@@ -1,13 +1,13 @@
 # CHANNEL 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > **用途**：本文件是 **CHANNEL** 模块迁移的**单一事实来源**与**增量跟踪入口**。开工前读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md`；历史过程记录见 `docs/extensions/history/CHANNEL__MIGRATION_HISTORY.md`（**冻结**）。切勿臆断代码现状——以本文件 + `git status` + `cargo test` 实际验证为准。
-> **当前状态**：**已完成（基线 2026-10-23）**。Java 后续新特性按 §6 增量跟踪流程登记到 §3。
-> **Java 源码**：`D:\IdeaProjects\agentscope-java\agentscope-extensions\agentscope-extensions-channel\`（本机 `main` 现为 6 个子模块，**已无 weixin**，见 §4.2）
+> **当前状态**：历史基线**已完成（2026-10-23）**；**2026-10-31 全量对齐复核**新增 `CHANNEL-N01`–`N22`（**3 个 P0 未关闭**，见 §3.5），现行状态以 §3.5 为准。Java 后续新特性按 §6 增量跟踪流程登记。
+> **Java 源码**：`D:\IdeaProjects\agentscope-java\agentscope-extensions\agentscope-extensions-channel\`（本机 `main` 为 **7** 个子模块，**含 weixin**；早期「已无 weixin」的记载已于 2026-10-26 更正，依据见 §4.2 `CHANNEL-X03`）
 > **Java 子模块**：common, dingtalk, feishu, github, gitlab, wecom, weixin（**7** 个；weixin 基线来自早期快照）
 > **Rust 目标**：`crates/agentscope-extensions-channel/`（波次 A）
 
 ## 0. 如何阅读本文件
-- 章节导航：§1 基线 → §2 逐类映射 → §3 缺口清单（当前为空）→ §4 设计决定/差异 → §5 已知限制 → §6 增量流程 → §7 验证基线 → §8 归档。
+- 章节导航：§1 基线 → §2 逐类映射 → §3 历史缺口清单（G1–G10，已全关闭）→ **§3.5 2026-10-31 全量对齐复核清单（唯一编号 N01–N22，现行待办以此为准）** → §4 设计决定/差异（D01–D08 / X01–X13）→ §5 已知限制 → §6 增量流程 → §7 验证基线 → §8 归档。
 - **状态取值**：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
 - **优先级**：P0=核心链路 / P1=重要 / P2=增强。
 - 每完成一项：把 §3 状态改 `已完成`，记录关闭日期，并在 §7 写最新验证结果（命令 + 结果）。
@@ -20,7 +20,7 @@
 | Java 规模（实测 2026-10-22） | 主代码 **8251** 行 / 测试 **3954** 行（**非空行**口径；`Get-ChildItem -Recurse -Filter *.java` 逐文件非空行求和，共 **92** 个文件 = 67 main + 25 test；`@Test` 计 **161** 个 + `@ParameterizedTest` 1 个）。分模块 main/test：common 593/300、dingtalk 1599/801、feishu 1212/205、github 873/**0**、gitlab 766/**0**、wecom 1254/325、weixin 1954/2323（原始行数口径：主 **9012** / 测试 **4347**） |
 | Rust crate | `crates/agentscope-extensions-channel`（`src/` **71** 个 `.rs`，**16334** 行（非空行口径；原始行数 **18000**）；内联测试 **405** passed（2026-10-31 实测）；已知基线：2026-10-26 G9 关闭后实测 **399**（**2026-10-29 勘误**：原记 385 = 266 `#[test]` + 119 `#[tokio::test]`，见 §3.1；**2026-10-31** G10 新增 6 个） |
 | 迁移波次 | A |
-| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 405 passed / 0 failed）—— 基线 2026-10-23 起全部 P0/P1/P2 缺口关闭（§3，细节见 history/CHANNEL__MIGRATION_HISTORY.md）：common 主干（`ChannelMediaMetadata`、`InboundEventDeduplicator`/`AccessTokenStore` seam）、七平台 `*ChannelProperties`/`*InboundMapper`（text + 媒体）/`*OutboundClient`/`*AccessTokenProvider`/签名与解密、六个平台 `*Channel` 适配（含 weixin）+ 五个 axum CallbackController + `DingTalkStreamClient`（常驻 WebSocket 网关）均已落地；G10（weixin 消费循环重试链 + 退避升级）已关闭。验证基线见 §7。 |
+| 当前状态 | **历史基线已完成，2026-10-31 全量复核新增 3 个 P0（未关闭）**（见 §3.5：N01 GitHub/GitLab 机器人身份未解析、N02 Feishu dispatch 失败丢消息、N03 WeCom 出站忽略 errcode）。历史基线（P1/P2 清零；2026-10-31 实测 405 passed / 0 failed）—— 基线 2026-10-23 起全部 P0/P1/P2 缺口关闭（§3，细节见 history/CHANNEL__MIGRATION_HISTORY.md）：common 主干（`ChannelMediaMetadata`、`InboundEventDeduplicator`/`AccessTokenStore` seam）、七平台 `*ChannelProperties`/`*InboundMapper`（text + 媒体）/`*OutboundClient`/`*AccessTokenProvider`/签名与解密、六个平台 `*Channel` 适配（含 weixin）+ 五个 axum CallbackController + `DingTalkStreamClient`（常驻 WebSocket 网关）均已落地；G10（weixin 消费循环重试链 + 退避升级）已关闭。验证基线见 §7。 |
 
 ### 1.1 与 harness 的边界（已裁定，必须遵守）
 harness 提供**路由/会话绑定骨架**（不可改）：`crates/agentscope-harness/src/agent/` 下 `channel.rs`、`chatui.rs`、`inbound.rs`、`router.rs`、`binding.rs`、`peer.rs`、`dm_scope.rs`、`config.rs`。
@@ -148,7 +148,7 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 | `URLEncoder` | 表单编码 | `percent-encoding = "2.3"` | — |
 | OkHttp WebSocket / `reactor-netty` | 常驻连接（DingTalk Stream） | `tokio-tungstenite` 0.29（`connect` + `handshake` + `rustls-tls-webpki-roots`） | 生产连接器 `dingtalk/stream.rs::TungsteniteConnector`；协议逻辑与 I/O 边界分离，可离线单测 |
 | Spring `@RestController` | 回调 HTTP 入口 | `axum` 0.7（workspace 依赖）+ `http`/`bytes` | **已裁定**：与 protocol/controlplane 统一用 axum；控制器为薄壳，只做参数提取与 `*CallbackOutcome` → HTTP 映射 |
-## 3. 缺口清单（当前：无）
+## 3. 缺口清单（G1–G10 已全部关闭；**2026-10-31 全量复核后的现行待办见 §3.5**）
 
 > 历史 P0/P1/P2 的发现、修复与反向验证细节见归档 `CHANNEL__MIGRATION_HISTORY.md`（章节编号沿用原 §6/§7/§8）。
 
@@ -209,26 +209,84 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 - **A2A / 长轮询等拉取式入站**：Java 侧无对应类 → 设计决定（不迁移）；weixin 的 iLink 长轮询已迁移在 `weixin/channel.rs`。
 - **真实平台联调**：见 §5（需租户环境，非代码缺口）。
 
+## 3.5 2026-10-31 全量对齐复核清单（唯一编号）
+
+> 复核基线：Java `main` @ `1524b3191`（`agentscope-extensions-channel` 7 子模块：common / dingtalk / feishu / github / gitlab / wecom / weixin，主代码 92 文件）；Rust 工作树 `crates/agentscope-extensions-channel`（71 个 `.rs`）。本表为本轮逐文件核对结论，**存量 §3.1–§3.4 历史清单（G1–G10）保持原样未重新编号**。
+> 编号规则：`CHANNEL-NN`（缺口/复核结论，状态列取值 `待办` / `进行中` / `已完成` / `设计决定（不迁移）` / `待裁定`）；差异另有 `CHANNEL-DNN`（§4.1 设计决定不迁移）/ `CHANNEL-XNN`（§4.2 有意差异）系列。编号本模块内唯一、单调递增，不复用历史 `G<n>`。
+> 核对面：消息模型（text / image / audio / video / file / folder / media）· 签名与解密算法（HMAC-SHA256 / SHA-256 / SHA-1 + AES-256-CBC）· 回调路由与幂等 · token 获取与 80% TTL 刷新 · 长连接（DingTalk Stream ACK 时序）· 发送 API 字段 · 错误码分类 · 限流/退避重试。
+
+### 3.5.1 缺口与待裁定
+
+| 编号 | 优先级 | 缺口项（可执行描述） | Java 参考（文件#符号） | Rust 现状（文件:行 / rg 零命中） | 执行状态 | 下一动作 |
+|---|---|---|---|---|---|---|
+| CHANNEL-N01 | P0 | **GitHub/GitLab 机器人身份从未解析 → 自评论回环防护在生产路径上恒为关闭**：`is_self()` 要求 `bot_user_id > 0`，而未调用 `refresh()` 时恒为 `-1`；只有 `botUserLogin` 覆盖也只是 `(-1, login)`，同样不生效。后果：机器人回复自己的评论会再次触发 webhook，仅靠 `BotLoopGuard`（20 条/60 s + 60 s 冷却）节流，形成长期刷屏循环 | `github/GitHubChannel.java#start`（`botIdentityResolver.refresh()`，L151）、`gitlab/GitLabChannel.java#start`（L147-149）；`GitHubBotIdentityResolver.java#refresh`（GET `/user`） | `src/github/channel.rs:113` 仅构造 `GitHubBotIdentityResolver`；`src/github/bot_identity.rs:149 refresh` / `:182 is_self`；`rg -n '\.refresh\(' src` **生产代码零命中**，仅 `bot_identity.rs:171,185` 与 `gitlab/bot_identity.rs:171,185` 的测试调用（另核 `try_refresh` 亦仅 `github/bot_identity.rs:268,282` 测试） | 待办 | ①在两平台通道增加启动钩子（`start()` 或在 `from_json_with` 后由宿主调用）；②`refresh()` 失败保持“未知”并 warn（已是 best-effort，勿改成启动失败）；③验收：新增测试断言「构造后未解析 → `is_self` false；`start()`/`refresh()` 后自评论被丢弃」，并做反向验证（去掉调用 → FAILED） |
+| CHANNEL-N02 | P0 | **Feishu 消息在 dispatch 失败时被永久丢弃**：Rust 先按 `header.event_id` 占用幂等键（`ChannelCore::admit`）再 dispatch，且把 dispatch 错误整体 `let _ =` 吞掉并回 200；Java 明确不在入口去重（“Durable intake owns deduplication”，避免“标记已见但未持久化”），并对 dispatch 失败回 **503** 让飞书重投。叠加后 Rust 在网关/agent 瞬时失败时既无重投也无错误信号 | `feishu/FeishuCallbackController.java#callback`（去重注释 + `onErrorResume` → `HttpStatus.SERVICE_UNAVAILABLE`） | `src/feishu/channel.rs:236-243`（`self.core.admit(event_id…)` → `let _ = PlatformChannel::dispatch(...)` → `Accepted`）；`FeishuCallbackOutcome` 无 `ServiceUnavailable` 变体（`src/feishu/channel.rs:43-52`），`src/feishu/controller.rs:66-75` 无 503 映射 | 待办 | ①新增 `FeishuCallbackOutcome::Unavailable` → `503`；②dispatch 失败时不吞错，且**先 dispatch 成功再落幂等键**（或保留“入口不去重”，把去重交给持久化入口）；③验收：`dispatch` 返回 Err 时控制器回 503 且同一 `event_id` 二次投递仍被受理 |
+| CHANNEL-N03 | P0 | **WeCom 出站把被拒绝的发送当成功**：`handle_send_response` 只对 `errcode` 42001/40014 做 token 失效，**不对非 0 errcode 返回错误**，也不校验空 body / 缺 `errcode`；Java `checkSendResponse` 对 `errcode != 0` 抛 `IllegalStateException`、对空 body / 缺 `errcode` 抛错。后果：消息被企业微信拒绝（如 81013 用户不存在、45009 接口超限）时返回 `Ok(())`，上层认为已投递，静默丢消息 | `wecom/WeComOutboundClient.java#checkSendResponse`（`errcode != 0` → throw；`defaultIfEmpty("")`；`MAX_SNIPPET_LENGTH` 截断） | `src/wecom/outbound.rs:80-90`（`send()` 只 `handle_send_response(&response.body)` 后 `Ok(())`）；`src/wecom/outbound.rs:94-105`（`handle_send_response` 用 `unwrap_or(0)`，解析失败直接 return） | 待办 | ①`handle_send_response` 改返回 `Result<()>`：body 非 JSON / 缺 `errcode` / `errcode != 0` → `ChannelError::Http`（携带截断后的 body，≤200 字符）；②保留 42001/40014 失效后仍报错；③验收：新增 `errcode=45009` → Err、空 body → Err 的测试，并反向验证（恢复旧实现 → FAILED） |
+| CHANNEL-N04 | P1 | **GitHub / GitLab / DingTalk 出站不校验 HTTP 状态码**：`HttpTransport::execute` 一律返回 `PreparedResponse`（含 4xx/5xx），三个客户端 `send()` 直接 `Ok(())`，401（坏 token）/403/404（仓库或 issue 不存在）/422（内容被拒）/429 都被当作投递成功。Java 走 `WebClient.retrieve()`，非 2xx 直接进 `onError` | `github/GitHubOutboundClient.java#sendOne`（`retrieve()`，15 s 超时）、`gitlab/GitLabOutboundClient.java#sendOne`、`dingtalk/DingTalkOutboundClient.java#post`（`retrieve()` + 10 s 超时 + token 失效） | `src/github/outbound.rs:111-119`、`src/gitlab/outbound.rs:112-120`（`self.transport.execute(request).await?` 后不查 `is_success()`）；`src/dingtalk/outbound.rs:110-122`（仅 `!is_success()` 时 `invalidate()`，仍返回 `Ok`）；`PreparedResponse::is_success` 已存在于 `src/common/http.rs` 但未被上述三处使用 | 待办 | ①三处 `send()` 在 `execute` 后加 `if !response.is_success() { return Err(ChannelError::Http(...)) }`（GitHub/GitLab 同时保留 `x-ratelimit-remaining` 诊断日志）；②DingTalk 保留失效逻辑后再报错；③验收：`RecordingTransport` 返回 401/422 时 `send()` 为 Err，反向验证 |
+| CHANNEL-N05 | P1 | **回执式投递（`deliverWithReceipt`）在 Rust 抽象层缺失**：Java `Channel` 接口有 `Mono<String> deliverWithReceipt(address, msg, deliveryId)`，飞书（`uuid` 去重 + 返回 `message_id`）与微信（返回 provider 回执）各自实现，供宿主持久化投递 worker 使用；Rust `PlatformChannel`/harness `Channel`/`ChannelSink` 都没有该方法，`FeishuOutboundClient::send_with_receipt` 无从通过通道调用（`WeixinChannel::deliver_with_receipt` 仅为具体类型固有方法） | `feishu/FeishuChannel.java#deliverWithReceipt`、`feishu/FeishuOutboundClient.java#sendWithReceipt`、`weixin/WeixinChannel.java#deliverWithReceipt` | `crates/agentscope-harness/src/agent/gateway/channel/channel.rs:22-44`（`Channel` 只有 channel_id/config/init/dispatch/apply_routing_config）；`crates/.../platform_channel.rs:165-217`（仅 `ctx()`/`deliver_reply()`/`dispatch`）；`rg 'deliver_with_receipt' crates` 仅命中 `src/weixin/channel.rs:754`（另核 `deliverWithReceipt` 全仓零命中）；`FeishuChannel` 无该方法（`src/feishu/channel.rs:63-260`） | 待裁定 | 需先裁定抽象归属：**A**=给 harness `Channel`/`ChannelSink` 增默认 `deliver_with_receipt`（默认 `Err(Unsupported)`，飞书/微信覆写，需 harness 授权）；**B**=在 channel crate 用具体类型方法 + 宿主 `match`。裁定后补 `FeishuChannel::deliver_with_receipt`（`uuid`+回执）与 trait 接线测试 |
+| CHANNEL-N06 | P2 | **webhook 验签基于有损 UTF-8 字符串而非原始字节**：控制器用 `String::from_utf8_lossy(&body)` 后按 `&str` 的字节算 HMAC；非 UTF-8 字节被替换为 U+FFFD，签名与被签名原文不一致 → 401，且 JSON 解析内容与 Java 不同。Java 以 `byte[]`/`String`（Spring 严格解码）验签原始请求体 | `github/GitHubWebhookController.java#webhook`（`@RequestBody byte[] rawBody`，HMAC over 原始字节）、`dingtalk/DingTalkCallbackController.java#dispatch`（`String body` 原样参与 HMAC） | `src/github/controller.rs:44`、`src/gitlab/controller.rs:43`、`src/dingtalk/controller.rs:143`、`src/feishu/controller.rs:45`、`src/wecom/controller.rs:77` 均 `String::from_utf8_lossy`；`src/github/channel.rs:161` 对 `raw_body.as_bytes()` 验签 | 待办 | ①控制器改为传 `&[u8]`/`Bytes`，验签用原始字节（GitHub/GitLab），XML/JSON 解析再各自解码；②或至少用 `std::str::from_utf8` 严格解码并在非 UTF-8 时回 400（而不是验签失败）；③验收：含非 UTF-8 字节的 body 验签结果与 Java 一致 |
+| CHANNEL-N07 | P2 | **未处理的 webhook 事件返回码不一致**：Java 对 GitHub 非 `issue_comment`/`pull_request_review_comment`、GitLab 非 `Note Hook` 返回 **204 No Content**；Rust 统一返回 200 `{}`（`Accepted`），语义上把“未处理”和“已处理”混同，宿主/监控无法区分 | `github/GitHubWebhookController.java#webhook`（`ResponseEntity.noContent()`）、`gitlab/GitLabWebhookController.java#webhook`（`noContent()`） | `src/github/controller.rs:70-75`（全部 `Accepted` → `Json({})`）；`src/gitlab/controller.rs` 同理；`GitHubCallbackOutcome`/`GitLabCallbackOutcome` 无 `Ignored` 变体 | 待办 | 增 `Ignored` 变体 → `204`，仅在“事件类型不支持”时使用；验收：`push` 事件返回 204，`issue_comment` 仍 200 |
+| CHANNEL-N08 | P2 | **平台 `TYPE` 常量缺失**：Java 六个通道类均有 `public static final String TYPE`（`"dingtalk"`/`"feishu"`/`"github"`/`"gitlab"`/`"wecom"`/`"weixin"`），是配置分发（`agentscope.json#channels[*].type`）与诊断的唯一标识来源；Rust 只有 `weixin` 导出 `CHANNEL_TYPE` | `dingtalk/DingTalkChannel.java:58`、`feishu/FeishuChannel.java`、`github/GitHubChannel.java`、`gitlab/GitLabChannel.java`、`wecom/WeComChannel.java`、`weixin/WeixinChannel.java` | `rg 'CHANNEL_TYPE' 与 'pub const TYPE' src` 均仅命中 `src/weixin/channel.rs:66`；其余五个平台零命中（另核 `pub const CHANNEL_ID`/`const TYPE` 亦零命中） | 待办 | 五个平台模块各加 `pub const CHANNEL_TYPE: &str`，并在 `mod.rs` re-export；验收：编译期常量断言测试 |
+| CHANNEL-N09 | P1 | **HTTP 模式通道无启动钩子、靠宿主显式 `register()`（否则回调一律 401/404）**：Java `start()` 把实例注册进 `*ChannelRegistry`，`stop()` 反注册；Rust 的 `ChannelRegistry::register` 在本 crate 生产代码中零调用（仅测试），`DingTalkChannel::start()`（http 模式）只校验 crypto 不注册，Feishu/GitHub/GitLab/WeCom 连 `start()/stop()` 都没有 → 宿主漏调 register 时 webhook 全部失败，且无编译期提示 | `dingtalk/DingTalkChannel.java#start/#stop`、`feishu/FeishuChannel.java#start`、`wecom/WeComChannel.java#start`（均 `registry.register(this)`） | `src/common/channel_registry.rs:85-100`（`register` 显式）；`rg -n '\.register\(' src` 仅 `github/controller.rs:106`、`feishu/controller.rs:107`、`gitlab/controller.rs:89`、`wecom/controller.rs:158`、`dingtalk/controller.rs:274,561`（**全部在 `#[cfg(test)]` 内**）；`src/dingtalk/channel.rs:181-193`（http 模式仅校验 crypto） | 待裁定 | 裁定归属：**A**=在 channel crate 加 `GatewayBootstrap`/`build_registry(…)->(Router, Registry)` 装配入口（宿主一行接入）；**B**=保持“宿主自装配”但在各平台补 `start()/stop()` 文档契约。裁定后补一条「走真实装配入口」的测试（防 §1.2 记载的“测试绿但装配漏接线”复发） |
+
+### 3.5.2 本轮复核确认已对齐（抽样，不求穷举）
+
+| 编号 | 能力 | Java 参考 | Rust 证据（文件:行 + 测试名） | 执行状态 |
+|---|---|---|---|---|
+| CHANNEL-N10 | `BotLoopGuard`：20 事件/60 s 窗口、超限后 60 s 冷却、空闲 peer 按 `window+cooldown` 淘汰、无后台线程 | `common/BotLoopGuard.java#allow/#maybeSweep` | `src/common/bot_loop_guard.rs:97 allow_at`、`:27 BotLoopGuardConfig::default`、`evict_idle_peers`/`tracked_peers`；测试 `bot_loop_guard.rs::tests::*`（含种子时钟） | 已完成 |
+| CHANNEL-N11 | `IdempotencyStore`：默认 5 min/10k，满容量先清过期再按插入序淘汰，过期后“仅 CAS 胜者重开窗口” | `common/IdempotencyStore.java#firstSeen/#sweep` | `src/common/idempotency_store.rs:36 DEFAULT_TTL_MS`、`:112 first_seen_at`（`Entry{seen_at_ms,seq}` + `order`）+ `sweep`；测试 `idempotency_store.rs::tests::*` | 已完成 |
+| CHANNEL-N12 | token 缓存：`putIfNewer` 严格比较 `refreshAtMs`、80% TTL（`expiresIn*800`）、三平台 provider 可注入 `AccessTokenStore` | `common/AccessTokenStore.java#putIfNewer`、`common/InMemoryAccessTokenStore.java`、各 `*AccessTokenProvider#refresh` | `src/common/token.rs:25 refresh_at_ms`、`:73 put_if_newer`（默认实现）、`:94 Mutex` 原子合并；`DingTalk/Feishu/WeCom` 均有 `with_store(...)`（`dingtalk/token.rs:40`、`feishu/token.rs:60`、`wecom/token.rs`） | 已完成 |
+| CHANNEL-N13 | DingTalk 回调验签/解密：`HMAC-SHA256(appSecret, ts+"\n"+appSecret)`、时间戳 ≤1 h 且未来偏差 ≤5 min、`aesKey` 43 字符 + `"="` 解码 32 字节、`16B ‖ 4B len ‖ msg ‖ trailer`（明文布局，竖线仅作分隔记号）、PKCS#7 按 **32 字节**块严格校验 | `dingtalk/DingTalkCallbackCrypto.java#verify/#decrypt` | `src/dingtalk/crypto.rs:52-53 MAX_TIMESTAMP_AGE_MS/MAX_FUTURE_TIMESTAMP_MS`、`JAVA_BASE64`（容忍尾部非零位）；金标向量测试 `hmac_signature_matches_the_java_gold_vector`、`decrypts_the_java_gold_ciphertext` | 已完成 |
+| CHANNEL-N14 | DingTalk Stream：注册体 `clientId/clientSecret/ua/subscriptions[CALLBACK,/v1.0/im/bot/messages/get]`、**先 ACK 再 dispatch**、1 s→60 s 指数退避并在连上后复位 | `dingtalk/DingTalkStreamClient.java#openConnection/#handleFrame/#ackFrame/#scheduleReconnect` | `src/dingtalk/stream.rs:61`（注册体 `ua`，整体 57-66）、`:346-352`（先 ACK 后派发）、`:137 next_backoff`、`:319`（连上复位）；测试 `callback_is_acked_before_the_payload_is_dispatched`、`backoff_doubles_up_to_the_cap` | 已完成 |
+| CHANNEL-N15 | DingTalk 配置：`appKey/appSecret/robotCode` 必填、`mode` ∈ {stream,http} 缺省 stream、`aesKey` 43 字符、`apiBase/oapiBase/streamRegisterUrl` 默认值、`token` 仅 Rust 扩展 | `dingtalk/DingTalkChannelProperties.java`（紧凑构造器） | `src/dingtalk/properties.rs:94-124`（默认值与校验逐条对应，错误文案对齐）；测试 `properties.rs::tests::*` | 已完成 |
+| CHANNEL-N16 | Feishu 加解密：AES key = `SHA-256(encryptKey)`、`16B IV ‖ CBC+PKCS#7`、签名 `SHA-256(ts+nonce+key+rawBody)` 常量时间比较、仅“已加密且带签名头”时强制校验 | `feishu/FeishuCrypto.java#verifySignature/#decrypt`、`feishu/FeishuCallbackController.java`（L1 步） | `src/feishu/crypto.rs`（`derive`/`verify_signature`/`decrypt`/`sign`）；`src/feishu/channel.rs:165-175`（校验条件）；测试 `encrypted_channel_rejects_a_signature_mismatch`、`encrypted_channel_accepts_a_valid_signature` | 已完成 |
+| CHANNEL-N17 | Feishu 出站：`receive_id_type=chat_id`、threaded reply 走 `/messages/{root_id}/reply` + `reply_in_thread`、`uuid=deliveryId`、`code 99991663/99991664` 失效 token、`code != 0` 报错 | `feishu/FeishuOutboundClient.java#sendOneReceipt/#checkSendResponse` | `src/feishu/outbound.rs:65-100`（uuid / reply_in_thread / receive_id）、`:136-170`（`parse_send_response` 失效并报错）；测试 `send_with_receipt_returns_message_id`、`parse_send_response_extracts_message_id_and_invalidates_on_auth_error` | 已完成 |
+| CHANNEL-N18 | GitHub：`X-Hub-Signature-256`（`sha256=` 前缀 + 常量时间）、`created` 限定、`issue_comment`/`pull_request_review_comment` 分支、`owner/repo#n` THREAD peer、自评论丢弃、按 `comment.id` 去重 | `github/GitHubSignatureVerifier.java#verify`、`github/GitHubInboundMapper.java#map`、`github/GitHubWebhookController.java` | `src/github/signature.rs`、`src/github/inbound.rs`、`src/github/channel.rs:156-196`；测试 `rejects_a_bad_signature`、`drops_self_authored_comments`、`admits_a_signed_issue_comment_once` | 已完成 |
+| CHANNEL-N19 | GitLab：`X-Gitlab-Token` 常量时间、仅 `Note Hook`、project path 按 Java `URLEncoder` 规则 percent-encode（`grp%2Fproj`）、`issues`/`merge_requests` 分支、`note.id` 去重 | `gitlab/GitLabWebhookController.java#webhook`、`gitlab/GitLabOutboundClient.java#sendOne` | `src/gitlab/signature.rs:verify_webhook_token`、`src/gitlab/outbound.rs:88-110`；测试 `builds_issue_note_request_with_encoded_project_id`、`a_valid_note_hook_is_accepted` | 已完成 |
+| CHANNEL-N20 | WeCom：`SHA-1(sort(token,ts,nonce,encrypt))` 常量时间、AES-256-CBC + 尾部 **receive_id 必须等于 corpId**、GET 握手解密 `echostr` 明文回显、POST 缺 `<Encrypt>`→400 | `wecom/WeComCrypto.java#verifySignature/#decrypt`、`wecom/WeComCallbackController.java#verify/#dispatch` | `src/wecom/signature.rs`、`src/wecom/crypto.rs`（receive_id 校验）、`src/wecom/channel.rs:162-186 verify_url`、`src/wecom/controller.rs:36-60`；测试 `verify_echoes_the_decrypted_echostr_as_plain_text` 等 | 已完成 |
+| CHANNEL-N21 | weixin 租约与投递：`is_lease_current` 围栏（取/续/写 context token/落库前各检一次）、`MAX_DISPATCH_ATTEMPTS=3` 后 `abandon_message`、`-14` 视为凭据拒绝并停消费 | `weixin/WeixinChannel.java#consume/#drainInbox/#requireLease`、`InMemoryWeixinStateStore.java` | `src/weixin/channel.rs:611-620`（重试预算 + abandon）、`:377-390`（notify_stop 前检查 lease）、`src/weixin/state_store.rs:110-175`；测试 `drain_inbox_abandons_a_message_after_the_retry_budget`、`stale_lease_cannot_write` 类 | 已完成 |
+| CHANNEL-N22 | weixin 配置 10 字段默认值逐一一致（`longPollTimeoutMs=35000`/`requestTimeoutMs=45000`/`maxBackoffMs=60000`/`leaseMs=90000`/`dispatchTimeoutMs=120000`/baseUrl 归一化/`accountId` 回落 channelId） | `weixin/WeixinChannelProperties.java`（紧凑构造器 + `from`） | `src/weixin/properties.rs:49-100`（`new` 内 `positive_or` 默认值表，`from_json` 见 `:93`）；测试 `properties.rs::tests::*` | 已完成 |
+
 ## 4. 设计决定与已知差异
 
 ### 4.1 设计决定（不迁移）
-| 项 | Java 参考 | 理由 |
-|---|---|---|
-| Spring AutoConfiguration / `@ConfigurationProperties` 绑定 | 各子模块 Spring 配置类 | Rust 无 Spring 容器；改为 `*ChannelProperties` 显式解析函数 |
-| 进程级 `*ChannelRegistry` 单例 | `DingTalk/Feishu/GitHub/GitLab/WeComChannelRegistry` | 收敛为泛型 `common::ChannelRegistry<C>`（Rust 共 6 个别名，含 Java 没有的 `WeixinChannelRegistry`），实例作用域便于测试隔离 |
-| A2A / 长轮询等拉取式入站 | — | Java 侧无对应类 |
-| 字段命名 | 各 `*ChannelProperties` camelCase 键名 | 保留 Java 键名，降低下游配置迁移成本 |
 
-### 4.2 与 Java 的已知差异（有意为之，非缺口）
-| 项 | Java | Rust | 理由 |
-|---|---|---|---|
-| seam 注入形式 | `fromProperties(..., InboundEventDeduplicator[, AccessTokenStore])` 三档重载 | `from_json(...)` + `from_json_with(..., &ChannelSeams)` | 避免每平台 3 个几乎相同的函数；两字段均可选，语义等价 |
-| token 缓存类型 | `InMemoryAccessTokenStore` | `InMemoryAccessTokenStore`（取代旧 `TokenCache`） | 接口化后不需要独立 `TokenCache` 类型；本 crate 无下游依赖方 |
-| weixin 工厂 | Java **有** weixin 子模块（HEAD `16cb024ae` 主 20 文件 / 1955 非空行，测 9 文件 / 2323 非空行） | `WeixinChannel::create(..., &ChannelSeams)` / `from_json_with` | **2026-10-26 复评更正**：原文称「本机 checkout 已无 weixin 子模块」**不成立**（`git cat-file -e HEAD:.../channel-weixin` 成功）；子模块由 `63a6f6168`（2026-09-23）引入，一直在基线内。§2.7 的早期快照数字与实测一致（20 类 / 2323 测试非空行），可继续引用 |
-| `ChannelMediaMetadata` 文件名净化 | 正则 `\p{Cf}` | 显式 Cf 区间枚举 | Rust `std` 无 Unicode general-category API，不为此新增依赖 |
-| DingTalk 回调签名 | 仅 `HmacSHA256(appSecret, ts+"\n"+appSecret)` | 同上 + 可选经典 `token+SHA1` 兼容路径 | 默认不配置 `token` 即完全等同 Java |
-| DingTalk `check_url` 首次验证 | 返回空 200 | 返回加密 `success` | 依据 DingTalk 事件订阅协议；**尚未在真实租户验证** |
-| weixin 失败后租约处理 | 同一租约内原地 `sleep(backoff)`，只保留租约 | `consume()` 返回后 `end_consuming()` 释放租约，外层重新 `begin_consuming()` | 两者语义等价（都是重试 + 退避）；Rust 侧释放租约让其它实例可接管，且重新获取会重新审计 `notifystart`。**退避值本身跨租约保留**（G10，§3.2） |
+> 编号 `CHANNEL-DNN`：Java 有、Rust **有意不迁**（JVM 专属 / 与 Rust 生态重复 / 已被更优机制替代）。所有条目均给出源码级依据。
+
+| 编号 | 项 | Java 参考 | 不迁移理由（源码级依据） | 影响面 |
+|---|---|---|---|---|
+| CHANNEL-D01 | Spring AutoConfiguration / `@ConfigurationProperties` 绑定 | 各子模块 Spring 配置类（构造器即校验，由容器绑定 `agentscope.json`） | Rust 无 Spring 容器与 DI；改为显式解析函数：`src/dingtalk/properties.rs::DingTalkChannelProperties::from_json`、`feishu` / `wecom` / `weixin` 的 `properties::from_json`、`github` / `gitlab` 的 `properties::from_json`（`rg '@ConfigurationProperties' crates` 零命中，另核 `AutoConfiguration` 亦零命中） | 宿主须显式构造通道并 `register`（见 CHANNEL-N09），没有容器自动装配 |
+| CHANNEL-D02 | 进程级 `*ChannelRegistry` 单例（`instance()`） | `DingTalk/Feishu/GitHub/GitLab/WeComChannelRegistry.java`（各含 `static instance()`） | 收敛为泛型 `common::ChannelRegistry<C>`（`src/common/channel_registry.rs`），实例作用域、可注入控制器，便于测试隔离；Rust 另加 Java 没有的 `WeixinChannelRegistry`（`src/weixin/channel.rs` 内 `type` 别名） | 装配点从“静态单例”改为“构造时注入”（与 CHANNEL-N09 同源） |
+| CHANNEL-D03 | A2A / 长轮询等拉取式入站抽象 | —（Java 侧无对应类） | 无基线可迁；weixin 的 iLink 长轮询按 `WeixinChannel` 语义直接落在 `src/weixin/channel.rs::run_consumer/poll_once` | 无 |
+| CHANNEL-D04 | 配置键名 camelCase 转 snake_case 的映射层 | 各 `*ChannelProperties.java` 直接读 camelCase 键 | 保留 Java 键名（`appKey`/`encodingAesKey`/`longPollTimeoutMs`…），降低下游 `agentscope.json` 迁移成本；Rust 侧仅结构体字段用 snake_case，读取键名不变（`src/common/props.rs::get_str/get_int`） | 配置文件可直接复用 |
+| CHANNEL-D05 | JVM 加密原语 `javax.crypto.Mac/Cipher`、`MessageDigest`、`java.util.Base64`、`MessageDigest.isEqual` | `DingTalkCallbackCrypto`/`FeishuCrypto`/`WeComCrypto`/`GitHubSignatureVerifier` | 替换为 RustCrypto + `base64`：`hmac`0.12 + `sha2`0.10（`src/dingtalk/crypto.rs`、`src/github/signature.rs`）、`sha1`0.10（`src/wecom/signature.rs`）、`aes`+`cbc`（`src/common/crypto.rs::aes_256_cbc_decrypt`）、`base64`0.22；`rg 'javax.crypto' crates` 与 `rg 'MessageDigest' crates` 均零命中 | 算法字节级等价（金标向量已覆盖）；仅 Java `Base64.getDecoder()` 的“忽略末位非零 bit”需显式开启（`with_decode_allow_trailing_bits(true)`，见 `dingtalk/crypto.rs::JAVA_BASE64`） |
+| CHANNEL-D06 | Jackson `ObjectMapper` + `DocumentBuilderFactory`(DOM, XXE 加固) | 各 inbound mapper / controller（`WeComInboundMapper`、`WeComCallbackController`） | `serde_json` 直接解析为 `Value`（保依赖轻量、可离线测）；XML 用 `quick-xml` 0.39（`src/common/xml.rs::xml_element_text` 复刻 `getElementsByTagName` + `getTextContent`，含 CDATA/实体/首个匹配）；`rg 'DocumentBuilderFactory' crates` 零命中 | XXE 加固由 quick-xml 默认不解析外部实体承担（无需 Java 那组 feature 开关） |
+| CHANNEL-D07 | Spring `@RestController` / `@RequestMapping` / `@RequestBody` | 五个 `*CallbackController.java` | 统一用 axum 0.7 薄壳（`src/*/controller.rs::router`），与 protocol/controlplane 一致；控制器只做参数提取 + `*CallbackOutcome → StatusCode` 映射 | 路由需宿主 `Router::merge` 挂载（Java 由组件扫描自动注册） |
+| CHANNEL-D08 | Reactor `Mono/Flux`（`concatMap` 顺序、`timeout`、`onErrorResume`） | 各 `*OutboundClient` / 控制器返回 `Mono` | 改 `async/await`：`for` 循环顺序发送（等价 `concatMap`）、`tokio::time::timeout`、`match` 展平错误；`rg 'reactor' crates/agentscope-extensions-channel` 与 `rg 'Mono<' …` 均零命中 | 无背压概念；单条消息顺序投递语义保持 |
+
+### 4.2 设计决定与已知差异
+
+> 编号 `CHANNEL-XNN`：Rust **已实现但与 Java 行为不同**（架构差异 / 有意优化 / 修复）。下表不含缺口——缺口见 §3.5.1。
+
+| 编号 | 项 | Rust 实现 | 与 Java 的差异 | 为何保留（收益/依据） |
+|---|---|---|---|---|
+| CHANNEL-X01 | seam 注入形式 | `from_json(...)` + `from_json_with(..., &ChannelSeams)`（`ChannelSeams` 同时携带 `deduplicator` + `token_store`） | Java 是 `fromProperties(..., InboundEventDeduplicator[, AccessTokenStore])` 三档重载 | 避免每平台 3 个几乎相同的函数；两字段均可选，语义等价 |
+| CHANNEL-X02 | token 缓存类型 | `common::InMemoryAccessTokenStore`（实现 `AccessTokenStore` trait） | Java 同名类；Rust 早前另有 `TokenCache` 已被取代 | 接口化后不需要独立缓存类型；本 crate 无下游依赖方 |
+| CHANNEL-X03 | weixin 工厂 | `WeixinChannel::create(..., &ChannelSeams)` / `from_json_with` | Java 有 weixin 子模块（HEAD 主 20 类 / 1955 非空行，测 9 文件 / 2323 非空行） | **2026-10-26 复评更正**：曾记「本机 checkout 已无 weixin 子模块」**不成立**（`git cat-file -e HEAD:.../channel-weixin` 成功）；子模块由 `63a6f6168`（2026-09-23）引入并一直在基线内；§2.7 快照数字与实测一致 |
+| CHANNEL-X04 | `ChannelMediaMetadata` 文件名净化 | 显式 Cf 区间枚举（`src/common/media.rs::sanitize_marker_file_name`） | Java 用正则 `\p{Cf}` | Rust `std` 无 Unicode general-category API，不为一个字符类新增依赖；覆盖范围对“零宽/格式字符”等价 |
+| CHANNEL-X05 | DingTalk 回调签名 | 2026 方案 `HMAC-SHA256(appSecret, ts+"\n"+appSecret)` + **可选**经典 `SHA1(sort(token,ts,nonce,encrypt))`（配置 `token` 时才启用） | Java 只有 appSecret HMAC 方案（无 `token` 属性） | 默认不配置 `token` 即完全等同 Java；保留老租户兼容路径。差异仅在显式配置后出现 |
+| CHANNEL-X06 | DingTalk `check_url` 首次验证 | 返回加密的 `{"msgtype":"text","text":{"content":"success"}}`（`src/dingtalk/controller.rs::CHECK_URL_SUCCESS`） | Java 返回空 200 | 依据 DingTalk 事件订阅协议（部分租户要求 success 应答）；**尚未在真实租户验证**，若与租户版本冲突需回退 |
+| CHANNEL-X07 | weixin 失败后租约处理 | `consume()` 结束即 `end_consuming()` 释放租约，外层 `begin_consuming()` 重取；退避值跨租约保留（`INITIAL_BACKOFF_MS`/`next_backoff`） | Java 在同一租约内原地 `sleep(backoff)`，只保留租约 | 两者语义等价（重试 + 指数退避）；Rust 释放租约让其它实例可接管，重取时重新审计 `notifystart`；退避只由健康 poll+drain 复位（§3.2 G10） |
+| CHANNEL-X08 | 分发/投递骨架归属 | 每平台只实现 `PlatformChannel::ctx()` + `deliver_reply()`，路由/会话绑定/reply 投递由 harness `PlatformCtx` + blanket impl 提供（`crates/agentscope-harness/src/agent/gateway/platform_channel.rs:165-217`） | Java 每个 `*Channel` 重复实现 `channelId/config/init/dispatch/deliver/sendReply`（同一段 routing 代码 6 份） | 消除重复、统一热切换（`apply_routing_config`）；新增平台只写两方法。**代价**：`deliverWithReceipt` 未随之进入抽象（缺口 CHANNEL-N05） |
+| CHANNEL-X09 | 生命周期与注册 | 无 `start()/stop()`（HTTP 模式），`register()` 由宿主显式调用；`ChannelRegistry` 可选镜像到 harness `ChannelManager` | Java `start()` 自注册 / `stop()` 反注册 | 实例作用域更易测（不污染进程单例）；镜像注册让 proactive delivery 复用同一 `deliver_reply`。**风险**：漏注册即回调失败（CHANNEL-N09） |
+| CHANNEL-X10 | weixin dispatch 重试计数位置 | `WeixinChannel.dispatch_failures: Mutex<HashMap<message_id, i32>>`（通道级，跨租约累计） | Java 放在 `LeaseSession.dispatchFailures`（每租约清零） | 防止“租约抖动 → 无限重试同一毒消息”；代价是租约频繁更替时可能提前 `abandon`。`MAX_DISPATCH_ATTEMPTS=3` 与 abandon 语义一致 |
+| CHANNEL-X11 | 并发原语 | `Mutex<HashMap>` / `Mutex<Inner>` 单锁（`BotLoopGuard`、`IdempotencyStore`、`InMemoryAccessTokenStore`） | Java 用 `ConcurrentHashMap`（分段）+ `AtomicReference` CAS 循环 | 临界区极短（几十 ns 级），单锁实现更简单且无可观测阻塞；`put_if_newer` 语义仍为“严格更新者胜” |
+| CHANNEL-X12 | weixin 并发模型 | tokio task + `tokio::select!` + `CancelSignal`（租约丢失即取消 turn，含 `TURN_CANCEL_GRACE` 宽限） | Java 守护线程 + `volatile running`/`AtomicBoolean` + `block(Duration)` 超时 | 取消能真正中断执行（Java 仅 `block` 超时后放弃等待）；`require_lease` 仍是同一套 fencing 语义 |
+| CHANNEL-X13 | 注册表与 harness 的桥接 | `ChannelRegistry::with_manager` 在注册时同步 `ChannelManager`（`src/common/channel_registry.rs:85-100`） | Java 无此桥（registry 只服务 controller） | 主动推送（gateway 发起）与回调回复共用同一 `deliver_reply` 路径；`ChannelManager` 无 `unregister`，故注释说明 stop 只摘本地表 |
+
+### 4.3 复核收敛记录（原「遗留」表，信息保留；非差异条目）
+
+> 本节原为 §4.2 之后的「遗留」段，随 §4 重构移入独立小节，内容未改，仅作关闭证据留档。
 
 **遗留（2026-10-31 复核，已收敛）**：§3 代码缺口清单已空（G1–G10 全部关闭）。2026-10-29 曾把三项登记为「非代码缺口（环境验证）」，本轮逐项复核后重新裁定：**三项的离线可测部分均已落地为代码+单测**，只剩真实租户联调（不在本 crate 代码范围）：
 
@@ -241,7 +299,7 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 
 ## 5. 已知限制（只剩「真实租户联调」，离线可测部分已全覆盖）
 
-> 2026-10-31 复核：下列四项都曾有「环境验证」注册，但经核查，它们的**可离线部分均有源码 + 单测**（证据见 §4.2 遗留表），因此只剩真实租户/真实网关联调。
+> 2026-10-31 复核：下列四项都曾有「环境验证」注册，但经核查，它们的**可离线部分均有源码 + 单测**（证据见 §4.3），因此只剩真实租户/真实网关联调。
 
 - **DingTalk**：真实租户的 HTTP 回调验签/解密、`check_url` 加密应答、Stream 连接与退避重连（离线已由 `dingtalk/controller.rs` 与 `dingtalk/stream.rs` 测试覆盖）。
 - **Feishu**：真实事件订阅需配置 `verificationToken`（未配置时普通事件一律 401，与 Java 一致）。

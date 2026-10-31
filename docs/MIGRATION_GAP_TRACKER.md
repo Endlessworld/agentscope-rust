@@ -1,6 +1,7 @@
 # AgentScope Java → Rust 迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
 > 用途：本文件是**所有迁移会话共享的单一事实来源**。任何会话在开始工作前必须先读本文件；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件与 `git status`/`cargo build` 实际验证为准。
+> **⚠ 2026-10-31 起 core / harness 的现行状态以新 tracker 为准**：`docs/extensions/CORE__GAP_TRACKER.md`、`docs/extensions/HARNESS__GAP_TRACKER.md`（全量逐文件复核，带唯一编号 `CORE-NN` / `HARNESS-NN`）。本文件中 core/harness 的 §3 段落降为历史快照，引用前请以新 tracker 复核。extensions 侧汇总见 `docs/extensions/EXTENSIONS_GAP_TRACKER.md`。
 > 对照基准：`MIGRATION_PLAN.md`（方案）+ 本文件（已整合原 worker_output 8 份分析报告）+ `crates/*`（实际代码）。
 > 覆盖统计截至：ACP 权限确认/取消/动态模型切换全套 + 嵌入式内存优化（lite feature + 对话压缩）+ 文件批量读写 + 沙箱 pwsh 修复后（b5e1635 之后 10 个提交已反映）。
 

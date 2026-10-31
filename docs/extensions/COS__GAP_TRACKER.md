@@ -21,6 +21,8 @@
 | 迁移波次 | B |
 | 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 105 passed / 0 failed，另 3 个 `no_run` doc）—— 真实 COS HTTP 适配器已落地：`CosHttpObjectStore` + 自建 `q-sign-algorithm=sha1` 签名（金标向量钉住）+ 分段上传 / 预签名 URL / STS token；P2 余项为 core 跨模块（`AgentStateStore::delete`）与实例隔离性说明（见 §4.2 / history/COS__MIGRATION_HISTORY.md） |
 
+> **2026-10-31 全量对齐复核**：结论见 §3.5（`COS-01`…`COS-18`）与 §4.4（`COS-D01`…`COS-D03`、`COS-X01`…`COS-X10`）；P0 = 0，待裁定 = 2（COS-02 / COS-08）。存量章节未改动。
+
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
 |---|---|---|---|
@@ -126,6 +128,40 @@
 - STS：普通请求 `x-cos-security-token` 进签名头列表；预签名把它当 **query 参数**并进入 `q-url-param-list`（接收方无需额外 header）；token 空串/全空白视为无 token。
 - **能力边界**：分片上传的 `Content-MD5` 未发送（COS 文档标可选）；不支持 `ListParts` 断点续传、上传进度回调、分片级重试（失败即整体回滚）、流式上传（内存峰值约 2× 对象大小：整体 `Arc<Vec<u8>>` + 单片副本；单次 `PUT` 路径为 1×）；预签名不支持 `response-*` 以外的自定义头签名（只签 `host`）。快照 `.tar` 上传走 `CosObjectStore::put`，因此自动获得阈值切换。
 
+## 3.5 2026-10-31 全量对齐复核清单（唯一编号）
+
+> 复核基线：Java `main` @ `1524b3191`；Rust 工作树 HEAD 见仓库。本表为本轮逐文件核对结论，**存量 §3.1–§3.4 历史清单保持原样未重新编号**。
+> 编号规则：`COS-NN`（缺口，状态列取值 `待办` / `进行中` / `已完成` / `设计决定（不迁移）` / `待裁定`）；§4.4 差异另有 `COS-D<NN>` / `COS-X<NN>` 系列。编号本模块内唯一、单调递增，不复用历史编号。
+> 规模口径（沿用既有实测，本轮未跑 cargo）：Java 5 个主类（882 非空行）+ 4 个测试类 62 个 `@Test`；Rust 13 个 `src/*.rs`（5241 非空行）+ **105** 内联 test（58 `#[test]` + 47 `#[tokio::test]`）+ 3 个 `no_run` doctest（只编译不执行）。
+
+### 3.5.1 缺口与待裁定
+
+| 编号 | 优先级 | 缺口项（可执行描述） | Java 参考（文件#符号） | Rust 现状（文件:行 / rg 零命中） | 执行状态 | 下一动作 |
+|---|---|---|---|---|---|---|
+| COS-01 | P1 | HTTP 后端**无连接/读写超时、无重试退避**：`reqwest::Client` 构建时只设 `user_agent`，`send()` 单发一次即返回 → 网络抖动直接失败，网络黑洞会无限挂起 | `CosAgentStateStore.java#save/get` 经 SDK `com.qcloud:cos_api:5.6.245` 的 `ClientConfig`（`setConnectionTimeout`/`setSocketTimeout`/`setMaxErrorRetry`）获得超时与自动重试 | `src/http_object_store.rs:378-384`（只 `.user_agent(USER_AGENT)`）；`rg 'timeout\|retry\|backoff' crates/agentscope-extensions-cos/src` → 仅 `http_object_store.rs:314` 一处**注释**命中（`proxy, timeouts, ...`），零实现 | 待办 | `CosHttpObjectStoreBuilder` 增 `connect_timeout`/`request_timeout`/`max_retries`；`send()` 对 GET/HEAD/PUT/DELETE 做指数退避（带 jitter，跳过非 408/429 的 4xx）。验收：httpmock 连续 503×2 后 200 → 断言共 3 次请求且最终 `Ok`；超时用例 → `CosError::Backend` |
+| COS-02 | P1 | 读/写失败与反序列化失败**静默降级**：`save`/`save_list` 打 `tracing::error!` 后返回 `()`；`get` 解析失败返 `None`；`get_list` 解析失败返空 `Vec` → 上层无法区分「无状态」与「读失败」，可能静默丢弃/重置会话 | `CosAgentStateStore.java#save`/`#getList` 均 `throw new RuntimeException(Failed to save/get ...)` | `src/agent_state_store.rs:128-152`（错误仅 `tracing::error!`）、`:207-216`（`from_str(...).ok()`）、`:218-232`（`unwrap_or_default()`）；同类吞错 `src/base_store.rs:139-155`（`get` 解析失败 → `None`） | 待裁定 | core `AgentStateStore` 签名无 `Result`（与 Java 抛异常不等价），本 crate 无法单方面修 → 需汇总方裁定「core 增 `try_save`/`try_get`」或「harness 侧暴露失败计数/事件」；裁定前保留 `tracing::error!` |
+| COS-03 | P2 | `AgentStateStore` 未提供**版本化 CAS**：core 已有 `supports_versioning`/`get_versioned`/`save_if_version`，COS 走默认降级 = 无条件覆写 → harness `StateCheckpointMiddleware` 在 COS 后端退化为 last-writer-wins | `CosAgentStateStore` **同样未覆写 `supportsVersioning()`**（`rg 'supportsVersioning\|saveIfVersion\|getVersioned'` 在 Java COS 模块零命中）→ 与基线一致，属超基线加固 | `rg 'supports_versioning\|save_if_version\|get_versioned' crates/agentscope-extensions-cos/src` → 零命中（另核 `If-Match`/`x-cos-meta` 亦零命中） | 待办 | 用对象 ETag + `If-Match`（或 `x-cos-meta-version` 元数据）实现 `get_versioned`/`save_if_version` 并置 `supports_versioning()=true`；验收：同 `expected` 并发两写一成一败（httpmock 412 → 冲突） |
+| COS-04 | P2 | `exists(user, session)` 用 `list_prefix` **全量**列举（Java 只取 1 条）；`list_session_ids` 亦无页大小/上限保护 → 大 session / 大 user 前缀下 O(N) 请求与内存 | `CosAgentStateStore.java#exists`（`setMaxKeys(1)`）/ `#listSessionIds` → `#listAllKeys` | `src/agent_state_store.rs:234-243`（`list_prefix`）、`:279-297`（全量 + 字符串切分） | 待办 | 改 `list_page(prefix, None, 1)`（HTTP 后端已支持 `max-keys`，`http_object_store.rs:912-925`）；验收：httpmock 断言 `exists` 只发一次 `max-keys=1` 请求 |
+| COS-05 | P2 | 单次 PUT 的 **5 GiB 上限未校验**：`multipart_threshold(u64::MAX)` 可关闭分片，`put` 会把 >5 GiB 体一次性单发（COS 必拒） | Java 模块只有 `COSClient.putObject`（单次上限 5 GiB，超出须 `TransferManager`） | `src/http_object_store.rs:289-293`（threshold 无范围校验）、`:866-877`（`put` 单发）；`multipart::plan_parts` 只校验分片容量 | 待办 | builder 校验 `multipart_threshold <= 5 GiB`，或 `put` 对 `len > 5 GiB` 强制走分片/报 `CosError::Config`；验收：设 `u64::MAX` + 6 GiB 长度（不实分配）→ `Config` |
+| COS-06 | P2 | 分片上传缺 **ListParts 断点续传、分片级重试、上传进度回调**，且整包驻留内存（峰值约 2× 对象）：任一分片失败即整体 abort 重传 | Java SDK `TransferManager`（分片重试 + 进度监听 + 断点） | `src/http_object_store.rs:558-584`（失败即 `abort_multipart`）、`:585-640`（`Arc<Vec<u8>>` 整包 + `to_vec()` 单片副本）；`rg 'list_parts\|on_progress' src` 零命中 | 待办 | 增 `GET ?uploadId`（ListParts）+ `resume_multipart`（按 ETag 跳过已完成分片）+ `FnMut(part_number, part_count)` 进度回调；验收：httpmock 中途 500 后重试只补缺失分片 |
+| COS-07 | P2 | 预签名 URL 无法附加业务参数（`response-content-disposition`/`response-content-type`），只签 `host` | Java SDK `GeneratePresignedUrlRequest` 支持 `response-*` 参数（本模块本身未用） | `src/http_object_store.rs:509-548`（`presign_get/put` 只塞 STS token）；底层 `src/presign.rs:64-90` 已收 `params` → 仅需暴露 | 待办 | 增 `presign_get_with_params`/`presign_put_with_params`；验收：URL 含 `response-content-disposition` 且该键出现在 `q-url-param-list` |
+| COS-08 | P2 | `CosSandboxExecutionGuard` 是**进程内可重入计数**，不阻塞、不跨进程；Java `SandboxExecutionGuard.tryEnter` 阻塞至获得槽位 | Java harness `SandboxExecutionGuard`（`@FunctionalInterface`，阻塞语义） | `src/guard.rs:91-110`（委托 harness guard，`is_distributed()` 保持 trait 默认 `false`）；`rg 'If-Match\|advisory\|lock' src/guard.rs` 零命中 | 待裁定 | 阻塞语义属 harness 层（汇总 tracker「harness guard 缺口」）；若要真分布式需 COS 租约对象（条件 PUT + 过期时间），属产品决策，本 crate 不单方面引锁协议 |
+
+### 3.5.2 本轮复核确认已对齐（抽样，不求穷举）
+
+| 编号 | 能力 | Java 参考 | Rust 证据（文件:行 + 测试名） | 执行状态 |
+|---|---|---|---|---|
+| COS-09 | COS v5 签名四步（SignKey / HttpString / StringToSign / Signature）+ `Authorization` 结构：`q-sign-algorithm=sha1`、`q-sign-time`=`q-key-time`=`<start>;<end>`、header/param 名小写后按编码键升序、值单次 percent-encode、path 签原文发编码 | SDK `RequestSigner`（`com.qcloud:cos_api:5.6.245`） | `src/signature.rs:120-272`；测试 `signature::tests::official_put_example_golden_vector`、`official_get_example_golden_vector`、`header_canonicalization_sorts_and_lowercases`、`parameter_canonicalization_is_sorted_and_encoded_once` | 已完成 |
+| COS-10 | state key 布局（`.json` / `.list.json` / `.list.hash`）、`__anon__` 用户段、前缀归一化（反斜杠→`/`、去前导 `/`、补尾 `/`、blank 回默认） | `CosAgentStateStore.java#stateObjectKey/listObjectKey/hashObjectKey/normalizePrefix` | `src/agent_state_store.rs:74-90`、`src/layout.rs:38-79`；测试 `object_keys_follow_the_java_layout`、`prefix_normalization`、`layout::tests::session_and_namespace_prefixes` | 已完成 |
+| COS-11 | BaseStore key 布局（`.json` / `.version`）、覆盖语义（version 从 0 起、成功写 +1）、`put_if_version(ns,key,v,0)` = 仅不存在时写、`search` 按 key 字典序 offset/limit 分页 | `CosBaseStore.java#dataObjectKey/versionObjectKey/put/putIfVersion/search` | `src/base_store.rs:64-78`、`:139-252`；测试 `put_get_increments_version`、`put_if_version_cas`、`search_paginates_ordered` | 已完成 |
+| COS-12 | 列举分页：`list-type=2` + `continuation-token` + `max-keys`（上限 1000，`0` = 后端默认），`list_prefix` 自动翻页至 token 为空 | `CosAgentStateStore.java#listAllKeys`（v1 `marker` 翻页，语义等价，见 COS-X02） | `src/http_object_store.rs:897-955`；测试 `list_page_uses_list_type_2_and_returns_continuation_token`、`list_prefix_follows_continuation_tokens` | 已完成 |
+| COS-13 | 错误码映射：404 → `get`=`Ok(None)` / `exists`=`false` / `delete`=`Ok(())`；403 → `CosError::Service{403}` 不与 404 混淆；`<Error><Code>/<Message>` 解析 | `#objectExists`（仅 404 判不存在）、`CosServiceException.getStatusCode()` | `src/http_object_store.rs:827-896`；测试 `get_returns_none_only_for_404`、`forbidden_is_an_error_not_a_missing_object`、`exists_uses_head_and_maps_404_to_false`、`delete_treats_404_as_success` | 已完成 |
+| COS-14 | list 增量哈希**走 core**（`compute_hash`/`needs_full_rewrite`），无本地平行实现 | `ListHashUtil.needsFullRewrite` | `src/agent_state_store.rs:15`（`use agentscope_core::state::list_hash::{compute_hash, needs_full_rewrite}`）、`:191-192`；`rg 'fn compute_list_hash\|fn needs_full_rewrite' src` → 零命中；测试 `pure_append_does_not_trigger_full_rewrite`、`legacy_state_without_hash_self_heals` | 已完成 |
+| COS-15 | 快照上传/下载/exists（`{prefix}{id}.tar`，缺失 → `CosError::NotFound`）、`CosSnapshotSpec` 包 harness `RemoteSnapshotSpec` | `CosRemoteSnapshotClient.java#upload/download/exists`、`CosSnapshotSpec extends RemoteSnapshotSpec` | `src/snapshot.rs:56-125`；测试 `upload_download_exists_roundtrip`、`download_missing_snapshot_reports_not_found`、`spec_builds_remote_snapshot` | 已完成 |
+| COS-16 | per-key 删除同时删 `.json`/`.list.json`/`.list.hash`（core `delete_key`），session 删除走批量删（1000/批，`Content-MD5`） | `CosAgentStateStore.java#delete(userId,sessionId,key)`、`#deleteKeys` | `src/agent_state_store.rs:245-277`；`src/http_object_store.rs:956-985`；测试 `delete_key_removes_value_list_and_hash_only`、`delete_session_uses_a_single_batch_call`、`delete_many_splits_requests_at_1000_keys` | 已完成 |
+| COS-17 | 组合者子前缀 `state/`/`store/`/`snapshot/` + 投影到 harness `DistributedStore` 五槽 | `CosDistributedStore.java#create/agentStateStore/baseStore/sandboxSnapshotSpec` | `src/distributed_store.rs:60-110`、`:147-160`；测试 `derives_sub_prefixes`、`harness_projection_fills_every_composite_slot` | 已完成 |
+| COS-18 | 测试密度：Java 62 个 `@Test` vs Rust 105 个内联 test（含 HTTP/签名/分段/预签名层断言） | 4 个测试类 / 760 非空行 | 105 test（58 `#[test]` + 47 `#[tokio::test]`）+ 3 个 `no_run` doctest（沿用 §1 / §4.1 既有实测，**本轮未运行 cargo**） | 已完成 |
+
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 **已完成**：COS 模块全部产出契约落地并复用既有 trait；list 增量哈希已收敛到 core（无平行实现）。**2026-10-29 复核**：测试数 **105**（§1 / §4.4 一致）；§3.1 旧记「31」已就地勘误（历史原文保留）；真实剩余见 §4.2（core `needs_full_rewrite` Case 3 与 Java 同款、分片上传无 `ListParts` 断点续传/分片级重试/进度回调、STS 不自动刷新、预签名只签 host、根 `object_store` 依赖无引用）。**2026-10-31 收口**：原列的「core trait 无 per-key `delete`」已不成立——core `AgentStateStore` 已有 `delete_key` 默认实现且本 crate 覆写之（`close()` 仍无 trait 对应，属设计决定）；`CosError::NotFound` 已接线（§5）。
@@ -218,6 +254,33 @@
 - `crates/agentscope-extensions-cos/Cargo.toml` 新增：`reqwest`（workspace）、`hmac 0.12`、`sha1 0.10`、`quick-xml 0.39`、`md5 0.8`、`base64`（workspace）；dev-dep `httpmock 0.7`。**未改根 `Cargo.toml`**（workspace 无 `hmac`/`sha1`/`quick-xml`/`md5` 条目，参照 `agentscope-extensions-channel` 先例写具体版本）。
 - `Cargo.lock` 由 cargo 自动更新（新增上述条目），属依赖引入的必然结果。
 - 新增 2 个源文件 + 3 个 doctest（均 `no_run`）。
+
+### 4.4 与 Java 的已知差异（有意为之，非缺口）
+
+> §4.3「2026-10-28 执行记录」为历史进程记录，保持原样；本节汇总本轮复核确认的**有意差异**。
+
+#### 4.4.1 设计决定（不迁移）
+
+| 编号 | 项 | Java 参考 | 不迁移理由（源码级依据） | 影响面 |
+|---|---|---|---|---|
+| COS-D01 | 不引入腾讯云 COS 官方 SDK（`com.qcloud:cos_api:5.6.245`） | `CosAgentStateStore`/`CosBaseStore`/`CosRemoteSnapshotClient` 全部经 `COSClient`（pom 依赖） | Rust 无对应官方 SDK；改为 `reqwest` + 自建 v5 签名（`src/signature.rs`，金标向量 `official_put_example_golden_vector`/`official_get_example_golden_vector`）+ COS XML REST（`src/http_object_store.rs`） | 签名正确性靠官方文档向量钉住；SDK 自带的超时/重试/连接池调优须自建 → 留有 COS-01 |
+| COS-D02 | `CosBaseStore` 的私有 `listAllKeys` / `deleteKeys` 工具方法 | `CosBaseStore.java:281` / `:301` | **Java 侧自身零调用**（`search` 自建翻页、`delete` 直接用 `deleteObject`，`rg 'listAllKeys\|deleteKeys'` 仅命中定义处）→ Java 死代码，无行为等价物需求 | 无 |
+| COS-D03 | Java 构造期校验的**位置**：`Objects.requireNonNull(cosClient)` + `bucketName must not be blank` | `CosAgentStateStore` / `CosBaseStore` 构造函数 | Rust 无 `COSClient`（后端是 `SharedObjectStore`）；bucket/凭证/endpoint/分片参数校验上移到 `CosHttpObjectStoreBuilder::build`（`http_object_store.rs:320-405`），上层 store 只校验 `object_store` 必填 | 校验时机前移到 build 期（优于首次请求才 403） |
+
+#### 4.4.2 设计决定与已知差异
+
+| 编号 | 项 | Rust 实现 | 与 Java 的差异 | 为何保留（收益/依据） |
+|---|---|---|---|---|
+| COS-X01 | 请求签名 | `src/signature.rs` 纯函数链（`sign_key`→`http_string`→`string_to_sign`→`sign_request`） | Java 交给 SDK；Rust 自算，`q-sign-algorithm=sha1` / `q-key-time` / header·param 排序手工保证 | 无 SDK 依赖（COS-D01）；纯函数可离线钉金标向量，时钟可注入（`ClockFn`） |
+| COS-X02 | 列举 API 版本 | `list-type=2` + `continuation-token`（`http_object_store.rs:912-955`） | Java 用 SDK v1 `marker` + `isTruncated`/`nextMarker`（`#listAllKeys`） | v2 是 COS 现行推荐 API，同一 bucket 数据可互读；两处 store 的 key 布局未变，`marker` 语义由 `next_continuation_token` 等价覆盖 |
+| COS-X03 | `save_list` 的 `existing_count` | 恒读已存列表实体长度，与 `.list.hash` 是否存在**解耦**（`agent_state_store.rs:167-190`） | Java 仅在 `storedHash != null` 时才读列表长度（`CosAgentStateStore.java#save(List)`） | 修掉 Java 的陈旧读：hash 缺失 + 写入空列表时 Java 不重写（旧列表残留），Rust 经 core Case 2 判定重写；`empty_existing_state_does_not_force_rewrite` 覆盖 |
+| COS-X04 | per-key 删除请求数 | 一次 `POST ?delete` 批量删 3 个对象（`agent_state_store.rs:258-277`） | Java 逐个 `getObjectMetadata` + `deleteObject`（3 次 HEAD + 3 次 DELETE） | 少 3 次往返；「删除不存在对象」无需先探活（COS delete 幂等） |
+| COS-X05 | BaseStore 同步 trait 的并发模型 | 写路径 `tokio::Mutex` 串行化 + `block_on` 桥接（多线程 runtime 用 `block_in_place`，current-thread 用独立线程）（`base_store.rs:80-120`、`:156-210`） | Java 阻塞 SDK 调用天然串行，无显式锁，读-改-写存在进程内竞态 | 进程内 `put_if_version` 的 read-check-write 变为原子；**跨进程仍非原子**（与 Java 同）→ 见 COS-03 |
+| COS-X06 | 错误分类 | `CosError{Config, Backend, Service{status,code,message}, Serialization, NotFound, Closed}` + `status()`/`is_not_found()`/`is_signature_error()`（`error.rs:7-60`） | Java 统一 `RuntimeException` 包裹 `CosServiceException` | 调用方可区分「对象不存在 / 签名错 / 传输失败 / 配置错」，是生产可用性前提（`forbidden_is_an_error_not_a_missing_object` 钉住 403≠404） |
+| COS-X07 | 组合者生命周期 | 组件在 `create()` 一次性构造并缓存（`Arc`），另提供真实 `CosSandboxExecutionGuard`（`distributed_store.rs:60-110`） | Java `agentStateStore()`/`baseStore()`/`sandboxSnapshotSpec()` **每次调用新建**；且未覆写 `sandboxExecutionGuard()`（继承 noop） | 语义等价且少重复构造；guard 由 noop 升级为进程内真实互斥（方向强于基线，强度仍受 COS-08 限制） |
+| COS-X08 | snapshot id 校验 | 拒绝 blank、含 `/`、含反斜杠、含 `..`、含 NUL（`layout.rs:81-95`） | Java 仅拒绝 blank/null（`CosRemoteSnapshotClient#objectKey`） | 安全加固：id 直接拼进 object key，路径穿越会打到前缀外对象；`unsafe_snapshot_id_rejected`/`spec_rejects_unsafe_ids` 覆盖 |
+| COS-X09 | 超出 Java 模块的能力 | 分段上传（阈值 5 MiB、分片 ≥1 MiB、≤10000 片、完成前按 partNumber 排序、失败即 abort）、预签名 URL（`q-*` 全量入 query，只签 host）、STS 轮换 `with_credentials`（`multipart.rs`、`presign.rs`、`http_object_store.rs:487-548`） | Java 模块只用 `COSClient.putObject/getObject/...`，**无**分段、无预签名、无 STS 代码 | 规则取自 Java 侧 SDK `TransferManager`（`TransferManagerUtils.shouldUseMultipartUpload` / `calculateOptimalPartSize` / `newFixedThreadPool(1)`）与 COS 文档，属超基线能力；STS 不自动刷新（调用方重建）以免隐式凭证生命周期管理 |
+| COS-X10 | `put_if_version` 的失败信号 | 版本冲突与写失败均返回 `false`（`base_store.rs:176-210`） | Java 冲突返回 `false`、IO 失败抛 `RuntimeException` | harness `BaseStore::put_if_version` 返回 `bool` 无错误通道；调用方须把 `false` 视作「未写入」并重读，不能假定一定是版本冲突 |
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-cos` 基线。

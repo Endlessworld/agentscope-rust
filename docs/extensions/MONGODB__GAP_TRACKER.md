@@ -20,6 +20,8 @@
 | 迁移波次 | B |
 | 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 **106 passed / 0 failed**：99 lib + 5 live 集成（`tests/mongodb_live.rs`，`AGENTSCOPE_TEST_MONGODB_URL` 门控）+ 2 另一 target，另 doc-test 1）—— **真驱动已接入**（`src/client_mongodb.rs`，官方 `mongodb = "3"`，18 个方法全实现）；三项 P1（builder `ttl_days`、guard `database_name`、级联删快照链路）均已闭环（级联链路经 harness `AgentStateStoreSandboxStateStore` 真实写入方验证），余 5 项 P2 全清零（§3.3）；`DistributedStore` 五槽投影已完成（§4.2-1 不成立）。详见 §3.3 / §4.1 与 history/MONGODB__MIGRATION_HISTORY.md |
 
+> **2026-10-31 全量对齐复核**：新增 §3.5（`MONGO-01..MONGO-22`）与 §4.3（`MONGO-D01..D06` / `MONGO-X01..X11`）。结论 **P0=0 / P1=4 / P2=6 / 待裁定=1**；§3.1–§3.4 历史清单未改动。§1「当前状态」行不需调整（能力面仍为已完成，残余为入口默认值、索引自动创建、互斥失败降级与读放大型问题）。
+
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
 |---|---|---|---|
@@ -132,6 +134,44 @@
 | 不引入真实 `mongodb` 驱动，改 `MongoClient` trait + `InMemoryMongoClient` | 保离线可编译/可测；驱动接入记 §4.2（**设计决定，不迁移**） |
 | `close()` / 连接所有权 / `objectMapper` 注入 | harness/core 无对应语义，Rust 侧省略（**设计决定，不迁移**） |
 | `supportsVersioning` / `getVersioned` 降为固有方法 | **已过时（2026-10-22 修正）**：core trait 已上提版本 API（commit `9a8fd07`），本 crate 已实装 → 见 §3.2 |
+
+## 3.5 2026-10-31 全量对齐复核清单（唯一编号）
+
+> 复核基线：Java `main` @ `1524b3191`；Rust 工作树 HEAD 见仓库。本表为本轮逐文件核对结论，**存量 §3.1–§3.4 历史清单保持原样未重新编号**。
+> 编号规则：`MONGO-NN`（缺口，状态列取值 `待办` / `进行中` / `已完成` / `设计决定（不迁移）` / `待裁定`）；§4.3 差异另有 `MONGO-D<NN>` / `MONGO-X<NN>` 系列。编号本模块内唯一、单调递增，不复用历史编号。
+> 结论摘要：**P0 = 0，P1 = 4（MONGO-01..MONGO-04），P2 = 6（MONGO-05..MONGO-10），待裁定 = 1（MONGO-04）**；Java 9 类（2235 行）已全部有 Rust 对应物，残余问题集中在**入口默认值/索引自动创建/互斥失败降级/读放大**四类。
+
+### 3.5.1 缺口与待裁定
+
+| 编号 | 优先级 | 缺口项（可执行描述） | Java 参考（文件#符号） | Rust 现状（文件:行 / rg 零命中） | 执行状态 | 下一动作 |
+|---|---|---|---|---|---|---|
+| MONGO-01 | P1 | `new(client, None)` 忽略 URI/驱动默认库，硬编码 `agentscope`：以 `mongodb://h/mydb` 连接后会话/工作区数据落到 `agentscope` 库，Java 同 URI 落 `mydb` → 迁移后读不到既有数据 | `MongoDistributedStore.java#fromConnectionString`（`cs.getDatabase()` 作库名） | `distributed_store.rs:62-63` `database_name.unwrap_or(DEFAULT_DATABASE)`；`client_mongodb.rs#default_database`/`with_default_database` 在 store 侧 **零引用**（`rg default_database src/distributed_store.rs` 零命中） | 待办 | `new` 的 `None` 分支改为取客户端默认库（seam 增 `default_database()`，默认回落 `DEFAULT_DATABASE`），或新增 `from_connection_string(uri)`；验收：URI 带库名时 `database_name()` 等于 URI 库名 |
+| MONGO-02 | P1 | BaseStore 读值不支持 legacy JSON 字符串形态：Java 对 `String` 值 `fromJson` 还原，Rust 落 `_ => StoreValue::new()` → **静默返回空 map**（内容丢失）；Java 对非 Document/String 抛 `IllegalStateException`，Rust 静默空 | `store/MongoBaseStore.java#parseValue` | `store.rs:110-121`（仅 `Value::Object` 分支，其余返回空 `StoreValue`） | 待办 | 加 `Value::String(s)` → `serde_json::from_str::<Map>` 分支（解析失败 warn + 空），非对象类型记 `tracing::warn`；验收：新增用例「legacy string value 可读回原 map」 |
+| MONGO-03 | P1 | 索引不再随构造自动创建：Java 三个组件构造器内即 `ensureIndexes()`，Rust 三个 `new()` 均不建索引，只有显式 `ensure_indexes()`（调用点仅 lib 文档示例 / `distributed_store.rs:197,200,202` / live 测试）。后果：配了 `ttl_days` 但漏调 → `_updated_at` TTL 索引不存在 → **会话永不过期**（Java 无此状态）；复合索引缺失还会全表扫 | `state/MongoAgentStateStore.java`（构造器 `ensureIndexes(builder.ttlDays)`）、`store/MongoBaseStore.java`（构造器 `ensureIndexes()`）、`sandbox/MongoSandboxExecutionGuard.java`（构造器 `ensureIndexes()`） | `state_store.rs:168`、`store.rs#ensure_indexes`、`sandbox_guard.rs:89` 三处均为独立 async 步骤；`rg 'ensure_indexes' src` 无任何自动调用点 | 待办 | 在 `MongodbDistributedStore` 增 `try_new(...).await`（内部建索引）或在首次写入前 lazy ensure；验收：仅 `new` + 首次 `save` 后 `list_indexes` 已含复合/TTL 索引 |
+| MONGO-04 | P1 | 互斥失败被降级为「无锁继续」：`MongodbGuardClient::try_enter` 在 `Err`（超时/后端错）时 `tracing::warn!` + `SandboxLease::noop()`，上层无从得知 → 沙箱操作在无分布式互斥下执行；Java `tryEnter` 抛 `InterruptedException` 中断调用 | `sandbox/MongoSandboxExecutionGuard.java#tryEnter`（超时 `throw new InterruptedException`） | `sandbox_guard.rs:455-469`（`Err => SandboxLease::noop()`）；trait 侧 `SandboxGuard::try_enter -> SandboxLease` 无错误通道（harness `sandbox/guard.rs:29`） | 待裁定 | 裁定二选一：①harness `SandboxGuard::try_enter` 改返回 `Result`（跨模块，记 §4.2）；②保留降级但暴露失败态（`last_error()`/`acquired_count()`）并由 middleware 拒绝执行；验收：锁超时场景不再静默继续 |
+| MONGO-05 | P2 | 读放大（Java 全部做服务端投影/聚合）：单键 `get`/`get_version` 读整篇会话文档；`search` 不投影 value/version；列表写判定的元素个数由客户端读整数组后 `len()` 得到（Java `$cond($isArray,$size)` 只回 1 个整数）→ 长对话历史下每轮 `save_list` 传输整数组 | `state/MongoAgentStateStore.java#get`/`#getVersioned`/`#save(List)`；`store/MongoBaseStore.java#get`/`#search` | `state_store.rs:463`（`get_field` 全文档 find_one）、`state_store.rs#get_version`（全文档）、`store.rs:246`（`search` find_many 无投影）、`client_mongodb.rs:868`（`first_field_value` 投影后本地 `as_array().len()`） | 待办 | seam 增 `projection` 参数（`FindOptions` 加字段）+ `first_field_size` 改真聚合 `$cond/$isArray/$size`；验收：live 测试用 `explain`/文档读取量或单测断言投影字段集 |
+| MONGO-06 | P2 | 续约丢锁无检测：Java 续约检查 `matchedCount==0` 报 `lock lost` 并告警；Rust 仅 `.is_err()`，锁被他人回收后静默 `continue` → 长时间任务在无锁状态下继续，且无任何日志 | `sandbox/MongoSandboxExecutionGuard.java#MongoLease.renew` | `sandbox_guard.rs:167-200`（`spawn_lease` 内 `update_one(...).is_err()` 判断，无 matched 判定） | 待办 | `MongoClient::update_one` 返回 `matched_count`（或续约改 `find_one_and_update` 判 `Option`），丢失时 `tracing::warn` 并标记 lease 失活 |
+| MONGO-07 | P2 | `ttl_days` 参数校验缺失：Java `ttlDays<=0` 抛 `IllegalArgumentException`；Rust `ttl_days(0)`/负数静默禁用 TTL（配置错误无反馈） | `state/MongoAgentStateStore.java#Builder.ttlDays` | `state_store.rs:692`（`ttl_days(i64)` 无校验）、`state_store.rs:168-190`（仅 `days>0` 生效） | 待办 | `build()` 校验并返回 `Err`，或签名改 `NonZeroI64`；验收：`ttl_days(0).build()` 返回错误 |
+| MONGO-08 | P2 | 未 release 的租约永久续期 → 锁泄漏：`MongodbGuardClient.leases` 只在显式 `release(&key)` 弹出；harness `SandboxLease` 明确「drop does not release」（`harness/src/agent/sandbox/lease.rs` 文档），一旦上层漏调 release，对应 `MongodbLeaseHandle` 的续约任务继续无限推后 `expiresAt` → 该 key 在进程存活期间永不失效（跨进程死锁面）。Java 由 `close()` + TTL 兜底 | `sandbox/MongoSandboxExecutionGuard.java#MongoLease.close`（取消续约 + 删除） | `sandbox_guard.rs:432`（`leases` 表）、`:471`（仅 release 弹出）、`:167`（续约任务无上限） | 待办 | 租约记录创建时间并设续约上限（如 ≤ N×lease_ttl 后停止并 warn），或提供 `release_all()` 供 shutdown；验收：漏 release 场景下锁在有限时间内可被回收 |
+| MONGO-09 | P2 | 连接选项不可程序化注入：Java 可 `create(MongoClient)` 传入自定义 `MongoClientSettings`（appName / maxPoolSize / serverSelectionTimeout / connectTimeout / writeConcern / readConcern / retryWrites）；Rust 仅 `connect(uri)`（`Client::with_uri_str` + ping），**无 `ClientOptions` 入口**（`rg ClientOptions src` 零命中），只能靠 URI 关键字调参 | `MongoDistributedStore.java#create(MongoClient)`、`MongoAgentStateStore.java#Builder.mongoClient` | `client_mongodb.rs:212`（`connect`）、`client_mongodb.rs:241`（仅 `with_default_database`） | 待办 | 增 `connect_with_options(uri, mongodb::options::ClientOptions)`；在 §4 记录「URI 关键字已覆盖项 vs 需编程设置项」；验收：可设 `app_name`/`max_pool_size` 并断言连接选项 |
+| MONGO-10 | P2 | 文档与清理小项：①`snapshot.rs:43-46` 字段注释仍称 `database`「retained for API parity / 后端全局解析」，但已被 `scoped_bucket()`（`snapshot.rs:96`）使用（注释陈旧矛盾）；②`state_store.rs:70-76` `invalid_key` 消息内含换行 + 9 空格缩进（Java 单行）；③`MongoClient::count`（`client.rs:393`）全仓零调用点 | `MongoAgentStateStore.java#validateStateKey`（单行消息） | `snapshot.rs:43-46`、`state_store.rs:70-76`、`client.rs:393` | 待办 | 改注释、单行化错误消息、删除 `count` 或标注为 seam 预留（`#[allow(dead_code)]` 不行，需注释说明） |
+
+### 3.5.2 本轮复核确认已对齐（抽样，不求穷举）
+
+| 编号 | 能力 | Java 参考 | Rust 证据（文件:行 + 测试名） | 执行状态 |
+|---|---|---|---|---|
+| MONGO-11 | 默认库 + 4 个集合名常量 | `MongoConstants.java` | `constants.rs:11-26`（`agentscope`/`agentscope_sessions`/`agentscope_base`/`agentscope_snapshots`/`agentscope_sandbox_locks` 逐字一致）；测试 `distributed_store::tests::defaults_to_agentscope_database` | 已完成 |
+| MONGO-12 | 键名转义/还原（`.`/`$`/`\0`/`\`，含递归 map/list） | `MongoKeyEscaper.java#escapeKey`/`#unescapeKey` | `key_escaper.rs:78-138` 编码逐字节一致（`\E`/`\$`/`\N`/`\\`，未知转义原样保留）；6 用例含 `round_trip_is_bijective`、`recursive_escape_and_unescape` | 已完成 |
+| MONGO-13 | error-85 索引迁移（按 key pattern 找**实际**索引名 → 容错 drop → 最多 3 次重建） | `MongoIndexUtils.java#createIndexWithMigration`/`#dropIndexTolerant` | `index_utils.rs:107-190`（`MAX_MIGRATION_ATTEMPTS=3`、容错 27 + `ns not found`）；`migrates_conflicting_index_by_renamed_name`、`migration_recovers_after_transient_conflicts`、`migration_gives_up_after_max_attempts`、live `index_options_conflict_is_migrated_on_live_server` | 已完成 |
+| MONGO-14 | 版本化 CAS 三分支 + 复合 `_id {user,session}` + 匿名用户归一 | `MongoAgentStateStore.java#saveIfVersion`/`#slotId`/`#normalizeUser` | `state_store.rs:225-390`（UNVERSIONED 无条件 + 11000 重试一次；expected==0 `$exists:false` upsert + 11000→UNVERSIONED；期望版本 `find_one_and_update`）；`__anon__`/`^[a-zA-Z_][a-zA-Z0-9_]*$` 一致；`versions_increment_and_cas_works`、`concurrent_create_if_absent_only_one_writer_wins`、`set_on_insert_records_session_identity`、`blank_session_id_is_rejected` | 已完成 |
+| MONGO-15 | 列表增量追加 + 全量重写 + 哈希走 core | `MongoAgentStateStore.java#save(List)`、core `ListHashUtil` | `state_store.rs:387-460` 三路分支（全量重写 / `$push $each` + `$setOnInsert` / 缩短重写）；`compute_hash`/`needs_full_rewrite` 来自 `agentscope_core::state`（`list_hash.rs` 仅 re-export，本地实现零残留）；`list_append_and_full_rewrite` | 已完成 |
+| MONGO-16 | BaseStore 命名空间编码 + 前缀范围查询 + 排序分页 + 版本语义 | `MongoBaseStore.java#namespacePath`/`#search`/`#putIfVersion` | `store.rs:88-121`（US 0x1F + 尾分隔符）、`:265-303`（`$gte/$lt(\u{FFFF})` + `sort key` + `skip/limit`）、`put` 每次 `$inc` 1、`put_if_version(0)` insert + 11000→false；`search_is_scoped_paginated_and_sorted`、`search_includes_child_namespaces`、`put_if_version_create_if_absent`、`delete_removes_only_target_key` | 已完成 |
+| MONGO-17 | 两步抢锁 + 过期回收 + token 作用域 + `lease_ttl/3` 续约 + 锁 id 哈希 | `MongoSandboxExecutionGuard.java#tryEnter`/`#composeLockId`/`MongoLease` | `sandbox_guard.rs:103-200`（insert → 11000 → `expiresAt<=now` reclaim → 轮询至 `lock_timeout`）、`:326`（`lock:`+hex(SHA-256(`scope:value`))，scope 小写，与 Java 字节级一致）、`:167`（`lease_ttl/3` 续约）；`expired_lock_can_be_reclaimed`、`release_is_token_scoped`、`lease_renewal_extends_the_lock_expiry`、`harness_lifecycle_releases_the_lock_exactly_once`、`lock_document_records_owner_and_lease_ttl` | 已完成 |
+| MONGO-18 | GridFS 快照（255KB 分块）+ legacy 单文档回退 + 无快照 TTL | `MongoRemoteSnapshotClient.java#upload`/`#download`/`#exists`/`#delete` | `snapshot.rs:206-256`（GridFS 优先 + legacy 回退 + 双路径删除）；`client_mongodb.rs#gridfs_upload`（真驱动 bucket + `metadata.createdAt`）；`gridfs_chunk_boundary_sizes_round_trip`、`download_and_exists_fall_back_to_legacy_document`、`delete_gridfs_also_cleans_up_legacy_document`、live `snapshot_gridfs_roundtrip_and_chunking` | 已完成 |
+| MONGO-19 | 会话删除级联删快照（读 `sandbox/session/<sid>` 的 `_sandbox_state`，仅 `snapshot.type=="remote"`） | `MongoDistributedStore.java#cascadeDeleteSnapshots`/`#findSessionSnapshotId` | `distributed_store.rs:90-140`（async `on_delete` + 解析 `snapshot.type/id`，失败 warn 不阻断删除）；`deleting_session_cascades_to_snapshot_written_by_the_harness_store`（经 harness `AgentStateStoreSandboxStateStore` 真实写入） | 已完成 |
+| MONGO-20 | change stream / 多文档事务 / bulkWrite **两侧均无**（无需迁移，已交叉验证） | `rg 'bulkWrite｜insertMany｜updateMany｜deleteMany｜replaceOne｜\.watch\(｜ChangeStream｜withTransaction｜startSession｜ClientSession' src/main/java` = **0 命中**（exit 1） | `rg 'bulk｜insert_many｜update_many｜delete_many｜watch\(｜change_stream｜transaction｜start_session' src tests` → 仅 `client.rs:12-13` 的能力边界说明注释；无对应实现 | 已完成 |
+| MONGO-21 | 驱动错误码映射（11000 重复键 / 85,86 索引冲突 / 26,27 命名空间缺失） | `MongoIndexUtils.java`（85/27）、各 store 的 11000 分支 | `client_mongodb.rs:482`（`map_error_code`）、`:497`（`driver_error_code` 含 `WriteFailure::WriteError`/`WriteConcernError`）；`error_codes_map_onto_crate_variants`；`client::tests::duplicate_id_errors` | 已完成 |
+| MONGO-22 | 组合者五槽投影（state / base / snapshot / guard / isolation_scope） | `MongoDistributedStore.java#agentStateStore`/`#baseStore`/`#sandboxSnapshotSpec`/`#sandboxExecutionGuard` | `distributed_store.rs:210-232`（`to_harness_store` 全量投影）；`harness_projection_fills_every_composite_slot`、`harness_projection_carries_state_store` | 已完成 |
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
@@ -271,6 +311,37 @@
    - 环境门控集成测试：`tests/mongodb_live.rs` 读 `AGENTSCOPE_TEST_MONGODB_URL`，未设置即 `return`（不用 `#[ignore]`），覆盖 state / base / snapshot / guard 四条链路（实测 **5 passed**）。
 4. **后续建议（非阻塞）**：`chunkSize` 参数化（当前固定 255KB 默认值）；`uploadDate` / `metadata` 在真驱动下的字节级一致已在 live 用例中比对，若要参数化需同步扩展这些断言。
 5. **跨模块需求：无**（本轮未触碰 core / harness / 其它 crate）。
+
+### 4.3 与 Java 的已知差异（有意为之，非缺口）
+
+> 本轮新增。§3.4「设计决定（不迁移）汇总」为历史条目，**保持原样未改动**；本节的 D/X 编号与 §3.5 缺口编号互不复用。
+
+#### 4.3.1 设计决定（不迁移）
+
+| 编号 | 项 | Java 参考 | 不迁移理由（源码级依据） | 影响面 |
+|---|---|---|---|---|
+| MONGO-D01 | `close()` / `ownsClient` / `AutoCloseable`（含 guard 执行器关闭） | `MongoDistributedStore.java#close`、`MongoAgentStateStore.java#close`、`MongoSandboxExecutionGuard.java#close` | Rust 组件不持有连接所有权（`MongodbDistributedStore` 持 `Arc<dyn MongoClient>`，由调用方持有）；guard 无常驻续约执行器 —— 续约是**每租约一个 tokio 任务**（`sandbox_guard.rs:167-200`），无 executor 需 shutdown | 调用方负责 client 生命周期；锁清理走 `release_async`（`sandbox_guard.rs:277`）或 Drop 兜底 |
+| MONGO-D02 | builder `connectionString(..)` 自建并拥有 client | `state/MongoAgentStateStore.java#Builder.connectionString` | Rust 构造路径只接受 `Arc<dyn MongoClient>`（`state_store.rs#MongodbAgentStateStoreBuilder`），连接由 `MongodbClient::connect` 独立负责，避免在同步 `build()` 里做隐藏 IO/起 runtime | 用法：先 `connect` 再 `builder().client(..).build()`；URI 库名语义见 MONGO-01 |
+| MONGO-D03 | `JsonCodec` 注入（`MongoBaseStore` 三参构造） | `store/MongoBaseStore.java#MongoBaseStore(db, name, codec)` | Rust 值类型固定为 `serde_json::Map`（harness `StoreValue`），序列化由 `serde_json` 唯一承担（`store.rs:110`），无多 codec 抽象可插 | 若需自定义序列化，需改 harness `StoreValue`（跨模块，不在本 crate） |
+| MONGO-D04 | 直接 `implements SandboxExecutionGuard` | `sandbox/MongoSandboxExecutionGuard.java` | harness 中 `SandboxExecutionGuard` 是**具体 struct**，可插拔面是 `SandboxGuard` trait（`harness/src/agent/sandbox/guard.rs:27`）→ 本 crate 提供固有 guard + `MongodbGuardClient` 适配并 `impl SandboxGuard`（`sandbox_guard.rs:440`、`:509`） | 与 JDBC/Redis/PG 等存储 crate 形态一致；投影进 `DistributedStore::sandbox_execution_guard` |
+| MONGO-D05 | `MongoSnapshotSpec extends RemoteSnapshotSpec`（类继承） | `snapshot/MongoSnapshotSpec.java` | Rust 无继承：`MongodbSnapshotSpec` 组合 `Arc<MongodbRemoteSnapshotClient>`，`build()` 内临时构造 `RemoteSnapshotSpec` 并委托（`snapshot.rs:266-292`） | 能力等价（`build(id)` → `Arc<dyn SandboxSnapshot>`）；`RemoteSnapshotSpec` 非 `Clone` 才用组合 |
+| MONGO-D06 | core trait 的三参 `delete(userId, sessionId, key)` | `state/MongoAgentStateStore.java#delete(String,String,String)` | Rust core `AgentStateStore` trait 无此默认方法 → 以固有 `delete_key`（`state_store.rs:494`）+ 私有 `delete_key_inner`（:503）提供同等三路 `$unset`（states/versions/hashes + `_updated_at`） | 能力等价；调用面收窄（须经具体类型而非 `dyn AgentStateStore` 调用） |
+
+#### 4.3.2 设计决定与已知差异
+
+| 编号 | 项 | Rust 实现 | 与 Java 的差异 | 为何保留（收益/依据） |
+|---|---|---|---|---|
+| MONGO-X01 | 驱动接缝 `MongoClient` trait + 进程级驱动 runtime 桥 | `client.rs#MongoClient`（18 方法）、`client_mongodb.rs#exec_on_driver`（专用线程 + 多线程 runtime + `oneshot` 回传） | Java 编译期直依赖 `mongodb-driver-sync` 并同步调用；Rust 抽象 21 方法 seam，异步实现，同步调用方（`BaseStore`/`is_held`）经 `block_on` 安全驱动 | 离线可测（`InMemoryMongoClient`）+ 真驱动可选；driver 任务固定在同一 runtime，`block_on` 从任意 runtime 调用不死锁、closing client 不中途取消任务 |
+| MONGO-X02 | 数据库限定集合键 `"<db>::<collection>"` | `client.rs#scoped_collection`，各组件 `new`/`build` 生成 key（`distributed_store.rs:70-72`、`snapshot.rs:96`、`sandbox_guard.rs#build`） | Java 用 `getDatabase(db).getCollection(c)` 原生隔离；Rust 把库名编码进扁平 key，真驱动在 `split_key` 解码回 `Database`+`Collection` | 同一份 store 逻辑同时服务内存后端与真驱动；`database_name_partitions_state_and_base_store`、`database_name_partitions_locks`、`database_name_isolates_snapshots` 保证隔离 |
+| MONGO-X03 | 组合式 `MongodbDistributedStore` + 五槽投影 | `distributed_store.rs:62-232`，`to_harness_store()` 投 `agent_state_store`/`isolation_scope`/`base_store`/`sandbox_snapshot_spec`/`sandbox_execution_guard` | Java `implements DistributedStore, AutoCloseable` 并在 volatile DCL 中懒缓存四组件；Rust 在 `new()` 内一次性构造 | harness `DistributedStore` 是 struct（`harness/src/agent/distributed_store.rs:14`），组合+投影即可复用，不建平行类型；组件均为 `Clone`，无需缓存 |
+| MONGO-X04 | 错误传播降级为日志 / `None` / `UNVERSIONED` | `state_store.rs:530-560`（trait `save`/`save_list` 吞错 warn）、`save_if_version` trait 版 `Err → UNVERSIONED`、`store.rs:157-176`（`put`/`put_if_version` 失败 warn 或 false）、`get_versioned` 读失败 → `UNVERSIONED` | Java 抛 `RuntimeException`/`IllegalArgumentException`（非法 key、非对象值、后端错误）；Rust harness/core trait 无 `Result` 通道 | 保持 trait 签名不变（harness 约束）；读失败回 `UNVERSIONED` 而非 `0`，避免 CAS 写者把「读失败」误判为「创建缺失」 |
+| MONGO-X05 | `list_session_ids` 去重 + 排序 | `state_store.rs#list_session_ids` 用 `BTreeSet<String>` | Java `LinkedHashSet`（保留 `distinct` 服务端返回顺序） | 去重 + 确定性顺序，调用方不依赖顺序；`exists_delete_and_list_session_ids` 覆盖 |
+| MONGO-X06 | 租约释放模型 | `release_async`（await 删除，token 作用域）+ `Drop` 内 `Handle::try_current().spawn` 清理，无 runtime 时退回 TTL 并 warn（`sandbox_guard.rs:277-330`） | Java `MongoLease.close()` 同步 `deleteOne` + executor 关闭兜底 | 不在 async 上下文里 `block_on`（避免毒化 worker/死锁）；Drop 无法 await，故 spawn 或退 TTL |
+| MONGO-X07 | `insert_one` 缺 `_id` 时补字符串 UUID | `client_mongodb.rs#insert_one` | Java 由驱动生成 `ObjectId` | 让 `_id` 可 JSON 往返（内存后端、日志、断言一致），避免 `ObjectId` 无法表达为 `serde_json::Value` |
+| MONGO-X08 | 内存后端的二进制/时间表示 | `client.rs#encode_binary`/`#decode_binary`；`bson_to_json` 把 `DateTime`→millis、`Binary`→base64、`ObjectId`→hex；不设 16GB 上限 | Java 全程 BSON `Binary`/`DateTime`，GridFS 受 16GB 规范上限约束 | 离线测试替身零依赖；真驱动路径保留原生 BSON 类型（`bson_to_json_projects_driver_only_types` 覆盖） |
+| MONGO-X09 | `gridfs_upload` 先删**全部**同名文件 | `client_mongodb.rs#gridfs_upload`（`gridfs_file_ids` → 全删 → 重新上传） | Java `deleteIfExists` 只删 `find().first()` 命中的那一个，并发上传竞态下可能残留同名副本 | 消除同名多版本歧义（`download`/`exists` 语义无歧义）；`reupload_drops_stale_chunks` 覆盖 |
+| MONGO-X10 | 删除回调为 async | `SessionDeleteCallback = Arc<dyn Fn(..) -> BoxFuture<'static, ()>>`，`AgentStateStore::delete` 内 `await`（`state_store.rs#delete`） | Java 同步 `BiConsumer`，异常只 `log.warn` 后继续删除 | 不再用 `futures::executor::block_on`（会阻塞/死锁 current-thread runtime）；级联失败仍 warn 不阻断删除（对齐 Java best-effort） |
+| MONGO-X11 | 官方驱动接入 + 环境门控 live 测试 | `client_mongodb.rs`（`mongodb = "3"`，18 个 seam 方法全实现）、`tests/mongodb_live.rs`（`AGENTSCOPE_TEST_MONGODB_URL` 未设即 `return`，不用 `#[ignore]`） | Java 编译期直依赖驱动、contract test 需 Testcontainers/Docker 才能跑 | 默认离线全绿、真库按需开启（2026-10-31 提交 `a4da839`）；跨库/跨进程语义由 live 用例补足 |
 
 ## 5. 执行约定（所有会话必须遵守）
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p agentscope-extensions-mongodb` 基线。
