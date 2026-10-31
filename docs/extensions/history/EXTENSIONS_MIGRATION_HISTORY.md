@@ -1205,3 +1205,39 @@ cargo test -p agentscope-extensions-judge -p agentscope-extensions-studio -j 2  
 cargo test -p agentscope-extensions-sandbox --lib  (×6)                         -> 205 passed / 0 failed 每次
 cargo build -p agentscope-extensions-judge                                      -> EXIT=0，本 crate 0 warning
 ```
+
+## 4.20 2026-10-31 执行记录（环境门控实测 + 真驱动补齐 + 文档归档 + ACP 挂起修复）
+
+### 4.20.1 环境门控集成测试：4 个真实缺陷（复用既有 Docker 容器，未拉新镜像）
+
+真实后端一跑就暴露了「离线全绿」掩盖的问题：
+
+1. **REDIS Cluster 重定向从未生效**（`state/redirect.rs`）：`parse_redirect` 按 `token == "MOVED"` 匹配，而 `redis` crate 的 `Debug` 渲染是 **`Moved: 12536 <ip>:<port>`**（首字母大写 + 冒号）。所有 MOVED 都落进 `Other("Redis command failed: Moved: ...")` 分支。离线用例只喂了虚构的 `MOVED 3999 127.0.0.1:6381` 形式，所以一直是绿的。修法：同时接受 `MOVED ` / `Moved: ` / `ASK ` / `Ask: `，回归用例改断言真实渲染形式。
+2. **POSTGRESQL state 写入静默失败**（`state.rs`）：`SqlValue::BigInt(now)` 绑到 `TIMESTAMP` 列 → 驱动 `Bind` 报 `cannot convert between i64 and timestamp`，但 `save` 只记日志不返回错误 → 表恒空、`get` 返回 `None`。修法：按列类型绑定正确字面量，且 `save` 必须把错误透出。
+3. **JDBC PostgreSQL schema 自举竞态**：两个并发 `CREATE TABLE IF NOT EXISTS` 在 PG 上抛 SQLSTATE `23505`（`pg_type_typname_nsp_index`）。修法：新增 `schema_bootstrap.rs`，用 `pg_advisory_lock` 串行化自举。
+4. **MYSQL**：state 表未全限定、快照表名未透传、`IS_USED_LOCK` 的 NULL owner 未容忍、测试表名未隔离。
+
+实测（主智能体独立复跑）：jdbc 271 / postgresql 128+5 / mysql 109+5+2 / redis 集群 2 / redis lib 162 / mongodb 99 / sandbox lib 227 / Docker 沙箱 1（真实 ubuntu:22.04 容器），全部 0 failed。
+
+**不可本地复现**（已记录证据，拒绝造假服务端）：E2B（云 SaaS + API key）、MEM 三厂商、CHANNEL 真实租户、TRAINING Trinity；K8s 有 kubectl 但无 context（Docker Desktop K8s 未启用）。
+
+### 4.20.2 两处「从未接真驱动」的补齐
+
+- **MONGODB**（`a4da839`）：`src/` 下没有 `client_mongodb.rs`，`Cargo.toml` 只有 `serde_json`，语义只对内存假对象验证过 —— 即「22 模块全部完成」对 MONGODB 是**夸大**。新增 `client_mongodb.rs`（1124 行，18 个方法含 GridFS）、`tests/mongodb_live.rs`（env 门控）、错误码映射（11000/85/26/27）。同步桥设计：驱动任务跑在进程级独立 runtime 线程，调用方只 `await oneshot`，因此从任意 runtime（含 `current_thread`）用 `futures::executor::block_on` 调用都不会死锁。实测 99 lib + 5 live + 2。
+- **REDIS 单机**（`f35f94c`）：此前只有 Cluster 用例。新增 `tests/redis_integration.rs`（729 行，`AGENTSCOPE_TEST_REDIS_URL` 门控），覆盖真 Lua 脚本的 `save_if_version(0)`、`save_list` 的 `:_hash` 自愈、多轮 `SCAN` 游标、`ConnectionManager` 重连、锁 token CAS。实测 162 lib + 6 live + 2 cluster。
+
+### 4.20.3 ACP 取消挂起（提交 `5883c98`，仅测试代码）
+
+**不是** cancel 链路坏了（探针：取消标记在回合开始后 544ms 触发，`prompt` 返回 `Cancelled`，第二轮 0.78s 完成）。真因：用例硬编码 `sleep(400ms)` 后取消，而冷会话到首次模型调用前的簿记（writer lease + `session_input` + `before_model` checkpoint + `model/dispatch`）在 Windows debug 下需 **0.7–1.0s**。取消若抢赢，第 1 轮在到达 provider 前即被取消 → fixture 的「首次调用永久挂起」落到**没人取消的第 2 轮**，而 `running` 状态没有看门狗（只有 `queued` 有）→ 永久挂起。修法：等模型调用计数 ≥1（10s 上限 + 显式超时断言）再取消；`acp/src/session.rs` 全部回退（零探针残留）。连续直接运行 6 次：`clean_runs=6 failed_runs=0`。
+
+### 4.20.4 文档归档规则落地
+
+21 个 `<MODULE>__MIGRATION_HISTORY.md` 迁入 `docs/extensions/history/`（`6c7cc2c`），tracker 只留 `## 6. 执行历史（已归档）` + 一行相对路径链接；tracker 总体积 1.77MB → 879KB，逐模块字节核对 `new tracker + history >= original`，零内容丢失。规则写入 `_TEMPLATE.md` §0/§5 与本文 §5，并记入长期记忆。
+
+### 4.20.5 全量回归（无 skip）
+
+`cargo test --workspace -j 2 --no-fail-fast`（带 MySQL/PG/Redis/RedisCluster/MongoDB/Docker 环境变量）→ **147 targets / 5419 passed / 0 failed / 5 ignored / EXITCODE=0**，无失败段。
+
+**踩坑**：首次全量把日志写进 `%TEMP%`，C 盘仅剩 20GB 时系统临时文件清理把日志删掉 + 连带终止 cmd 进程，整轮静默中断（无 error、无 EXITCODE）。改为日志落仓库内 `.agentscope/workspace/logs/` 后正常完成。教训：**长任务日志不能放 `%TEMP%`**。
+
+另：Windows MSVC 无条件生成 `.pdb`，`target/debug/deps` 里 518 个 `.pdb` 占 **45.75GB**（target 总计 76.3GB）。删除可再生；盘满时表现为 `link.exe`/`LNK1318` 失败而 `EXITCODE` 仍为 0（假绿）。

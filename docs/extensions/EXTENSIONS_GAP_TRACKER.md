@@ -90,11 +90,11 @@
 
 | 类型 | 项 | 依据 / 说明 |
 |---|---|---|
-| 环境门控 | 真实 MySQL（JDBC / MYSQL / SKILLS） | `AGENTSCOPE_TEST_MYSQL_URL`（+ `_DATABASE`）；未设即 skip + `return`，**非 `#[ignore]`** |
-| 环境门控 | 真实 PostgreSQL（JDBC / POSTGRESQL / SKILLS） | `AGENTSCOPE_TEST_POSTGRES_URL`（SKILLS 侧 `AGENTSCOPE_TEST_PG_URL`） |
+| 环境门控 | 真实 MySQL（JDBC / MYSQL / SKILLS） | `AGENTSCOPE_TEST_MYSQL_URL`（+ `_DATABASE`）；未设即 skip + `return`，**非 `#[ignore]`**；**已实跑通过**（2026-10-31，容器 `mysql:8.0`；需 `--features mysql-driver`/`mysql_async`，默认特性下为 0 用例） |
+| 环境门控 | 真实 PostgreSQL（JDBC / POSTGRESQL / SKILLS） | `AGENTSCOPE_TEST_POSTGRES_URL`（SKILLS 侧 `AGENTSCOPE_TEST_PG_URL`）；**已实跑通过**（2026-10-31，容器 `postgres:16`；需 `--features postgres-driver`/`postgres-executor`） |
 | 环境门控 | 真实 Redis（单机 + Cluster） | `AGENTSCOPE_TEST_REDIS_URL`（6 用例：Lua 脚本 / SCAN 游标 / 重连 / 锁 CAS）、`AGENTSCOPE_TEST_REDIS_CLUSTER_URL`（2 用例：槽路由 / 拓扑扇出）；**均已实跑通过**（2026-10-31，容器 `redis:7-alpine` + 3 主集群） |
 | 环境门控 | 真实 MongoDB | `AGENTSCOPE_TEST_MONGODB_URL`（5 用例：state / base / snapshot / guard）；**已实跑通过**（2026-10-31，容器 `mongo:7`，官方驱动 `mongodb = "3"`）；Java 侧未用 change-stream/事务/批量写（`rg` 零命中） |
-| 环境门控 | E2B / Kubernetes | `AGENTSCOPE_TEST_E2B_API_KEY`/`_URL`/`_TEMPLATE`；`AGENTSCOPE_TEST_K8S_API_URL`/`_WARM_POOL`（+`_TOKEN`/`_NAMESPACE`） |
+| 环境门控 | E2B / Kubernetes | `AGENTSCOPE_TEST_E2B_API_KEY`/`_URL`/`_TEMPLATE`；`AGENTSCOPE_TEST_K8S_API_URL`/`_WARM_POOL`（+`_TOKEN`/`_NAMESPACE`）；本机无 E2B 凭据、无 kube context（Docker Desktop K8s 未启用），**未实跑** |
 | 环境门控 | MEM 三厂商真实端点 | `MEM0_LIVE_BASE_URL` / `BAILIAN_LIVE_API_KEY` / `REME_LIVE_BASE_URL`（`tests/live_endpoints.rs`，wire 契约已由 mock 全链路覆盖） |
 | 环境门控 | CHANNEL 真实租户联调 / TRAINING live Trinity | 需厂商凭据与在线服务；签名、报文、路由均已离线覆盖 |
 | 设计决定 | CONTROLPLANE `GrpcTransport` **wire 层** | 需 `protoc` + `tonic`/`prost` + 构建期拷贝 service proto，且 bidi 流无法经 unary JSON 通道；语义层已落地 `transport/asdp.rs`（握手/退避/心跳/ack 门控），wire 由宿主 `AsdpLink` 注入 |
@@ -112,10 +112,12 @@
 
 ```powershell
 cargo test -p <crate> -j 2 --no-fail-fast                 # 逐 crate（本表数字来源）
-cargo test --workspace -j 2 --no-fail-fast -- --skip a_cancelled_turn_does_not_block_the_next_prompt
+cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 ```
 
-- **全量**：**156 targets / 5395 passed / 0 failed / 5 ignored / EXITCODE=0**（跳过的 1 条为 §4.2-1 的 Windows 永久挂起用例）。
+- **全量**：**147 targets / 5419 passed / 0 failed / 5 ignored / EXITCODE=0**（无 `^failures:` 段；ACP 用例已修复并计入）。
+- **5 个 ignored**：MODEL `catalog` 3 个（联网读 models.dev / 依赖 OS 临时目录的已下载 payload）+ 2 个 ```ignore 文档示例（RAG `hook.rs`、CHANNEL `platform_channel.rs`），均为既有状态。
+- **live 实测**：本次全量带环境变量执行，真实连通 `redis_integration`（6）、`redis_cluster_integration`（2）、`mongodb_live`（5）、`harness_docker_sandbox_test`（1，真实容器 8.4s）。JDBC/MySQL 的 `*_integration_tests` 在默认特性下为 0 用例，需显式 `--features`（数字见 §1 与各 tracker §4.1）。
 - **上下文数字**（非 extensions 口径）：`agentscope-core --lib` 377、`agentscope-harness --lib` 519。
 - **逐 crate 数字**见 §1；`--features` 差异（mysql_async / s3 / http-client / postgres-driver / mysql-executor）已在表中标注。
 - **判失败**：只看 `^failures:` 段（§0）；`EXITCODE=0` 但不能排除「磁盘满导致假失败」（历史曾把 `.pdb` 占满盘表现为 link 失败）。
@@ -124,15 +126,15 @@ cargo test --workspace -j 2 --no-fail-fast -- --skip a_cancelled_turn_does_not_b
 
 ### 4.2 已知非本轮问题（pre-existing，不计入模块缺口）
 
-1. `agentscope-extensions-acp` 的 `acp_interrupted_turn_test::a_cancelled_turn_does_not_block_the_next_prompt` 在本机 Windows **永久挂起**（已用 `git worktree` 在起点 `f81c8b1` 复现，非本轮引入）。根因方向：SDK `$/cancel_request` 未送达 agent 侧，`acp/src/session.rs` 的 admission 看门狗只覆盖 `status=queued`，`running` 状态无上限等待。修法需在 ACP 运行时（对 `running` 加可取消上限，或修 cancel 送达）。
+1. ~~ACP `a_cancelled_turn_does_not_block_the_next_prompt` 永久挂起~~ **已修**（提交 `5883c98`，仅测试代码）。真因不是 cancel 链路：用例硬编码 `sleep(400ms)` 后取消，而冷会话到首次模型调用前的簿记约 0.7–1.0s；取消若抢赢，第 1 轮在到达 provider 前就被取消，于是 fixture 的「首次调用永久挂起」落到没人取消的第 2 轮 → 永久等待。改为等模型调用计数 ≥1 再取消（10s 上限 + 超时断言），断言强度未降。残留风险：provider 永不返回且客户端永不取消时 `running` 仍无上限（有意不加粗粒度超时，避免杀掉健康长任务）。
 2. `acp_stdio_thought_test` 依赖 live 模型的 reasoning 输出 → 偶发失败（既有 flaky）。
 3. `agentscope-extensions-training::runner` 使用进程级 `OnceLock` 静态注册表 + `clear_all()`，默认并行度下测试间竞争 → 单跑稳定（`-j 2` 可规避）。
 
 ### 4.3 后续事项
 
-1. **真实后端联调**（代码已就绪，只缺环境）：MySQL / PostgreSQL / Redis Cluster / MongoDB / E2B / Kubernetes / MEM 三厂商 / Trinity，按 §3.1 的环境变量逐项执行。
+1. **真实后端联调**：MySQL / PostgreSQL / Redis 单机+集群 / MongoDB / Docker 沙箱**已实测通过**（见 §4.1 与 `history/EXTENSIONS_MIGRATION_HISTORY.md`）；仍缺环境的只有 E2B（云 SaaS）、Kubernetes（本机无 context）、MEM 三厂商、CHANNEL 真实租户、Trinity-RFT。
 2. **可选增强（P2）**：测试密度对齐 Java（如 SKILLS 108 vs 192 `@Test`、POSTGRESQL 53 个 Java 用例未覆盖）；各 tracker §3 P2 行即候选清单。
-3. **ACP cancel 挂起**（§4.2-1）：在 ACP 运行时侧处理，属 core/harness 范围，不在 extensions 模块内。
+3. **ACP `running` 无上限**（§4.2-1 残留）：仅在「provider 永不返回且客户端永不取消」时可触发，需先论证不会误杀健康长任务再动手。
 
 ## 5. 执行约定（所有会话必须遵守）
 
