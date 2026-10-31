@@ -23,10 +23,26 @@ use std::sync::{Arc, Mutex};
 ///
 /// [`SandboxGuard::is_held`] stays synchronous: it is a diagnostics probe (single
 /// round-trip, no polling) and is never part of the acquire/release path.
+///
+/// ## Fail-closed contract
+///
+/// [`SandboxGuard::try_enter`] is **fallible**: when the lease cannot be acquired (lock
+/// store unreachable, acquisition timed out, backend unsupported) the implementation
+/// **must** return `Err`. It must never hand back [`SandboxLease::noop`] and let the
+/// caller keep going — that silently drops cross-process mutual exclusion, which is the
+/// exact bug this contract exists to prevent. `SandboxManager::acquire` propagates the
+/// error with `?`, so the sandbox is neither resumed nor created under a lost lock.
 #[async_trait::async_trait]
 pub trait SandboxGuard: Send + Sync + std::fmt::Debug {
     /// Tries to acquire a lease for the given isolation key.
-    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease;
+    ///
+    /// `Ok(lease)` means the caller holds the isolation key. `Err(_)` means acquisition
+    /// failed and the caller **must abort** (fail-closed); returning a no-op lease here is
+    /// a contract violation.
+    async fn try_enter(
+        &self,
+        key: SandboxIsolationKey,
+    ) -> agentscope_core::error::Result<SandboxLease>;
 
     /// Releases a lease for the given isolation key.
     ///
@@ -58,8 +74,13 @@ pub trait SandboxGuard: Send + Sync + std::fmt::Debug {
 
 #[async_trait::async_trait]
 impl SandboxGuard for SandboxExecutionGuard {
-    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
-        SandboxExecutionGuard::try_enter(self, key)
+    /// The in-process guard cannot fail: re-entrant counting is local state, so it always
+    /// yields `Ok(lease)`. Object-store guards that delegate here inherit that.
+    async fn try_enter(
+        &self,
+        key: SandboxIsolationKey,
+    ) -> agentscope_core::error::Result<SandboxLease> {
+        Ok(SandboxExecutionGuard::try_enter(self, key))
     }
 
     async fn release(&self, key: &SandboxIsolationKey) {
@@ -199,9 +220,12 @@ mod tests {
 
         #[async_trait::async_trait]
         impl SandboxGuard for CountingGuard {
-            async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+            async fn try_enter(
+                &self,
+                key: SandboxIsolationKey,
+            ) -> agentscope_core::error::Result<SandboxLease> {
                 self.enters.fetch_add(1, Ordering::SeqCst);
-                SandboxLease::new(key)
+                Ok(SandboxLease::new(key))
             }
             async fn release(&self, _key: &SandboxIsolationKey) {
                 self.releases.fetch_add(1, Ordering::SeqCst);
@@ -214,7 +238,7 @@ mod tests {
         let inner = Arc::new(CountingGuard::default());
         let guard: Arc<dyn SandboxGuard> = inner.clone();
         let key = SandboxIsolationKey::new("user", "u1");
-        let _lease = guard.try_enter(key.clone()).await;
+        let _lease = guard.try_enter(key.clone()).await.expect("lease");
         guard.release(&key).await;
 
         assert_eq!(inner.enters.load(Ordering::SeqCst), 1);

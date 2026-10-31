@@ -210,7 +210,11 @@ impl SandboxManager {
         let mut lease = SandboxLease::noop();
         if let Some(key) = &scope_key {
             debug!("[sandbox] Acquiring execution guard for scope {}", key);
-            lease = self.execution_guard.try_enter(key.clone()).await;
+            // Fail-closed: a guard that cannot take the lease returns `Err`, and the
+            // acquisition aborts here — no sandbox is resumed/created without the lock.
+            // Never fall back to a no-op lease (that would silently drop distributed
+            // mutual exclusion).
+            lease = self.execution_guard.try_enter(key.clone()).await?;
         }
 
         // Try to load persisted state (Priority 3)
@@ -576,7 +580,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SandboxGuard for RecordingGuard {
-        async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+        async fn try_enter(
+            &self,
+            key: SandboxIsolationKey,
+        ) -> agentscope_core::error::Result<SandboxLease> {
             self.state.enters.fetch_add(1, Ordering::SeqCst);
             *self
                 .state
@@ -585,7 +592,7 @@ mod tests {
                 .expect("guard state")
                 .entry(key.clone())
                 .or_insert(0) += 1;
-            SandboxLease::new(key)
+            Ok(SandboxLease::new(key))
         }
 
         async fn release(&self, key: &SandboxIsolationKey) {
@@ -718,6 +725,125 @@ mod tests {
             "a failed acquisition must not leak the isolation key"
         );
         assert_eq!((observed.enters(), observed.releases()), (1, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    //  Fail-closed guard acquisition (SANDBOX-09)
+    // -----------------------------------------------------------------------
+
+    /// A guard whose acquisition always fails, as a distributed backend does when its lock
+    /// store is unreachable or the lock cannot be taken before the deadline.
+    #[derive(Debug, Clone, Default)]
+    struct FailingGuard {
+        enters: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxGuard for FailingGuard {
+        async fn try_enter(
+            &self,
+            _key: SandboxIsolationKey,
+        ) -> agentscope_core::error::Result<SandboxLease> {
+            self.enters.fetch_add(1, Ordering::SeqCst);
+            Err(agentscope_core::error::Error::Other(
+                "lock store unreachable".to_string(),
+            ))
+        }
+
+        async fn release(&self, _key: &SandboxIsolationKey) {}
+
+        fn is_held(&self, _key: &SandboxIsolationKey) -> bool {
+            false
+        }
+    }
+
+    /// A client that records how many sandboxes it was asked to create.
+    #[derive(Debug, Clone, Default)]
+    struct CountingSandboxClient {
+        creates: Arc<AtomicUsize>,
+    }
+
+    impl CountingSandboxClient {
+        fn creates(&self) -> usize {
+            self.creates.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxClient for CountingSandboxClient {
+        async fn create(
+            &self,
+            _workspace_spec: &WorkspaceSpec,
+            _snapshot_spec: Option<&dyn SandboxSnapshotSpec>,
+            _options: Option<&SandboxClientOptions>,
+        ) -> Result<Box<dyn Sandbox>> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(MockSandbox::new()))
+        }
+
+        async fn resume(&self, _state: &SandboxState) -> Result<Box<dyn Sandbox>> {
+            Ok(Box::new(MockSandbox::new()))
+        }
+
+        async fn delete(&self, _sandbox: &dyn Sandbox) -> Result<()> {
+            Ok(())
+        }
+
+        fn serialize_state(&self, state: &SandboxState) -> Result<String> {
+            serde_json::to_string(state)
+                .map_err(|e| agentscope_core::error::Error::Other(e.to_string()))
+        }
+
+        fn deserialize_state(&self, json: &str) -> Result<SandboxState> {
+            serde_json::from_str(json)
+                .map_err(|e| agentscope_core::error::Error::Other(e.to_string()))
+        }
+
+        fn deserialize_state_with_spec(
+            &self,
+            json: &str,
+            _snapshot_spec: Option<&dyn SandboxSnapshotSpec>,
+        ) -> Result<SandboxState> {
+            self.deserialize_state(json)
+        }
+    }
+
+    /// Fail-closed: a guard that cannot take the isolation lease must abort the acquire.
+    ///
+    /// Before the `Result` contract the guard's `Err` was downgraded to
+    /// [`SandboxLease::noop`] and the manager happily created a sandbox while another
+    /// process held the same key. This test pins both halves of the fix: the error reaches
+    /// the caller, and no sandbox is created (that half is what makes it fail-closed rather
+    /// than merely louder).
+    #[tokio::test]
+    async fn guard_acquisition_failure_aborts_the_acquire() {
+        let guard = FailingGuard::default();
+        let observed_guard = guard.clone();
+        let client = CountingSandboxClient::default();
+        let observed_client = client.clone();
+        let manager = SandboxManager::with_guard(
+            Arc::new(client),
+            Arc::new(InMemorySandboxStateStore::new()),
+            "test-agent",
+            guard,
+        );
+        let context = agent_scoped_context();
+
+        let error = manager.acquire(&context, None).await.unwrap_err();
+        assert!(
+            format!("{error}").contains("lock store unreachable"),
+            "the guard's error must reach the caller: {error}"
+        );
+        assert_eq!(
+            observed_guard.enters.load(Ordering::SeqCst),
+            1,
+            "the guard is consulted exactly once"
+        );
+        assert_eq!(
+            observed_client.creates(),
+            0,
+            "no sandbox may be created when the isolation lease is unavailable"
+        );
     }
 
     // -----------------------------------------------------------------------

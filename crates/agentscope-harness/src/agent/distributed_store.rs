@@ -114,7 +114,7 @@ mod tests {
             .sandbox_execution_guard
             .expect("guard slot must be populated");
         let key = crate::agent::sandbox::SandboxIsolationKey::new("user", "u1");
-        let lease = guard.try_enter(key.clone()).await;
+        let lease = guard.try_enter(key.clone()).await.expect("lease");
         assert!(!lease.is_noop());
         assert!(guard.is_held(&key));
         guard.release(&key).await;
