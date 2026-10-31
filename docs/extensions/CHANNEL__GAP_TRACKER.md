@@ -1,6 +1,6 @@
 # CHANNEL 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
-> **用途**：本文件是 **CHANNEL** 模块迁移的**单一事实来源**与**增量跟踪入口**。开工前读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md`；历史过程记录见 `docs/extensions/CHANNEL__MIGRATION_HISTORY.md`（**冻结**）。切勿臆断代码现状——以本文件 + `git status` + `cargo test` 实际验证为准。
+> **用途**：本文件是 **CHANNEL** 模块迁移的**单一事实来源**与**增量跟踪入口**。开工前读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md`；历史过程记录见 `docs/extensions/history/CHANNEL__MIGRATION_HISTORY.md`（**冻结**）。切勿臆断代码现状——以本文件 + `git status` + `cargo test` 实际验证为准。
 > **当前状态**：**已完成（基线 2026-10-23）**。Java 后续新特性按 §6 增量跟踪流程登记到 §3。
 > **Java 源码**：`D:\IdeaProjects\agentscope-java\agentscope-extensions\agentscope-extensions-channel\`（本机 `main` 现为 6 个子模块，**已无 weixin**，见 §4.2）
 > **Java 子模块**：common, dingtalk, feishu, github, gitlab, wecom, weixin（**7** 个；weixin 基线来自早期快照）
@@ -285,7 +285,8 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 - 分模块：common 62 / dingtalk 78 / feishu 44 / github 32 / gitlab 35 / wecom 48 / weixin 86。
 - 本 crate 无下游依赖方（仅根 `Cargo.toml` 的 members 登记），影响面即本 crate。
 
-## 8. 归档
+## 8. 执行历史（已归档）
 
-- 历史记录：`docs/extensions/CHANNEL__MIGRATION_HISTORY.md`（**冻结**）——原 §4 项目状态、§6 静态复核快照、§7 P0 修复（G1）、§8 P1/P2 修复（G2–G8）。
-- 汇总登记：`docs/extensions/EXTENSIONS_GAP_TRACKER.md` §1 第 5 行（CHANNEL = 已完成）与 §4.8 #14。
+- 执行记录 / 静态复核 / 勘误 / 反向验证明细：[`history/CHANNEL__MIGRATION_HISTORY.md`](./history/CHANNEL__MIGRATION_HISTORY.md)（**冻结**：原 §4 项目状态、§6 静态复核快照、§7 P0 修复（G1）、§8 P1/P2 修复（G2–G8））。
+- 本文件只保留现行状态（§0–§7）；历史条目一律写进上述归档文件，不再回填本文。
+- 汇总登记：`docs/extensions/EXTENSIONS_GAP_TRACKER.md` §1 第 5 行（CHANNEL = 已完成）。

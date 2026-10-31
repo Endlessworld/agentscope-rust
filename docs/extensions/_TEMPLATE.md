@@ -9,6 +9,7 @@
 - **执行状态**取值：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
 - **优先级**：P0=核心链路 / P1=重要 / P2=增强。
 - 每完成一项：把状态改 `已完成`，在 `交接信息` 写最新验证结果（命令 + 结果）。
+- **本文件只写现行状态（§0–§5）**：执行过程记录（回执 / 静态复核 / 勘误 / 反向验证明细）写入 `docs/extensions/history/__NAME__MIGRATION_HISTORY.md`，本文件只在 §6 留一行相对路径链接。
 
 ## 1. 模块概览
 | 项 | 内容 |
@@ -46,5 +47,6 @@
 - 开工前：读本文件 + `docs/MIGRATION_GAP_TRACKER.md` + `git status`；确认 `cargo build -p __CRATE__` 基线。
 - 改动中：保持 `cargo build -p __CRATE__` / `cargo test -p __CRATE__` 通过。
 - 完工后：更新 §3 条目状态与 §4，并在 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` 对应行登记。
+- 完工后（归档）：执行记录写入 `docs/extensions/history/__NAME__MIGRATION_HISTORY.md`，**不要**在本文件追加历史章节；跨文件引用一律用相对路径链接，不复制正文。
 - **仅在本 crate 内改动**；新增依赖写入 `crates/__CRATE__/Cargo.toml` 的 `[dependencies]`，不要改根 `Cargo.toml` 的 `[workspace.dependencies]`（如需请记入 §4.2 由汇总方处理）。
 - 不修改 `crates/agentscope-core` / `crates/agentscope-harness`（除非本 tracker 明确授权），不修改其它模块的 crate。
