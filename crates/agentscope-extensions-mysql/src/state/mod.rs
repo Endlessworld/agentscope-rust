@@ -393,7 +393,7 @@ impl MysqlAgentStateStore {
         value: serde_json::Value,
         expected_version: Option<i64>,
     ) -> MysqlResult<i64> {
-        require_session_id(session_id)?;
+        require_slot_id(user_id, session_id)?;
         validate_state_key(key)?;
         let json = serde_json::to_string(&value)?;
         match expected_version {
@@ -451,7 +451,7 @@ impl MysqlAgentStateStore {
     }
 
     /// Builds the version-conflict error. Reading the stored version is only used to make
-    /// the message actionable; it never gates the write (the CAS already decided).
+    /// the report actionable; it never gates the write (the CAS already decided).
     fn conflict(
         &self,
         user_id: Option<&str>,
@@ -463,9 +463,11 @@ impl MysqlAgentStateStore {
             .backend
             .read_version(user_id, session_id, key)
             .unwrap_or(0);
-        MysqlError::InvalidArgument(format!(
-            "version conflict for key '{key}': expected {expected}, found {found}"
-        ))
+        MysqlError::Conflict {
+            key: key.to_string(),
+            expected,
+            found,
+        }
     }
 
     /// Encodes list items for the backend.
@@ -520,7 +522,7 @@ impl MysqlAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> MysqlResult<i64> {
-        require_session_id(session_id)?;
+        require_slot_id(user_id, session_id)?;
         validate_state_key(key)?;
         self.backend.read_version(user_id, session_id, key)
     }
@@ -550,7 +552,7 @@ impl AgentStateStore for MysqlAgentStateStore {
         key: &str,
         value: serde_json::Value,
     ) {
-        if !key_access_is_valid(session_id, key) {
+        if !key_access_is_valid(user_id, session_id, key) {
             return;
         }
         if let Ok(json) = serde_json::to_string(&value) {
@@ -567,7 +569,7 @@ impl AgentStateStore for MysqlAgentStateStore {
         key: &str,
         values: &[serde_json::Value],
     ) {
-        if require_session_id(session_id).is_err() {
+        if require_slot_id(user_id, session_id).is_err() {
             return;
         }
         // Java: `if (values.isEmpty()) return;` (MysqlAgentStateStore.java:571-573).
@@ -585,7 +587,7 @@ impl AgentStateStore for MysqlAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> Option<serde_json::Value> {
-        if !key_access_is_valid(session_id, key) {
+        if !key_access_is_valid(user_id, session_id, key) {
             return None;
         }
         let json = self.backend.get_single(user_id, session_id, key).ok()??;
@@ -598,7 +600,7 @@ impl AgentStateStore for MysqlAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> Vec<serde_json::Value> {
-        if !key_access_is_valid(session_id, key) {
+        if !key_access_is_valid(user_id, session_id, key) {
             return Vec::new();
         }
         self.backend
@@ -610,14 +612,14 @@ impl AgentStateStore for MysqlAgentStateStore {
     }
 
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
-        if require_session_id(session_id).is_err() {
+        if require_slot_id(user_id, session_id).is_err() {
             return false;
         }
         self.backend.exists(user_id, session_id).unwrap_or(false)
     }
 
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {
-        if require_session_id(session_id).is_err() {
+        if require_slot_id(user_id, session_id).is_err() {
             return;
         }
         let _ = self.backend.delete(user_id, session_id);
@@ -637,7 +639,7 @@ impl AgentStateStore for MysqlAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> agentscope_core::state::VersionedState {
-        if !key_access_is_valid(session_id, key) {
+        if !key_access_is_valid(user_id, session_id, key) {
             return agentscope_core::state::VersionedState {
                 value: None,
                 version: agentscope_core::state::UNVERSIONED,
@@ -702,8 +704,8 @@ fn ensure_version_column(
 /// `exists` / `delete` have no key parameter). Without the guard a key longer than
 /// `VARCHAR(255)` reaches MySQL, where non-strict mode truncates it and two distinct keys
 /// sharing a 255-character prefix silently collide.
-fn key_access_is_valid(session_id: &str, key: &str) -> bool {
-    match require_session_id(session_id).and_then(|_| validate_state_key(key)) {
+fn key_access_is_valid(user_id: Option<&str>, session_id: &str, key: &str) -> bool {
+    match require_slot_id(user_id, session_id).and_then(|_| validate_state_key(key)) {
         Ok(()) => true,
         Err(err) => {
             tracing::debug!("rejected state access with an invalid identifier: {err}");
@@ -712,12 +714,73 @@ fn key_access_is_valid(session_id: &str, key: &str) -> bool {
     }
 }
 
-fn require_session_id(session_id: &str) -> MysqlResult<String> {
+/// Separator between the user namespace and the session id inside the `session_id` column.
+///
+/// Mirrors Java `MysqlAgentStateStore#slotId`: `normalizeUser(userId) + ":" + sessionId`.
+/// The previous Rust separator was `0x1F`, so the same `(user, session)` pair landed in two
+/// different rows (and in two non-overlapping `list_session_ids` prefixes) on the Java and
+/// Rust sides.
+pub const SESSION_USER_SEPARATOR: char = ':';
+
+/// Sentinel user for callers that pass no user id, matching `MysqlAgentStateStore#ANON_USER`.
+pub(crate) const ANON_USER: &str = "__anon__";
+
+/// Folds `(userId, sessionId)` into the single `session_id` column value, mirroring Java
+/// `MysqlAgentStateStore#slotId` (blank/absent user → [`ANON_USER`]).
+///
+/// This is the **only** place the column value is composed: the driver adapter and the
+/// `LIKE` prefix of `list_session_ids` both go through it, so they cannot drift apart.
+pub fn compose_slot_id(user_id: Option<&str>, session_id: &str) -> String {
+    format!(
+        "{}{SESSION_USER_SEPARATOR}{session_id}",
+        normalize_user(user_id)
+    )
+}
+
+/// `LIKE` prefix covering every session of one user, mirroring Java
+/// `MysqlAgentStateStore#listSessionIds` (`normalizeUser(userId) + ":"`).
+pub fn slot_id_prefix(user_id: Option<&str>) -> String {
+    format!("{}{SESSION_USER_SEPARATOR}", normalize_user(user_id))
+}
+
+fn normalize_user(user_id: Option<&str>) -> &str {
+    match user_id {
+        Some(user) if !user.trim().is_empty() => user,
+        _ => ANON_USER,
+    }
+}
+
+/// Validates the `(userId, sessionId)` pair the way Java's `validateSessionId` does — on the
+/// **composed** slot id, not on the session id alone.
+///
+/// * blank session id → [`MysqlError::BlankSessionId`];
+/// * a `:` in either part is rejected: it is the separator, so `("a:b", "c")` and
+///   `("a", "b:c")` would otherwise share one row group;
+/// * the composed length is capped at [`MAX_STATE_IDENTIFIER_LENGTH`], the width of the
+///   `VARCHAR(255)` `session_id` column — a long user id can blow that budget even when the
+///   session id itself fits (non-strict MySQL would silently truncate the pair).
+fn require_slot_id(user_id: Option<&str>, session_id: &str) -> MysqlResult<()> {
     if session_id.trim().is_empty() {
         return Err(MysqlError::BlankSessionId);
     }
-    require_max_length(session_id, "sessionId")?;
-    Ok(session_id.to_string())
+    if session_id.contains(SESSION_USER_SEPARATOR) {
+        return Err(MysqlError::InvalidArgument(format!(
+            "sessionId must not contain '{SESSION_USER_SEPARATOR}' (it separates userId from sessionId)"
+        )));
+    }
+    let user = normalize_user(user_id);
+    if user.contains(SESSION_USER_SEPARATOR) {
+        return Err(MysqlError::InvalidArgument(format!(
+            "userId must not contain '{SESSION_USER_SEPARATOR}' (it separates userId from sessionId)"
+        )));
+    }
+    let length = compose_slot_id(user_id, session_id).chars().count();
+    if length > MAX_STATE_IDENTIFIER_LENGTH {
+        return Err(MysqlError::InvalidArgument(format!(
+            "userId + '{SESSION_USER_SEPARATOR}' + sessionId must be at most {MAX_STATE_IDENTIFIER_LENGTH} characters, got {length}"
+        )));
+    }
+    Ok(())
 }
 
 /// Maximum length of a session id or state key, matching both the Java
@@ -1006,7 +1069,19 @@ mod tests {
             .save_if_version(Some("u"), "sess", "k", json!({"new": true}), Some(0))
             .await
             .expect_err("a row at version 5 must reject create-if-absent");
-        assert!(matches!(err, MysqlError::InvalidArgument(_)), "{err:?}");
+        // MYSQL-10: a stale expectation is an optimistic-locking outcome, not an argument
+        // error (Java returns the `UNVERSIONED` sentinel and never throws).
+        assert!(
+            matches!(
+                err,
+                MysqlError::Conflict {
+                    expected: 0,
+                    found: 5,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(
             err.to_string().contains("expected 0, found 5"),
             "conflict message should report the stored version: {err}"
@@ -1027,6 +1102,38 @@ mod tests {
         assert!(err.is_err());
         assert_eq!(s.get(Some("u"), "sess", "k").await, Some(json!("a")));
         assert_eq!(s.read_version(Some("u"), "sess", "k").unwrap(), 1);
+    }
+
+    /// MYSQL-10: a stale expectation is a lost optimistic-locking race, so the inherent API
+    /// reports the typed [`MysqlError::Conflict`] instead of an argument error, while the
+    /// infallible trait path keeps folding it into `UNVERSIONED`.
+    #[tokio::test]
+    async fn stale_expected_version_reports_a_typed_conflict() {
+        let s = store();
+        s.save_if_version(Some("u"), "sess", "k", json!(1), None)
+            .await
+            .expect("create");
+
+        let err = s
+            .save_if_version(Some("u"), "sess", "k", json!(2), Some(9))
+            .await
+            .expect_err("version 9 does not exist");
+        assert!(
+            matches!(
+                err,
+                MysqlError::Conflict {
+                    expected: 9,
+                    found: 1,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        let version =
+            AgentStateStore::save_if_version(&s, Some("u"), "sess", "k", json!(3), 9).await;
+        assert_eq!(version, agentscope_core::state::UNVERSIONED);
+        assert_eq!(s.get(Some("u"), "sess", "k").await, Some(json!(1)));
     }
 
     /// The CAS must be decided by the backend primitive, never by a prior `read_version`
@@ -1363,5 +1470,73 @@ mod tests {
             ddl.contains("PRIMARY KEY (session_id, state_key, item_index)"),
             "{ddl}"
         );
+    }
+
+    /// MYSQL-04: the `session_id` column holds Java's `user:session` slot id. The previous
+    /// `0x1F` separator put the same `(user, session)` pair into two different rows on the
+    /// Java and Rust sides, and the two `list_session_ids` prefixes never overlapped.
+    #[test]
+    fn slot_id_uses_the_java_colon_separator() {
+        assert_eq!(compose_slot_id(Some("alice"), "s1"), "alice:s1");
+        assert_eq!(compose_slot_id(None, "s1"), "__anon__:s1");
+        assert_eq!(compose_slot_id(Some("   "), "s1"), "__anon__:s1");
+        assert_eq!(slot_id_prefix(Some("alice")), "alice:");
+        assert_eq!(slot_id_prefix(None), "__anon__:");
+    }
+
+    /// MYSQL-04: `:` is the slot separator, so it must be rejected inside either part —
+    /// otherwise `("a:b", "c")` and `("a", "b:c")` share one row group.
+    #[tokio::test]
+    async fn colon_in_user_or_session_id_is_rejected() {
+        let (s, backend) = store_with_backend();
+        let err = s
+            .save_if_version(Some("u"), "a:b", "k", json!(1), None)
+            .await
+            .expect_err("a ':' inside the session id is ambiguous");
+        assert!(matches!(err, MysqlError::InvalidArgument(_)), "{err:?}");
+        assert_eq!(backend.get_single(Some("u"), "a:b", "k").unwrap(), None);
+
+        let err = s
+            .save_if_version(Some("a:b"), "sess", "k", json!(1), None)
+            .await
+            .expect_err("a ':' inside the user id is ambiguous");
+        assert!(matches!(err, MysqlError::InvalidArgument(_)), "{err:?}");
+
+        // The infallible trait entries drop the access instead of writing it.
+        s.save(Some("u"), "a:b", "k", json!(1)).await;
+        assert_eq!(s.get(Some("u"), "a:b", "k").await, None);
+        assert!(s.get_list(Some("u"), "a:b", "k").await.is_empty());
+        assert!(!s.exists(Some("u"), "a:b").await);
+        assert!(matches!(
+            s.read_version(Some("u"), "a:b", "k"),
+            Err(MysqlError::InvalidArgument(_))
+        ));
+    }
+
+    /// MYSQL-13: Java validates the composed slot id, so a long user id can exhaust the
+    /// `VARCHAR(255)` budget even when the session id alone fits.
+    #[tokio::test]
+    async fn slot_length_counts_user_separator_and_session() {
+        let s = store();
+        let user = "u".repeat(200);
+        let session = "s".repeat(100);
+        let err = s
+            .save_if_version(Some(&user), &session, "k", json!(1), None)
+            .await
+            .expect_err("200 + ':' + 100 exceeds VARCHAR(255)");
+        assert!(matches!(err, MysqlError::InvalidArgument(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("at most 255 characters"),
+            "unexpected message: {err}"
+        );
+
+        // 199 + ':' + 55 == 255 is still accepted.
+        let user = "u".repeat(199);
+        let session = "s".repeat(MAX_STATE_IDENTIFIER_LENGTH - 200);
+        assert_eq!(
+            user.chars().count() + 1 + session.chars().count(),
+            MAX_STATE_IDENTIFIER_LENGTH
+        );
+        assert_eq!(s.read_version(Some(&user), &session, "k").unwrap(), 0);
     }
 }

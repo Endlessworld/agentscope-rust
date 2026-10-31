@@ -358,7 +358,7 @@ mod tests {
             .as_ref()
             .expect("sandbox_execution_guard projected");
         let key = agentscope_harness::agent::sandbox::SandboxIsolationKey::new("user", "u");
-        let lease = guard.try_enter(key.clone()).await;
+        let lease = guard.try_enter(key.clone()).await.expect("lease");
         assert!(!lease.is_noop());
         assert!(guard.is_held(&key));
         guard.release(&key).await;

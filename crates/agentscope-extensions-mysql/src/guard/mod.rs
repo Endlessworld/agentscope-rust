@@ -302,49 +302,79 @@ impl SandboxGuard for MysqlSandboxExecutionGuard {
     /// to `lock_timeout`), so the acquisition runs on a blocking thread: awaiting it directly
     /// would stall a Tokio worker for the whole timeout.
     ///
-    /// A timed-out acquisition degrades to a no-op lease, mirroring the JDBC guard's
-    /// fallback (the caller then runs unprotected rather than deadlocking).
-    async fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
+    /// **Fail-closed** (MYSQL-05): a timed-out or failed `GET_LOCK` returns `Err`, so the
+    /// caller aborts. It used to be downgraded to [`SandboxLease::noop`], which let the
+    /// sandbox run with no cross-process exclusion at all.
+    async fn try_enter(
+        &self,
+        key: SandboxIsolationKey,
+    ) -> agentscope_core::error::Result<SandboxLease> {
         let this = self.clone();
         let acquire_key = key.clone();
         let acquired = tokio::task::spawn_blocking(move || this.try_enter(&acquire_key)).await;
         match acquired {
             Ok(Ok(lease)) => {
-                if let Ok(mut leases) = self.trait_leases.lock() {
-                    leases.entry(key.clone()).or_default().push(lease);
-                }
-                SandboxLease::new(key)
+                // Poison-tolerant: bailing out on a poisoned mutex would drop the concrete
+                // lease (releasing the named lock) and still return `Ok`, i.e. hand the
+                // caller a lease for a lock it no longer holds — the same fail-open this
+                // contract forbids.
+                let mut leases = self
+                    .trait_leases
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                leases.entry(key.clone()).or_default().push(lease);
+                Ok(SandboxLease::new(key))
             }
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, "[mysql-guard] lock not acquired");
-                SandboxLease::noop()
+                tracing::error!(error = %e, "[mysql-guard] lock not acquired");
+                Err(agentscope_core::error::Error::Other(format!(
+                    "MySQL sandbox guard lock not acquired: {e}"
+                )))
             }
             Err(e) => {
                 tracing::error!(error = %e, "[mysql-guard] blocking acquire task failed");
-                SandboxLease::noop()
+                Err(agentscope_core::error::Error::Other(format!(
+                    "MySQL sandbox guard blocking acquire task failed: {e}"
+                )))
             }
         }
     }
 
     async fn release(&self, key: &SandboxIsolationKey) {
-        let dropped =
-            self.trait_leases
+        let dropped = {
+            let mut leases = self
+                .trait_leases
                 .lock()
-                .ok()
-                .and_then(|mut leases| match leases.get_mut(key) {
-                    Some(stack) => {
-                        let lease = stack.pop();
-                        if stack.is_empty() {
-                            leases.remove(key);
-                        }
-                        lease
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match leases.get_mut(key) {
+                Some(stack) => {
+                    let lease = stack.pop();
+                    if stack.is_empty() {
+                        leases.remove(key);
                     }
-                    None => None,
-                });
+                    lease
+                }
+                None => None,
+            }
+        };
         match dropped {
             // Dropping the lease releases the named lock.
             Some(lease) => drop(lease),
-            None => MysqlSandboxExecutionGuard::release(self, key),
+            None => {
+                // No trait-held lease: release only if **this** guard took the lock through
+                // its inherent `try_enter` (local `active` bookkeeping). A guard whose
+                // `try_enter` failed closed never acquired the key and must not release
+                // another holder's `GET_LOCK`.
+                let lock_name = self.compose_lock_name(key);
+                let locally_held = self
+                    .active
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key(&lock_name);
+                if locally_held {
+                    MysqlSandboxExecutionGuard::release(self, key);
+                }
+            }
         }
     }
 
@@ -604,5 +634,52 @@ mod tests {
         assert!(SandboxGuard::is_distributed(&g));
         let object: Arc<dyn SandboxGuard> = Arc::new(guard());
         assert!(object.is_distributed());
+    }
+
+    /// MYSQL-05: acquisition through the harness `SandboxGuard` trait is **fail-closed**. A
+    /// contended (timed-out) `GET_LOCK` must surface as `Err` so `SandboxManager::acquire`
+    /// aborts; the old downgrade to `SandboxLease::noop()` let the sandbox run with no
+    /// cross-process exclusion at all.
+    #[tokio::test]
+    async fn trait_try_enter_fails_closed_on_contention() {
+        let backend = Arc::new(InMemoryLockBackend::default());
+        let holder = MysqlSandboxExecutionGuard::builder(backend.clone()).build();
+        let contender = MysqlSandboxExecutionGuard::builder(backend.clone()).build();
+        let key = SandboxIsolationKey::new("user", "u1");
+
+        let lease = SandboxGuard::try_enter(&holder, key.clone())
+            .await
+            .expect("first acquire");
+        assert!(
+            !lease.is_noop(),
+            "a real lock must never be reported as a no-op lease"
+        );
+
+        let err = SandboxGuard::try_enter(&contender, key.clone())
+            .await
+            .expect_err("a contended acquire must fail closed");
+        assert!(err.to_string().contains("lock not acquired"), "{err}");
+        assert!(SandboxGuard::is_held(&holder, &key));
+
+        // Releasing without a lease must not free another holder's lock.
+        SandboxGuard::release(&contender, &key).await;
+        assert!(
+            SandboxGuard::is_held(&holder, &key),
+            "a failed acquire must not release the winner's lock"
+        );
+
+        SandboxGuard::release(&holder, &key).await;
+        assert!(!SandboxGuard::is_held(&holder, &key));
+        assert_eq!(SandboxGuard::active_count(&holder), 0);
+
+        // The failed attempt left no bookkeeping behind: the contender can take the lock
+        // once the holder is done, and releases it exactly once.
+        let lease = SandboxGuard::try_enter(&contender, key.clone())
+            .await
+            .expect("retry after the holder released");
+        assert!(!lease.is_noop());
+        SandboxGuard::release(&contender, &key).await;
+        assert!(!SandboxGuard::is_held(&contender, &key));
+        assert_eq!(SandboxGuard::active_count(&contender), 0);
     }
 }

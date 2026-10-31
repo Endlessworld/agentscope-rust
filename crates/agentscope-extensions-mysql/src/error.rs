@@ -32,6 +32,23 @@ pub enum MysqlError {
     #[error("timed out waiting for lock: {0}")]
     LockTimeout(String),
 
+    /// A compare-and-set expectation did not match the stored version.
+    ///
+    /// Mirrors Java `MysqlAgentStateStore#updateIfVersion`, which reports the sentinel
+    /// `UNVERSIONED` and never throws: a stale expectation is a normal optimistic-locking
+    /// outcome (re-read and retry), not a caller mistake. The infallible `AgentStateStore`
+    /// path already folds it back into `UNVERSIONED`; this variant is what the fallible
+    /// inherent API returns, so callers can branch on it without parsing the message.
+    #[error("version conflict for key '{key}': expected {expected}, found {found}")]
+    Conflict {
+        /// The key whose expectation failed.
+        key: String,
+        /// The version the caller expected.
+        expected: i64,
+        /// The version found in the store (`0` when the row is missing).
+        found: i64,
+    },
+
     /// Internal consistency failure (e.g. lock bookkeeping).
     #[error("internal error: {0}")]
     Internal(String),

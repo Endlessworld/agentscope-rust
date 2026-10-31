@@ -121,7 +121,7 @@ async fn native_lock_guard_is_the_default() {
 
     let long_value = format!("agent-{}", "y".repeat(120));
     let key = SandboxIsolationKey::new("user", long_value.as_str());
-    let lease = guard.try_enter(key.clone()).await;
+    let lease = guard.try_enter(key.clone()).await.expect("lease");
     assert!(!lease.is_noop(), "GET_LOCK must succeed on a live server");
     guard.release(&key).await;
 }

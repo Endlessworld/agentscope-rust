@@ -30,18 +30,8 @@ use crate::error::{MysqlError, MysqlResult};
 use crate::guard::LockBackend;
 use crate::identifier::validate_identifier;
 use crate::snapshot::SnapshotBackend;
-use crate::state::{CasOutcome, StateBackend};
+use crate::state::{compose_slot_id, slot_id_prefix, CasOutcome, StateBackend};
 use crate::store::SqlBackend;
-
-/// Separator between the user namespace and the session id inside the `session_id` column.
-///
-/// Java's table has no user column (its store is per-tenant); the Rust core trait carries a
-/// user id, so the adapter folds it into the primary key with a control character that
-/// cannot appear in a validated identifier.
-const SESSION_USER_SEPARATOR: char = '\u{1F}';
-
-/// Namespace used when the caller passes no user id (`IsolationScope::Global`).
-const ANON_USER: &str = "__anon__";
 
 /// A `mysql_async` pool plus the runtime that drives it, exposed through the crate's
 /// synchronous backend traits.
@@ -112,22 +102,15 @@ impl MysqlAsyncBackend {
         self.block_on(async { self.pool.get_conn().await }).map_err(driver_error)
     }
 
-    /// Folds the user namespace into the `session_id` column.
+    /// Folds the user namespace into the `session_id` column, exactly like Java
+    /// `MysqlAgentStateStore#slotId` (`normalizeUser(userId) + ":" + sessionId`).
     fn session_key(&self, user_id: Option<&str>, session_id: &str) -> String {
-        let user = match user_id {
-            Some(u) if !u.trim().is_empty() => u,
-            _ => ANON_USER,
-        };
-        format!("{user}{SESSION_USER_SEPARATOR}{session_id}")
+        compose_slot_id(user_id, session_id)
     }
 
-    /// `LIKE` prefix covering every session of one user.
+    /// `LIKE` prefix covering every session of one user, mirroring Java `listSessionIds`.
     fn session_key_prefix(&self, user_id: Option<&str>) -> String {
-        let user = match user_id {
-            Some(u) if !u.trim().is_empty() => u,
-            _ => ANON_USER,
-        };
-        format!("{user}{SESSION_USER_SEPARATOR}")
+        slot_id_prefix(user_id)
     }
 
     /// Database-qualified state table, exactly like Java `MysqlAgentStateStore#getFullTableName`.
