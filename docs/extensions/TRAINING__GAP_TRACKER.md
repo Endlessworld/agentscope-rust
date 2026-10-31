@@ -19,7 +19,7 @@
 | Rust crate | `crates/agentscope-extensions-training` |
 | Rust 规模（2026-10-31 实测） | 5 个源文件；`runner.rs` 2272 行（其余未变：`backend.rs` 748、`lib.rs` 32、`reward.rs` 107、`strategy.rs` 720）；**82 个测试**（2026-10-31：`#[test]` 65 + `#[tokio::test]` 17；分模块 strategy 18 / backend 17 / reward 3 / runner 44） |
 | 迁移波次 | C |
-| 当前状态 | **总判：已完成**（代码面 P0/P1/P2 全清，余 live 联调 P2-1）—— 历史：2026-09-18 收尾（build ✅ / test 64 passed）；2026-10-22 静态复核 2 P0 + 3 P1 + 4 P2 按 §4.2 处理；2026-10-28 实测 74 passed；**2026-10-31 收口：注册表去进程全局化（P2-3）、`shadow_pool_capacity` 接线（P2-2）、`TrainingHook` 卸载（P2-5），源码测试数 82（待实跑确认），并删除测试串行锁** |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 82 passed / 0 failed）—— 代码面 P0/P1/P2 全清（注册表去进程全局化、`shadow_pool_capacity` 接线、`TrainingHook` 卸载、测试串行锁删除）；余 live 联调 P2-1 需环境（非代码缺口）。历史见 history/TRAINING__MIGRATION_HISTORY.md |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -106,11 +106,11 @@
 | backend DTO + client 单测 | *Test | 已完成 | 17 项（backend.rs，含 7 个 `#[tokio::test]`）：DTO snake_case 往返（commit/feedback）、缺省字段不序列化、StatusResponse 反序列化+大小写不敏感成功、endpoint/timeout 校验、loopback mock HTTP（feedback/commit 请求体+非 2xx）、adapter 收集 msg_id / 无 context 警告路径 / 由 base_url 自建模型 |
 | reward 单测 | RewardCalculatorTest | 已完成 | 3 项：闭包代理、Zero 常量、闭包读取 agent 字段 |
 | runner 单测 | *Test | 已完成 | 44 项（runner.rs，含 10 个 `#[tokio::test]`；2026-10-28 新增 8 项：cloner 继承/覆盖、pool 接线、commit 调度两个、hook 装配与有/无绑定两种路径；**2026-10-31 新增 8 项**：注册表实例隔离/global 单例×2、router 默认隔离注册表、队列容量准入×2、hook 禁用直通、`stop()` 禁用已装 hook）：RunExecutionContext（收集/空 id panic/eq/display/set_messages）、RunRegistry（自增/清理/空 id panic/cleanup_old_tasks）、TaskExecutionRegistry（注册/排序/空查询/统计/ids/cleanup）、TaskIdGenerator、TrainingConfig（默认/校验/可选 setter/repeatTime/sampleRate）、TrainingRunner（builder 校验/start-stop 幂等/混用忽略）、router（recursion/sampling/explicit）、AgentCloner+ShadowAgentSpec、run_shadow 未选中短路 |
-| **合计** | | | **82 passed / 0 failed**（2026-10-31 源码计数：`#[test]` 65 + `#[tokio::test]` 17 = 82；分模块 strategy 18 / backend 17 / reward 3 / runner 44；无 `#[ignore]`，无 doc-test。2026-10-28 基线 74，本轮 +8。**待主智能体实跑确认**） |
+| **合计** | | | **82 passed / 0 failed**（2026-10-31 源码计数：`#[test]` 65 + `#[tokio::test]` 17 = 82；分模块 strategy 18 / backend 17 / reward 3 / runner 44；无 `#[ignore]`，无 doc-test。2026-10-28 基线 74，本轮 +8。2026-10-31 主智能体实测确认） |
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
-- **状态：已完成（2026-10-31 收口）**：截至 2026-10-28 除 P0-1（实测 Java 亦无非缺口）、P1-3（设计决定）、P2-1（live 待条件）、P2-2/P2-3 外已全部关闭；**2026-10-31 又关闭 P2-2（`shadow_pool_capacity` 接线）、P2-3（注册表去进程全局化）、P2-5（`TrainingHook` 卸载）与 见 history/TRAINING__MIGRATION_HISTORY.md 测试串行锁**，源码测试数 82（待主智能体实跑确认）。21 个 Java 类全部有 Rust 对应（详见 §2），划分为 4 个模块：
+- **状态：已完成（2026-10-31 收口）**：截至 2026-10-28 除 P0-1（实测 Java 亦无非缺口）、P1-3（设计决定）、P2-1（live 待条件）、P2-2/P2-3 外已全部关闭；**2026-10-31 又关闭 P2-2（`shadow_pool_capacity` 接线）、P2-3（注册表去进程全局化）、P2-5（`TrainingHook` 卸载）与 见 history/TRAINING__MIGRATION_HISTORY.md 测试串行锁**，源码测试数 82（2026-10-31 实测）。21 个 Java 类全部有 Rust 对应（详见 §2），划分为 4 个模块：
   - `strategy.rs`：`TrainingAnnotation`(+Builder)/`TrainingContext`/`SelectionDecision`/`TrainingSelectionStrategy`(trait)/`SamplingRateStrategy`/`ExplicitMarkingStrategy`/`is_expired`
   - `reward.rs`：`RewardCalculator`(trait) + `FnRewardCalculator` + `ZeroRewardCalculator`
   - `backend.rs`：`dto::{CommitRequest,FeedbackRequest,StatusResponse}` + `TrinityClient`(+Builder) + `TrinityModelAdapter`(+Builder)
@@ -120,7 +120,7 @@
   - `cargo test -p agentscope-extensions-training` → **64 passed; 0 failed**（2026-09-18 基线；经 见 history/TRAINING__MIGRATION_HISTORY.md 增至 66，2026-10-28 增至 **74**，见下行）
   - 首轮基线 37 passed；本轮补齐 27 个离线单测（无网络、无 Trinity 依赖）。
   - **2026-10-28 复验**：`cargo build -p agentscope-extensions-training` → exit 0（本 crate 无新警告）；`cargo test -p agentscope-extensions-training` → **74 passed / 0 failed**（lib 74，doc-test 0）；连跑 3 次一致。新增 8 项测试见 history/TRAINING__MIGRATION_HISTORY.md。
-  - **2026-10-31 收口（未实跑，按硬约束由主智能体统一验证）**：源码测试函数 82（`#[test]` 65 + `#[tokio::test]` 17），本 crate 改动仅 `src/runner.rs`；`registry_test_lock` 已删除，测试之间不再共享任何进程全局可变状态。待主智能体跑 `cargo test -p agentscope-extensions-training`（建议 `-j 2` 连跑 2-3 次）确认。
+  - **2026-10-31 收口（已实测）**：源码测试函数 82（`#[test]` 65 + `#[tokio::test]` 17），本 crate 改动仅 `src/runner.rs`；`registry_test_lock` 已删除，测试之间不再共享任何进程全局可变状态。主智能体实测 `cargo test -p agentscope-extensions-training` = **82 passed / 0 failed**（`-j 2`）。
   - 静态复核（2026-10-22，未编译）：源码内 `#[test]` 57 + `#[tokio::test]` 7 = **64**，与声明一致；无 `#[ignore]`、无 doc-test 块，故「64 test 通过」与代码一致（未重跑 cargo）。
 - **复用既有 trait（未重建平行类型）**：
   - `core::Model` trait：`TrinityModelAdapter` 实现它并委派内层 `Arc<dyn Model>`（组合模式，对齐 Java）。

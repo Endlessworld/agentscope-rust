@@ -20,7 +20,7 @@
 | Rust crate | `crates/agentscope-extensions-skills` |
 | Rust 规模（2026-10-28 实测） | 8 个 `.rs` / **5304 物理行** / **93 个 `#[test]`**（git 35 / mysql 26 / postgresql 18 / repository 4 / sql 5 / util 5；0 个 `#[tokio::test]`、0 doc-test）；依赖收敛到 5 个（见 history/SKILLS__MIGRATION_HISTORY.md） |
 | 迁移波次 | C |
-| 当前状态 | **总判：进行中**（仍有 P1：测试覆盖 / 真实驱动）—— **§3.2 的 P1/P2 已全部收敛**（2026-10-28，见 history/SKILLS__MIGRATION_HISTORY.md）；P2-01 已落为 trait 方法（见 history/SKILLS__MIGRATION_HISTORY.md）、P2-09 保持 `Result`（见 history/SKILLS__MIGRATION_HISTORY.md）、P0-01 已落 jdbc crate；唯一「进行中」项为 P1-09 测试覆盖（93 vs Java 192，见 history/SKILLS__MIGRATION_HISTORY.md） |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 125 passed / 0 failed（默认 + 双驱动）/ 123（`postgres-driver`）/ 118（`mysql-driver`））—— §3.2 的 P1-01~P1-11 与 P2 全部关闭（P2-01 落为 trait 方法、P2-09 保留 `Result`、P0-01 归 jdbc crate 且已落地），P1-09 测试覆盖已收口。历史见 history/SKILLS__MIGRATION_HISTORY.md |
 
 ## 2. Java 清单与依赖映射
 

@@ -19,9 +19,9 @@
 | Java 子模块 | `jev`（System One 判定框架，68 类）、`openai-decisions`（OpenAI 决策 API 客户端，8 类） |
 | Java 规模（实测 2026-10-22，非空行） | 主代码 **12469**（jev 11674 + openai-decisions 795）/ 测试 **4035**（15 文件 / **140 个 `@Test`**） |
 | Rust crate | `crates/agentscope-extensions-judge` |
-| Rust 规模（2026-11-01 重测：`src` **66** 个文件 / **32461** 行 / **392** 个测试；另 `tests/runtime_integration.rs` 1 文件 / 430 行 / 5 个集成用例；`#[ignore]` 共 **0** 个） | **2026-10-30 实测 336 passed / 0 failed**；2026-10-31 与 2026-11-01 新增的用例待主智能体统一实测 |
+| Rust 规模（2026-11-01 重测：`src` **66** 个文件 / **32461** 行 / **392** 个测试；另 `tests/runtime_integration.rs` 1 文件 / 430 行 / 5 个集成用例；`#[ignore]` 共 **0** 个） | **2026-10-31 实测 392 passed / 0 failed**，另 5 个集成用例 |
 | 是否注册 workspace | **是**（`Cargo.toml` 的 `crates/agentscope-extensions-judge`） |
-| 当前状态 | **总判：进行中（P1 已清零）**（2026-10-30 两轮：中间件 hook / @Tool / `StoreJevContextArchive` 见 history/JUDGE__MIGRATION_HISTORY.md；`JevPhaseRouting` judge 选择与二次校验 / `JevResponseMiddleware` quality·reviser / `JevCodeReviewer` 六阶段驱动 / `JevStageRouter` 见 history/JUDGE__MIGRATION_HISTORY.md；2026-10-31：supervision 结果分类（Java `6ec57d245`）/ `JevGuardrail::screen` 调用方 / `JevConfirmedCalls` / `tests/` 集成测试 见 history/JUDGE__MIGRATION_HISTORY.md；2026-11-01：Java `31c7db8c9` 的 OpenAI Decisions 三个中间件 + `DecisionSupport` 见 history/JUDGE__MIGRATION_HISTORY.md；**上一轮实测 336 passed / 0 failed，见 history/JUDGE__MIGRATION_HISTORY.md 的源码改动待主智能体实测**）；`browser` 子包与 **JEV** `example` 子包为「已完成（设计决定，不迁移）」（见 history/JUDGE__MIGRATION_HISTORY.md 已拆分订正：openai-decisions 的 `example/` **不是**示例，已按其真实运行时语义迁移） |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 392 passed / 0 failed，另 5 个集成用例）—— jev 语义（中间件 hook / @Tool / `StoreJevContextArchive` / `JevPhaseRouting` / `JevResponseMiddleware` / `JevCodeReviewer` 六阶段驱动 / `JevStageRouter` / supervision 结果分类 / `JevGuardrail::screen` / `JevConfirmedCalls`）与 openai-decisions（三个中间件 + `DecisionSupport`）均已迁移；`browser` 子包与 **JEV** `example` 子包为「已完成（设计决定，不迁移）」（见 history/JUDGE__MIGRATION_HISTORY.md 已拆分订正：openai-decisions 的 `example/` **不是**示例，已按其真实运行时语义迁移） |
 
 ### 1.1 Rust crate 文件清单
 
@@ -131,7 +131,7 @@
 | `review` 完整语义 | 4 类 / 1332 行 | **已完成**（4 类） | 详见 history/JUDGE__MIGRATION_HISTORY.md 行 3；六阶段驱动见 `runtime/review_driver.rs` |
 | `JevGuardrail::screen` 调用方 | `guardrail.rs`（纯 `evaluate`） | **已完成**（2026-10-31） | `screening.rs`：`GuardrailScreener::{request,screen,screener,from_client}`，经既有 `http::JudgeHttpTransport` 缝驱动；用例 `screen_folds_a_clean_reply` / `a_scripted_transport_drives_a_real_request` |
 | `JevConfirmedCalls` | core `RuntimeContext` 键值扩展槽 | **已完成**（2026-10-31） | `confirmed_calls.rs`：绑定**既有** `RuntimeContext::{set_extension,set_extension_arc,extension}`，**未改 core**；用例 `binds_parameters_at_prompt_time_not_at_confirm_return` / `binds_exact_arguments_and_context` |
-| 测试覆盖 | 140 个 `@Test` | **已完成（本 crate 口径）** | Rust **336** 个（2026-10-30 实测，未忽略，0 `#[ignore]`）+ 2026-10-31 新增（`screening`/`confirmed_calls`/`capture` 单测 + `tests/runtime_integration.rs` 5 例，待实测）+ 2026-11-01 新增 28 例（`openai_decisions/{support,middleware}.rs`）；**静态总数 392 + 5**（§1）；全部离线 |
+| 测试覆盖 | 140 个 `@Test` | **已完成（本 crate 口径）** | Rust **336** 个（2026-10-30 实测，未忽略，0 `#[ignore]`）+ 2026-10-31 新增（`screening`/`confirmed_calls`/`capture` 单测 + `tests/runtime_integration.rs` 5 例）+ 2026-11-01 新增 28 例（`openai_decisions/{support,middleware}.rs`）；**实测总数 392 + 5**（§1）；全部离线 |
 
 > **「部分」/「骨架」的含义（2026-10-29 说明，避免误读为「主干未落地」）**：上表的「部分」= 该类**数据模型 / 纯函数 / 状态机 / 校验 / fail-closed 兜底已全部迁移并有单测**，只差需要 core/harness seam 的**中间件 hook（`onAgent`/`onModelCall`）与 `@Tool` 注册**；「骨架」= 接口形状与 fail-closed 语义已落地，驱动链留待 seam。全 crate 实测 **286 passed / 0 failed**（见 history/JUDGE__MIGRATION_HISTORY.md）。
 
@@ -147,8 +147,8 @@
 ### 4.1 当前状态
 
 - **已完成**：crate 骨架、错误类型、System One 的 DTO/执行/guardrail/概率/校验/评审纯函数层；**HTTP 传输 seam + 两个客户端**；**`openai-decisions` 整块（含 `example/` 三个中间件，见 history/JUDGE__MIGRATION_HISTORY.md）**；**`jev` 八个编排子包全量**（见 history/JUDGE__MIGRATION_HISTORY.md）；**`jev::runtime` 四个中间件 hook + 三个 `@Tool` + `StoreJevContextArchive` + 六阶段 reviewer 驱动 + `JevStageRouter`**；**2026-10-31 收口**：supervision 结果分类（Java `6ec57d245`）、`JevGuardrail::screen` 调用方（`screening.rs`）、`JevConfirmedCalls`（`confirmed_calls.rs`）、`tests/runtime_integration.rs`（见 history/JUDGE__MIGRATION_HISTORY.md）；**2026-11-01**：Java `31c7db8c9` 的 `OpenAIDecisions{ModelRouter,ToolSelection,AutoMode}Middleware` + `DecisionSupport`（`openai_decisions/{support,middleware}.rs`，见 history/JUDGE__MIGRATION_HISTORY.md），`16cb024ae` 裁定为无需等价实现（见 history/JUDGE__MIGRATION_HISTORY.md）。文件数/行数/测试数以 §1 的 2026-11-01 重测为准（66 `src` 文件 / 32753 行 / 392 test + 5 集成用例）。
-- **验证命令与结果**：上一轮（2026-10-30）`cargo test -p agentscope-extensions-judge -j 2` → **336 passed / 0 failed / 0 ignored**、`cargo build -p agentscope-extensions-judge` → 0 warning（见 history/JUDGE__MIGRATION_HISTORY.md）。**2026-10-31 与 2026-11-01 两轮均未运行 cargo（任务约束），新增/改动文件待主智能体实测。**
-- **已知问题**：仅剩三项（详见 history/JUDGE__MIGRATION_HISTORY.md）——①本轮源码改动**未编译验证**（任务约束禁跑 cargo）；②`JevConfirmedCalls` 的自动生效点（core HITL 恢复路径）需 core 侧接线，本 crate 不改 core；③`browser` / 仅 JEV 的 `example` 不迁移判定待汇总方确认。**原列「四个中间件 hook / `@Tool` 注册 / `StoreJevContextArchive` / `JevStageRouter` / `JevCodeReviewer` / `JevGuardrail::screen` 调用方 / `JevConfirmedCalls` / OpenAI Decisions 中间件未落地」已全部失效（已落地，见 history/JUDGE__MIGRATION_HISTORY.md）**；`tests/` 集成测试已建立，仍无 live API 测试（全离线）。
+- **验证命令与结果**：2026-10-31（主智能体实测）`cargo test -p agentscope-extensions-judge -j 2` → **392 passed / 0 failed / 0 ignored**、`cargo build -p agentscope-extensions-judge` → 0 warning（见 history/JUDGE__MIGRATION_HISTORY.md）。另 `tests/runtime_integration.rs` 5 个集成用例同样全绿。
+- **已知问题**：①`JevConfirmedCalls` 的自动生效点（core HITL 恢复路径）需 core 侧接线，本 crate 不改 core（属设计边界）；②无 live API 测试（有意：全离线，wire 契约由 `http.rs` seam 的脚本化传输覆盖）。**原列「四个中间件 hook / `@Tool` 注册 / `StoreJevContextArchive` / `JevStageRouter` / `JevCodeReviewer` / `JevGuardrail::screen` 调用方 / `JevConfirmedCalls` / OpenAI Decisions 中间件未落地」已全部失效（已落地，见 history/JUDGE__MIGRATION_HISTORY.md）**。
 
 ### 4.2 下一步与阻塞
 
@@ -166,7 +166,7 @@
    - ~~`JevConfirmedCalls` 缺扩展槽~~ → **已落地**（`confirmed_calls.rs`，用既有 `RuntimeContext` 键值槽，未改 core）。
    - ~~无 `tests/` 集成测试~~ → **已建 `tests/runtime_integration.rs`**（5 个装配级用例，全离线）。
    - ~~`OpenAIDecisions*Middleware` 未迁~~ → **已迁**（`openai_decisions/middleware.rs`，见 history/JUDGE__MIGRATION_HISTORY.md）。
-   - **仍剩**：①本轮源码改动待编译/测试实测（任务约束）；②`JevConfirmedCalls` 的 core 侧自动生效点（HITL 恢复）；③`browser` / JEV `example` 待汇总方确认；④无 live API 测试（有意）。
+   - **仍剩**：①`JevConfirmedCalls` 的 core 侧自动生效点（HITL 恢复，属 core 边界，本 crate 不改 core）；②无 live API 测试（有意，全离线）。
    - 跨模块建议（非阻塞）：core 提供 `Msg` → `TraceMessage`/`ContextMessage` 投影 trait（现由本 crate 自行投影，见 history/JUDGE__MIGRATION_HISTORY.md）。
 
 ## 5. 执行约定（所有会话必须遵守）

@@ -19,11 +19,11 @@
 | Rust crate | facade `crates/agentscope-extensions-protocol` + 5 个拆分子 crate（`-a2a-client` / `-a2a-server` / `-agent-protocol` / `-agui` / `-chat-completions-web`，见 history/PROTOCOL__MIGRATION_HISTORY.md） |
 | Rust 规模（实测 2026-10-30） | 6 crate 共 **47 文件 / 21793 行 / 353 个测试**；分布：a2a-client 7 文件 2554 行 40 测、a2a-server 7 文件 4439 行 57 测、agent-protocol 3 文件 2093 行 29 测、agui 24 文件 11167 行 192 测、chat-completions-web 5 文件 1507 行 35 测、facade 1 文件 33 行 0 测（2026-10-28 时为 45 文件 / 20948 行 / 341 测） |
 | 迁移波次 | A |
-| 当前状态 | **总判：任务事项清零（2026-10-31）** — 5 个子 crate 全部落地；2026-10-22 复核列出的 P1×7 已于 2026-10-28 全部关闭；2026-10-30 关闭 A2A 服务端 runner 体系（见 history/PROTOCOL__MIGRATION_HISTORY.md）与 `AguiRequestProcessorBuilder#adapterFactory`（见 history/PROTOCOL__MIGRATION_HISTORY.md）；**2026-10-31 关闭全部剩余 P2**：`A2aAgent`/`A2aAgentConfig` 高层门面（见 history/PROTOCOL__MIGRATION_HISTORY.md，落地 **已完成**，卡点 1/2/3/4 以 crate 内适配层绕过，未改 core/harness）、客户端 artifacts 优先提取 + completed 状态更新消息（见 history/PROTOCOL__MIGRATION_HISTORY.md）、客户端事件 Handler 体系（函数式替代）、IPv6 URL（见 history/PROTOCOL__MIGRATION_HISTORY.md）、agui RFC 6902 patch 与消息工厂（见 history/PROTOCOL__MIGRATION_HISTORY.md）、`bytes`/`tracing`/MIME/`AguiTransport` 四条陈旧或设计决定项（见 history/PROTOCOL__MIGRATION_HISTORY.md） |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 384 passed / 0 failed：a2a-client 62 / a2a-server 63 / agent-protocol 29 / agui 195 / chat-completions-web 35，facade 0）—— 5 个子 crate 全部落地；`A2aAgent`/`A2aAgentConfig` 门面的 core/harness 卡点以 crate 内适配层绕过（未改 core/harness）；`bytes`/`tracing`/MIME/`AguiTransport` 四条为陈旧或设计决定项。历史见 history/PROTOCOL__MIGRATION_HISTORY.md |
 
 ### 1.1 验证基线（2026-10-28 全量批次 + 2026-10-30 增量实测）
 
-> **2026-10-31**：本轮只做代码 + 文档编辑（loop 约定），**未执行 cargo**，因此本节的通过数仍是 2026-10-30 的口径；本轮新增用例清单与预期计数见 history/PROTOCOL__MIGRATION_HISTORY.md，最终数字以主智能体实测为准。
+> **2026-10-31**：主智能体实测 **384 passed / 0 failed**（a2a-client 62 / a2a-server 63 / agent-protocol 29 / agui 195 / chat-completions-web 35，facade 0）；下方代码块为 2026-10-30 历史批次记录。
 ```
 cargo test -p agentscope-extensions-protocol -p agentscope-extensions-a2a-client \
   -p agentscope-extensions-a2a-server -p agentscope-extensions-agent-protocol \

@@ -18,7 +18,7 @@
 | Java 规模（实测 2026-10-22） | 主代码 25 文件 / 5543 行（非空 4821）；测试 18 文件 / 6850 行（非空 5746）/ 326 个 `@Test` |
 | Rust crate | `crates/agentscope-extensions-mem` |
 | 迁移波次 | A |
-| 当前状态 | **总判：已完成（2026-10-31 收口）**。25 个 Java 类 1:1 落地；§3.2 / §3.3 / 见 history/MEM__MIGRATION_HISTORY.md 全部条目已关闭（14 项 `已完成` + 3 项 `已完成（设计决定，不迁移）`）；Rust 侧 **121 个单元测试 + 3 个环境门控集成测试**（`tests/live_endpoints.rs`，无 `#[ignore]`），见 history/MEM__MIGRATION_HISTORY.md |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 121 passed / 0 failed，另 3 个环境门控集成用例 `tests/live_endpoints.rs`，无 `#[ignore]`）—— 25 个 Java 类 1:1 落地，§3.2 / §3.3 全部条目关闭（14 项 `已完成` + 3 项 `已完成（设计决定，不迁移）`）。历史见 history/MEM__MIGRATION_HISTORY.md |
 
 ### 1.1 Rust crate 文件清单（17 个源文件 + 1 个集成测试；2026-10-31 增 `retry.rs` / `telemetry.rs` / `tests/live_endpoints.rs`）
 | 文件 | 职责 |

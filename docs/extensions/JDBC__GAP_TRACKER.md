@@ -18,7 +18,7 @@
 | Java 规模（实测，2026-10-22 静态复核） | 主代码 **5265 非空行 / 5731 物理行**（24 个 `.java`）/ 测试 **4406 非空行 / 4907 物理行**（19 个 `.java`；**175** 个 `@Test` + **5** 个 `@ParameterizedTest`（执行次数远多于 5），`H2TestSupport` 为支撑类无 `@Test`）。**注**：Java 侧含 `skill` 包（3 个主类 1313 非空行 / 4 个测试类 37 个 `@Test`），Rust 侧**完全缺失**，见 §3.5 |
 | Rust crate | `crates/agentscope-extensions-jdbc` |
 | 迁移波次 | B |
-| 当前状态 | **总判：已收口（2026-10-31 二轮）**。执行后端齐备：`backend::RusqliteExecutor`（默认）+ `PostgresExecutor`（`postgres-executor`）+ **`MysqlExecutor`（`mysql-executor`，本轮新增）**；真实库集成测试全部 **env 门控**（PG `AGENTSCOPE_TEST_POSTGRES_URL` 5 条、MySQL `AGENTSCOPE_TEST_MYSQL_URL` 8 条），无 `#[ignore]`。历史基线（2026-10-28）：`cargo test` = **217 passed / 0 failed**；本轮离线新增：`driver/mysql.rs` 内联 4 条、`tests/distributed_store_tests.rs` +1、`tests/mysql_integration_tests.rs` 8 条（仅 `--features mysql-executor` 时编译）。剩余 P2 仅为 dead_code helper 与跨语言表名/表组差异（见 §4.2）。核实证据与口径见 history/JDBC__MIGRATION_HISTORY.md 与文末「二轮收口记录」 |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 217 passed / 0 failed（默认）/ 271（`postgres-executor + mysql-executor`），其中环境门控集成 PG 5 条、MySQL 8 条，无 `#[ignore]`）—— 执行后端齐备：`backend::RusqliteExecutor`（默认）+ `PostgresExecutor`（`postgres-executor`）+ `MysqlExecutor`（`mysql-executor`）；P2 余项仅 dead_code helper 与跨语言表名/表组差异（见 §4.2）。证据与口径见 history/JDBC__MIGRATION_HISTORY.md |
 
 ### 1.1 基线（开工/完工实测）
 | 项 | 开工基线 | 完工基线 |

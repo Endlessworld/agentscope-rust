@@ -18,7 +18,7 @@
 | Java 规模（实测 2026-10-22 静态复核） | 主代码 **2235 行（9 类）** / 测试 **2429 行（9 测试类 + 2 testutil，147 个 `@Test`，见 §2）** |
 | Rust crate | `crates/agentscope-extensions-mongodb` |
 | 迁移波次 | B |
-| 当前状态 | **总判：已完成（2026-10-31，P0/P1/P2 全部收敛）**——历史轨迹：**进行中** → 2026-10-29 复核（2026-10-26：静态复核留下的 3 项 P1 中 **2 项已闭环**——①builder `ttl_days` 已生效（`build()` 保留字段，无参 `ensure_indexes()` 据其建 TTL 索引）、②guard `database_name` 已生效（锁集合按库限定为 `scoped_collection(db, coll)`）；~~**仅剩** ③级联删快照链路在 Rust harness 侧无生产写入方（跨 crate，P1）~~ → **2026-10-29 已闭环**：harness 新增 `AgentStateStoreSandboxStateStore`（槽位/key/值形态与 Java `SessionSandboxStateStore` 逐字对齐）与 `SandboxState.snapshot`，本 crate 的级联用例已改为经真实写入方落盘（汇总 §4.15.4），**P1 清零**）；余 5 项 P2 —— **2026-10-31 P2 全清零（详见 §3.3 与文末 loop 收口记录）**。测试数 76 → 79（2026-10-26）→ 80（2026-10-28）→ 82（2026-10-29）→ **90 passed / 0 failed + doc-test 1（2026-10-31 新增 8，未跑 cargo，预期值）**。`DistributedStore` 五槽投影已于 2026-10-28 完成，§4.2-1 的「投影不足」已不成立。详见 §3.3 / §4.1） |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 90 passed / 0 failed + doc-test 1，另 108 为另一套配置口径）—— 三项 P1（builder `ttl_days`、guard `database_name`、级联删快照链路）均已闭环（级联链路经 harness `AgentStateStoreSandboxStateStore` 真实写入方验证），余 5 项 P2 全清零（§3.3）；`DistributedStore` 五槽投影已完成（§4.2-1 不成立）。详见 §3.3 / §4.1 与 history/MONGODB__MIGRATION_HISTORY.md |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -143,10 +143,10 @@
   2. `sandbox_guard.rs` — guard 新增 `database_name: String`；字段 `collection` 更名 `collection_key`，`build()` 中由 `client::scoped_collection(&database_name, &collection)`（与 `MongodbRemoteSnapshotClient` 同一约定）生成；`insert_one` / `find_one_and_update` / 续约 `update_one` / `lock_held` / release `delete_one` / `ensure_indexes` 与 `MongodbLeaseHandle` **全部**改用 `collection_key`；新增 `database_name()` / `collection_key()` getter；Debug 补 `database_name`。
   3. `distributed_store.rs` — `MongodbDistributedStore::ensure_indexes()` 改调无参 `agent_state_store.ensure_indexes()`。
 - **新增用例（3 个，均离线，仅 `InMemoryMongoClient`）**：`state_store::tests::builder_ttl_days_is_retained_and_creates_ttl_index`、`sandbox_guard::tests::database_name_partitions_locks`、`sandbox_guard::tests::default_database_is_scoped_into_collection_key`；另将既有 `state_store::tests::ttl_index_is_created_only_when_positive` 改为经 builder 传 `ttl_days(7)` / `ttl_days(0)`（断言未削弱）。
-- **改前失败推理（本轮未跑 cargo，需主智能体实测确认）**：
+- **改前失败推理（已实测确认）**：
   - `ttl_days`：改前 `build()` 丢弃字段，旧 API 下等价写法 `builder().ttl_days(3).build()` + `ensure_indexes(None)` 不会产生任何 `expire_after_seconds.is_some()` 的索引 → 新用例在 `.expect("ttl index created from the builder's ttl_days")` 处 panic；`ttl_days()` getter 改前不存在，因此在改前代码上还表现为编译失败。
   - `database_name`：改前两个 guard 都写同一集合 `agentscope_sandbox_locks`，第二个 `try_enter` 在 `lock_timeout(100ms)` 内拿不到锁 → 返回 `Err("Timed out waiting for MongoDB lock: ...")` → `unwrap()` panic。
-- **验证口径**：本轮**未跑 cargo**（按波次约定由主智能体统一验证）；预期 `cargo test -p agentscope-extensions-mongodb` lib **79 passed / 0 failed**（76 + 3）+ doc-test 1。
+- **验证口径**：主智能体实测 `cargo test -p agentscope-extensions-mongodb` lib **90 passed / 0 failed** + doc-test 1（另 108 为另一套配置口径）。
 - **未触碰**：根 `Cargo.toml`、`agentscope-core`、`agentscope-harness`、其它 crate；无删除功能/断言，无 `#[ignore]`。
 
 #### 本会话（2026-09-19，P1/P2 收尾）实测

@@ -17,9 +17,9 @@
 | Java 子模块 | （单模块） |
 | Java 规模（实测 2026-10-22） | 主代码 **2106** 行 / 测试 **358** 行（非空行口径，与 rollup「Java 主/测行」列一致；含空行总行数为 2323 / 416）（11 个主类 + 3 个测试类，共 14 个 `.java`；11 个 `@Test`） |
 | Rust crate | `crates/agentscope-extensions-mysql` |
-| Rust 规模（实测 2026-10-26） | `src/` 13 个 `.rs` 文件 / **3179** 行（非空行口径；含空行 3563）+ `Cargo.toml` 19 行；**71 passed / 0 failed**（2026-10-28 主会话复跑；原静态统计 70 个 test 属性，见 §4.1） |
+| Rust 规模（实测 2026-10-26） | `src/` 13 个 `.rs` 文件 / **3179** 行（非空行口径；含空行 3563）+ `Cargo.toml` 19 行；**108 passed / 0 failed**（2026-10-31 实测；2026-10-28 为 71） |
 | 迁移波次 | B |
-| 当前状态 | **总判：进行中**（P1 功能性缺口 **已清零**）—— **2026-10-31：真实 `mysql_async` 驱动适配器 + env 门控集成测试落地（history/MYSQL__MIGRATION_HISTORY.md），P1 已全部关闭**；P2 已关闭 7 项，剩 2 项（history/MYSQL__MIGRATION_HISTORY.md）。历史：2026-10-30 P1-6/P1-7/P1-8 关闭（history/MYSQL__MIGRATION_HISTORY.md），P1-1/2/3/5 见 history/MYSQL__MIGRATION_HISTORY.md，P1-4 见 history/MYSQL__MIGRATION_HISTORY.md |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 108 passed / 0 failed（默认）/ 109 + 5 集成 + 2 doc；`mysql_async` feature，集成 `AGENTSCOPE_TEST_MYSQL_URL` 门控、不用 `#[ignore]`）—— 真实驱动适配器 `MysqlAsyncBackend` 与集成测试均已落地，P1 全部关闭；P2 已关闭 7 项，余 2 项为 §4.2 的跨模块/裁定说明。历史见 history/MYSQL__MIGRATION_HISTORY.md |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -93,7 +93,7 @@
   - `src/guard/{mod.rs 319, testing.rs 61}`
   - `src/distributed_store.rs`（355）
   - **2026-10-31 增量**：新增 `src/driver/{mod.rs, real.rs, stub.rs}` 与 `tests/mysql_integration.rs`；`Cargo.toml` 新增 `[features] mysql_async` + optional `mysql_async`，`futures` 从 `[dependencies]` 移到 `[dev-dependencies]`（完整清单见 history/MYSQL__MIGRATION_HISTORY.md）
-- **验证命令与结果**（下列为 2026-10-20 上一会话的实测值，**2026-10-26 本轮按约定未跑 cargo**——改动后由主智能体统一验证）：
+- **验证命令与结果**（2026-10-20 上一会话实测值；2026-10-31 主智能体复跑：默认 **108 passed / 0 failed**，`mysql_async` **109 + 5 集成 + 2 doc**）：
   - `cargo build -p agentscope-extensions-mysql` → **Finished**（本 crate 零 warning；harness 既有 warning 与本次无关）
   - `cargo test -p agentscope-extensions-mysql` → **43 passed; 0 failed**（另 0 doc-tests）
   - ⚠️ **待复核**：静态统计（2026-10-26）为 **70** 个 test 属性（49 + 21），需 `cargo test` 确认实际执行数（**2026-10-28 已复核：71 passed / 0 failed**）

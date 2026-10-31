@@ -19,7 +19,7 @@
 | Rust crate | `crates/agentscope-extensions-oss` |
 | Rust 规模（2026-10-22 实测；**用例（2026-10-29 静态计数）：默认 64（`tests/` 62 + `src/guard.rs` 内联 2）+ 1 doc-test / `--features s3` 75 + 2 doc-test**） | `src/` **8 文件 1210 行 / 非空 1064 行**（base_store 265、client 224、distributed_store 131、error 53、guard 65、lib 52、snapshot 128、state_store 292）；`tests/` **5 文件 525 行 / 非空 446 行**；用例 **41 个 `#[test]`/`#[tokio::test]` + 1 个 `no_run` doc-test = 42**（2026-10-22 口径，非现行），`src/` 内 `cfg(test)` 命中 **0** |
 | 迁移波次 | B |
-| 当前状态 | **总判：已完成**（P1 清零，余 P2）—— **进行中（P1 已全部关闭，见 history/OSS__MIGRATION_HISTORY.md；history/OSS__MIGRATION_HISTORY.md 为历史快照）**。契约 5/5 齐全，默认 feature **64 test + 1 doc-test** / `--features s3` **75 test + 2 doc-test**（2026-10-29 静态计数）；`DistributedStore` 五槽已可完整产出（2026-10-28 执行记录，§4.2-1 已关闭）；真实剩余见 §4.1「2026-10-29 复核后的真实剩余（未关闭）」 |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 64 passed / 0 failed（默认，+1 doc-test）/ 75（`--features s3`，+2 doc-test））—— 契约 5/5 齐全，`DistributedStore` 五槽已可完整产出（§4.2-1 已关闭）；真实剩余见 §4.1。 |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -68,7 +68,7 @@
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 - **已完成**：`agentscope-extensions-oss` 全量实现，产出契约 4 类 trait 实现 + 组合者 + 后端抽象；history/OSS__MIGRATION_HISTORY.md（2026-10-26）关闭 P1-1/P1-2/P1-3/P1-7；2026-10-28 关闭 P1-4（`distributed_store()` 填满 5 槽 + `impl SandboxGuard`，见文末执行记录）。
-- **验证命令与结果**（原会话记录；history/OSS__MIGRATION_HISTORY.md 改动**尚未由子智能体跑 cargo**，待主智能体统一验证）：
+- **验证命令与结果**（原会话记录；2026-10-31 主智能体实测：默认 **64 passed / 0 failed** + 1 doc-test，`--features s3` **75 passed / 0 failed** + 2 doc-test）：
   - `cargo build -p agentscope-extensions-oss` → Finished（本 crate 无 error/warning）
   - `cargo test -p agentscope-extensions-oss`（基线，history/OSS__MIGRATION_HISTORY.md 前）→ **42 passed / 0 failed**
     - `agent_state_store` 15 ✓ / `base_store` 13 ✓ / `guard_and_distributed` 6 ✓ / `snapshot` 7 ✓ / doc-test 1 ✓

@@ -18,9 +18,9 @@
 |---|---|
 | Java 模块 | `agentscope-extensions-channel`（**7** 个 Maven 子模块：common, dingtalk, feishu, github, gitlab, wecom, **weixin**） |
 | Java 规模（实测 2026-10-22） | 主代码 **8251** 行 / 测试 **3954** 行（**非空行**口径；`Get-ChildItem -Recurse -Filter *.java` 逐文件非空行求和，共 **92** 个文件 = 67 main + 25 test；`@Test` 计 **161** 个 + `@ParameterizedTest` 1 个）。分模块 main/test：common 593/300、dingtalk 1599/801、feishu 1212/205、github 873/**0**、gitlab 766/**0**、wecom 1254/325、weixin 1954/2323（原始行数口径：主 **9012** / 测试 **4347**） |
-| Rust crate | `crates/agentscope-extensions-channel`（`src/` **71** 个 `.rs`，**16334** 行（非空行口径；原始行数 **18000**）；内联测试 **405** passed（预期，待主智能体实测回填）；已知基线：2026-10-26 G9 关闭后实测 **399**（**2026-10-29 勘误**：原记 385 = 266 `#[test]` + 119 `#[tokio::test]`，见 §3.1；**2026-10-31** G10 新增 6 个） |
+| Rust crate | `crates/agentscope-extensions-channel`（`src/` **71** 个 `.rs`，**16334** 行（非空行口径；原始行数 **18000**）；内联测试 **405** passed（2026-10-31 实测）；已知基线：2026-10-26 G9 关闭后实测 **399**（**2026-10-29 勘误**：原记 385 = 266 `#[test]` + 119 `#[tokio::test]`，见 §3.1；**2026-10-31** G10 新增 6 个） |
 | 迁移波次 | A |
-| 当前状态 | **总判：已完成**（代码缺口 0）—— 基线 **2026-10-23**：全部 P0/P1/P2 缺口已关闭（§3，历史细节见归档 §7/§8），文本 + 媒体链路全绿；**2026-10-26** G9 关闭；**2026-10-31** G10 关闭（weixin 消费循环重试链 + 退避升级，另补 token 过期重取离线测试）。common 主干（含 `ChannelMediaMetadata`、`InboundEventDeduplicator`/`AccessTokenStore` seam）、七平台 `*ChannelProperties`/`*InboundMapper`（text + 媒体）/`*OutboundClient`/`*AccessTokenProvider`/签名与解密、六个平台 `*Channel` 适配（含 weixin）+ 五个 axum CallbackController + `DingTalkStreamClient`（常驻 WebSocket 网关）均已落地。验证基线见 §7。 |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 405 passed / 0 failed）—— 基线 2026-10-23 起全部 P0/P1/P2 缺口关闭（§3，细节见 history/CHANNEL__MIGRATION_HISTORY.md）：common 主干（`ChannelMediaMetadata`、`InboundEventDeduplicator`/`AccessTokenStore` seam）、七平台 `*ChannelProperties`/`*InboundMapper`（text + 媒体）/`*OutboundClient`/`*AccessTokenProvider`/签名与解密、六个平台 `*Channel` 适配（含 weixin）+ 五个 axum CallbackController + `DingTalkStreamClient`（常驻 WebSocket 网关）均已落地；G10（weixin 消费循环重试链 + 退避升级）已关闭。验证基线见 §7。 |
 
 ### 1.1 与 harness 的边界（已裁定，必须遵守）
 harness 提供**路由/会话绑定骨架**（不可改）：`crates/agentscope-harness/src/agent/` 下 `channel.rs`、`chatui.rs`、`inbound.rs`、`router.rs`、`binding.rs`、`peer.rs`、`dm_scope.rs`、`config.rs`。
@@ -279,7 +279,7 @@ harness 新增 **`agent/gateway/platform_channel.rs`**（`PlatformChannel` trait
 | `cargo test -p agentscope-extensions-channel` | **385 passed / 0 failed / 0 ignored**（doc-test 0） |
 | `cargo clippy -p agentscope-extensions-channel --all-targets` | 仅 crate 内既有历史提示，无新增 |
 
-**2026-10-31 增量（待主智能体统一实测回填）**：新增 6 个离线单测（`weixin::channel::tests` 4 + `feishu::token::tests` 1 + `wecom::token::tests` 1），预期基线 `399 → 405 passed / 0 failed`；反向验证项：`the_consumer_reacquires_the_lease_after_a_transient_failure`（回退 `end_consuming` 的 `running = false` → FAILED）、`consumer_backoff_escalates_and_survives_a_reacquired_lease`（回退 `begin_consuming` 的重置行 → FAILED）。
+**2026-10-31 增量（实测）**：新增 6 个离线单测（`weixin::channel::tests` 4 + `feishu::token::tests` 1 + `wecom::token::tests` 1），实测基线 `399 → 405 passed / 0 failed`；反向验证项：`the_consumer_reacquires_the_lease_after_a_transient_failure`（回退 `end_consuming` 的 `running = false` → FAILED）、`consumer_backoff_escalates_and_survives_a_reacquired_lease`（回退 `begin_consuming` 的重置行 → FAILED）。
 
 - 测试构成：266 `#[test]` + 119 `#[tokio::test]`。
 - 分模块：common 62 / dingtalk 78 / feishu 44 / github 32 / gitlab 35 / wecom 48 / weixin 86。

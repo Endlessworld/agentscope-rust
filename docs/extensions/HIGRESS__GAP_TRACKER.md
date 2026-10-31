@@ -18,7 +18,7 @@
 | Java 规模（静态复核实测） | 主代码 **1050 行** / 测试 **1016 行**（非空行；含空行分别 1146 / 1252）；rollup 记的 1071 / 971 与实测不符，见 history/HIGRESS__MIGRATION_HISTORY.md 勘误 |
 | Rust crate | `crates/agentscope-extensions-higress` |
 | 迁移波次 | C |
-| 当前状态 | **总判：已完成**（P1 清零，P2 于 2026-10-31 收口——P2-4/P2-5/P2-6/P2-7 已落地，P2-2 定性为「设计决定（不迁移）」，P2-8 转跨模块需求；见 history/HIGRESS__MIGRATION_HISTORY.md）—— 已完成（57 lib test + 1 doc test；P1-1 ~ P1-4 于 2026-10-28 关闭） |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 60 passed / 0 failed，另 1 doc-test）—— P1-1 ~ P1-4 已关闭；P2-4/P2-5/P2-6/P2-7 已落地，P2-2 定性为「设计决定（不迁移）」，P2-8 转跨模块需求。见 history/HIGRESS__MIGRATION_HISTORY.md |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |

@@ -19,7 +19,7 @@
 | Java 规模（实测行数，非空行） | 主代码 **15946** / 测试 **16792**（bailian 1447/1493、dify 2509/1136、haystack 1565/1163、ragflow 1849/2091、simple 8576/10909） |
 | Rust crate | `crates/agentscope-extensions-rag` |
 | 迁移波次 | A |
-| 当前状态 | **总判：已完成（无剩余条目）**（2026-10-31 清零）—— `dify`、`ragflow`、`bailian`、`haystack`、`simple` 子模块的离线链路与外部服务链路均已迁移；2026-10-26 补 `simple` 的 **HTTP embedding 4 件**（openai / dashscope text / dashscope multimodal / ollama）+ `ReaderUtils` + `ImageReader`；2026-10-28 两批补齐外部向量库 4 件（`QdrantStore` / `PgVectorStore` 51 测试；`MilvusStore` / `ElasticsearchStore` 60 测试），实测 `436 passed / 0 failed`；**2026-10-31 loop 补齐 `RAGMode`/`GenericRAGHook`、`ExternalApiReader` 与 3 个 Java 增量（Qdrant 无 scheme IP、Dify 裸字符串 query、OpenAI embedding 生命周期），并接线 `SimpleKnowledge` usage listener，至此 §2.3 / §3 / §4.2 无未关闭条目（见 history/RAG__MIGRATION_HISTORY.md）** |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 469 passed / 0 failed）—— dify / ragflow / bailian / haystack / simple 5 个子模块的离线链路与外部服务链路均已迁移，含 HTTP embedding 4 件、`ReaderUtils`/`ImageReader`、外部向量库 4 件（Qdrant / PgVector / Milvus / Elasticsearch）、`RAGMode`/`GenericRAGHook` 与 `ExternalApiReader`；§2.3 / §3 / §4.2 无未关闭条目。历史见 history/RAG__MIGRATION_HISTORY.md |
 
 ### 1.1 Rust crate 文件清单（55 个源文件；2026-10-28 两批新增 `store/{qdrant,pgvector,milvus,elasticsearch}.rs` 4 个源文件 5587 行非空 + 111 个内联测试；2026-10-31 新增 `src/hook.rs` 与 `src/reader/external_api.rs`）
 
@@ -27,8 +27,8 @@
 > `embedding/{utils,openai,dashscope,ollama,test_support}.rs` 与 `reader/{utils,image}.rs`，
 > 并扩充了 `embedding.rs`、`reader.rs`、`hash.rs`、`lib.rs`、`Cargo.toml`。新增测试数：
 > openai 12 / dashscope 15 / ollama 8 / embedding::utils 10 / reader::utils 6 / reader::image 8 /
-> hash 1 = **60**。**已完成（2026-10-29 勘误）**：原记「待主智能体统一跑 `cargo test` 确认」，实际 2026-10-28 第二批已实测 **436 passed / 0 failed / 0 ignored**（见 §1.2 / §4.1）。
-> **2026-10-31 loop**：新增 `src/hook.rs`（`RagMode` / `GenericRagHook` / `GenericRagMiddleware`）与 `src/reader/external_api.rs`（`ExternalApiReader`），源文件 53 → **55**；按本轮约定子智能体**未执行 cargo**，编译/测试由主智能体统一验证；测试名与预期增量见 history/RAG__MIGRATION_HISTORY.md。
+> hash 1 = **60**。**已完成（2026-10-29 勘误）**：实际 2026-10-28 第二批已实测 **436 passed / 0 failed / 0 ignored**（见 §1.2 / §4.1）；2026-10-31 全量实测 **469 passed / 0 failed**。
+> **2026-10-31 loop**：新增 `src/hook.rs`（`RagMode` / `GenericRagHook` / `GenericRagMiddleware`）与 `src/reader/external_api.rs`（`ExternalApiReader`），源文件 53 → **55**；该轮新增用例已由主智能体实测（全量 **469 passed / 0 failed**），测试名见 history/RAG__MIGRATION_HISTORY.md。
 | 文件 | 职责 |
 |---|---|
 | `src/lib.rs` | crate 根：15 个模块声明 + re-export；说明 Java core `rag` 包已 `@Deprecated(forRemoval)` 且 core 无对应实现 |
@@ -101,7 +101,7 @@ rustfmt --edition 2021 --check (store/{milvus,elasticsearch}.rs、store.rs、lib
 ```
 > 依据：见 history/RAG__MIGRATION_HISTORY.md（`MilvusStore` 32 测试 + `ElasticsearchStore` 28 测试 = +60）、§4.1。
 
-**2026-10-31 loop（本轮）**：按本轮约定**子智能体未执行 cargo/rustc/clippy/fmt**，离线用例由主智能体统一跑；本轮新增测试名见 history/RAG__MIGRATION_HISTORY.md，预期总数 436 → **约 490**（新用例 50+，精确值以主智能体实测为准）。
+**2026-10-31 loop**：本轮新增测试名见 history/RAG__MIGRATION_HISTORY.md；主智能体实测全量 **469 passed / 0 failed**（基线 436 → 469，+33）。
 
 ## 2. Java 清单与依赖映射
 

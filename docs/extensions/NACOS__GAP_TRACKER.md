@@ -18,7 +18,7 @@
 | Java 规模 | 主代码 11 个 `.java`（另 4 个 `pom.xml`）2095 行 / 92.3KB；测试 8 文件 2452 行 / 122.0KB；Java `@Test` 合计 120 |
 | Rust crate | `crates/agentscope-extensions-nacos`（11 个 `.rs` + `Cargo.toml`，3050 行） |
 | 迁移波次 | C |
-| 当前状态 | **已完成（2026-10-31 收口）**：真实 `NacosAiService`（`src/http.rs` + `NacosHttpTransport` seam + `ReqwestNacosTransport`，含 `poll_once`/`spawn_polling`）已落地；P0/P1 语义缺口（security scheme 按 type 分派、supportedInterfaces 组装/拆分、prompt 推送、skill 资源 key/必填/zip 校验、A2A 类型复用 protocol crate、doOverwrite 去重）与 TTL/`invalidate`、A2A capability extensions 保留（Java `5da592b4a`）全部关闭；离线 **92 passed**（默认与 `--features http-client` 同），详见 history/NACOS__MIGRATION_HISTORY.md。仅真实 Nacos 服务联调需环境（非代码缺口） |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 92 passed / 0 failed（默认与 `--features http-client` 同））—— 真实 `NacosAiService`（`src/http.rs` + `NacosHttpTransport` seam + `ReqwestNacosTransport`，含 `poll_once`/`spawn_polling`）已落地；P0/P1 语义缺口与 TTL/`invalidate`、A2A capability extensions 保留（Java `5da592b4a`）全部关闭；仅真实 Nacos 服务联调需环境（非代码缺口）。详见 history/NACOS__MIGRATION_HISTORY.md |
 
 ## 2. Java 清单与依赖映射
 

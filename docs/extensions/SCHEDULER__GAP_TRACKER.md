@@ -18,7 +18,7 @@
 | Java 规模（实测 2026-10-22） | 主代码 3234 行（14 个顶层类型）/ 测试 3178 行（13 个测试类 + 1 个 Stub 辅助类，共 180 个 `@Test`）；分模块 主/测：common 1868/1094、quartz 975/1445、xxl-job 391/639 |
 | Rust crate | `crates/agentscope-extensions-scheduler` |
 | 迁移波次 | C |
-| 当前状态 | **总判：已完成（2026-10-31 收口，见 history/SCHEDULER__MIGRATION_HISTORY.md）**——§3/§4.2 无未关闭条目；剩余项全部为「设计决定（不迁移）」并附源码级依据。基线：91 passed（lib 88 + 集成 3）；本轮新增 12 个 scheduler lib 用例（预期 lib 100 + 集成 3 = 103），另 core 新增 2 个用例（由主智能体统一验证，见 history/SCHEDULER__MIGRATION_HISTORY.md） |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 100 passed / 0 failed（lib），另 3 个集成）—— §3/§4.2 无未关闭条目，剩余项全部为「设计决定（不迁移）」并附源码级依据。见 history/SCHEDULER__MIGRATION_HISTORY.md |
 
 ## 2. Java 清单与依赖映射
 
@@ -125,7 +125,7 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
   - `cargo test -p agentscope-extensions-scheduler` → `test result: ok. 37 passed; 0 failed`（lib）+ doc-tests 0 failed。
 - 未删除任何测试或功能；未改动根 `Cargo.toml`、core/harness 及其它 crate。
 
-- **cron 语义对齐（2026-10-26，代码已落盘、子智能体未跑 cargo）**：4 项 P1 语义分叉修复（星期基准 1-7、dom/dow 冲突报错、非法 cron 快速失败且无副作用、`zone_id` 生效）。新增文件 `src/common/config/zone.rs`；新增 `job::CronPlan` / `quartz::resolve_cron`；`cron::CronExpression::matches`/`next_after` 泛型到任意 `TimeZone`。测试名单与「改前如何失败」见 history/SCHEDULER__MIGRATION_HISTORY.md。注意：**行为变更** —— `0 0 9 * * MON-FRI` 这类两侧都指定的 6 字段表达式现在会报错（必须写 `0 0 9 ? * MON-FRI`），调用方与示例需同步。
+- **cron 语义对齐（2026-10-26）**：4 项 P1 语义分叉修复（星期基准 1-7、dom/dow 冲突报错、非法 cron 快速失败且无副作用、`zone_id` 生效）。新增文件 `src/common/config/zone.rs`；新增 `job::CronPlan` / `quartz::resolve_cron`；`cron::CronExpression::matches`/`next_after` 泛型到任意 `TimeZone`。测试名单与「改前如何失败」见 history/SCHEDULER__MIGRATION_HISTORY.md。注意：**行为变更** —— `0 0 9 * * MON-FRI` 这类两侧都指定的 6 字段表达式现在会报错（必须写 `0 0 9 ? * MON-FRI`），调用方与示例需同步。
 
 - **2026-10-28 执行（7 项任务全部落地，见 history/SCHEDULER__MIGRATION_HISTORY.md 详表）**：cron `L`/`L-n`/`LW`/`nW`/`nL`/`n#k` + 7 字段年 + `a/1` + `?` 严格化；`next_after` 接入生产循环 + 查询 API；`interrupt()` 中止 in-flight；`TaskStatus` 6 值 + `is_terminal`/`as_str` + `trigger_state`；xxl-job `XxlJobContext`/`XxlJobHelper`/`handleSuccess`/`handleFail`/分片参数/日志 id；`cancel` 语义（quartz join 等待 + xxl-job `try_cancel` 原文报错）；`execution_count()`/`schedule_config()`/`agent_config()` 公开。
   - 实测：`cargo test -p agentscope-extensions-scheduler` → lib **88 passed / 0 failed**、`tests/quartz_execution.rs` **3 passed / 0 failed**、doc-tests 0 → 合计 **91 passed / 0 failed**（基线 52+3=55 全绿保留，新增 36）。
@@ -133,7 +133,7 @@ Java 聚合模块 = 1 个 Rust crate；3 个 Java 子模块映射为 crate 内 3
   - 未新增任何依赖（未引入 `chrono-tz`，未用 `tokio-util`；interrupt 用 `tokio::sync::watch` + `select!`）。
 
 - **2026-10-31 loop 收口（8 项 = 原 6 项 + §3/见 history/SCHEDULER__MIGRATION_HISTORY.md 遗留 2 项，见 history/SCHEDULER__MIGRATION_HISTORY.md）**：core 新增推理产出 hook（additive）；`XxlJobLogMiddleware` + `RuntimeAgentConfig::with_middleware`；registry 改弱引用句柄反查；`run_with` 补 model 校验（`Model cannot be null.`）；`shutdown`/`cancel` 改「先等 in-flight 再退出循环」；删 `agentscope-harness`、`futures` 降 dev-dep；补 Builder/`schedule_default`。
-  - **测试**：基线 lib 88 + 集成 3 = 91；本轮新增 **12** 个 scheduler lib 用例 → **预期 lib 100 + 集成 3 = 103**（另 core 新增 2 个用例，计入 core crate）。子智能体按本轮约定**未执行 cargo**，实测结果由主智能体统一回填（见 history/SCHEDULER__MIGRATION_HISTORY.md）。
+  - **测试**：基线 lib 88 + 集成 3 = 91；本轮新增 **12** 个 scheduler lib 用例 → **实测 lib 100 + 集成 3 = 103**（另 core 新增 2 个用例，计入 core crate；见 history/SCHEDULER__MIGRATION_HISTORY.md）。
   - 未删除任何既有测试/断言；两处断言**语义更正**并写明理由：`cancel_aborts_the_in_flight_execution` → `cancel_waits_for_the_in_flight_execution_to_finish`（Java `deleteJob` 不中断运行中作业）；xxl-job `reply:hello` 日志断言 → 改为「调度器不再写最终回复日志，由 Hook 记录推理步」（见 history/SCHEDULER__MIGRATION_HISTORY.md）。
 
 ### 4.2 下一步与阻塞（2026-10-31 全部收口）

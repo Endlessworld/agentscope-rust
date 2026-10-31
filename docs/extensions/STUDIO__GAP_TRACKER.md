@@ -17,9 +17,9 @@
 | Java 子模块 | `io.agentscope.core.studio` + `io.agentscope.core.tracing.telemetry` |
 | Java 规模（实测 2026-10-22） | 主代码 28 文件 / **4305 行**（非空行 3738）；测试 10 文件 / **1837 行**（非空行 1554）；`@Test` 方法 91 个 |
 | Rust crate | `crates/agentscope-extensions-studio` |
-| Rust 规模（实测 2026-10-31） | 19 个 `.rs` / **6998 行**（非空行 6363）/ **92 个内联测试**（62 `#[test]` + 30 `#[tokio::test]`；新增 9 个待主智能体编译验证）|
+| Rust 规模（实测 2026-10-31） | 19 个 `.rs` / **6998 行**（非空行 6363）/ **92 个内联测试**（62 `#[test]` + 30 `#[tokio::test]`）|
 | 迁移波次 | C |
-| 当前状态 | **总判：已完成（P1 清零）**—— 原 2 项 P1（`StudioClient` 无 HTTP 注入点 / `StudioUserAgent` 未集成 core agent 循环）已于 **2026-10-30** 关闭（见 history/STUDIO__MIGRATION_HISTORY.md）。已完成（**92 个离线单测**；Socket.IO 真实传输 + OTLP 降级导出已落地；`TelemetryTracing` 已落地但**未自动装配**（设计决定，不迁移；§4.2 第 4 条））。**2026-10-22 静态复核**发现的 3 项已于 2026-10-28 全部关闭：P0-1 `StudioMessageHook` 捕获键（见 history/STUDIO__MIGRATION_HISTORY.md）、P1-1 `TelemetryTracer` 三处语义（§4.1.0v）、P1-2 Socket.IO 鉴权键（§4.1.0v）。**2026-10-31 收口（见 history/STUDIO__MIGRATION_HISTORY.md）**：P2-2 / P2-3 / P2-4 落代码 + 离线测试；P2-1、§4.2 第 4 条（`StudioManager` 自动装配）、多模态抽取裁定为「设计决定（不迁移）」并附源码证据；仅 §4.2 第 6 条 `format` span 自动接线保留为**跨模块需求**（core 无 formatter 钩子） |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 92 passed / 0 failed）—— Socket.IO 真实传输 + OTLP 降级导出 + `TelemetryTracing` 已落地；`StudioManager` 自动装配与多模态抽取为「设计决定（不迁移）」（§4.2 第 4 条），仅 §4.2 第 6 条 `format` span 自动接线保留为**跨模块需求**（core 无 formatter 钩子）。历史见 history/STUDIO__MIGRATION_HISTORY.md |
 | 行数口径 | Java 4305/1837 与 Rust 5048 均为**物理行**（含空行/注释）；非空行口径 Java 3738/1554、Rust 4578。汇总 tracker 的 3700/1452 与之同族，需按口径换算 |
 
 ## 2. Java 清单与依赖映射

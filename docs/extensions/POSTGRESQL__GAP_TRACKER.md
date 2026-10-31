@@ -21,7 +21,7 @@
 | Rust crate | `crates/agentscope-extensions-postgresql` |
 | Rust 规模（实测 2026-10-28） | `src/` **13** 个文件（新增 `murmur3.rs`）/ **115** → **123** 个测试属性（2026-10-30 复测，见 history/POSTGRESQL__MIGRATION_HISTORY.md；分布 `state` 40 / `sql` 19 / `store` 19 / `snapshot` 16 / `guard` 16 / `distributed` 8 / `murmur3` 5） |
 | 迁移波次 | B |
-| 当前状态 | **总判：已完成（P1 清零，2026-10-30）**—— P0 骨架/组件接线 + 离线测试覆盖完成（**2026-10-30 实测 123 passed / 0 failed / 0 ignored**，见 history/POSTGRESQL__MIGRATION_HISTORY.md）；§3.2 的 4 项 P1 语义偏差已于 10-28 关闭，10-30 又关闭「advisory lock 会话归属」与「`save_list_sync` 事务原子性」（history/POSTGRESQL__MIGRATION_HISTORY.md）。**剩余仅为真实 PostgreSQL 集成测试（环境受限，非代码缺口）与 §3.3 / §4.2 的 P2 项** |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 128 passed / 0 failed（lib）+ 5 个集成用例（`postgres-driver`，`AGENTSCOPE_TEST_POSTGRES_URL` 门控））—— P0 组件接线与离线测试覆盖完成；§3.2 的 4 项 P1 语义偏差与 advisory lock 会话归属、`save_list_sync` 事务原子性均已关闭；P2 余项见 §3.3（`memory::MemoryClient` 门控、组合者形态「待确认」）。历史见 history/POSTGRESQL__MIGRATION_HISTORY.md |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -94,7 +94,7 @@
 
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
-- **状态**：`crates/agentscope-extensions-postgresql/` 的 P0 组件已全部落地并接线；**离线测试覆盖 P0 缺口已补齐**，编译与全部测试通过。**2026-10-31 收口**：版本化 trait 三方法覆写、guard/store 日志、死代码清理、集成测试（环境门控）与 async→阻塞池桥接已落地，详见 history/POSTGRESQL__MIGRATION_HISTORY.md（本轮未跑 cargo，计数为静态）。
+- **状态**：`crates/agentscope-extensions-postgresql/` 的 P0 组件已全部落地并接线；**离线测试覆盖 P0 缺口已补齐**，编译与全部测试通过。**2026-10-31 收口**：版本化 trait 三方法覆写、guard/store 日志、死代码清理、集成测试（环境门控）与 async→阻塞池桥接已落地，详见 history/POSTGRESQL__MIGRATION_HISTORY.md（2026-10-31 主智能体实测 **128 lib + 5 集成**）。
 - **验证命令与结果（2026-10-28，本轮实测）**：
   - `cargo build -p agentscope-extensions-postgresql` → **通过**（EXIT=0；仍仅 2 个既有警告：`error.rs::to_core` dead_code、`memory.rs::SessionRow::created_at` 未读）
   - `cargo test -p agentscope-extensions-postgresql` → **115 passed / 0 failed / 0 ignored**（EXIT=0；0 doc-tests）。分布：`sql` 19、`state` 37（15 `#[test]` + 22 `#[tokio::test]`）、`store` 19、`snapshot` 16（10 + 6）、`guard` 11、`distributed` 8（5 + 3）、`murmur3` 5 → 合计 **115**（`#[test]` 84 + `#[tokio::test]` 31）。基线（本轮开工前）为 **111 passed**，本次 +4 用例

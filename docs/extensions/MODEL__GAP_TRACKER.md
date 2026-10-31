@@ -19,11 +19,11 @@
 | Java 规模（去空行口径，rollup 使用） | 主代码 30058 行 / 测试 54660 行（= 33819 / 63416 扣除空行；**与上一行同源同文件，仅统计口径不同**，跨会话引用时勿混用） |
 | Rust crate | `crates/agentscope-extensions-model` |
 | 迁移波次 | A |
-| 当前状态 | **总判：已完成**（2026-10-31 收口）—— **主体完成（provider 主链路 + 剩余 P1）** — `common`（HTTP seam + error/capabilities/usage/diagnostics/media/model_map/**multi_agent**）+ `ollama` + `dashscope`（含**加密 seam** 与**多智能体**）+ `anthropic`（含**内置 server tool**）+ `gemini` + `openai` / `responses`（含**多智能体分组**）/ `anthropic_async` + `openai-official`（含 proxy / x-should-retry / 枚举白名单）+ `relay`。2026-10-28 实测：**56 个源文件 / 22111 物理行 / 369 内联 + 5 集成测试 = 374 passed / 0 failed**。**2026-10-31 收口：原列 6 项「仍开放」全部关闭**——① anthropic 并行 tool-use 拆分 → `anthropic/converter.rs::{collect_split_tool_results, convert_parallel_tool_calls}` + 2 用例；② gemini Vertex AI → **已完成（设计决定，不迁移）**，`GeminiModelProvider` 显式报错 + 用例 `create_rejects_vertex_ai`；③ 内置远程媒体下载 → `common::RemoteMediaCache::prefetch`（`HttpTransport::get_bytes`）+ 3 用例；④ openai `compat.*` → `openai::compat`（四厂商 + 7 用例）；⑤ `DashScopeMultiModalTool` → **已完成（设计决定，不迁移）**，依据 §3.2 / §4.2-4；⑥ Java 测试逐条对照 → 映射表 见 history/MODEL__MIGRATION_HISTORY.md。本轮另补 openai chat 多智能体格式化（`OpenAIMultiAgentFormatter` / `OpenAIConversationMerger`，§3.2 + 见 history/MODEL__MIGRATION_HISTORY.md）。静态计数 **416 内联测试 + 9 个集成 = 425**（编译/运行由主智能体验证） |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 419 passed / 0 failed，另 5 个集成用例）—— 7 个 Java 子模块（anthropic / dashscope / gemini / ollama / openai / openai-official / e2e-tests）全部落地：`common`（HTTP seam + error/capabilities/usage/diagnostics/media/model_map/multi_agent）+ `ollama` + `dashscope`（加密 seam + 多智能体）+ `anthropic`（内置 server tool）+ `gemini` + `openai` / `responses` / `anthropic_async` + `openai-official`（proxy / x-should-retry / 枚举白名单）+ `relay`；gemini Vertex AI 与 `DashScopeMultiModalTool` 为「已完成（设计决定，不迁移）」（§3.2 / §4.2-4）。历史见 history/MODEL__MIGRATION_HISTORY.md |
 
 ### 1.1 验证基线（2026-09-19 实测；2026-09-21 / 2026-10-12 更新；2026-10-22 静态复核）
 
-> **2026-10-31 loop 基线（受限执行体，未跑 cargo）**：静态计数 **416 个内联测试 + 9 个集成 = 425**（上轮 377 + 5 = 382；本轮 **+39 内联 + 4 集成**，集成新增 `tests/registry_semantics.rs`）。`cargo build/test -p agentscope-extensions-model` 由主智能体统一执行，本表不写编译期结论。
+> **2026-10-31 基线（主智能体实测）**：**419 passed / 0 failed，另 5 个集成用例**（源码静态计数 416 内联 + 9 集成，含本轮新增 `tests/registry_semantics.rs`；上轮 377 + 5 = 382，本轮 +39 内联 + 4 集成）。
 
 > ⚠️ **2026-10-22 静态复核**：本节历史 `passed` 数字（198 / 236）为既往会话的编译期结果，本次复核按约定**未执行 `cargo build` / `cargo test`**，仅静态清点测试属性。当前源码静态计数为 **267 个测试属性（262 内联 + 5 集成）**，高于 见 history/MODEL__MIGRATION_HISTORY.md 记录的 236；差额来自 2026-10-12 之后新增的 server-tool / base_url / media 等用例。真实 `passed` 数需下次编译轮确认。
 ```

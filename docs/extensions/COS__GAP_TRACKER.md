@@ -19,7 +19,7 @@
 | Rust 规模（实测 2026-10-28 第二轮） | 13 个 `src/*.rs` / **5241 非空行**（5823 总行）；无 `tests/` 目录；**105** 内联 test（58 个 `#[test]` + 47 个 `#[tokio::test]`，其中 2 个为 multi-thread flavor）+ 3 个 `no_run` doctest（**只编译、不执行**） |
 | Rust crate | `crates/agentscope-extensions-cos` |
 | 迁移波次 | B |
-| 当前状态 | **总判：已完成**（本 crate P1 清零，唯一 P1 属 core 跨模块；余 P2）—— 已完成（**真实 COS HTTP 适配器已落地**：`CosHttpObjectStore` + 自建 `q-sign-algorithm=sha1` 签名（金标向量钉住）+ **分段上传 / 预签名 URL / STS token**（2026-10-28 第二轮）） |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 105 passed / 0 failed，另 3 个 `no_run` doc）—— 真实 COS HTTP 适配器已落地：`CosHttpObjectStore` + 自建 `q-sign-algorithm=sha1` 签名（金标向量钉住）+ 分段上传 / 预签名 URL / STS token；P2 余项为 core 跨模块（`AgentStateStore::delete`）与实例隔离性说明（见 §4.2 / history/COS__MIGRATION_HISTORY.md） |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
