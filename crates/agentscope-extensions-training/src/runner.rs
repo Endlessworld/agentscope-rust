@@ -13,6 +13,7 @@ use agentscope_core::middleware::{
     AgentInput, EventStream, ExtensionPoint, Middleware, MiddlewareChain, Next,
 };
 use agentscope_core::model::Model;
+use agentscope_core::tool::Toolkit;
 use agentscope_core::{Agent, AgentEvent, CallableAgent, ReActAgent, RuntimeContext};
 use futures::StreamExt;
 
@@ -667,6 +668,78 @@ pub struct ShadowAgentSpec {
 /// agent simply uses the defaults for every call.
 pub struct AgentCloner;
 
+/// Snapshot of the production-agent fields a shadow clone needs.
+///
+/// Java's `AgentCloner` reads them off the live agent with reflection; Rust copies them
+/// into this value. Taking a snapshot instead of holding a reference is what lets a
+/// [`TrainingHook`] bind to an agent it only *borrows* — notably the `ReActAgent` owned by
+/// a `HarnessAgent` (`HarnessAgent::agent()`), which is never handed
+/// out as an `Arc`. Only `name` / `description` / `sys_prompt` / `max_iters` are copied;
+/// the [`Toolkit`] clone shares the tool table, so tools registered after binding are
+/// still visible to shadow runs.
+#[derive(Clone)]
+pub struct ShadowAgentBlueprint {
+    name: String,
+    description: String,
+    sys_prompt: String,
+    max_iters: i32,
+    toolkit: Toolkit,
+}
+
+impl ShadowAgentBlueprint {
+    /// Snapshots the fields copied from `agent` onto its shadow clone.
+    pub fn from_agent(agent: &ReActAgent) -> Self {
+        Self {
+            name: agent.name().to_string(),
+            description: agent.description().to_string(),
+            sys_prompt: agent.sys_prompt().to_string(),
+            max_iters: agent.max_iters(),
+            toolkit: agent.toolkit().clone(),
+        }
+    }
+
+    /// The production agent name (shadow clones get a `-shadow` suffix).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The production agent description, copied onto the clone.
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// The system prompt inherited by the clone (unless a [`ShadowAgentSpec`] overrides it).
+    pub fn sys_prompt(&self) -> &str {
+        &self.sys_prompt
+    }
+
+    /// The max reasoning iterations inherited by the clone.
+    pub fn max_iters(&self) -> i32 {
+        self.max_iters
+    }
+
+    /// The tool catalog shared with the clone.
+    pub fn toolkit(&self) -> &Toolkit {
+        &self.toolkit
+    }
+}
+
+impl From<&ReActAgent> for ShadowAgentBlueprint {
+    fn from(agent: &ReActAgent) -> Self {
+        Self::from_agent(agent)
+    }
+}
+
+impl std::fmt::Debug for ShadowAgentBlueprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShadowAgentBlueprint")
+            .field("name", &self.name)
+            .field("max_iters", &self.max_iters)
+            .field("tools", &self.toolkit.tool_names().len())
+            .finish()
+    }
+}
+
 impl AgentCloner {
     /// Clones `original`, replacing its model with `new_model`.
     ///
@@ -677,22 +750,35 @@ impl AgentCloner {
         new_model: Arc<dyn Model>,
         spec: ShadowAgentSpec,
     ) -> Result<ReActAgent> {
-        // Java copies `sysPrompt` / `maxIters` reflectively; Rust reads them back
-        // through the public getters and only lets `ShadowAgentSpec` override them.
+        Self::clone_blueprint(&ShadowAgentBlueprint::from_agent(original), new_model, spec)
+    }
+
+    /// Clones from a [`ShadowAgentBlueprint`] snapshot.
+    ///
+    /// Used by the automatic [`TrainingHook`] path, which may only borrow the production
+    /// agent (a `HarnessAgent` owns its `ReActAgent`), instead of requiring an
+    /// `Arc<ReActAgent>`.
+    pub fn clone_blueprint(
+        blueprint: &ShadowAgentBlueprint,
+        new_model: Arc<dyn Model>,
+        spec: ShadowAgentSpec,
+    ) -> Result<ReActAgent> {
+        // Java copies `sysPrompt` / `maxIters` reflectively; Rust carries them in the
+        // blueprint and only lets `ShadowAgentSpec` override them.
         let sys_prompt = spec
             .sys_prompt
-            .unwrap_or_else(|| original.sys_prompt().to_string());
-        let max_iters = spec.max_iters.unwrap_or_else(|| original.max_iters());
+            .unwrap_or_else(|| blueprint.sys_prompt.clone());
+        let max_iters = spec.max_iters.unwrap_or(blueprint.max_iters);
         let builder = ReActAgent::builder()
-            .name(format!("{}-shadow", original.name()))
-            .description(original.description().to_string())
+            .name(format!("{}-shadow", blueprint.name))
+            .description(blueprint.description.clone())
             .model(new_model)
-            .toolkit(original.toolkit().clone())
+            .toolkit(blueprint.toolkit.clone())
             .sys_prompt(sys_prompt)
             .max_iters(max_iters)
             .todo_tool(false);
         builder.build().map_err(|e| {
-            Error::Agent(format!("Failed to clone ReActAgent: {}", original.name()).into())
+            Error::Agent(format!("Failed to clone ReActAgent: {}", blueprint.name).into())
                 .with_source_boxed(e)
         })
     }
@@ -867,12 +953,30 @@ impl TrainingRouter {
     /// Runs the shadow training flow for a single selected call.
     ///
     /// Runs `repeat_time` iterations with the same task id and incrementing run
-    /// ids. This is blocking (awaited) to remain testable; production callers may
-    /// wrap it in `tokio::spawn`.
+    /// ids. This is blocking (awaited) to remain testable; the automatic path
+    /// ([`TrainingHook`]) spawns it instead, like Java's `subscribeOn(asyncScheduler)`.
     pub async fn run_shadow(
         &self,
         agent_name: &str,
         production_agent: &ReActAgent,
+        inputs: Vec<Msg>,
+        output: Msg,
+        annotation: Option<&TrainingAnnotation>,
+        spec: ShadowAgentSpec,
+    ) -> Vec<ShadowRunReport> {
+        let blueprint = ShadowAgentBlueprint::from_agent(production_agent);
+        self.run_shadow_blueprint(agent_name, &blueprint, inputs, output, annotation, spec)
+            .await
+    }
+
+    /// Runs the shadow flow from a [`ShadowAgentBlueprint`] snapshot.
+    ///
+    /// Same as [`Self::run_shadow`], but the production agent is described by a borrowed
+    /// snapshot instead of an `Arc<ReActAgent>` — the path [`TrainingHook`] uses.
+    pub async fn run_shadow_blueprint(
+        &self,
+        agent_name: &str,
+        production: &ShadowAgentBlueprint,
         inputs: Vec<Msg>,
         output: Msg,
         annotation: Option<&TrainingAnnotation>,
@@ -916,12 +1020,7 @@ impl TrainingRouter {
             let context = Arc::new(RunExecutionContext::create(task_id.clone(), run_id.clone()));
 
             let report = self
-                .run_single_shadow(
-                    production_agent,
-                    inputs.clone(),
-                    context.clone(),
-                    spec.clone(),
-                )
+                .run_single_shadow(production, inputs.clone(), context.clone(), spec.clone())
                 .await;
             reports.push(report);
 
@@ -934,7 +1033,7 @@ impl TrainingRouter {
 
     async fn run_single_shadow(
         &self,
-        production_agent: &ReActAgent,
+        production_agent: &ShadowAgentBlueprint,
         inputs: Vec<Msg>,
         context: Arc<RunExecutionContext>,
         spec: ShadowAgentSpec,
@@ -965,7 +1064,7 @@ impl TrainingRouter {
         };
 
         // Clone the production agent, replacing its model with the adapter.
-        let shadow = match AgentCloner::clone_with_model(production_agent, adapter, spec) {
+        let shadow = match AgentCloner::clone_blueprint(production_agent, adapter, spec) {
             Ok(a) => a,
             Err(e) => {
                 tracing::error!("Failed to clone shadow agent: {e}");
@@ -1057,9 +1156,11 @@ pub type AnnotationProvider = Arc<dyn Fn() -> Option<TrainingAnnotation> + Send 
 /// stream is drained, which is where Java `PostCallEvent` fires. Differences from
 /// Java, both intentional:
 ///
-/// * the post-call step is awaited inline instead of being subscribed on a bounded
-///   elastic pool, so a production call only completes after its shadow runs do
-///   (wrap the call in `tokio::spawn` when that latency matters);
+/// * the post-call step is spawned on the current tokio runtime instead of being
+///   subscribed on a bounded elastic pool: the production call returns as soon as its own
+///   output is drained, and the shadow runs finish in the background (Java
+///   `subscribeOn(asyncScheduler)`); [`TrainingHook::completed_calls`] and
+///   [`TrainingHook::shadow_rounds`] are how a host observes them finishing;
 /// * it only applies to the agents the host attaches it to, not to every agent;
 /// * unloading is done through [`TrainingHook::disable`] (Java
 ///   `removeSystemHook`), because a built [`MiddlewareChain`] cannot be edited.
@@ -1080,7 +1181,7 @@ pub type AnnotationProvider = Arc<dyn Fn() -> Option<TrainingAnnotation> + Send 
 pub struct TrainingHook {
     router: Arc<TrainingRouter>,
     spec: Mutex<ShadowAgentSpec>,
-    agent: Mutex<Option<Weak<ReActAgent>>>,
+    agent: Mutex<Option<ShadowAgentBlueprint>>,
     completed_calls: Arc<AtomicUsize>,
     /// Fallback annotation source, consulted only when the call context carries none.
     annotation_provider: Mutex<Option<AnnotationProvider>>,
@@ -1141,10 +1242,22 @@ impl TrainingHook {
 
     /// Binds the production agent this hook clones for shadow runs.
     ///
-    /// Held as a [`Weak`] reference on purpose: the agent owns its middleware chain,
-    /// so an `Arc` here would make the agent keep itself alive forever.
-    pub fn bind_agent(&self, agent: &Arc<ReActAgent>) {
-        *self.agent.lock().unwrap() = Some(Arc::downgrade(agent));
+    /// The hook keeps a [`ShadowAgentBlueprint`] snapshot instead of a reference, so it
+    /// accepts a borrowed agent: a `HarnessAgent` owns its `ReActAgent`
+    /// (`HarnessAgent::agent()`) and never hands out an `Arc`, which is exactly the value
+    /// to pass here.
+    pub fn bind_agent(&self, agent: &ReActAgent) {
+        self.bind_blueprint(ShadowAgentBlueprint::from_agent(agent));
+    }
+
+    /// Binds a pre-built [`ShadowAgentBlueprint`] snapshot.
+    pub fn bind_blueprint(&self, blueprint: ShadowAgentBlueprint) {
+        *self.agent.lock().unwrap() = Some(blueprint);
+    }
+
+    /// Whether a production agent has been bound (without it the hook is a passthrough).
+    pub fn has_agent(&self) -> bool {
+        self.agent.lock().unwrap().is_some()
     }
 
     /// Number of completed production calls this hook has handled.
@@ -1234,31 +1347,42 @@ impl Middleware for TrainingHook {
                 }
             }
         });
-        let agent = self.agent.lock().unwrap().clone();
+        let blueprint = self.agent.lock().unwrap().clone();
         let router = Arc::clone(&self.router);
         let spec = self.spec.lock().unwrap().clone();
         let completed = Arc::clone(&self.completed_calls);
         let shadow_rounds = Arc::clone(&self.shadow_rounds);
         let tail = futures::stream::once(async move {
-            let Some(agent) = agent.and_then(|weak| weak.upgrade()) else {
+            let Some(blueprint) = blueprint else {
                 return;
             };
             let Some(output) = reply.lock().unwrap().clone() else {
                 return;
             };
-            let agent_name = agent.name().to_string();
-            let reports = router
-                .run_shadow(
-                    &agent_name,
-                    &agent,
-                    inputs,
-                    output,
-                    annotation.as_ref(),
-                    spec,
-                )
-                .await;
-            shadow_rounds.fetch_add(reports.len(), Ordering::SeqCst);
-            completed.fetch_add(1, Ordering::SeqCst);
+            let agent_name = blueprint.name().to_string();
+            // Java `subscribeOn(asyncScheduler)`: the production call must not pay for
+            // the shadow runs, so the post-call step is spawned and observed through
+            // [`Self::completed_calls`] / [`Self::shadow_rounds`].
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                tracing::warn!(
+                    "TrainingHook ran outside a tokio runtime; skipping the shadow runs for {agent_name}"
+                );
+                return;
+            };
+            handle.spawn(async move {
+                let reports = router
+                    .run_shadow_blueprint(
+                        &agent_name,
+                        &blueprint,
+                        inputs,
+                        output,
+                        annotation.as_ref(),
+                        spec,
+                    )
+                    .await;
+                shadow_rounds.fetch_add(reports.len(), Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+            });
         })
         .filter_map(|_| async { None::<Result<AgentEvent>> });
         Box::pin(inner.chain(tail))
@@ -1340,6 +1464,22 @@ impl TrainingRunner {
         hooks.len()
     }
 
+    /// Number of attached hooks that were never bound to a production agent.
+    ///
+    /// An unbound hook is a silent passthrough: agent calls succeed but nothing is
+    /// collected (Java has no binding step at all, so this can only be a wiring mistake).
+    /// [`Self::start`] warns when this is non-zero; the count is exposed so a host can
+    /// assert on the wiring instead of discovering it from missing training data.
+    pub fn unbound_hook_count(&self) -> usize {
+        let mut hooks = self.hooks.lock().unwrap();
+        hooks.retain(|weak| weak.strong_count() > 0);
+        hooks
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|hook| !hook.has_agent())
+            .count()
+    }
+
     /// Whether a periodic-commit task is currently installed.
     pub fn has_commit_scheduler(&self) -> bool {
         self.commit_task.lock().unwrap().is_some()
@@ -1350,6 +1490,15 @@ impl TrainingRunner {
         if self.running.swap(true, Ordering::SeqCst) {
             tracing::warn!("TrainingRunner already running");
             return;
+        }
+        // `attach()` alone trains nothing until a hook is bound to an agent. Java has no
+        // such step (the hook is global), so this is a Rust-only wiring mistake and must
+        // not pass silently.
+        let unbound = self.unbound_hook_count();
+        if unbound > 0 {
+            tracing::warn!(
+                "{unbound} training hook(s) attached but not bound to an agent: their calls will not be trained (call TrainingHook::bind_agent / bind_blueprint)"
+            );
         }
         self.start_commit_scheduler();
         tracing::info!("TrainingRunner started successfully");
@@ -2276,6 +2425,30 @@ mod tests {
         assert_eq!(hook.completed_calls(), 0);
     }
 
+    #[test]
+    fn runner_reports_unbound_hooks() {
+        let runner = TrainingRunner::builder()
+            .trinity_endpoint("http://127.0.0.1:1")
+            .reward_calculator(Arc::new(ZeroRewardCalculator))
+            .commit_interval_seconds(0)
+            .build()
+            .unwrap();
+        let mut chain = MiddlewareChain::new();
+        let hook = runner.attach(&mut chain);
+        assert_eq!(runner.attached_hook_count(), 1);
+        // TRAIN-03: `attach()` alone trains nothing — without a bound agent the hook is
+        // a silent passthrough, a wiring mistake Java does not have (its hook is global).
+        assert_eq!(runner.unbound_hook_count(), 1);
+        hook.bind_agent(&model_support::agent("prod"));
+        assert_eq!(runner.unbound_hook_count(), 0);
+        // The chain also holds the hook, so the entry only disappears once both are
+        // dropped (the runner keeps a weak reference either way).
+        drop(hook);
+        drop(chain);
+        assert_eq!(runner.attached_hook_count(), 0);
+        assert_eq!(runner.unbound_hook_count(), 0);
+    }
+
     #[tokio::test]
     async fn training_hook_drives_post_call_after_agent_completion() {
         let router = Arc::new(router_with(0.0, 10));
@@ -2293,9 +2466,11 @@ mod tests {
         hook.bind_agent(&agent);
         let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
         assert_eq!(reply.text_content(), "ok");
-        // The hook observed AGENT_RESULT once the stream drained; the 0% strategy
+        // The hook observed AGENT_RESULT once the stream drained and runs its post-call
+        // step on a background task (Java `subscribeOn(asyncScheduler)`); the 0% strategy
         // rejects the call so no shadow run (and no network) happens.
-        assert_eq!(hook.completed_calls(), 1);
+        wait_until("the hook's post-call step", || hook.completed_calls() == 1).await;
+        assert_eq!(hook.shadow_rounds(), 0);
     }
 
     #[tokio::test]
@@ -2312,6 +2487,8 @@ mod tests {
             .unwrap();
         let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
         assert_eq!(reply.text_content(), "ok");
+        // Unbound: the hook is a passthrough, so not even the post-call task is spawned.
+        assert!(!hook.has_agent());
         assert_eq!(hook.completed_calls(), 0);
     }
 
@@ -2341,7 +2518,10 @@ mod tests {
 
         hook.enable();
         agent.call(vec![Msg::user("hi")]).await.unwrap();
-        assert_eq!(hook.completed_calls(), 1);
+        wait_until("the re-enabled hook's post-call step", || {
+            hook.completed_calls() == 1
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -2368,7 +2548,7 @@ mod tests {
         hook.bind_agent(&agent);
         runner.start();
         agent.call(vec![Msg::user("hi")]).await.unwrap();
-        assert_eq!(hook.completed_calls(), 1);
+        wait_until("the hook's post-call step", || hook.completed_calls() == 1).await;
 
         runner.stop().await;
         assert!(!hook.is_enabled());
@@ -2481,6 +2661,19 @@ mod tests {
         TrainingRouter::new(config, client)
     }
 
+    /// Router that always samples (100%), used to exercise the real shadow path.
+    fn sampling_router(endpoint: &str) -> TrainingRouter {
+        let config = TrainingConfig::builder()
+            .trinity_endpoint(endpoint)
+            .selection_strategy(Arc::new(SamplingRateStrategy::of(1.0)))
+            .reward_calculator(Arc::new(ZeroRewardCalculator))
+            .repeat_time(1)
+            .build()
+            .unwrap();
+        let client = TrinityClient::builder().endpoint(endpoint).build().unwrap();
+        TrainingRouter::new(config, client)
+    }
+
     fn reply_agent(chain: MiddlewareChain) -> Arc<ReActAgent> {
         Arc::new(
             ReActAgent::builder()
@@ -2500,6 +2693,21 @@ mod tests {
             events.push(item);
         }
         events
+    }
+
+    /// Waits (bounded) until `ready` holds.
+    ///
+    /// The hook runs its post-call step on a spawned task (Java
+    /// `subscribeOn(asyncScheduler)`), so its counters advance after the production call
+    /// already returned; tests must observe them instead of assuming they are final.
+    async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if ready() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
     }
 
     #[tokio::test]
@@ -2532,9 +2740,11 @@ mod tests {
         .expect("a marked call must not stall on the fake Trinity endpoint");
         assert!(events.iter().all(|event| event.is_ok()));
 
-        assert_eq!(hook.completed_calls(), 1);
+        wait_until("the background shadow round", || {
+            hook.completed_calls() == 1 && hook.shadow_rounds() == 1
+        })
+        .await;
         // One shadow round ran: chat completion + feedback, both served locally.
-        assert_eq!(hook.shadow_rounds(), 1);
         assert_eq!(router.task_registry().get_task_count(), 1);
         assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
         let lines = server.join().unwrap();
@@ -2564,7 +2774,7 @@ mod tests {
         let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
         assert_eq!(reply.text_content(), "ok");
         // The hook still observed the call, but no annotation means no training data.
-        assert_eq!(hook.completed_calls(), 1);
+        wait_until("the hook's post-call step", || hook.completed_calls() == 1).await;
         assert_eq!(hook.shadow_rounds(), 0);
         assert_eq!(router.task_registry().get_task_count(), 0);
     }
@@ -2589,8 +2799,10 @@ mod tests {
             .expect("a marked call must not stall on the fake Trinity endpoint")
             .unwrap();
         assert_eq!(reply.text_content(), "ok");
-        assert_eq!(hook.completed_calls(), 1);
-        assert_eq!(hook.shadow_rounds(), 1);
+        wait_until("the background shadow round", || {
+            hook.completed_calls() == 1 && hook.shadow_rounds() == 1
+        })
+        .await;
         assert_eq!(router.task_registry().get_task_count(), 1);
         assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
         let _ = server.join().unwrap();
@@ -2621,7 +2833,95 @@ mod tests {
         ))
         .await;
         assert!(events.iter().all(|event| event.is_ok()));
-        assert_eq!(hook.completed_calls(), 1);
+        wait_until("the hook's post-call step", || hook.completed_calls() == 1).await;
         assert_eq!(hook.shadow_rounds(), 0);
+    }
+
+    // --- TRAIN-02: the post-call step must not extend the production call ---------
+
+    #[tokio::test]
+    async fn training_hook_returns_before_the_shadow_run_finishes() {
+        let (endpoint, served, server) = trinity_mock::spawn(2);
+        let router = Arc::new(sampling_router(&endpoint));
+        let mut chain = MiddlewareChain::new();
+        let hook = Arc::new(TrainingHook::new(Arc::clone(&router)));
+        hook.install(&mut chain);
+        let agent = reply_agent(chain);
+        hook.bind_agent(&agent);
+
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "ok");
+        // TRAIN-02: Java subscribes the shadow work on a bounded elastic scheduler and
+        // returns immediately. Before the fix the hook awaited `run_shadow` inline, so
+        // both counters were already final (completed 1, rounds 1) at this point.
+        assert_eq!(hook.completed_calls(), 0);
+        assert_eq!(hook.shadow_rounds(), 0);
+
+        // The background task then drives the full shadow round (chat + feedback) on the
+        // loopback Trinity stand-in.
+        wait_until("the background shadow round", || {
+            hook.completed_calls() == 1 && hook.shadow_rounds() == 1
+        })
+        .await;
+        assert_eq!(router.pending_shadow_runs(), 0);
+        assert_eq!(router.task_registry().get_task_count(), 1);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let _ = server.join().unwrap();
+    }
+
+    // --- TRAIN-10: binding a borrowed agent (HarnessAgent path) --------------------
+
+    #[tokio::test]
+    async fn training_hook_binds_a_borrowed_agent_through_a_blueprint() {
+        let (endpoint, served, server) = trinity_mock::spawn(2);
+        let router = Arc::new(sampling_router(&endpoint));
+        let mut chain = MiddlewareChain::new();
+        let hook = Arc::new(TrainingHook::new(Arc::clone(&router)));
+        hook.install(&mut chain);
+        let agent = reply_agent(chain);
+
+        // A `HarnessAgent` owns its `ReActAgent` and only lends it out
+        // (`HarnessAgent::agent()`), so binding must not require an `Arc`. The hook keeps
+        // a `ShadowAgentBlueprint` snapshot instead of a `Weak` reference.
+        assert!(!hook.has_agent());
+        hook.bind_agent(agent.as_ref());
+        assert!(hook.has_agent());
+
+        agent.call(vec![Msg::user("hi")]).await.unwrap();
+        wait_until("the background shadow round", || {
+            hook.completed_calls() == 1 && hook.shadow_rounds() == 1
+        })
+        .await;
+        assert_eq!(router.task_registry().get_task_count(), 1);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    fn agent_cloner_clones_from_a_blueprint() {
+        let original = ReActAgent::builder()
+            .name("prod")
+            .description("production agent")
+            .sys_prompt("you are the production agent")
+            .max_iters(3)
+            .model(Arc::new(model_support::FakeModel))
+            .build()
+            .unwrap();
+        let blueprint = ShadowAgentBlueprint::from_agent(&original);
+        assert_eq!(blueprint.name(), "prod");
+        assert_eq!(blueprint.description(), "production agent");
+        assert_eq!(blueprint.sys_prompt(), "you are the production agent");
+        assert_eq!(blueprint.max_iters(), 3);
+
+        let shadow = AgentCloner::clone_blueprint(
+            &blueprint,
+            Arc::new(model_support::FakeModel),
+            ShadowAgentSpec::default(),
+        )
+        .unwrap();
+        assert_eq!(shadow.name(), "prod-shadow");
+        assert_eq!(shadow.description(), "production agent");
+        assert_eq!(shadow.sys_prompt(), "you are the production agent");
+        assert_eq!(shadow.max_iters(), 3);
     }
 }
