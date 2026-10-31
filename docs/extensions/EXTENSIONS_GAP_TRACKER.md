@@ -27,8 +27,8 @@
 | 5 | A | CHANNEL | `agentscope-extensions-channel` | `已完成` | 405 | [CHANNEL](./CHANNEL__GAP_TRACKER.md)（历史：[CHANNEL__MIGRATION_HISTORY](./history/CHANNEL__MIGRATION_HISTORY.md)） |
 | 6 | A | MEM | `agentscope-extensions-mem` | `已完成` | 121（另 3 env 门控） | [MEM](./MEM__GAP_TRACKER.md) |
 | 7 | B | JDBC | `agentscope-extensions-jdbc` | `已完成` | 217（+1 doc；另 env 门控 13） | [JDBC](./JDBC__GAP_TRACKER.md) |
-| 8 | B | REDIS | `agentscope-extensions-redis` | `已完成` | 148（+2 doc） | [REDIS](./REDIS__GAP_TRACKER.md) |
-| 9 | B | MONGODB | `agentscope-extensions-mongodb` | `已完成` | 90 / 108（两套配置） | [MONGODB](./MONGODB__GAP_TRACKER.md) |
+| 8 | B | REDIS | `agentscope-extensions-redis` | `已完成` | 162 lib + 6 单机 live + 2 集群 live（+2 doc） | [REDIS](./REDIS__GAP_TRACKER.md) |
+| 9 | B | MONGODB | `agentscope-extensions-mongodb` | `已完成` | 99 lib + 5 live（真驱动）+ 2（另 1 doc） | [MONGODB](./MONGODB__GAP_TRACKER.md) |
 | 10 | B | MYSQL | `agentscope-extensions-mysql` | `已完成` | 108 默认 / 109 + 5（`--features mysql_async`） | [MYSQL](./MYSQL__GAP_TRACKER.md) |
 | 11 | B | POSTGRESQL | `agentscope-extensions-postgresql` | `已完成` | 127（含 `--features postgres-driver`；tracker 上次记 123 @10-30） | [POSTGRESQL](./POSTGRESQL__GAP_TRACKER.md) |
 | 12 | B | COS | `agentscope-extensions-cos` | `已完成` | 105（+3 `no_run` doc） | [COS](./COS__GAP_TRACKER.md) |
@@ -92,8 +92,8 @@
 |---|---|---|
 | 环境门控 | 真实 MySQL（JDBC / MYSQL / SKILLS） | `AGENTSCOPE_TEST_MYSQL_URL`（+ `_DATABASE`）；未设即 skip + `return`，**非 `#[ignore]`** |
 | 环境门控 | 真实 PostgreSQL（JDBC / POSTGRESQL / SKILLS） | `AGENTSCOPE_TEST_POSTGRES_URL`（SKILLS 侧 `AGENTSCOPE_TEST_PG_URL`） |
-| 环境门控 | 真实 Redis Cluster | `AGENTSCOPE_TEST_REDIS_CLUSTER_URL`（MOVED/ASK 路由与拓扑扇出已离线覆盖） |
-| 环境门控 | 真实 MongoDB | `AGENTSCOPE_TEST_MONGODB_URL`；Java 侧未用 change-stream/事务/批量写（`rg` 零命中），语义由 `InMemoryMongoClient` 覆盖 |
+| 环境门控 | 真实 Redis（单机 + Cluster） | `AGENTSCOPE_TEST_REDIS_URL`（6 用例：Lua 脚本 / SCAN 游标 / 重连 / 锁 CAS）、`AGENTSCOPE_TEST_REDIS_CLUSTER_URL`（2 用例：槽路由 / 拓扑扇出）；**均已实跑通过**（2026-10-31，容器 `redis:7-alpine` + 3 主集群） |
+| 环境门控 | 真实 MongoDB | `AGENTSCOPE_TEST_MONGODB_URL`（5 用例：state / base / snapshot / guard）；**已实跑通过**（2026-10-31，容器 `mongo:7`，官方驱动 `mongodb = "3"`）；Java 侧未用 change-stream/事务/批量写（`rg` 零命中） |
 | 环境门控 | E2B / Kubernetes | `AGENTSCOPE_TEST_E2B_API_KEY`/`_URL`/`_TEMPLATE`；`AGENTSCOPE_TEST_K8S_API_URL`/`_WARM_POOL`（+`_TOKEN`/`_NAMESPACE`） |
 | 环境门控 | MEM 三厂商真实端点 | `MEM0_LIVE_BASE_URL` / `BAILIAN_LIVE_API_KEY` / `REME_LIVE_BASE_URL`（`tests/live_endpoints.rs`，wire 契约已由 mock 全链路覆盖） |
 | 环境门控 | CHANNEL 真实租户联调 / TRAINING live Trinity | 需厂商凭据与在线服务；签名、报文、路由均已离线覆盖 |

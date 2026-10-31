@@ -18,7 +18,7 @@
 | Java 规模（实测 2026-10-22 静态复核） | 主代码 **2235 行（9 类）** / 测试 **2429 行（9 测试类 + 2 testutil，147 个 `@Test`，见 §2）** |
 | Rust crate | `crates/agentscope-extensions-mongodb` |
 | 迁移波次 | B |
-| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 90 passed / 0 failed + doc-test 1，另 108 为另一套配置口径）—— 三项 P1（builder `ttl_days`、guard `database_name`、级联删快照链路）均已闭环（级联链路经 harness `AgentStateStoreSandboxStateStore` 真实写入方验证），余 5 项 P2 全清零（§3.3）；`DistributedStore` 五槽投影已完成（§4.2-1 不成立）。详见 §3.3 / §4.1 与 history/MONGODB__MIGRATION_HISTORY.md |
+| 当前状态 | **已完成**（P1/P2 清零；2026-10-31 实测 **106 passed / 0 failed**：99 lib + 5 live 集成（`tests/mongodb_live.rs`，`AGENTSCOPE_TEST_MONGODB_URL` 门控）+ 2 另一 target，另 doc-test 1）—— **真驱动已接入**（`src/client_mongodb.rs`，官方 `mongodb = "3"`，18 个方法全实现）；三项 P1（builder `ttl_days`、guard `database_name`、级联删快照链路）均已闭环（级联链路经 harness `AgentStateStoreSandboxStateStore` 真实写入方验证），余 5 项 P2 全清零（§3.3）；`DistributedStore` 五槽投影已完成（§4.2-1 不成立）。详见 §3.3 / §4.1 与 history/MONGODB__MIGRATION_HISTORY.md |
 
 ## 2. Java 清单与依赖映射
 | Java 类 / 包 | 职责 | Rust 对应 | 说明 |
@@ -264,11 +264,12 @@
 
 1. **阻塞项：无**。§3 全部条目为「已完成」或「已完成（设计决定，不迁移）」。
 2. **依赖**：本 crate 本轮**净减 1 个依赖**（删除未使用的 `serde`），无新增依赖，未改根 `Cargo.toml`。
-3. **真实驱动接入配方（未执行，供有 live MongoDB 的会话照做）**：
-   - `Cargo.toml`：`mongodb = { workspace = true }`（根 `Cargo.toml:80` 已有 `mongodb = 3`）；首次 fetch 需带 `--config 'http.proxy='` 覆盖 git 全局代理，进 cache 后不再联网。
-   - 新增 `src/client_mongodb.rs`：`impl MongoClient for MongodbClient`（18 个方法）。`scoped_collection(db, coll)` 的 `<db>::<coll>` 约定改为 `client.database(db).collection(coll)`（把 key 按 `::` 拆开）；`FindFilter` → `Document`（`$gte/$lt/$lte/$exists:false`）；`Update` → `Document`（`$set/$setOnInsert/$inc/$push/$pushEach/$unset`）；`MongoError` ← 驱动错误码（11000 / 85 / 27）；GridFS 用 `mongodb::gridfs::GridFsBucket`（默认 255KB 分块，与内存后端布局一致）。
-   - 环境门控集成测试：读 `AGENTSCOPE_TEST_MONGODB_URL`，**未设置则直接 `return` 跳过**（不用 `#[ignore]`），覆盖 state / base / snapshot / guard 四条链路。
-4. **后续建议**：真实驱动接入后把 `chunkSize` 参数化（当前固定 255KB 默认值），并验证 `uploadDate` / `metadata` 在真驱动下的字节级一致。
+3. **真实驱动（已完成，2026-10-31）**：
+   - `Cargo.toml` 已加 `mongodb = { workspace = true }`（根 `Cargo.toml:80` 已有 `mongodb = "3"`，未改根清单）；内存后端仍零驱动依赖。
+   - `src/client_mongodb.rs`：`impl MongoClient for MongodbClient`（18 个方法全实现）。`<db>::<collection>` 解码回真实 `Database`/`Collection`；`FindFilter` → `Document`；`Update` → 更新文档（`$set/$setOnInsert/$inc/$push/$pushEach/$unset`，与内存后端共用 `Update::ops()` 单一事实来源）；错误码 11000 → `DuplicateKey`、85/86 → `IndexOptionsConflict`、26/27 → `NamespaceNotFound`；GridFS 用真驱动 bucket（255KB 分块）。
+   - **同步调用桥**：驱动任务跑在独立的进程级 runtime 线程，调用方 await `oneshot` —— 因此 `futures::executor::block_on` 从任意 runtime（含 current_thread）调用都不会死锁，客户端关闭也不会中途取消驱动任务。
+   - 环境门控集成测试：`tests/mongodb_live.rs` 读 `AGENTSCOPE_TEST_MONGODB_URL`，未设置即 `return`（不用 `#[ignore]`），覆盖 state / base / snapshot / guard 四条链路（实测 **5 passed**）。
+4. **后续建议（非阻塞）**：`chunkSize` 参数化（当前固定 255KB 默认值）；`uploadDate` / `metadata` 在真驱动下的字节级一致已在 live 用例中比对，若要参数化需同步扩展这些断言。
 5. **跨模块需求：无**（本轮未触碰 core / harness / 其它 crate）。
 
 ## 5. 执行约定（所有会话必须遵守）
