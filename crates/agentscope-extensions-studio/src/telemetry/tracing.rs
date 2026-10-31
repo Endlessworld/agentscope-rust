@@ -2,10 +2,14 @@
 //!
 //! Java attaches tracing as a `Tracer` implementation at four points (`callAgent`,
 //! `callModel`, `callTool`, `callFormat`); this module does the same with
-//! [`TelemetryTracing`]: three of them are core [`Middleware`] hooks
-//! (`OnAgent`/`OnModelCall`/`OnActing`) and the fourth — formatting — has no core seam, so
-//! it is exposed as the synchronous [`TelemetryTracing::call_format`] wrapper, the
-//! equivalent of Java's `callFormat(formatter, msgs, supplier)`.
+//! [`TelemetryTracing`]: all four are core [`Middleware`] hooks
+//! (`OnAgent`/`OnModelCall`/`OnActing`/`OnFormat`). The `OnFormat` hook hands over the
+//! requested [`ResponseFormat`] but neither the formatter instance nor its output, so the
+//! span it produces records the request side only; hosts that format messages themselves can
+//! still use [`TelemetryTracing::call_format`], the direct equivalent of Java's
+//! `callFormat(formatter, msgs, supplier)`.
+//!
+//! [`ResponseFormat`]: agentscope_core::formatter::ResponseFormat
 //!
 //! Every span records both sides of the call, like Java:
 //! - request attributes immediately (`get_*_request_attributes`),
@@ -24,8 +28,9 @@
 //! task, the equivalent of Java's `BatchSpanProcessor`. The task exports on a schedule
 //! (`StudioConfig::telemetry_batch_interval`, default 5s) and as soon as a batch is full
 //! (`StudioConfig::telemetry_batch_size`, default 512), so a long-lived agent exports without
-//! leaking spans. Hosts that need determinism (tests, short-lived processes) still call
-//! [`TelemetryTracing::flush`].
+//! leaking spans. A failed export keeps its batch and retries with backoff (100ms doubling,
+//! capped at 5s, three attempts) instead of dropping the spans. Hosts that need determinism
+//! (tests, short-lived processes) still call [`TelemetryTracing::flush`].
 //!
 //! [`TraceExporter::export`]: super::exporter::TraceExporter::export
 
@@ -37,6 +42,7 @@ use std::time::Duration;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::event::AgentEvent;
+use agentscope_core::formatter::ResponseFormat;
 use agentscope_core::message::Msg;
 use agentscope_core::middleware::{
     ActingInput, ActingResultsHandle, AgentInput, EventStream, ExtensionPoint, Middleware,
@@ -62,10 +68,11 @@ use crate::studio::config::{
     StudioConfig, DEFAULT_TELEMETRY_BATCH_INTERVAL, DEFAULT_TELEMETRY_BATCH_SIZE,
 };
 
-/// Provider name recorded on model-call spans when the host does not override it.
+/// Provider name recorded on model-call spans when neither the model nor the host names one.
 ///
-/// The core `Model` trait exposes the model name but not the provider, so the value is
-/// configuration, mirroring Java's `TelemetryTracer.Builder.providerName`.
+/// [`Model::provider_name`] is the primary source; this value is the fallback the host
+/// configures through [`TelemetryTracing::with_provider_name`], mirroring Java's
+/// `TelemetryTracer.Builder.providerName`.
 pub const DEFAULT_PROVIDER_NAME: &str = "unknown";
 
 /// Agent type name recorded in `agentscope.function.name` when the host does not
@@ -78,6 +85,9 @@ pub const DEFAULT_AGENT_TYPE_NAME: &str = "ReActAgent";
 
 /// Model type name used when the provider is unknown (Rust cannot reflect the type).
 const FALLBACK_MODEL_TYPE_NAME: &str = "ChatModel";
+
+/// Formatter type name used when the provider is unknown (Rust cannot reflect the type).
+const FALLBACK_FORMATTER_TYPE_NAME: &str = "ChatFormatter";
 
 /// The `agentscope.function.name` value of a tool span.
 ///
@@ -95,6 +105,21 @@ fn model_type_name(provider_name: &str) -> &'static str {
         super::gen_ai_attributes::provider_name::GCP_GEMINI => "GeminiChatModel",
         super::gen_ai_attributes::provider_name::ANTHROPIC => "AnthropicChatModel",
         _ => FALLBACK_MODEL_TYPE_NAME,
+    }
+}
+
+/// Java formatter simple class name for a provider, used by the framework `format` span.
+///
+/// Java reads it off the formatter instance it wraps (`getFunctionName(formatter, "format")`,
+/// `TelemetryTracer.java:213`); core's `OnFormat` hook only hands over the requested format, so
+/// the name is derived from the provider family — the same input the model span uses.
+fn formatter_type_name(provider_name: &str) -> &'static str {
+    match provider_name {
+        super::gen_ai_attributes::provider_name::OPENAI => "OpenAIChatFormatter",
+        as_attrs::provider_name::DASHSCOPE => "DashScopeChatFormatter",
+        super::gen_ai_attributes::provider_name::GCP_GEMINI => "GeminiChatFormatter",
+        super::gen_ai_attributes::provider_name::ANTHROPIC => "AnthropicChatFormatter",
+        _ => FALLBACK_FORMATTER_TYPE_NAME,
     }
 }
 
@@ -191,10 +216,21 @@ impl TelemetryTracing {
     }
 
     /// Overrides the provider name recorded on model-call spans.
+    ///
+    /// [`Model::provider_name`] wins when the model reports one; this value is the fallback for
+    /// models that keep the trait default (`unknown`). It must be applied before the tracer is
+    /// shared (the instance is cloned into the middleware chain *and* kept by the host), because
+    /// the state lives behind an `Arc`: a late call cannot take effect and is logged instead of
+    /// being dropped silently.
     pub fn with_provider_name(mut self, provider_name: impl Into<String>) -> Self {
+        let provider_name = provider_name.into();
         // The instance is not shared yet, so the state is uniquely owned here.
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.provider_name = provider_name.into();
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.provider_name = provider_name,
+            None => tracing::warn!(
+                provider_name = %provider_name,
+                "studio telemetry: provider name ignored — the tracer is already shared; set it before cloning the tracer into the middleware chain"
+            ),
         }
         self
     }
@@ -202,10 +238,16 @@ impl TelemetryTracing {
     /// Overrides the agent type name recorded in `agentscope.function.name`.
     ///
     /// Java reads the concrete class name reflectively; a host that wraps or renames the
-    /// agent can pass its own type name here.
+    /// agent can pass its own type name here. As with [`TelemetryTracing::with_provider_name`],
+    /// a call on an already-shared tracer cannot take effect and is logged.
     pub fn with_agent_type_name(mut self, agent_type_name: impl Into<String>) -> Self {
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.agent_type = agent_type_name.into();
+        let agent_type_name = agent_type_name.into();
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.agent_type = agent_type_name,
+            None => tracing::warn!(
+                agent_type_name = %agent_type_name,
+                "studio telemetry: agent type name ignored — the tracer is already shared; set it before cloning the tracer into the middleware chain"
+            ),
         }
         self
     }
@@ -230,6 +272,21 @@ impl TelemetryTracing {
     fn current(&self, ctx: &RuntimeContext) -> Option<SpanCtx> {
         let key = Self::run_key(ctx)?;
         self.inner.spans.lock().ok()?.get(&key).cloned()
+    }
+
+    /// The provider name recorded on model spans: what the model reports, else the configured
+    /// fallback (STUDIO-13).
+    ///
+    /// Java reflects the model class (`ProviderNameConverter`); the core trait now lets a model
+    /// answer that question itself, so the configured value is only needed for models that keep
+    /// the `unknown` default.
+    fn resolved_provider_name(&self, model: &dyn Model) -> String {
+        let reported = model.provider_name().trim();
+        if reported.is_empty() || reported == DEFAULT_PROVIDER_NAME {
+            self.inner.provider_name.clone()
+        } else {
+            reported.to_string()
+        }
     }
 
     fn begin(
@@ -259,8 +316,10 @@ impl TelemetryTracing {
     /// Rust equivalent of Java's `TelemetryTracer.callFormat` (`TelemetryTracer.java:203`):
     /// Java wraps the synchronous formatter invocation in a span, records
     /// `getFormatRequestAttributes` up front and `getFormatResponseAttributes` on success.
-    /// Core has no formatter interception point (`Middleware` exposes no `on_format`), so
-    /// hosts that format messages themselves call this wrapper directly.
+    /// Core's [`ExtensionPoint::OnFormat`] hook already produces the format span for every
+    /// structured-output call (see `on_format`), but it carries no formatter instance and no
+    /// output — a host that formats messages itself with a known formatter keeps using this
+    /// wrapper for the full both-sides span.
     ///
     /// `formatter_type` is the formatter's simple class name (`"OpenAIChatFormatter"`, …); it
     /// is mapped to the span's target through [`FormatterConverter::get_formatter_target`]
@@ -285,7 +344,7 @@ impl TelemetryTracing {
             .unwrap_or_else(new_trace_id);
         let target = FormatterConverter::get_formatter_target(formatter_type);
         let mut attributes = get_common_attributes();
-        attributes.extend(get_format_request_attributes(target, msgs));
+        attributes.extend(get_format_request_attributes(target, Some(msgs)));
         attributes.push(function_name_attribute(get_function_name(
             formatter_type,
             "format",
@@ -308,6 +367,7 @@ impl TelemetryTracing {
     }
 }
 
+#[async_trait::async_trait]
 impl Middleware for TelemetryTracing {
     fn on_agent(
         &self,
@@ -381,9 +441,11 @@ impl Middleware for TelemetryTracing {
             .map(|p| p.trace_id.clone())
             .unwrap_or_else(new_trace_id);
         let span_id = new_span_id();
+        // STUDIO-13: the model knows its family; the configured name is only the fallback.
+        let provider_name = self.resolved_provider_name(input.model.as_ref());
         let mut attributes = get_common_attributes();
         attributes.extend(get_llm_request_attributes(
-            &self.inner.provider_name,
+            &provider_name,
             input.model.model_name(),
             &input.messages,
             &input.tools,
@@ -391,7 +453,7 @@ impl Middleware for TelemetryTracing {
         ));
         // Java `TelemetryTracer.java:124`: `<ChatModelType>.callModel`.
         attributes.push(function_name_attribute(get_function_name(
-            model_type_name(&self.inner.provider_name),
+            model_type_name(&provider_name),
             "callModel",
         )));
         // Java feeds every streamed chunk into a `StreamChatResponseAggregator` and records
@@ -475,7 +537,47 @@ impl Middleware for TelemetryTracing {
             ExtensionPoint::OnAgent,
             ExtensionPoint::OnModelCall,
             ExtensionPoint::OnActing,
+            ExtensionPoint::OnFormat,
         ]
+    }
+
+    /// Records the structured-output request handed over by the framework (STUDIO-12).
+    ///
+    /// Java's `callFormat` wraps the formatter invocation (`TelemetryTracer.java:203-226`);
+    /// core's [`ExtensionPoint::OnFormat`] seam runs before each model request is built and
+    /// hands over the requested [`ResponseFormat`], but neither the formatter instance nor its
+    /// output. The span therefore carries the request side (operation, target, function name)
+    /// and ends immediately with the same unset status Java's `finally { span.end() }` leaves
+    /// when nothing set one. Nothing is recorded for an unconstrained call, exactly like Java,
+    /// where `callFormat` only runs when a format is requested.
+    async fn on_format(&self, ctx: &RuntimeContext, format: &mut Option<ResponseFormat>) {
+        if format.is_none() {
+            return;
+        }
+        let parent = self.current(ctx);
+        let trace_id = parent
+            .as_ref()
+            .map(|p| p.trace_id.clone())
+            .unwrap_or_else(new_trace_id);
+        // Java maps the formatter class name through `FormatterConverter`; the provider family
+        // is the closest identity this hook exposes.
+        let formatter_type = formatter_type_name(&self.inner.provider_name);
+        let target = FormatterConverter::get_formatter_target(formatter_type);
+        let mut attributes = get_common_attributes();
+        attributes.extend(get_format_request_attributes(target, None));
+        attributes.push(function_name_attribute(get_function_name(
+            formatter_type,
+            "format",
+        )));
+        let mut guard = self.begin(
+            format!("{} {target}", as_attrs::operation_name::FORMAT),
+            trace_id,
+            new_span_id(),
+            parent.map(|p| p.span_id),
+            attributes,
+            SpanKind::Internal,
+        );
+        guard.end(SpanStatus::Unset);
     }
 }
 
@@ -738,7 +840,9 @@ impl BatchConfig {
         Self {
             // `tokio::time::interval` panics on a zero period, and a zero batch size would
             // export span-by-span; clamp both instead of trusting the caller.
-            interval: config.telemetry_batch_interval().max(Duration::from_millis(1)),
+            interval: config
+                .telemetry_batch_interval()
+                .max(Duration::from_millis(1)),
             max_batch_size: config.telemetry_batch_size().max(1),
         }
     }
@@ -826,13 +930,52 @@ impl SpanSink {
     }
 }
 
+/// How often one batch is offered to the exporter before it is dropped.
+///
+/// The OTel SDK `BatchSpanProcessor` retries through its exporter instead of dropping on the
+/// first failure (STUDIO-06); three attempts keep a permanently broken endpoint from wedging
+/// the sink while surviving a transient outage.
+const EXPORT_MAX_ATTEMPTS: u32 = 3;
+
+/// First retry delay; doubles per attempt, capped by [`EXPORT_RETRY_MAX_DELAY`].
+const EXPORT_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
+/// Upper bound of the retry backoff (same cap as [`crate::studio::StudioClient`]).
+const EXPORT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+
 async fn export(exporter: &Arc<dyn TraceExporter>, batch: &mut Vec<Span>) {
     if batch.is_empty() {
         return;
     }
+    // Keep the spans across attempts: taking them out of the buffer and dropping them on a
+    // failed export is exactly the loss this retry exists to prevent.
     let spans = std::mem::take(batch);
-    if let Err(error) = exporter.export(&spans).await {
-        tracing::warn!("studio telemetry export failed: {error}");
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match exporter.export(&spans).await {
+            Ok(()) => return,
+            Err(error) if attempt < EXPORT_MAX_ATTEMPTS => {
+                let delay = EXPORT_RETRY_BASE_DELAY
+                    .saturating_mul(1u32 << (attempt - 1))
+                    .min(EXPORT_RETRY_MAX_DELAY);
+                tracing::warn!(
+                    attempt,
+                    spans = spans.len(),
+                    ?delay,
+                    "studio telemetry export failed, retrying: {error}"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    attempt,
+                    spans = spans.len(),
+                    "studio telemetry export failed, giving up on this batch: {error}"
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -1022,20 +1165,6 @@ mod tests {
         assert_eq!(exporter.len(), 1);
         // The fallback key is cleaned up like the run key.
         assert!(tracing.inner.spans.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn only_the_three_traced_points_are_active() {
-        let tracing = TelemetryTracing::new(Arc::new(RecordingTraceExporter::new()));
-        let points = tracing.active_points();
-        assert_eq!(
-            points,
-            vec![
-                ExtensionPoint::OnAgent,
-                ExtensionPoint::OnModelCall,
-                ExtensionPoint::OnActing
-            ]
-        );
     }
 
     /// A `Model` that answers with an empty stream: the model span needs only its name.
@@ -1468,7 +1597,11 @@ mod tests {
             next_with(vec![Ok(AgentEvent::new(AgentEventType::AgentStart))]),
         );
         let _ = drain(stream).await;
-        assert_eq!(exporter.len(), 0, "nothing exports before the schedule fires");
+        assert_eq!(
+            exporter.len(),
+            0,
+            "nothing exports before the schedule fires"
+        );
 
         // No `flush()`: only the tokio clock moves (default interval is 5s). Under
         // `start_paused` the runtime may auto-advance to earlier timers, so step the clock
@@ -1523,6 +1656,335 @@ mod tests {
             Some(&2),
             "a full batch must be exported at once, got {calls:?}"
         );
+    }
+
+    #[test]
+    fn the_traced_points_cover_the_four_java_calls() {
+        // Java `Tracer`: callAgent / callModel / callTool / callFormat. STUDIO-12 closed the
+        // last gap by taking the format span off core's `ExtensionPoint::OnFormat` seam.
+        let tracing = TelemetryTracing::new(Arc::new(RecordingTraceExporter::new()));
+        let points = tracing.active_points();
+        assert_eq!(
+            points,
+            vec![
+                ExtensionPoint::OnAgent,
+                ExtensionPoint::OnModelCall,
+                ExtensionPoint::OnActing,
+                ExtensionPoint::OnFormat
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_framework_format_hook_emits_a_format_span() {
+        // STUDIO-12: the span comes from the core seam, so a structured-output call is traced
+        // without the host having to call `call_format`.
+        let exporter = Arc::new(RecordingTraceExporter::new());
+        let tracing = TelemetryTracing::new(exporter.clone()).with_provider_name("anthropic");
+        let mut chain = agentscope_core::middleware::MiddlewareChain::new();
+        chain.add(Box::new(tracing.clone()));
+
+        let requested = Some(ResponseFormat::json_object());
+        let mut format = requested.clone();
+        chain
+            .apply_format(&ctx(Some("run-format-hook")), &mut format)
+            .await;
+        assert_eq!(format, requested, "the tracer must not rewrite the request");
+        tracing.flush().await;
+
+        let spans = exporter.spans();
+        assert_eq!(spans.len(), 1);
+        let format = &spans[0];
+        assert_eq!(format.name, "format anthropic");
+        assert_eq!(format.kind, SpanKind::Internal);
+        // Java's `finally { span.end(); }` leaves the status unset when it never sets one.
+        assert_eq!(format.status, SpanStatus::Unset);
+        assert_eq!(
+            attr_str(format, gen_ai::GEN_AI_OPERATION_NAME),
+            as_attrs::operation_name::FORMAT
+        );
+        assert_eq!(
+            attr_str(format, as_attrs::AGENTSCOPE_FORMAT_TARGET),
+            "anthropic"
+        );
+        assert_eq!(
+            attr_str(format, as_attrs::AGENTSCOPE_FUNCTION_NAME),
+            "AnthropicChatFormatter.format"
+        );
+        // The hook carries no message list: Java's `msgList == null` branch.
+        assert!(attr_value(format, as_attrs::AGENTSCOPE_FUNCTION_INPUT).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unconstrained_call_emits_no_format_span() {
+        // Java only traces `callFormat` when a format is requested.
+        let exporter = Arc::new(RecordingTraceExporter::new());
+        let tracing = TelemetryTracing::new(exporter.clone());
+        let mut chain = agentscope_core::middleware::MiddlewareChain::new();
+        chain.add(Box::new(tracing.clone()));
+
+        let mut format: Option<ResponseFormat> = None;
+        chain
+            .apply_format(&ctx(Some("run-no-format")), &mut format)
+            .await;
+        tracing.flush().await;
+        assert!(exporter.is_empty());
+    }
+
+    /// Answers with the JSON a native structured-output call expects, and reports its provider.
+    struct StructuredModel;
+
+    #[async_trait::async_trait]
+    impl agentscope_core::model::Model for StructuredModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<agentscope_core::model::ToolSchema>,
+            _options: agentscope_core::model::GenerateOptions,
+        ) -> futures::stream::BoxStream<
+            '_,
+            agentscope_core::error::Result<agentscope_core::model::ChatResponse>,
+        > {
+            use agentscope_core::message::{ContentBlock, TextBlock};
+            let response = agentscope_core::model::ChatResponse::builder()
+                .id("resp-structured")
+                .content(vec![ContentBlock::Text(TextBlock::new(
+                    r#"{"answer":"ok"}"#,
+                ))])
+                .finish_reason("stop")
+                .build();
+            Box::pin(futures::stream::iter(vec![Ok(response)]))
+        }
+
+        fn model_name(&self) -> &str {
+            "claude-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "anthropic"
+        }
+
+        fn supports_native_structured_output(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_structured_call_runs_the_format_span_through_the_core_seam() {
+        // Real assembly path: the chain the agent was built with drives `on_format`.
+        let exporter = Arc::new(RecordingTraceExporter::new());
+        let tracing = TelemetryTracing::new(exporter.clone());
+        let mut chain = agentscope_core::middleware::MiddlewareChain::new();
+        chain.add(Box::new(tracing.clone()));
+
+        let agent = agentscope_core::agent::ReActAgent::builder()
+            .name("traced")
+            .model(Arc::new(StructuredModel))
+            .middleware_chain(chain)
+            .build()
+            .expect("agent builds");
+
+        let reply = agent
+            .call_with_schema(
+                vec![Msg::user("hi")],
+                agentscope_core::formatter::JsonSchema::default(),
+            )
+            .await
+            .expect("structured call succeeds");
+        assert!(reply.text_content().contains("ok"));
+        tracing.flush().await;
+
+        let spans = exporter.spans();
+        let root = spans
+            .iter()
+            .find(|s| s.name == format!("{} traced", operation_name::INVOKE_AGENT))
+            .expect("agent span");
+        let format = spans
+            .iter()
+            .find(|s| s.name.starts_with(as_attrs::operation_name::FORMAT))
+            .expect("format span");
+        assert_eq!(
+            format.parent_span_id.as_deref(),
+            Some(root.span_id.as_str())
+        );
+        assert_eq!(format.trace_id, root.trace_id);
+        // STUDIO-13: no host configuration needed — the model reports its own provider.
+        let chat = spans
+            .iter()
+            .find(|s| s.name.starts_with(operation_name::CHAT))
+            .expect("model span");
+        assert_eq!(attr_str(chat, gen_ai::GEN_AI_PROVIDER_NAME), "anthropic");
+        assert_eq!(
+            attr_str(chat, as_attrs::AGENTSCOPE_FUNCTION_NAME),
+            "AnthropicChatModel.callModel"
+        );
+    }
+
+    /// A model that reports its provider family, like the extension providers do.
+    struct ProviderModel;
+
+    #[async_trait::async_trait]
+    impl agentscope_core::model::Model for ProviderModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<agentscope_core::model::ToolSchema>,
+            _options: agentscope_core::model::GenerateOptions,
+        ) -> futures::stream::BoxStream<
+            '_,
+            agentscope_core::error::Result<agentscope_core::model::ChatResponse>,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn model_name(&self) -> &str {
+            "claude-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "anthropic"
+        }
+    }
+
+    /// Runs one model call through the hook and returns its exported span.
+    async fn exported_chat_span(
+        exporter: &Arc<RecordingTraceExporter>,
+        tracing: &TelemetryTracing,
+        model: Arc<dyn Model>,
+        run: &str,
+    ) -> Span {
+        let input = ModelCallInput::new(
+            vec![Msg::user("hi")],
+            Vec::new(),
+            agentscope_core::model::GenerateOptions::default(),
+            model,
+        );
+        let next: Next<ModelCallInput> =
+            Box::new(|_| -> EventStream { Box::pin(futures::stream::empty()) });
+        let _ = drain(tracing.on_model_call(&ctx(Some(run)), input, next)).await;
+        tracing.flush().await;
+        exporter
+            .spans()
+            .into_iter()
+            .find(|s| s.name.starts_with(operation_name::CHAT))
+            .expect("model span")
+    }
+
+    #[tokio::test]
+    async fn the_model_reported_provider_name_wins_over_the_configured_fallback() {
+        // STUDIO-13: `Model::provider_name` is the primary source, so both the provider
+        // attribute and the model type in `agentscope.function.name` are right without the
+        // host configuring anything.
+        let exporter = Arc::new(RecordingTraceExporter::new());
+        let tracing = TelemetryTracing::new(exporter.clone()).with_provider_name("openai");
+        let chat =
+            exported_chat_span(&exporter, &tracing, Arc::new(ProviderModel), "run-provider").await;
+        assert_eq!(attr_str(&chat, gen_ai::GEN_AI_PROVIDER_NAME), "anthropic");
+        assert_eq!(
+            attr_str(&chat, as_attrs::AGENTSCOPE_FUNCTION_NAME),
+            "AnthropicChatModel.callModel"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_without_a_provider_name_uses_the_configured_fallback() {
+        let exporter = Arc::new(RecordingTraceExporter::new());
+        let tracing = TelemetryTracing::new(exporter.clone()).with_provider_name("dashscope");
+        let chat =
+            exported_chat_span(&exporter, &tracing, Arc::new(StubModel), "run-fallback").await;
+        assert_eq!(attr_str(&chat, gen_ai::GEN_AI_PROVIDER_NAME), "dashscope");
+        assert_eq!(
+            attr_str(&chat, as_attrs::AGENTSCOPE_FUNCTION_NAME),
+            "DashScopeChatModel.callModel"
+        );
+    }
+
+    /// Fails the first `failures` exports, then records: STUDIO-06's retry path.
+    #[derive(Debug)]
+    struct FlakyExporter {
+        failures: usize,
+        attempts: Mutex<usize>,
+        recorded: Mutex<Vec<Span>>,
+    }
+
+    impl FlakyExporter {
+        fn new(failures: usize) -> Self {
+            Self {
+                failures,
+                attempts: Mutex::new(0),
+                recorded: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            *self.attempts.lock().expect("attempts lock")
+        }
+
+        fn recorded(&self) -> Vec<Span> {
+            self.recorded.lock().expect("recorded lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TraceExporter for FlakyExporter {
+        async fn export(&self, spans: &[Span]) -> crate::error::StudioResult<()> {
+            let attempt = {
+                let mut attempts = self.attempts.lock().expect("attempts lock");
+                *attempts += 1;
+                *attempts
+            };
+            if attempt <= self.failures {
+                return Err(crate::error::StudioError::WebSocket(format!(
+                    "export {attempt} failed"
+                )));
+            }
+            self.recorded
+                .lock()
+                .expect("recorded lock")
+                .extend_from_slice(spans);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_export_is_retried_until_the_spans_arrive() {
+        // STUDIO-06: a single failed POST used to drop the whole batch.
+        let exporter = Arc::new(FlakyExporter::new(2));
+        let tracing = TelemetryTracing::new(exporter.clone());
+        let stream = tracing.on_agent(
+            &ctx(Some("run-retry")),
+            agent_input(),
+            next_with(vec![Ok(AgentEvent::new(AgentEventType::AgentStart))]),
+        );
+        let _ = drain(stream).await;
+        // `flush` waits for the export to settle, retries included.
+        tracing.flush().await;
+
+        assert_eq!(exporter.attempts(), EXPORT_MAX_ATTEMPTS as usize);
+        let recorded = exporter.recorded();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the retried batch must reach the exporter"
+        );
+        assert_eq!(recorded[0].name, expected_agent_span_name());
+    }
+
+    #[tokio::test]
+    async fn a_permanently_failing_export_gives_up_without_blocking_the_sink() {
+        let exporter = Arc::new(FlakyExporter::new(usize::MAX));
+        let tracing = TelemetryTracing::new(exporter.clone());
+        let stream = tracing.on_agent(
+            &ctx(Some("run-dead-endpoint")),
+            agent_input(),
+            next_with(vec![Ok(AgentEvent::new(AgentEventType::AgentStart))]),
+        );
+        let _ = drain(stream).await;
+        // Must return: an unreachable endpoint cannot retry forever.
+        tracing.flush().await;
+
+        assert_eq!(exporter.attempts(), EXPORT_MAX_ATTEMPTS as usize);
+        assert!(exporter.recorded().is_empty());
     }
 
     fn model_input() -> ModelCallInput {

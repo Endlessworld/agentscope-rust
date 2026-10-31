@@ -288,7 +288,13 @@ pub fn get_tool_response_attributes(output: &[ContentBlock]) -> Attributes {
 }
 
 /// Extracts the request attributes for a formatter invocation.
-pub fn get_format_request_attributes(format_target: &str, msgs: &[Msg]) -> Attributes {
+///
+/// `msgs` is the message list the formatter is about to convert. Java writes
+/// `AGENTSCOPE_FUNCTION_INPUT` only when the caller has one
+/// (`AttributesExtractors.java:320` `if (msgList != null)`); `None` is that branch, which is
+/// what the framework `OnFormat` hook sees — it carries the requested format, not the
+/// messages.
+pub fn get_format_request_attributes(format_target: &str, msgs: Option<&[Msg]>) -> Attributes {
     let mut attrs = Vec::new();
     string_attr(
         &mut attrs,
@@ -300,8 +306,10 @@ pub fn get_format_request_attributes(format_target: &str, msgs: &[Msg]) -> Attri
         as_attrs::AGENTSCOPE_FORMAT_TARGET,
         format_target,
     );
-    if let Ok(v) = serde_json::to_string(msgs) {
-        string_attr(&mut attrs, as_attrs::AGENTSCOPE_FUNCTION_INPUT, v);
+    if let Some(msgs) = msgs {
+        if let Ok(v) = serde_json::to_string(msgs) {
+            string_attr(&mut attrs, as_attrs::AGENTSCOPE_FUNCTION_INPUT, v);
+        }
     }
     attrs
 }
