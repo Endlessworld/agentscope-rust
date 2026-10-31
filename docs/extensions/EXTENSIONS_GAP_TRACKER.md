@@ -140,6 +140,8 @@
 | 3 | 消息可靠性（丢消息/静默失败） | CHANNEL-N01 / N02 / N03 |
 | 4 | 运行时安全（panic / 不可恢复） | OSS-01、PG-01、REDIS-03、SANDBOX-01 / 03 |
 
+**P0 现状（2026-10-31 Round 1 收口）**：上表 30 条**全部关闭**（逐条交付见 §3.3.5，逐条状态见各模块 tracker §3.5；模块 tracker 内已无 `P0 + 待办/进行中/待实施` 行）。**P0 清零**，但「P0 清零」不等于生产可用：§3.3.5 末列出的 P1 阻塞项（`try_enter -> Result` 族）与 P2 长尾仍未完成。
+
 **~~待裁定（41 条）~~ 已于 2026-10-31 全部裁定（见 §3.3）；以下为复核时点快照，不再代表现行状态**：均为 trait/抽象归属或跨模块决策，需汇总方裁定后才能在模块内落地。典型：`SandboxGuard::try_enter` 无 `Result` 通道（REDIS-06 / MYSQL-05）、`Channel::deliver_with_receipt` 归属（CHANNEL-N05）、ACP cancel 归属（HARNESS-15）、`@Tool` 宏是否新建 `agentscope-macros`（CORE-14）、A2A 单版本 vs 双版本协商（PROTO-A2A-01）、hook 是否上提 harness（TRAIN-10）、`Memory` 是否标 deprecated（CORE-13）、JEV 中间件归属（JUDGE-01/04）。
 
 原「零未关闭条目」口径见 §3.2（存量差异，仍有效）。
@@ -237,22 +239,80 @@
 4. **批次 3（模块落地）**：各 crate 实现 + 故障注入测试。
 5. **批次 4（文档收口）**：`COS-08`/`MODEL-13`/`CORE-14`/`CP-13`/`OSS-10` 落 §4.3.1、`RAG-09` 改判记录、`SCHED-05/06` 契约文档、`HARNESS-15/16` 状态更正。
 
+#### 3.3.5 Round 1 执行结果（2026-10-31，22 个子智能体并行）
+
+> 口径：本节是 **§3.3.4 批次 1–3 首轮的实测结果**，也是各模块 tracker 里「待主智能体实测」字段的**唯一回填来源**（模块 tracker 不再各自维护's passed 数）。子智能体只做编辑、禁跑 `cargo`；编译与测试由主智能体统一执行。
+
+**基础设施（批次 1/2，core + harness）**
+
+| 交付 | 位置 |
+|---|---|
+| `AgentStateStore::try_get_versioned` / `try_save_if_version` 默认方法族（`Err(unsupported)`；`InMemory` 拒空 sessionId、`JsonFile` 报损坏/写失败） | `core/src/state/store.rs:131/169` |
+| `Model::provider_name()`（默认 `unknown`）、`Model::tool_search_mode()` + `model::ToolSearchMode` | `core/src/model/model.rs:31/41`、`model/tool_search_mode.rs`（新） |
+| `ExtensionPoint::OnFormat`（8→9）+ `Middleware::on_format` + `MiddlewareChain::apply_format`，接进 `reasoning_phase`/`call_with_format` | `core/src/middleware/middleware.rs:162/304`、`agent/react_agent.rs:1995` |
+| `SessionLogStore::delete` 默认 `Err(unsupported)`；`Memory` 标 `#[deprecated]` | `core/src/session/log.rs:221`、`core/src/memory/mod.rs` |
+| `on_agent_built` + `HarnessAgentHandle`；`Channel`/`ChannelSink::deliver_with_receipt` + `DeliveryReceipt`；`SandboxManager::release` 按值消费 + `take_sandbox()`/`close()` | `harness/src/agent/harness_agent.rs`、`gateway/channel/channel.rs`、`sandbox/manager.rs` |
+| `agent/tools.rs`（tools.json 治理）、`mcp_registrar` + `McpServerConfig.transport` + `McpToolSource`/`McpClientSource`、`AsyncToolMiddleware`/`SandboxLifecycleMiddleware` 接线 | `harness/src/agent/{tools.rs(新), mcp.rs, mcp_client_manager.rs, middleware/sandbox_lifecycle.rs}` |
+
+**模块落地**
+
+| 模块 | 本轮关闭 | 关键交付 | 新增测试 |
+|---|---|---|---|
+| CORE | `CORE-01`、`CORE-13` 收尾 | `event_generate_reason`/`stop_reason`/`stop_message`（中间件停止语义生效、结果成对落盘） | `tests/state_store_versioning_test.rs`(+11)、`model_test.rs` 扩展 |
+| HARNESS | `HARNESS-29/30/01/09/04/05`、`HARNESS-17` | 见上表；`tools.json` 过滤点位于「全部 catalogued 工具后、平台工具前」 | 5 个新集成文件（17 用例） |
+| ACP | `ACP-01`、`ACP-03` | closed 轮询分支 + `cancel_epoch_moved`（turn 代次在 admission 前捕获）+ load 先回放再应答 | `tests/acp_session_cancel_test.rs`(2)、`acp_load_replay_test.rs`(1) |
+| PROTOCOL | `PROTO-A2A-01`、`PROTO-A2A-05`、`PROTO-AP-01` | A2A 切 1.0（PascalCase + 旧名别名、`supportedInterfaces`/`securityRequirements`）；push 四方法 `-32004`；SSE `event:`/`timeout_seconds`/`Last-Event-ID` | 既有套件内新增 |
+| MEM | `MEM-01/02/03` | `MemLongTermMemoryMiddleware`(order=50，`run_id` 每轮仅检索 1 次)、`MemError::HttpStatus` 带 vendor/operation、ReMe 文案 | `tests/long_term_memory_wiring_test.rs`(1) |
+| MODEL | `MODEL-01/02/11`、`MODEL-09` 部分 | `src/assembly.rs` 装配入口（7 provider + 协议实现表）、`OpenAiChatModel::default_options`/`from_context`、anthropic/responses usage 映射 | 既有 428 用例内新增 |
+| SANDBOX | `SANDBOX-01/02/03` | AgentRun MCP streamable-HTTP（`initialize`+`Mcp-Session-Id`）、Crockford base32 sandboxId 派生、`sandbox_id` 元数据双向读写 + resume 重建 | 既有套件内新增 |
+| CHANNEL | `N01/N02/N03/N06/N07/N08/N09` | 机器人 `start()` 触发 `refresh()`；Feishu 先 dispatch 后落幂等键 + `Unavailable`→503；WeCom `errcode` 校验 + 截断；UTF-8 严格解码→400；`gateway.rs::build_gateway_registry` 单入口 | +22 离线用例（另有 5 条期望更新） |
+| CONTROLPLANE | `CP-01/02/03/04` | 契约 HTTP 服务装配 + 自注册 + ASDP 事件泵（批 20、in-flight 15s 同 `report_id` 重投、5s 泵）；`FrameworkAdapter` 9 个 Java 对齐默认方法 | +17 离线用例 |
+| STUDIO | `STUDIO-01/02/04` | `StudioTransport::input_registry` 复用 registry（重连不丢 pending input）；span 周期 flush（5s/512）；模型 span 四个用量字段 | `tests/manager_input_loop.rs`(1) |
+| SCHEDULER | `SCHED-01/05/06/09` | factory 解析模型、`SchedulerLock` 门控每次 firing、dispatch 映射、并发上限 gate | +10 离线用例 |
+| TRAINING | `TRAIN-01/11`、`HARNESS-17` | `resolve_annotation(ctx)`（`RuntimeContext.extensions` 优先、`annotation_provider` 兜底）+ `shadow_rounds()`；注册表实例化 | +5 用例（loopback mock + 10s timeout） |
+| JDBC | `JDBC-01/02/03` | `save_list` 读改写事务化、无 `RETURNING` 回退事务化、负 `expected_version` 拒绝 | `state_tests.rs` 36→39 |
+| MYSQL | `MYSQL-01/03` | `save_if_version(Some(0))` 冲突回退、`key_access_is_valid` 接入 4 个 key 入口 | 既有套件内新增 |
+| OSS / COS | `OSS-01`、`COS-01` | `S3Worker` 专有 OS 线程 + `mpsc`；COS 超时/重试（全抖动、POST 不重放） | `oss/tests/async_bridge.rs`(3) |
+| POSTGRESQL / MONGODB | `PG-01/03`、`MONGO-01/02` | `block_on` 三态运行时策略；session `DEFAULT 1` + 显式 `version=1` + 迁移脚本；`default_database()` seam；legacy JSON 兼容 | `docs/migrations/postgresql_session_version_default.md`（新） |
+| REDIS | `REDIS-02/03/04` | 拓扑重定向（`READONLY`/`CLUSTERDOWN`/`TRYAGAIN` + 槽缓存失效）、连接重试、`delete_key_inner` 两形态清理 | 13 离线 + 1 环境门控 live |
+| NACOS | `NACOS-01/02/03/04/11/15/16` | 复用 a2a-server 协议类型、登录 token 复用 + 90% TTL 刷新、401 重放一次、错误分类枚举、namespace 必填 + override | +13 fake transport 用例 |
+| RAG / JUDGE | `RAG-09/10`、`JUDGE-01/04` | `Reader` seam（pdf/docx 可选 feature）+ `ExternalApiReader`；embedding wire 契约；JEV 三中间件 + `JevConfirmGuard` | `rag/tests/embedding_wire_contract.rs`(6)、judge +24/+6 |
+| SKILLS | `SKILLS-01/02/10` | `SyncBridge` 改专用 OS 线程驱动（`block_in_place` 不用）；`git --version` 启动自检 + `git_binary` 注入；PG schema 校验 | +10 离线用例 |
+
+**仍阻塞 / 未开工（Round 2 候选）**
+
+- `SandboxGuard::try_enter` **仍是 `-> SandboxLease`**（`harness/src/agent/sandbox/guard.rs:29/105`，未改）→ `MYSQL-05`、`PG-04`、`MONGO-04`、`REDIS-06`、`SANDBOX-09` 五个模块阻塞在这一条 trait 变更上；改它需要同步改 5 个存储 crate 的 guard 实现与 `SandboxManager`，建议单独一轮、由 harness 独占。
+- 需 in-process fixture / 新传输层：`ACP-02`（MCP-over-ACP fixture）、`SKILLS-03`（TLS）、`SKILLS-04`（git 同步互斥）、`REDIS-01`（真实集群路由）、`CP-05/CP-12`。
+- 需 core/harness 既有能力已具备、可直接开工：`JDBC-12`、`COS-02`、`REDIS-05`（`try_*` 已落地）、`STUDIO-12/13`（`OnFormat`/`provider_name` 已落地）、`MODEL-12/13`（`tool_search_mode` 已落地）、`ACP-04`（`delete` 已落地）、`CHANNEL-N05`（`deliver_with_receipt` 已落地）、`TRAIN-10`（`on_agent_built` 已落地）。
+- P2 长尾未动：`MEM-04/05/06`、`NACOS-05~10/12~14`、`MYSQL-02/04/06`、`JDBC-04/05/11`、`STUDIO-05/06`、`HARNESS-02/03/08/12/13`。
+
+**本轮新增依赖（均已实测编译通过）**
+
+- `agentscope-extensions-sandbox`：`sha2`（workspace 版本，Cargo 内 `{ workspace = true }`）。
+- `agentscope-extensions-mem`：`futures`（dev 侧另加 `agentscope-harness`）。
+- `agentscope-extensions-nacos`：path 依赖 `agentscope-extensions-a2a-server`（连带 axum/reqwest，记 NACOS tracker §4.2-7）。
+- `agentscope-extensions-studio`：dev-deps tokio 追加 `net`/`test-util`。
+- 根 `Cargo.toml`：MSRV 说明（`OSS-09`，`rust-version = "1.85"` 判定依据），未动 `[workspace.dependencies]`。
+
+**分派说明**：本轮共 22 个并行子智能体；其中 harness 第二路（复核 `on_agent_built`/`deliver_with_receipt`/`McpTransport`/`McpToolSource`/`SandboxManager::release`/`HARNESS-04`）**净改动 0**——六项均已在批次 2 落盘，其自建测试与既有用例重复已删除。
+
 ## 4. 状态与下一步
 
-### 4.1 验证命令与实测（2026-10-31，stable 1.96.1）
+### 4.1 验证命令与实测（2026-10-31，stable **1.97.1**）
 
 ```powershell
 cargo test -p <crate> -j 2 --no-fail-fast                 # 逐 crate（本表数字来源）
 cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 ```
 
-- **全量**：**147 targets / 5419 passed / 0 failed / 5 ignored / EXITCODE=0**（无 `^failures:` 段；ACP 用例已修复并计入）。
-- **5 个 ignored**：MODEL `catalog` 3 个（联网读 models.dev / 依赖 OS 临时目录的已下载 payload）+ 2 个 ```ignore 文档示例（RAG `hook.rs`、CHANNEL `platform_channel.rs`），均为既有状态。
-- **live 实测**：本次全量带环境变量执行，真实连通 `redis_integration`（6）、`redis_cluster_integration`（2）、`mongodb_live`（5）、`harness_docker_sandbox_test`（1，真实容器 8.4s）。JDBC/MySQL 的 `*_integration_tests` 在默认特性下为 0 用例，需显式 `--features`（数字见 §1 与各 tracker §4.1）。
-- **上下文数字**（非 extensions 口径）：`agentscope-core --lib` 377、`agentscope-harness --lib` 519。
-- **逐 crate 数字**见 §1；`--features` 差异（mysql_async / s3 / http-client / postgres-driver / mysql-executor）已在表中标注。
+- **全量（Round 1 收口实测，2026-10-31）**：**158 targets / 5652 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）。工具链 `rustc 1.97.1 (8bab26f4f 2026-07-14)`。
+- **6 个 ignored**：`agentscope-core` lib 3 个（既有）+ 3 个 ```ignore 文档示例（CHANNEL `platform_channel.rs`、RAG `hook.rs`、HARNESS 新增示例），**无 `#[ignore]` 新增**。
+- **本轮修掉的失败（主智能体统一验证 loop）**：`agentscope-core` `FormatInjector::on_format` 签名、MODEL `openai` `Option<Option<_>>`、agent-protocol `LAST_EVENT_ID`、RAG `docx` 字节串转义、harness `tools.rs` 生命周期/所有权、mem 测试 trait 转型、nacos `FakeTransport` 强转与 A2A 1.0 形状、scheduler quartz 注入锁、CHANNEL wecom 截断、STUDIO span 周期导出、CONTROLPLANE bridge 三例（缺 `start()` 未开 journal）、ACP `session/close`（closed 分支仍等 journal 写者租约 → 加 500ms 有界关闭）、RAG `embedding_wire_contract` 字节序。
+- **live 实测**：真实连通 `redis_integration`（6）、`redis_cluster_integration`（2）、`mongodb_live`（5）、`harness_docker_sandbox_test`（1）。JDBC/MySQL 的 `*_integration_tests` 在默认特性下为 0 用例，需显式 `--features`（数字见各 tracker §4.1）。
+- **`--features` 补充实测**：`-p agentscope-extensions-oss --features s3` **全绿（EXITCODE=0）**；`-p agentscope-extensions-rag --features pdf,docx` 由 RAG tracker 记录。
+- **上下文数字**（非 extensions 口径）：`agentscope-core` 476（lib 384 + 12 集成 target）、`agentscope-harness` lib 530。
 - **判失败**：只看 `^failures:` 段（§0）；`EXITCODE=0` 但不能排除「磁盘满导致假失败」（历史曾把 `.pdb` 占满盘表现为 link 失败）。
-- **环境**：`-j 2` 规避 `os error 1455`（页面文件/rlib mmap）；PowerShell 管道直连全量输出会栈溢出 → 先 `Out-File` 再分析；`Blocking waiting for file lock` 属正常排队。
+- **环境**：`-j 2` 规避 `os error 1455`（页面文件/rlib mmap）；PowerShell 管道直连全量输出会栈溢出 → 先 `Out-File` 再分析；`Blocking waiting for file lock` 属正常排队；全量 `cargo test --workspace` 首轮编译约 15–20 分钟，需后台进程 + 日志轮询（工具单命令上限 ~300s）。
 - **反向验证**：每模块至少回退 1 处实现 → 对应用例 `FAILED` → 恢复后全绿；明细见各 tracker 的「执行记录 / 反向验证」小节。
 
 ### 4.2 已知非本轮问题（pre-existing，不计入模块缺口）
@@ -263,7 +323,7 @@ cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 
 ### 4.3 后续事项
 
-1. **P0 清零（30 条）**：按 §3.1 的四组顺序执行（装配接线 → 互操作协议 → 消息可靠性 → 运行时安全）。每组完工后回填本模块 tracker §3.5 状态并同步本文 §3.1。
+1. **~~P0 清零（30 条）~~ 已完成（2026-10-31 Round 1，见 §3.3.5）**：四组顺序执行完毕，全量 158 targets / 5652 passed / 0 failed。下一步按 §3.3.5「仍阻塞 / 未开工」清单推进：先由 harness 独占一轮改 `SandboxGuard::try_enter -> Result` 解锁 5 个存储模块，再处理已解锁项（`JDBC-12`/`COS-02`/`REDIS-05`/`STUDIO-12,13`/`MODEL-12,13`/`ACP-04`/`CHANNEL-N05`/`TRAIN-10`）。
 2. **~~待裁定 41 条~~ 已完成（2026-10-31 全部裁定，见 §3.3）**：36 项转 `待办`（按 §3.1 的 P0 分组顺序执行）、5 项转 `设计决定（不迁移）`（`COS-08` / `MODEL-13` / `CORE-14` / `CP-13` / `OSS-10`）；`HARNESS-16` 关闭为 `已完成`、`HARNESS-15` 去重退役。执行批次见 §3.3.4。
 3. **真实后端联调**：MySQL / PostgreSQL / Redis（单机 + 集群）/ MongoDB / Docker 沙箱**已实测通过**（§3.2 + `history/EXTENSIONS_MIGRATION_HISTORY.md`）；仍缺环境：E2B、Kubernetes、MEM 三厂商、CHANNEL 真实租户、Trinity-RFT。
 4. **可选增强（P2，136 条）**：测试密度对齐 Java（如 SKILLS 108 vs 192 `@Test`、POSTGRESQL 53 个 Java 用例未覆盖）；各 tracker §3.5 的 P2 行即候选清单。

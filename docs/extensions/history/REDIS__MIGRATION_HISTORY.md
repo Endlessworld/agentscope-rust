@@ -317,3 +317,54 @@ harness `DistributedStore` 新增三个可选复合槽位（`base_store` / `sand
 ```powershell
 AGENTSCOPE_TEST_REDIS_CLUSTER_URL=redis://127.0.0.1:7000 cargo test -p agentscope-extensions-redis --test redis_cluster_integration
 ```
+
+## 10. 执行记录（2026-10-31 Round 1：REDIS-02 / 03 / 04 闭合，05/06 跳过）
+
+> 并行迁移轮次的 REDIS 子智能体作业。硬约束：**只做代码/文档编辑，不跑 `cargo` / `rustc` / `git` / 网络**；故本节所有「用例数」为主智能体待回填项，本文件不声称已实测。
+
+### 10.1 REDIS-03（P0）同步 `BaseStore` 断线重连
+
+- 根因：`store::BlockingRedisCommands::with_conn` 只在 `conn.is_none()` 时建连，命令失败仅 `map_err`，**从不回填 `None`** → 一次 `CLIENT KILL` / Redis 重启后该 `RedisStore` 在本进程内永久失败（Java `JedisPooled` 每条命令取池连接，天然自愈）。
+- 改法：`with_conn` 的闭包从 `FnOnce` 放宽为 `FnMut`，业务逻辑移入新的自由函数 `run_with_reconnect(slot, context, connect, op)`：
+  1. `slot.is_none()` 时先 `connect()`；
+  2. 命令失败且 `is_connection_failure`（`is_io_error()` 或 `is_connection_dropped()`）→ `*slot = None`、重开、**重试一次**；
+  3. 其他错误（Lua / 类型 / CAS 冲突）直接返回，**不重发**（避免非幂等命令执行两次）。
+- `RedisStore::from_connection` 无 URL → `open_blocking_connection("")` 返回「cannot be reconnected」明确错误，而不是空 URL 解析错误。
+- 新增诊断 `RedisStore::client_id()`（`StoreCommands::client_id`，`CLIENT ID`）：这是 live 用例唯一能拿到「当前阻塞连接」句柄的方式，用于 `CLIENT KILL ID` 并断言重连后 id 变化。
+- 离线用例（`src/store.rs` tests，4 个，均不触网）：`a_dead_connection_is_evicted_and_the_command_is_retried_once`、`a_command_error_that_is_not_a_connection_error_is_never_retried`、`a_second_connection_error_gives_up_after_one_retry`、`a_preopened_connection_reports_that_it_cannot_be_reconnected`。**反向验证口径**：把重试分支删掉（`Err(error) => Err(map_err(..))`）→ 第 1 个用例 FAIL（`opened` 仍为 1）。
+- live（env 门控）：`tests/redis_integration.rs::base_store_reconnects_after_its_blocking_socket_is_killed`——`CLIENT KILL ID <store client id>` 后轮询 `store.get` 至成功（10s 上限），再断言 `client_id` 已变化且 `put` 仍可写。
+
+### 10.2 REDIS-02（P1）failover 后 `READONLY` 永久失败
+
+- 根因：`redirect.rs` 只识别 `MOVED`/`ASK`；`SlotCache` 无失效入口。缓存过的主节点被降级为副本后，写命令持续得到 `READONLY`，而它被归类为 `Other` → 直接失败，且缓存条目永不更新。
+- 改法：
+  1. `CommandFailure::StaleTopology(String)` + `is_stale_topology`（token 级大写比较 `READONLY` / `CLUSTERDOWN` / `TRYAGAIN`，兼容驱动 `ReadOnly: READONLY ...` 渲染）；`from_message` 先判重定向、再判过期拓扑。
+  2. `SlotCache::invalidate(slot)`。
+  3. `run_with_redirects(transport, cache, slot)` 改为有界循环：`MAX_REDIRECTS = 1`、`MAX_TOPOLOGY_REFRESHES = 1`；过期拓扑 → 清该 slot 缓存、`target = None` 后重试（从种子节点重新学习）；第二次过期 / 第二次重定向 / 其他错误 → `Err`。
+  4. `ClusterRouter::run` 把 `slot` 传进循环；`RoutedCommand` 不再快照 `start`，而是**每次 `send` 重读 slot 缓存**——否则「清缓存」后仍会发到那个已降级的节点。
+- 离线用例（4 新 + 4 改）：`stale_topology_codes_are_classified`、`readonly_evicts_the_stale_slot_and_retries_once`、`a_refresh_can_be_followed_by_one_redirect`、`a_second_stale_topology_signal_gives_up`；既有 `moved_is_cached_and_retried_once` / `ask_sends_asking_and_is_not_cached` / `second_redirect_gives_up` / `non_redirect_errors_propagate_without_retry` 仅补 `slot` 实参，断言不变。**反向验证口径**：去掉 `StaleTopology` 分支（回落到 `Other`）→ 第 2 个用例 FAIL（只发 1 次、缓存条目仍在）。
+
+### 10.3 REDIS-04（P1）core `delete_key` 未实现
+
+- 改法：`impl AgentStateStore for RedisAgentStateStore` 新增 `delete_key`（委托 `delete_key_inner`）：
+  1. 空白 key / 非法 session 在 I/O 前 `Err`；
+  2. 读 `:_keys` 成员判定形态：`{key}:list` 成员 → 删 `:list` + `:list:_hash`；裸成员 → 删 `{key}` + `:ver`；**两种形态同时存在时两条都删**（`save` 后再 `save_list` 同一键名是合法序列）；未跟踪的 key 按单值形态删。
+  3. **逐键 `DEL`**（与 `delete_inner` 同因：V0 布局可能跨 slot）；
+  4. 仅在确实被跟踪时用单键脚本 `DISCARD_TRACKED_KEY_SCRIPT`（`SREM`）摘掉索引成员——未新增 adapter 方法，仍保持 Java `RedisClientAdapter` 的 13 个方法。
+- 内存替身：`MemoryRedisAdapter::eval_script` 增加该脚本解释，并模拟「`SREM` 摘空后集合键消失」（真实 Redis 语义），使 `exists()` 断言成立。
+- 离线用例（5）：`delete_key_removes_one_value_and_keeps_the_rest_of_the_session`、`delete_key_removes_a_list_with_its_hash_marker`、`delete_key_removes_both_shapes_when_one_key_name_holds_both`、`delete_key_is_idempotent_and_leaves_untracked_keys_alone`、`delete_key_rejects_a_blank_session_or_key_before_io`。**反向验证口径**：删掉 trait 覆写 → 5 个用例全部因默认 `Err("...does not support per-key delete")` FAIL。
+- 边界：**未跟踪**的 key 按单值形态删除（`{key}` + `:ver`）；键名以 `:list` 结尾的单值键与列表成员在 `:_keys` 上本就不可区分（`delete_inner` 同样如此），属布局既有歧义。
+
+### 10.4 跳过项
+
+| 条目 | 原因 |
+|---|---|
+| `REDIS-05` | 依赖 core 批次 1/2 的 `AgentStateStore::try_get_versioned` / `try_save_if_version` 默认方法族（harness 落盘改走 `try_*`）；本轮禁止自造替代品。行内已标 `阻塞`。 |
+| `REDIS-06` | 依赖 harness 批次 1/2 把 `SandboxGuard::try_enter` 改为返回 `Result<SandboxLease>`；当前 trait 无 `Result` 通道，不改 harness 就无法 fail-closed。行内已标 `阻塞`。 |
+| `REDIS-01`（P1） | 未在本轮预算内：需给 `ManagerRedisCommands` 注入 `ClusterRouter`，且验收依赖真实集群（`tests/redis_cluster_integration.rs`）。保持 `待办`。 |
+
+### 10.5 改动文件与约束
+
+- 代码：`src/store.rs`、`src/state/redirect.rs`、`src/state/connection.rs`、`src/state/mod.rs`、`src/test_support/mod.rs`、`tests/redis_integration.rs`。
+- 文档：`docs/extensions/REDIS__GAP_TRACKER.md`（§3.5.1 三行 + 新增 §3.5.3 + §1 注记）、本文件 §10。
+- **未改**根 `Cargo.toml` / `Cargo.lock` / `agentscope-core` / `agentscope-harness` / 其它模块 crate；**未新增依赖**；**未删除任何测试、未加 `#[ignore]`**。

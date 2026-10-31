@@ -450,3 +450,45 @@ cargo build -p agentscope-extensions-scheduler
 
 - **core**（本模块获授权的唯一改动）：`middleware/middleware.rs` 与 `agent/react_agent.rs` 的 **additive** hook（无行为变更，默认空实现；`ExtensionPoint::ALL` 7 → 8）。**未触碰 `RuntimeContext`**（JUDGE 独占）、未改 harness。
 - **需汇总方登记**：`EXTENSIONS_GAP_TRACKER.md` 第 17 行状态应改为「已完成（2026-10-31 收口，§9）」；core 新增 `on_reasoning_result` 扩展点是否需在 core 侧 tracker 登记，由主智能体裁定。
+
+## 10. 2026-10-31 复核裁定落地（SCHED-01/05/06/09）
+
+> 本节由 scheduler 子智能体编写。**本轮未执行 cargo/git**（子智能体禁跑），验证命令由主智能体统一执行。
+
+### 10.1 逐项结果
+
+| # | 条目 | 结果 | 实现落点 | 修复前为何失败 |
+|---|---|---|---|---|
+| 1 | SCHED-01（P0） | ✅ 已完成 | `AgentFactory::resolve_model`（默认 `cfg.model().cloned()`，`common/scheduler/task.rs:39`）；`run_with` 改为「配置与工厂都无 model 才报 `Model cannot be null.`」，并把工厂解析出的 model 注入传给 `run` 的配置（`:167-183`） | `RuntimeAgentConfig::from(AgentConfig)` 的 `model: None`，旧 `run_with` 在 `factory.run` 之前就返回 `Model cannot be null.`，宿主工厂永不被调用 |
+| 2 | SCHED-05（P1，裁定：文档 + 注入式锁） | ✅ 已完成 | `src/common/scheduler/lock.rs`（`SchedulerLock` + `NoopSchedulerLock`）、`QuartzAgentSchedulerBuilder::scheduler_lock`、`quartz/job.rs::fire` 的 `try_acquire`/`release`；单实例前提写入 `src/lib.rs` 的 `# Deployment premise` | 旧实现无任何互斥钩子：`fire` 直接执行，多实例同 cron 必然重复执行；`rg 'SchedulerLock'` 零命中 |
+| 3 | SCHED-06（P1，裁定 B：宿主桥接契约） | ✅ 已完成 | `src/xxljob/bridge.rs`：`ExecutorBridge`（`run`/`idle_beat`/`kill`）+ `DispatchRequest`→`XxlJobContext` 字段映射 + `ExecuteResponse`；`impl ExecutorBridge for XxlJobAgentScheduler`；模块文档给出 6 端点映射表与 camelCase 字段表 | 旧实现只有进程内 `trigger`，无 admin console ↔ 执行器的契约面（无 HTTP 依赖） |
+| 4 | SCHED-09（P2，裁定 A：`Arc<Semaphore>` 默认 10） | ✅ 已完成 | `QuartzAgentScheduler.concurrency` + `DEFAULT_MAX_CONCURRENCY = 10` + builder `max_concurrency`/`concurrency_limiter`；`fire` 执行前取 permit（与 `task.cancelled()` 竞速） | 旧实现每任务一个 tokio 循环直接 `fire`，同刻触发数不受限 |
+
+### 10.2 新增测试（10 个，全部离线）
+
+| 文件 | 新增测试 |
+|---|---|
+| `src/common/scheduler/task.rs` | `factory_resolved_model_is_accepted_and_handed_to_run`（1） |
+| `src/common/scheduler/lock.rs` | `noop_lock_grants_every_slot`（1） |
+| `src/quartz/mod.rs` | `schedule_default_runs_with_a_factory_resolved_model`、`injected_scheduler_lock_gates_every_firing`、`a_denied_slot_skips_the_execution`、`concurrency_limit_bounds_simultaneous_executions`（4） |
+| `src/xxljob/bridge.rs` | `dispatch_request_maps_onto_the_execution_context`、`bridge_run_dispatches_with_the_mapped_context`、`bridge_run_reports_500_for_an_unknown_handler`、`idle_beat_and_kill_report_the_expected_codes`（4） |
+
+并发用例用「0-permit gate + `watch`」推进，不依赖 sleep 时长；锁用例用 `Notify` 同步，不轮询。
+
+### 10.3 反向验证（回退 → 期望 FAILED）
+
+| 回退的实现 | 期望失败的用例 |
+|---|---|
+| `run_with` 改回「只看 `agent_config.model()`」 | `common::scheduler::task::tests::factory_resolved_model_is_accepted_and_handed_to_run`、`quartz::tests::schedule_default_runs_with_a_factory_resolved_model` |
+| `run_with` 不再把解析出的 model 注入传给 `run` 的配置 | 同上（两个用例都断言 `config.model()` 在 `run` 内是 `Some`） |
+| `fire` 删掉 `lock.try_acquire`/`release` | `quartz::tests::{injected_scheduler_lock_gates_every_firing, a_denied_slot_skips_the_execution}` |
+| `ExecutorBridge::run` 不把 `DispatchRequest` 映射进 `XxlJobContext`（如直接用空参） | `xxljob::bridge::tests::{dispatch_request_maps_onto_the_execution_context, bridge_run_dispatches_with_the_mapped_context}` |
+| `fire` 不取 permit（直接执行） | `quartz::tests::concurrency_limit_bounds_simultaneous_executions`（`max_active` 会到 3） |
+
+### 10.4 注记
+
+- **新增依赖：无**（仍为 core / serde / serde_json / thiserror / async-trait / tokio / tracing / chrono / uuid；`futures` 仍仅 dev）。
+- 锁的槽位键 = `<scheduler_id>:<task name>:<slot>`；`slot`：CRON = 计划触发时刻（ms）、FIXED_RATE = `now/period` 桶、FIXED_DELAY = 当前时刻（ms）。CRON 为跨节点可比键，FIXED_RATE/DELAY 为尽力对齐（无共享 start instant）。
+- 顺序：先拿锁、再等 permit；槽位归本节点时排队执行，避免两节点各跑一部分。手动 `trigger`/`run` 不进锁也不受 permit 限制（对齐 Java `triggerJob` 本地触发）。
+- 已知边界：`ExecutorBridge::kill` 无 per-job 线程表，与 `cancel` 同语义返回 500 原文；`idle_beat` 恒返回 200（等价 Java 无 jobThread 分支）；`/api/registry`、`/api/beat`、`/api/log` 纯宿主侧。
+
