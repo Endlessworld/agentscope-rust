@@ -381,6 +381,34 @@ impl AgentSession {
         self.submit_with_key_msg(&key, message).await
     }
 
+    /// Starts a turn with **no user input**, so context that middlewares inject on a
+    /// reasoning step (pending subagent results, inbox hints) reaches the model.
+    ///
+    /// Background work only surfaces on a reasoning step, so an idle session has to be given
+    /// one; this is the journal-backed equivalent of Java `HarnessGateway#runWakeup`. The
+    /// turn is admitted exactly like a `submit` — it is journaled, so its reply stays in the
+    /// conversation the next prompt restores — it just carries no input messages.
+    pub async fn wakeup(&self) -> crate::Result<Task> {
+        self.ensure_open()?;
+        // Same admission rule as a submit: settle a turn that can still be continued first,
+        // otherwise the wakeup is rejected as `turn_unfinished`.
+        self.prepare_open_turn_before_submit().await?;
+        let key = uuid::Uuid::new_v4().to_string();
+        let command = Command::new(
+            &key,
+            "submit",
+            Some(turn_id_for(&key)),
+            Vec::new(),
+            Vec::new(),
+        )?;
+        let accepted = {
+            self.seed_receipt_if_new(&command).await?;
+            self.inbox.accept(&command).await?
+        };
+        self.start();
+        self.receipt(&accepted).await
+    }
+
     /// Submits a new task; retry with the same key and identical input to get the same receipt.
     pub async fn submit_with_key(
         &self,

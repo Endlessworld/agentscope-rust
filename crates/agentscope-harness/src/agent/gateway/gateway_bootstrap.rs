@@ -7,6 +7,7 @@ use agentscope_core::error::{Error, Result};
 use crate::agent::bus::MessageBus;
 
 use super::harness_gateway::{ChannelManager, GatewayAgent, HarnessGateway};
+use super::wakeup_dispatcher::{WakeupDispatcher, WakeupTarget};
 
 /// A fully-wired gateway bootstrap: the underlying `HarnessGateway` plus the list of
 /// registered agents and the main agent id.
@@ -14,6 +15,16 @@ pub struct GatewayBootstrap {
     gateway: Arc<HarnessGateway>,
     agents: Vec<(String, Arc<dyn GatewayAgent>)>,
     main_agent_id: String,
+    /// Turns queued wakeups into runs for as long as the bootstrap is alive.
+    wakeup: Option<WakeupDispatcher>,
+}
+
+impl Drop for GatewayBootstrap {
+    fn drop(&mut self) {
+        if let Some(wakeup) = &self.wakeup {
+            wakeup.close();
+        }
+    }
 }
 
 impl GatewayBootstrap {
@@ -93,8 +104,19 @@ impl GatewayBootstrapBuilder {
 
         let gateway = Arc::new(HarnessGateway::create(
             self.channel_manager,
-            self.message_bus,
+            self.message_bus.clone(),
         ));
+
+        // A finished background task (subagent, offloaded tool) enqueues a wakeup next to its
+        // inbox hint; without a dispatcher nothing consumes that queue, so an idle session
+        // stays silent until the user types again. Java's bootstrap owns the same pair:
+        // `new WakeupDispatcher(bus, gateway)` with the gateway as the target.
+        let wakeup = self.message_bus.as_ref().map(|bus| {
+            let target: Arc<dyn WakeupTarget> = gateway.clone();
+            let dispatcher = WakeupDispatcher::new(Arc::clone(bus), target);
+            dispatcher.start();
+            dispatcher
+        });
 
         // Register all agents, bind the main one.
         let main_agent = self
@@ -115,6 +137,7 @@ impl GatewayBootstrapBuilder {
             gateway,
             agents: self.agents,
             main_agent_id: resolved_main_id,
+            wakeup,
         })
     }
 }

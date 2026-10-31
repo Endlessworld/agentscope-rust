@@ -97,10 +97,26 @@ impl WorkspaceMessageBus {
 
     /// Reads a file's full content, or `None` on any error (transient failures).
     async fn read_file_content(&self, path: &str) -> Option<String> {
-        match self.fs.read(&self.ctx, path, 0, usize::MAX).await {
+        match self
+            .fs
+            .read(&self.ctx, Self::fs_path(path), 0, usize::MAX)
+            .await
+        {
             Ok(data) => Some(data.content),
             Err(_) => None,
         }
+    }
+
+    /// Turns a path reported by [`list_sorted`](Self::list_sorted) back into one the
+    /// filesystem accepts.
+    ///
+    /// `Filesystem::ls` reports paths relative to the filesystem root with a leading `/`
+    /// (see `LocalFilesystem::display_path`). An *unrestricted* filesystem — the default
+    /// `HarnessAgent` one — resolves such a path as absolute, so reading or deleting it
+    /// silently misses. Everything the bus lists lives below its own root, so the separator
+    /// can be dropped.
+    fn fs_path(path: &str) -> &str {
+        path.trim_start_matches('/')
     }
 
     fn extract_entry_id(path: &str) -> String {
@@ -162,7 +178,7 @@ impl MessageBus for WorkspaceMessageBus {
                     tracing::warn!("queue_drain: corrupt JSON in entry {path} ({e}), deleting");
                 }
             }
-            self.fs.delete(&self.ctx, path).await?;
+            self.fs.delete(&self.ctx, Self::fs_path(path)).await?;
         }
         Ok(result)
     }
@@ -190,7 +206,7 @@ impl MessageBus for WorkspaceMessageBus {
             let files = self.list_sorted(&dir).await?;
             let excess = files.len().saturating_sub(max_len as usize);
             for path in files.iter().take(excess) {
-                self.fs.delete(&self.ctx, path).await?;
+                self.fs.delete(&self.ctx, Self::fs_path(path)).await?;
             }
         }
         Ok(entry_id)

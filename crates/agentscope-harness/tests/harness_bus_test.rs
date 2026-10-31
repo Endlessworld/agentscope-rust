@@ -259,6 +259,42 @@ async fn enqueue_wakeup_writes_wakeups_queue() {
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 
+#[tokio::test]
+async fn an_unrestricted_filesystem_still_drains_its_queues() {
+    // `HarnessAgent` defaults to an *unrestricted* `LocalFilesystem`, which resolves a
+    // leading `/` as absolute. `Filesystem::ls` reports root-relative paths with that
+    // leading slash, so a drain that fed them straight back to `read` silently returned
+    // nothing (and left the entries behind) — every inbox hint and wakeup was lost.
+    let dir = temp_dir("unrestricted").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(&dir));
+    // A relative bus root, as `HarnessAgent` uses: an unrestricted filesystem resolves a
+    // leading `/` as absolute.
+    let bus = WorkspaceMessageBus::new(fs, ".agentscope/bus");
+
+    bus.enqueue_wakeup("user-1", "sess-1", "agent-1")
+        .await
+        .unwrap();
+    let drained = bus.queue_drain("agentscope:wakeups", 10).await.unwrap();
+    assert_eq!(drained.len(), 1, "the wakeup must be readable back");
+    assert_eq!(drained[0].payload["sessionId"], "sess-1");
+    assert!(
+        bus.queue_drain("agentscope:wakeups", 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a drained entry must be deleted"
+    );
+
+    bus.inbox_push("sess-1", serde_json::json!({"hint": "hi"}))
+        .await
+        .unwrap();
+    let hints = bus.inbox_drain("sess-1", 10).await.unwrap();
+    assert_eq!(hints.len(), 1, "the inbox hint must be readable back");
+    assert_eq!(hints[0].payload["hint"], "hi");
+
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
 // ---- Mode D: degraded pub/sub ----
 
 #[tokio::test]

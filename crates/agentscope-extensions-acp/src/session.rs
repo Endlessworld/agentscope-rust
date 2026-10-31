@@ -21,6 +21,7 @@ use agentscope_core::permission::{PermissionBehavior, PermissionRule};
 use agentscope_core::ConfirmHandler;
 use sha2::{Digest, Sha256};
 
+use agentscope_harness::agent::bus::MessageBus;
 use agentscope_harness::agent::HarnessAgent;
 
 use super::config::{self, ModeChoice, ModelChoice};
@@ -348,6 +349,15 @@ impl Drop for RunningPrompt {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
+}
+
+/// What a turn is started from.
+///
+/// A prompt carries user content; a wakeup carries none and exists only so the middlewares
+/// get a reasoning step to inject pending background results into.
+enum TurnInput {
+    Prompt(Vec<ContentBlock>),
+    Wakeup,
 }
 
 /// A single ACP session backed by a [`HarnessAgent`].
@@ -1387,9 +1397,72 @@ impl AcpAgentSession {
     where
         F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
     {
-        let stop = self.run_prompt_inner(content, emit, cancellation).await;
+        let stop = self
+            .run_prompt_inner(TurnInput::Prompt(content), emit, cancellation)
+            .await;
         self.report_turn_memory(stop);
         stop
+    }
+
+    /// Runs a **wakeup turn**: no user input, only the context middlewares inject on a
+    /// reasoning step (pending subagent results, inbox hints).
+    ///
+    /// A host uses this when background work finishes while the session is idle: the
+    /// delivery itself is pull-based, so without a turn the result would sit unread until the
+    /// user's next prompt. Notifications go to the connection bound by the last prompt.
+    ///
+    /// Returns `None` when the session has nothing to deliver (a turn that ended after
+    /// reading the result) or no client connection is bound — starting an empty turn would
+    /// only make the model re-answer the previous question.
+    pub async fn run_wakeup(&mut self) -> Option<StopReason> {
+        let ctx = self.session_context();
+        if !self.agent.has_pending_background_work(&ctx).await {
+            return None;
+        }
+        let client = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        let emit = move |notification| {
+            let _ = client.notify(notification);
+        };
+        let stop = self.run_prompt_inner(TurnInput::Wakeup, emit, None).await;
+        self.report_turn_memory(stop);
+        Some(stop)
+    }
+
+    /// The bus this session's agent enqueues inbox hints and wakeup requests into.
+    ///
+    /// A host that wakes idle sessions drains [`WAKEUPS_KEY`] through it: a finished
+    /// background task pushes one entry, and the entry is the trigger for a wakeup turn.
+    ///
+    /// [`WAKEUPS_KEY`]: agentscope_harness::agent::bus::WAKEUPS_KEY
+    pub fn message_bus(&self) -> Option<&Arc<dyn MessageBus>> {
+        self.agent.message_bus()
+    }
+
+    /// Drains the wakeup queue and returns the session ids that asked to be woken.
+    ///
+    /// The queue is per workspace, not per session, so the ids are resolved against the
+    /// host's session registry by the caller. Each entry is consumed: one wakeup attempt per
+    /// completion, like the harness `WakeupDispatcher`, so a failing turn is not retried in a
+    /// loop.
+    pub async fn drain_wakeup_requests(&self) -> Vec<String> {
+        let Some(bus) = self.message_bus() else {
+            return Vec::new();
+        };
+        let Ok(entries) = bus
+            .queue_drain(agentscope_harness::agent::bus::WAKEUPS_KEY, 64)
+            .await
+        else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .filter_map(|entry| entry.payload.get("sessionId")?.as_str())
+            .map(str::to_string)
+            .collect()
     }
 
     /// Runs a prompt against the core agent and streams updates.
@@ -1400,7 +1473,9 @@ impl AcpAgentSession {
     where
         F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
     {
-        let stop = self.run_prompt_inner(content, emit, None).await;
+        let stop = self
+            .run_prompt_inner(TurnInput::Prompt(content), emit, None)
+            .await;
         self.report_turn_memory(stop);
         stop
     }
@@ -1571,11 +1646,12 @@ impl AcpAgentSession {
         Ok(Msg::user_blocks(blocks))
     }
 
-    /// Shared implementation for [`run_prompt`](Self::run_prompt) and
-    /// [`run_prompt_cancellable`](Self::run_prompt_cancellable).
+    /// Shared implementation for [`run_prompt`](Self::run_prompt),
+    /// [`run_prompt_cancellable`](Self::run_prompt_cancellable) and
+    /// [`run_wakeup`](Self::run_wakeup).
     async fn run_prompt_inner<F>(
         &mut self,
-        content: Vec<ContentBlock>,
+        input: TurnInput,
         emit: F,
         cancellation: Option<agent_client_protocol::RequestCancellation>,
     ) -> StopReason
@@ -1645,18 +1721,24 @@ impl AcpAgentSession {
             .replace(chrono::Utc::now().to_rfc3339());
         emit(self.session_info_update());
         // Convert ACP content blocks into a core user message; unsupported media is
-        // rejected before any model call so the client gets a readable reason.
+        // rejected before any model call so the client gets a readable reason. A wakeup turn
+        // carries no user message at all — the middlewares inject the pending context.
         let descriptor = self.selected_descriptor();
-        let message = match Self::convert_prompt_blocks(content, descriptor.as_deref()) {
-            Ok(message) => message,
-            Err(error) => {
-                emit(super::event::message_chunk(
-                    self.session_id.clone(),
-                    format!("Unsupported prompt content: {error}"),
-                    None,
-                ));
-                return StopReason::Refusal;
+        let message = match input {
+            TurnInput::Prompt(content) => {
+                match Self::convert_prompt_blocks(content, descriptor.as_deref()) {
+                    Ok(message) => Some(message),
+                    Err(error) => {
+                        emit(super::event::message_chunk(
+                            self.session_id.clone(),
+                            format!("Unsupported prompt content: {error}"),
+                            None,
+                        ));
+                        return StopReason::Refusal;
+                    }
+                }
             }
+            TurnInput::Wakeup => None,
         };
         // Run the turn through the session runtime instead of driving `stream_events`
         // directly: the runtime owns the journal writer, restores the committed state from
@@ -1730,16 +1812,20 @@ impl AcpAgentSession {
         }
         // The key identifies this prompt in the journal: it is derived from the user's text
         // plus the acceptance time, so a retry of this attempt reuses it while an identical
-        // question asked later is still a new turn.
-        let idempotency_key =
-            prompt_idempotency_key(&message, chrono::Utc::now().timestamp_millis());
+        // question asked later is still a new turn. A wakeup turn has no text to hash.
+        let idempotency_key = message
+            .as_ref()
+            .map(|message| prompt_idempotency_key(message, chrono::Utc::now().timestamp_millis()));
         let mut submit_attempts = 0usize;
         let mut task = loop {
             submit_attempts += 1;
-            match session
-                .submit_with_key_msg(&idempotency_key, message.clone())
-                .await
-            {
+            let submitted = match (&message, &idempotency_key) {
+                (Some(message), Some(key)) => {
+                    session.submit_with_key_msg(key, message.clone()).await
+                }
+                _ => session.wakeup().await,
+            };
+            match submitted {
                 Ok(task) => break task,
                 Err(error) if submit_attempts < 3 => {
                     tracing::warn!(

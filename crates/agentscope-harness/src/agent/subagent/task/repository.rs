@@ -92,7 +92,10 @@ pub trait TaskRepository: Send + Sync {
 
     /// Registers a callback invoked when any task reaches a terminal state (COMPLETED or
     /// FAILED). Only one callback is supported; a second call replaces the previous one.
-    async fn set_completion_callback(&self, _callback: TaskCompletionCallback) {}
+    ///
+    /// Synchronous like Java's `setCompletionCallback`: `HarnessAgent::build` wires it while
+    /// assembling the agent, which is not an async context.
+    fn set_completion_callback(&self, _callback: TaskCompletionCallback) {}
 
     /// Releases background maintenance resources (heartbeat / orphan sweeper).
     async fn shutdown(&self) {}

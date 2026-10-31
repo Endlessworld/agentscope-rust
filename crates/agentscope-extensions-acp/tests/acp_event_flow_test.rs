@@ -275,3 +275,53 @@ async fn a_clone_sees_the_activity_of_a_turn_it_did_not_run() {
         "the clone must observe the turn's activity time"
     );
 }
+
+/// A finished background task must be able to wake an idle session.
+///
+/// The delivery itself is pull-based (the middleware reads it on a reasoning step), so the
+/// completion callback also enqueues a wakeup. This asserts the ACP side of that chain: the
+/// entry is readable through the session's own bus, names the session, and is consumed by the
+/// drain (one attempt per completion — a failing turn is not retried in a loop).
+#[tokio::test]
+async fn a_wakeup_request_survives_the_round_trip_through_the_bus() {
+    let model: Arc<dyn Model> = Arc::new(ScriptedModel {
+        responses: std::sync::Mutex::new(vec![]),
+    });
+    let dir = std::env::temp_dir().join(format!("agentscope_acp_wakeup_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let agent = HarnessAgent::builder()
+        .name("acp-wakeup")
+        .model(model)
+        .cwd(dir.clone())
+        .workspace(dir.join("ws"))
+        .max_iters(2)
+        .build();
+    let session = AcpAgentSession::new(
+        SessionId::new("s-wakeup"),
+        dir.clone(),
+        agent,
+        vec![],
+        vec![],
+    );
+
+    let bus = session.message_bus().expect("the agent owns a bus").clone();
+    assert!(
+        session.drain_wakeup_requests().await.is_empty(),
+        "a fresh session has nothing to wake for"
+    );
+    bus.enqueue_wakeup("user-1", "s-wakeup", "agent-1")
+        .await
+        .expect("the producer can enqueue a wakeup");
+
+    assert_eq!(
+        session.drain_wakeup_requests().await,
+        vec!["s-wakeup".to_string()],
+        "the wakeup must name the session it belongs to"
+    );
+    assert!(
+        session.drain_wakeup_requests().await.is_empty(),
+        "a wakeup is consumed by the drain, not replayed"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

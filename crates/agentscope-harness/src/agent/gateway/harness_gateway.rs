@@ -525,3 +525,28 @@ fn fast_random() -> u32 {
         .unwrap_or(0);
     nanos ^ (std::process::id() << 16)
 }
+
+/// The gateway is the dispatcher's target: Java declares
+/// `HarnessGateway implements WakeupDispatcher.WakeupTarget`, which is what lets a host wire
+/// `new WakeupDispatcher(bus, gateway)` directly.
+#[async_trait]
+impl super::wakeup_dispatcher::WakeupTarget for HarnessGateway {
+    async fn is_session_running(&self, session_id: &str) -> bool {
+        HarnessGateway::is_session_running(self, session_id).await
+    }
+
+    async fn has_pending_work(&self, session_id: &str) -> bool {
+        // The completion callback pushes the inbox hint *before* the wakeup, and the running
+        // turn drains the inbox on every reasoning step — so an empty inbox means the turn
+        // already saw the result and waking the session again would start an empty turn.
+        // Without a bus there is no way to tell, so the wakeup is not swallowed.
+        let Some(bus) = &self.message_bus else {
+            return true;
+        };
+        bus.inbox_has_messages(session_id).await.unwrap_or(true)
+    }
+
+    async fn run_wakeup(&self, user_id: Option<&str>, session_id: &str) -> Result<Option<Msg>> {
+        HarnessGateway::run_wakeup(self, user_id, session_id).await
+    }
+}

@@ -838,3 +838,208 @@ async fn spawned_subagent_result_is_delivered_on_the_next_turn() {
         "the delivery must be stamped after the turn"
     );
 }
+
+#[tokio::test]
+async fn wakeup_turn_delivers_background_results_without_user_input() {
+    // Regression: a background result is pull-based (the middleware reads it on a reasoning
+    // step), so an idle session needs a turn to be started for it. `AgentSession::wakeup`
+    // provides that turn, and task completion must also push an inbox hint so a host that
+    // only watches the inbox still notices.
+    let dir = temp_dir("wakeup");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("main")
+            .model(Arc::new(RecordingModel {
+                seen: Arc::clone(&seen),
+                reply: "main reply",
+            }))
+            .cwd(dir.to_path_buf())
+            .workspace(dir.join("ws"))
+            .max_iters(2)
+            .session_id("s1")
+            .subagent(SubagentDeclaration::new("worker", "does work", "You work."))
+            .build(),
+    );
+
+    let repo = agent.task_repository();
+    let ctx = RuntimeContext::default().with_session_id("s1");
+    let bg = repo
+        .put_task(
+            &ctx,
+            "t-wake",
+            "worker",
+            "s1",
+            TaskRunSpec::Local {
+                execution: Box::new(|| Ok("bg result".to_string())),
+            },
+        )
+        .await;
+    assert!(
+        tokio::task::spawn_blocking(move || bg.wait_for_completion(5_000))
+            .await
+            .unwrap(),
+        "background task must settle"
+    );
+
+    // The completion callback (Java `wireTaskRepositoryMessageBus`) pushes an inbox hint and
+    // enqueues a wakeup: the hint is what the model sees, the wakeup is what a host drains to
+    // know it has to start a turn.
+    let bus = agent.message_bus().expect("bus").clone();
+    let mut hinted = false;
+    let mut woken = false;
+    let mut drained = Vec::new();
+    for _ in 0..100 {
+        if !hinted {
+            hinted = bus.inbox_has_messages("s1").await.unwrap_or(false);
+        }
+        if !woken {
+            let entries = bus
+                .queue_drain(agentscope_harness::agent::bus::WAKEUPS_KEY, 10)
+                .await
+                .unwrap_or_default();
+            for entry in &entries {
+                drained.push(entry.payload.clone());
+            }
+            woken = drained
+                .iter()
+                .any(|payload| payload["sessionId"] == serde_json::json!("s1"));
+        }
+        if hinted && woken {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(hinted, "task completion must push an inbox hint");
+    assert!(
+        woken,
+        "task completion must enqueue a wakeup for the session: {drained:?}"
+    );
+    assert!(
+        !repo.find_pending_deliveries(&ctx, "s1").await.is_empty(),
+        "the undelivered result must be visible before the turn"
+    );
+    assert!(
+        agent.has_pending_background_work(&ctx).await,
+        "a host must be able to tell there is work to wake for"
+    );
+
+    // A turn with no user input must deliver it.
+    let session = agent.session(ctx.clone()).await.expect("session opens");
+    let task = session.wakeup().await.expect("wakeup admitted");
+    let settled = session
+        .await_task(&task.command_id)
+        .await
+        .expect("wakeup settles");
+    assert_eq!(settled.status, "completed", "{settled:?}");
+
+    let prompts = seen.lock().unwrap().clone();
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.contains("background subagent task") && p.contains("bg result")),
+        "the wakeup turn must surface the result: {prompts:?}"
+    );
+    assert!(
+        repo.is_delivered(&ctx, "s1", "t-wake").await,
+        "the delivery must be stamped after the wakeup turn"
+    );
+    assert!(
+        repo.find_pending_deliveries(&ctx, "s1").await.is_empty(),
+        "nothing may stay pending after the wakeup turn"
+    );
+    assert!(
+        !agent.has_pending_background_work(&ctx).await,
+        "a wakeup that already read its result must not leave work behind: the deferred \
+         retry would otherwise start an empty turn"
+    );
+}
+
+/// A wakeup that lands while a turn is running is retried after that turn ends, and the
+/// retry is dropped once the turn has read the result. That decision rests on
+/// `has_pending_background_work`, so it must see *both* sources: an inbox hint and an
+/// undelivered task result. Seeing only one would either start empty turns or drop a result
+/// the model never read.
+#[tokio::test]
+async fn the_wakeup_guard_sees_both_task_results_and_inbox_hints() {
+    let dir = temp_dir("wakeup-guard");
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("main")
+            .model(Arc::new(ScriptedModel("ok")))
+            .cwd(dir.to_path_buf())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .session_id("s1")
+            .subagent(SubagentDeclaration::new("worker", "does work", "You work."))
+            .build(),
+    );
+    let ctx = RuntimeContext::default().with_session_id("s1");
+    assert!(
+        !agent.has_pending_background_work(&ctx).await,
+        "a session with no background work must not be woken"
+    );
+
+    // An inbox hint alone is enough: the model has something to read.
+    let bus = agent.message_bus().expect("bus").clone();
+    bus.inbox_push("s1", serde_json::json!({"text": "hint"}))
+        .await
+        .expect("the hint is queued");
+    assert!(
+        agent.has_pending_background_work(&ctx).await,
+        "an inbox hint alone must count as pending work"
+    );    assert!(
+        !bus.inbox_drain("s1", 10).await.expect("drain").is_empty(),
+        "the hint must be readable back"
+    );
+    assert!(
+        !agent.has_pending_background_work(&ctx).await,
+        "a drained inbox leaves nothing to wake for"
+    );
+
+    // An undelivered result alone is enough, even with the hint already consumed.
+    let repo = agent.task_repository();
+    let bg = repo
+        .put_task(
+            &ctx,
+            "t-guard",
+            "worker",
+            "s1",
+            TaskRunSpec::Local {
+                execution: Box::new(|| Ok("bg result".to_string())),
+            },
+        )
+        .await;
+    assert!(
+        tokio::task::spawn_blocking(move || bg.wait_for_completion(5_000))
+            .await
+            .unwrap(),
+        "background task must settle"
+    );
+    // The completion callback pushes an inbox hint as well; wait for it so the drain below
+    // leaves the undelivered result as the only pending work.
+    for _ in 0..100 {
+        if bus.inbox_has_messages("s1").await.unwrap_or(false) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let _ = bus.inbox_drain("s1", 64).await.expect("drain");
+    assert!(
+        !bus.inbox_has_messages("s1").await.unwrap_or(true),
+        "the inbox must be empty so only the result can keep the session pending"
+    );
+    assert!(
+        !repo.find_pending_deliveries(&ctx, "s1").await.is_empty(),
+        "the result must still be undelivered"
+    );
+    assert!(
+        agent.has_pending_background_work(&ctx).await,
+        "an undelivered task result alone must count as pending work"
+    );
+    repo.mark_delivered(&ctx, "s1", "t-guard").await;
+    assert!(
+        !agent.has_pending_background_work(&ctx).await,
+        "a delivered result leaves nothing to wake for"
+    );
+}

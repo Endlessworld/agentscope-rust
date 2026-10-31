@@ -30,6 +30,7 @@ use crate::tool::CompactConfig;
 use super::artifact::ArtifactDeliveryTarget;
 use super::bus::{AsyncToolRegistry, MessageBus, WorkspaceAsyncToolRegistry, WorkspaceMessageBus};
 use super::distributed_store::DistributedStore;
+use super::gateway::create_completion_callback;
 use super::isolation_scope::IsolationScope;
 use super::memory::compaction::{CompactionConfig, ConversationCompactor};
 use super::memory::{
@@ -94,6 +95,10 @@ pub struct HarnessAgent {
     record_model_requests: bool,
     /// Task repository bound to this agent (defaults to a `WorkspaceTaskRepository`).
     task_repository: Arc<dyn TaskRepository>,
+    /// The message bus used for inbox delivery and wakeup signals (always present: the
+    /// builder falls back to a workspace-backed bus). Exposed so a host can run the wakeup
+    /// dispatcher against the same queue this agent enqueues into.
+    message_bus: Option<Arc<dyn MessageBus>>,
     /// The embedded ReAct agent that drives the reasoning→acting loop.
     /// `None` when no model was configured (assembly-only mode).
     agent: Option<ReActAgent>,
@@ -187,6 +192,40 @@ impl HarnessAgent {
     /// The task repository bound to this agent.
     pub fn task_repository(&self) -> &Arc<dyn TaskRepository> {
         &self.task_repository
+    }
+
+    /// The message bus this agent enqueues inbox hints and wakeup signals into.
+    ///
+    /// A host that wakes idle sessions needs this handle: the wakeup queue is
+    /// filesystem-backed, so draining it through a different bus pointed at the same root
+    /// works, but reusing the agent's own handle avoids depending on the root layout.
+    pub fn message_bus(&self) -> Option<&Arc<dyn MessageBus>> {
+        self.message_bus.as_ref()
+    }
+
+    /// Whether the conversation still holds background work the model has not seen: an
+    /// undelivered subagent result, or an inbox hint from an offloaded tool / subagent /
+    /// teammate.
+    ///
+    /// Both are only consumed on a reasoning step, so this is what a host checks before
+    /// starting a wakeup turn — an empty wakeup would just make the model re-answer the
+    /// previous question. `ctx` must be the context the turn runs under: the task records and
+    /// the inbox are keyed by its session id, and its user id selects the isolation namespace
+    /// the tools wrote to.
+    pub async fn has_pending_background_work(&self, ctx: &RuntimeContext) -> bool {
+        let session = super::subagent::task::task_session_key(ctx);
+        if !self
+            .task_repository
+            .find_pending_deliveries(ctx, &session)
+            .await
+            .is_empty()
+        {
+            return true;
+        }
+        let Some(bus) = self.message_bus.as_ref() else {
+            return false;
+        };
+        bus.inbox_has_messages(&session).await.unwrap_or(false)
     }
 
     pub fn model(&self) -> Option<&Arc<dyn Model>> {
@@ -1944,6 +1983,14 @@ impl HarnessAgentBuilder {
                     agent_id.clone(),
                 ))
             });
+        // Connect task completion to the message bus (Java
+        // `HarnessAgent.Builder#wireTaskRepositoryMessageBus`): a terminal subagent task
+        // pushes a hint into the session inbox and enqueues a wakeup, which is what re-runs
+        // an idle session instead of leaving the result to be discovered on the next user
+        // prompt. Like Java this replaces any callback the caller had registered.
+        if let Some(bus) = &message_bus {
+            task_repo.set_completion_callback(create_completion_callback(Arc::clone(bus)));
+        }
         // Shared model slot: `set_model` publishes runtime switches through it,
         // so children spawned after a switch get the new model instead of the
         // build-time snapshot. Created unconditionally; only consumed when the
@@ -2249,6 +2296,7 @@ impl HarnessAgentBuilder {
             disable_session_persistence: self.disable_session_persistence,
             record_model_requests: self.record_model_requests,
             task_repository: task_repo,
+            message_bus: message_bus.clone(),
             agent,
             workspace_manager: Some(workspace_manager),
             plan_mode_manager,

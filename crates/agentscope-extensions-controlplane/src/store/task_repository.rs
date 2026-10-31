@@ -1049,7 +1049,7 @@ impl TaskRepository for ControlPlaneTaskRepository {
             .unwrap_or(false)
     }
 
-    async fn set_completion_callback(&self, callback: TaskCompletionCallback) {
+    fn set_completion_callback(&self, callback: TaskCompletionCallback) {
         *self
             .shared
             .completion_callback
@@ -1247,8 +1247,7 @@ mod tests {
         let sink = Arc::clone(&seen);
         repo.set_completion_callback(Arc::new(move |task_id, _session, _result| {
             sink.lock().unwrap().push(task_id);
-        }))
-        .await;
+        }));
 
         let ctx = RuntimeContext::new();
         let task = repo

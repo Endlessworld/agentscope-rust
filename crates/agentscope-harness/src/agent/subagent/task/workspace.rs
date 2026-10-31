@@ -83,7 +83,7 @@ struct RepoState {
 /// truth source for task state, with in-memory `BackgroundTask` handles as a local overlay.
 pub struct WorkspaceTaskRepository {
     state: Arc<RepoState>,
-    completion_callback: tokio::sync::RwLock<Option<TaskCompletionCallback>>,
+    completion_callback: std::sync::RwLock<Option<TaskCompletionCallback>>,
     /// Remote execution transport; `agent-protocol` by default, injectable for tests.
     transport: Arc<dyn RemoteSubagentTransport>,
     /// Throttles orphan sweeps (process-local by default, store-backed for cross-replica).
@@ -113,7 +113,7 @@ impl WorkspaceTaskRepository {
                 namespace_factory: None,
                 registered_scopes: std::sync::Mutex::new(BTreeSet::new()),
             }),
-            completion_callback: tokio::sync::RwLock::new(None),
+            completion_callback: std::sync::RwLock::new(None),
             transport: Arc::new(AgentProtocolTransport::new()),
             sweep_gate,
             maintenance: std::sync::Mutex::new(None),
@@ -146,8 +146,11 @@ impl WorkspaceTaskRepository {
 
     /// Registers a callback invoked when any task reaches a terminal state (COMPLETED or
     /// FAILED). Only one callback is supported; a second call replaces the previous one.
-    pub async fn set_completion_callback(&self, callback: TaskCompletionCallback) {
-        *self.completion_callback.write().await = Some(callback);
+    pub fn set_completion_callback(&self, callback: TaskCompletionCallback) {
+        *self
+            .completion_callback
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(callback);
     }
 
     fn tasks_path(&self, session_id: &str) -> String {
@@ -330,7 +333,11 @@ impl TaskRepository for WorkspaceTaskRepository {
         let session_id = session_id.to_string();
         let session_for_task = session_id.clone();
         let bg2 = bg.clone();
-        let cb = self.completion_callback.read().await.clone();
+        let cb = self
+            .completion_callback
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
 
         let handle = tokio::task::spawn(async move {
             /// Aborts the adopted run whenever the wrapper goes away — completion **or** an
@@ -611,8 +618,8 @@ impl TaskRepository for WorkspaceTaskRepository {
         map.get(task_id).map(|r| r.is_delivered()).unwrap_or(false)
     }
 
-    async fn set_completion_callback(&self, callback: TaskCompletionCallback) {
-        *self.completion_callback.write().await = Some(callback);
+    fn set_completion_callback(&self, callback: TaskCompletionCallback) {
+        WorkspaceTaskRepository::set_completion_callback(self, callback);
     }
 
     async fn shutdown(&self) {
@@ -1562,8 +1569,7 @@ mod tests {
         let seen2 = seen.clone();
         repo.set_completion_callback(Arc::new(move |tid, sid, result| {
             seen2.lock().unwrap().push((tid, sid, result));
-        }))
-        .await;
+        }));
 
         let bg = repo
             .put_task(&ctx, "t-remote", "sub1", "sess", remote_spec())
@@ -1704,8 +1710,7 @@ mod tests {
         let hits2 = hits.clone();
         repo.set_completion_callback(Arc::new(move |_, _, _| {
             hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }))
-        .await;
+        }));
 
         let bg = repo
             .put_task(&ctx, "t-sup", "sub1", "sess", remote_spec())

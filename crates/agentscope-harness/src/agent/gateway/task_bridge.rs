@@ -96,25 +96,47 @@ impl TaskCompletionBridge {
         Self { message_bus }
     }
 
-    /// Creates a `TaskCompletionCallback` that enqueues wakeups to the message
-    /// bus. Suitable for passing to `WorkspaceTaskRepository::set_completion_callback`.
+    /// Creates a `TaskCompletionCallback` that pushes a `<system-reminder>` hint into the
+    /// session inbox and enqueues a wakeup, mirroring Java
+    /// `HarnessAgent#wireTaskRepositoryMessageBus`.
+    ///
+    /// The inbox hint is what makes the result survive a process restart (the queue lives on
+    /// the filesystem); the wakeup is what re-runs an idle session right away.
     pub fn callback(&self) -> TaskCompletionCallback {
         let bus = Arc::clone(&self.message_bus);
         Arc::new(
-            move |task_id: String, session_id: String, _result: Option<String>| {
+            move |task_id: String, session_id: String, result: Option<String>| {
                 let bus = bus.clone();
                 tokio::spawn(async move {
+                    let mut hint = String::from("<system-reminder>Background subagent task '");
+                    hint.push_str(&task_id);
+                    hint.push_str("' has completed.\n\nResult:\n\n");
+                    hint.push_str(result.as_deref().unwrap_or("(no output)"));
+                    hint.push_str("\n</system-reminder>");
+                    let payload = serde_json::json!({
+                        "type": "hint",
+                        "id": new_hex(),
+                        "hint": hint,
+                        "source": "subagent_task",
+                    });
+                    if let Err(e) = bus.inbox_push(&session_id, payload).await {
+                        tracing::warn!(task = %task_id, %e, "task completion hint was not pushed");
+                    }
                     // Enqueue wakeup with session_id so the dispatcher can route to the
                     // correct session. The agent_id is empty (main agent handles delivery).
-                    if let Err(e) = bus.enqueue_wakeup("", &session_id, "").await {
-                        tracing::warn!(
-                        "TaskCompletionBridge: failed to enqueue wakeup for task {task_id}: {e}"
-                    );
+                    let anonymous = "";
+                    if let Err(e) = bus.enqueue_wakeup(anonymous, &session_id, anonymous).await {
+                        tracing::warn!(task = %task_id, %e, "task completion wakeup was not enqueued");
                     }
                 });
             },
         )
     }
+}
+
+/// Generates a UUID without dashes, matching the Java side.
+fn new_hex() -> String {
+    uuid::Uuid::new_v4().to_string().replace('-', "")
 }
 
 /// Wires the `TaskCompletionBridge` into a `WorkspaceTaskRepository` and
@@ -125,7 +147,7 @@ pub async fn wire_task_completion(
     message_bus: Arc<dyn MessageBus>,
 ) {
     let bridge = TaskCompletionBridge::new(message_bus);
-    repo.set_completion_callback(bridge.callback()).await;
+    repo.set_completion_callback(bridge.callback());
 }
 
 /// Convenience: creates a `TaskCompletionBridge` and returns the callback for

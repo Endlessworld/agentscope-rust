@@ -57,7 +57,11 @@ pub const ACP_CONTEXT_WINDOW_TOKENS: usize = 256_000;
 
 /// The window the conversation compactor sizes itself against.
 pub fn compaction_window_tokens() -> usize {
-    parse_compaction_window(std::env::var("AGENTSCOPE_ACP_COMPACTION_WINDOW").ok().as_deref())
+    parse_compaction_window(
+        std::env::var("AGENTSCOPE_ACP_COMPACTION_WINDOW")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Parses the `AGENTSCOPE_ACP_COMPACTION_WINDOW` override.
@@ -511,6 +515,10 @@ impl AcpCodingAgent {
         transport: impl agent_client_protocol::ConnectTo<Agent> + 'static,
     ) -> agent_client_protocol::Result<()> {
         let agent = Arc::new(self);
+        // Start the idle-wakeup loop before serving requests: a session only exists after
+        // `session/new`, and the loop picks it up from the registry on its next tick.
+        let wakeup_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wakeup = spawn_wakeup_loop(Arc::clone(&agent), Arc::clone(&wakeup_stop));
         let a_init = agent.clone();
         let a_new = agent.clone();
         let a_prompt = agent.clone();
@@ -526,7 +534,7 @@ impl AcpCodingAgent {
         let a_providers = agent.clone();
         let a_providers_set = agent.clone();
         let a_providers_disable = agent.clone();
-        Agent
+        let result = Agent
             .builder()
             .on_receive_request(
                 async move |initialize: InitializeRequest, responder, _cx| {
@@ -901,8 +909,81 @@ impl AcpCodingAgent {
                 agent_client_protocol::on_receive_request!(),
             )
             .connect_to(transport)
-            .await
+            .await;
+        // The connection is gone: stop waking sessions nobody is listening to.
+        wakeup_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        wakeup.abort();
+        result
     }
+}
+
+/// Runs the idle-wakeup loop for the lifetime of the connection.
+///
+/// Background results (subagent tasks, offloaded tools, teammate messages) only reach the
+/// model on a reasoning step, so a session that went idle with a pending result would stay
+/// silent until the user typed again. This loop is the ACP counterpart of the harness
+/// `WakeupDispatcher`: it drains the wakeup queue each producer writes to and gives the
+/// named session the turn it is missing.
+///
+/// A wakeup that lands while the session is running is **deferred, not dropped**: the running
+/// turn only reads the result if it reaches another reasoning step, and a turn that is
+/// already wrapping up would leave it unserved. Deferred entries are retried each tick until
+/// the session goes idle; the turn's own `run_wakeup` guard drops the retry when that turn
+/// already consumed the result, so an empty turn is never started. One attempt per idle
+/// period, like the dispatcher, so a failing turn is not retried in a loop.
+fn spawn_wakeup_loop(
+    agent: Arc<AcpCodingAgent>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Long enough to be free when nothing is pending, short enough that a finished
+        // subagent's summary shows up while the user is still looking at the session.
+        const TICK: std::time::Duration = std::time::Duration::from_millis(500);
+        // Sessions that asked to be woken while their turn was still running.
+        let mut deferred: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(TICK).await;
+            let sessions: Vec<AcpAgentSession> = {
+                let registry = agent
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                registry.values().cloned().collect()
+            };
+            // Sessions built from the same workspace share one bus, so whichever of them
+            // drains first collects every entry; the second drain is empty.
+            for session in sessions {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                for target_id in session.drain_wakeup_requests().await {
+                    deferred.insert(target_id, ());
+                }
+            }
+            // Serve everything that is now idle; keep the sessions still running.
+            for target_id in std::mem::take(&mut deferred).into_keys() {
+                let target = {
+                    let registry = agent
+                        .sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    registry.get(&target_id).cloned()
+                };
+                let Some(mut target) = target else {
+                    // Unknown or evicted session: nothing to wake.
+                    continue;
+                };
+                if target.is_closed() {
+                    continue;
+                }
+                if target.is_running() {
+                    deferred.insert(target_id, ());
+                    continue;
+                }
+                target.run_wakeup().await;
+            }
+        }
+    })
 }
 
 /// Handles `_agentscope/session/respond`: converts the wire answers and hands them to the
@@ -1067,10 +1148,7 @@ mod tests {
             super::parse_compaction_window(None),
             super::ACP_CONTEXT_WINDOW_TOKENS
         );
-        assert_eq!(
-            super::parse_compaction_window(Some(" 300000 ")),
-            300_000
-        );
+        assert_eq!(super::parse_compaction_window(Some(" 300000 ")), 300_000);
         // A typo or a zero must not silently disable compaction.
         assert_eq!(
             super::parse_compaction_window(Some("0")),
