@@ -30,15 +30,21 @@ pub fn role_to_bailian_role(role: MsgRole) -> Option<&'static str> {
     }
 }
 
-/// Whether a message should be recorded, mirroring `BailianLongTermMemory.record`:
-/// only `User` / pure `Assistant` (no tool-use block) with non-blank text and no
-/// compressed-history marker.
+/// Whether a message should be recorded, mirroring the single predicate inside
+/// `BailianLongTermMemory.record`: only `User` / pure `Assistant` (no tool-use block)
+/// with non-blank text and no compressed-history marker.
 pub fn is_recordable(msg: &Msg) -> bool {
-    match msg.role() {
+    let role_allowed = match msg.role() {
         MsgRole::User => true,
         MsgRole::Assistant => !msg.has_block(ContentBlockKind::ToolUse),
         MsgRole::System | MsgRole::Tool => false,
+    };
+    if !role_allowed {
+        return false;
     }
+    // Java: `textContent == null || textContent.isBlank()` / `contains("<compressed_history>")`.
+    let text = msg.text_content();
+    !text.trim().is_empty() && !text.contains(COMPRESSED_HISTORY_MARKER)
 }
 
 /// Converts a single [`Msg`] to a [`BailianMessage`], or `None` when unsupported.
@@ -53,13 +59,7 @@ pub fn convert_to_bailian_message(msg: &Msg) -> Option<BailianMessage> {
 /// Converts a slice of messages into Bailian messages, applying the Java filters.
 pub fn convert_messages(msgs: &[Msg]) -> Vec<BailianMessage> {
     msgs.iter()
-        .filter(|msg| {
-            if !is_recordable(msg) {
-                return false;
-            }
-            let text = msg.text_content();
-            !text.trim().is_empty() && !text.contains(COMPRESSED_HISTORY_MARKER)
-        })
+        .filter(|msg| is_recordable(msg))
         .filter_map(convert_to_bailian_message)
         .collect()
 }
@@ -322,6 +322,23 @@ mod tests {
         assert!(is_recordable(&Msg::assistant("plain")));
         assert!(!is_recordable(&tool_use_assistant()));
         assert!(!is_recordable(&Msg::system("sys")));
+    }
+
+    /// MEM-04: the public helper carries the **whole** Java predicate, so blank text
+    /// and compressed-history markers are rejected without going through
+    /// [`convert_messages`]. Bailian uses `String#isBlank` (whitespace counts as empty).
+    #[test]
+    fn is_recordable_rejects_blank_text_and_compressed_history() {
+        assert!(!is_recordable(&Msg::user("")));
+        assert!(!is_recordable(&Msg::user("   \t\n")));
+        assert!(!is_recordable(&Msg::assistant("  ")));
+        assert!(!is_recordable(&Msg::user(format!(
+            "{COMPRESSED_HISTORY_MARKER} summary"
+        ))));
+        assert!(!is_recordable(&Msg::assistant(format!(
+            "x {COMPRESSED_HISTORY_MARKER}"
+        ))));
+        assert!(is_recordable(&Msg::user("kept")));
     }
 
     #[test]

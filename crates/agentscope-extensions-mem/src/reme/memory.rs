@@ -28,13 +28,21 @@ pub fn role_to_reme_role(role: MsgRole) -> Option<&'static str> {
     }
 }
 
-/// Whether a message should be recorded, mirroring `ReMeLongTermMemory.record`.
+/// Whether a message should be recorded, mirroring the single predicate inside
+/// `ReMeLongTermMemory.record`: only `User` / pure `Assistant` (no tool-use block)
+/// with non-empty text and no compressed-history marker.
 pub fn is_recordable(msg: &Msg) -> bool {
-    match msg.role() {
+    let role_allowed = match msg.role() {
         MsgRole::User => true,
         MsgRole::Assistant => !msg.has_block(ContentBlockKind::ToolUse),
         MsgRole::System | MsgRole::Tool => false,
+    };
+    if !role_allowed {
+        return false;
     }
+    // Java: `textContent == null || textContent.isEmpty()` / `contains("<compressed_history>")`.
+    let text = msg.text_content();
+    !text.is_empty() && !text.contains(COMPRESSED_HISTORY_MARKER)
 }
 
 /// Converts a single [`Msg`] to a [`ReMeMessage`], or `None` when unsupported.
@@ -49,13 +57,7 @@ pub fn convert_to_reme_message(msg: &Msg) -> Option<ReMeMessage> {
 /// Converts a slice of messages into ReMe messages, applying the Java filters.
 pub fn convert_messages(msgs: &[Msg]) -> Vec<ReMeMessage> {
     msgs.iter()
-        .filter(|msg| {
-            if !is_recordable(msg) {
-                return false;
-            }
-            let text = msg.text_content();
-            !text.is_empty() && !text.contains(COMPRESSED_HISTORY_MARKER)
-        })
+        .filter(|msg| is_recordable(msg))
         .filter_map(convert_to_reme_message)
         .collect()
 }
@@ -202,6 +204,19 @@ mod tests {
         assert!(is_recordable(&Msg::assistant("plain")));
         assert!(!is_recordable(&tool_use_assistant()));
         assert!(!is_recordable(&Msg::tool("id", "name", "out")));
+    }
+
+    /// MEM-04: the public helper carries the **whole** Java predicate, so empty text
+    /// and compressed-history markers are rejected without going through
+    /// [`convert_messages`]. ReMe uses `String#isEmpty` (whitespace-only is kept).
+    #[test]
+    fn is_recordable_rejects_empty_text_and_compressed_history() {
+        assert!(!is_recordable(&Msg::user("")));
+        assert!(!is_recordable(&Msg::assistant("")));
+        assert!(!is_recordable(&Msg::user(format!(
+            "{COMPRESSED_HISTORY_MARKER} summary"
+        ))));
+        assert!(is_recordable(&Msg::user("   ")));
     }
 
     #[test]

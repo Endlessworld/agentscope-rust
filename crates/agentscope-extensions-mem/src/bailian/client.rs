@@ -227,4 +227,74 @@ mod tests {
             "Bailian API search memory failed with status 429: slow down"
         );
     }
+
+    /// MEM-06: a non-2xx `add` surfaces the structured status/body (not only the
+    /// rendered message) so a caller can branch on the code.
+    #[tokio::test]
+    async fn add_propagates_http_status_and_body() {
+        let mock = MockTransport::new();
+        mock.push_response(Err(MemError::http_status(500, "boom")));
+        let client =
+            BailianMemoryClient::with_transport(Arc::new(mock.clone()), "key", DEFAULT_BASE_URL)
+                .unwrap();
+        let err = client
+            .add(&crate::bailian::dto::BailianAddRequest::new())
+            .await
+            .unwrap_err();
+        match err {
+            MemError::HttpStatus {
+                vendor,
+                operation,
+                status,
+                ref body,
+            } => {
+                assert_eq!((vendor, operation, status), ("Bailian", "add memory", 500));
+                assert_eq!(body, "boom");
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    /// MEM-06: a malformed body is reported as [`MemError::Json`] (Java surfaces the
+    /// Jackson failure raised by `executePost`'s `fromJson`).
+    #[tokio::test]
+    async fn invalid_json_surfaces_as_a_json_error() {
+        let mock = MockTransport::new();
+        mock.push_body("not json");
+        mock.push_body("{\"memory_nodes\": 42}");
+        let client =
+            BailianMemoryClient::with_transport(Arc::new(mock), "key", DEFAULT_BASE_URL).unwrap();
+        assert!(matches!(
+            client
+                .add(&crate::bailian::dto::BailianAddRequest::new())
+                .await
+                .unwrap_err(),
+            MemError::Json(_)
+        ));
+        assert!(matches!(
+            client
+                .search(&crate::bailian::dto::BailianSearchRequest::new())
+                .await
+                .unwrap_err(),
+            MemError::Json(_)
+        ));
+    }
+
+    /// MEM-06: Bailian rejects an empty body (Java `executePost` fails on a null body),
+    /// unlike ReMe which falls back to `{}`.
+    #[tokio::test]
+    async fn empty_response_body_is_a_transport_error() {
+        let mock = MockTransport::new();
+        mock.push_body("   ");
+        let client =
+            BailianMemoryClient::with_transport(Arc::new(mock), "key", DEFAULT_BASE_URL).unwrap();
+        let err = client
+            .search(&crate::bailian::dto::BailianSearchRequest::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "memory transport error: Bailian API returned empty response"
+        );
+    }
 }
