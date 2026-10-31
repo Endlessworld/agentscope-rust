@@ -377,15 +377,16 @@ impl TransportWrapper for JsonRpcTransportWrapper {
 /// Whether a JSON-RPC method is answered with a stream of responses.
 ///
 /// Mirrors Java `JsonRpcTransportWrapper#handleStreamRequest`, which accepts both
-/// `SendStreamingMessage` (`message/stream`) and `SubscribeToTask` (`tasks/resubscribe`).
-/// **Deviation**: only the streaming message methods stream here — Java can honor a resubscribe
-/// because the SDK keeps a per-task event queue; this handler has no queue (each run's events are
-/// relayed once, then recorded as artifacts), so `SubscribeToTask` would have to re-run the agent.
-/// It therefore stays a non-streaming method and answers `-32601` (`dispatch` has no arm for it).
+/// `SendStreamingMessage` (`message/stream`) and `SubscribeToTask` (`tasks/resubscribe`). The
+/// resubscribe arm relays the events a task already recorded (plus the live ones) instead of
+/// starting a second run — see [`A2aTaskRegistry::event_log`](crate::A2aTaskRegistry::event_log).
 pub fn is_streaming_method(method: &str) -> bool {
     matches!(
         method,
-        methods::MESSAGE_STREAM | methods::LEGACY_MESSAGE_STREAM
+        methods::MESSAGE_STREAM
+            | methods::LEGACY_MESSAGE_STREAM
+            | methods::TASKS_RESUBSCRIBE
+            | methods::LEGACY_TASKS_RESUBSCRIBE
     )
 }
 
@@ -605,22 +606,23 @@ mod tests {
         assert!(is_streaming_method(methods::MESSAGE_STREAM));
         assert!(is_streaming_method(methods::LEGACY_MESSAGE_STREAM));
         assert!(!is_streaming_method(methods::MESSAGE_SEND));
-        // No per-task event queue: resubscribe would have to re-run the agent, so it stays a
-        // non-streaming (unsupported) method rather than silently starting a second run.
-        assert!(!is_streaming_method(methods::TASKS_RESUBSCRIBE));
+        // Resubscribe streams the recorded events of an existing task (Java
+        // `handleStreamRequest` accepts `SubscribeToTask` too).
+        assert!(is_streaming_method(methods::TASKS_RESUBSCRIBE));
+        assert!(is_streaming_method(methods::LEGACY_TASKS_RESUBSCRIBE));
         assert!(!is_streaming_method(
             agentscope_core::event::AgentEventType::AgentStart.wire_name()
         ));
     }
 
     #[test]
-    fn resubscribe_is_not_streamed_and_reports_method_not_found() {
+    fn resubscribe_is_served_as_a_stream_and_reports_the_unknown_task() {
         let wrapper = JsonRpcTransportWrapper::new(handler());
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tasks/resubscribe",
-            "params": { "id": "t-1" }
+            "params": { "id": "t-unknown" }
         })
         .to_string();
         let response = rt().block_on(wrapper.handle_request(
@@ -628,9 +630,14 @@ mod tests {
             &TransportHeaders::new(),
             &TransportMetadata::new(),
         ));
-        assert!(!response.is_stream());
-        let parsed: JsonRpcResponse = serde_json::from_str(response.as_json().unwrap()).unwrap();
-        assert_eq!(parsed.error.unwrap().code, JsonRpcError::METHOD_NOT_FOUND);
+        assert!(response.is_stream());
+        let TransportResponse::Stream(stream) = response else {
+            panic!("expected a stream");
+        };
+        let frames: Vec<String> = rt().block_on(futures::StreamExt::collect(stream));
+        assert_eq!(frames.len(), 1, "expected one error frame: {frames:?}");
+        let parsed: JsonRpcResponse = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(parsed.error.unwrap().code, JsonRpcError::TASK_NOT_FOUND);
     }
 
     #[test]

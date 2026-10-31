@@ -29,22 +29,26 @@
 //! 4. The A2A wire protocol has no structured-output extension, so `call_with_schema` reports
 //!    [`A2aError::UnsupportedMethod`] instead of silently degrading.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agentscope_core::event::{AgentEvent, EventData};
 use agentscope_core::message::Msg;
 use agentscope_core::state::AgentState;
 use agentscope_core::tool::Toolkit;
-use agentscope_core::{Agent, CallableAgent, Error, JsonSchema, Result as CoreResult};
+use agentscope_core::{
+    Agent, CallableAgent, Error, JsonSchema, ObservableAgent, Result as CoreResult,
+};
+use futures::stream::BoxStream;
 
 use crate::card::AgentCardResolver;
 use crate::client::{A2aClient, JsonRpcTransport, ReqwestJsonRpcTransport, SendResult};
 use crate::error::A2aError;
-use crate::message::MessageConvert;
-use crate::model::{MessageSendParams, Task, TaskIdParams, TaskQueryParams};
-use crate::result::task_result_message;
+use crate::message::{message_constants, MessageConstants, MessageConvert};
+use crate::model::{MessageSendParams, Part, StreamEvent, Task, TaskIdParams, TaskQueryParams};
+use crate::result::{task_result_message, TaskResultAccumulator};
 
 /// Default number of `tasks/get` polls before a call gives up on a non-terminal task.
 pub const DEFAULT_POLL_ATTEMPTS: usize = 100;
@@ -67,7 +71,10 @@ pub struct A2aAgentConfig {
 impl std::fmt::Debug for A2aAgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("A2aAgentConfig")
-            .field("auth_headers", &self.auth_headers.keys().collect::<Vec<_>>())
+            .field(
+                "auth_headers",
+                &self.auth_headers.keys().collect::<Vec<_>>(),
+            )
             .field("poll_attempts", &self.poll_attempts)
             .field("poll_interval", &self.poll_interval)
             .finish_non_exhaustive()
@@ -247,15 +254,22 @@ pub struct A2aAgent {
     description: String,
     resolver: Arc<dyn AgentCardResolver>,
     config: A2aAgentConfig,
-    state: Mutex<AgentState>,
+    state: Arc<Mutex<AgentState>>,
     toolkit: Toolkit,
     running: Arc<Mutex<Vec<Arc<InFlightCall>>>>,
+    /// Sinks registered through [`ObservableAgent::subscribe`], mirroring Java
+    /// `ClientEventContext#setEventEmitter`.
+    sinks: Arc<Mutex<Vec<A2aEventSink>>>,
     /// Serializes calls of this agent, mirroring Java `callSerializationKey(session)`.
     ///
     /// An async mutex because the guard is held across the request's awaits and
-    /// [`CallableAgent::call`] must stay `Send`.
-    call_gate: tokio::sync::Mutex<()>,
+    /// [`CallableAgent::call`] must stay `Send`; `stream_events` additionally takes an
+    /// **owned** guard so the returned stream can be `'static`.
+    call_gate: Arc<tokio::sync::Mutex<()>>,
 }
+
+/// A subscriber registered through [`ObservableAgent::subscribe`].
+type A2aEventSink = Box<dyn Fn(AgentEvent) + Send + Sync>;
 
 impl std::fmt::Debug for A2aAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -309,10 +323,7 @@ impl A2aAgent {
 
     /// The current history of the agent state (Java `historyOf(session)`).
     pub fn history(&self) -> Vec<Msg> {
-        self.state
-            .lock()
-            .map(|state| state.context.clone())
-            .unwrap_or_default()
+        history_of(&self.state)
     }
 
     /// The running call ids, sorted for stable assertions.
@@ -390,6 +401,37 @@ impl A2aAgent {
         ))
     }
 
+    /// Sends `messages` over `message/stream` and relays the remote run as core events.
+    ///
+    /// Mirrors Java `A2aAgent#streamEvents`: an `AGENT_START`, one `TEXT_BLOCK_DELTA` (or
+    /// `THINKING_BLOCK_DELTA`) per text part of every artifact update, then `AGENT_RESULT` plus
+    /// `AGENT_END` once the task reaches a terminal state. Each emitted event is also pushed to the
+    /// sinks registered through [`ObservableAgent::subscribe`], which is Java's
+    /// `ClientEventContext#setEventEmitter`.
+    ///
+    /// The call is serialized like [`exchange`](Self::exchange): the gate is taken on the first
+    /// poll and released when the stream ends or is dropped.
+    pub fn stream_events(
+        &self,
+        messages: Vec<Msg>,
+    ) -> BoxStream<'static, Result<AgentEvent, A2aError>> {
+        let state = AgentStreamState {
+            name: self.name.clone(),
+            resolver: self.resolver.clone(),
+            config: self.config.clone(),
+            agent_state: self.state.clone(),
+            sinks: self.sinks.clone(),
+            gate: self.call_gate.clone(),
+            _guard: None,
+            messages,
+            phase: AgentStreamPhase::Start,
+            accumulator: TaskResultAccumulator::new(),
+            started: false,
+            pending: VecDeque::new(),
+        };
+        Box::pin(futures::stream::unfold(state, next_agent_stream_item))
+    }
+
     /// Cancels the running call's remote task, mirroring Java `cancelRemoteTask`.
     ///
     /// Returns `None` when no call carries a task id yet.
@@ -414,12 +456,7 @@ impl A2aAgent {
     }
 
     fn append_history(&self, messages: &[Msg]) {
-        if messages.is_empty() {
-            return;
-        }
-        if let Ok(mut state) = self.state.lock() {
-            state.context.extend(messages.iter().cloned());
-        }
+        append_to_history(&self.state, messages);
     }
 
     fn register_call(&self, task: &Task) -> Arc<InFlightCall> {
@@ -486,6 +523,163 @@ impl A2aAgent {
     }
 }
 
+/// The current history of the agent state, mirroring Java `historyOf(session)`.
+fn history_of(state: &Arc<Mutex<AgentState>>) -> Vec<Msg> {
+    state
+        .lock()
+        .map(|state| state.context.clone())
+        .unwrap_or_default()
+}
+
+/// Appends `messages` to the agent state, mirroring Java's per-call history update.
+fn append_to_history(state: &Arc<Mutex<AgentState>>, messages: &[Msg]) {
+    if messages.is_empty() {
+        return;
+    }
+    if let Ok(mut state) = state.lock() {
+        state.context.extend(messages.iter().cloned());
+    }
+}
+
+/// Phases of one [`A2aAgent::stream_events`] run.
+enum AgentStreamPhase {
+    /// Nothing requested yet: the call is serialized and the remote stream opened on first poll.
+    Start,
+    /// The remote stream is open; frames arrive incrementally.
+    Running(BoxStream<'static, Result<StreamEvent, A2aError>>),
+    /// The run settled (or failed); nothing more to emit.
+    Done,
+}
+
+/// State carried through `futures::stream::unfold` for one streaming call.
+struct AgentStreamState {
+    name: String,
+    resolver: Arc<dyn AgentCardResolver>,
+    config: A2aAgentConfig,
+    agent_state: Arc<Mutex<AgentState>>,
+    sinks: Arc<Mutex<Vec<A2aEventSink>>>,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    /// Held for the whole stream, so two streaming calls of one agent never interleave.
+    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    messages: Vec<Msg>,
+    phase: AgentStreamPhase,
+    accumulator: TaskResultAccumulator,
+    /// Whether `AGENT_START` was already emitted.
+    started: bool,
+    pending: VecDeque<Result<AgentEvent, A2aError>>,
+}
+
+/// One poll of a streaming call, mirroring Java `A2aAgent#streamEvents`.
+async fn next_agent_stream_item(
+    mut state: AgentStreamState,
+) -> Option<(Result<AgentEvent, A2aError>, AgentStreamState)> {
+    loop {
+        if let Some(item) = state.pending.pop_front() {
+            if let Ok(event) = &item {
+                emit_to_sinks(&state.sinks, event);
+            }
+            return Some((item, state));
+        }
+        if !state.started {
+            state.started = true;
+            state
+                .pending
+                .push_back(Ok(AgentEvent::AgentStart(EventData::default())));
+            continue;
+        }
+        match std::mem::replace(&mut state.phase, AgentStreamPhase::Done) {
+            AgentStreamPhase::Start => {
+                state._guard = Some(state.gate.clone().lock_owned().await);
+                append_to_history(&state.agent_state, &state.messages);
+                let history = history_of(&state.agent_state);
+                let client = A2aClient::new(state.name.clone(), state.resolver.clone())
+                    .with_transport(state.config.transport.clone())
+                    .with_auth_headers(state.config.auth_headers.clone());
+                let params = MessageSendParams {
+                    message: MessageConvert::convert_from_msgs(&history),
+                    configuration: None,
+                    metadata: None,
+                };
+                match client.message_stream_incremental(params).await {
+                    Ok(events) => state.phase = AgentStreamPhase::Running(events),
+                    Err(error) => state.pending.push_back(Err(error)),
+                }
+            }
+            AgentStreamPhase::Running(mut events) => {
+                match futures::StreamExt::next(&mut events).await {
+                    Some(Ok(event)) => {
+                        for mapped in stream_event_to_agent_events(&event) {
+                            state.pending.push_back(Ok(mapped));
+                        }
+                        match state.accumulator.observe(&event, &state.name) {
+                            Some(reply) => {
+                                append_to_history(&state.agent_state, std::slice::from_ref(&reply));
+                                let mut data = EventData::default();
+                                if let Ok(value) = serde_json::to_value(&reply) {
+                                    data.fields.insert("reply".to_string(), value);
+                                }
+                                state.pending.push_back(Ok(AgentEvent::AgentResult(data)));
+                                state
+                                    .pending
+                                    .push_back(Ok(AgentEvent::AgentEnd(EventData::default())));
+                            }
+                            None => state.phase = AgentStreamPhase::Running(events),
+                        }
+                    }
+                    Some(Err(error)) => state.pending.push_back(Err(error)),
+                    None => state.phase = AgentStreamPhase::Done,
+                }
+            }
+            AgentStreamPhase::Done => return None,
+        }
+    }
+}
+
+/// Maps one A2A stream event to the core events a local subscriber sees.
+///
+/// Java `ClientEventContext#emitDeltas` forwards the TEXT and THINKING blocks of every artifact
+/// update; status updates and task payloads only feed the terminal result, so they produce no
+/// delta events here.
+fn stream_event_to_agent_events(event: &StreamEvent) -> Vec<AgentEvent> {
+    let StreamEvent::ArtifactUpdate(update) = event else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    for part in &update.artifact.parts {
+        let Part::Text(text) = part else {
+            continue;
+        };
+        let mut data = EventData::default();
+        data.fields.insert(
+            "reply_id".to_string(),
+            serde_json::Value::String(update.artifact.artifact_id.clone()),
+        );
+        data.fields.insert(
+            "delta".to_string(),
+            serde_json::Value::String(text.text.clone()),
+        );
+        let block_type = MessageConstants::metadata_value(
+            text.metadata.as_ref(),
+            MessageConstants::BLOCK_TYPE_METADATA_KEY,
+        );
+        if block_type.as_deref() == Some(message_constants::block_content::TYPE_THINKING) {
+            events.push(AgentEvent::ThinkingBlockDelta(data));
+        } else {
+            events.push(AgentEvent::TextBlockDelta(data));
+        }
+    }
+    events
+}
+
+/// Pushes `event` to every registered sink, mirroring Java `ClientEventContext`'s emitter.
+fn emit_to_sinks(sinks: &Arc<Mutex<Vec<A2aEventSink>>>, event: &AgentEvent) {
+    if let Ok(sinks) = sinks.lock() {
+        for sink in sinks.iter() {
+            sink(event.clone());
+        }
+    }
+}
+
 impl Agent for A2aAgent {
     fn agent_id(&self) -> &str {
         &self.name
@@ -516,6 +710,14 @@ impl Agent for A2aAgent {
 
     fn toolkit(&self) -> &Toolkit {
         &self.toolkit
+    }
+}
+
+impl ObservableAgent for A2aAgent {
+    fn subscribe(&self, sink: Box<dyn Fn(AgentEvent) + Send + Sync>) {
+        if let Ok(mut sinks) = self.sinks.lock() {
+            sinks.push(sink);
+        }
     }
 }
 
@@ -595,10 +797,11 @@ impl A2aAgentBuilder {
             description: self.description,
             resolver: self.resolver,
             config: self.config,
-            state: Mutex::new(self.state),
+            state: Arc::new(Mutex::new(self.state)),
             toolkit: Toolkit::new(),
             running: Arc::new(Mutex::new(Vec::new())),
-            call_gate: tokio::sync::Mutex::new(()),
+            sinks: Arc::new(Mutex::new(Vec::new())),
+            call_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -668,7 +871,10 @@ mod tests {
             if replies.len() > 1 {
                 replies.remove(0)
             } else {
-                replies.first().cloned().unwrap_or_else(|| self.send_reply.clone())
+                replies
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| self.send_reply.clone())
             }
         }
     }
@@ -688,17 +894,30 @@ mod tests {
             };
             Box::pin(async move { Ok(response) })
         }
+
+        fn send_stream(
+            &self,
+            _url: String,
+            request: JsonRpcRequest,
+            _headers: BTreeMap<String, String>,
+        ) -> futures::stream::BoxStream<'static, Result<JsonRpcResponse, A2aError>> {
+            self.methods.lock().unwrap().push(request.method.clone());
+            let response = self.send_reply.clone();
+            Box::pin(futures::stream::once(async move { Ok(response) }))
+        }
     }
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Runtime::new().unwrap()
     }
 
-    fn completed_task_reply(artifacts: Option<Vec<Artifact>>, message: Option<&str>) -> JsonRpcResponse {
+    fn completed_task_reply(
+        artifacts: Option<Vec<Artifact>>,
+        message: Option<&str>,
+    ) -> JsonRpcResponse {
         let mut status = TaskStatus::new(TaskState::Completed);
-        status.message = message.map(|text| {
-            Message::new("m-status", MessageRole::Agent, vec![Part::text(text)])
-        });
+        status.message = message
+            .map(|text| Message::new("m-status", MessageRole::Agent, vec![Part::text(text)]));
         let mut task = Task::new("t-1", status);
         task.artifacts = artifacts;
         JsonRpcResponse::success(serde_json::to_value(&task).unwrap(), Some(1.into()))
@@ -726,7 +945,10 @@ mod tests {
     fn call_returns_the_task_artifacts() {
         let transport = ScriptedTransport::new(
             completed_task_reply(
-                Some(vec![Artifact::new("art-1", vec![Part::text("real answer")])]),
+                Some(vec![Artifact::new(
+                    "art-1",
+                    vec![Part::text("real answer")],
+                )]),
                 Some("done"),
             ),
             Vec::new(),
@@ -840,7 +1062,9 @@ mod tests {
         runtime.block_on(handle).unwrap();
 
         assert_eq!(reply.text_content(), "Task t-1 interrupt successfully.");
-        assert!(transport.methods().contains(&methods::TASKS_CANCEL.to_string()));
+        assert!(transport
+            .methods()
+            .contains(&methods::TASKS_CANCEL.to_string()));
     }
 
     // Java: `1524b3191` — a card that cannot be resolved fails the call immediately.
@@ -851,23 +1075,23 @@ mod tests {
             Vec::new(),
             JsonRpcResponse::success(serde_json::Value::Null, Some(2.into())),
         );
-        let agent = A2aAgent::builder(
-            "missing",
-            Arc::new(ScriptedResolver { card: Err(()) }),
-        )
-        .config(
-            A2aAgentConfig::builder()
-                .transport(transport.clone())
-                .build(),
-        )
-        .build();
+        let agent = A2aAgent::builder("missing", Arc::new(ScriptedResolver { card: Err(()) }))
+            .config(
+                A2aAgentConfig::builder()
+                    .transport(transport.clone())
+                    .build(),
+            )
+            .build();
 
         let error = rt()
             .block_on(agent.call(vec![Msg::user("hi")]))
             .expect_err("the call fails");
         let text = error.to_string();
         assert!(text.contains("missing"), "error names the agent: {text}");
-        assert!(text.contains("ScriptedResolver"), "error names the resolver: {text}");
+        assert!(
+            text.contains("ScriptedResolver"),
+            "error names the resolver: {text}"
+        );
         assert!(
             transport.methods().is_empty(),
             "nothing is sent when the card is missing"
@@ -899,5 +1123,125 @@ mod tests {
         );
         let agent = agent_with(transport);
         assert!(Agent::toolkit(&agent).tool_names().is_empty());
+    }
+
+    /// Transport that answers `message/stream` with the scripted frames.
+    struct StreamTransport {
+        frames: Mutex<Vec<JsonRpcResponse>>,
+        methods: Mutex<Vec<String>>,
+    }
+
+    impl StreamTransport {
+        fn new(frames: Vec<JsonRpcResponse>) -> Arc<Self> {
+            Arc::new(Self {
+                frames: Mutex::new(frames),
+                methods: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl JsonRpcTransport for StreamTransport {
+        fn send(
+            &self,
+            _url: &str,
+            _request: &JsonRpcRequest,
+            _headers: &BTreeMap<String, String>,
+        ) -> Pin<Box<dyn Future<Output = Result<JsonRpcResponse, A2aError>> + Send + '_>> {
+            unreachable!("only the streaming method is used")
+        }
+
+        fn send_stream(
+            &self,
+            _url: String,
+            request: JsonRpcRequest,
+            _headers: BTreeMap<String, String>,
+        ) -> futures::stream::BoxStream<'static, Result<JsonRpcResponse, A2aError>> {
+            self.methods.lock().unwrap().push(request.method.clone());
+            let frames = std::mem::take(&mut *self.frames.lock().unwrap());
+            Box::pin(futures::stream::iter(frames.into_iter().map(Ok)))
+        }
+    }
+
+    fn artifact_update(text: &str) -> JsonRpcResponse {
+        let artifact = Artifact::new("artifact-1", vec![Part::text(text)]);
+        let mut update = crate::model::TaskArtifactUpdateEvent::new("t-1", artifact);
+        // Streamed chunks of one block arrive as appended parts, like a real A2A server does.
+        update.append = Some(true);
+        JsonRpcResponse::success(serde_json::to_value(&update).unwrap(), Some(1.into()))
+    }
+
+    fn completed_update() -> JsonRpcResponse {
+        let update = crate::model::TaskStatusUpdateEvent::new(
+            "t-1",
+            TaskStatus::new(TaskState::Completed),
+            true,
+        );
+        JsonRpcResponse::success(serde_json::to_value(&update).unwrap(), Some(2.into()))
+    }
+
+    // Java: A2aAgent#streamEvents — deltas are relayed, then `AgentResult` carries the reply.
+    #[test]
+    fn stream_events_relays_deltas_and_the_terminal_result() {
+        use futures::StreamExt;
+
+        let transport = StreamTransport::new(vec![
+            artifact_update("Hel"),
+            artifact_update("lo"),
+            completed_update(),
+        ]);
+        let agent = A2aAgent::builder("remote", resolver())
+            .config(
+                A2aAgentConfig::builder()
+                    .transport(transport.clone())
+                    .build(),
+            )
+            .build();
+
+        // Subscribers see exactly what the stream emits (Java `ClientEventContext#emit`).
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        agent.subscribe(Box::new(move |event| {
+            recorder.lock().unwrap().push(event.event_type());
+        }));
+
+        let events = rt().block_on(async {
+            let mut stream = agent.stream_events(vec![Msg::user("hi")]);
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                events.push(event.unwrap());
+            }
+            events
+        });
+
+        let kinds: Vec<_> = events.iter().map(|event| event.event_type()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                agentscope_core::event::AgentEventType::AgentStart,
+                agentscope_core::event::AgentEventType::TextBlockDelta,
+                agentscope_core::event::AgentEventType::TextBlockDelta,
+                agentscope_core::event::AgentEventType::AgentResult,
+                agentscope_core::event::AgentEventType::AgentEnd,
+            ],
+            "{:?}",
+            events
+        );
+        assert_eq!(events[1].data().fields["delta"], "Hel");
+        assert_eq!(events[2].data().fields["delta"], "lo");
+
+        // The terminal result is the reply the accumulator derived from the artifacts.
+        let reply: Msg = serde_json::from_value(events[3].data().fields["reply"].clone()).unwrap();
+        assert_eq!(reply.text_content(), "Hello");
+
+        // The stream went through `message/stream` and kept the reply in the history.
+        assert_eq!(
+            transport.methods.lock().unwrap().as_slice(),
+            [crate::model::methods::MESSAGE_STREAM]
+        );
+        let history = agent.history();
+        assert_eq!(history.last().unwrap().text_content(), "Hello");
+
+        // Every emitted event reached the sink.
+        assert_eq!(*seen.lock().unwrap(), kinds);
     }
 }

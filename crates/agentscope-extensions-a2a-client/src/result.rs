@@ -14,8 +14,8 @@
 
 use agentscope_core::message::Msg;
 
-use crate::message::MessageConvert;
-use crate::model::{Artifact, StreamEvent, Task, TaskState, TaskStatusUpdateEvent};
+use crate::message::{MessageConstants, MessageConvert};
+use crate::model::{Artifact, Part, StreamEvent, Task, TaskState, TaskStatusUpdateEvent};
 
 /// Whether a task carries output artifacts, mirroring Java's
 /// `task.artifacts() != null && !task.artifacts().isEmpty()`.
@@ -33,12 +33,16 @@ pub fn task_result_message(task: &Task, agent_name: &str) -> Option<Msg> {
     }
     let artifacts = task.artifacts.as_deref().unwrap_or_default();
     if status.state == TaskState::Completed && has_artifacts(artifacts) {
-        return Some(MessageConvert::convert_from_artifacts(artifacts, agent_name));
+        return Some(MessageConvert::convert_from_artifacts(
+            artifacts, agent_name,
+        ));
     }
     if let Some(message) = &status.message {
         return Some(MessageConvert::convert_from_message(message, agent_name));
     }
-    Some(MessageConvert::convert_from_artifacts(artifacts, agent_name))
+    Some(MessageConvert::convert_from_artifacts(
+        artifacts, agent_name,
+    ))
 }
 
 /// Terminal reply of a `TaskStatusUpdateEvent`, mirroring Java
@@ -69,7 +73,9 @@ pub fn status_update_result_message(
             return Some(MessageConvert::convert_from_message(message, agent_name));
         }
     }
-    Some(MessageConvert::convert_from_artifacts(artifacts, agent_name))
+    Some(MessageConvert::convert_from_artifacts(
+        artifacts, agent_name,
+    ))
 }
 
 /// Folds `message/stream` events into the terminal reply of one call.
@@ -102,7 +108,7 @@ impl TaskResultAccumulator {
                 task_result_message(task, agent_name)
             }
             StreamEvent::ArtifactUpdate(update) => {
-                self.artifacts.push(update.artifact.clone());
+                self.merge_artifact(update);
                 None
             }
             StreamEvent::StatusUpdate(update) => {
@@ -119,6 +125,47 @@ impl TaskResultAccumulator {
     /// The artifacts seen so far.
     pub fn artifacts(&self) -> &[Artifact] {
         &self.artifacts
+    }
+
+    /// Folds one artifact update into the accumulated artifacts.
+    ///
+    /// An update with `append: true` carries more parts of an artifact that was already seen
+    /// (A2A `TaskUpdater#addArtifact` semantics), so its parts are merged instead of starting a
+    /// second artifact. A text part that continues the same streamed block (same
+    /// `_agentscope_msg_id`) has its text appended, so chunked output stays one block instead of
+    /// becoming one block per chunk.
+    fn merge_artifact(&mut self, update: &crate::model::TaskArtifactUpdateEvent) {
+        if update.append == Some(true) {
+            if let Some(existing) = self
+                .artifacts
+                .iter_mut()
+                .find(|artifact| artifact.artifact_id == update.artifact.artifact_id)
+            {
+                for part in &update.artifact.parts {
+                    let continued = match (existing.parts.last_mut(), part) {
+                        (Some(Part::Text(last)), Part::Text(next)) => {
+                            let same_block = MessageConstants::metadata_value(
+                                last.metadata.as_ref(),
+                                MessageConstants::MSG_ID_METADATA_KEY,
+                            ) == MessageConstants::metadata_value(
+                                next.metadata.as_ref(),
+                                MessageConstants::MSG_ID_METADATA_KEY,
+                            );
+                            if same_block {
+                                last.text.push_str(&next.text);
+                            }
+                            same_block
+                        }
+                        _ => false,
+                    };
+                    if !continued {
+                        existing.parts.push(part.clone());
+                    }
+                }
+                return;
+            }
+        }
+        self.artifacts.push(update.artifact.clone());
     }
 
     /// The terminal reply, when one was produced.
@@ -162,7 +209,10 @@ mod tests {
     #[test]
     fn completed_task_prefers_artifacts_over_the_status_message() {
         let task = completed_task(
-            Some(vec![Artifact::new("art-1", vec![Part::text("real answer")])]),
+            Some(vec![Artifact::new(
+                "art-1",
+                vec![Part::text("real answer")],
+            )]),
             Some("done"),
         );
         let msg = task_result_message(&task, "remote").expect("terminal task yields a reply");
@@ -230,7 +280,10 @@ mod tests {
         let artifacts = vec![Artifact::new("art-1", vec![Part::text("partial")])];
         let msg = status_update_result_message(&update, &artifacts, "remote")
             .expect("final update yields a reply");
-        assert_eq!(msg.text_content(), "A2A task ended with state: failed, message: boom");
+        assert_eq!(
+            msg.text_content(),
+            "A2A task ended with state: failed, message: boom"
+        );
     }
 
     #[test]
@@ -268,19 +321,52 @@ mod tests {
             "remote",
         );
         assert_eq!(duplicate.unwrap().text_content(), "streamed answer");
-        assert_eq!(accumulator.finish().unwrap().text_content(), "streamed answer");
+        assert_eq!(
+            accumulator.finish().unwrap().text_content(),
+            "streamed answer"
+        );
     }
 
     #[test]
     fn a_task_event_also_feeds_the_terminal_reply() {
         let mut accumulator = TaskResultAccumulator::new();
         let task = completed_task(
-            Some(vec![Artifact::new("art-1", vec![Part::text("task answer")])]),
+            Some(vec![Artifact::new(
+                "art-1",
+                vec![Part::text("task answer")],
+            )]),
             Some("done"),
         );
         let msg = accumulator
             .observe(&StreamEvent::Task(task), "remote")
             .expect("a terminal task yields the reply");
         assert_eq!(msg.text_content(), "task answer");
+    }
+
+    // Java: an `append: true` artifact update extends the artifact it belongs to.
+    #[test]
+    fn appended_artifact_chunks_extend_the_same_artifact() {
+        use crate::model::TaskArtifactUpdateEvent;
+
+        let mut accumulator = TaskResultAccumulator::new();
+        for chunk in ["Hel", "lo"] {
+            let mut update = TaskArtifactUpdateEvent::new(
+                "t-1",
+                Artifact::new("art-1", vec![Part::text(chunk)]),
+            );
+            update.append = Some(true);
+            assert!(accumulator
+                .observe(&StreamEvent::ArtifactUpdate(update), "remote")
+                .is_none());
+        }
+        assert_eq!(accumulator.artifacts().len(), 1);
+
+        let msg = accumulator
+            .observe(
+                &StreamEvent::StatusUpdate(final_update(TaskState::Completed, None)),
+                "remote",
+            )
+            .expect("the final update yields the reply");
+        assert_eq!(msg.text_content(), "Hello");
     }
 }

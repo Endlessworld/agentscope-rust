@@ -68,8 +68,12 @@ pub mod server_constants {
 /// Push notifications are a documented design decision (the card keeps
 /// `capabilities.pushNotifications: false`), so the methods report the A2A 1.0
 /// `UnsupportedOperationError` instead of the generic method-not-found.
-pub const PUSH_NOT_SUPPORTED_MESSAGE: &str =
-    "Push notifications are not supported by this agent";
+pub const PUSH_NOT_SUPPORTED_MESSAGE: &str = "Push notifications are not supported by this agent";
+
+/// Message returned by `ListTasks` (`tasks/list`), mirroring Java
+/// `AgentScopeA2aRequestHandler#onListTasks`.
+pub const LIST_TASKS_NOT_SUPPORTED_MESSAGE: &str =
+    "Listing tasks is not supported: callers are not authorized";
 
 /// Per-request options handed to an [`AgentRunner`].
 ///
@@ -197,9 +201,14 @@ impl crate::card::AgentDescriptor for RunnerDescriptor<'_> {
 
 /// In-memory task store, mirroring the `InMemoryTaskStore` used by
 /// `AgentScopeA2aRequestHandler.Builder` when no store is supplied.
+///
+/// Besides the tasks it also keeps one [`TaskEventLog`] per task: the sequenced events a run
+/// emitted. That log is what `SubscribeToTask` (`tasks/resubscribe`) replays, mirroring the
+/// `InMemoryQueueManager` the Java server delegates to.
 #[derive(Debug, Default)]
 pub struct A2aTaskRegistry {
     tasks: Mutex<HashMap<String, Task>>,
+    event_logs: Mutex<HashMap<String, Arc<TaskEventLog>>>,
 }
 
 impl A2aTaskRegistry {
@@ -207,8 +216,9 @@ impl A2aTaskRegistry {
         Self::default()
     }
 
-    /// Stores or replaces a task.
+    /// Stores or replaces a task, forgetting the events of a previous run of the same id.
     pub fn put(&self, task: Task) {
+        self.event_logs.lock().unwrap().remove(&task.id);
         self.tasks.lock().unwrap().insert(task.id.clone(), task);
     }
 
@@ -243,6 +253,38 @@ impl A2aTaskRegistry {
         Some(task.clone())
     }
 
+    /// The event log of `task_id`, created on demand for a task that exists.
+    ///
+    /// `None` when the task is unknown, which is what `SubscribeToTask` turns into
+    /// `TaskNotFoundError`.
+    pub fn event_log(&self, task_id: &str) -> Option<Arc<TaskEventLog>> {
+        if !self.tasks.lock().unwrap().contains_key(task_id) {
+            return None;
+        }
+        let mut logs = self.event_logs.lock().unwrap();
+        Some(
+            logs.entry(task_id.to_string())
+                .or_insert_with(|| Arc::new(TaskEventLog::new()))
+                .clone(),
+        )
+    }
+
+    /// Records one serialized task event under `task_id`.
+    ///
+    /// No-op for unknown tasks: only events of tracked tasks are replayable.
+    pub fn publish_event(&self, task_id: &str, event: serde_json::Value) {
+        if let Some(log) = self.event_log(task_id) {
+            log.publish(event);
+        }
+    }
+
+    /// Marks the event log of `task_id` as complete.
+    pub fn close_events(&self, task_id: &str) {
+        if let Some(log) = self.event_log(task_id) {
+            log.close();
+        }
+    }
+
     /// Number of tracked tasks.
     pub fn len(&self) -> usize {
         self.tasks.lock().unwrap().len()
@@ -251,6 +293,100 @@ impl A2aTaskRegistry {
     /// Whether the registry holds no tasks.
     pub fn is_empty(&self) -> bool {
         self.tasks.lock().unwrap().is_empty()
+    }
+}
+
+/// One recorded task event, numbered per task so a late subscriber can resume after `seq`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskEventRecord {
+    /// 1-based, monotonically increasing per task.
+    pub seq: u64,
+    /// The serialized `TaskStatusUpdateEvent` / `TaskArtifactUpdateEvent` payload.
+    pub event: serde_json::Value,
+}
+
+/// The sequenced event log of one task, mirroring the SDK's per-task event queue.
+///
+/// Subscribers read [`TaskEventLog::events_after`] first and then wait on [`TaskEventLog::subscribe`],
+/// so an event published between the two is never lost (the notification channel reports
+/// "something changed", the buffer is the source of truth).
+#[derive(Debug)]
+pub struct TaskEventLog {
+    state: Mutex<TaskEventLogState>,
+    notify: tokio::sync::broadcast::Sender<()>,
+}
+
+#[derive(Debug, Default)]
+struct TaskEventLogState {
+    records: Vec<TaskEventRecord>,
+    next_seq: u64,
+    closed: bool,
+}
+
+impl Default for TaskEventLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TaskEventLog {
+    /// Creates an empty, open log.
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(TaskEventLogState::default()),
+            notify: tokio::sync::broadcast::channel(8).0,
+        }
+    }
+
+    /// Appends `event`, returning the sequence number assigned to it.
+    pub fn publish(&self, event: serde_json::Value) -> u64 {
+        let seq = {
+            let mut state = self.state.lock().unwrap();
+            let seq = state.next_seq + 1;
+            state.next_seq = seq;
+            state.records.push(TaskEventRecord { seq, event });
+            seq
+        };
+        let _ = self.notify.send(());
+        seq
+    }
+
+    /// Marks the log as complete: subscribers stop once they drained it.
+    pub fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        let _ = self.notify.send(());
+    }
+
+    /// Whether [`close`](Self::close) was already called.
+    pub fn is_closed(&self) -> bool {
+        self.state.lock().unwrap().closed
+    }
+
+    /// Every recorded event whose `seq` is greater than `cursor`, oldest first.
+    pub fn events_after(&self, cursor: u64) -> Vec<TaskEventRecord> {
+        self.state
+            .lock()
+            .unwrap()
+            .records
+            .iter()
+            .filter(|record| record.seq > cursor)
+            .cloned()
+            .collect()
+    }
+
+    /// Subscribes to change notifications of this log.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.notify.subscribe()
+    }
+
+    /// The number of recorded events.
+    pub fn len(&self) -> usize {
+        self.state.lock().unwrap().records.len()
+    }
+
+    /// Whether no event was recorded yet.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -613,12 +749,17 @@ impl A2aRequestHandler {
         request: &JsonRpcRequest,
     ) -> Result<serde_json::Value, JsonRpcError> {
         match request.method.as_str() {
-            methods::MESSAGE_SEND | methods::LEGACY_MESSAGE_SEND => self.message_send(request).await,
+            methods::MESSAGE_SEND | methods::LEGACY_MESSAGE_SEND => {
+                self.message_send(request).await
+            }
             methods::MESSAGE_STREAM | methods::LEGACY_MESSAGE_STREAM => {
-                self.message_stream(request).await
+                self.collect_stream_responses(request).await
             }
             methods::TASKS_GET | methods::LEGACY_TASKS_GET => self.tasks_get(request),
             methods::TASKS_CANCEL | methods::LEGACY_TASKS_CANCEL => self.tasks_cancel(request),
+            methods::TASKS_RESUBSCRIBE | methods::LEGACY_TASKS_RESUBSCRIBE => {
+                self.collect_stream_responses(request).await
+            }
             methods::AGENT_CARD_GET | methods::LEGACY_AGENT_CARD_GET => {
                 serde_json::to_value(&self.agent_card)
                     .map_err(|e| JsonRpcError::new(JsonRpcError::INTERNAL_ERROR, e.to_string()))
@@ -636,6 +777,14 @@ impl A2aRequestHandler {
             | methods::LEGACY_PUSH_CONFIG_DELETE => Err(JsonRpcError::new(
                 JsonRpcError::UNSUPPORTED_OPERATION,
                 PUSH_NOT_SUPPORTED_MESSAGE,
+            )),
+            // Java `AgentScopeA2aRequestHandler#onListTasks` rejects listing even though A2A 1.0
+            // declares the method: the task store is not a query surface. It therefore answers
+            // `UnsupportedOperationError` (`-32004`) with the same authorization wording instead of
+            // the generic `-32601`, which would read as "unknown method".
+            methods::TASKS_LIST | methods::LEGACY_TASKS_LIST => Err(JsonRpcError::new(
+                JsonRpcError::UNSUPPORTED_OPERATION,
+                LIST_TASKS_NOT_SUPPORTED_MESSAGE,
             )),
             other => Err(JsonRpcError::new(
                 JsonRpcError::METHOD_NOT_FOUND,
@@ -655,12 +804,13 @@ impl A2aRequestHandler {
         serde_json::to_value(&result).map_err(internal)
     }
 
-    /// `message/stream`: relays the run as a sequence of status/artifact events.
+    /// `message/stream` and `tasks/resubscribe`: relay the run as a sequence of
+    /// status/artifact events.
     ///
     /// Java's streaming methods return a `Flux` of responses (one SSE frame each); collecting
     /// that stream is what a non-streaming caller observes, so this shares the incremental
     /// implementation with [`stream_responses`](Self::stream_responses).
-    async fn message_stream(
+    async fn collect_stream_responses(
         &self,
         request: &JsonRpcRequest,
     ) -> Result<serde_json::Value, JsonRpcError> {
@@ -679,20 +829,35 @@ impl A2aRequestHandler {
 
     /// Answers a streaming method with a stream of JSON-RPC responses, one per A2A event.
     ///
-    /// The stream is lazy: the agent is started when the first item is polled, and each
-    /// agent event is relayed before the run finishes — this is the Rust counterpart of Java
-    /// `JsonRpcTransportWrapper#handleStreamRequest` returning a `Flux<String>`.
+    /// The stream is lazy: for `message/stream` the agent is started when the first item is
+    /// polled, and each agent event is relayed before the run finishes — this is the Rust
+    /// counterpart of Java `JsonRpcTransportWrapper#handleStreamRequest` returning a
+    /// `Flux<String>`. For `tasks/resubscribe` no run is started: the events already recorded for
+    /// the task are replayed (from the requested cursor) and the live stream is followed, which
+    /// is what makes reconnects work.
     pub fn stream_responses(
         &self,
         request: &JsonRpcRequest,
     ) -> Result<BoxStream<'static, JsonRpcResponse>, JsonRpcError> {
+        let phase = match request.method.as_str() {
+            methods::TASKS_RESUBSCRIBE | methods::LEGACY_TASKS_RESUBSCRIBE => {
+                let (task_id, cursor) = resubscribe_params(request)?;
+                StreamPhase::Resubscribe {
+                    task_id,
+                    cursor,
+                    log: None,
+                    receiver: None,
+                }
+            }
+            _ => StreamPhase::Start,
+        };
         let state = StreamState {
             runner: self.runner.clone(),
             registry: self.registry.clone(),
             execute_properties: self.execute_properties,
             request: request.clone(),
             id: request.id.clone(),
-            phase: StreamPhase::Start,
+            phase,
             pending: VecDeque::new(),
         };
         Ok(Box::pin(futures::stream::unfold(state, next_stream_item)))
@@ -721,9 +886,14 @@ impl A2aRequestHandler {
                 &context_id,
             ));
         }
-        self.registry
-            .update_status(&task_id, status)
-            .ok_or_else(|| JsonRpcError::new(JsonRpcError::TASK_NOT_FOUND, "task vanished"))
+        let updated = self
+            .registry
+            .update_status(&task_id, status.clone())
+            .ok_or_else(|| JsonRpcError::new(JsonRpcError::TASK_NOT_FOUND, "task vanished"))?;
+        // A blocking `SendMessage` also leaves a replayable trail, so `SubscribeToTask` answers
+        // the terminal state instead of an empty stream.
+        self.close_task_events(&task_id, status, Some(&context_id));
+        Ok(updated)
     }
 
     /// `tasks/get`.
@@ -744,7 +914,32 @@ impl A2aRequestHandler {
             .registry
             .cancel(&params.id)
             .ok_or_else(|| JsonRpcError::new(JsonRpcError::TASK_NOT_FOUND, "task not found"))?;
+        // A cancelled task keeps no live run to follow, so its subscribers learn the terminal
+        // state through the event log instead of waiting for an update that will never come.
+        if task.status.state == TaskState::Canceled {
+            self.close_task_events(&task.id, task.status.clone(), task.context_id.as_deref());
+        }
         serde_json::to_value(&task).map_err(internal)
+    }
+
+    /// Records the terminal status of `task_id` in its event log and closes it.
+    fn close_task_events(
+        &self,
+        task_id: &str,
+        status: TaskStatus,
+        context_id: Option<&str>,
+    ) -> Option<Task> {
+        let mut event = agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent::new(
+            task_id.to_string(),
+            status,
+            true,
+        );
+        event.context_id = context_id.map(str::to_string);
+        if let Ok(value) = serde_json::to_value(&event) {
+            self.registry.publish_event(task_id, value);
+        }
+        self.registry.close_events(task_id);
+        self.registry.get(task_id)
     }
 }
 
@@ -853,7 +1048,17 @@ fn record_artifact_if_any(
     };
     let parts = ServerMessageConvert::convert_from_content_blocks(&msg, false);
     if !parts.is_empty() {
-        registry.add_artifact(task_id, Artifact::new(task_id.to_string(), parts));
+        let artifact = Artifact::new(task_id.to_string(), parts);
+        registry.add_artifact(task_id, artifact.clone());
+        let mut update = agentscope_extensions_a2a_client::model::TaskArtifactUpdateEvent::new(
+            task_id.to_string(),
+            artifact,
+        );
+        update.append = Some(true);
+        update.last_chunk = Some(false);
+        if let Ok(value) = serde_json::to_value(&update) {
+            registry.publish_event(task_id, value);
+        }
     }
 }
 
@@ -862,6 +1067,16 @@ fn record_artifact_if_any(
 enum StreamPhase {
     /// Nothing started yet: the agent is opened on first poll.
     Start,
+    /// `SubscribeToTask`: relaying the events recorded for an existing task.
+    Resubscribe {
+        task_id: String,
+        /// Last sequence number the subscriber already saw; events after it are replayed.
+        cursor: u64,
+        /// Resolved on first poll (the task may not exist).
+        log: Option<Arc<TaskEventLog>>,
+        /// Subscribed before the buffer is read, so a publish in between is not missed.
+        receiver: Option<tokio::sync::broadcast::Receiver<()>>,
+    },
     /// The agent is running; events arrive incrementally.
     Running {
         events: BoxStream<'static, Result<AgentEvent, A2aError>>,
@@ -885,13 +1100,18 @@ struct StreamState {
 }
 
 impl StreamState {
-    /// Queues a successful response carrying `value` as its `result`.
-    fn push_result<T: serde::Serialize>(&mut self, value: &T) {
-        let response = match serde_json::to_value(value) {
-            Ok(value) => JsonRpcResponse::success(value, self.id.clone()),
-            Err(error) => JsonRpcResponse::failure(internal(error), self.id.clone()),
-        };
-        self.pending.push_back(response);
+    /// Records one task event in the task's event log, then queues it as a response.
+    ///
+    /// Only events recorded here can be replayed by a `SubscribeToTask` subscriber.
+    fn push_task_event<T: serde::Serialize>(&mut self, task_id: &str, value: &T) {
+        match serde_json::to_value(value) {
+            Ok(value) => {
+                self.registry.publish_event(task_id, value.clone());
+                self.pending
+                    .push_back(JsonRpcResponse::success(value, self.id.clone()));
+            }
+            Err(error) => self.push_error(internal(error)),
+        }
     }
 
     /// Queues a JSON-RPC error response.
@@ -918,10 +1138,13 @@ impl StreamState {
         }
         self.registry.update_status(&task_id, status.clone());
         let mut event = agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent::new(
-            task_id, status, true,
+            task_id.clone(),
+            status,
+            true,
         );
         event.context_id = Some(context_id);
-        self.push_result(&event);
+        self.push_task_event(&task_id, &event);
+        self.registry.close_events(&task_id);
         self.phase = StreamPhase::Done;
     }
 
@@ -938,10 +1161,13 @@ impl StreamState {
         };
         self.registry.update_status(&task_id, status.clone());
         let mut event = agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent::new(
-            task_id, status, true,
+            task_id.clone(),
+            status,
+            true,
         );
         event.context_id = Some(context_id);
-        self.push_result(&event);
+        self.push_task_event(&task_id, &event);
+        self.registry.close_events(&task_id);
         self.phase = StreamPhase::Done;
     }
 }
@@ -972,7 +1198,7 @@ async fn next_stream_item(mut state: StreamState) -> Option<(JsonRpcResponse, St
                                 false,
                             );
                         event.context_id = Some(context_id.clone());
-                        state.push_result(&event);
+                        state.push_task_event(&task_id, &event);
                         state.phase = StreamPhase::Running {
                             events,
                             projector: AgentOutputProjector::new(state.execute_properties),
@@ -1005,7 +1231,7 @@ async fn next_stream_item(mut state: StreamState) -> Option<(JsonRpcResponse, St
                             update.context_id = Some(context_id.clone());
                             update.append = Some(true);
                             update.last_chunk = Some(false);
-                            state.push_result(&update);
+                            state.push_task_event(&task_id, &update);
                         }
                     }
                     state.phase = StreamPhase::Running {
@@ -1022,9 +1248,166 @@ async fn next_stream_item(mut state: StreamState) -> Option<(JsonRpcResponse, St
                     state.finish_succeeded(task_id, context_id, projector);
                 }
             },
+            StreamPhase::Resubscribe {
+                task_id,
+                cursor,
+                log,
+                receiver,
+            } => {
+                let registry = state.registry.clone();
+                match next_resubscribe_item(&registry, &task_id, cursor, log, receiver).await {
+                    ResubscribeStep::Event {
+                        record,
+                        log,
+                        receiver,
+                    } => {
+                        state
+                            .pending
+                            .push_back(JsonRpcResponse::success(record.event, state.id.clone()));
+                        state.phase = StreamPhase::Resubscribe {
+                            task_id,
+                            cursor: record.seq,
+                            log: Some(log),
+                            receiver: Some(receiver),
+                        };
+                    }
+                    ResubscribeStep::Waiting { log, receiver } => {
+                        state.phase = StreamPhase::Resubscribe {
+                            task_id,
+                            cursor,
+                            log: Some(log),
+                            receiver: Some(receiver),
+                        };
+                    }
+                    ResubscribeStep::Finished => {
+                        state.phase = StreamPhase::Done;
+                    }
+                    ResubscribeStep::UnknownTask => {
+                        state.push_error(JsonRpcError::new(
+                            JsonRpcError::TASK_NOT_FOUND,
+                            "task not found",
+                        ));
+                        state.phase = StreamPhase::Done;
+                    }
+                }
+            }
             StreamPhase::Done => return None,
         }
     }
+}
+
+/// One step of a `SubscribeToTask` poll.
+enum ResubscribeStep {
+    /// A recorded event is ready to be relayed.
+    Event {
+        record: TaskEventRecord,
+        log: Arc<TaskEventLog>,
+        receiver: tokio::sync::broadcast::Receiver<()>,
+    },
+    /// Nothing recorded past the cursor yet: a notification was consumed, re-read the buffer.
+    Waiting {
+        log: Arc<TaskEventLog>,
+        receiver: tokio::sync::broadcast::Receiver<()>,
+    },
+    /// The log is complete and fully drained.
+    Finished,
+    /// The subscribed task is not tracked.
+    UnknownTask,
+}
+
+/// Advances one `SubscribeToTask` poll: replay what is buffered, then wait for live events.
+async fn next_resubscribe_item(
+    registry: &Arc<A2aTaskRegistry>,
+    task_id: &str,
+    cursor: u64,
+    log: Option<Arc<TaskEventLog>>,
+    receiver: Option<tokio::sync::broadcast::Receiver<()>>,
+) -> ResubscribeStep {
+    let log = match log {
+        Some(log) => log,
+        None => match registry.event_log(task_id) {
+            Some(log) => log,
+            None => return ResubscribeStep::UnknownTask,
+        },
+    };
+    // Subscribe before reading the buffer, so a publish happening in between is not lost.
+    let mut receiver = receiver.unwrap_or_else(|| log.subscribe());
+    if let Some(record) = log.events_after(cursor).into_iter().next() {
+        return ResubscribeStep::Event {
+            record,
+            log,
+            receiver,
+        };
+    }
+    if log.is_closed() {
+        // A subscriber that missed every event still learns the terminal state once.
+        if cursor == 0 {
+            if let Some(task) = registry.get(task_id) {
+                if task.status.state.is_terminal() {
+                    let mut event =
+                        agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent::new(
+                            task_id.to_string(),
+                            task.status,
+                            true,
+                        );
+                    event.context_id = task.context_id;
+                    if let Ok(value) = serde_json::to_value(&event) {
+                        // Off-log snapshot: its seq equals the cursor, so it is emitted only once.
+                        return ResubscribeStep::Event {
+                            record: TaskEventRecord {
+                                seq: cursor,
+                                event: value,
+                            },
+                            log,
+                            receiver,
+                        };
+                    }
+                }
+            }
+        }
+        return ResubscribeStep::Finished;
+    }
+    match receiver.recv().await {
+        Ok(()) => {}
+        // A lagging subscriber only missed notifications, never buffered events.
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => return ResubscribeStep::Finished,
+    }
+    match log.events_after(cursor).into_iter().next() {
+        Some(record) => ResubscribeStep::Event {
+            record,
+            log,
+            receiver,
+        },
+        None => ResubscribeStep::Waiting { log, receiver },
+    }
+}
+
+/// Reads the `SubscribeToTask` params: the task id plus the optional replay cursor.
+///
+/// A2A 1.0 declares only `id`. The cursor is the extra `lastEventSeq`, accepted both at the top
+/// level and under `metadata` so a client can resume exactly where its previous stream stopped
+/// (`0` replays the whole log of a run that is still open).
+fn resubscribe_params(request: &JsonRpcRequest) -> Result<(String, u64), JsonRpcError> {
+    let params = request
+        .params
+        .clone()
+        .filter(|p| !p.is_null())
+        .ok_or_else(|| JsonRpcError::new(JsonRpcError::INVALID_PARAMS, "missing params"))?;
+    let task_id = params
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| JsonRpcError::new(JsonRpcError::INVALID_PARAMS, "missing task id"))?;
+    let cursor = params
+        .get("lastEventSeq")
+        .or_else(|| {
+            params
+                .get("metadata")
+                .and_then(|meta| meta.get("lastEventSeq"))
+        })
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    Ok((task_id.to_string(), cursor))
 }
 
 /// Decodes JSON-RPC `params`, mirroring the SDK's `-32602` on malformed input.
@@ -1880,7 +2263,9 @@ mod tests {
             methods::LEGACY_PUSH_CONFIG_DELETE,
         ] {
             let response = rt().block_on(handler.handle(&JsonRpcRequest::new(method, None, None)));
-            let error = response.error.unwrap_or_else(|| panic!("{method} must fail"));
+            let error = response
+                .error
+                .unwrap_or_else(|| panic!("{method} must fail"));
             assert_eq!(error.code, JsonRpcError::UNSUPPORTED_OPERATION, "{method}");
             assert_eq!(error.message, PUSH_NOT_SUPPORTED_MESSAGE, "{method}");
         }
@@ -1928,5 +2313,237 @@ mod tests {
         let descriptor: &dyn crate::card::AgentDescriptor = &descriptor;
         assert_eq!(descriptor.agent_name(), "desc-agent");
         assert_eq!(descriptor.agent_description(), "a description");
+    }
+
+    /// One streaming text delta of the `reply-1` block.
+    fn text_delta(text: &str) -> AgentEvent {
+        let mut data = agentscope_core::event::EventData::default();
+        data.fields.insert(
+            "reply_id".to_string(),
+            serde_json::Value::String("reply-1".to_string()),
+        );
+        data.fields.insert(
+            "delta".to_string(),
+            serde_json::Value::String(text.to_string()),
+        );
+        AgentEvent::TextBlockDelta(data)
+    }
+
+    /// Sends `message/send` for a task id we control and returns the resulting task.
+    fn send_message(handler: &A2aRequestHandler, task_id: &str) -> Task {
+        let mut message = Message::new("m1", MessageRole::User, vec![Part::text("ping")]);
+        message.task_id = Some(task_id.to_string());
+        let params = MessageSendParams {
+            message,
+            configuration: None,
+            metadata: None,
+        };
+        let response = rt().block_on(handler.handle(&JsonRpcRequest::new(
+            methods::MESSAGE_SEND,
+            Some(serde_json::to_value(params).unwrap()),
+            None,
+        )));
+        assert!(!response.is_error());
+        serde_json::from_value(response.result.unwrap()).unwrap()
+    }
+
+    /// Collects `tasks/resubscribe` for `task_id` the way a non-streaming caller sees it.
+    fn resubscribe(
+        handler: &A2aRequestHandler,
+        task_id: &str,
+        cursor: Option<u64>,
+    ) -> Vec<serde_json::Value> {
+        let params = match cursor {
+            Some(cursor) => serde_json::json!({ "id": task_id, "lastEventSeq": cursor }),
+            None => serde_json::json!({ "id": task_id }),
+        };
+        let response = rt().block_on(handler.handle(&JsonRpcRequest::new(
+            methods::TASKS_RESUBSCRIBE,
+            Some(params),
+            Some(serde_json::Value::from(7)),
+        )));
+        assert!(!response.is_error(), "{:?}", response.error);
+        assert_eq!(response.id, Some(serde_json::Value::from(7)));
+        serde_json::from_value(response.result.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn resubscribe_replays_a_finished_task_from_the_requested_cursor() {
+        let handler = handler();
+        let task = send_message(&handler, "t-replay");
+        assert_eq!(task.status.state, TaskState::Completed);
+
+        // The whole trail: the artifact the run produced, then the terminal status.
+        let events = resubscribe(&handler, "t-replay", None);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["kind"], "artifact-update");
+        assert_eq!(events[1]["kind"], "status-update");
+        assert_eq!(events[1]["final"], true);
+
+        // Resuming after seq 1 only replays the terminal status.
+        let events = resubscribe(&handler, "t-replay", Some(1));
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["kind"], "status-update");
+
+        // A subscriber that is already up to date gets nothing more.
+        assert!(resubscribe(&handler, "t-replay", Some(2)).is_empty());
+
+        // Unknown tasks report `TaskNotFoundError`.
+        let response = rt().block_on(handler.handle(&JsonRpcRequest::new(
+            methods::TASKS_RESUBSCRIBE,
+            Some(serde_json::json!({ "id": "missing" })),
+            None,
+        )));
+        assert_eq!(response.error.unwrap().code, JsonRpcError::TASK_NOT_FOUND);
+    }
+
+    #[test]
+    fn list_tasks_reports_unsupported_operation() {
+        let handler = handler();
+        for method in [methods::TASKS_LIST, methods::LEGACY_TASKS_LIST] {
+            let response = rt().block_on(handler.handle(&JsonRpcRequest::new(
+                method,
+                None,
+                Some(serde_json::Value::from(1)),
+            )));
+            let error = response.error.unwrap();
+            assert_eq!(error.code, JsonRpcError::UNSUPPORTED_OPERATION);
+            assert_eq!(error.message, LIST_TASKS_NOT_SUPPORTED_MESSAGE);
+        }
+
+        // `tasks/get` keeps its own error taxonomy.
+        let response = rt().block_on(handler.handle(&JsonRpcRequest::new(
+            methods::TASKS_GET,
+            Some(serde_json::json!({ "id": "missing" })),
+            None,
+        )));
+        assert_eq!(response.error.unwrap().code, JsonRpcError::TASK_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_second_subscriber_follows_a_running_task_without_rerunning_it() {
+        use futures::channel::mpsc;
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Runner whose event stream is fed by the test, counting how often a run was opened.
+        struct SharedRunner {
+            receiver: Mutex<Option<mpsc::UnboundedReceiver<Result<AgentEvent, A2aError>>>>,
+            runs: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentRunner for SharedRunner {
+            fn agent_name(&self) -> String {
+                "shared-agent".to_string()
+            }
+
+            fn agent_description(&self) -> String {
+                "fed by the test".to_string()
+            }
+
+            async fn stream_events(
+                &self,
+                _request_messages: Vec<Msg>,
+                _options: AgentRequestOptions,
+            ) -> Result<Vec<AgentEvent>, A2aError> {
+                unreachable!("the incremental path is used")
+            }
+
+            fn stream_events_incremental(
+                &self,
+                _request_messages: Vec<Msg>,
+                _options: AgentRequestOptions,
+            ) -> Option<BoxStream<'static, Result<AgentEvent, A2aError>>> {
+                self.runs.fetch_add(1, Ordering::SeqCst);
+                let receiver = self.receiver.lock().unwrap().take()?;
+                Some(Box::pin(receiver))
+            }
+
+            fn stop(&self, _task_id: &str) {}
+        }
+
+        let (sender, receiver) = mpsc::unbounded();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let handler = A2aRequestHandler::new(
+            Arc::new(SharedRunner {
+                receiver: Mutex::new(Some(receiver)),
+                runs: runs.clone(),
+            }),
+            AgentCard::new("shared-agent", "http://localhost"),
+            registry(),
+        );
+        let mut message = Message::new("m1", MessageRole::User, vec![Part::text("ping")]);
+        message.task_id = Some("t-live".to_string());
+        let params = MessageSendParams {
+            message,
+            configuration: None,
+            metadata: None,
+        };
+        let mut primary = handler
+            .stream_responses(&JsonRpcRequest::new(
+                methods::MESSAGE_STREAM,
+                Some(serde_json::to_value(params).unwrap()),
+                None,
+            ))
+            .unwrap();
+
+        // The run starts on the first poll and reports `working`.
+        let first = primary.next().await.unwrap();
+        let first: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
+            serde_json::from_value(first.result.unwrap()).unwrap();
+        assert_eq!(first.status.state, TaskState::Working);
+
+        // One delta is relayed and recorded in the task's event log.
+        sender.unbounded_send(Ok(text_delta("Hel"))).unwrap();
+        let recorded = primary.next().await.unwrap();
+        assert!(recorded.result.unwrap()["artifact"].is_object());
+
+        // A subscriber that joins now replays what the run already emitted...
+        let mut secondary = handler
+            .stream_responses(&JsonRpcRequest::new(
+                methods::TASKS_RESUBSCRIBE,
+                Some(serde_json::json!({ "id": "t-live" })),
+                Some(serde_json::Value::from("sub-1")),
+            ))
+            .unwrap();
+        let replayed = secondary.next().await.unwrap();
+        assert_eq!(replayed.id, Some(serde_json::Value::from("sub-1")));
+        let replayed: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
+            serde_json::from_value(replayed.result.unwrap()).unwrap();
+        assert_eq!(replayed.status.state, TaskState::Working);
+        assert!(!replayed.is_final);
+        let replayed = secondary.next().await.unwrap();
+        let replayed: agentscope_extensions_a2a_client::model::TaskArtifactUpdateEvent =
+            serde_json::from_value(replayed.result.unwrap()).unwrap();
+        assert_eq!(replayed.task_id, "t-live");
+        assert_eq!(replayed.append, Some(true));
+
+        // ...and then follows the live run, which the original stream keeps driving.
+        sender.unbounded_send(Ok(text_delta("lo"))).unwrap();
+        assert!(primary.next().await.unwrap().result.is_some());
+        let live = secondary.next().await.unwrap();
+        let live: agentscope_extensions_a2a_client::model::TaskArtifactUpdateEvent =
+            serde_json::from_value(live.result.unwrap()).unwrap();
+        assert_eq!(live.task_id, "t-live");
+
+        // The run ends: both streams see the terminal status, then stop.
+        drop(sender);
+        let finished = primary.next().await.unwrap();
+        let finished: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
+            serde_json::from_value(finished.result.unwrap()).unwrap();
+        assert!(finished.is_final);
+        let tail = secondary.next().await.unwrap();
+        let tail: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
+            serde_json::from_value(tail.result.unwrap()).unwrap();
+        assert!(tail.is_final);
+        assert_eq!(tail.status.state, TaskState::Completed);
+        assert!(
+            secondary.next().await.is_none(),
+            "the subscriber ends with the task"
+        );
+
+        // The late subscriber never opened a second run.
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 }

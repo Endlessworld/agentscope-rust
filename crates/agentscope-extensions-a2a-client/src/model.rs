@@ -21,6 +21,9 @@ pub mod methods {
     pub const TASKS_GET: &str = "GetTask";
     pub const TASKS_CANCEL: &str = "CancelTask";
     pub const TASKS_RESUBSCRIBE: &str = "SubscribeToTask";
+    /// A2A 1.0 `ListTasks`. Declared by the spec, rejected by the server (see
+    /// `agentscope_extensions_a2a_server::LIST_TASKS_NOT_SUPPORTED_MESSAGE`).
+    pub const TASKS_LIST: &str = "ListTasks";
     pub const PUSH_CONFIG_SET: &str = "CreateTaskPushNotificationConfig";
     pub const PUSH_CONFIG_GET: &str = "GetTaskPushNotificationConfig";
     pub const PUSH_CONFIG_LIST: &str = "ListTaskPushNotificationConfigs";
@@ -33,6 +36,7 @@ pub mod methods {
     pub const LEGACY_TASKS_GET: &str = "tasks/get";
     pub const LEGACY_TASKS_CANCEL: &str = "tasks/cancel";
     pub const LEGACY_TASKS_RESUBSCRIBE: &str = "tasks/resubscribe";
+    pub const LEGACY_TASKS_LIST: &str = "tasks/list";
     pub const LEGACY_PUSH_CONFIG_SET: &str = "tasks/pushNotificationConfig/set";
     pub const LEGACY_PUSH_CONFIG_GET: &str = "tasks/pushNotificationConfig/get";
     pub const LEGACY_PUSH_CONFIG_LIST: &str = "tasks/pushNotificationConfig/list";
