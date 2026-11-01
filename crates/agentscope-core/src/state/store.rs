@@ -42,6 +42,28 @@ pub trait AgentStateStore: Send + Sync {
         value: serde_json::Value,
     );
 
+    /// Fallible variant of [`AgentStateStore::save`].
+    ///
+    /// The infallible `save*` / `get*` / `exists` / `delete*` methods are **best-effort**: a
+    /// backend that cannot land a write may drop the failure silently, which is fine for
+    /// "state is a cache" callers but hides a lost write from a caller that must not
+    /// continue. Use the `try_*` variant when the outcome matters. Backends with a real
+    /// error source (e.g. a failed atomic write or a corrupt payload) override these; the
+    /// default keeps the infallible behaviour and only reports what it can diagnose from
+    /// its inputs. Consistent with [`AgentStateStore::try_get_versioned`] /
+    /// [`AgentStateStore::try_save_if_version`].
+    async fn try_save(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<()> {
+        require_session_id(session_id)?;
+        self.save(user_id, session_id, key, value).await;
+        Ok(())
+    }
+
     /// Save a list of values.
     async fn save_list(
         &self,
@@ -51,6 +73,20 @@ pub trait AgentStateStore: Send + Sync {
         values: &[serde_json::Value],
     );
 
+    /// Fallible variant of [`AgentStateStore::save_list`] (same contract as
+    /// [`AgentStateStore::try_save`]).
+    async fn try_save_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        values: &[serde_json::Value],
+    ) -> Result<()> {
+        require_session_id(session_id)?;
+        self.save_list(user_id, session_id, key, values).await;
+        Ok(())
+    }
+
     /// Get a single value, or `None` if not present.
     async fn get(
         &self,
@@ -58,6 +94,19 @@ pub trait AgentStateStore: Send + Sync {
         session_id: &str,
         key: &str,
     ) -> Option<serde_json::Value>;
+
+    /// Fallible variant of [`AgentStateStore::get`]: also reports failures that
+    /// [`AgentStateStore::get`] collapses to "nothing stored" (same contract as
+    /// [`AgentStateStore::try_get_versioned`]).
+    async fn try_get(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        require_session_id(session_id)?;
+        Ok(self.get(user_id, session_id, key).await)
+    }
 
     /// Get a list of values (empty when not present).
     async fn get_list(
@@ -67,11 +116,38 @@ pub trait AgentStateStore: Send + Sync {
         key: &str,
     ) -> Vec<serde_json::Value>;
 
+    /// Fallible variant of [`AgentStateStore::get_list`] (same contract as
+    /// [`AgentStateStore::try_get`]).
+    async fn try_get_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        require_session_id(session_id)?;
+        Ok(self.get_list(user_id, session_id, key).await)
+    }
+
     /// Whether a session has any persisted state.
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool;
 
+    /// Fallible variant of [`AgentStateStore::exists`] (same contract as
+    /// [`AgentStateStore::try_get`]).
+    async fn try_exists(&self, user_id: Option<&str>, session_id: &str) -> Result<bool> {
+        require_session_id(session_id)?;
+        Ok(self.exists(user_id, session_id).await)
+    }
+
     /// Delete a session and all its data.
     async fn delete(&self, user_id: Option<&str>, session_id: &str);
+
+    /// Fallible variant of [`AgentStateStore::delete`] (same contract as
+    /// [`AgentStateStore::try_get`]).
+    async fn try_delete(&self, user_id: Option<&str>, session_id: &str) -> Result<()> {
+        require_session_id(session_id)?;
+        self.delete(user_id, session_id).await;
+        Ok(())
+    }
 
     /// Delete a single state value, keeping the rest of the session intact.
     ///
@@ -94,8 +170,30 @@ pub trait AgentStateStore: Send + Sync {
         ))
     }
 
+    /// Fallible variant of [`AgentStateStore::delete_key`] (same contract as
+    /// [`AgentStateStore::try_get`]). Propagates the default
+    /// `delete_key` refusal, so "backend cannot delete a single key" stays visible.
+    async fn try_delete_key(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<()> {
+        require_session_id(session_id)?;
+        self.delete_key(user_id, session_id, key).await
+    }
+
     /// List session identifiers under the given user namespace (`None` = anonymous).
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String>;
+
+    /// Fallible variant of [`AgentStateStore::list_session_ids`].
+    ///
+    /// There is no `session_id` to validate here, so the default only preserves the
+    /// infallible behaviour; backends that can fail to enumerate (e.g. an unreadable
+    /// directory) override it.
+    async fn try_list_session_ids(&self, user_id: Option<&str>) -> Result<Vec<String>> {
+        Ok(self.list_session_ids(user_id).await)
+    }
 
     /// Whether this backend supports optimistic concurrency through
     /// [`AgentStateStore::get_versioned`] / [`AgentStateStore::save_if_version`].
@@ -576,6 +674,86 @@ impl AgentStateStore for JsonFileAgentStateStore {
         let _ = tokio::fs::remove_dir_all(self.session_dir(user_id, session_id)).await;
     }
 
+    // The four `try_*` overrides below cover the operations with a real error source:
+    // serialization, a failed atomic write, and a payload that exists but cannot be parsed.
+    // Reporting them keeps "absent" distinguishable from "broken".
+    async fn try_save(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<()> {
+        require_session_id(session_id)?;
+        let path = self.state_path(user_id, session_id, key);
+        let json = serde_json::to_string_pretty(&value)?;
+        self.atomic_write(&path, &json).await
+    }
+
+    async fn try_save_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        values: &[serde_json::Value],
+    ) -> Result<()> {
+        require_session_id(session_id)?;
+        let path = self.list_path(user_id, session_id, key);
+        let mut content = String::new();
+        for value in values {
+            content.push_str(&serde_json::to_string(value)?);
+            content.push('\n');
+        }
+        self.atomic_write(&path, &content).await
+    }
+
+    async fn try_get(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        require_session_id(session_id)?;
+        let path = self.state_path(user_id, session_id, key);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(text) => serde_json::from_str(&text).map(Some).map_err(|error| {
+                crate::Error::Other(format!(
+                    "failed to parse state value `{key}` at `{}`: {error}",
+                    path.display()
+                ))
+            }),
+            // A missing file is the ordinary "absent key" case, not a failure.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn try_get_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        require_session_id(session_id)?;
+        let path = self.list_path(user_id, session_id, key);
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).map_err(|error| {
+                    crate::Error::Other(format!(
+                        "failed to parse a state list entry `{key}` at `{}`: {error}",
+                        path.display()
+                    ))
+                })
+            })
+            .collect()
+    }
+
     // The JSON backend can genuinely fail: a corrupt payload is not the same as an absent
     // one, and a failed atomic write is not the same as a lost CAS race. Both used to look
     // like "nothing stored" / "conflict" to the caller.
@@ -638,5 +816,209 @@ impl AgentStateStore for JsonFileAgentStateStore {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod try_variants {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("agentscope-store-{tag}-{}-{n}", std::process::id()))
+    }
+
+    /// Backend without a real error source: the default `try_*` methods stay `Ok`.
+    #[tokio::test]
+    async fn default_try_methods_mirror_the_infallible_ones() {
+        let store = InMemoryAgentStateStore::new();
+        store
+            .try_save(Some("u"), "s", "k", serde_json::json!({"a": 1}))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.try_get(Some("u"), "s", "k").await.unwrap(),
+            Some(serde_json::json!({"a": 1}))
+        );
+
+        store
+            .try_save_list(
+                Some("u"),
+                "s",
+                "l",
+                &[serde_json::json!(1), serde_json::json!(2)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.try_get_list(Some("u"), "s", "l").await.unwrap(),
+            vec![serde_json::json!(1), serde_json::json!(2)]
+        );
+
+        assert!(store.try_exists(Some("u"), "s").await.unwrap());
+        assert_eq!(
+            store.try_list_session_ids(Some("u")).await.unwrap(),
+            vec!["s".to_string()]
+        );
+
+        store.try_delete_key(Some("u"), "s", "k").await.unwrap();
+        assert_eq!(store.try_get(Some("u"), "s", "k").await.unwrap(), None);
+
+        store.try_delete(Some("u"), "s").await.unwrap();
+        assert!(!store.try_exists(Some("u"), "s").await.unwrap());
+    }
+
+    /// A blank `session_id` is diagnosable from the inputs alone, so the default
+    /// implementation must report it instead of "succeeding".
+    #[tokio::test]
+    async fn default_try_methods_reject_a_blank_session_id() {
+        let store = InMemoryAgentStateStore::new();
+        assert!(store
+            .try_save(None, "  ", "k", serde_json::json!(1))
+            .await
+            .is_err());
+        assert!(store.try_save_list(None, "  ", "k", &[]).await.is_err());
+        assert!(store.try_get(None, "  ", "k").await.is_err());
+        assert!(store.try_get_list(None, "  ", "k").await.is_err());
+        assert!(store.try_exists(None, "  ").await.is_err());
+        assert!(store.try_delete(None, "  ").await.is_err());
+        assert!(store.try_delete_key(None, "  ", "k").await.is_err());
+        // Nothing was stored under the rejected session id.
+        assert_eq!(store.list_session_ids(None).await, Vec::<String>::new());
+    }
+
+    struct FailingStore;
+
+    #[async_trait]
+    impl AgentStateStore for FailingStore {
+        async fn save(
+            &self,
+            _user: Option<&str>,
+            _session: &str,
+            _key: &str,
+            _v: serde_json::Value,
+        ) {
+        }
+        async fn save_list(
+            &self,
+            _user: Option<&str>,
+            _session: &str,
+            _key: &str,
+            _values: &[serde_json::Value],
+        ) {
+        }
+        async fn get(
+            &self,
+            _user: Option<&str>,
+            _session: &str,
+            _key: &str,
+        ) -> Option<serde_json::Value> {
+            None
+        }
+        async fn get_list(
+            &self,
+            _user: Option<&str>,
+            _session: &str,
+            _key: &str,
+        ) -> Vec<serde_json::Value> {
+            Vec::new()
+        }
+        async fn exists(&self, _user: Option<&str>, _session: &str) -> bool {
+            false
+        }
+        async fn delete(&self, _user: Option<&str>, _session: &str) {}
+        async fn list_session_ids(&self, _user: Option<&str>) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn try_save(
+            &self,
+            _user: Option<&str>,
+            _session: &str,
+            _key: &str,
+            _value: serde_json::Value,
+        ) -> Result<()> {
+            Err(crate::Error::Other("disk full".into()))
+        }
+        async fn try_get(
+            &self,
+            _user: Option<&str>,
+            _session: &str,
+            _key: &str,
+        ) -> Result<Option<serde_json::Value>> {
+            Err(crate::Error::Other("corrupt payload".into()))
+        }
+    }
+
+    /// An overriding backend's error reaches the caller instead of being flattened to
+    /// "nothing stored" / "written".
+    #[tokio::test]
+    async fn overridden_try_methods_surface_backend_errors() {
+        let store = FailingStore;
+        let error = store
+            .try_save(None, "s", "k", serde_json::json!(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("disk full"), "{error}");
+        let error = store.try_get(None, "s", "k").await.unwrap_err();
+        assert!(error.to_string().contains("corrupt payload"), "{error}");
+    }
+
+    /// Root points at an existing *file*, so the session directory cannot be created:
+    /// the write fails instead of being dropped.
+    #[tokio::test]
+    async fn json_file_store_reports_write_failures() {
+        let root = temp_root("blocked");
+        tokio::fs::write(&root, b"not a directory").await.unwrap();
+        let store = JsonFileAgentStateStore::new(root.clone());
+
+        assert!(store
+            .try_save(None, "s", "k", serde_json::json!({"a": 1}))
+            .await
+            .is_err());
+        assert!(store
+            .try_save_list(None, "s", "k", &[serde_json::json!({ "a": 1 })])
+            .await
+            .is_err());
+
+        let _ = tokio::fs::remove_file(&root).await;
+    }
+
+    #[tokio::test]
+    async fn json_file_store_distinguishes_absent_from_corrupt() {
+        let root = temp_root("corrupt");
+        let store = JsonFileAgentStateStore::new(root.clone());
+
+        // Absent key: mirror `get` (None) instead of reporting a failure.
+        assert_eq!(store.try_get(None, "s", "k").await.unwrap(), None);
+        assert_eq!(
+            store.try_get_list(None, "s", "l").await.unwrap(),
+            Vec::<serde_json::Value>::new()
+        );
+
+        store
+            .try_save(None, "s", "k", serde_json::json!({"a": 1}))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.try_get(None, "s", "k").await.unwrap(),
+            Some(serde_json::json!({"a": 1}))
+        );
+
+        // A payload that exists but cannot be parsed is a real failure.
+        let session_dir = root.join("__anon__").join("s");
+        tokio::fs::write(session_dir.join("k.json"), b"{not json")
+            .await
+            .unwrap();
+        assert_eq!(store.get(None, "s", "k").await, None);
+        assert!(store.try_get(None, "s", "k").await.is_err());
+
+        tokio::fs::write(session_dir.join("l.jsonl"), b"1\n{oops\n")
+            .await
+            .unwrap();
+        assert!(store.try_get_list(None, "s", "l").await.is_err());
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

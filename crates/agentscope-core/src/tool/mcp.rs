@@ -38,6 +38,8 @@ pub struct McpTool {
     description: String,
     /// Optional human-readable display title (see [`Tool::title`]).
     title: Option<String>,
+    /// Optional JSON Schema for the tool's output (see [`Tool::output_schema`]).
+    output_schema: Option<serde_json::Value>,
     parameters: serde_json::Value,
     /// Server name this tool belongs to (used in error messages).
     server: String,
@@ -77,6 +79,7 @@ impl McpTool {
             name: name.into(),
             description: description.into(),
             title: None,
+            output_schema: None,
             parameters,
             server: server.into(),
             handler,
@@ -113,6 +116,33 @@ impl McpTool {
     pub fn with_title_from_definition(self, definition: &serde_json::Value) -> Self {
         match Self::resolve_display_title(definition) {
             Some(t) => self.with_title(t),
+            None => self,
+        }
+    }
+
+    /// Sets the JSON Schema describing this tool's output (see
+    /// [`Tool::output_schema`]). Non-object and empty-object schemas are ignored, in the
+    /// same spirit as the blank-title rule above: a server that sends `{}` declares no
+    /// output contract.
+    pub fn with_output_schema(mut self, schema: serde_json::Value) -> Self {
+        if schema
+            .as_object()
+            .map(|object| !object.is_empty())
+            .unwrap_or(false)
+        {
+            self.output_schema = Some(schema);
+        }
+        self
+    }
+
+    /// Attaches the output schema resolved from a raw MCP tool definition, preferring
+    /// `outputSchema` and falling back to the snake_case `output_schema`.
+    pub fn with_output_schema_from_definition(self, definition: &serde_json::Value) -> Self {
+        match definition
+            .get("outputSchema")
+            .or_else(|| definition.get("output_schema"))
+        {
+            Some(schema) => self.with_output_schema(schema.clone()),
             None => self,
         }
     }
@@ -177,6 +207,10 @@ impl Tool for McpTool {
 
     fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    fn output_schema(&self) -> Option<&serde_json::Value> {
+        self.output_schema.as_ref()
     }
 
     fn is_external(&self) -> bool {
@@ -314,6 +348,84 @@ mod tests {
     #[test]
     fn title_defaults_to_none() {
         assert_eq!(bare_tool().title(), None);
+    }
+
+    #[test]
+    fn output_schema_defaults_to_none_and_is_reachable_through_dyn_tool() {
+        let tool = bare_tool();
+        assert_eq!(tool.output_schema(), None);
+        // The toolkit and the provider converters hold `dyn Tool`, so the override must
+        // be visible there too.
+        let as_dyn: &dyn Tool = &tool;
+        assert_eq!(as_dyn.output_schema(), None);
+    }
+
+    #[test]
+    fn with_output_schema_is_carried_on_the_tool() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"ticket_id": {"type": "string"}}
+        });
+        let tool = bare_tool().with_output_schema(schema.clone());
+        let as_dyn: &dyn Tool = &tool;
+        assert_eq!(as_dyn.output_schema(), Some(&schema));
+    }
+
+    #[test]
+    fn empty_or_non_object_output_schemas_are_ignored() {
+        // A server that sends `{}` declares no output contract.
+        assert_eq!(
+            bare_tool()
+                .with_output_schema(serde_json::json!({}))
+                .output_schema(),
+            None
+        );
+        assert_eq!(
+            bare_tool()
+                .with_output_schema(serde_json::Value::Null)
+                .output_schema(),
+            None
+        );
+        assert_eq!(
+            bare_tool()
+                .with_output_schema(serde_json::json!("not a schema"))
+                .output_schema(),
+            None
+        );
+    }
+
+    #[test]
+    fn output_schema_from_definition_reads_both_keys() {
+        let camel = serde_json::json!({
+            "name": "t",
+            "outputSchema": {"type": "object", "properties": {"a": {"type": "string"}}}
+        });
+        assert!(bare_tool()
+            .with_output_schema_from_definition(&camel)
+            .output_schema()
+            .is_some());
+
+        let snake = serde_json::json!({
+            "output_schema": {"type": "object", "properties": {"b": {"type": "boolean"}}}
+        });
+        assert!(bare_tool()
+            .with_output_schema_from_definition(&snake)
+            .output_schema()
+            .is_some());
+
+        // Absent or empty stays `None`.
+        assert_eq!(
+            bare_tool()
+                .with_output_schema_from_definition(&serde_json::json!({"name": "t"}))
+                .output_schema(),
+            None
+        );
+        assert_eq!(
+            bare_tool()
+                .with_output_schema_from_definition(&serde_json::json!({"outputSchema": {}}))
+                .output_schema(),
+            None
+        );
     }
 
     #[test]

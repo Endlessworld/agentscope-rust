@@ -69,6 +69,16 @@ pub trait Tool: Send + Sync {
     fn title(&self) -> Option<&str> {
         None
     }
+    /// The JSON Schema describing this tool's output, when the tool declares one.
+    ///
+    /// Mirrors Java `AgentTool.getOutputSchema()`, including its additive shape: the
+    /// default is `None`, so no implementer must change. Unlike
+    /// [`parameters_schema`](Self::parameters_schema) it is not part of the tool-call
+    /// contract; providers that support structured tool output forward it as
+    /// `outputSchema`.
+    fn output_schema(&self) -> Option<&serde_json::Value> {
+        None
+    }
     /// Whether this tool performs no observable side effects.
     fn is_read_only(&self) -> bool {
         false
@@ -335,6 +345,17 @@ mod tests {
     fn blank_title_is_ignored() {
         assert_eq!(fn_tool().with_title("  ").title(), None);
         assert_eq!(fn_tool().with_title("").title(), None);
+    }
+
+    #[test]
+    fn output_schema_is_additive_and_defaults_to_none() {
+        let tool = fn_tool();
+        assert_eq!(tool.output_schema(), None);
+        // The trait default must also be reachable through a trait object, which is how
+        // the toolkit and the provider converters hold tools.
+        let as_dyn: &dyn Tool = &tool;
+        assert_eq!(as_dyn.output_schema(), None);
+        assert_eq!(as_dyn.schema().output_schema, None);
     }
 
     #[test]
