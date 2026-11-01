@@ -314,8 +314,8 @@ impl DashScopeChatModel {
                 force_multimodal,
                 prompt,
                 options,
-            ),
-            None => to_dashscope_messages_with_options(messages, force_multimodal, options),
+            )?,
+            None => to_dashscope_messages_with_options(messages, force_multimodal, options)?,
         };
         let mut request = build_request(
             &self.model_name,

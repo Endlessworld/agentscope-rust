@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::source::Source;
+use super::JsonMap;
 
 /// State of a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -36,7 +37,7 @@ pub enum ToolResultState {
 ///
 /// Mirrors the sealed `ContentBlock` hierarchy in the Java SDK: serialized with a `type`
 /// discriminator (`text`, `thinking`, `image`, `audio`, `video`, `tool_use`, `tool_result`,
-/// `hint`, `data`).
+/// `hint`, `data`, `document`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -51,6 +52,7 @@ pub enum ContentBlock {
     ToolResult(ToolResultBlock),
     Hint(HintBlock),
     Data(DataBlock),
+    Document(DocumentBlock),
 }
 
 /// Plain text content.
@@ -930,9 +932,114 @@ impl DataBlockBuilder {
     }
 }
 
+/// Document content for model input (PDF, Word, plain text and other provider formats).
+///
+/// Unlike [`DataBlock`], which is a generic binary/media container, this block carries document
+/// semantics converters need in order to route the content: optional MIME type and size fields,
+/// a human-readable file name, and a source that may be a provider-side file id rather than
+/// bytes. Mirrors `io.agentscope.core.message.DocumentBlock`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocumentBlock {
+    /// The document source (file id, URL or Base64); required.
+    pub source: Source,
+    /// Stable identifier; generated if absent or empty.
+    #[serde(default = "new_document_id")]
+    pub id: String,
+    /// Optional human-readable name (e.g. file name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Optional MIME type of the document (e.g. `application/pdf`).
+    #[serde(rename = "mime_type", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Optional size of the document in bytes.
+    #[serde(rename = "size_bytes", skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// Optional provider-specific metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<JsonMap>,
+}
+
+impl DocumentBlock {
+    pub fn new(source: Source) -> Self {
+        Self {
+            source,
+            id: new_document_id(),
+            name: None,
+            mime_type: None,
+            size_bytes: None,
+            metadata: None,
+        }
+    }
+
+    pub fn builder() -> DocumentBlockBuilder {
+        DocumentBlockBuilder::default()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DocumentBlockBuilder {
+    source: Option<Source>,
+    id: Option<String>,
+    name: Option<String>,
+    mime_type: Option<String>,
+    size_bytes: Option<u64>,
+    metadata: Option<JsonMap>,
+}
+
+impl DocumentBlockBuilder {
+    pub fn source(mut self, source: Source) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    pub fn mime_type(mut self, mime_type: impl Into<String>) -> Self {
+        self.mime_type = Some(mime_type.into());
+        self
+    }
+
+    pub fn size_bytes(mut self, size_bytes: u64) -> Self {
+        self.size_bytes = Some(size_bytes);
+        self
+    }
+
+    pub fn metadata(mut self, metadata: JsonMap) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn build(self) -> DocumentBlock {
+        DocumentBlock {
+            source: self.source.expect("DocumentBlock requires a source"),
+            id: self
+                .id
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(new_document_id),
+            name: self.name,
+            mime_type: self.mime_type,
+            size_bytes: self.size_bytes,
+            metadata: self.metadata,
+        }
+    }
+}
+
+fn new_document_id() -> String {
+    Uuid::new_v4().to_string().replace('-', "")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{FileIdSource, Msg, MsgRole};
 
     #[test]
     fn success_sets_explicit_success_state() {
@@ -1023,5 +1130,64 @@ mod tests {
         // Unset detail is omitted from the wire form.
         let value = serde_json::to_value(ContentBlock::Image(image)).unwrap();
         assert!(value.get("detail").is_none(), "{value}");
+    }
+
+    #[test]
+    fn document_block_serializes_file_id_source() {
+        let block = DocumentBlock::builder()
+            .source(Source::FileId(FileIdSource::new("dashscope", "file-abc")))
+            .name("report.pdf")
+            .mime_type("application/pdf")
+            .size_bytes(1024)
+            .build();
+        let value = serde_json::to_value(ContentBlock::Document(block)).unwrap();
+        assert_eq!(value["type"], "document");
+        assert_eq!(value["source"]["type"], "file_id");
+        assert_eq!(value["source"]["provider"], "dashscope");
+        assert_eq!(value["source"]["file_id"], "file-abc");
+        assert_eq!(value["mime_type"], "application/pdf");
+        assert_eq!(value["size_bytes"], 1024);
+        assert_eq!(value["name"], "report.pdf");
+    }
+
+    #[test]
+    fn document_block_roundtrips_and_generates_id_when_absent() {
+        let json = serde_json::json!({
+            "type": "document",
+            "source": {"type": "file_id", "provider": "dashscope", "file_id": "f1"}
+        });
+        let block: ContentBlock = serde_json::from_value(json).unwrap();
+        let ContentBlock::Document(document) = block else {
+            panic!("expected a document block");
+        };
+        assert_eq!(document.id.len(), 32);
+        // Optional fields stay absent from the wire form.
+        let value = serde_json::to_value(ContentBlock::Document(document)).unwrap();
+        assert!(value.get("name").is_none(), "{value}");
+        assert!(value.get("mime_type").is_none(), "{value}");
+
+        // An explicit empty id is replaced by a fresh one, like `DataBlock`.
+        let rebuilt = DocumentBlock::builder()
+            .source(Source::FileId(FileIdSource::new("dashscope", "f1")))
+            .id("")
+            .build();
+        assert_eq!(rebuilt.id.len(), 32);
+    }
+
+    #[test]
+    fn user_message_accepts_document_block_but_system_does_not() {
+        let document = ContentBlock::Document(DocumentBlock::new(Source::FileId(
+            FileIdSource::new("dashscope", "f1"),
+        )));
+        let msg = Msg::user_blocks(vec![document.clone()]);
+        assert_eq!(msg.content.len(), 1);
+
+        let rejected = std::panic::catch_unwind(|| {
+            Msg::builder()
+                .role(MsgRole::System)
+                .content(vec![document])
+                .build();
+        });
+        assert!(rejected.is_err(), "SYSTEM messages must reject documents");
     }
 }

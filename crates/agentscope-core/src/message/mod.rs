@@ -6,13 +6,14 @@ pub mod source;
 pub mod usage;
 
 pub use block::{
-    AudioBlock, ContentBlock, DataBlock, HintBlock, ImageBlock, ImageDetail, TextBlock,
-    ThinkingBlock, ToolCallState, ToolResultBlock, ToolResultState, ToolUseBlock, VideoBlock,
+    AudioBlock, ContentBlock, DataBlock, DocumentBlock, DocumentBlockBuilder, HintBlock, ImageBlock,
+    ImageDetail, TextBlock, ThinkingBlock, ToolCallState, ToolResultBlock, ToolResultState,
+    ToolUseBlock, VideoBlock,
 };
 pub use execution_details::{ToolExecutionDetails, ToolExecutionOutcome};
 pub use keys::metadata_keys;
 pub use msg::{current_timestamp, GenerateReason, Msg, MsgBuilder, MsgRole};
-pub use source::{Base64Source, Source, URLSource};
+pub use source::{Base64Source, FileIdSource, FileIdSourceBuilder, Source, URLSource};
 pub use usage::ChatUsage;
 
 /// JSON map used for message/block metadata and arbitrary tool inputs.

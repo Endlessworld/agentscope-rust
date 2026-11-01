@@ -451,6 +451,7 @@ fn source_url(source: &Source) -> String {
     match source {
         Source::Url(url) => url.url.clone(),
         Source::Base64(data) => format!("data:{};base64,{}", data.media_type, data.data),
+        Source::FileId(file) => format!("fileid://{}", file.file_id),
     }
 }
 

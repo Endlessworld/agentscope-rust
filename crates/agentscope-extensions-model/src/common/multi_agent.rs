@@ -168,6 +168,8 @@ pub fn merge_agent_group(group: &[Msg], history_prompt: &str) -> Msg {
                 ContentBlock::Audio(_) => text.push_str(&format!("{name}: [Audio]\n")),
                 ContentBlock::Video(_) => text.push_str(&format!("{name}: [Video]\n")),
                 ContentBlock::Data(_) => text.push_str(&format!("{name}: [Data]\n")),
+                // Documents have no textual rendering in the merged history.
+                ContentBlock::Document(_) => {}
                 // Tool blocks always live in a tool sequence, never in an agent group.
                 ContentBlock::ToolUse(_) | ContentBlock::ToolResult(_) => {}
             }

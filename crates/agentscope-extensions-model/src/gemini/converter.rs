@@ -213,8 +213,9 @@ pub fn to_gemini_contents(messages: &[Msg]) -> Vec<GeminiContent> {
                 ContentBlock::Audio(a) => parts.push(audio_part(a)),
                 ContentBlock::Video(v) => parts.push(video_part(v)),
                 ContentBlock::Data(d) => parts.push(block_data_part(d)),
-                // Thinking blocks never go back to the API.
+                // Thinking blocks never go back to the API; documents have no Gemini part.
                 ContentBlock::Thinking(_) => {}
+                ContentBlock::Document(_) => {}
             }
         }
 
@@ -451,6 +452,7 @@ pub fn merge_to_content(messages: &[Msg], history_prompt: &str) -> GeminiContent
                     parts.push(block_data_part(d));
                 }
                 ContentBlock::ToolUse(_) => {}
+                ContentBlock::Document(_) => {}
             }
         }
     }

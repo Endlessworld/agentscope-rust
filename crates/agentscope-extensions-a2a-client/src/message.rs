@@ -334,6 +334,9 @@ pub fn content_block_to_part(block: &ContentBlock) -> Option<Part> {
             ))
         }
         ContentBlock::Data(_) => None,
+        // Documents have no A2A part either: the protocol carries files, not
+        // provider-side document references.
+        ContentBlock::Document(_) => None,
     }
 }
 
@@ -363,6 +366,12 @@ fn media_part(source: &Source, media_type: &str) -> Option<Part> {
             name: Some(name),
             bytes: None,
             uri: Some(url.url.clone()),
+        },
+        Source::FileId(file) => FileContent {
+            mime_type: Some(media_type.to_string()),
+            name: Some(name),
+            bytes: None,
+            uri: Some(format!("fileid://{}", file.file_id)),
         },
     };
     Some(Part::File(FilePart::new(file)))

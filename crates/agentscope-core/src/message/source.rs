@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-/// Media source for binary content blocks (URL or Base64).
+/// Media source for binary content blocks (URL, Base64 or a provider file id).
 ///
 /// Mirrors the `Source` polymorphic hierarchy in the Java SDK: serialized with a `type`
-/// discriminator (`"url"` / `"base64"`).
+/// discriminator (`"url"` / `"base64"` / `"file_id"`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Source {
@@ -11,6 +11,62 @@ pub enum Source {
     Url(URLSource),
     /// Base64-encoded media source.
     Base64(Base64Source),
+    /// Document that already lives on the provider side and is referenced by its file id.
+    FileId(FileIdSource),
+}
+
+/// Document already uploaded to a model provider and referenced by that provider's file id.
+///
+/// Providers that accept documents through a file id (for example DashScope `qwen-long` with
+/// `fileid://`) keep the bytes outside the request payload: the id is the only thing the
+/// request carries. Use this source when the upload is managed by the caller or by a
+/// provider-specific client; use [`URLSource`] or [`Base64Source`] when the document bytes
+/// travel with the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileIdSource {
+    /// Provider that owns the file identifier (e.g. `dashscope`).
+    pub provider: String,
+    /// Provider-assigned file identifier.
+    #[serde(rename = "file_id")]
+    pub file_id: String,
+}
+
+impl FileIdSource {
+    pub fn new(provider: impl Into<String>, file_id: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            file_id: file_id.into(),
+        }
+    }
+
+    pub fn builder() -> FileIdSourceBuilder {
+        FileIdSourceBuilder::default()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct FileIdSourceBuilder {
+    provider: Option<String>,
+    file_id: Option<String>,
+}
+
+impl FileIdSourceBuilder {
+    pub fn provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
+        self
+    }
+
+    pub fn file_id(mut self, file_id: impl Into<String>) -> Self {
+        self.file_id = Some(file_id.into());
+        self
+    }
+
+    pub fn build(self) -> FileIdSource {
+        FileIdSource {
+            provider: self.provider.expect("FileIdSource requires a provider"),
+            file_id: self.file_id.expect("FileIdSource requires a file id"),
+        }
+    }
 }
 
 /// URL-based media content.

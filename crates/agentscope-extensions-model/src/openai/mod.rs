@@ -951,6 +951,10 @@ fn audio_content_part(source: &Source) -> ChatCompletionRequestUserMessageConten
             text_content_part(format!("[Audio URL: {}]", url.url))
         }
         Source::Url(_) => text_content_part("[Audio URL - missing]"),
+        Source::FileId(file) => text_content_part(format!(
+            "[Audio - unsupported source: fileid://{}]",
+            file.file_id
+        )),
     }
 }
 
@@ -966,6 +970,7 @@ fn video_content_part(source: &Source) -> ChatCompletionRequestUserMessageConten
             format!("data:{};base64,{}", video.media_type, video.data)
         }
         Source::Base64(_) => String::new(),
+        Source::FileId(file) => format!("fileid://{}", file.file_id),
     };
     diagnostics::warn(
         "video_not_inlined",
@@ -997,6 +1002,21 @@ fn user_message_content(msg: &Msg) -> ChatCompletionRequestUserMessageContent {
                     Source::Base64(source) => {
                         format!("data:{};base64,{}", source.media_type, source.data)
                     }
+                    Source::FileId(source) => {
+                        diagnostics::warn(
+                            "unsupported_media_type",
+                            "content.image",
+                            format!(
+                                "image source 'fileid://{}' cannot be inlined; sent as a text placeholder",
+                                source.file_id
+                            ),
+                        );
+                        parts.push(text_content_part(format!(
+                            "[Image - unsupported source: fileid://{}]",
+                            source.file_id
+                        )));
+                        continue;
+                    }
                 };
                 parts.push(ChatCompletionRequestUserMessageContentPart::ImageUrl(
                     ChatCompletionRequestMessageContentPartImage {
@@ -1020,6 +1040,22 @@ fn user_message_content(msg: &Msg) -> ChatCompletionRequestUserMessageContent {
             ContentBlock::Audio(audio) => {
                 multipart = true;
                 parts.push(audio_content_part(&audio.source));
+            }
+            // Documents are not accepted by OpenAI: report the dropped content as a
+            // text placeholder instead of collapsing the message to empty.
+            ContentBlock::Document(d) => {
+                let label = d.name.clone().unwrap_or_else(|| d.id.clone());
+                diagnostics::warn(
+                    "document_not_supported",
+                    "content.document",
+                    format!(
+                        "DocumentBlock is not supported by OpenAI; sending a text placeholder instead of '{label}'"
+                    ),
+                );
+                multipart = true;
+                parts.push(text_content_part(format!(
+                    "[Document - not supported by OpenAI: {label}]"
+                )));
             }
             _ => {}
         }

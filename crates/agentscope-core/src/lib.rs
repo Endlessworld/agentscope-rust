@@ -52,10 +52,11 @@ pub use interruption::{InterruptContext, InterruptControl, InterruptSource};
 #[allow(deprecated)]
 pub use memory::{InMemoryMemory, Memory, StateBackedMemory};
 pub use message::{
-    metadata_keys, AudioBlock, Base64Source, ChatUsage, ContentBlock, DataBlock, GenerateReason,
-    HintBlock, ImageBlock, ImageDetail, JsonMap, Msg, MsgBuilder, MsgRole, Source, TextBlock,
-    ThinkingBlock, ToolCallState, ToolExecutionDetails, ToolExecutionOutcome, ToolResultBlock,
-    ToolResultState, ToolUseBlock, URLSource, VideoBlock,
+    metadata_keys, AudioBlock, Base64Source, ChatUsage, ContentBlock, DataBlock, DocumentBlock,
+    DocumentBlockBuilder, FileIdSource, FileIdSourceBuilder, GenerateReason, HintBlock, ImageBlock,
+    ImageDetail, JsonMap, Msg, MsgBuilder, MsgRole, Source, TextBlock, ThinkingBlock, ToolCallState,
+    ToolExecutionDetails, ToolExecutionOutcome, ToolResultBlock, ToolResultState, ToolUseBlock,
+    URLSource, VideoBlock,
 };
 pub use middleware::{
     ActingInput, ActingResultsHandle, ActingResultsSnapshot, AgentInput, ExtensionPoint,

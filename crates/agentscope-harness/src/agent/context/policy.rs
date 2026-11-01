@@ -118,6 +118,8 @@ fn image_cost(source: &agentscope_core::message::Source) -> i64 {
             (bytes / 1_000).clamp(256, 4_096)
         }
         agentscope_core::message::Source::Url(_) => 2_048,
+        // A provider file id carries no local payload to size.
+        agentscope_core::message::Source::FileId(_) => 2_048,
     }
 }
 

@@ -364,11 +364,12 @@ fn validate_role_content(role: &MsgRole, content: &[ContentBlock]) {
                 match block {
                     ContentBlock::Text(_)
                     | ContentBlock::Data(_)
+                    | ContentBlock::Document(_)
                     | ContentBlock::Image(_)
                     | ContentBlock::Audio(_)
                     | ContentBlock::Video(_) => {}
                     other => panic!(
-                        "USER message may only contain text/data/image/audio/video blocks, got {}",
+                        "USER message may only contain text/data/document/image/audio/video blocks, got {}",
                         block_variant_name(other)
                     ),
                 }
@@ -399,6 +400,7 @@ fn block_variant_name(block: &ContentBlock) -> &'static str {
         ContentBlock::ToolResult(_) => "tool_result",
         ContentBlock::Hint(_) => "hint",
         ContentBlock::Data(_) => "data",
+        ContentBlock::Document(_) => "document",
     }
 }
 
@@ -414,6 +416,7 @@ pub enum ContentBlockKind {
     ToolResult,
     Hint,
     Data,
+    Document,
 }
 
 impl ContentBlockKind {
@@ -429,6 +432,7 @@ impl ContentBlockKind {
                 | (ContentBlockKind::ToolResult, ContentBlock::ToolResult(_))
                 | (ContentBlockKind::Hint, ContentBlock::Hint(_))
                 | (ContentBlockKind::Data, ContentBlock::Data(_))
+                | (ContentBlockKind::Document, ContentBlock::Document(_))
         )
     }
 }

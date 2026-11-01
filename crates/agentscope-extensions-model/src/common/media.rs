@@ -91,6 +91,10 @@ impl MediaResolver for DefaultMediaResolver {
                     }
                 }
             }
+            Source::FileId(file) => Err(Error::Other(format!(
+                "provider file id '{}' has no inline bytes; {purpose} needs a URL or base64 source",
+                file.file_id
+            ))),
         }
     }
 }

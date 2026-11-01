@@ -147,6 +147,10 @@ pub fn image_source(source: &Source) -> Result<AnthropicImageSource> {
                 Ok(AnthropicImageSource::Url { url: url.clone() })
             }
         }
+        Source::FileId(file) => Err(Error::Other(format!(
+            "provider file id '{}' carries no image bytes; a document file id is not an image source",
+            file.file_id
+        ))),
     }
 }
 
@@ -277,6 +281,22 @@ pub fn message_content_blocks(
             ContentBlock::ToolResult(_) => {}
             // Audio/video have no Anthropic request representation.
             ContentBlock::Audio(_) | ContentBlock::Video(_) => {}
+            // Documents are not accepted by Anthropic: report the dropped
+            // content as a text placeholder instead of collapsing the message
+            // to empty (which would drop it entirely).
+            ContentBlock::Document(d) => {
+                let label = d.name.clone().unwrap_or_else(|| d.id.clone());
+                crate::common::diagnostics::warn(
+                    "document_not_supported",
+                    "content.document",
+                    format!(
+                        "DocumentBlock is not supported by Anthropic; sending a text placeholder instead of '{label}'"
+                    ),
+                );
+                out.push(AnthropicContentBlock::Text(AnthropicTextBlock::new(
+                    format!("[Document - not supported by Anthropic: {label}]"),
+                )));
+            }
         }
     }
     out

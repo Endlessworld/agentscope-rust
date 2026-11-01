@@ -119,6 +119,10 @@ pub fn resolve_mime_type(source: &Source) -> Result<String> {
                 url_source.url
             )))
         }
+        Source::FileId(file) => Err(Error::Other(format!(
+            "Provider file id '{}' carries no MIME type; set DocumentBlock.mimeType explicitly",
+            file.file_id
+        ))),
     }
 }
 

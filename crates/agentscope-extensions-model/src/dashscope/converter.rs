@@ -72,19 +72,39 @@ fn has_cache_marker(message: &DashScopeMessage) -> bool {
 ///
 /// Mirrors `DashScopeChatFormatter#applyAutomaticCacheControl`.
 pub fn apply_automatic_cache_control(messages: &mut [DashScopeMessage], options: &GenerateOptions) {
+    apply_automatic_cache_control_excluding(messages, options, &[]);
+}
+
+/// Same as [`apply_automatic_cache_control`], but `skip[i] == true` marks a
+/// message that must never receive an automatic marker (the `fileid://`
+/// directives injected for document blocks). Java keeps the injected messages out
+/// of automatic placement with a parallel directive list, so the remaining
+/// boundaries stay aligned.
+pub fn apply_automatic_cache_control_excluding(
+    messages: &mut [DashScopeMessage],
+    options: &GenerateOptions,
+    skip: &[bool],
+) {
     if messages.is_empty() || options.cache_control != Some(true) {
         return;
     }
-    let mut marker_count = messages.iter().filter(|m| has_cache_marker(m)).count();
+    let skipped = |index: usize| skip.get(index).copied().unwrap_or(false);
+    let mut marker_count = messages
+        .iter()
+        .enumerate()
+        .filter(|(index, m)| !skipped(*index) && has_cache_marker(m))
+        .count();
     if marker_count > MAX_CACHE_MARKERS {
         return;
     }
     // Candidate indices: the final message, then each system message, in order.
     let mut candidates: Vec<usize> = Vec::new();
     let last = messages.len() - 1;
-    candidates.push(last);
+    if !skipped(last) {
+        candidates.push(last);
+    }
     for (i, m) in messages.iter().enumerate() {
-        if m.role.as_deref() == Some("system") {
+        if !skipped(i) && m.role.as_deref() == Some("system") {
             candidates.push(i);
         }
     }
@@ -105,6 +125,63 @@ fn metadata_cache_directive(msg: &Msg) -> Option<bool> {
     msg.metadata
         .get(agentscope_core::metadata_keys::CACHE_CONTROL)
         .and_then(|v| v.as_bool())
+}
+
+/// Provider name a DashScope document file id must belong to.
+const DASHSCOPE_PROVIDER: &str = "dashscope";
+/// Scheme DashScope's `qwen-long` document contract uses.
+const FILE_ID_SCHEME: &str = "fileid://";
+
+/// Builds the system messages DashScope's document contract expects.
+///
+/// `qwen-long` reads documents from a `fileid://` reference carried by a system
+/// message placed before the turn that asks about them, not from a content part.
+/// Each document block therefore contributes one system message ahead of its own
+/// message (Java `DashScopeChatFormatter#appendDocumentMessages`).
+///
+/// Only a DashScope [`Source::FileId`] is supported: URL and Base64 documents are
+/// rejected here rather than dropped. Blocks on non-`USER` turns are left alone —
+/// documents are user input.
+fn document_messages(msg: &Msg) -> Result<Vec<DashScopeMessage>> {
+    if msg.role != MsgRole::User {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for block in &msg.content {
+        let ContentBlock::Document(document) = block else {
+            continue;
+        };
+        let Source::FileId(file) = &document.source else {
+            return Err(agentscope_core::Error::Other(format!(
+                "DashScope document input requires a file id source, got {}; \
+                 upload the document first and pass the DashScope file id",
+                source_kind(&document.source)
+            )));
+        };
+        if file.provider != DASHSCOPE_PROVIDER {
+            return Err(agentscope_core::Error::Other(format!(
+                "DashScope document input requires a DashScope file id, got provider '{}'",
+                file.provider
+            )));
+        }
+        out.push(DashScopeMessage {
+            role: Some("system".to_string()),
+            content: Some(DashScopeContent::Text(format!(
+                "{FILE_ID_SCHEME}{}",
+                file.file_id
+            ))),
+            ..Default::default()
+        });
+    }
+    Ok(out)
+}
+
+fn source_kind(source: &Source) -> &'static str {
+    match source {
+        Source::Url(_) => "URLSource",
+        Source::Base64(_) => "Base64Source",
+        Source::FileId(_) => "FileIdSource",
+    }
 }
 
 /// DashScope native text-generation endpoint.
@@ -170,6 +247,10 @@ fn source_url(source: &Source, validate: fn(&str) -> Result<()>) -> Result<Strin
                 Ok(u.url.clone())
             }
         }
+        Source::FileId(file) => Err(agentscope_core::Error::Other(format!(
+            "provider file id '{}' cannot be used as a media URL; upload the document and use a DocumentBlock",
+            file.file_id
+        ))),
     }
 }
 
@@ -290,6 +371,9 @@ fn multimodal_parts(blocks: &[ContentBlock]) -> Vec<DashScopeContentPart> {
             // Thinking blocks are never sent back to the model.
             ContentBlock::Thinking(_) => {}
             ContentBlock::ToolUse(_) => {}
+            // Documents travel as a separate `fileid://` system message, never
+            // as a content part (Java `DashScopeChatFormatter#appendDocumentMessages`).
+            ContentBlock::Document(_) => {}
         }
     }
     if parts.is_empty() {
@@ -394,24 +478,41 @@ fn multimodal_message(msg: &Msg) -> DashScopeMessage {
 /// `force_multimodal` mirrors "this model only speaks the multimodal API"; when
 /// set, every message uses the content-part list shape regardless of whether it
 /// carries media.
-pub fn to_dashscope_messages(messages: Vec<Msg>, force_multimodal: bool) -> Vec<DashScopeMessage> {
-    messages
-        .into_iter()
-        .map(|msg| {
-            let explicit = metadata_cache_directive(&msg) == Some(true);
-            let mut converted = if force_multimodal || has_media_content(&msg) {
-                multimodal_message(&msg)
-            } else {
-                simple_message(&msg)
-            };
-            // Explicit `Msg` metadata markers are emitted as supplied; the
-            // automatic pass (if enabled) only fills in unmarked boundaries.
-            if explicit {
-                set_cache_control_on_content(&mut converted);
-            }
-            converted
-        })
-        .collect()
+pub fn to_dashscope_messages(
+    messages: Vec<Msg>,
+    force_multimodal: bool,
+) -> Result<Vec<DashScopeMessage>> {
+    Ok(to_dashscope_messages_flagged(messages, force_multimodal)?.0)
+}
+
+/// Same as [`to_dashscope_messages`], additionally reporting which output entries
+/// were injected `fileid://` directives (so automatic cache placement can skip
+/// them and keep the directive list aligned).
+fn to_dashscope_messages_flagged(
+    messages: Vec<Msg>,
+    force_multimodal: bool,
+) -> Result<(Vec<DashScopeMessage>, Vec<bool>)> {
+    let mut out: Vec<DashScopeMessage> = Vec::new();
+    let mut injected: Vec<bool> = Vec::new();
+    for msg in messages {
+        let documents = document_messages(&msg)?;
+        injected.extend(std::iter::repeat(true).take(documents.len()));
+        out.extend(documents);
+        let explicit = metadata_cache_directive(&msg) == Some(true);
+        let mut converted = if force_multimodal || has_media_content(&msg) {
+            multimodal_message(&msg)
+        } else {
+            simple_message(&msg)
+        };
+        // Explicit `Msg` metadata markers are emitted as supplied; the
+        // automatic pass (if enabled) only fills in unmarked boundaries.
+        if explicit {
+            set_cache_control_on_content(&mut converted);
+        }
+        out.push(converted);
+        injected.push(false);
+    }
+    Ok((out, injected))
 }
 
 /// Converts messages and then applies the automatic cache policy from
@@ -420,10 +521,10 @@ pub fn to_dashscope_messages_with_options(
     messages: Vec<Msg>,
     force_multimodal: bool,
     options: &GenerateOptions,
-) -> Vec<DashScopeMessage> {
-    let mut converted = to_dashscope_messages(messages, force_multimodal);
-    apply_automatic_cache_control(&mut converted, options);
-    converted
+) -> Result<Vec<DashScopeMessage>> {
+    let (mut converted, injected) = to_dashscope_messages_flagged(messages, force_multimodal)?;
+    apply_automatic_cache_control_excluding(&mut converted, options, &injected);
+    Ok(converted)
 }
 
 /// Converts tool schemas into DashScope tool definitions.
@@ -573,6 +674,8 @@ fn merge_history_text_and_parts(messages: &[Msg]) -> (String, Vec<DashScopeConte
                     parts.push(data_part(d));
                     text.push_str(&format!("{name}: [Data]\n"));
                 }
+                // Documents travel as separate `fileid://` system messages.
+                ContentBlock::Document(_) => {}
                 // Audio has no textual rendering in the Java text-mode merger.
                 ContentBlock::Audio(_) => {}
                 // Thinking blocks are never sent back to the model.
@@ -672,6 +775,8 @@ pub fn merge_multimodal_conversation(
                     flush(&mut text, &mut content);
                     content.push(data_part(d));
                 }
+                // Documents travel as separate `fileid://` system messages.
+                ContentBlock::Document(_) => {}
                 ContentBlock::Thinking(_) => {}
                 ContentBlock::ToolResult(tr) => {
                     crate::common::diagnostics::warn(
@@ -723,8 +828,9 @@ pub fn to_multi_agent_messages(
     force_multimodal: bool,
     history_prompt: &str,
     options: &GenerateOptions,
-) -> Vec<DashScopeMessage> {
+) -> Result<Vec<DashScopeMessage>> {
     let mut result: Vec<DashScopeMessage> = Vec::new();
+    let mut injected: Vec<bool> = Vec::new();
     let mut start = 0;
 
     // Java picks the merger from the endpoint type, not from media presence:
@@ -748,6 +854,7 @@ pub fn to_multi_agent_messages(
                 set_cache_control_on_content(&mut system);
             }
             result.push(system);
+            injected.push(false);
             start = 1;
         }
     }
@@ -757,6 +864,13 @@ pub fn to_multi_agent_messages(
     for (kind, group) in group_messages(remaining) {
         match kind {
             GroupType::AgentMessage => {
+                // Document blocks inside a merged group still need their own
+                // `fileid://` system message ahead of the turn.
+                for msg in &group {
+                    let documents = document_messages(msg)?;
+                    injected.extend(std::iter::repeat(true).take(documents.len()));
+                    result.extend(documents);
+                }
                 let mut merged = if multimodal {
                     merge_multimodal_conversation(&group, history_prompt, is_first_agent_group)
                 } else {
@@ -771,16 +885,19 @@ pub fn to_multi_agent_messages(
                 };
                 apply_merged_cache_directive(&group, &mut merged);
                 result.push(merged);
+                injected.push(false);
                 is_first_agent_group = false;
             }
             GroupType::ToolSequence => {
-                result.extend(to_dashscope_messages(group, multimodal));
+                let (mut converted, flags) = to_dashscope_messages_flagged(group, multimodal)?;
+                result.append(&mut converted);
+                injected.extend(flags);
             }
         }
     }
 
-    apply_automatic_cache_control(&mut result, options);
-    result
+    apply_automatic_cache_control_excluding(&mut result, options, &injected);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -790,6 +907,29 @@ mod tests {
 
     fn user(text: &str) -> Msg {
         Msg::user(text)
+    }
+
+    fn convert(messages: Vec<Msg>, force_multimodal: bool) -> Vec<DashScopeMessage> {
+        to_dashscope_messages(messages, force_multimodal).expect("dashscope conversion")
+    }
+
+    fn convert_with_options(
+        messages: Vec<Msg>,
+        force_multimodal: bool,
+        options: &GenerateOptions,
+    ) -> Vec<DashScopeMessage> {
+        to_dashscope_messages_with_options(messages, force_multimodal, options)
+            .expect("dashscope conversion")
+    }
+
+    fn convert_multi_agent(
+        messages: Vec<Msg>,
+        force_multimodal: bool,
+        history_prompt: &str,
+        options: &GenerateOptions,
+    ) -> Vec<DashScopeMessage> {
+        to_multi_agent_messages(messages, force_multimodal, history_prompt, options)
+            .expect("dashscope conversion")
     }
 
     #[test]
@@ -820,7 +960,7 @@ mod tests {
 
     #[test]
     fn simple_message_wraps_text_in_string_content() {
-        let msgs = to_dashscope_messages(vec![user("hello")], false);
+        let msgs = convert(vec![user("hello")], false);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role.as_deref(), Some("user"));
         assert_eq!(
@@ -838,7 +978,7 @@ mod tests {
         msg.content.push(ContentBlock::Text(TextBlock::new("b")));
         msg.content
             .push(ContentBlock::Hint(HintBlock::new("h", "c")));
-        let msgs = to_dashscope_messages(vec![msg], false);
+        let msgs = convert(vec![msg], false);
         assert_eq!(
             msgs[0].content.as_ref().and_then(|c| c.as_text()),
             Some("a\nb\nc")
@@ -856,7 +996,7 @@ mod tests {
                 .unwrap()
                 .clone(),
         )));
-        let msgs = to_dashscope_messages(vec![msg], false);
+        let msgs = convert(vec![msg], false);
         let calls = msgs[0].tool_calls.as_ref().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id.as_deref(), Some("call_1"));
@@ -887,7 +1027,7 @@ mod tests {
             None,
         );
         msg.role = MsgRole::Tool;
-        let msgs = to_dashscope_messages(vec![msg], false);
+        let msgs = convert(vec![msg], false);
         assert_eq!(msgs[0].role.as_deref(), Some("tool"));
         assert_eq!(msgs[0].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(msgs[0].name.as_deref(), Some("get_weather"));
@@ -904,7 +1044,7 @@ mod tests {
             .push(ContentBlock::Image(ImageBlock::new(Source::Base64(
                 agentscope_core::Base64Source::new("image/png", "AAAA"),
             ))));
-        let msgs = to_dashscope_messages(vec![msg], false);
+        let msgs = convert(vec![msg], false);
         match msgs[0].content.as_ref().unwrap() {
             DashScopeContent::Parts(parts) => {
                 assert_eq!(parts.len(), 2);
@@ -920,7 +1060,7 @@ mod tests {
 
     #[test]
     fn force_multimodal_uses_part_list_for_text_only_messages() {
-        let msgs = to_dashscope_messages(vec![user("hi")], true);
+        let msgs = convert(vec![user("hi")], true);
         match msgs[0].content.as_ref().unwrap() {
             DashScopeContent::Parts(parts) => {
                 assert_eq!(parts.len(), 1);
@@ -947,7 +1087,7 @@ mod tests {
         );
         let mut msg = Msg::tool("call_1", "get_image", "");
         msg.content = vec![ContentBlock::ToolResult(result)];
-        let msgs = to_dashscope_messages(vec![msg], true);
+        let msgs = convert(vec![msg], true);
         assert_eq!(msgs[0].role.as_deref(), Some("tool"));
         assert_eq!(msgs[0].tool_call_id.as_deref(), Some("call_1"));
         match msgs[0].content.as_ref().unwrap() {
@@ -966,7 +1106,7 @@ mod tests {
             .push(ContentBlock::Thinking(agentscope_core::ThinkingBlock::new(
                 "secret",
             )));
-        let msgs = to_dashscope_messages(vec![msg], false);
+        let msgs = convert(vec![msg], false);
         assert_eq!(
             msgs[0].content.as_ref().and_then(|c| c.as_text()),
             Some("x")
@@ -1021,7 +1161,7 @@ mod tests {
         };
         let req = build_request(
             "qwen-plus",
-            to_dashscope_messages(vec![user("hi")], false),
+            convert(vec![user("hi")], false),
             true,
             &runtime,
             &defaults,
@@ -1055,7 +1195,7 @@ mod tests {
         };
         let req = build_request(
             "qwen3-max",
-            to_dashscope_messages(vec![user("hi")], false),
+            convert(vec![user("hi")], false),
             false,
             &runtime,
             &GenerateOptions::default(),
@@ -1072,7 +1212,7 @@ mod tests {
         // Absent by default.
         let req = build_request(
             "qwen3-max",
-            to_dashscope_messages(vec![user("hi")], false),
+            convert(vec![user("hi")], false),
             false,
             &GenerateOptions::default(),
             &GenerateOptions::default(),
@@ -1091,7 +1231,7 @@ mod tests {
             .content(vec![ContentBlock::Text(TextBlock::new("hello"))])
             .metadata_entry("_cache_control", serde_json::json!(true))
             .build();
-        let msgs = to_dashscope_messages(vec![msg], false);
+        let msgs = convert(vec![msg], false);
         let value = serde_json::to_value(&msgs[0]).unwrap();
         // The marker must live inside the content block, not at message level.
         assert!(value.get("cache_control").is_none());
@@ -1115,7 +1255,7 @@ mod tests {
             cache_control: Some(true),
             ..Default::default()
         };
-        let converted = to_dashscope_messages_with_options(msgs, false, &options);
+        let converted = convert_with_options(msgs, false, &options);
         let value = serde_json::to_value(&converted).unwrap();
         assert_eq!(
             value[0]["content"][0]["cache_control"]["type"],
@@ -1131,7 +1271,7 @@ mod tests {
     fn automatic_cache_control_disabled_by_default() {
         let msgs = vec![user("hello")];
         let converted =
-            to_dashscope_messages_with_options(msgs, false, &GenerateOptions::default());
+            convert_with_options(msgs, false, &GenerateOptions::default());
         let value = serde_json::to_value(&converted).unwrap();
         assert!(value[0]["content"][0].get("cache_control").is_none());
     }
@@ -1154,7 +1294,7 @@ mod tests {
             named("more", "Alice"),
             Msg::tool("call-1", "search", "42"),
         ];
-        let out = to_multi_agent_messages(messages, false, "PROMPT", &GenerateOptions::default());
+        let out = convert_multi_agent(messages, false, "PROMPT", &GenerateOptions::default());
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].role.as_deref(), Some("system"));
         assert_eq!(
@@ -1183,7 +1323,7 @@ mod tests {
                 agentscope_core::Base64Source::new("image/png", "QUJD"),
             ))),
         ])];
-        let out = to_multi_agent_messages(messages, false, "", &GenerateOptions::default());
+        let out = convert_multi_agent(messages, false, "", &GenerateOptions::default());
         let parts = match out[0].content.as_ref().unwrap() {
             DashScopeContent::Parts(parts) => parts,
             other => panic!("expected parts, got {other:?}"),
@@ -1210,7 +1350,7 @@ mod tests {
             ))),
             ContentBlock::Text(TextBlock::new("done")),
         ])];
-        let out = to_multi_agent_messages(messages, true, "PROMPT", &GenerateOptions::default());
+        let out = convert_multi_agent(messages, true, "PROMPT", &GenerateOptions::default());
         let parts = match out[0].content.as_ref().unwrap() {
             DashScopeContent::Parts(parts) => parts,
             other => panic!("expected parts, got {other:?}"),
@@ -1232,7 +1372,7 @@ mod tests {
             "search",
             agentscope_core::JsonMap::new(),
         ))]);
-        let out = to_multi_agent_messages(
+        let out = convert_multi_agent(
             vec![assistant, Msg::tool("call-1", "search", "42")],
             false,
             "PROMPT",
@@ -1249,5 +1389,122 @@ mod tests {
             "search"
         );
         assert_eq!(out[1].role.as_deref(), Some("tool"));
+    }
+
+    // ---- Document input (qwen-long `fileid://`) ---------------------------
+
+    fn document_msg(file_id: &str) -> Msg {
+        Msg::user_blocks(vec![
+            ContentBlock::Text(TextBlock::new("Summarise this")),
+            ContentBlock::Document(
+                agentscope_core::DocumentBlock::builder()
+                    .source(Source::FileId(agentscope_core::FileIdSource::new(
+                        "dashscope", file_id,
+                    )))
+                    .name("report.pdf")
+                    .mime_type("application/pdf")
+                    .build(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn document_block_emits_file_id_system_message_before_the_turn() {
+        let msgs = convert(vec![document_msg("file-abc")], false);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role.as_deref(), Some("system"));
+        assert_eq!(
+            msgs[0].content.as_ref().and_then(|c| c.as_text()),
+            Some("fileid://file-abc")
+        );
+        assert_eq!(msgs[1].role.as_deref(), Some("user"));
+        assert_eq!(
+            msgs[1].content.as_ref().and_then(|c| c.as_text()),
+            Some("Summarise this")
+        );
+    }
+
+    #[test]
+    fn document_block_keeps_cache_directives_aligned() {
+        let options = GenerateOptions::builder().cache_control(true).build();
+        let msgs = convert_with_options(vec![document_msg("file-abc")], false, &options);
+        assert_eq!(msgs.len(), 2);
+        // The injected directive stays a plain string message: it is skipped by
+        // automatic cache placement, so it is never rewritten into content parts.
+        assert_eq!(msgs[0].role.as_deref(), Some("system"));
+        assert_eq!(
+            msgs[0].content.as_ref().and_then(|c| c.as_text()),
+            Some("fileid://file-abc")
+        );
+        // The turn itself still receives the automatic marker.
+        match msgs[1].content.as_ref().expect("content") {
+            DashScopeContent::Parts(parts) => {
+                assert!(parts.iter().any(|p| p.cache_control.is_some()), "{parts:?}");
+            }
+            other => panic!("expected marked parts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn document_block_on_non_user_turn_is_left_alone() {
+        // ASSISTANT/TOOL accept arbitrary blocks for back-compat; a document there
+        // is aberrant input and must neither be mapped nor rejected.
+        let assistant = Msg::assistant_blocks(vec![
+            ContentBlock::Text(TextBlock::new("reply")),
+            ContentBlock::Document(agentscope_core::DocumentBlock::new(Source::Url(
+                agentscope_core::URLSource::new("https://example.com/a.pdf"),
+            ))),
+        ]);
+        let msgs = convert(vec![assistant], false);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role.as_deref(), Some("assistant"));
+    }
+
+    #[test]
+    fn document_block_rejects_non_file_id_source() {
+        let msg = Msg::user_blocks(vec![ContentBlock::Document(
+            agentscope_core::DocumentBlock::new(Source::Url(agentscope_core::URLSource::new(
+                "https://example.com/a.pdf",
+            ))),
+        )]);
+        let err = to_dashscope_messages(vec![msg], false).expect_err("URL document rejected");
+        assert!(
+            err.to_string().contains("requires a file id source"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("URLSource"), "{err}");
+    }
+
+    #[test]
+    fn document_block_rejects_foreign_provider() {
+        let msg = Msg::user_blocks(vec![ContentBlock::Document(
+            agentscope_core::DocumentBlock::new(Source::FileId(
+                agentscope_core::FileIdSource::new("openai", "file-abc"),
+            )),
+        )]);
+        let err = to_dashscope_messages(vec![msg], false).expect_err("foreign provider rejected");
+        assert!(
+            err.to_string().contains("requires a DashScope file id"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn multi_agent_document_block_emits_file_id_system_message() {
+        let out = convert_multi_agent(
+            vec![document_msg("file-abc")],
+            false,
+            "PROMPT",
+            &GenerateOptions::default(),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role.as_deref(), Some("system"));
+        assert_eq!(
+            out[0].content.as_ref().and_then(|c| c.as_text()),
+            Some("fileid://file-abc")
+        );
+        assert_eq!(out[1].role.as_deref(), Some("user"));
+        let merged = out[1].content.as_ref().and_then(|c| c.as_text()).unwrap();
+        assert!(merged.contains("Summarise this"), "{merged}");
     }
 }

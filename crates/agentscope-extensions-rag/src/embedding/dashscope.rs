@@ -339,6 +339,10 @@ impl DashScopeMultiModalEmbedding {
                     &base64::engine::general_purpose::STANDARD.encode(bytes),
                 ))
             }
+            Source::FileId(file) => Err(RagError::Embedding(format!(
+                "ImageBlock source 'fileid://{}' carries no image bytes (model={}, provider={PROVIDER})",
+                file.file_id, self.model_name
+            ))),
         }
     }
 

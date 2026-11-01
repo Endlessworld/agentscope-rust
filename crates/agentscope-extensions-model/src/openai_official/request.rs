@@ -832,6 +832,10 @@ pub fn resolve_image_url(source: &Source) -> Result<String> {
     match source {
         Source::Url(url) => Ok(url.url.clone()),
         Source::Base64(base64) => Ok(format!("data:{};base64,{}", base64.media_type, base64.data)),
+        Source::FileId(file) => Err(Error::Model(format!(
+            "provider file id '{}' cannot be used as an image URL by the openai-official provider.",
+            file.file_id
+        ))),
     }
 }
 
@@ -848,6 +852,10 @@ pub fn resolve_data_block_image_url(block: &DataBlock) -> Result<String> {
             }
             Ok(format!("data:{};base64,{}", base64.media_type, base64.data))
         }
+        Source::FileId(file) => Err(Error::Model(format!(
+            "provider file id '{}' cannot be used as a DataBlock image by the openai-official provider.",
+            file.file_id
+        ))),
     }
 }
 

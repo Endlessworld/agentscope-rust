@@ -162,6 +162,7 @@ pub(crate) fn block_type_name(block: &ContentBlock) -> &'static str {
         ContentBlock::ToolResult(_) => "ToolResultBlock",
         ContentBlock::Hint(_) => "HintBlock",
         ContentBlock::Data(_) => "DataBlock",
+        ContentBlock::Document(_) => "DocumentBlock",
     }
 }
 

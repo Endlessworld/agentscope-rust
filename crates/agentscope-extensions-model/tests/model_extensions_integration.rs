@@ -35,6 +35,10 @@ impl MediaResolver for StaticResolver {
                 base64: b.data.clone(),
                 mime_type: b.media_type.clone(),
             }),
+            Source::FileId(file) => Err(agentscope_core::Error::Other(format!(
+                "provider file id '{}' has no inline bytes",
+                file.file_id
+            ))),
         }
     }
 }
