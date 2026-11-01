@@ -32,9 +32,10 @@ use crate::model::{
     ToolInfo,
 };
 use crate::transport::{
-    AsdpEvent, AsdpTransport, ContractHttpServer, ContractProvider, EventReport, EventReportAck,
-    ExecutionAttemptCommand, HttpSelfRegistration, RegisteredIdentity, RegistrationOptions,
-    SessionEventMsg,
+    AsdpEvent, AsdpTransport, ContractHttpServer, ContractProvider, ConversationTurnPhase,
+    ConversationTurnReport, EventReport, EventReportAck, ExecutionAttemptCommand,
+    ExecutionAttemptPhase, ExecutionAttemptReport, HttpSelfRegistration, RegisteredIdentity,
+    RegistrationOptions, SessionEventMsg,
 };
 
 /// Level-2 outbox flush period (`SessionBridge.EVENT_FLUSH_INTERVAL_MS`).
@@ -541,8 +542,13 @@ impl ControlPlaneBridge {
     /// for every decoded frame; exposing it lets a host drive the same path from its own
     /// wire layer. A rejected command is returned as an error (never a panic) so a bad
     /// push-down cannot break the bridge.
+    ///
+    /// With an ASDP link attached, `executionAttempt` and `conversationTurn` also report
+    /// their phases upstream (tracker CP-05). Reporting is best effort: a failed report is
+    /// logged and never changes the command outcome.
     pub async fn dispatch_downstream(&self, event: AsdpEvent) -> ControlPlaneResult<()> {
-        dispatch_downstream(self.adapter.clone(), event).await
+        let transport = self.asdp();
+        dispatch_downstream(self.adapter.clone(), transport.as_deref(), event).await
     }
 
     /// Spawns the outbox pump and the downstream reader.
@@ -579,8 +585,12 @@ impl ControlPlaneBridge {
                         }
                     }
                     Ok(Some(event)) => {
-                        if let Err(error) =
-                            dispatch_downstream(reader_adapter.clone(), event).await
+                        if let Err(error) = dispatch_downstream(
+                            reader_adapter.clone(),
+                            Some(transport.as_ref()),
+                            event,
+                        )
+                        .await
                         {
                             tracing::debug!("controlplane: downstream command rejected: {error}");
                         }
@@ -1083,14 +1093,21 @@ async fn dispatch_session_command(
     Ok(outcome)
 }
 
-/// Consumer side of the ASDP channel: routes one decoded downstream frame to the adapter.
+/// Consumer side of the ASDP channel: routes one decoded downstream frame to the adapter
+/// and reports its progress back upstream.
 ///
 /// Mirrors the three handlers Java's `SessionBridge.start` binds: `dispatchCommand` for
 /// `sessionCmd`, `onExecutionAttempt` for `executionAttempt`, `onConversationTurn` for
 /// `conversationTurn`. Every arm reports instead of panicking, so a malformed or unwanted
 /// push-down cannot break the bridge.
+///
+/// `transport` is where the upstream `executionAttempt` / `conversationTurn` phases go.
+/// Reporting never changes the outcome of a command: a failed report is logged and the
+/// command result is returned untouched (Java `SessionBridge.reportAttempt` does the same,
+/// so an unreachable control plane cannot turn a dispatched attempt into a failure).
 async fn dispatch_downstream(
     adapter: Option<Arc<dyn FrameworkAdapter>>,
+    transport: Option<&AsdpTransport>,
     event: AsdpEvent,
 ) -> ControlPlaneResult<()> {
     match event {
@@ -1107,37 +1124,162 @@ async fn dispatch_downstream(
             .map(|_| ())
         }
         AsdpEvent::ExecutionAttempt(command) => {
+            let session_id = execution_session_id(command.runtime_binding.as_deref());
             // `cancel` ends the attempt: Java reports it as cancelled and never dispatches it.
             if command.command == "cancel" {
+                report_attempt(
+                    transport,
+                    &session_id,
+                    &command.attempt_id,
+                    ExecutionAttemptPhase::Cancelled,
+                    None,
+                )
+                .await;
                 return Ok(());
             }
             let Some(adapter) = adapter else {
                 return Ok(());
             };
-            adapter.handle_agent_task(assignment_of(&command)).await
+            for phase in [ExecutionAttemptPhase::Ack, ExecutionAttemptPhase::Start] {
+                report_attempt(transport, &session_id, &command.attempt_id, phase, None).await;
+            }
+            let outcome = adapter.handle_agent_task(assignment_of(&command)).await;
+            match &outcome {
+                Ok(()) => {
+                    report_attempt(
+                        transport,
+                        &session_id,
+                        &command.attempt_id,
+                        ExecutionAttemptPhase::Completed,
+                        None,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    report_attempt(
+                        transport,
+                        &session_id,
+                        &command.attempt_id,
+                        ExecutionAttemptPhase::Failed,
+                        Some(error.to_string()),
+                    )
+                    .await
+                }
+            }
+            outcome
         }
         AsdpEvent::ConversationTurn(command) => {
             let Some(adapter) = adapter else {
                 return Ok(());
             };
+            report_turn(
+                transport,
+                &command.session_id,
+                &command.turn_id,
+                ConversationTurnPhase::Accepted,
+                None,
+                None,
+            )
+            .await;
             let content = notice_content(command.input.as_deref());
-            if content.trim().is_empty() {
-                return Err(ControlPlaneError::Config(
+            let outcome = if content.trim().is_empty() {
+                Err(ControlPlaneError::Config(
                     "conversation input.message is required".into(),
-                ));
+                ))
+            } else {
+                adapter
+                    .run_conversation_turn(&command.session_id, &content)
+                    .await
+                    .and_then(|reply| {
+                        if reply.trim().is_empty() {
+                            Err(ControlPlaneError::Internal(
+                                "conversation completed without an assistant reply".into(),
+                            ))
+                        } else {
+                            Ok(reply)
+                        }
+                    })
+            };
+            match &outcome {
+                Ok(reply) => {
+                    report_turn(
+                        transport,
+                        &command.session_id,
+                        &command.turn_id,
+                        ConversationTurnPhase::Completed,
+                        Some(serde_json::json!({ "content": reply })),
+                        None,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    report_turn(
+                        transport,
+                        &command.session_id,
+                        &command.turn_id,
+                        ConversationTurnPhase::Failed,
+                        None,
+                        Some(error.to_string()),
+                    )
+                    .await
+                }
             }
-            let reply = adapter
-                .run_conversation_turn(&command.session_id, &content)
-                .await?;
-            if reply.trim().is_empty() {
-                return Err(ControlPlaneError::Internal(
-                    "conversation completed without an assistant reply".into(),
-                ));
-            }
-            Ok(())
+            outcome.map(|_| ())
         }
         // Acks are applied by the reader before dispatch; the remaining arms need no consumer.
         AsdpEvent::Acked(_) | AsdpEvent::ConnectRejected(_) | AsdpEvent::Ignored => Ok(()),
+    }
+}
+
+/// Reports one execution-attempt phase upstream (`SessionBridge.reportAttempt`).
+///
+/// Best effort: no link and no error ever reach the command path.
+async fn report_attempt(
+    transport: Option<&AsdpTransport>,
+    session_id: &str,
+    attempt_id: &str,
+    phase: ExecutionAttemptPhase,
+    error: Option<String>,
+) {
+    let Some(transport) = transport else {
+        return;
+    };
+    let report = ExecutionAttemptReport {
+        session_id: session_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        phase,
+        error,
+        occurred_at_ms: crate::transport::asdp::now_millis(),
+    };
+    if let Err(error) = transport.report_execution_attempt(report).await {
+        tracing::warn!("controlplane: executionAttempt report failed: {error}");
+    }
+}
+
+/// Reports one conversation-turn phase upstream (`SessionBridge.reportConversationTurn`).
+///
+/// Best effort, like [`report_attempt`]: the reply/error still travels back to the caller.
+async fn report_turn(
+    transport: Option<&AsdpTransport>,
+    session_id: &str,
+    turn_id: &str,
+    phase: ConversationTurnPhase,
+    reply: Option<serde_json::Value>,
+    error: Option<String>,
+) {
+    let Some(transport) = transport else {
+        return;
+    };
+    let report = ConversationTurnReport {
+        session_id: session_id.to_string(),
+        turn_id: turn_id.to_string(),
+        phase,
+        reply,
+        error,
+        occurred_at_ms: crate::transport::asdp::now_millis(),
+    };
+    if let Err(error) = transport.report_conversation_turn(report).await {
+        tracing::warn!("controlplane: conversationTurn report failed: {error}");
     }
 }
 
@@ -1569,6 +1711,7 @@ mod tests {
         assignments: Mutex<Vec<AgentTaskAssignment>>,
         turns: Mutex<Vec<String>>,
         fail_context: std::sync::atomic::AtomicBool,
+        fail_task: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -1638,6 +1781,9 @@ mod tests {
             assignment: AgentTaskAssignment,
         ) -> ControlPlaneResult<()> {
             self.assignments.lock().unwrap().push(assignment);
+            if self.fail_task.load(Ordering::SeqCst) {
+                return Err(ControlPlaneError::Internal("agent task exploded".into()));
+            }
             Ok(())
         }
         async fn run_conversation_turn(
@@ -1916,6 +2062,27 @@ mod tests {
                     serde_json::from_value::<EventReport>(value.get("eventReport")?.clone()).ok()
                 })
                 .collect()
+        }
+
+        /// Every `executionAttempt` / `conversationTurn` report the transport sent, in order.
+        fn reports<T: serde::de::DeserializeOwned>(&self, arm: &str) -> Vec<T> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|frame| {
+                    let value: serde_json::Value = serde_json::from_str(frame).ok()?;
+                    serde_json::from_value::<T>(value.get(arm)?.clone()).ok()
+                })
+                .collect()
+        }
+
+        fn attempt_reports(&self) -> Vec<ExecutionAttemptReport> {
+            self.reports("executionAttempt")
+        }
+
+        fn turn_reports(&self) -> Vec<ConversationTurnReport> {
+            self.reports("conversationTurn")
         }
     }
 
@@ -2296,6 +2463,253 @@ mod tests {
                 .await,
             Err(ControlPlaneError::Internal(_))
         ));
+    }
+
+    /// A bridge with the recording adapter mounted and a connected ASDP transport attached.
+    ///
+    /// Returns the link as well so the upstream phase reports can be inspected.
+    async fn reporting_bridge() -> (
+        ControlPlaneBridge,
+        Arc<RecordingAdapter>,
+        Arc<RecordingLink>,
+        Arc<AsdpTransport>,
+    ) {
+        let (mut bridge, adapter) = adapter_bridge();
+        let link = Arc::new(RecordingLink::default());
+        let link_handle: Arc<dyn AsdpLink> = link.clone();
+        let transport = asdp_transport(link_handle);
+        transport.connect().await.unwrap();
+        bridge.attach_asdp(Arc::clone(&transport));
+        (bridge, adapter, link, transport)
+    }
+
+    /// CP-05: a `cancel` attempt is reported as `cancelled` and nothing else — it is never
+    /// dispatched, so no `ack`/`start` can precede it.
+    #[tokio::test]
+    async fn a_cancelled_attempt_reports_only_cancelled() {
+        let (bridge, adapter, link, _transport) = reporting_bridge().await;
+        bridge
+            .dispatch_downstream(execution_attempt("cancel"))
+            .await
+            .unwrap();
+        assert!(adapter.assignments.lock().unwrap().is_empty());
+        let reports = link.attempt_reports();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].phase, ExecutionAttemptPhase::Cancelled);
+        assert_eq!(reports[0].session_id, "sess-9");
+        assert_eq!(reports[0].attempt_id, "attempt-1");
+        assert!(reports[0].error.is_none());
+        assert!(reports[0].occurred_at_ms > 0);
+    }
+
+    /// CP-05: a dispatched attempt is reported `ack` -> `start` -> `complete`, and the
+    /// report keeps the attempt's session/attempt identity.
+    #[tokio::test]
+    async fn a_dispatched_attempt_reports_ack_start_and_complete() {
+        let (bridge, adapter, link, _transport) = reporting_bridge().await;
+        bridge
+            .dispatch_downstream(execution_attempt("dispatch"))
+            .await
+            .unwrap();
+        assert_eq!(adapter.assignments.lock().unwrap().len(), 1);
+        let reports = link.attempt_reports();
+        let phases: Vec<_> = reports.iter().map(|report| report.phase).collect();
+        assert_eq!(
+            phases,
+            vec![
+                ExecutionAttemptPhase::Ack,
+                ExecutionAttemptPhase::Start,
+                ExecutionAttemptPhase::Completed
+            ]
+        );
+        assert!(reports.iter().all(|report| report.error.is_none()));
+        assert!(reports
+            .iter()
+            .all(|report| report.session_id == "sess-9" && report.attempt_id == "attempt-1"));
+    }
+
+    /// CP-05: a failing adapter is reported as `fail` with the error message, and the command
+    /// result is still propagated unchanged.
+    #[tokio::test]
+    async fn a_failed_attempt_reports_fail_with_the_error() {
+        let (bridge, adapter, link, _transport) = reporting_bridge().await;
+        adapter.fail_task.store(true, Ordering::SeqCst);
+        let outcome = bridge.dispatch_downstream(execution_attempt("dispatch")).await;
+        assert!(
+            matches!(outcome, Err(ControlPlaneError::Internal(ref message))
+                if message == "agent task exploded"),
+            "expected the adapter error, got {outcome:?}"
+        );
+        let reports = link.attempt_reports();
+        let phases: Vec<_> = reports.iter().map(|report| report.phase).collect();
+        assert_eq!(
+            phases,
+            vec![
+                ExecutionAttemptPhase::Ack,
+                ExecutionAttemptPhase::Start,
+                ExecutionAttemptPhase::Failed
+            ]
+        );
+        assert_eq!(
+            reports[2].error.as_deref(),
+            Some("controlplane internal error: agent task exploded")
+        );
+        assert_eq!(
+            serde_json::to_value(reports[2].phase).unwrap(),
+            serde_json::json!("fail"),
+            "the wire phase must match the proto action"
+        );
+    }
+
+    /// CP-05: a completed turn is reported `accepted` -> `completed` with the reply payload.
+    #[tokio::test]
+    async fn a_completed_turn_reports_accepted_then_completed() {
+        let (bridge, _adapter, link, _transport) = reporting_bridge().await;
+        bridge
+            .dispatch_downstream(conversation_turn(Some(r#"{"message":"hello"}"#)))
+            .await
+            .unwrap();
+        let reports = link.turn_reports();
+        let phases: Vec<_> = reports.iter().map(|report| report.phase).collect();
+        assert_eq!(
+            phases,
+            vec![
+                ConversationTurnPhase::Accepted,
+                ConversationTurnPhase::Completed
+            ]
+        );
+        assert!(reports.iter().all(|report| report.session_id == "s1"
+            && report.turn_id == "turn-1"));
+        assert!(reports[0].reply.is_none());
+        assert_eq!(
+            reports[1].reply,
+            Some(serde_json::json!({ "content": "echo: hello" }))
+        );
+        assert!(reports[1].error.is_none());
+    }
+
+    /// CP-05: a rejected turn (blank input, or a reply the adapter could not produce) is
+    /// reported `accepted` -> `failed` with the reason, and the error still reaches the caller.
+    #[tokio::test]
+    async fn a_failed_turn_reports_fail_with_the_reason() {
+        let (bridge, _adapter, link, _transport) = reporting_bridge().await;
+        assert!(matches!(
+            bridge.dispatch_downstream(conversation_turn(None)).await,
+            Err(ControlPlaneError::Config(_))
+        ));
+        let reports = link.turn_reports();
+        let phases: Vec<_> = reports.iter().map(|report| report.phase).collect();
+        assert_eq!(
+            phases,
+            vec![
+                ConversationTurnPhase::Accepted,
+                ConversationTurnPhase::Failed
+            ]
+        );
+        assert_eq!(
+            reports[1].error.as_deref(),
+            Some("invalid controlplane configuration: conversation input.message is required")
+        );
+        assert!(reports[1].reply.is_none());
+
+        // A blank reply is a failure too, reported under its own phase pair.
+        assert!(matches!(
+            bridge
+                .dispatch_downstream(conversation_turn(Some(r#"{"content":"silent"}"#)))
+                .await,
+            Err(ControlPlaneError::Internal(_))
+        ));
+        let reports = link.turn_reports();
+        assert_eq!(reports.len(), 4, "{reports:?}");
+        assert_eq!(reports[2].phase, ConversationTurnPhase::Accepted);
+        assert_eq!(reports[3].phase, ConversationTurnPhase::Failed);
+        assert_eq!(
+            reports[3].error.as_deref(),
+            Some("controlplane internal error: conversation completed without an assistant reply")
+        );
+    }
+
+    /// CP-05: reporting is best effort — a broken stream must not turn a dispatched attempt
+    /// into a failure.
+    #[tokio::test]
+    async fn a_failing_report_does_not_change_the_command_outcome() {
+        /// Link double whose sends fail once the handshake has gone through.
+        #[derive(Default)]
+        struct FlakyLink {
+            fail: AtomicBool,
+            sent: Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl AsdpLink for FlakyLink {
+            async fn send(&self, frame: &str) -> ControlPlaneResult<()> {
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(ControlPlaneError::Http("stream down".into()));
+                }
+                self.sent.lock().unwrap().push(frame.to_string());
+                Ok(())
+            }
+            async fn recv(&self) -> ControlPlaneResult<Option<String>> {
+                futures::future::pending::<ControlPlaneResult<Option<String>>>().await
+            }
+            async fn close(&self) -> ControlPlaneResult<()> {
+                Ok(())
+            }
+        }
+
+        let (mut bridge, adapter) = adapter_bridge();
+        let link = Arc::new(FlakyLink::default());
+        let link_handle: Arc<dyn AsdpLink> = link.clone();
+        let transport = asdp_transport(link_handle);
+        transport.connect().await.unwrap();
+        link.fail.store(true, Ordering::SeqCst);
+        bridge.attach_asdp(Arc::clone(&transport));
+
+        bridge
+            .dispatch_downstream(execution_attempt("dispatch"))
+            .await
+            .unwrap();
+        bridge
+            .dispatch_downstream(conversation_turn(Some(r#"{"message":"hello"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(adapter.assignments.lock().unwrap().len(), 1);
+        assert_eq!(*adapter.turns.lock().unwrap(), vec!["hello".to_string()]);
+        // Only the handshake left the link; every phase report failed and was swallowed.
+        assert_eq!(link.sent.lock().unwrap().len(), 1);
+    }
+
+    /// CP-05: with no transport the same dispatch runs without reporting anything.
+    #[tokio::test]
+    async fn downstream_dispatch_without_a_transport_reports_nothing() {
+        let adapter = Arc::new(RecordingAdapter::default());
+        let handle: Arc<dyn FrameworkAdapter> =
+            Arc::new(SharedRecordingAdapter(Arc::clone(&adapter)));
+        let link = Arc::new(RecordingLink::default());
+        let link_handle: Arc<dyn AsdpLink> = link.clone();
+        // A live, connected transport the caller simply does not hand to the dispatcher.
+        let transport = asdp_transport(link_handle);
+        transport.connect().await.unwrap();
+
+        dispatch_downstream(
+            Some(Arc::clone(&handle)),
+            None,
+            execution_attempt("dispatch"),
+        )
+        .await
+        .unwrap();
+        dispatch_downstream(
+            Some(handle),
+            None,
+            conversation_turn(Some(r#"{"message":"hello"}"#)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(adapter.assignments.lock().unwrap().len(), 1);
+        assert_eq!(*adapter.turns.lock().unwrap(), vec!["hello".to_string()]);
+        assert!(link.attempt_reports().is_empty());
+        assert!(link.turn_reports().is_empty());
     }
 
     /// Link double that delivers one queued downstream frame and then completes the stream.

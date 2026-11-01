@@ -191,6 +191,13 @@ pub enum ExecutionAttemptPhase {
     Heartbeat,
     /// The attempt was cancelled before completion.
     Cancelled,
+    /// The dispatched attempt finished (`complete` on the wire).
+    #[serde(rename = "complete")]
+    Completed,
+    /// The dispatched attempt failed; [`ExecutionAttemptReport::error`] holds the reason
+    /// (`fail` on the wire).
+    #[serde(rename = "fail")]
+    Failed,
 }
 
 impl ExecutionAttemptPhase {
@@ -201,6 +208,8 @@ impl ExecutionAttemptPhase {
             Self::Start => "start",
             Self::Heartbeat => "heartbeat",
             Self::Cancelled => "cancelled",
+            Self::Completed => "complete",
+            Self::Failed => "fail",
         }
     }
 
@@ -211,6 +220,10 @@ impl ExecutionAttemptPhase {
             "start" => Some(Self::Start),
             "heartbeat" => Some(Self::Heartbeat),
             "cancelled" => Some(Self::Cancelled),
+            // The proto says `complete`/`fail`; the past tense is tolerated because the
+            // conversation-turn arm spells them that way.
+            "complete" | "completed" => Some(Self::Completed),
+            "fail" | "failed" => Some(Self::Failed),
             _ => None,
         }
     }
@@ -667,7 +680,7 @@ impl AsdpTransport {
     }
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
@@ -960,6 +973,8 @@ mod tests {
             ExecutionAttemptPhase::Start,
             ExecutionAttemptPhase::Heartbeat,
             ExecutionAttemptPhase::Cancelled,
+            ExecutionAttemptPhase::Completed,
+            ExecutionAttemptPhase::Failed,
         ] {
             assert_eq!(
                 ExecutionAttemptPhase::parse(phase.as_str()),
@@ -967,6 +982,17 @@ mod tests {
                 "{phase:?}"
             );
         }
+        // The wire strings follow the proto (`complete`/`fail`), not the Rust names.
+        assert_eq!(ExecutionAttemptPhase::Completed.as_str(), "complete");
+        assert_eq!(ExecutionAttemptPhase::Failed.as_str(), "fail");
+        assert_eq!(
+            serde_json::to_value(ExecutionAttemptPhase::Completed).unwrap(),
+            serde_json::json!("complete")
+        );
+        assert_eq!(
+            ExecutionAttemptPhase::parse("COMPLETED"),
+            Some(ExecutionAttemptPhase::Completed)
+        );
         assert_eq!(
             ExecutionAttemptPhase::parse("CANCELLED"),
             Some(ExecutionAttemptPhase::Cancelled)
