@@ -89,6 +89,17 @@
 //! (30s) timeouts stay configurable through each client's `with_timeout`
 //! / `with_api_type` constructor.
 //!
+//! **`add` is a write, so retries can duplicate memories** (tracker MEM-05):
+//! [`HttpTransport::post_json`] carries no idempotency hint, so [`RetryTransport`]
+//! re-sends every POST verbatim — Mem0 `add` re-extracts memories, ReMe
+//! `/summary_personal_memory` re-summarises, Bailian `add` appends a record. The
+//! default [`RetryPolicy::none`] (one attempt) is Java's behaviour and therefore
+//! safe; a policy with `max_attempts > 1` is the caller accepting that a retry may
+//! land after a request that already succeeded server-side, and [`RetryTransport`]
+//! warns once at construction. For retry-reads-only, build two clients over the same
+//! base URL: one with the policy for `search`, one with [`RetryPolicy::none`] for
+//! `add` (both through the client's `with_transport`).
+//!
 //! ## Offline by default
 //!
 //! All clients depend on the [`HttpTransport`] seam, so assembly can inject

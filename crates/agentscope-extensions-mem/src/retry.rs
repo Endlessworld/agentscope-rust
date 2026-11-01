@@ -6,6 +6,20 @@
 //! policy exists so callers can opt into bounded exponential backoff without
 //! forking the clients: it lives at the [`HttpTransport`] seam, so every vendor
 //! client inherits it through its `*_and_policy` constructor.
+//!
+//! ## Non-idempotent `add`
+//!
+//! [`HttpTransport::post_json`] carries no idempotency hint, so the decorator
+//! retries **every** POST — including `add`, which is a write on all three vendors
+//! (Mem0 re-extracts memories, ReMe `/summary_personal_memory` re-summarises,
+//! Bailian appends a record). A retry that lands after a response was lost can
+//! therefore duplicate memories. [`RetryPolicy::default`] is a single attempt, so
+//! Java parity is safe; a policy with `max_attempts > 1` is the caller's explicit
+//! acceptance of that risk, and [`RetryTransport::new`] logs it once.
+//!
+//! There is no per-call opt-out on this seam. To retry only reads, build two
+//! clients over the same base URL: one with the policy, used for `search`, and one
+//! with [`RetryPolicy::none`] (via each client's `with_transport`) used for `add`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,6 +31,9 @@ use crate::error::{MemError, Result};
 use crate::http::HttpTransport;
 
 /// Exponential-backoff retry policy.
+///
+/// A policy with `max_attempts > 1` also re-sends non-idempotent `add` requests;
+/// see the module docs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetryPolicy {
     /// Total number of attempts, including the first one (clamped to `>= 1`).
@@ -108,7 +125,17 @@ pub struct RetryTransport {
 
 impl RetryTransport {
     /// Wraps `inner` with `policy`.
+    ///
+    /// Logs a warning when the policy retries, because retried POSTs are re-sent
+    /// verbatim and `add` is not idempotent (see the module docs).
     pub fn new(inner: Arc<dyn HttpTransport>, policy: RetryPolicy) -> Self {
+        if policy.max_attempts > 1 {
+            tracing::warn!(
+                max_attempts = policy.max_attempts,
+                "retry policy re-sends POST bodies; `add` is not idempotent (Mem0 re-extracts, \
+                 ReMe re-summarises), so a retried add can duplicate memories"
+            );
+        }
         Self {
             inner,
             policy,

@@ -447,4 +447,33 @@ mod tests {
             "Mem0 API search request failed with status 500: boom"
         );
     }
+
+    /// MEM-05: `add` is a write, but the retry decorator cannot tell it apart from a
+    /// read, so it re-sends the identical body. Pinned here so the duplicate-write
+    /// risk is a documented, tested property rather than an accident.
+    #[tokio::test]
+    async fn add_is_re_sent_verbatim_when_retries_are_enabled() {
+        let mock = MockTransport::new();
+        mock.push_response(Err(MemError::http_status(503, "busy")));
+        mock.push_body("{}");
+        let transport: Arc<dyn HttpTransport> = Arc::new(RetryTransport::new(
+            Arc::new(mock.clone()),
+            RetryPolicy::new(2, Duration::ZERO, Duration::ZERO, 1.0),
+        ));
+        let client = Mem0Client::with_transport(
+            transport,
+            "https://mem0.test",
+            Some("k".to_string()),
+            Mem0ApiType::Platform,
+        )
+        .unwrap();
+        client
+            .add(&Mem0AddRequest::new().with_user_id("u"))
+            .await
+            .unwrap();
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2, "the add POST is retried");
+        assert_eq!(requests[0].0, requests[1].0);
+        assert_eq!(requests[0].2, requests[1].2, "the same write is re-sent");
+    }
 }
