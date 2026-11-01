@@ -35,6 +35,17 @@ const FIELD_OWNER: &str = "owner";
 const FIELD_TOKEN: &str = "token";
 const FIELD_EXPIRES_AT: &str = "expiresAt";
 
+/// Hard cap on how long one lease keeps being renewed, as a multiple of `lease_ttl`.
+///
+/// The harness lease contract is explicit that dropping a lease does **not** release it,
+/// and `MongodbGuardClient` only pops a lease on an explicit `release`. A missed release
+/// would otherwise push `expiresAt` forward forever and pin the isolation key for the
+/// whole life of the process (MONGO-08). After `MAX_LEASE_LIFETIME_MULTIPLE × lease_ttl`
+/// the renewal task stops with a warning and the lock expires through its TTL index, so a
+/// leaked lease degrades into a bounded (mis)configuration instead of a permanent
+/// cross-process deadlock.
+pub const MAX_LEASE_LIFETIME_MULTIPLE: u32 = 10;
+
 /// A sandbox execution guard backed by MongoDB locks.
 ///
 /// Unlike the Java class (which implements `SandboxExecutionGuard` directly), this
@@ -175,12 +186,27 @@ impl MongodbSandboxExecutionGuard {
         let renew_interval = interval;
         let lock_lost = Arc::new(AtomicBool::new(false));
         let renew_lost = lock_lost.clone();
+        let renewal_capped = Arc::new(AtomicBool::new(false));
+        let renew_capped = renewal_capped.clone();
+        // Deadline after which renewal stops even though nothing released the lease
+        // (MONGO-08): the lock then expires through its TTL index.
+        let renew_deadline = chrono::Utc::now().timestamp_millis()
+            + lease_ttl_ms.saturating_mul(MAX_LEASE_LIFETIME_MULTIPLE as i64);
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(renew_interval);
             // Skip the immediate first tick; renew after one interval.
             ticker.tick().await;
             loop {
                 ticker.tick().await;
+                if chrono::Utc::now().timestamp_millis() >= renew_deadline {
+                    renew_capped.store(true, Ordering::SeqCst);
+                    tracing::warn!(
+                        "[sandbox-guard] MongoDB lock {renew_id} was renewed for its maximum \
+                         lifetime ({MAX_LEASE_LIFETIME_MULTIPLE} × lease_ttl) without being \
+                         released; stopping renewal so the TTL can reclaim it"
+                    );
+                    break;
+                }
                 let new_expires = chrono::Utc::now().timestamp_millis() + lease_ttl_ms;
                 let filter = FindFilter::eq(FIELD_LOCK_ID, json!(renew_id.clone()))
                     .and(FindFilter::eq(FIELD_TOKEN, json!(renew_token.clone())));
@@ -226,6 +252,7 @@ impl MongodbSandboxExecutionGuard {
             token,
             expires_at,
             lock_lost,
+            renewal_capped,
             renewal: Some(handle),
         }
     }
@@ -258,6 +285,9 @@ pub struct MongodbLeaseHandle {
     /// Set by the renewal task when the lock document disappeared (expired and
     /// reclaimed, or its token was overwritten).
     lock_lost: Arc<AtomicBool>,
+    /// Set by the renewal task once it hit [`MAX_LEASE_LIFETIME_MULTIPLE`] × `lease_ttl`
+    /// without the lease being released (MONGO-08).
+    renewal_capped: Arc<AtomicBool>,
     renewal: Option<JoinHandle<()>>,
 }
 
@@ -295,6 +325,15 @@ impl MongodbLeaseHandle {
     /// there is nothing left to renew — and the caller must treat the sandbox as unlocked.
     pub fn is_lock_lost(&self) -> bool {
         self.lock_lost.load(Ordering::SeqCst)
+    }
+
+    /// True once renewal stopped at its lifetime cap ([`MAX_LEASE_LIFETIME_MULTIPLE`] ×
+    /// `lease_ttl`) because nobody released the lease (MONGO-08).
+    ///
+    /// The lock document then simply expires through the TTL index, so a lease leaked by a
+    /// missing `release` can still be reclaimed instead of being renewed forever.
+    pub fn is_renewal_capped(&self) -> bool {
+        self.renewal_capped.load(Ordering::SeqCst)
     }
 
     /// Releases the lock, deleting the document only when the token still matches.
@@ -1007,5 +1046,36 @@ mod tests {
             Some(lease.expires_at()),
             "a lost lease must stop renewing"
         );
+    }
+
+    /// MONGO-08: a lease that is never released stops being renewed after
+    /// `MAX_LEASE_LIFETIME_MULTIPLE × lease_ttl`, so a leaked lease cannot pin the
+    /// isolation key forever — the lock expires and becomes reclaimable.
+    #[tokio::test]
+    async fn renewal_stops_after_the_lifetime_cap() {
+        let g = MongodbSandboxExecutionGuard::builder(Arc::new(InMemoryMongoClient::new()))
+            .lease_ttl(Duration::from_millis(60))
+            .retry_interval(Duration::from_millis(10))
+            .lock_timeout(Duration::from_millis(100))
+            .build();
+        let key = SandboxIsolationKey::new("session", "leaked");
+        let lease = g.try_enter(&key).await.unwrap();
+        assert!(!lease.is_renewal_capped());
+
+        // Renewal every `lease_ttl / 3` = 20ms; the cap is 10 × 60ms = 600ms.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            lease.is_renewal_capped(),
+            "renewal must stop at MAX_LEASE_LIFETIME_MULTIPLE × lease_ttl"
+        );
+
+        // The ticker stopped, so the lock expires with its TTL and a competitor wins it.
+        let reclaimed = g
+            .try_enter(&key)
+            .await
+            .expect("a capped lease must become reclaimable");
+        assert_ne!(reclaimed.token(), lease.token());
+        // Keep the original lease alive until here: its renewal must not have interfered.
+        assert!(!lease.is_lock_lost());
     }
 }

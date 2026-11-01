@@ -54,9 +54,9 @@
 //!
 //! * `list_indexes` hides MongoDB's implicit `_id_` index; the in-process backend never
 //!   reports it, and the index-migration helper must not consider it.
-//! * `first_field_size` / `first_field_string` read the projected field from the first
-//!   matching document instead of running a `$size` aggregation: `$size` raises a
-//!   server error on non-array values whereas the seam contract is `Ok(None)`.
+//! * `first_field_size_and_string` runs the same `$cond: [$isArray, $size, 0]` aggregation
+//!   Java uses (so only a number and a hash string are transferred), which is also why it
+//!   never raises `$size`'s "not an array" server error.
 //! * A GridFS file document's `uploadDate` is a real BSON `DateTime` (as Java writes
 //!   it), not a millis integer.
 //! * `create_index` reports exactly what the server decides. MongoDB 7 raises `85` when
@@ -72,10 +72,10 @@ use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mongodb::bson::{Bson, DateTime, Document};
+use mongodb::bson::{doc, Bson, DateTime, Document};
 use mongodb::error::{Error as DriverError, ErrorKind, WriteFailure};
 use mongodb::gridfs::GridFsBucket;
-use mongodb::options::{GridFsBucketOptions, IndexOptions, ReturnDocument};
+use mongodb::options::{ClientOptions, GridFsBucketOptions, IndexOptions, ReturnDocument};
 use mongodb::{Client, Collection, Database};
 use serde_json::{Map, Value};
 
@@ -202,6 +202,9 @@ where
 pub struct MongodbClient {
     client: Client,
     default_database: String,
+    /// The driver options this client was built from, retained so callers can inspect the
+    /// connection settings they injected (MONGO-09).
+    options: ClientOptions,
 }
 
 impl MongodbClient {
@@ -211,24 +214,62 @@ impl MongodbClient {
     /// surfacing later as a confusing per-operation server-selection timeout.
     pub async fn connect(uri: impl AsRef<str>) -> MongoResult<Self> {
         let uri = uri.as_ref().to_string();
-        let client = exec_on_driver(move || async move {
-            let client = Client::with_uri_str(&uri).await.map_err(map_driver_error)?;
-            client
-                .database("admin")
-                .run_command(doc_ping())
+        let options = exec_on_driver(move || async move {
+            ClientOptions::parse(uri)
                 .await
-                .map_err(map_driver_error)?;
-            Ok(client)
+                .map_err(map_driver_error)
         })
         .await?;
-        let default_database = client
-            .default_database()
-            .map(|db| db.name().to_string())
+        Self::connect_with_options(options).await
+    }
+
+    /// Connects with explicit driver options and verifies the deployment with a `ping`.
+    ///
+    /// This is the programmatic equivalent of the Java `create(MongoClient)` overload:
+    /// `app_name` / `max_pool_size` / `server_selection_timeout` / `connect_timeout` /
+    /// `retry_writes` / `write_concern` etc. can be set on the [`ClientOptions`] instead
+    /// of (or on top of) connection-string keywords (MONGO-09). Parse a URI with
+    /// [`ClientOptions::parse`] and mutate the result to keep the URI's settings.
+    pub async fn connect_with_options(options: ClientOptions) -> MongoResult<Self> {
+        let client = Self::from_options(options).await?;
+        client.ping().await?;
+        Ok(client)
+    }
+
+    /// Builds the client from explicit driver options **without** health-checking the
+    /// deployment (the caller decides when to validate, e.g. right after construction).
+    ///
+    /// Construction always happens on the dedicated driver runtime, so the driver's
+    /// topology/pool tasks are not tied to the caller's runtime.
+    pub async fn from_options(options: ClientOptions) -> MongoResult<Self> {
+        let default_database = options
+            .default_database
+            .clone()
             .unwrap_or_else(|| DEFAULT_DATABASE.to_string());
+        let driver_options = options.clone();
+        let client = exec_on_driver(move || async move {
+            Client::with_options(driver_options).map_err(map_driver_error)
+        })
+        .await?;
         Ok(Self {
             client,
             default_database,
+            options,
         })
+    }
+
+    /// The driver options this client was created with.
+    pub fn options(&self) -> &ClientOptions {
+        &self.options
+    }
+
+    async fn ping(&self) -> MongoResult<()> {
+        let db = self.client.database("admin");
+        exec_on_driver(move || async move {
+            db.run_command(doc_ping()).await.map_err(map_driver_error)?;
+            Ok(())
+        })
+        .await
     }
 
     /// The database used for collection keys that are not `"<db>::<collection>"`
@@ -577,6 +618,25 @@ impl MongoClient for MongodbClient {
             .await
     }
 
+    async fn find_one_projected(
+        &self,
+        collection: &str,
+        filter: &FindFilter,
+        projection: &[&str],
+    ) -> MongoResult<Option<Map<String, Value>>> {
+        let coll = self.collection(collection);
+        let filter = find_filter_to_document(filter);
+        let projection = include_projection(projection);
+        exec_on_driver(move || async move {
+                coll.find_one(filter)
+                    .projection(projection)
+                    .await
+                    .map_err(map_driver_error)
+                    .map(|found| found.map(|doc| document_to_json_map(&doc)))
+            })
+            .await
+    }
+
     async fn find_many(
         &self,
         collection: &str,
@@ -590,8 +650,14 @@ impl MongoClient for MongodbClient {
         let sort_field = options.sort_ascending_by.clone();
         let skip = options.skip;
         let limit = options.limit;
+        let projection = options.projection.as_ref().map(|fields| {
+            include_projection(&fields.iter().map(String::as_str).collect::<Vec<_>>())
+        });
         exec_on_driver(move || async move {
                 let mut find = coll.find(filter);
+                if let Some(projection) = projection {
+                    find = find.projection(projection);
+                }
                 if let Some(field) = sort_field {
                     let mut sort = Document::new();
                     sort.insert(field, Bson::Int32(1));
@@ -694,28 +760,55 @@ impl MongoClient for MongodbClient {
             .await
     }
 
-    async fn first_field_size(
+    async fn first_field_size_and_string(
         &self,
         collection: &str,
         filter: &FindFilter,
-        field: &str,
-    ) -> MongoResult<Option<usize>> {
-        let value = self
-            .first_field_value(collection, filter, field)
-            .await?;
-        Ok(value.and_then(|v| v.as_array().map(|items| items.len())))
-    }
+        size_field: &str,
+        string_field: &str,
+    ) -> MongoResult<(Option<usize>, Option<String>)> {
+        use futures::TryStreamExt as _;
 
-    async fn first_field_string(
-        &self,
-        collection: &str,
-        filter: &FindFilter,
-        field: &str,
-    ) -> MongoResult<Option<String>> {
-        let value = self
-            .first_field_value(collection, filter, field)
-            .await?;
-        Ok(value.and_then(|v| v.as_str().map(|s| s.to_string())))
+        let coll = self.collection(collection);
+        let filter = find_filter_to_document(filter);
+        let size_ref = format!("${size_field}");
+        let hash_ref = format!("${string_field}");
+        // Same `$cond: [$isArray, $size, 0]` as Java `MongoAgentStateStore.save(List)`.
+        let count_expr = doc! {
+            "$cond": [
+                doc! { "$isArray": size_ref.clone() },
+                doc! { "$size": size_ref },
+                0,
+            ]
+        };
+        exec_on_driver(move || async move {
+                // Only the count and the hash string cross the wire, never the array
+                // itself (MONGO-05).
+                let pipeline = vec![
+                    doc! { "$match": filter },
+                    doc! { "$limit": 1 },
+                    doc! {
+                        "$project": {
+                            "_id": 0,
+                            "count": count_expr,
+                            "storedHash": hash_ref,
+                        }
+                    },
+                ];
+                let mut cursor = coll.aggregate(pipeline).await.map_err(map_driver_error)?;
+                let Some(doc) = cursor.try_next().await.map_err(map_driver_error)? else {
+                    return Ok((None, None));
+                };
+                let count = match doc.get("count") {
+                    Some(Bson::Int32(n)) => Some(*n as usize),
+                    Some(Bson::Int64(n)) => Some(*n as usize),
+                    Some(Bson::Double(n)) => Some(*n as usize),
+                    _ => None,
+                };
+                let stored_hash = doc.get_str("storedHash").ok().map(|s| s.to_string());
+                Ok((count, stored_hash))
+            })
+            .await
     }
 
     async fn create_index(&self, collection: &str, spec: &IndexSpec) -> MongoResult<()> {
@@ -866,43 +959,13 @@ impl MongoClient for MongodbClient {
     }
 }
 
-impl MongodbClient {
-    /// Reads the raw JSON value at `field` (a possibly-dotted path) of the first
-    /// matching document, using a projection so only that subtree is transferred.
-    async fn first_field_value(
-        &self,
-        collection: &str,
-        filter: &FindFilter,
-        field: &str,
-    ) -> MongoResult<Option<Value>> {
-        let coll = self.collection(collection);
-        let filter = find_filter_to_document(filter);
-        let field = field.to_string();
-        let mut projection = Document::new();
-        projection.insert(field.clone(), Bson::Int32(1));
-        exec_on_driver(move || async move {
-                let found = coll
-                    .find_one(filter)
-                    .projection(projection)
-                    .await
-                    .map_err(map_driver_error)?;
-                Ok(found.and_then(|doc| {
-                    resolve_path(&document_to_json_map(&doc), &field)
-                }))
-            })
-            .await
+/// Builds an inclusive projection document (`{field: 1, …}`) from dotted paths.
+fn include_projection(fields: &[&str]) -> Document {
+    let mut projection = Document::new();
+    for field in fields {
+        projection.insert((*field).to_string(), Bson::Int32(1));
     }
-}
-
-/// Resolves a dotted field path against a JSON object.
-fn resolve_path(doc: &Map<String, Value>, path: &str) -> Option<Value> {
-    let mut parts = path.split('.');
-    let first = parts.next()?;
-    let mut current = doc.get(first)?;
-    for part in parts {
-        current = current.as_object()?.get(part)?;
-    }
-    Some(current.clone())
+    projection
 }
 
 fn index_options(
@@ -992,6 +1055,35 @@ mod tests {
         let doc = find_filter_to_document(&filter);
         let rendered = bson_to_json(&Bson::Document(doc));
         assert_eq!(rendered, json!({"versions.k": {"$eq": 3, "$exists": false}}));
+    }
+
+    /// MONGO-09: connection settings can be injected programmatically (the Java
+    /// `create(MongoClient)` equivalent) instead of only through URI keywords, and they
+    /// are carried into the driver client. `from_options` skips the ping, so this runs
+    /// offline.
+    #[tokio::test]
+    async fn connection_options_are_carried_into_the_client() {
+        let mut options = ClientOptions::parse("mongodb://127.0.0.1:27017/mydb")
+            .await
+            .expect("a plain URI parses without a server");
+        options.app_name = Some("agentscope-test".to_string());
+        options.max_pool_size = Some(7);
+        options.server_selection_timeout = Some(Duration::from_secs(5));
+
+        let client = MongodbClient::from_options(options)
+            .await
+            .expect("the client builds from explicit options");
+        // The URI's database becomes the default for unscoped collection keys.
+        assert_eq!(client.default_database(), "mydb");
+        assert_eq!(
+            client.options().app_name.as_deref(),
+            Some("agentscope-test")
+        );
+        assert_eq!(client.options().max_pool_size, Some(7));
+        assert_eq!(
+            client.options().server_selection_timeout,
+            Some(Duration::from_secs(5))
+        );
     }
 
     #[test]

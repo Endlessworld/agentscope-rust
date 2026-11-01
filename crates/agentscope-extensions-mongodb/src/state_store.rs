@@ -73,8 +73,9 @@ pub fn validate_state_key(key: &str) -> Result<(), MongoError> {
 }
 
 fn invalid_key(key: &str) -> MongoError {
+    // Single line, like the Java message (MONGO-10).
     MongoError::InvalidArgument(format!(
-        "key must match pattern ^[a-zA-Z_][a-zA-Z0-9_]*$ but was: {key} 
+        "key must match pattern ^[a-zA-Z_][a-zA-Z0-9_]*$ but was: {key} \
          (MongoDB field names cannot contain '.' or '$')"
     ))
 }
@@ -109,8 +110,8 @@ fn require_session_id(session_id: &str) -> Result<(), MongoError> {
 pub struct MongodbAgentStateStore {
     client: Arc<dyn MongoClient>,
     collection: String,
-    /// Session TTL in days as configured through the builder; `None` (or a
-    /// non-positive value) disables the TTL index.
+    /// Session TTL in days as configured through the builder; `None` disables the TTL
+    /// index. The builder rejects non-positive values (MONGO-07).
     ttl_days: Option<i64>,
     on_delete: Option<SessionDeleteCallback>,
 }
@@ -175,16 +176,14 @@ impl MongodbAgentStateStore {
         )
         .await?;
         if let Some(days) = self.ttl_days {
-            if days > 0 {
-                create_index_with_migration(
-                    &self.client,
-                    &self.collection,
-                    &IndexSpec::ascending(&[FIELD_UPDATED_AT])
-                        .sparse()
-                        .expire_after_seconds(days * 24 * 3600),
-                )
-                .await?;
-            }
+            create_index_with_migration(
+                &self.client,
+                &self.collection,
+                &IndexSpec::ascending(&[FIELD_UPDATED_AT])
+                    .sparse()
+                    .expire_after_seconds(days * 24 * 3600),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -199,7 +198,18 @@ impl MongodbAgentStateStore {
     ) -> Result<(Option<Value>, i64), MongoError> {
         validate_state_key(key)?;
         let filter = slot_filter(user_id, session_id);
-        let doc = self.client.find_one(&self.collection, &filter).await?;
+        // Projected read (MONGO-05): only the requested value and version are transferred,
+        // like Java `Projections.include(stateField, versionField)`.
+        let state_field = format!("{FIELD_STATES}.{key}");
+        let version_field = format!("{FIELD_VERSIONS}.{key}");
+        let doc = self
+            .client
+            .find_one_projected(
+                &self.collection,
+                &filter,
+                &[state_field.as_str(), version_field.as_str()],
+            )
+            .await?;
         let Some(doc) = doc else {
             return Ok((None, 0));
         };
@@ -400,16 +410,14 @@ impl MongodbAgentStateStore {
         let hash_field = format!("{FIELD_HASHES}.{key}");
         let now = chrono::Utc::now().timestamp_millis();
 
-        // Obtain the existing count and stored hash server-side.
-        let existing_count = self
+        // Obtain the existing count and stored hash server-side, in one round trip
+        // (MONGO-05): mirrors Java's `$cond/$isArray/$size` + `storedHash` aggregation, so
+        // a long history never transfers the array just to count it.
+        let (existing_count, stored_hash) = self
             .client
-            .first_field_size(&self.collection, &filter, &state_field)
-            .await?
-            .unwrap_or(0);
-        let stored_hash = self
-            .client
-            .first_field_string(&self.collection, &filter, &hash_field)
+            .first_field_size_and_string(&self.collection, &filter, &state_field, &hash_field)
             .await?;
+        let existing_count = existing_count.unwrap_or(0);
         let current_hash = compute_hash(values);
 
         let encoded: Vec<Value> = values.iter().map(key_escaper::escape).collect();
@@ -470,9 +478,13 @@ impl MongodbAgentStateStore {
         list: bool,
     ) -> Option<Value> {
         let filter = slot_filter(user_id, session_id);
+        // Projected read (MONGO-05): transferring the whole session document to read one
+        // key is exactly the read amplification Java avoids with
+        // `Projections.include(stateField)`.
+        let state_field = format!("{FIELD_STATES}.{key}");
         let doc = self
             .client
-            .find_one(&self.collection, &filter)
+            .find_one_projected(&self.collection, &filter, &[state_field.as_str()])
             .await
             .ok()
             .flatten()?;
@@ -588,9 +600,11 @@ impl AgentStateStore for MongodbAgentStateStore {
 
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
         let filter = slot_filter(user_id, session_id);
+        // A count alone answers "does the slot exist?" without transferring the session
+        // document (MONGO-05); `count` would otherwise be an unused seam method (MONGO-10).
         matches!(
-            self.client.find_one(&self.collection, &filter).await,
-            Ok(Some(_))
+            self.client.count(&self.collection, &filter).await,
+            Ok(n) if n > 0
         )
     }
 
@@ -690,7 +704,8 @@ impl MongodbAgentStateStoreBuilder {
     /// Optional session TTL in days. When positive, a sparse TTL index is created on
     /// `_updated_at` by [`MongodbAgentStateStore::ensure_indexes`], which reads the
     /// value retained by [`MongodbAgentStateStoreBuilder::build`]. Defaults to `None`
-    /// (no expiry).
+    /// (no expiry); a non-positive value is rejected by `build()`, mirroring Java
+    /// `Builder.ttlDays` throwing `IllegalArgumentException` (MONGO-07).
     pub fn ttl_days(mut self, days: i64) -> Self {
         self.ttl_days = Some(days);
         self
@@ -707,10 +722,21 @@ impl MongodbAgentStateStoreBuilder {
     /// Builds the store. This is synchronous; call
     /// [`MongodbAgentStateStore::ensure_indexes`] to create indexes — it picks up
     /// the `ttl_days` configured here and creates the session TTL index.
+    ///
+    /// Fails when `ttl_days` was set to a non-positive value: silently disabling expiry
+    /// would leave sessions alive forever with no feedback (MONGO-07; Java's
+    /// `Builder.ttlDays` throws the same way).
     pub fn build(self) -> MongoResult<MongodbAgentStateStore> {
         let client = self
             .client
             .ok_or_else(|| MongoError::InvalidArgument("client must be provided".into()))?;
+        if let Some(days) = self.ttl_days {
+            if days <= 0 {
+                return Err(MongoError::InvalidArgument(
+                    "ttlDays must be positive or null".into(),
+                ));
+            }
+        }
         let store = MongodbAgentStateStore {
             client,
             collection: self
@@ -765,6 +791,44 @@ mod tests {
             Some(json!({"a": 1}))
         );
         assert_eq!(s.get(Some("u1"), "sess", "missing").await, None);
+    }
+
+    /// MONGO-05: single-key reads project server-side instead of transferring the whole
+    /// session document (Java `Projections.include(stateField)`).
+    #[tokio::test]
+    async fn single_key_reads_project_the_requested_fields() {
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let s = MongodbAgentStateStore::new(raw.clone(), SESSIONS_COLLECTION);
+        s.save(Some("u"), "sess", "history", json!([1, 2, 3]))
+            .await;
+        s.save(Some("u"), "sess", "other", json!({ "blob": "x".repeat(1024) }))
+            .await;
+
+        assert_eq!(
+            s.get(Some("u"), "sess", "history").await,
+            Some(json!([1, 2, 3]))
+        );
+        assert_eq!(
+            raw.last_projection(),
+            Some(vec!["states.history".to_string()]),
+            "get must transfer only the requested state field"
+        );
+
+        let (value, version) = s.get_version(Some("u"), "sess", "history").await.unwrap();
+        assert_eq!(value, Some(json!([1, 2, 3])));
+        assert_eq!(version, 1);
+        assert_eq!(
+            raw.last_projection(),
+            Some(vec![
+                "states.history".to_string(),
+                "versions.history".to_string()
+            ]),
+            "get_version must project the value and its version only"
+        );
+
+        // `exists` transfers a count instead of a document, so it does not widen the read.
+        assert!(s.exists(Some("u"), "sess").await);
+        assert!(!s.exists(Some("u"), "missing").await);
     }
 
     #[tokio::test]
@@ -1096,12 +1160,25 @@ mod tests {
         assert_eq!(ttl.expire_after_seconds, Some(7 * 24 * 3600));
         assert!(ttl.sparse);
 
-        // A non-positive TTL is ignored: no additional TTL index is created.
+        // MONGO-07: a non-positive TTL is a configuration error, not a silent "TTL off"
+        // (Java `Builder.ttlDays` throws IllegalArgumentException).
+        for days in [0, -1] {
+            let err = MongodbAgentStateStore::builder()
+                .client(Arc::new(InMemoryMongoClient::new()))
+                .ttl_days(days)
+                .build()
+                .expect_err("a non-positive ttl_days must be rejected");
+            assert!(
+                err.to_string().contains("ttlDays must be positive"),
+                "unexpected error for ttl_days({days}): {err}"
+            );
+        }
+
+        // Without `ttl_days` no TTL index is created at all.
         let raw2 = Arc::new(InMemoryMongoClient::new());
         let client2: Arc<dyn MongoClient> = raw2.clone();
         let s2 = MongodbAgentStateStore::builder()
             .client(client2.clone())
-            .ttl_days(0)
             .build()
             .unwrap();
         s2.ensure_indexes().await.unwrap();

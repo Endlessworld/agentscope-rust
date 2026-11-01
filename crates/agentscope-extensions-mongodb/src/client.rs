@@ -326,12 +326,15 @@ impl Update {
     }
 }
 
-/// Find options: sort, skip and limit.
+/// Find options: sort, skip, limit and projection.
 #[derive(Debug, Clone, Default)]
 pub struct FindOptions {
     pub sort_ascending_by: Option<String>,
     pub skip: Option<usize>,
     pub limit: Option<usize>,
+    /// Dotted field paths to return (an inclusive projection). `None` returns the whole
+    /// document; a list restricts the transfer to exactly those fields (MONGO-05).
+    pub projection: Option<Vec<String>>,
 }
 
 /// Options for `find_one_and_update`.
@@ -371,6 +374,21 @@ pub trait MongoClient: Send + Sync {
         &self,
         collection: &str,
         filter: &FindFilter,
+    ) -> MongoResult<Option<Map<String, Value>>>;
+
+    /// Finds the first document matching `filter`, returning **only** the dotted field
+    /// paths in `projection`.
+    ///
+    /// Java projects single-key reads the same way (`Projections.include(stateField)` in
+    /// `MongoAgentStateStore.get` / `getVersioned`), so reading one state key never
+    /// transfers the whole session document (MONGO-05). The returned document keeps the
+    /// requested paths nested (`["states.foo"]` → `{"states": {"foo": …}}`); a field
+    /// that is absent from the stored document is absent from the result.
+    async fn find_one_projected(
+        &self,
+        collection: &str,
+        filter: &FindFilter,
+        projection: &[&str],
     ) -> MongoResult<Option<Map<String, Value>>>;
 
     /// Finds documents matching `filter`, sorted/paginated per `options`.
@@ -413,24 +431,25 @@ pub trait MongoClient: Send + Sync {
         filter: &FindFilter,
     ) -> MongoResult<Vec<Value>>;
 
-    /// Returns the array length at `field` (a possibly-dotted path) of the first
-    /// matching document. Mirrors the `$size` aggregation used to obtain a list
-    /// length without transferring the array.
-    async fn first_field_size(
+    /// Returns the array length at `size_field` **and** the string at `string_field`
+    /// (both possibly-dotted paths) of the first document matching `filter`, in a single
+    /// round trip.
+    ///
+    /// Mirrors the aggregation Java `MongoAgentStateStore.save(List)` runs before every
+    /// list write: `$project: {count: {$cond: [{$isArray: "$<size_field>"},
+    /// {$size: "$<size_field>"}, 0]}, storedHash: "$<string_field>"}` — only a number and
+    /// a short string cross the wire, never the array itself (MONGO-05).
+    ///
+    /// `(None, None)` when no document matches; otherwise the count is `Some(n)` (`0`
+    /// when the field is missing or not an array, exactly like the `$cond`) and the
+    /// string is `None` when absent or not a string.
+    async fn first_field_size_and_string(
         &self,
         collection: &str,
         filter: &FindFilter,
-        field: &str,
-    ) -> MongoResult<Option<usize>>;
-
-    /// Reads the string at `field` (a possibly-dotted path) of the first matching
-    /// document (used for the stored list hash).
-    async fn first_field_string(
-        &self,
-        collection: &str,
-        filter: &FindFilter,
-        field: &str,
-    ) -> MongoResult<Option<String>>;
+        size_field: &str,
+        string_field: &str,
+    ) -> MongoResult<(Option<usize>, Option<String>)>;
 
     // ── index lifecycle ──
 
@@ -495,6 +514,22 @@ fn set_field(doc: &mut Map<String, Value>, path: &str, value: Value) {
         current = entry.as_object_mut().expect("object just ensured");
     }
     current.insert(parts[parts.len() - 1].to_string(), value);
+}
+
+/// Keeps only the requested (possibly dotted) field paths of `doc`.
+///
+/// Mirrors an inclusive MongoDB projection: requested paths keep their nesting
+/// (`["states.foo"]` → `{"states": {"foo": …}}`), fields absent from `doc` are absent
+/// from the result. The in-process backend applies it locally; the real driver pushes the
+/// same field set down to the server.
+fn project_doc(doc: &Map<String, Value>, projection: &[String]) -> Map<String, Value> {
+    let mut out = Map::new();
+    for field in projection {
+        if let Some(value) = resolve_field(doc, field) {
+            set_field(&mut out, field, value.clone());
+        }
+    }
+    out
 }
 
 /// Unsets a possibly-dotted field path.
@@ -565,6 +600,8 @@ pub struct InMemoryMongoClient {
     /// Default database reported through [`MongoClient::default_database`]; `None` until a
     /// test simulates a URI that names a database.
     default_database: Option<String>,
+    /// Test hook: projection of the most recent projected read.
+    last_projection: Mutex<Option<Vec<String>>>,
 }
 
 impl InMemoryMongoClient {
@@ -577,6 +614,22 @@ impl InMemoryMongoClient {
     pub fn with_default_database(mut self, database: impl Into<String>) -> Self {
         self.default_database = Some(database.into());
         self
+    }
+
+    /// Test hook: the projection of the most recent projected read (see
+    /// [`MongoClient::find_one_projected`] / [`FindOptions::projection`]); `None` for an
+    /// unprojected read. Lets a test assert a caller really restricts the transfer
+    /// (MONGO-05).
+    pub fn last_projection(&self) -> Option<Vec<String>> {
+        self.last_projection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn record_projection(&self, projection: Option<&Vec<String>>) {
+        let mut slot = self.last_projection.lock().unwrap_or_else(|p| p.into_inner());
+        *slot = projection.cloned();
     }
 
     /// Test hook: forces the next `n` [`MongoClient::create_index`] calls to fail with
@@ -637,12 +690,30 @@ impl MongoClient for InMemoryMongoClient {
         })
     }
 
+    async fn find_one_projected(
+        &self,
+        collection: &str,
+        filter: &FindFilter,
+        projection: &[&str],
+    ) -> MongoResult<Option<Map<String, Value>>> {
+        let projection: Vec<String> = projection.iter().map(|f| (*f).to_string()).collect();
+        self.record_projection(Some(&projection));
+        self.with_collection(collection, |state| {
+            Ok(state
+                .docs
+                .iter()
+                .find(|d| filter.matches(d))
+                .map(|d| project_doc(d, &projection)))
+        })
+    }
+
     async fn find_many(
         &self,
         collection: &str,
         filter: &FindFilter,
         options: &FindOptions,
     ) -> MongoResult<Vec<Map<String, Value>>> {
+        self.record_projection(options.projection.as_ref());
         self.with_collection(collection, |state| {
             let mut matches: Vec<Map<String, Value>> = state
                 .docs
@@ -661,6 +732,9 @@ impl MongoClient for InMemoryMongoClient {
             let mut page: Vec<Map<String, Value>> = matches.split_off(start);
             if let Some(limit) = options.limit {
                 page.truncate(limit);
+            }
+            if let Some(projection) = &options.projection {
+                page = page.iter().map(|d| project_doc(d, projection)).collect();
             }
             Ok(page)
         })
@@ -783,35 +857,29 @@ impl MongoClient for InMemoryMongoClient {
         })
     }
 
-    async fn first_field_size(
+    async fn first_field_size_and_string(
         &self,
         collection: &str,
         filter: &FindFilter,
-        field: &str,
-    ) -> MongoResult<Option<usize>> {
+        size_field: &str,
+        string_field: &str,
+    ) -> MongoResult<(Option<usize>, Option<String>)> {
         self.with_collection(collection, |state| {
-            Ok(state
-                .docs
-                .iter()
-                .find(|d| filter.matches(d))
-                .and_then(|d| resolve_field(d, field))
-                .and_then(|v| v.as_array().map(|a| a.len())))
-        })
-    }
-
-    async fn first_field_string(
-        &self,
-        collection: &str,
-        filter: &FindFilter,
-        field: &str,
-    ) -> MongoResult<Option<String>> {
-        self.with_collection(collection, |state| {
-            Ok(state
-                .docs
-                .iter()
-                .find(|d| filter.matches(d))
-                .and_then(|d| resolve_field(d, field))
-                .and_then(|v| v.as_str().map(|s| s.to_string())))
+            Ok(match state.docs.iter().find(|d| filter.matches(d)) {
+                None => (None, None),
+                Some(doc) => (
+                    // `$cond: [$isArray, $size, 0]` — a missing or non-array field counts
+                    // as 0, like the aggregation.
+                    Some(
+                        resolve_field(doc, size_field)
+                            .and_then(|v| v.as_array().map(|a| a.len()))
+                            .unwrap_or(0),
+                    ),
+                    resolve_field(doc, string_field)
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                ),
+            })
         })
     }
 
@@ -1096,6 +1164,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found.unwrap().get("x"), Some(&json!(1)));
+    }
+
+    /// MONGO-05: a projected read transfers only the requested fields, and the seam keeps
+    /// dotted paths nested exactly like an inclusive MongoDB projection.
+    #[tokio::test]
+    async fn projected_reads_return_only_the_requested_fields() {
+        let c = InMemoryMongoClient::new();
+        c.insert_one(
+            "sessions",
+            doc(
+                "a",
+                json!({"states": {"foo": 1, "bar": 2}, "hashes": {"foo": "h"}, "user_id": "u"}),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let filter = FindFilter::eq("_id", json!("a"));
+        let found = c
+            .find_one_projected("sessions", &filter, &["states.foo", "hashes.foo"])
+            .await
+            .unwrap()
+            .expect("document exists");
+        assert_eq!(found.get("states"), Some(&json!({"foo": 1})));
+        assert_eq!(found.get("hashes"), Some(&json!({"foo": "h"})));
+        assert!(
+            found.get("user_id").is_none(),
+            "unprojected fields must not be transferred: {found:?}"
+        );
+        assert_eq!(c.last_projection(), Some(vec![
+            "states.foo".to_string(),
+            "hashes.foo".to_string()
+        ]));
+
+        // An absent path stays absent instead of materialising nulls.
+        let empty = c
+            .find_one_projected("sessions", &filter, &["states.missing"])
+            .await
+            .unwrap()
+            .expect("document exists");
+        assert!(empty.is_empty(), "nothing to project: {empty:?}");
+
+        // `find_many` honours the same projection.
+        let page = c
+            .find_many(
+                "sessions",
+                &filter,
+                &FindOptions {
+                    projection: Some(vec!["states.bar".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].get("states"), Some(&json!({"bar": 2})));
     }
 
     #[tokio::test]

@@ -37,8 +37,12 @@ const LOG_TARGET: &str = "mongo-snapshot";
 #[derive(Clone)]
 pub struct MongodbRemoteSnapshotClient {
     client: Arc<dyn MongoClient>,
-    /// The database name; retained for API parity with the Java constructor (the
-    /// in-process backend resolves collections globally, not per database).
+    /// The database name this client is bound to.
+    ///
+    /// Java binds the GridFS bucket and the legacy collection to a `MongoDatabase`; here
+    /// the name is encoded into the collection/bucket key by
+    /// [`Self::scoped_bucket`] because the in-process backend keeps one flat map (a real
+    /// server scopes collections per database natively).
     database: String,
     /// The GridFS bucket / legacy collection name.
     bucket: String,

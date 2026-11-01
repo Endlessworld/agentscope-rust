@@ -173,9 +173,15 @@ impl BaseStore for MongodbStore {
         }
         let id = Self::item_doc_id(namespace, key).ok()?;
         let filter = FindFilter::eq(FIELD_ID, json!(id));
-        let doc = futures::executor::block_on(self.client.find_one(&self.collection, &filter))
-            .ok()
-            .flatten()?;
+        // MONGO-05: project the payload and its version so a single-key read does not
+        // transfer the whole item document (Java reads `value`/`version` only).
+        let doc = futures::executor::block_on(self.client.find_one_projected(
+            &self.collection,
+            &filter,
+            &[FIELD_VALUE, FIELD_VERSION],
+        ))
+        .ok()
+        .flatten()?;
         let value = Self::parse_value(doc.get(FIELD_VALUE).unwrap_or(&Value::Null));
         let version = doc.get(FIELD_VERSION).and_then(|v| v.as_u64()).unwrap_or(0);
         Some(StoreItem::new(key, value, version))
@@ -304,6 +310,13 @@ impl BaseStore for MongodbStore {
             sort_ascending_by: Some(FIELD_KEY.to_string()),
             skip: Some(offset),
             limit: Some(limit),
+            // MONGO-05: a listing only needs the key, payload and version — the
+            // namespace/index fields stay on the server.
+            projection: Some(vec![
+                FIELD_KEY.to_string(),
+                FIELD_VALUE.to_string(),
+                FIELD_VERSION.to_string(),
+            ]),
         };
         let Ok(docs) =
             futures::executor::block_on(self.client.find_many(&self.collection, &filter, &options))
@@ -352,6 +365,39 @@ mod tests {
         let mut m = StoreValue::new();
         m.insert("content".to_string(), json!(content));
         m
+    }
+
+    /// MONGO-05: `get` and `search` project the fields they return, so neither transfers
+    /// the `_id` / `namespace` index columns nor any unrelated field.
+    #[test]
+    fn reads_project_only_the_fields_they_return() {
+        use crate::client::InMemoryMongoClient;
+
+        let raw = Arc::new(InMemoryMongoClient::new());
+        let s = MongodbStore::with_defaults(raw.clone());
+        s.put(&ns(), "a.txt", value("a"));
+
+        assert_eq!(
+            s.get(&ns(), "a.txt").unwrap().value.get("content").unwrap(),
+            &json!("a")
+        );
+        assert_eq!(
+            raw.last_projection(),
+            Some(vec!["value".to_string(), "version".to_string()]),
+            "get must transfer only the payload and its version"
+        );
+
+        let items = s.search(&ns(), 10, 0);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            raw.last_projection(),
+            Some(vec![
+                "key".to_string(),
+                "value".to_string(),
+                "version".to_string()
+            ]),
+            "search must project the returned columns only"
+        );
     }
 
     #[test]
