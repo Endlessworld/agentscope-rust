@@ -10,7 +10,8 @@ pub mod asdp;
 
 pub use asdp::{
     AsdpEvent, AsdpLink, AsdpTransport, ConnectRequest, ConnectResponse, ConversationTurnCommand,
-    Downstream, DownstreamPayload, EventReport, EventReportAck, ExecutionAttemptCommand,
+    ConversationTurnPhase, ConversationTurnReport, Downstream, DownstreamPayload, EventReport,
+    EventReportAck, ExecutionAttemptCommand, ExecutionAttemptPhase, ExecutionAttemptReport,
     Heartbeat, SessionCommand, SessionEventCursor, SessionEventMsg, Upstream, UpstreamMeta,
     UpstreamPayload, HEARTBEAT_INTERVAL, RECONNECT_BASE, RECONNECT_MAX,
 };

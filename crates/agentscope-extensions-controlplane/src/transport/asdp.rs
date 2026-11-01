@@ -20,7 +20,9 @@
 //! * event reports gated by `EventReportAck` so only acknowledged reports leave the
 //!   durable outbox (`GrpcTransport.java:286-315, 378-412`),
 //! * downstream dispatch for connect-ack / session-command / execution-attempt /
-//!   conversation-turn (`GrpcTransport.java:378-432`).
+//!   conversation-turn (`GrpcTransport.java:378-432`),
+//! * typed upstream reports for `executionAttempt` / `conversationTurn`
+//!   (`SessionBridge.reportAttempt` / `SessionBridge.reportConversationTurn`).
 //!
 //! Frames are the canonical proto3 **JSON** encoding of the messages, not protobuf
 //! bytes: a host that adds a tonic link performs the byte encoding inside [`AsdpLink`]
@@ -173,6 +175,142 @@ pub struct ConnectResponse {
     pub accepted: bool,
     pub reject_reason: String,
     pub control_plane_version: String,
+}
+
+/// Phase of an execution attempt, carried as the proto `action` field
+/// (`asdp.proto:104`: `ack | preparing | start | heartbeat | waiting | progress |
+/// respond | complete | fail | cancelled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionAttemptPhase {
+    /// The attempt was accepted for dispatch.
+    Ack,
+    /// Execution started.
+    Start,
+    /// Periodic liveness ping while the attempt runs (`ATTEMPT_HEARTBEAT_INTERVAL_MS`).
+    Heartbeat,
+    /// The attempt was cancelled before completion.
+    Cancelled,
+}
+
+impl ExecutionAttemptPhase {
+    /// The proto `action` string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ack => "ack",
+            Self::Start => "start",
+            Self::Heartbeat => "heartbeat",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parses a proto `action`, tolerating case and `-`/`_` separators.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match normalize_phase(raw).as_str() {
+            "ack" => Some(Self::Ack),
+            "start" => Some(Self::Start),
+            "heartbeat" => Some(Self::Heartbeat),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// Upstream execution-attempt report (`SessionBridge.reportAttempt`).
+///
+/// The proto message is keyed by attempt/task identity; `session_id` and
+/// `occurred_at_ms` are the bridge-side context a control plane needs to correlate a
+/// report with a session, and `error` maps to `error_message` on a failed attempt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionAttemptReport {
+    pub session_id: String,
+    pub attempt_id: String,
+    pub phase: ExecutionAttemptPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub occurred_at_ms: i64,
+}
+
+impl ExecutionAttemptReport {
+    /// Wraps the report in the untyped `executionAttempt` arm.
+    pub fn to_payload(&self) -> ControlPlaneResult<UpstreamPayload> {
+        let value = serde_json::to_value(self).map_err(|error| {
+            ControlPlaneError::Internal(format!("cannot encode ASDP executionAttempt: {error}"))
+        })?;
+        Ok(UpstreamPayload::ExecutionAttempt(value))
+    }
+}
+
+/// Phase of a conversation turn, carried as the proto `action` field
+/// (`asdp.proto:286`: `accepted | started | delta | completed | failed | cancelled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConversationTurnPhase {
+    /// The turn was accepted, before any validation.
+    Accepted,
+    /// The turn is being executed.
+    Started,
+    /// The turn produced a reply.
+    Completed,
+    /// The turn failed (validation, deadline or execution error).
+    Failed,
+}
+
+impl ConversationTurnPhase {
+    /// The proto `action` string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Parses a proto `action`, tolerating case and `-`/`_` separators.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match normalize_phase(raw).as_str() {
+            "accepted" => Some(Self::Accepted),
+            "started" => Some(Self::Started),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Upstream conversation-turn report (`SessionBridge.reportConversationTurn`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationTurnReport {
+    pub session_id: String,
+    pub turn_id: String,
+    pub phase: ConversationTurnPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub occurred_at_ms: i64,
+}
+
+impl ConversationTurnReport {
+    /// Wraps the report in the untyped `conversationTurn` arm.
+    pub fn to_payload(&self) -> ControlPlaneResult<UpstreamPayload> {
+        let value = serde_json::to_value(self).map_err(|error| {
+            ControlPlaneError::Internal(format!("cannot encode ASDP conversationTurn: {error}"))
+        })?;
+        Ok(UpstreamPayload::ConversationTurn(value))
+    }
+}
+
+/// Lower-cases `raw` and drops `-`/`_` so `CANCELLED`, `cancelled` and `can-celled` agree.
+fn normalize_phase(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|ch| *ch != '-' && *ch != '_')
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 /// One `oneof` arm of the upstream message. Untyped arms keep their raw JSON so a
@@ -429,6 +567,30 @@ impl AsdpTransport {
         Ok(true)
     }
 
+    /// Reports one execution-attempt phase upstream (`SessionBridge.reportAttempt` ->
+    /// `GrpcTransport.reportExecutionAttempt`).
+    ///
+    /// Like the heartbeat, the report is not journalled in the durable outbox: `false`
+    /// means the stream was down and the frame was dropped, matching Java's
+    /// `GrpcTransport.send`.
+    pub async fn report_execution_attempt(
+        &self,
+        report: ExecutionAttemptReport,
+    ) -> ControlPlaneResult<bool> {
+        self.report(report.to_payload()?).await
+    }
+
+    /// Reports one conversation-turn phase upstream
+    /// (`SessionBridge.reportConversationTurn` -> `GrpcTransport.reportConversationTurn`).
+    ///
+    /// Same contract as [`Self::report_execution_attempt`]: `false` when disconnected.
+    pub async fn report_conversation_turn(
+        &self,
+        report: ConversationTurnReport,
+    ) -> ControlPlaneResult<bool> {
+        self.report(report.to_payload()?).await
+    }
+
     /// Reads and dispatches one downstream frame; `None` when the peer completed.
     pub async fn next_event(&self) -> ControlPlaneResult<Option<AsdpEvent>> {
         let Some(frame) = self.link.recv().await? else {
@@ -480,6 +642,16 @@ impl AsdpTransport {
             state.connected = false;
         }
         self.link.close().await
+    }
+
+    /// Sends one already-built payload; `false` when the stream is down.
+    async fn report(&self, payload: UpstreamPayload) -> ControlPlaneResult<bool> {
+        if !self.is_connected() {
+            return Ok(false);
+        }
+        let frame = self.frame(payload)?;
+        self.link.send(&frame).await?;
+        Ok(true)
     }
 
     fn frame(&self, payload: UpstreamPayload) -> ControlPlaneResult<String> {
@@ -551,7 +723,7 @@ mod tests {
         }
     }
 
-    fn transport(link: Arc<RecordingLink>) -> AsdpTransport {
+    fn transport(link: Arc<dyn AsdpLink>) -> AsdpTransport {
         let meta = UpstreamMeta {
             agent_key: "friday".into(),
             instance_key: "rep-1".into(),
@@ -732,5 +904,222 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         assert!(transport.next_event().await.unwrap().is_none());
+    }
+
+    #[derive(Default)]
+    struct FailAfterHandshakeLink {
+        sent: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl AsdpLink for FailAfterHandshakeLink {
+        async fn send(&self, _frame: &str) -> ControlPlaneResult<()> {
+            let mut sent = self.sent.lock().unwrap();
+            *sent += 1;
+            if *sent == 1 {
+                Ok(())
+            } else {
+                Err(ControlPlaneError::Http("stream closed".into()))
+            }
+        }
+
+        async fn recv(&self) -> ControlPlaneResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn close(&self) -> ControlPlaneResult<()> {
+            Ok(())
+        }
+    }
+
+    fn attempt_report(phase: ExecutionAttemptPhase) -> ExecutionAttemptReport {
+        ExecutionAttemptReport {
+            session_id: "s-1".into(),
+            attempt_id: "a-1".into(),
+            phase,
+            error: None,
+            occurred_at_ms: 1_699_000_000_000,
+        }
+    }
+
+    fn turn_report(phase: ConversationTurnPhase) -> ConversationTurnReport {
+        ConversationTurnReport {
+            session_id: "s-1".into(),
+            turn_id: "t-1".into(),
+            phase,
+            reply: Some(serde_json::json!({ "content": "hi" })),
+            error: None,
+            occurred_at_ms: 1_699_000_000_000,
+        }
+    }
+
+    #[test]
+    fn execution_attempt_phases_round_trip() {
+        for phase in [
+            ExecutionAttemptPhase::Ack,
+            ExecutionAttemptPhase::Start,
+            ExecutionAttemptPhase::Heartbeat,
+            ExecutionAttemptPhase::Cancelled,
+        ] {
+            assert_eq!(
+                ExecutionAttemptPhase::parse(phase.as_str()),
+                Some(phase),
+                "{phase:?}"
+            );
+        }
+        assert_eq!(
+            ExecutionAttemptPhase::parse("CANCELLED"),
+            Some(ExecutionAttemptPhase::Cancelled)
+        );
+        assert_eq!(
+            ExecutionAttemptPhase::parse("  Heart-Beat "),
+            Some(ExecutionAttemptPhase::Heartbeat)
+        );
+        assert_eq!(ExecutionAttemptPhase::parse("accept"), None);
+        assert_eq!(ExecutionAttemptPhase::parse(""), None);
+    }
+
+    #[test]
+    fn conversation_turn_phases_round_trip() {
+        for phase in [
+            ConversationTurnPhase::Accepted,
+            ConversationTurnPhase::Started,
+            ConversationTurnPhase::Completed,
+            ConversationTurnPhase::Failed,
+        ] {
+            assert_eq!(
+                ConversationTurnPhase::parse(phase.as_str()),
+                Some(phase),
+                "{phase:?}"
+            );
+        }
+        assert_eq!(
+            ConversationTurnPhase::parse("FAILED"),
+            Some(ConversationTurnPhase::Failed)
+        );
+        assert_eq!(
+            ConversationTurnPhase::parse("start"),
+            None,
+            "execution-attempt phases must not leak into conversation turns"
+        );
+        assert_eq!(ConversationTurnPhase::parse("failed-delta"), None);
+    }
+
+    #[test]
+    fn reports_serialise_to_their_camel_case_arms() {
+        let payload = attempt_report(ExecutionAttemptPhase::Heartbeat)
+            .to_payload()
+            .unwrap();
+        assert_eq!(payload.field_name(), "executionAttempt");
+        let frame = Upstream {
+            meta: UpstreamMeta::default(),
+            payload,
+        }
+        .to_json()
+        .unwrap();
+        assert_eq!(frame["executionAttempt"]["sessionId"], "s-1");
+        assert_eq!(frame["executionAttempt"]["attemptId"], "a-1");
+        assert_eq!(frame["executionAttempt"]["phase"], "heartbeat");
+        assert_eq!(
+            frame["executionAttempt"]["occurredAtMs"],
+            1_699_000_000_000i64
+        );
+        assert!(frame["executionAttempt"].get("error").is_none());
+        assert_eq!(
+            serde_json::from_value::<ExecutionAttemptReport>(frame["executionAttempt"].clone())
+                .unwrap(),
+            attempt_report(ExecutionAttemptPhase::Heartbeat)
+        );
+
+        let mut failed = attempt_report(ExecutionAttemptPhase::Cancelled);
+        failed.error = Some("cancelled by operator".into());
+        let frame = Upstream {
+            meta: UpstreamMeta::default(),
+            payload: failed.to_payload().unwrap(),
+        }
+        .to_json()
+        .unwrap();
+        assert_eq!(frame["executionAttempt"]["error"], "cancelled by operator");
+
+        let payload = turn_report(ConversationTurnPhase::Completed)
+            .to_payload()
+            .unwrap();
+        assert_eq!(payload.field_name(), "conversationTurn");
+        let frame = Upstream {
+            meta: UpstreamMeta::default(),
+            payload,
+        }
+        .to_json()
+        .unwrap();
+        assert_eq!(frame["conversationTurn"]["sessionId"], "s-1");
+        assert_eq!(frame["conversationTurn"]["turnId"], "t-1");
+        assert_eq!(frame["conversationTurn"]["phase"], "completed");
+        assert_eq!(frame["conversationTurn"]["reply"]["content"], "hi");
+        assert_eq!(
+            serde_json::from_value::<ConversationTurnReport>(frame["conversationTurn"].clone())
+                .unwrap(),
+            turn_report(ConversationTurnPhase::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_are_dropped_while_disconnected_and_sent_once_connected() {
+        let link = Arc::new(RecordingLink::default());
+        let transport = transport(link.clone());
+
+        assert!(!transport
+            .report_execution_attempt(attempt_report(ExecutionAttemptPhase::Ack))
+            .await
+            .unwrap());
+        assert!(!transport
+            .report_conversation_turn(turn_report(ConversationTurnPhase::Accepted))
+            .await
+            .unwrap());
+        assert!(link.sent().is_empty(), "nothing leaves a down stream");
+
+        transport.connect().await.unwrap();
+        assert!(transport
+            .report_execution_attempt(attempt_report(ExecutionAttemptPhase::Start))
+            .await
+            .unwrap());
+        assert!(transport
+            .report_conversation_turn(turn_report(ConversationTurnPhase::Completed))
+            .await
+            .unwrap());
+
+        let sent = link.sent();
+        assert_eq!(sent.len(), 3, "handshake plus the two reports");
+        assert_eq!(
+            serde_json::from_value::<ExecutionAttemptReport>(sent[1]["executionAttempt"].clone())
+                .unwrap()
+                .phase,
+            ExecutionAttemptPhase::Start
+        );
+        assert_eq!(
+            serde_json::from_value::<ConversationTurnReport>(sent[2]["conversationTurn"].clone())
+                .unwrap()
+                .phase,
+            ConversationTurnPhase::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn report_send_errors_are_propagated() {
+        let link = Arc::new(FailAfterHandshakeLink::default());
+        let transport = transport(link);
+
+        transport.connect().await.unwrap();
+        assert!(matches!(
+            transport
+                .report_execution_attempt(attempt_report(ExecutionAttemptPhase::Start))
+                .await,
+            Err(ControlPlaneError::Http(_))
+        ));
+        assert!(matches!(
+            transport
+                .report_conversation_turn(turn_report(ConversationTurnPhase::Failed))
+                .await,
+            Err(ControlPlaneError::Http(_))
+        ));
     }
 }
