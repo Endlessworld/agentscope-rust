@@ -271,7 +271,15 @@ impl MysqlStore {
                 .insert_create(&self.insert_sql(), &ns_path, key, &json, now)
             {
                 Ok(()) => Ok(true),
-                Err(e) if e.is_duplicate_key() => Ok(false),
+                Err(e) if e.is_duplicate_key() => {
+                    tracing::debug!(
+                        table = %self.table_name,
+                        key,
+                        expected_version,
+                        "create-if-absent found the row already present; CAS failed"
+                    );
+                    Ok(false)
+                }
                 Err(e) => Err(e),
             };
         }
@@ -284,6 +292,14 @@ impl MysqlStore {
             key,
             expected_version as i64,
         )?;
+        if affected == 0 {
+            tracing::debug!(
+                table = %self.table_name,
+                key,
+                expected_version,
+                "version-guarded update matched no row; CAS failed"
+            );
+        }
         Ok(affected == 1)
     }
 
@@ -341,6 +357,11 @@ impl MysqlStoreBuilder {
             let ddl = dialect.render(dialect.create_table_sql(), &table_name);
             let _ = backend.execute_ddl(&ddl);
         }
+        tracing::debug!(
+            dialect = dialect.name(),
+            table = %table_name,
+            "prepared MySQL store statements"
+        );
         MysqlStore {
             backend,
             dialect,
@@ -358,6 +379,11 @@ impl MysqlStoreBuilder {
             let ddl = dialect.render(dialect.create_table_sql(), &table_name);
             backend.execute_ddl(&ddl)?;
         }
+        tracing::debug!(
+            dialect = dialect.name(),
+            table = %table_name,
+            "prepared MySQL store statements"
+        );
         Ok(MysqlStore {
             backend,
             dialect,

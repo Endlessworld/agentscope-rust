@@ -131,7 +131,13 @@ impl MysqlLockLease {
     /// Explicitly releases the lock. Idempotent.
     pub fn release(&mut self) {
         if !self.released {
-            let _ = self.backend.release_lock(&self.lock_name);
+            if let Err(e) = self.backend.release_lock(&self.lock_name) {
+                tracing::warn!(
+                    lock = %self.lock_name,
+                    error = %e,
+                    "failed to release MySQL advisory lock"
+                );
+            }
             Self::decrement_active(&self.active, &self.lock_name);
             self.released = true;
         }
@@ -246,6 +252,11 @@ impl MysqlSandboxExecutionGuard {
     /// `InterruptedException`.
     pub fn try_enter(&self, key: &SandboxIsolationKey) -> MysqlResult<MysqlLockLease> {
         let lock_name = self.compose_lock_name(key);
+        tracing::debug!(
+            lock = %lock_name,
+            timeout_secs = self.lock_timeout.as_secs(),
+            "acquiring MySQL advisory lock"
+        );
         if self.backend.try_acquire(&lock_name, self.lock_timeout)? {
             tracing::debug!(lock = %lock_name, "acquired MySQL advisory lock");
             *self
@@ -277,7 +288,9 @@ impl MysqlSandboxExecutionGuard {
     pub fn release(&self, key: &SandboxIsolationKey) {
         let lock_name = self.compose_lock_name(key);
         tracing::debug!(lock = %lock_name, "releasing MySQL advisory lock");
-        let _ = self.backend.release_lock(&lock_name);
+        if let Err(e) = self.backend.release_lock(&lock_name) {
+            tracing::warn!(lock = %lock_name, error = %e, "failed to release MySQL advisory lock");
+        }
         MysqlLockLease::decrement_active(&self.active, &lock_name);
     }
 

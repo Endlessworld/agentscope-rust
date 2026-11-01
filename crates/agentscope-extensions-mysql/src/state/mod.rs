@@ -512,6 +512,13 @@ impl MysqlAgentStateStore {
             .backend
             .read_version(user_id, session_id, key)
             .unwrap_or(0);
+        tracing::debug!(
+            session_id,
+            key,
+            expected,
+            found,
+            "state version conflict; nothing was written"
+        );
         MysqlError::Conflict {
             key: key.to_string(),
             expected,
@@ -549,6 +556,14 @@ impl MysqlAgentStateStore {
         let existing_count = self.backend.list_len(user_id, session_id, key)?;
 
         if list_hash::needs_full_rewrite(values, stored_hash.as_deref(), existing_count) {
+            // Hash mismatch, shrink, or a missing hash row above existing rows: the
+            // incremental path cannot be trusted, so fall back to a full rewrite.
+            tracing::debug!(
+                key,
+                existing_count,
+                rows = values.len(),
+                "list changed; rewriting every row"
+            );
             let encoded = Self::encode_values(values)?;
             self.backend.save_list_and_hash(
                 user_id,
@@ -560,6 +575,12 @@ impl MysqlAgentStateStore {
                 &current_hash,
             )?;
         } else if values.len() > existing_count {
+            tracing::debug!(
+                key,
+                existing_count,
+                rows = values.len(),
+                "list grew at the tail; appending only the new items"
+            );
             let encoded = Self::encode_values(values)?;
             self.backend.save_list_and_hash(
                 user_id,
@@ -570,6 +591,8 @@ impl MysqlAgentStateStore {
                 &hash_key,
                 &current_hash,
             )?;
+        } else {
+            tracing::debug!(key, existing_count, "list unchanged; skipping the write");
         }
         Ok(())
     }

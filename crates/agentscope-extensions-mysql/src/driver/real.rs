@@ -79,7 +79,21 @@ impl MysqlAsyncBackend {
         let pool = Pool::new(opts);
         runtime
             .block_on(async { pool.get_conn().await.map(|_| ()) })
-            .map_err(|e| MysqlError::DriverUnavailable(format!("cannot connect to MySQL: {e}")))?;
+            .map_err(|e| {
+                tracing::warn!(
+                    database = %config.database,
+                    error = %e,
+                    "cannot establish a MySQL connection"
+                );
+                MysqlError::DriverUnavailable(format!("cannot connect to MySQL: {e}"))
+            })?;
+        tracing::debug!(
+            database = %config.database,
+            state_table = %config.state_table,
+            store_table = %config.store_table,
+            snapshot_table = %config.snapshot_table,
+            "connected to MySQL"
+        );
         Ok(Arc::new(Self {
             runtime: Arc::new(runtime),
             pool,
@@ -98,8 +112,15 @@ impl MysqlAsyncBackend {
     }
 
     /// Checks out a pooled connection, mapping the driver error onto [`MysqlError`].
+    ///
+    /// The pool dials a fresh connection when every pooled one is busy or dead, so a failure
+    /// here is also what a failed reconnect looks like; it is logged before being returned.
     fn conn(&self) -> MysqlResult<mysql_async::Conn> {
-        self.block_on(async { self.pool.get_conn().await }).map_err(driver_error)
+        self.block_on(async { self.pool.get_conn().await })
+            .map_err(|e| {
+                tracing::warn!(error = %e, "MySQL connection checkout failed");
+                driver_error(e)
+            })
     }
 
     /// Folds the user namespace into the `session_id` column, exactly like Java
@@ -215,7 +236,17 @@ impl MysqlAsyncBackend {
                 }
             }
         })
-        .map_err(driver_error)
+        .map_err(|e| {
+            tracing::warn!(
+                table = %table,
+                key = state_key,
+                rows = values_json.len(),
+                from_index = start,
+                error = %e,
+                "list write failed; the transaction was rolled back"
+            );
+            driver_error(e)
+        })
     }
 }
 
