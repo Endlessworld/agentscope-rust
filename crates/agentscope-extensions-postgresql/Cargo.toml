@@ -11,6 +11,12 @@ rust-version.workspace = true
 # adapter (`PgSimpleClient`).
 default = []
 postgres-driver = ["dep:tokio-postgres", "dep:bytes", "tokio/rt-multi-thread"]
+# Bounded connection reuse for `PgSimpleClient` (PG-05). Deliberately dependency-free: the
+# pool is a few dozen lines over `tokio::sync::Semaphore`, so no `deadpool`/`bb8` is pulled in.
+postgres-pool = ["postgres-driver"]
+# Exposes `MemoryClient`, the in-memory SQL simulator, as library API for downstream tests
+# (PG-07). Off by default so the test double cannot be mistaken for a real store.
+testing = []
 
 [dependencies]
 agentscope-core = { path = "../agentscope-core" }

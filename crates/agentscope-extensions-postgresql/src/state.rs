@@ -571,11 +571,22 @@ impl AgentStateStore for PostgresAgentStateStore {
         let user = user_id.map(str::to_string);
         let session = session_id.to_string();
         let key = key.to_string();
-        let _ = self
+        let logged_key = key.clone();
+        if let Err(e) = self
             .run_blocking(move |store| {
                 store.save_versioned(user.as_deref(), &session, &key, &value)
             })
-            .await;
+            .await
+        {
+            // Java throws here; `AgentStateStore` has no error channel, so the failure is at
+            // least reported instead of vanishing (PG-08).
+            tracing::warn!(
+                error = %e,
+                session = %session_id,
+                key = %logged_key,
+                "PostgreSQL state save failed"
+            );
+        }
     }
 
     async fn save_list(
@@ -592,10 +603,21 @@ impl AgentStateStore for PostgresAgentStateStore {
             return;
         }
         let key = key.to_string();
+        let logged_key = key.clone();
         let values = values.to_vec();
-        let _ = self
+        if let Err(e) = self
             .run_blocking(move |store| store.save_list_sync(&slot, &key, &values))
-            .await;
+            .await
+        {
+            // A silent failure here would leave the list and its `":_hash"` companion behind
+            // the caller's back (PG-08).
+            tracing::warn!(
+                error = %e,
+                session = %session_id,
+                key = %logged_key,
+                "PostgreSQL state list save failed"
+            );
+        }
     }
 
     async fn get(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Option<Value> {
@@ -605,10 +627,22 @@ impl AgentStateStore for PostgresAgentStateStore {
         }
         let key = key.to_string();
         let logged_key = key.clone();
-        let json = self
+        let json = match self
             .run_blocking(move |store| store.get_sync(&slot, &key, SINGLE_STATE_INDEX))
             .await
-            .ok()??;
+        {
+            Ok(json) => json?,
+            Err(e) => {
+                // A read failure is not an absent key; report it loudly (PG-08).
+                tracing::warn!(
+                    error = %e,
+                    session = %session_id,
+                    key = %logged_key,
+                    "PostgreSQL state read failed; reporting the value as missing"
+                );
+                return None;
+            }
+        };
         match serde_json::from_str(&json) {
             Ok(value) => Some(value),
             Err(e) => {
@@ -634,10 +668,23 @@ impl AgentStateStore for PostgresAgentStateStore {
         }
         let key = key.to_string();
         let logged_key = key.clone();
-        let rows = self
+        let rows = match self
             .run_blocking(move |store| store.get_list_rows_sync(&slot, &key))
             .await
-            .unwrap_or_default();
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                // Java throws; the trait returns a bare `Vec`, so warn and return empty
+                // instead of pretending the list is empty data (PG-08).
+                tracing::warn!(
+                    error = %e,
+                    session = %session_id,
+                    key = %logged_key,
+                    "PostgreSQL state list read failed; reporting an empty list"
+                );
+                return Vec::new();
+            }
+        };
         rows.into_iter()
             .filter_map(|json| match serde_json::from_str(&json) {
                 Ok(value) => Some(value),
@@ -659,18 +706,38 @@ impl AgentStateStore for PostgresAgentStateStore {
         let Ok(slot) = Self::slot_id(user_id, session_id) else {
             return false;
         };
-        self.run_blocking(move |store| store.session_exists_sync(&slot))
+        match self
+            .run_blocking(move |store| store.session_exists_sync(&slot))
             .await
-            .unwrap_or(false)
+        {
+            Ok(exists) => exists,
+            Err(e) => {
+                // "Could not ask" must not be reported as "does not exist" silently (PG-08).
+                tracing::warn!(
+                    error = %e,
+                    session = %session_id,
+                    "PostgreSQL session existence check failed; reporting false"
+                );
+                false
+            }
+        }
     }
 
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {
         let Ok(slot) = Self::slot_id(user_id, session_id) else {
             return;
         };
-        let _ = self
+        if let Err(e) = self
             .run_blocking(move |store| store.delete_session_sync(&slot))
-            .await;
+            .await
+        {
+            // Java throws; here the rows may still exist, so say so (PG-08).
+            tracing::warn!(
+                error = %e,
+                session = %session_id,
+                "PostgreSQL session delete failed"
+            );
+        }
     }
 
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
@@ -678,9 +745,19 @@ impl AgentStateStore for PostgresAgentStateStore {
             Some(u) if !u.trim().is_empty() => u.to_string(),
             _ => ANON_USER.to_string(),
         };
-        self.run_blocking(move |store| store.list_session_ids_sync(&user_segment))
+        match self
+            .run_blocking(move |store| store.list_session_ids_sync(&user_segment))
             .await
-            .unwrap_or_default()
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "PostgreSQL session listing failed; reporting no sessions"
+                );
+                Vec::new()
+            }
+        }
     }
 
     fn supports_versioning(&self) -> bool {
@@ -739,7 +816,17 @@ impl AgentStateStore for PostgresAgentStateStore {
                 value: None,
                 version,
             },
-            Err(_) => unversioned(),
+            Err(e) => {
+                // A read failure is reported as `UNVERSIONED` (the trait's only "no optimistic
+                // state" answer) but never silently (PG-08).
+                tracing::warn!(
+                    error = %e,
+                    session = %session_id,
+                    key = %logged_key,
+                    "PostgreSQL versioned state read failed"
+                );
+                unversioned()
+            }
         }
     }
 
@@ -754,6 +841,7 @@ impl AgentStateStore for PostgresAgentStateStore {
         let user = user_id.map(str::to_string);
         let session = session_id.to_string();
         let key = key.to_string();
+        let logged_key = key.clone();
         match self
             .run_blocking(move |store| {
                 store.save_if_version(user.as_deref(), &session, &key, &value, expected_version)
@@ -761,7 +849,17 @@ impl AgentStateStore for PostgresAgentStateStore {
             .await
         {
             Ok(v) => v,
-            Err(_) => agentscope_core::state::UNVERSIONED,
+            Err(e) => {
+                // Java throws; the trait returns the version, so a failure looks like a plain
+                // CAS conflict — warn so it is distinguishable from one (PG-08).
+                tracing::warn!(
+                    error = %e,
+                    session = %session_id,
+                    key = %logged_key,
+                    "PostgreSQL versioned save failed; reporting UNVERSIONED"
+                );
+                agentscope_core::state::UNVERSIONED
+            }
         }
     }
 }
@@ -772,6 +870,15 @@ mod tests {
     //! the Java side). The crate's [`MemoryClient`] plays the role of H2: it recognises the
     //! exact statement shapes emitted by this module and simulates `ON CONFLICT`, conditional
     //! CAS, `LIKE` and the `INFORMATION_SCHEMA` existence checks.
+    //!
+    //! Java cases with **no** Rust equivalent by design (see tracker §4.3.1):
+    //! `builderNullNamesFallbackToDefaults` / `builderBlankNamesFallbackToDefaults` (Rust
+    //! *rejects* an invalid identifier via `PgResult` instead of silently falling back),
+    //! `rejectsNullDataSourceInConstructor` and `executeInWriteTransactionKeepsAutoCommitWhenAlreadyDisabled`
+    //! (PG-D02/PG-D04), `closeIsNoOp` (PG-D02), `rollbackFailureIsAddedAsSuppressed`
+    //! (`execute_in_transaction` keeps the original error and logs the rollback failure),
+    //! `getThrowsWhenResultSetReadFails` / `getPropagatesResultSetCloseFailure` /
+    //! `saveListPropagatesResultSetCloseFailure` (JDBC `ResultSet` handles, PG-D06).
 
     use super::*;
     use crate::memory::MemoryClient;
@@ -1573,7 +1680,8 @@ mod tests {
         ));
     }
 
-    // Java: PostgresAgentStateStoreTest#createSchemaFailureThrows, #verifySchemaSqlExceptionThrows
+    // Java: PostgresAgentStateStoreTest#createSchemaFailureThrows, #verifySchemaSqlExceptionThrows,
+    //       #createTableFailureThrows
     #[test]
     fn build_propagates_batch_failures() {
         let err = PostgresAgentStateStore::builder(Arc::new(FailingClient))
@@ -1584,7 +1692,8 @@ mod tests {
     }
 
     // Java: PostgresAgentStateStoreTest#saveSingleStateThrowsWhenSqlFails,
-    //       #saveListThrowsWhenSqlFails, #getThrowsWhenQueryFails
+    //       #saveListThrowsWhenSqlFails, #getThrowsWhenQueryFails, #getListThrowsWhenSqlFails,
+    //       #saveIfVersionUnconditionalReadVersionSqlException
     #[tokio::test]
     async fn query_failures_surface_through_inherent_methods() {
         let s = PostgresAgentStateStore::builder(Arc::new(BatchOkQueryFailClient))
@@ -1596,6 +1705,65 @@ mod tests {
         assert!(s.get_list_rows_sync(&slot("s1"), "k").is_err());
         assert!(s.version_of(None, "s1", "k").is_err());
         assert!(s.save_if_version(None, "s1", "k", &json!(1), 0).is_err());
+        // The unconditional path writes, then re-reads the version: that read failure counts.
+        assert!(s
+            .save_if_version(None, "s1", "k", &json!(1), UNVERSIONED)
+            .is_err());
+    }
+
+    // Java: PostgresAgentStateStoreTest#listSessionIdsThrowsWhenSqlFails
+    #[test]
+    fn list_session_ids_propagates_sql_failures() {
+        let s = PostgresAgentStateStore::builder(Arc::new(BatchOkQueryFailClient))
+            .create_if_not_exist(true)
+            .build()
+            .unwrap();
+        assert!(s.list_session_ids_sync(ANON_USER).is_err());
+    }
+
+    // Java: PostgresAgentStateStoreTest#verifyTableExistenceSqlExceptionThrows
+    #[test]
+    fn verify_table_existence_sql_failure_is_reported() {
+        // `create_if_not_exist(false)` verifies schema and table through INFORMATION_SCHEMA; a
+        // failing probe must surface as an error, not as "the table is missing".
+        let err = PostgresAgentStateStore::builder(Arc::new(BatchOkQueryFailClient))
+            .create_if_not_exist(false)
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, PostgresError::Query(_)), "unexpected: {err}");
+    }
+
+    // Java: PostgresAgentStateStoreTest#getListCountReturnsZeroWhenNoRows,
+    //       #getListCountReturnsZeroWhenMaxIndexNull, #getListCountUsesMaxIndexWhenPresent
+    #[test]
+    fn list_count_tracks_the_max_index_one_past_the_end() {
+        let c = client();
+        let s = store(&c);
+        // No rows: `MAX(item_index)` is NULL, which means "empty" (index 0 is free).
+        assert_eq!(s.list_count_sync(&slot("s1"), "k").unwrap(), 0);
+
+        // A gap must not be compressed: the count is `max_index + 1`, so an append starts at 4
+        // (Java `getListCountUsesMaxIndexWhenPresent`) and cannot overwrite index 3.
+        insert_raw(&c, &s, "s1", "k", 0, "1");
+        insert_raw(&c, &s, "s1", "k", 3, "4");
+        assert_eq!(s.list_count_sync(&slot("s1"), "k").unwrap(), 4);
+    }
+
+    // Java: PostgresAgentStateStoreTest#saveIfVersionUnconditionalReadsVersionWithoutDeserializingState
+    #[tokio::test]
+    async fn unconditional_save_reads_only_the_version_of_a_corrupt_payload() {
+        let c = client();
+        let s = store(&c);
+        let key = "corrupt";
+        insert_raw(&c, &s, "s1", key, SINGLE_STATE_INDEX, "not json");
+
+        // The unconditional write replaces the payload and bumps the stored version; it must
+        // not need to deserialize the value it overwrites.
+        let version = s
+            .save_if_version(None, "s1", key, &json!({"ok": true}), UNVERSIONED)
+            .expect("unconditional save");
+        assert_eq!(version, 2);
+        assert_eq!(s.get(None, "s1", key).await, Some(json!({"ok": true})));
     }
 
     /// Inserts a raw session row so decode failures can be exercised (Java mocks the

@@ -429,6 +429,13 @@ mod tests {
     //! Note: the 64-bit lock key uses MurmurHash3 x64/128 hash[0], exactly as
     //! `PostgresSandboxExecutionGuard#composeLockKey` does, so Rust and Java interoperate
     //! on the same advisory-lock keys (see `crate::murmur3`).
+    //!
+    //! Java cases with **no** Rust equivalent by design (tracker §4.3.1 PG-D06): the JDBC
+    //! resource teardown cases `tryEnterPropagatesResultSetCloseFailure`,
+    //! `leaseCloseHandlesConnectionCloseFailure`, `tryEnterHandlesInnerSQLExceptionAndCloseFailure`
+    //! and `tryEnterHandlesInnerInterruptedExceptionAndCloseFailure` — `ResultSet#close` /
+    //! `Connection#close` failures do not exist on the session seam, whose `close` is
+    //! infallible and idempotent.
 
     use super::*;
     use crate::client::{QueryOutcome, SqlValue};
@@ -632,7 +639,52 @@ mod tests {
         );
     }
 
-    // Java: PostgresSandboxExecutionGuardTest#tryEnterTimesOutWhenLockNeverAcquired
+    /// A lock session whose `pg_try_advisory_lock` fails must surface the error (Java
+    /// `tryEnterWrapsSqlException`), not be retried as if the lock were merely taken.
+    #[test]
+    fn lock_session_sql_errors_are_propagated() {
+        let g = PostgresSandboxExecutionGuard::new(Arc::new(FailingLockSessionClient));
+        let err = g.try_enter(&key("session", "sql-error")).unwrap_err();
+        assert!(
+            matches!(err, PostgresError::Query(ref m) if m.contains("advisory lock statement failed")),
+            "expected the session error, got {err:?}"
+        );
+    }
+
+    /// A client whose dedicated lock session fails on every advisory statement.
+    #[derive(Debug)]
+    struct FailingLockSessionClient;
+
+    #[derive(Debug)]
+    struct FailingLockSession;
+
+    impl PostgresLockSession for FailingLockSession {
+        fn try_lock(&self, _lock_name: i64) -> PgResult<bool> {
+            Err(PostgresError::Query(
+                "advisory lock statement failed".into(),
+            ))
+        }
+        fn unlock(&self, _lock_name: i64) -> PgResult<bool> {
+            Err(PostgresError::Query("advisory unlock failed".into()))
+        }
+        fn close(&mut self) {}
+    }
+
+    impl PostgresClient for FailingLockSessionClient {
+        fn query(&self, _sql: &str, _params: &[SqlValue]) -> PgResult<QueryOutcome> {
+            unreachable!()
+        }
+        fn execute_batch(&self, _sql: &str) -> PgResult<()> {
+            Ok(())
+        }
+        fn open_lock_session(&self) -> PgResult<Box<dyn PostgresLockSession>> {
+            Ok(Box::new(FailingLockSession))
+        }
+    }
+
+    // Java: PostgresSandboxExecutionGuardTest#tryEnterTimesOutWhenLockNeverAcquired,
+    //       #tryEnterHandlesInnerInterruptedException (Java surfaces an interrupted wait as a
+    //       `RuntimeException`; here the same condition ends as `PostgresError::LockTimeout`)
     #[test]
     fn try_enter_times_out_when_another_connection_holds_the_lock() {
         let c = client();
@@ -656,8 +708,9 @@ mod tests {
         assert_eq!(lease.lock_name(), g.compose_lock_key(&k));
     }
 
-    // Java: PostgresSandboxExecutionGuardTest#tryEnterPollsUntilLockAcquired (the loop polls
-    // under the timeout; after the holder releases we observe a successful acquisition).
+    // Java: PostgresSandboxExecutionGuardTest#tryEnterPollsUntilLockAcquired,
+    //       #tryEnterPollsWhenResultSetEmptyThenAcquires (the loop polls under the timeout;
+    //       after the holder releases we observe a successful acquisition).
     #[test]
     fn try_enter_succeeds_after_contention_clears() {
         let c = client();

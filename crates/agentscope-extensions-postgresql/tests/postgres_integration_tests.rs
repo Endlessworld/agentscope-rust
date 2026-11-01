@@ -335,3 +335,43 @@ fn transaction_seam_commits_and_rolls_back_on_a_live_server() {
 
     drop_table(client.as_ref(), &table);
 }
+
+/// PG-09: the statement kind comes from the server's prepared-statement columns, not from a
+/// `SELECT` prefix. A CTE ending in `SELECT`, an `EXPLAIN` or a leading comment used to be
+/// routed to `execute`, so callers saw `Affected` and read an empty result set.
+#[test]
+fn statement_kind_follows_the_server_result_set_on_a_live_server() {
+    let Some(client) = connect() else { return };
+
+    match client
+        .query("WITH x AS (SELECT 1 AS n) SELECT n FROM x", &[])
+        .expect("CTE select")
+    {
+        QueryOutcome::Rows(rows) => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].first().and_then(|cell| cell.as_i32()), Some(1));
+        }
+        other => panic!("a CTE SELECT must be reported as rows, got {other:?}"),
+    }
+
+    // A leading comment must not change the classification.
+    assert!(matches!(
+        client.query("/* keep me */ SELECT 2", &[]),
+        Ok(QueryOutcome::Rows(_))
+    ));
+    assert!(matches!(
+        client.query("EXPLAIN SELECT 1", &[]),
+        Ok(QueryOutcome::Rows(_))
+    ));
+
+    // A statement without a result set still reports an affected-row count.
+    let table = unique("agentscope_it_kind");
+    match client
+        .query(&format!("CREATE TABLE \"{table}\" (k TEXT)"), &[])
+        .expect("DDL executes")
+    {
+        QueryOutcome::Affected(_) => {}
+        other => panic!("DDL must be reported as affected rows, got {other:?}"),
+    }
+    drop_table(client.as_ref(), &table);
+}

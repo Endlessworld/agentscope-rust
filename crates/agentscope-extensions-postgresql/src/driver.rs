@@ -11,6 +11,15 @@
 //! (`block_in_place` hands it back to the scheduler first); the async traits additionally
 //! hop onto the blocking pool via [`crate::blocking`].
 //!
+//! Statement routing is decided by the **server**: the statement is prepared and
+//! `Statement::columns()` decides between `query` (result set) and `execute` (row count),
+//! so `WITH ... SELECT`, `EXPLAIN` or a leading comment cannot be mistaken for a write
+//! (PG-09).
+//!
+//! Feature `postgres-pool` adds a bounded pool of connections for statement execution
+//! (PG-05, [`ConnectionPool`]). Advisory-lock leases and write transactions keep opening
+//! their own dedicated connection: PG locks are session-scoped.
+//!
 //! This module is intentionally minimal: it establishes a connection and executes
 //! `(sql, params)` statements, mapping `$n` bind arguments in order.
 
@@ -58,6 +67,126 @@ where
     }
 }
 
+/// The future returned by a [`ConnectionPool`] factory.
+#[cfg(feature = "postgres-pool")]
+type ConnectFuture<T> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = PgResult<T>> + Send + 'static>,
+>;
+
+/// A bounded, self-contained pool of driver connections (feature `postgres-pool`, PG-05).
+///
+/// Without it every statement of [`PgSimpleClient`] is serialised on one connection while
+/// lock leases and write transactions open *extra* connections with no cap at all. The pool
+/// hands at most `max_connections` connections to concurrent callers and parks them for
+/// reuse on drop; a connection that failed at the connection level is [`discard`]ed instead.
+///
+/// Deliberately no `deadpool-postgres`/`bb8`: a semaphore plus an idle vector covers what
+/// this crate needs, and the default build keeps pulling in no extra crates.
+///
+/// [`discard`]: PooledConnection::discard
+#[cfg(feature = "postgres-pool")]
+pub struct ConnectionPool<T> {
+    max_connections: usize,
+    idle: std::sync::Mutex<Vec<T>>,
+    permits: Arc<tokio::sync::Semaphore>,
+    factory: Box<dyn Fn() -> ConnectFuture<T> + Send + Sync>,
+}
+
+#[cfg(feature = "postgres-pool")]
+impl<T> std::fmt::Debug for ConnectionPool<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionPool")
+            .field("max_connections", &self.max_connections)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "postgres-pool")]
+impl<T: Send + 'static> ConnectionPool<T> {
+    /// Creates a pool that opens new connections through `factory` up to `max_connections`.
+    pub fn new(
+        max_connections: usize,
+        factory: impl Fn() -> ConnectFuture<T> + Send + Sync + 'static,
+    ) -> Self {
+        assert!(max_connections > 0, "connection pool needs a capacity");
+        Self {
+            max_connections,
+            idle: std::sync::Mutex::new(Vec::new()),
+            permits: Arc::new(tokio::sync::Semaphore::new(max_connections)),
+            factory: Box::new(factory),
+        }
+    }
+
+    /// Upper bound on simultaneously open connections.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// Connections currently parked for reuse.
+    pub fn idle_connections(&self) -> usize {
+        self.idle.lock().map(|idle| idle.len()).unwrap_or(0)
+    }
+
+    /// Borrows a connection, reusing an idle one or opening a new one. Waits while all
+    /// `max_connections` are in use.
+    pub async fn acquire(self: &Arc<Self>) -> PgResult<PooledConnection<T>> {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|e| PostgresError::Query(format!("connection pool is closed: {e}")))?;
+        let recycled = self.idle.lock().ok().and_then(|mut idle| idle.pop());
+        let item = match recycled {
+            Some(item) => item,
+            None => (self.factory)().await?,
+        };
+        Ok(PooledConnection {
+            pool: Arc::clone(self),
+            item: Some(item),
+            _permit: permit,
+        })
+    }
+}
+
+/// A connection borrowed from a [`ConnectionPool`]; returning it to the idle list happens on
+/// drop, and dropping the permit frees the capacity slot.
+#[cfg(feature = "postgres-pool")]
+pub struct PooledConnection<T> {
+    pool: Arc<ConnectionPool<T>>,
+    item: Option<T>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[cfg(feature = "postgres-pool")]
+impl<T> PooledConnection<T> {
+    /// Drops the connection instead of returning it to the pool (a closed backend must not
+    /// be handed to the next caller).
+    pub fn discard(&mut self) {
+        self.item.take();
+    }
+}
+
+#[cfg(feature = "postgres-pool")]
+impl<T> std::ops::Deref for PooledConnection<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.item
+            .as_ref()
+            .expect("a pooled connection is present until it is dropped")
+    }
+}
+
+#[cfg(feature = "postgres-pool")]
+impl<T> Drop for PooledConnection<T> {
+    fn drop(&mut self) {
+        if let Some(item) = self.item.take() {
+            if let Ok(mut idle) = self.pool.idle.lock() {
+                idle.push(item);
+            }
+        }
+    }
+}
+
 /// A synchronous [`PostgresClient`] over a live `tokio-postgres` connection.
 pub struct PgSimpleClient {
     runtime: Arc<Runtime>,
@@ -66,6 +195,10 @@ pub struct PgSimpleClient {
     /// [`PostgresClient::execute_in_transaction`] can open *additional* dedicated
     /// connections to the same server (Java gets them from the `DataSource` pool).
     config: Config,
+    /// Bounded connection reuse for [`PostgresClient::query`] (feature `postgres-pool`,
+    /// PG-05). Lock sessions and write transactions never borrow from it.
+    #[cfg(feature = "postgres-pool")]
+    pool: Option<Arc<ConnectionPool<Client>>>,
 }
 
 impl std::fmt::Debug for PgSimpleClient {
@@ -79,6 +212,46 @@ impl PgSimpleClient {
     ///
     /// Example: `host=localhost user=postgres password=secret dbname=agentscope`.
     pub fn connect(config: &str) -> PgResult<Arc<Self>> {
+        Ok(Arc::new(Self::open(config)?))
+    }
+
+    /// Connects with a bounded pool of at most `max_connections` connections serving
+    /// [`PostgresClient::query`] (feature `postgres-pool`, PG-05).
+    ///
+    /// Advisory-lock sessions and write transactions still open their own connection: a lock
+    /// belongs to the session that took it, so it must never ride on a shared one.
+    #[cfg(feature = "postgres-pool")]
+    pub fn connect_with_pool(config: &str, max_connections: usize) -> PgResult<Arc<Self>> {
+        if max_connections == 0 {
+            // A zero-sized pool would wait forever instead of failing.
+            return Err(PostgresError::Query(
+                "max_connections must be at least 1".into(),
+            ));
+        }
+        let mut owner = Self::open(config)?;
+        let cfg = owner.config.clone();
+        let runtime = Arc::clone(&owner.runtime);
+        let pool = ConnectionPool::new(max_connections, move || -> ConnectFuture<Client> {
+            let cfg = cfg.clone();
+            let runtime = Arc::clone(&runtime);
+            Box::pin(async move {
+                let (client, connection) = cfg
+                    .connect(NoTls)
+                    .await
+                    .map_err(|e| PostgresError::Query(format!("pool connection failed: {e}")))?;
+                runtime.spawn(async move {
+                    if let Err(e) = connection.await {
+                        tracing::warn!("[postgres] pooled connection error: {e}");
+                    }
+                });
+                Ok(client)
+            })
+        });
+        owner.pool = Some(Arc::new(pool));
+        Ok(Arc::new(owner))
+    }
+
+    fn open(config: &str) -> PgResult<Self> {
         let parsed: Config = config
             .parse()
             .map_err(|e| PostgresError::Query(format!("invalid connection string: {e}")))?;
@@ -96,11 +269,13 @@ impl PgSimpleClient {
                 tracing::warn!("[postgres] connection error: {e}");
             }
         });
-        Ok(Arc::new(Self {
+        Ok(Self {
             runtime: Arc::new(runtime),
             client,
             config: parsed,
-        }))
+            #[cfg(feature = "postgres-pool")]
+            pool: None,
+        })
     }
 
     /// Opens one extra connection driven by the same runtime.
@@ -204,6 +379,20 @@ fn boxed(value: &SqlValue) -> Box<dyn tokio_postgres::types::ToSql + Sync + Send
 
 impl PostgresClient for PgSimpleClient {
     fn query(&self, sql: &str, params: &[SqlValue]) -> PgResult<QueryOutcome> {
+        // PG-05: with the pool enabled, statements borrow a pooled connection instead of
+        // queueing on the single one; a backend that died is not returned to the pool.
+        #[cfg(feature = "postgres-pool")]
+        if let Some(pool) = &self.pool {
+            let pool = Arc::clone(pool);
+            return block_on(&self.runtime, async move {
+                let mut connection = pool.acquire().await?;
+                let outcome = execute_statement(&connection, sql, params).await;
+                if connection.is_closed() {
+                    connection.discard();
+                }
+                outcome
+            });
+        }
         block_on(&self.runtime, execute_statement(&self.client, sql, params))
     }
 
@@ -269,18 +458,21 @@ async fn execute_statement(
         .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
 
-    let upper = sql.trim_start().to_uppercase();
-    if upper.starts_with("SELECT") {
-        let rows = client.query(sql, &refs).await.map_err(driver_error)?;
-        let mut out: Vec<Row> = Vec::with_capacity(rows.len());
-        for row in rows {
-            out.push(decode_row(&row));
-        }
-        Ok(QueryOutcome::Rows(out))
-    } else {
-        let affected = client.execute(sql, &refs).await.map_err(driver_error)?;
-        Ok(QueryOutcome::Affected(affected as u64))
+    // PG-09: ask the server what the statement returns instead of guessing from a `SELECT`
+    // prefix. `WITH x AS (SELECT ...) SELECT ...`, `EXPLAIN`, `TABLE` and statements with a
+    // leading comment were routed to `execute`, so the caller got `Affected` and read an
+    // empty result set. `Statement::columns()` is empty exactly when there is no result set.
+    let statement = client.prepare(sql).await.map_err(driver_error)?;
+    if statement.columns().is_empty() {
+        let affected = client.execute(&statement, &refs).await.map_err(driver_error)?;
+        return Ok(QueryOutcome::Affected(affected as u64));
     }
+    let rows = client.query(&statement, &refs).await.map_err(driver_error)?;
+    let mut out: Vec<Row> = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(decode_row(&row));
+    }
+    Ok(QueryOutcome::Rows(out))
 }
 
 /// Best-effort row decoding into [`Cell`]s (heterogeneous columns are tried in order).
@@ -320,6 +512,7 @@ fn try_bytes(row: &tokio_postgres::Row, i: usize) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A runtime shaped like the one [`PgSimpleClient`] owns.
     fn driver_runtime() -> Runtime {
@@ -369,5 +562,77 @@ mod tests {
     fn block_on_works_without_an_ambient_runtime() {
         let runtime = driver_runtime();
         assert_eq!(block_on(&runtime, async { 7u32 }), 7);
+    }
+
+    /// PG-05: the pool never opens more connections than its capacity and parks them for
+    /// reuse instead of dialling again (`deadpool-postgres` is not needed for that).
+    #[cfg(feature = "postgres-pool")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pool_caps_concurrent_connections_and_reuses_them() {
+        let created = Arc::new(AtomicUsize::new(0));
+        let pool = counting_pool(2, Arc::clone(&created));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let pool = Arc::clone(&pool);
+            tasks.push(tokio::spawn(async move {
+                let connection = pool.acquire().await.expect("pooled connection");
+                // Hold the connection across a suspension point so 8 callers really contend.
+                tokio::task::yield_now().await;
+                *connection
+            }));
+        }
+        for task in tasks {
+            task.await.expect("pooled task");
+        }
+        assert_eq!(
+            created.load(Ordering::SeqCst),
+            2,
+            "the pool must never open more connections than its capacity"
+        );
+        assert_eq!(pool.idle_connections(), 2);
+        assert_eq!(pool.max_connections(), 2);
+    }
+
+    /// A connection that is `discard`ed must not be handed to the next caller.
+    #[cfg(feature = "postgres-pool")]
+    #[tokio::test]
+    async fn discarded_connections_are_replaced_instead_of_reused() {
+        let created = Arc::new(AtomicUsize::new(0));
+        let pool = counting_pool(1, Arc::clone(&created));
+        {
+            let mut connection = pool.acquire().await.expect("first connection");
+            assert_eq!(*connection, 0);
+            connection.discard();
+        }
+        assert_eq!(pool.idle_connections(), 0);
+        let connection = pool.acquire().await.expect("second connection");
+        assert_eq!(*connection, 1);
+    }
+
+    /// A failed connect must release its capacity slot; leaking it would deadlock the pool
+    /// (the second `acquire` would wait forever).
+    #[cfg(feature = "postgres-pool")]
+    #[tokio::test]
+    async fn a_failed_connect_releases_the_capacity_slot() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let pool: Arc<ConnectionPool<usize>> = Arc::new(ConnectionPool::new(1, move || {
+            let counter = Arc::clone(&counter);
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(PostgresError::Query("connection refused".into()))
+            })
+        }));
+        assert!(pool.acquire().await.is_err());
+        assert!(pool.acquire().await.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "postgres-pool")]
+    fn counting_pool(max_connections: usize, created: Arc<AtomicUsize>) -> Arc<ConnectionPool<usize>> {
+        Arc::new(ConnectionPool::new(max_connections, move || {
+            let created = Arc::clone(&created);
+            Box::pin(async move { Ok(created.fetch_add(1, Ordering::SeqCst)) })
+        }))
     }
 }

@@ -139,14 +139,37 @@ impl BaseStore for PostgresStore {
             self.full_table
         );
         let params = [SqlValue::text(ns_path), SqlValue::text(key)];
-        match self.client.query(&sql, &params).ok()? {
-            QueryOutcome::Rows(rows) => rows.first().and_then(|row| {
-                let json = row.first().and_then(Cell::as_str)?;
-                let version = row.get(1).and_then(Cell::as_i64).unwrap_or(0) as u64;
-                let value = Self::deserialize(json).ok()?;
-                Some(StoreItem::new(key, value, version))
-            }),
-            _ => None,
+        let outcome = match self.client.query(&sql, &params) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // Java throws; `BaseStore::get` has no error channel, so a failed read would
+                // otherwise be indistinguishable from a missing key (PG-08).
+                tracing::warn!(error = %e, key, table = %self.full_table, "PostgresStore get failed");
+                return None;
+            }
+        };
+        let QueryOutcome::Rows(rows) = outcome else {
+            tracing::warn!(key, table = %self.full_table, "PostgresStore get returned no row set");
+            return None;
+        };
+        let row = rows.first()?;
+        let Some(json) = row.first().and_then(Cell::as_str) else {
+            tracing::warn!(key, table = %self.full_table, "PostgresStore get returned no value column");
+            return None;
+        };
+        let version = row.get(1).and_then(Cell::as_i64).unwrap_or(0) as u64;
+        match Self::deserialize(json) {
+            Ok(value) => Some(StoreItem::new(key, value, version)),
+            Err(e) => {
+                // A bad payload is not a missing item: report it (PG-08).
+                tracing::warn!(
+                    error = %e,
+                    key,
+                    table = %self.full_table,
+                    "PostgresStore get could not decode the stored value"
+                );
+                None
+            }
         }
     }
 
@@ -176,7 +199,10 @@ impl BaseStore for PostgresStore {
             SqlValue::text(json),
             SqlValue::BigInt(now),
         ];
-        let _ = self.client.query(&sql, &params);
+        if let Err(e) = self.client.query(&sql, &params) {
+            // Java throws; a swallowed write error would look like a successful put (PG-08).
+            tracing::warn!(error = %e, key, table = %self.full_table, "PostgresStore put failed");
+        }
     }
 
     fn put_if_version(
@@ -236,10 +262,23 @@ impl BaseStore for PostgresStore {
             SqlValue::text(key),
             SqlValue::BigInt(expected_version as i64),
         ];
-        matches!(
-            self.client.query(&sql, &params),
-            Ok(QueryOutcome::Affected(1))
-        )
+        match self.client.query(&sql, &params) {
+            Ok(QueryOutcome::Affected(1)) => true,
+            // Zero affected rows is a genuine CAS mismatch, not an error.
+            Ok(_) => false,
+            Err(e) => {
+                // Java throws; `BaseStore::put_if_version` returns `bool`, so never report a
+                // failed statement as a mere version conflict without saying so (PG-08).
+                tracing::warn!(
+                    error = %e,
+                    key,
+                    expected_version,
+                    table = %self.full_table,
+                    "PostgresStore put_if_version(update) failed"
+                );
+                false
+            }
+        }
     }
 
     /// Conditional row update / insert-if-absent: atomic in the database (Java
@@ -273,11 +312,29 @@ impl BaseStore for PostgresStore {
                     let key = row.first().and_then(Cell::as_str)?.to_string();
                     let json = row.get(1).and_then(Cell::as_str)?;
                     let version = row.get(2).and_then(Cell::as_i64).unwrap_or(0) as u64;
-                    let value = Self::deserialize(json).ok()?;
-                    Some(StoreItem::new(key, value, version))
+                    match Self::deserialize(json) {
+                        Ok(value) => Some(StoreItem::new(key, value, version)),
+                        Err(e) => {
+                            // Skip the item but never silently (PG-08).
+                            tracing::warn!(
+                                error = %e,
+                                key = %key,
+                                table = %self.full_table,
+                                "PostgresStore search could not decode one item"
+                            );
+                            None
+                        }
+                    }
                 })
                 .collect(),
-            _ => Vec::new(),
+            Ok(_) => {
+                tracing::warn!(table = %self.full_table, "PostgresStore search returned no row set");
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, table = %self.full_table, "PostgresStore search failed");
+                Vec::new()
+            }
         }
     }
 
@@ -293,7 +350,10 @@ impl BaseStore for PostgresStore {
             self.full_table
         );
         let params = [SqlValue::text(ns_path), SqlValue::text(key)];
-        let _ = self.client.query(&sql, &params);
+        if let Err(e) = self.client.query(&sql, &params) {
+            // Java throws; the row may still be there (PG-08).
+            tracing::warn!(error = %e, key, table = %self.full_table, "PostgresStore delete failed");
+        }
     }
 }
 
@@ -322,6 +382,15 @@ mod tests {
     //! Java side). [`MemoryClient`] replaces H2 here: it understands the exact statement
     //! shapes emitted above, including `ON CONFLICT` upserts, conditional CAS updates and
     //! `LIKE ... ESCAPE '!'` prefix search.
+    //!
+    //! Java cases with **no** Rust equivalent by design (see tracker §4.3.1 PG-D01/PG-D05/PG-X05):
+    //! `putIfVersionRejectsNegativeExpectedVersion` (`expected_version: u64` cannot be
+    //! negative), `namespaceSegmentCannotBeNull` (`&str`/`&[String]` cannot be null),
+    //! `customObjectMapperRoundTrip` (PG-D01: `serde_json` is not pluggable),
+    //! `serializeFailureThrows` (`StoreValue` is a JSON object; encoding cannot fail),
+    //! `putIfVersionInsertDuplicateByNullSqlStateThrows` (Java throws on an unclassifiable
+    //! duplicate, Rust reports a CAS conflict — PG-X05), `getPropagatesResultSetCloseFailure`
+    //! (JDBC `ResultSet#close`, PG-D06).
 
     use super::*;
     use crate::memory::MemoryClient;
@@ -450,7 +519,7 @@ mod tests {
         assert_eq!(c.store_row_count(), 1);
     }
 
-    // Java: PostgresBaseStoreTest#deserializeHandlesNullAndEmpty
+    // Java: PostgresBaseStoreTest#deserializeHandlesNullAndEmpty, #serializeNullValueAsEmptyMap
     #[test]
     fn get_decodes_empty_json_as_empty_map() {
         let c = client();
@@ -487,7 +556,8 @@ mod tests {
 
     // ---- CAS ----------------------------------------------------------------
 
-    // Java: PostgresBaseStoreTest#putIfVersionInsertSucceeds
+    // Java: PostgresBaseStoreTest#putIfVersionInsertSucceeds,
+    //       #putIfVersionInsertDuplicateReturnsFalse
     #[test]
     fn put_if_version_zero_creates_then_fails_on_duplicate() {
         let c = client();
@@ -694,6 +764,7 @@ mod tests {
 
     // PG-02: `putIfVersion(.., 0)` must treat a class-23 SQLSTATE as a failed CAS even when the
     // server message is localised, and must never report a SQL failure as a successful CAS.
+    // Java: PostgresBaseStoreTest#putIfVersionInsertDuplicateBySqlStateReturnsFalse
     #[test]
     fn structured_sqlstate_classifies_a_localised_duplicate_key() {
         let s = PostgresStore::with_schema_init(Arc::new(LocalisedDuplicateClient)).unwrap();
@@ -724,7 +795,8 @@ mod tests {
     }
 
     // Java: PostgresBaseStoreTest#getThrowsWhenSqlFails / #putThrowsWhenSqlFails /
-    //       #deleteThrowsWhenSqlFails / #searchThrowsWhenSqlFails
+    //       #deleteThrowsWhenSqlFails / #searchThrowsWhenSqlFails /
+    //       #putIfVersionInsertOtherSqlExceptionThrows / #putIfVersionUpdateThrowsWhenSqlFails
     #[test]
     fn sql_failures_never_fabricate_a_successful_result() {
         let s = PostgresStore::builder(Arc::new(FailingClient { fail_batch: false }))
@@ -747,7 +819,8 @@ mod tests {
         assert!(!s.put_if_version(&n, "", val(json!({ "a": 1 })), 0));
     }
 
-    // Java: PostgresBaseStoreTest#buildThrowsWhenSchemaInitializationFails
+    // Java: PostgresBaseStoreTest#buildThrowsWhenSchemaInitializationFails,
+    //       #initializeSchemaFailureThrows
     #[test]
     fn initialize_schema_failure_is_reported_on_build() {
         let err = PostgresStore::builder(Arc::new(FailingClient { fail_batch: true }))
@@ -755,5 +828,35 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, PostgresError::Query(_)));
+    }
+
+    // Java: PostgresBaseStoreTest#deserializeInvalidJsonThrows — Java throws, but
+    // `BaseStore::get` has no error channel; the undecodable payload is reported as a missing
+    // item *and logged* (PG-08) instead of being silently dropped.
+    #[test]
+    fn invalid_json_payload_is_reported_as_missing() {
+        let c = client();
+        let s = store(&c);
+        let n = ns(&["filesystem"]);
+        c.query(
+            &format!(
+                "INSERT INTO {} (namespace_path, item_key, value_json, version, updated_at) \
+                 VALUES ($1, $2, $3, 3, $4)",
+                s.full_table
+            ),
+            &[
+                SqlValue::text(crate::sql::namespace_path(&n).unwrap()),
+                SqlValue::text("k"),
+                SqlValue::text("{not json"),
+                SqlValue::BigInt(0),
+            ],
+        )
+        .unwrap();
+
+        assert!(s.get(&n, "k").is_none());
+        // `search` skips only the bad row (it is the only one here).
+        assert!(s.search(&n, 10, 0).is_empty());
+        // The row is still there: the failure is a decode failure, not a delete.
+        assert_eq!(c.store_row_count(), 1);
     }
 }

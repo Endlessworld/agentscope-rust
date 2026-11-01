@@ -194,6 +194,10 @@ mod tests {
     //! Offline unit tests mirroring `PostgresRemoteSnapshotClientTest` (JUnit5 + Mockito +
     //! H2 on the Java side). `MemoryClient` stores `BYTEA` blobs in a `HashMap`, so the
     //! upload/download/exists round-trips run without a live PostgreSQL server.
+    //!
+    //! Java cases with **no** Rust equivalent by design (tracker §4.3.1 PG-D05):
+    //! `uploadRejectsNullData` and `existsRejectsNullSnapshotId` — `&[u8]` / `&str` cannot be
+    //! null, and the blank-id path is covered by `upload_rejects_blank_snapshot_id`.
 
     use super::*;
     use crate::memory::MemoryClient;
@@ -251,7 +255,9 @@ mod tests {
         assert!(client.upload("", b"archive").await.is_err());
     }
 
-    // Java: PostgresRemoteSnapshotClientTest#constructorWithDefaultTableInitializesSchema
+    // Java: PostgresRemoteSnapshotClientTest#constructorWithDefaultTableInitializesSchema,
+    //       #constructorWithNullTableNameUsesDefault (Rust has no nullable table name: the
+    //       default is used when none is given, i.e. `new`)
     #[test]
     fn constructor_initializes_default_table() {
         let c = client();

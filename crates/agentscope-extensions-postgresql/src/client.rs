@@ -8,7 +8,7 @@
 //! [`crate::blocking`]).
 //!
 //! Two implementations ship in this crate:
-//! * [`crate::memory::MemoryClient`] — a pure in-memory SQL *simulator* used for the
+//! * `crate::memory::MemoryClient` — a pure in-memory SQL *simulator* used for the
 //!   crate's unit tests (no database required).
 //! * `PgSimpleClient` (feature `postgres-driver`) — wraps `tokio-postgres`.
 //!

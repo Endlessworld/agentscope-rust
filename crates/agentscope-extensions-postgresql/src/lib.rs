@@ -13,9 +13,11 @@
 //! # Architecture
 //! All SQL flows through the synchronous [`PostgresClient`] seam ([`client`]). The async
 //! traits are bridged onto it via `tokio::task::spawn_blocking` ([`blocking`]).
-//! [`MemoryClient`] is an in-memory SQL simulator used by this crate's tests, so the
-//! crate compiles and tests with **no live database**. The real driver adapter
-//! (`PgSimpleClient`, feature `postgres-driver`) wraps `tokio-postgres`.
+//! `MemoryClient` is an in-memory SQL simulator used by this crate's tests, so the crate
+//! compiles and tests with **no live database**. It is not production API: the `memory`
+//! module only exists for this crate's own tests or behind the `testing` feature (PG-07).
+//! The real driver adapter (`PgSimpleClient`, feature `postgres-driver`) wraps
+//! `tokio-postgres`; feature `postgres-pool` adds bounded connection reuse (PG-05).
 //!
 //! Two capabilities are **session-scoped** and therefore explicit on the seam:
 //! * [`PostgresClient::open_lock_session`] yields a dedicated connection per advisory-lock
@@ -31,6 +33,7 @@ pub mod client;
 pub mod distributed;
 pub mod error;
 pub mod guard;
+#[cfg(any(test, feature = "testing"))]
 pub mod memory;
 pub mod snapshot;
 pub mod sql;
@@ -51,6 +54,7 @@ pub use guard::{
     PostgresSandboxExecutionGuard, PostgresSandboxExecutionGuardBuilder, PostgresSandboxLease,
     DEFAULT_KEY_PREFIX, DEFAULT_LOCK_TIMEOUT_SECONDS,
 };
+#[cfg(any(test, feature = "testing"))]
 pub use memory::MemoryClient;
 pub use snapshot::{
     initialize_snapshot_table, postgres_snapshot_spec, postgres_snapshot_spec_with_table,
