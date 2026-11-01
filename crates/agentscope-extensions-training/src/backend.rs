@@ -342,8 +342,20 @@ impl Model for TrinityModelAdapter {
         self.delegate.supports_native_structured_output_with_tools()
     }
 
+    fn supports_tool_choice_specific(&self) -> bool {
+        self.delegate.supports_tool_choice_specific()
+    }
+
     fn context_window_size(&self) -> usize {
         self.delegate.context_window_size()
+    }
+
+    fn max_output_tokens(&self) -> usize {
+        self.delegate.max_output_tokens()
+    }
+
+    fn descriptor(&self) -> Option<&agentscope_core::model::ModelDescriptor> {
+        self.delegate.descriptor()
     }
 }
 
@@ -519,6 +531,89 @@ mod tests {
         fn model_name(&self) -> &str {
             "fake"
         }
+    }
+
+    /// Delegate advertising every capability the adapter must forward (TRAIN-06).
+    struct CapableModel {
+        descriptor: agentscope_core::model::ModelDescriptor,
+    }
+
+    impl Model for CapableModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<ToolSchema>,
+            _options: GenerateOptions,
+        ) -> futures::stream::BoxStream<'_, Result<ChatResponse>> {
+            Box::pin(stream::empty())
+        }
+        fn model_name(&self) -> &str {
+            "capable"
+        }
+        fn supports_native_structured_output(&self) -> bool {
+            true
+        }
+        fn supports_native_structured_output_with_tools(&self) -> bool {
+            true
+        }
+        fn supports_tool_choice_specific(&self) -> bool {
+            true
+        }
+        fn context_window_size(&self) -> usize {
+            131_072
+        }
+        fn max_output_tokens(&self) -> usize {
+            8_192
+        }
+        fn descriptor(&self) -> Option<&agentscope_core::model::ModelDescriptor> {
+            Some(&self.descriptor)
+        }
+    }
+
+    #[test]
+    fn adapter_forwards_delegate_capabilities() {
+        use agentscope_core::model::{ModelKind, ModelStatus};
+        let descriptor = agentscope_core::model::ModelDescriptor {
+            key: "demo/model".to_string(),
+            provider: "demo".to_string(),
+            id: "model".to_string(),
+            name: "Demo".to_string(),
+            description: None,
+            family: None,
+            kind: ModelKind::Chat,
+            context_window: 131_072,
+            max_output: 8_192,
+            input_modalities: Default::default(),
+            output_modalities: Default::default(),
+            attachment: false,
+            reasoning: false,
+            reasoning_options: vec![],
+            interleaved_field: None,
+            tool_call: true,
+            structured_output: Some(true),
+            temperature: true,
+            status: ModelStatus::Active,
+            open_weights: false,
+            cost: None,
+            canonical: None,
+            use_cases: Default::default(),
+            fingerprint: 0,
+        };
+        let adapter = TrinityModelAdapter::builder()
+            .delegate(Arc::new(CapableModel { descriptor }))
+            .build()
+            .unwrap();
+        // Shadow runs copy the adapter into a cloned agent; every capability bit has to
+        // survive that hop or the clone degrades to the trait defaults.
+        assert!(adapter.supports_native_structured_output());
+        assert!(adapter.supports_native_structured_output_with_tools());
+        assert!(adapter.supports_tool_choice_specific());
+        assert_eq!(adapter.context_window_size(), 131_072);
+        assert_eq!(adapter.max_output_tokens(), 8_192);
+        assert_eq!(
+            adapter.descriptor().map(|d| d.key.as_str()),
+            Some("demo/model")
+        );
     }
 
     #[tokio::test]

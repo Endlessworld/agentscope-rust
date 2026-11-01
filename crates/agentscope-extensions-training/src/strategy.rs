@@ -332,17 +332,29 @@ pub struct SamplingRateStrategy {
 }
 
 impl SamplingRateStrategy {
-    /// Creates a sampling strategy for the given rate (must be in `[0, 1]`).
+    /// Creates a sampling strategy for the given rate.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `sample_rate` is outside `[0, 1]` (Java `IllegalArgumentException`).
+    /// Use [`SamplingRateStrategy::try_of`] where a panic would abort a host thread.
     pub fn of(sample_rate: f64) -> Self {
-        assert!(
-            (0.0..=1.0).contains(&sample_rate),
-            "Sample rate must be between 0 and 1"
-        );
+        Self::try_of(sample_rate).expect("Sample rate must be between 0 and 1")
+    }
+
+    /// Fallible [`SamplingRateStrategy::of`]: returns an error instead of panicking when
+    /// `sample_rate` is outside `[0, 1]`.
+    pub fn try_of(sample_rate: f64) -> agentscope_core::error::Result<Self> {
+        if !(0.0..=1.0).contains(&sample_rate) {
+            return Err(agentscope_core::error::Error::Agent(
+                "Sample rate must be between 0 and 1".to_string(),
+            ));
+        }
         let seed = now_millis() ^ (u64::from(std::process::id()) << 17) ^ 0x9E37_79B9_7F4A_7C15;
-        Self {
+        Ok(Self {
             sample_rate,
             rng: AtomicU64::new(seed | 1),
-        }
+        })
     }
 
     /// The configured sample rate.
