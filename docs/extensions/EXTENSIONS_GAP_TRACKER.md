@@ -425,6 +425,74 @@
 
 Round 2 §3.3.6「剩余 P1/P2」清单整体顺延（MODEL-05~08/10、SANDBOX-04/08、CP-08/CP-13、STUDIO-03/05/07~11、SCHED-07/08/10、HIGRESS-01/04、JDBC-05/06~09/11、REDIS-01/07~10/12/14、MONGO-05/07/08/09/10、MYSQL-02/06~09/11/12、NACOS-08~14、PROTO-A2A-03/AP-02、RAG-03/04/06/07/22、SKILLS-03/06/08/09/11、COS-05/06/07、OSS-08、MEM-05、TRAIN-04~09①），另加 **SANDBOX-09**（harness manager 级 kill 链用例已在 `4676a29` 落地，剩余为后端侧断言）。
 
+### 3.3.8 Round 4 执行结果（2026-11-01，21 路全并行：core/harness 各独占 + 19 扩展模块）
+
+目标：清掉 Round 3 收口后各模块 tracker §3.5.1 中仍挂 `待办` 的 P1/P2 长尾。按「crate 归属 + 文件互不重叠」拆成 **21 路**：**core 与 harness 各自独占**（分别只有一条路径可改该 crate），其余 19 个扩展模块按 crate 隔离。每路交付前必须完成自验收（`cargo build -p` / `cargo test -p -j 2 --no-fail-fast` / feature 组合 / **≥1 处反向验证**），主智能体统一跑全量闸门并按模块拆分提交。
+
+#### 执行结果（按模块）
+
+| 模块 | 本轮关闭 | 实测 passed |
+|---|---|---|
+| CORE | `CORE-02`（全 deny 判定 + `last_assistant_message_with_reason`）、`CORE-03`（`agent/failover.rs`：`AgentCore.fallback_model` + `FailoverListener`）、`CORE-04`（`tool/interceptor.rs`：`ToolCallInterceptor` 链）、`CORE-06`（`middleware/final_answer_filter.rs`）、`CORE-07`（`message/execution_details.rs`） | 14 targets / **507** / 3 ignored |
+| HARNESS | `HARNESS-07`（`subagent/spec_generator.rs`）、`HARNESS-08`（`McpServerConfig.prefix_tool_names` → `{server}__{tool}` 注册）、`HARNESS-10`（`PinnedSandboxFilesystem` + `RoutedSandboxFilesystem`）、`HARNESS-11`（`BaseStoreSkillUsageBackend` + `CompositeFilter`）、`HARNESS-13`（builder 直连 core 两个执行配置）、`HARNESS-14`（`assets/context-conventions.md`，opt-in 不默认注入） | lib **573** / 0 failed |
+| MODEL | `MODEL-05`（`reasoning_details` / `thoughtSignature` 回传）、`MODEL-07/08`（openai/anthropic/gemini 的 `multiAgentPrompt`）、`MODEL-14/15/16`（dashscope `enable_search` / `enable_code_interpreter` / `multimodal_patterns` / native structured output）、`MODEL-12`（复核 + 接线 `Model::tool_search_mode()`） | **457**（+12） |
+| RAG | `RAG-03`（`src/tool.rs::KnowledgeRetrievalTool`）、`RAG-04`（`RetryPolicy.max_delay` + 10s cap）、`RAG-06`（删除空转 `check_compatibility` 旋钮）、`RAG-07`（文档指向）、`RAG-22`（gRPC 端口误用的 REST 提示） | **509** / `pdf,docx` 511 |
+| JDBC | `JDBC-05`（`JdbcError::Database(DbError{message,sql_state,vendor_code})` + 窄化 `is_unique_violation`）、`JDBC-06`（`enable_base_tables` / `enable_skill_tables`）、`JDBC-07`（跨域重名表校验）、`JDBC-11`（4 写者×25 轮并发用例） | **289**（16 target） |
+| MYSQL | `MYSQL-02`（`StateBackend::save_list_and_hash` 单事务）、`MYSQL-06`（标识符允许 `-` + 反引号）、`MYSQL-07`（`COALESCE(MAX(item_index)+1,0)`）、`MYSQL-08`（upload 刷新 `created_at`）、`MYSQL-09`（`MysqlError::Server{code,sql_state,message}`）、`MYSQL-11`（`connect_with_config` 表名单一来源）、`MYSQL-12`（`get_single_versioned` 单条 SELECT） | **129** 默认 / 135 `mysql_async` |
+| POSTGRESQL | `PG-05`（`ConnectionPool` + `postgres-pool` feature，零新依赖）、`PG-06`（`// Java:` 溯源 + 4 条补测）、`PG-07`（`testing` feature 门控 memory 模块）、`PG-08`（19 处吞错补 `warn!`）、`PG-09`（`Statement::columns()` 判 Rows/Affected） | **142** 默认 / 148 `postgres-driver,postgres-pool` |
+| REDIS | `REDIS-01`（`raw_client.rs` 注入 `ClusterRouter`，7 个键命令走 slot 路由；snapshot/guard 在集群下可用）、`REDIS-08`（`set_bytes_with_ttl` 单命令 `SET..EX`）、`REDIS-09`（`SAVE_LIST_SCRIPT` 一次 EVAL）、`REDIS-10`（死代码取舍入 rustdoc）、`REDIS-12`（空白 keyPrefix / 零 TTL / 零重试间隔显式拒绝）、`REDIS-14`（Drop 语义文档化 + live 断言） | **207**（195 lib + 7 单机 + 3 集群 + 2 doc） |
+| MONGODB | `MONGO-05`（投影读 `find_one_projected` + `$project{count:$cond}`）、`MONGO-07`（`ttl_days<=0` 在 `build()` 拒绝）、`MONGO-08`（续约上限 `MAX_LEASE_LIFETIME_MULTIPLE=10`）、`MONGO-09`（`connect_with_options`）、`MONGO-10`（注释/错误文案/`count` 接线） | **118**（111 lib + 5 live + 2 doc） |
+| COS | `COS-05`（`multipart_threshold > 5 GiB` build 期拒绝）、`COS-06`（`list_parts` 翻页 + `resume_multipart` ETag 复用 + 进度回调 + 有序 complete）、`COS-07`（`presign_*_with_params` + 保留字校验） | **139**（+7） |
+| OSS | `OSS-05`（`delete_session_strict` 按 1000 分批走 `delete_many` 单次 `?delete`）、`OSS-06`（`search_strict` 有界翻页 `max_keys=剩余×2≤1000`）、`OSS-07`（`put_multipart`，part ETag 自算 MD5，默认 `Unsupported`）、`OSS-08`（新建 `tests/s3_store.rs` 11 例） | **88** 默认 / **128** `s3`（真机 412 未验证） |
+| NACOS | `NACOS-08`（`build_transport_properties` 改 `collect::<Result<_,_>>()?`，非法 transport 使 register 返 `Err`）、`NACOS-09`（`format_host_for_url` 包 IPv6 方括号）、`NACOS-10`（`skill_exists_detailed` + 非 NOT_FOUND 补 `warn!`）、`NACOS-12`（`unsubscribe_prompt`/`unsubscribe_agent_card`/`close`）、`NACOS-13`（`NacosHttpAiService::polling`）| `NACOS-14`（注释对齐） | **120** 默认 / **121** `http-client` |
+| HIGRESS | `HIGRESS-01`（`list_tool_specs` 保原始 schema + `tool_parameters` 对齐 Java 转换）、`HIGRESS-04`（复用前比对 endpoint，不一致 fail-loud） | **69** + 1 doc |
+| MEM | `MEM-05`（非幂等 `add` 重试风险文档化 + 构造期 `warn!`） | **143**（139+3+1） |
+| SCHEDULER | `SCHED-07`（`SchedulerError` 四变体）、`SCHED-08`（`impl TaskControl` + 真实调用点）、`SCHED-10`（`AgentConfig`/`ScheduleConfig` camelCase + snake_case alias） | **123**（lib 120 + 集成 3） |
+| TRAINING | `TRAIN-04`（shadow 独立 toolkit + 自绑 todo）、`TRAIN-05`（`cleanup` 移出循环）、`TRAIN-06`（`TrinityModelAdapter` 三个能力转发）、`TRAIN-07`（`sample_rate` 返回 `Result`）、`TRAIN-08`（`TrainingHook::order()=-500`）、`TRAIN-09`（100% 采样 permit 用例） | **99** |
+| STUDIO | `STUDIO-03`（`ConnectionState` + `wait_ready`）、`STUDIO-05`（心跳看门狗 `timeout_at`）、`STUDIO-07`（`SpanStream::drop` → `Unset`）、`STUDIO-08`（`Local::now()`）、`STUDIO-09`（builder 注入 transport）、`STUDIO-10`（`structuredInput` 默认 `{}` + `agent_id`）、`STUDIO-11`（`TerminalIo` + 提示符） | **110** |
+| SKILLS | `SKILLS-08`（`split_frontmatter` 上移 + 只存正文）、`SKILLS-09`（真库集成测试 env 门控）、`SKILLS-11`（`file://` 仓经真实装配路径挂载） | **138** 默认 / 148 pg / 143 mysql |
+| PROTOCOL | `PROTO-A2A-03`（`A2aAgentBuilder::middlewares` + `wrap_agent`/`wrap_reasoning` 接入）、`PROTO-AP-02`（cancel 200 空体、`task_id` 蛇形超集、`tool_call_id` 双收） | a2a-client 72 + agent-protocol 36 |
+| CONTROLPLANE | `CP-08`（`MessageBus` → `log_append`/`log_read` 有界重放）、`CP-09`（能力集合与 info/自注册同源）、`CP-10`（session phase 状态机 + `sessions`/`session_state`）、`CP-11`（`BusyGuard` Drop + Err 即时复位）、`CP-12`（`update_identity` 通知后续帧） | lib **206** + 4 e2e |
+
+#### 缝设计裁定（本轮确认，后续勿反复）
+
+1. **core / harness 必须独占**：两条路径分别只能改自己的 crate，否则并行必冲突。`CORE-07` 因此选了 **metadata key `executionDetails` + 类型化存取器**（`ToolResultBlock` 字面量构造遍布 26+ 处，加字段会击穿 harness/extensions）。
+2. **`PROTO-A2A-03` 未改 core**：`wrap_agent` / `wrap_reasoning` / `Next<T>` 早已存在（`core/src/middleware/middleware.rs:322/343`），A2A 侧只是接入；`Hook` 无 Rust trait → 用 `on_reasoning` / `on_reasoning_result` 等价覆盖。
+3. **`SKILLS-03` 阻塞**：需根 `[workspace.dependencies]` 加 rustls feature（硬禁区），已行内标注待裁定。
+4. **`MYSQL-09` 的 JDBC 侧不改代码**：`jdbc/src/dialect/vendor/mysql.rs` 键列已显式 `utf8mb4_bin`，表默认保留 `utf8mb4_unicode_ci` 是带注释的有意设计（只影响非键列）；本轮只把 `docs/migrations/mysql_binary_collation.md` 的不精确表述改正。
+5. **`HARNESS-08` 与 Round 3 不重复**：Round 3 落的是连接级 `propagate_meta`，本轮是 `prefix_tool_names`（`{server}__{tool}` 注册名）。
+
+#### 跨模块需求（Round 5 输入，累计 12 条）
+
+| 编号 | 归属 | 需求 |
+|---|---|---|
+| a | harness | `CORE-07` 的 `kind`/`exit_code`/`output_truncated` 由 shell / 文件工具填充 |
+| b | core | `MODEL-17`：`JsonSchema` 增 `description`、`ImageBlock` 增 `detail` |
+| c | core | `RAG-03`：工具上下文暴露会话历史（当前用 `ConversationHistorySource` seam 绕过） |
+| d | harness | `SANDBOX-12`：暴露 `LayoutSpec`（`SandboxClient::create`/`SandboxContext`）或 `WorkspaceSpec.bind_mounts` |
+| e | harness | `COS-08`：跨进程互斥归属 harness |
+| f | harness | `HIGRESS`：`list_tools` 端口暴露原始 schema（通用 `McpToolSource` 路径拿不到） |
+| g | harness | `HARNESS-02`：core failover 已就绪（`CORE-03`），可接 |
+| h | core | `HARNESS-12`：`stopOnReject` 字段 |
+| i | 根 `Cargo.toml` | `SKILLS-03`：rustls feature（**待裁定**） |
+| j | 跨 crate | `PROTOCOL`：AP `status` 词表统一（`pending/running/success/error/cancelled`） |
+| k | JDBC | `MYSQL-09` 的 JDBC 表默认 collation（已按「有意设计」归档，非缺陷） |
+| l | core | `MODEL-10` thinking 回放（本轮未做） |
+
+#### 全量闸门（Round 4）
+
+**177 targets / 6066 passed / 0 failed / 7 ignored / EXITCODE=0**，无 `^failures:` 段；较 Round 3 **+4 targets / +176 passed**。
+
+#### 提交（按功能模块分组，`dev` 线性）
+
+21 条模块提交（`feat(core)` / `feat(harness)` / `feat(extensions/<mod>)` ×19）+ 1 条 docs + 1 条 `chore(memory)`。`Cargo.lock` 随 OSS 模块提交（`md5` 依赖）；`git log --merges --oneline` 在 `dev` 上无输出。
+
+#### 反作弊审计（Round 4）
+
+- 源代码**零新增** `#[ignore]` / `todo!()` / `unimplemented!()`（diff 命中的 13 + 1 处全在 tracker / 回执正文）。
+- 断言净增 **+609 / −27**；新增测试函数 **+106**；`rg "REVERSE-VERIFICATION" crates -g '*.rs'` 零命中。
+- 每路均提交了「回退了什么 → 哪条用例 FAILED → 已恢复」的反向验证记录；抽样复核有效（`r4-jdbc` 恢复前后文件 SHA-256 一致）。
+- 范围体检：改动的 `Cargo.toml` 全部属各自 crate，`docs/` 只有各模块 tracker + 一份运维文档（主智能体改），无越界。
 ## 4. 状态与下一步
 
 ### 4.1 验证命令与实测（2026-10-31，stable **1.97.1**）
@@ -434,6 +502,7 @@ cargo test -p <crate> -j 2 --no-fail-fast                 # 逐 crate（本表�
 cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 ```
 
+- **全量（Round 4 收口实测，2026-11-01）**：**177 targets / 6066 passed / 0 failed / 7 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 3 基线 **+4 targets / +176 passed**，ignored +1（harness 新增 `context/conventions.rs` 的 ```ignore 文档示例，非 `#[ignore]`）。
 - **全量（Round 3 收口实测，2026-11-01）**：**173 targets / 5890 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 2 基线 **+76 passed**，targets 与 ignored 未增（Wave C 只在既有 target 内加用例）。
 - **全量（Round 2 收口实测，2026-11-01）**：**173 targets / 5814 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 1 基线 **+15 targets / +162 passed**，ignored 未增。
 - **全量（Round 1 收口实测，2026-10-31）**：**158 targets / 5652 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）。工具链 `rustc 1.97.1 (8bab26f4f 2026-07-14)`。

@@ -30,7 +30,7 @@ Rust 侧修复：把**键列**显式声明为 `COLLATE utf8mb4_bin`（二进制�
 | 逻辑表 | 默认表名 | 键列 | 现状态 |
 |---|---|---|---|
 | KV / 命名空间存储 | `agentscope_store` | `namespace_path`、`item_key` | 新 DDL 已 `utf8mb4_bin`；**存量库需迁移** |
-| 会话状态 | `agentscope_sessions` | `session_id`、`state_key` | 新 DDL 仍为 `COLLATE utf8mb4_unicode_ci`（**大小写不敏感**）→ 见 §5「已知同类问题」 |
+| 会话状态 | `agentscope_sessions` | `session_id`、`state_key` | 新 DDL 键列已显式 `CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`；**表级默认仍为 `utf8mb4_unicode_ci`（仅影响非键列）** → 见 §5 |
 | 快照 | `agentscope_snapshots` | `snapshot_id`（主键） | DDL 未指定 COLLATE → 继承表默认；若快照 id 含大小写变体需一并迁移 |
 
 **表名可配置**：通过 `TableNameConfig`（`prefix` 默认 `agentscope_`，或 `store_table_name` / `session_state_table_name` / `snapshot_table_name` 全名覆盖）。迁移脚本中的表名请替换为实际值。
