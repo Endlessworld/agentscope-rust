@@ -91,6 +91,10 @@ pub struct PreparedResponse {
     pub status: u16,
     /// Response body as text.
     pub body: String,
+    /// Ordered response headers; duplicates are preserved (HTTP allows a repeated name).
+    ///
+    /// Carried for diagnostics such as `Retry-After` / `x-ratelimit-remaining` (CHANNEL-N04).
+    pub headers: Vec<(String, String)>,
 }
 
 impl PreparedResponse {
@@ -98,7 +102,25 @@ impl PreparedResponse {
         Self {
             status,
             body: body.into(),
+            headers: Vec::new(),
         }
+    }
+
+    /// Append one response header, chainable. An empty `name` is ignored: it can never be a valid
+    /// HTTP field name, so keeping it would only add noise to the diagnostics headers carry.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        let name = name.into();
+        let value = value.into();
+        if !name.is_empty() {
+            self.headers.push((name, value));
+        }
+        self
+    }
+
+    /// Append several response headers, preserving order and duplicate names.
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers.extend(headers);
+        self
     }
 
     /// `true` for 2xx statuses.
@@ -233,7 +255,11 @@ impl HttpTransport for ReqwestTransport {
             .text()
             .await
             .map_err(|e| ChannelError::Http(e.to_string()))?;
-        Ok(PreparedResponse { status, body })
+        Ok(PreparedResponse {
+            status,
+            body,
+            headers: Vec::new(),
+        })
     }
 
     fn with_response_timeout(&self, timeout: Duration) -> Option<Arc<dyn HttpTransport>> {
@@ -301,6 +327,56 @@ mod tests {
         assert!(PreparedResponse::new(299, "ok").is_success());
         assert!(!PreparedResponse::new(400, "bad").is_success());
         assert!(!PreparedResponse::new(500, "bad").is_success());
+    }
+
+    #[test]
+    fn prepared_response_headers_are_appended_in_order() {
+        let response = PreparedResponse::new(200, "ok")
+            .with_header("X-Test", "1")
+            .with_header("", "ignored");
+        assert_eq!(
+            response.headers,
+            vec![("X-Test".to_string(), "1".to_string())]
+        );
+        assert!(response.is_success());
+    }
+
+    #[test]
+    fn with_headers_appends_and_keeps_duplicate_names() {
+        let response = PreparedResponse::new(429, "slow down")
+            .with_headers(vec![
+                ("Retry-After".to_string(), "1".to_string()),
+                ("x-ratelimit-remaining".to_string(), "0".to_string()),
+            ])
+            .with_header("retry-after", "2");
+        assert_eq!(
+            response.headers,
+            vec![
+                ("Retry-After".to_string(), "1".to_string()),
+                ("x-ratelimit-remaining".to_string(), "0".to_string()),
+                ("retry-after".to_string(), "2".to_string()),
+            ]
+        );
+    }
+
+    /// The headers a [`PreparedResponse`] carries must be usable as real HTTP response headers,
+    /// so verify them at the `http` field-name/field-value layer that `axum::Response::builder`
+    /// ultimately appends through.
+    #[test]
+    fn prepared_response_headers_are_valid_http_fields() {
+        use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+        let response = PreparedResponse::new(429, "slow down")
+            .with_header("Retry-After", "1")
+            .with_header("x-ratelimit-remaining", "0");
+        let mut map = HeaderMap::new();
+        for (name, value) in &response.headers {
+            let name = HeaderName::from_bytes(name.as_bytes()).expect("valid header name");
+            let value: HeaderValue = value.parse().expect("valid header value");
+            map.append(name, value);
+        }
+        assert_eq!(map.get("retry-after").map(|v| v.as_bytes()), Some(&b"1"[..]));
+        assert_eq!(map.len(), 2);
     }
 
     #[test]
