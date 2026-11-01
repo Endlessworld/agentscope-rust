@@ -6,8 +6,9 @@
 //! * `io.agentscope.core.rag.GenericRAGHook` — the automatic retrieval hook, which injects
 //!   `<retrieved_knowledge>...</retrieved_knowledge>` as an extra **user** message.
 //!
-//! Because the core Rust `RagMode`/hook layer has not been migrated (see tracker §4.2),
-//! this module exposes the pure mapping functions so callers can wire RAG however they
+//! Because core Rust has no `RagMode`/hook layer of its own, both halves live in this crate:
+//! [`crate::tool::KnowledgeRetrievalTool`] (agentic) and [`crate::hook`] (generic). This module
+//! keeps only the pure mapping functions the two share, so callers can wire RAG however they
 //! prefer.
 
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock};

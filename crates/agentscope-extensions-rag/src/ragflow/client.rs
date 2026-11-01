@@ -8,6 +8,7 @@
 //! The transport is injectable ([`HttpTransport`]), so the whole test suite runs offline.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -15,7 +16,22 @@ use crate::error::{RagError, Result};
 use crate::ragflow::config::RAGFlowConfig;
 use crate::ragflow::model::RAGFlowResponse;
 use crate::ragflow::request::build_retrieval_request_body;
-use crate::transport::{HttpRequest, HttpTransport};
+use crate::transport::{HttpRequest, HttpTransport, TransportOptions};
+
+/// Java `RAGFlowClient.RetryInterceptor` caps one backoff sleep at 10s
+/// (`Thread.sleep(Math.min(waitTime, 10000))`).
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// Transport options for a RAGFlow client: Java's `2^attempt * 1s` backoff capped at 10s.
+fn retry_options(config: &RAGFlowConfig) -> TransportOptions {
+    TransportOptions {
+        connect_timeout: config.timeout,
+        read_timeout: config.timeout,
+        max_retries: config.max_retries,
+        max_delay: Some(MAX_RETRY_DELAY),
+        ..TransportOptions::default()
+    }
+}
 
 /// Client for the RAGFlow retrieval API.
 pub struct RAGFlowClient {
@@ -35,12 +51,7 @@ impl std::fmt::Debug for RAGFlowClient {
 impl RAGFlowClient {
     /// Creates a client with the real `reqwest` transport.
     pub fn from_config(config: RAGFlowConfig) -> Result<Self> {
-        let options = crate::transport::TransportOptions {
-            connect_timeout: config.timeout,
-            read_timeout: config.timeout,
-            max_retries: config.max_retries,
-            ..crate::transport::TransportOptions::default()
-        };
+        let options = retry_options(&config);
         let transport = crate::transport::ReqwestTransport::with_extra_headers(
             &options,
             config.custom_headers.clone(),
@@ -409,5 +420,21 @@ mod tests {
         let cfg = config(2);
         let client = RAGFlowClient::from_config(cfg).unwrap();
         assert_eq!(client.config().max_retries, 2);
+    }
+
+    /// The Java interceptor waits `2^attempt * 1s`, capped at 10s.
+    #[test]
+    fn retry_options_match_the_java_backoff_cap() {
+        let options = retry_options(&config(3));
+        assert_eq!(options.max_retries, 3);
+        assert_eq!(options.base_delay, Duration::from_secs(1));
+        assert_eq!(options.max_delay, Some(Duration::from_secs(10)));
+        let policy = crate::retry::RetryPolicy {
+            max_retries: options.max_retries,
+            base_delay: options.base_delay,
+            max_delay: options.max_delay,
+        };
+        let sequence: Vec<u64> = (0..5).map(|a| policy.delay_for(a).as_secs()).collect();
+        assert_eq!(sequence, vec![1, 2, 4, 8, 10]);
     }
 }

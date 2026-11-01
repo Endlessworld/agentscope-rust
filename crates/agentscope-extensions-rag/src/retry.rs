@@ -1,9 +1,9 @@
 //! HTTP retry helper shared by remote backends.
 //!
-//! Ports the `RetryInterceptor` embedded in Java `DifyRAGClient`: retry on transport
-//! failures, HTTP 429 and 5xx; propagate 4xx immediately. Backoff is exponential with a
-//! fixed factor (the Java interceptor only logs; no delay is applied, so the Rust port
-//! keeps the same shape but sleeps between attempts so it is actually useful).
+//! Ports the `RetryInterceptor` embedded in Java `DifyRAGClient` / `RAGFlowClient`: retry on
+//! transport failures, HTTP 429 and 5xx; propagate 4xx immediately. The backoff is
+//! `2^attempt * 1s`, exactly like `Math.pow(2, attempt) * 1000`; RAGFlow additionally caps a
+//! single sleep at 10s (`Math.min(waitTime, 10000)`), which [`RetryPolicy::max_delay`] models.
 
 use std::time::Duration;
 
@@ -16,14 +16,18 @@ pub struct RetryPolicy {
     pub max_retries: u32,
     /// Base delay before the first retry; doubled per subsequent attempt.
     pub base_delay: Duration,
+    /// Ceiling for one backoff sleep; `None` lets the delay grow without bound.
+    pub max_delay: Option<Duration>,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        // Matches Java `DifyRAGConfig.DEFAULT_MAX_RETRIES = 3`.
+        // Matches Java `DifyRAGConfig.DEFAULT_MAX_RETRIES = 3` and the interceptors'
+        // `Math.pow(2, attempt) * 1000` first sleep.
         Self {
             max_retries: 3,
-            base_delay: Duration::from_millis(200),
+            base_delay: Duration::from_secs(1),
+            max_delay: None,
         }
     }
 }
@@ -34,6 +38,19 @@ impl RetryPolicy {
         Self {
             max_retries,
             base_delay: Duration::ZERO,
+            max_delay: None,
+        }
+    }
+
+    /// Backoff before retry number `attempt` (0-based): `base_delay * 2^attempt`, capped by
+    /// [`max_delay`](Self::max_delay).
+    pub fn delay_for(&self, attempt: u32) -> Duration {
+        let delay = self
+            .base_delay
+            .saturating_mul(2u32.saturating_pow(attempt));
+        match self.max_delay {
+            Some(cap) => delay.min(cap),
+            None => delay,
         }
     }
 }
@@ -55,7 +72,7 @@ where
                 if attempt >= policy.max_retries || !is_retryable_error(&err) {
                     return Err(err);
                 }
-                let delay = policy.base_delay * 2u32.pow(attempt);
+                let delay = policy.delay_for(attempt);
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
@@ -153,7 +170,25 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_matches_java_max_retries() {
-        assert_eq!(RetryPolicy::default().max_retries, 3);
+    fn default_policy_matches_java_backoff() {
+        let policy = RetryPolicy::default();
+        assert_eq!(policy.max_retries, 3);
+        assert_eq!(policy.base_delay, Duration::from_secs(1));
+        assert_eq!(policy.max_delay, None);
+        // Java `(long) Math.pow(2, attempt) * 1000`.
+        let sequence: Vec<u64> = (0..3).map(|a| policy.delay_for(a).as_secs()).collect();
+        assert_eq!(sequence, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn max_delay_caps_the_exponential_backoff() {
+        let policy = RetryPolicy {
+            max_retries: 5,
+            base_delay: Duration::from_secs(1),
+            max_delay: Some(Duration::from_secs(10)),
+        };
+        // Java RAGFlow `Thread.sleep(Math.min(waitTime, 10000))`.
+        let sequence: Vec<u64> = (0..5).map(|a| policy.delay_for(a).as_secs()).collect();
+        assert_eq!(sequence, vec![1, 2, 4, 8, 10]);
     }
 }

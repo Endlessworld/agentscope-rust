@@ -25,6 +25,8 @@ use crate::transport::{HttpTransport, ReqwestTransport, TransportOptions};
 
 /// Java `EmbeddingUtils.DEFAULT_INITIAL_BACKOFF`.
 pub const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Java `EmbeddingUtils.DEFAULT_MAX_BACKOFF`.
+pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// Default per-attempt timeout.
 ///
 /// Java's `ExecutionConfig.MODEL_DEFAULTS` carries a 300s timeout for chat models; embeddings are
@@ -37,12 +39,8 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 /// Timeout + retry configuration for one embedding model.
 ///
 /// Java modelled this as the shared `ExecutionConfig`; the Rust core has no embedding-facing
-/// equivalent, so the two knobs that actually mattered are carried here.
-///
-/// Note: Java additionally capped the backoff at `MAX_BACKOFF = 10s`
-/// (`EmbeddingUtils.DEFAULT_MAX_BACKOFF`). [`RetryPolicy`] only has a base delay, so the crate's
-/// retry helper doubles it without a ceiling; with the default 3 retries the largest sleep is 8s,
-/// i.e. below the Java ceiling anyway.
+/// equivalent, so the two knobs that actually mattered are carried here. The backoff is Java
+/// `EmbeddingUtils`' 1s initial delay capped at its `DEFAULT_MAX_BACKOFF` of 10s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingExecutionConfig {
     /// Per-attempt timeout; `None` disables it (Java: a `null` timeout).
@@ -58,6 +56,7 @@ impl Default for EmbeddingExecutionConfig {
             retry: RetryPolicy {
                 max_retries: DEFAULT_MAX_RETRIES,
                 base_delay: DEFAULT_INITIAL_BACKOFF,
+                max_delay: Some(DEFAULT_MAX_BACKOFF),
             },
         }
     }
@@ -180,6 +179,7 @@ pub(crate) fn build_transport(
         read_timeout: timeout,
         max_retries: 0,
         base_delay: Duration::ZERO,
+        max_delay: None,
     };
     let transport = ReqwestTransport::with_extra_headers(&options, extra_headers)?;
     let transport: Arc<dyn HttpTransport> = Arc::new(transport);
@@ -199,6 +199,7 @@ mod tests {
         assert_eq!(config.timeout, Some(Duration::from_secs(60)));
         assert_eq!(config.retry.max_retries, 3);
         assert_eq!(config.retry.base_delay, DEFAULT_INITIAL_BACKOFF);
+        assert_eq!(config.retry.max_delay, Some(DEFAULT_MAX_BACKOFF));
     }
 
     #[test]

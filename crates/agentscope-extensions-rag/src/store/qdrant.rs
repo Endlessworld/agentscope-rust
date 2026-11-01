@@ -52,6 +52,14 @@ use crate::transport::{
 /// Java defaults to gRPC port `6334`; the REST listener is `6333`.
 pub const DEFAULT_HTTP_PORT: u16 = 6333;
 
+/// Qdrant's gRPC listener. The REST API is not served there, but Java's `QdrantStore` defaults
+/// to it, so a migrated configuration keeps pointing at it (tracker RAG-22).
+pub const DEFAULT_GRPC_PORT: u16 = 6334;
+
+/// Appended to a failed connect when the location still points at [`DEFAULT_GRPC_PORT`].
+const GRPC_PORT_HINT: &str =
+    "Qdrant's gRPC port 6334 does not serve the REST API; use the REST port 6333 instead";
+
 /// Distance metric stored on the Qdrant collection.
 ///
 /// Java's `createCollection` hardcodes `Distance.Cosine`; the Rust config exposes the knob
@@ -86,7 +94,6 @@ pub struct QdrantConfig {
     dimensions: usize,
     api_key: Option<String>,
     use_transport_layer_security: bool,
-    check_compatibility: bool,
     distance: QdrantDistance,
 }
 
@@ -121,11 +128,6 @@ impl QdrantConfig {
         self.use_transport_layer_security
     }
 
-    /// Kept for Java parity; the REST port has no compatibility probe.
-    pub fn check_compatibility(&self) -> bool {
-        self.check_compatibility
-    }
-
     /// Distance metric used when the collection is created.
     pub fn distance(&self) -> QdrantDistance {
         self.distance
@@ -140,7 +142,6 @@ pub struct QdrantConfigBuilder {
     dimensions: usize,
     api_key: Option<String>,
     use_transport_layer_security: bool,
-    check_compatibility: bool,
     distance: QdrantDistance,
 }
 
@@ -152,7 +153,6 @@ impl Default for QdrantConfigBuilder {
             dimensions: 0,
             api_key: None,
             use_transport_layer_security: true,
-            check_compatibility: true,
             distance: QdrantDistance::Cosine,
         }
     }
@@ -186,12 +186,6 @@ impl QdrantConfigBuilder {
     /// Java `useTransportLayerSecurity` — selects `https` for bare `host:port` locations.
     pub fn use_transport_layer_security(mut self, enabled: bool) -> Self {
         self.use_transport_layer_security = enabled;
-        self
-    }
-
-    /// Java `checkCompatibility` — accepted for parity, unused by the REST port.
-    pub fn check_compatibility(mut self, enabled: bool) -> Self {
-        self.check_compatibility = enabled;
         self
     }
 
@@ -229,7 +223,6 @@ impl QdrantConfigBuilder {
             dimensions: self.dimensions,
             api_key: self.api_key,
             use_transport_layer_security: self.use_transport_layer_security,
-            check_compatibility: self.check_compatibility,
             distance: self.distance,
         })
     }
@@ -542,7 +535,10 @@ impl QdrantStore {
         transport: Arc<dyn HttpTransport>,
     ) -> Result<Self> {
         let store = Self::new(config, transport)?;
-        store.ensure_collection().await?;
+        store
+            .ensure_collection()
+            .await
+            .map_err(|error| store.with_rest_port_hint(error))?;
         Ok(store)
     }
 
@@ -614,6 +610,43 @@ impl QdrantStore {
         let body = create_collection_body(self.config.dimensions, self.config.distance);
         self.execute(HttpMethod::Put, self.collection_url(), Some(body))
             .await
+    }
+
+    /// Whether the resolved base URL points at Qdrant's gRPC listener.
+    fn uses_grpc_port(&self) -> bool {
+        self.base_url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+            == Some(DEFAULT_GRPC_PORT)
+    }
+
+    /// Appends the REST-port hint to a connect failure (tracker RAG-22): the port mapping stays
+    /// untouched, only the diagnosis is made visible.
+    fn with_rest_port_hint(&self, error: RagError) -> RagError {
+        if !self.uses_grpc_port() {
+            return error;
+        }
+        match error {
+            RagError::Http(message) => RagError::Http(format!("{message} ({GRPC_PORT_HINT})")),
+            RagError::Api {
+                status_code,
+                error_code,
+                message,
+            } => RagError::Api {
+                status_code,
+                error_code,
+                message: format!("{message} ({GRPC_PORT_HINT})"),
+            },
+            RagError::Auth {
+                status_code,
+                message,
+            } => RagError::Auth {
+                status_code,
+                message: format!("{message} ({GRPC_PORT_HINT})"),
+            },
+            other => other,
+        }
     }
 
     fn ensure_open(&self) -> Result<()> {
@@ -1033,6 +1066,35 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Java's default location is the gRPC port; a REST connect there must say so (RAG-22).
+    #[tokio::test]
+    async fn a_connect_failure_on_the_grpc_port_hints_the_rest_port() {
+        let transport = MockTransport::new(vec![HttpResponse::new(503, "service unavailable")]);
+        let config = QdrantConfig::builder()
+            .location("127.0.0.1:6334")
+            .collection_name("knowledge")
+            .dimensions(2)
+            .build()
+            .unwrap();
+
+        let error = QdrantStore::connect_with(config, transport.clone())
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("gRPC port 6334"), "{message}");
+        assert!(message.contains("6333"), "{message}");
+        assert_eq!(transport.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connect_failure_on_the_rest_port_has_no_port_hint() {
+        let transport = MockTransport::new(vec![HttpResponse::new(503, "service unavailable")]);
+        let error = QdrantStore::connect_with(config(), transport)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("gRPC port 6334"));
     }
 
     #[tokio::test]

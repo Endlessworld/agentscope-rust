@@ -436,6 +436,7 @@ impl ExternalApiReaderBuilder {
                     read_timeout: self.read_timeout,
                     max_retries: 0,
                     base_delay: self.retry_delay,
+                    max_delay: None,
                 };
                 Arc::new(ReqwestTransport::new(&options)?)
             }

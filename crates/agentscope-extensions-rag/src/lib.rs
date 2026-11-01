@@ -33,6 +33,9 @@
 //! * [`message`] — mapping retrieved documents onto [`agentscope_core::message::Msg`],
 //!   covering both the agentic-tool format and the generic-hook `<retrieved_knowledge>`
 //!   injection.
+//! * [`tool`] — [`KnowledgeRetrievalTool`](tool::KnowledgeRetrievalTool), the agentic-mode
+//!   `retrieve_knowledge` tool (a core
+//!   [`Tool`](agentscope_core::tool::Tool) implementation).
 //! * [`hook`] — [`RagMode`](hook::RagMode), the [`GenericRagHook`](hook::GenericRagHook)
 //!   automatic-retrieval hook and its `Middleware` adapter
 //!   ([`GenericRagMiddleware`](hook::GenericRagMiddleware)).
@@ -77,6 +80,7 @@ pub mod reader;
 pub mod retry;
 pub mod simple;
 pub mod store;
+pub mod tool;
 pub mod transport;
 
 pub use embedding::{
@@ -106,4 +110,8 @@ pub use store::{
     MilvusConfigBuilder, MilvusMetricType, MilvusStore, PgExecutor, PgParam, PgRow, PgVectorConfig,
     PgVectorConfigBuilder, PgVectorDistanceType, PgVectorStore, QdrantConfig, QdrantConfigBuilder,
     QdrantDistance, QdrantScoredPoint, QdrantStore, SearchQuery, TokioPostgresExecutor, VdbStore,
+};
+pub use tool::{
+    ConversationHistorySource, KnowledgeRetrievalTool, DEFAULT_RETRIEVE_LIMIT,
+    RETRIEVE_KNOWLEDGE_TOOL_NAME,
 };

@@ -146,6 +146,8 @@ pub struct TransportOptions {
     pub max_retries: u32,
     /// Base retry backoff.
     pub base_delay: Duration,
+    /// Ceiling for one backoff sleep; `None` leaves it uncapped.
+    pub max_delay: Option<Duration>,
 }
 
 impl Default for TransportOptions {
@@ -154,7 +156,8 @@ impl Default for TransportOptions {
             connect_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(30),
             max_retries: 3,
-            base_delay: Duration::from_millis(200),
+            base_delay: Duration::from_secs(1),
+            max_delay: None,
         }
     }
 }
@@ -189,6 +192,7 @@ impl ReqwestTransport {
             retry: RetryPolicy {
                 max_retries: options.max_retries,
                 base_delay: options.base_delay,
+                max_delay: options.max_delay,
             },
             extra_headers,
         })
@@ -262,7 +266,7 @@ where
         if !retryable || attempt >= policy.max_retries {
             return outcome;
         }
-        let delay = policy.base_delay * 2u32.pow(attempt);
+        let delay = policy.delay_for(attempt);
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
