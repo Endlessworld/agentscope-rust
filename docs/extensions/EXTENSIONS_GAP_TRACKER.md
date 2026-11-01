@@ -493,6 +493,55 @@ Round 2 §3.3.6「剩余 P1/P2」清单整体顺延（MODEL-05~08/10、SANDBOX-0
 - 断言净增 **+609 / −27**；新增测试函数 **+106**；`rg "REVERSE-VERIFICATION" crates -g '*.rs'` 零命中。
 - 每路均提交了「回退了什么 → 哪条用例 FAILED → 已恢复」的反向验证记录；抽样复核有效（`r4-jdbc` 恢复前后文件 SHA-256 一致）。
 - 范围体检：改动的 `Cargo.toml` 全部属各自 crate，`docs/` 只有各模块 tracker + 一份运维文档（主智能体改），无越界。
+### 3.3.9 Round 5 执行结果（2026-11-01，11 路并行：core 两串行段 + harness 独占 + 9 扩展模块）
+
+**范围**：Round 4 之后各模块 tracker 剩余的未闭合项 + 4 项待决策裁定后的派生工作。
+
+| 路 | 关闭缺口 | 实测 |
+|---|---|---|
+| core-1 | CORE-05（`tool/search` 包：策略/工具/中间件 + `ToolContextState.discovered_tools`）、CORE-11（`FinishReasons`）、CORE-27（`JsonSchema.description` / `ImageBlock.detail`）、CORE-28（`stop_on_reject` + `rejected_turn_reason`） | 14 targets / **526** / 3 ignored |
+| core-2 | CORE-08（`state::legacy::load`，Java 实际键名 `toolkit_activeGroups`）、CORE-09（`RequirementProposeTool`）、CORE-29（`ReasoningContext` 保 thinking metadata）、CORE-30（会话历史通道） | 14 targets / **543** / 3 ignored（+17） |
+| harness | HARNESS-02（failover 接线）/ 03（三 Spec + `LayoutSpec`/`bind_mounts`）/ 06（两个校验器 + `load`）/ 12（`stop_on_reject` 透传）、CORE-07（`executionDetails` 工具侧）/ 10（`context_build` 事件）/ 12（`SubagentExposed` 发射） | lib **602**（+29） |
+| model | MODEL-06（能力位选项）/ 10（`responses` reasoning 回放）/ 17（description + detail 透传）/ 18（anthropic signature 回放）+ CORE-11 字面量收敛 | **467**（+11） |
+| skills | SKILLS-03（`postgres-tls` / `mysql-tls`，opt-in，未改根依赖） | **138 / 150 / 154 / 146** |
+| jdbc | JDBC-08（指数退避 50→1000 封顶）/ 09（快照表 ENGINE/CHARSET）+ tracing 埋点 | **292**（+3） |
+| mysql | tracing 埋点 23 处（零逻辑改动）+ MYSQL-26 复核确认 | **129** / `mysql_async` 128 |
+| training | HARNESS-17（实例级注册表复核确认，`global()` 标 legacy） | **99**（默认并行连跑 3 次） |
+| agent-protocol | AP status 词表对齐 Java + snake_case 键并存 | **38**（+2） |
+| rag | RAG-03 接入 core `ToolExecutionContext::conversation_history()` | **512** / `pdf,docx` 514 |
+
+#### 全量闸门（Round 5）
+
+**177 targets / 6149 passed / 0 failed / 7 ignored / EXITCODE=0**，无 `^failures:` 段；较 Round 4 **+83 passed**。
+
+#### 裁定与实施（2026-11-01，Round 5 前置）
+
+| 项 | 结论 | 依据 |
+|---|---|---|
+| AP status 词表 | **AP 服务端改用 Java 词表**（`pending/running/awaiting_confirm/success/error/cancelled`，snake_case 键并存） | 真 bug：harness `RemoteTaskStatus`（`protocol_client.rs:54-70`）只认 `success/error/awaiting_confirm/cancelled`，而 AP `snapshot_value` 发 `Completed/Failed` → Rust 服务端 + Rust 客户端永远判不出成功；且 `awaiting_confirm` 时 status 仍为 `Running` |
+| MODEL-10 thinking 回放 | **做**：`include:["reasoning.encrypted_content"]` + `Item::Reasoning` 回放；缺 encrypted 时**跳过 + warn**（与 `openai_official` 硬 `Err` 有意不同——`responses` 还服务 OpenAI 兼容网关） | async-openai 0.41.3 已具备 `ReasoningItem.encrypted_content`/`Item::Reasoning`/`IncludeEnum::ReasoningEncryptedContent`；同 crate `openai_official/request.rs:605` 有可复用范式 |
+| COS-08 | **不迁 harness，维持 crate 设计决定**，仅在 §4.2 登记为可选项 | ①COS 委托的 harness 默认 guard 是进程内可重入计数，`try_enter` 永不失败，阻塞语义对 COS 零收益；②harness `SandboxGuard::try_enter` 契约是 fail-closed 非阻塞（`sandbox/guard.rs:38-47`），改阻塞波及 8 个存储 crate；③对象存储无租约原语，真跨进程互斥需条件 PUT + 过期时间（产品决策） |
+| SKILLS-03 TLS | **不动根 `[workspace.dependencies]`**：`mysql-tls` 复用 `mysql_async` 既有 `rustls-tls/tls12/ring`；`postgres-tls` 在 crate 内实现 `MakeTlsConnect`（`tokio-rustls 0.26` + 平台证书/webpki 回退） | 依赖已在 lock 与本地 cache，零新下载；`default-features=false` 只编 `ring`，不引入 `aws-lc-sys` |
+
+#### 关键交叉修复
+
+- **CORE-29 `ReasoningContext` 丢 metadata**（model 路在实施 MODEL-10/18 时发现的真实缺陷）：`thinking: String` → `Option<ThinkingBlock>`，按 key 合并、空 map 不清空。修前 MODEL-10/18 的回放元数据在**流式路径**（ACP 即走流式）到不了持久化 `Msg`。
+- **CORE-30 会话历史通道**：为不击穿 12 处 `ToolExecutionContext { .. }` 字面量构造，**不加结构体字段**，改由 `tool_runtime` 写 `runtime` 键 `conversationHistory`（尾部 32 条、空历史不写键）+ 类型化只读器 `conversation_history()`。
+- **harness `shell_execute_tool` 的 `metadata =` 覆写 bug**：填 `executionDetails` 时把既有 metadata 整块覆盖，已改为合并。
+- **`ROW_FORMAT` 争议定论**：Java `MysqlDialect.java:157-163` 无该子句、`JdbcRemoteSnapshotClient` 有 → jdbc 与 mysql 各对齐各自 Java 对端，**不存在需保平的偏差**。
+
+#### 跨模块需求处置
+
+- **已解决**：CORE-07 工具侧填充、MODEL-17（core 扩字段）、MODEL-10/18 的 metadata 通路（CORE-29）、RAG-03 会话历史（CORE-30）、SANDBOX-12（`LayoutSpec`/`bind_mounts`）、HARNESS-02（core failover 已接）、HARNESS-12（core `stop_on_reject` 已接）。
+- **仍开放**：`ToolSearchMiddleware` 的宿主装配（Java harness 无对应装配点，不接线，宿主可经 `builder.middleware(...)` 自行注册）；MODEL-18 流式 `signature_delta` 未捕获；HIGRESS 原始 schema（本 crate 已有 wrapper 绕过）；COS-08（见上表）。
+
+#### 反作弊审计（Round 5）
+
+- 源代码**零新增** `#[ignore]` / `todo!()` / `unimplemented!()`。
+- 断言净增 **+142 / −7**；新增 `#[test]` **48**（表驱动用例按一条计）。
+- 各路均附「回退了什么 → 哪条用例 FAILED → 已恢复」，抽样复核有效。
+- 范围体检：改动的 `Cargo.toml` 仅 `crates/agentscope-extensions-skills/Cargo.toml`（crate 内具体版本 + opt-in feature）；`Cargo.lock` 仅 +7 行依赖列表、零新 package、零版本漂移；根 `Cargo.toml` 未动。
+
 ## 4. 状态与下一步
 
 ### 4.1 验证命令与实测（2026-10-31，stable **1.97.1**）
@@ -502,6 +551,7 @@ cargo test -p <crate> -j 2 --no-fail-fast                 # 逐 crate（本表�
 cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 ```
 
+- **全量（Round 5 收口实测，2026-11-01）**：**177 targets / 6149 passed / 0 failed / 7 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 4 **+83 passed**（targets / ignored 不变）。
 - **全量（Round 4 收口实测，2026-11-01）**：**177 targets / 6066 passed / 0 failed / 7 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 3 基线 **+4 targets / +176 passed**，ignored +1（harness 新增 `context/conventions.rs` 的 ```ignore 文档示例，非 `#[ignore]`）。
 - **全量（Round 3 收口实测，2026-11-01）**：**173 targets / 5890 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 2 基线 **+76 passed**，targets 与 ignored 未增（Wave C 只在既有 target 内加用例）。
 - **全量（Round 2 收口实测，2026-11-01）**：**173 targets / 5814 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 1 基线 **+15 targets / +162 passed**，ignored 未增。
