@@ -1285,16 +1285,44 @@ fn confirm_results_to_json(results: &[ConfirmResult]) -> Value {
     )
 }
 
+/// Maps a record onto the wire status vocabulary of Java `AgentProtocolTaskStore#mapStatus`.
+///
+/// `awaiting_confirm` wins over the underlying status: a parked run still carries
+/// [`TaskStatus::Running`] internally, but both Java and this repository's
+/// `RemoteTaskStatus` only recognize the pause through this word. The previous
+/// `TaskStatus::as_str()` output (`Pending`/`Running`/`Completed`/`Failed`/`Cancelled`) was never
+/// understood by the harness client, so `is_terminal_success()` could never become true.
+fn map_status(record: &TaskRecord) -> &'static str {
+    if record.awaiting_confirm {
+        return AWAITING_CONFIRM_SENTINEL.trim_matches('_');
+    }
+    match record.status {
+        TaskStatus::Pending => "pending",
+        TaskStatus::Running => "running",
+        TaskStatus::Completed => "success",
+        TaskStatus::Failed => "error",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
+
 /// Snapshot shape returned by [`AgentProtocolTaskStore::snapshot`].
 ///
-/// Mirrors the map built by Java `AgentProtocolTaskStore#snapshot`.
+/// Mirrors the map built by Java `AgentProtocolTaskStore#snapshot`. Java's snake-case keys are
+/// emitted alongside the camelCase spellings this crate has always served, so a client ported from
+/// either side finds the key it reads.
 pub fn snapshot_value(record: &TaskRecord) -> Value {
     serde_json::json!({
-        "taskId": record.task_id,
-        "agentId": record.sub_agent_id,
-        "status": record.status.as_str(),
+        "task_id": record.task_id,
+        "agent_id": record.sub_agent_id,
+        "status": map_status(record),
         "result": record.result,
         "error": record.error_message,
+        "pending_confirms": record.pending_confirms,
+        "last_event_seq": record.last_event_seq,
+        "cancel_requested": record.cancel_requested,
+        "awaiting_confirm": record.awaiting_confirm,
+        "taskId": record.task_id,
+        "agentId": record.sub_agent_id,
         "awaitingConfirm": record.awaiting_confirm,
         "pendingConfirms": record.pending_confirms,
         "lastEventSeq": record.last_event_seq,
@@ -1588,8 +1616,9 @@ fn sse_frame(event: &RemoteAgentEvent) -> Vec<u8> {
 /// Reads the current snapshot, or an empty object when the task vanished mid-request.
 ///
 /// Java answers `submit`/`resume` with `{task_id, status}` (`AgentProtocolController#submit`
-/// `:79-84`, `#resume` `:128-147`); this server keeps the richer snapshot but adds Java's snake
-/// `task_id` next to the protocol's `taskId`, so a client ported from Java finds the key it reads.
+/// `:79-84`, `#resume` `:128-147`); this server keeps the richer snapshot, and
+/// [`snapshot_value`] already carries Java's snake `task_id` next to the protocol's `taskId`. The
+/// insert below only matters for the vanished-task fallback.
 fn snapshot_for(store: &Arc<AgentProtocolTaskStore>, task_id: &str) -> Value {
     let mut snapshot = store
         .snapshot(task_id)
@@ -1839,7 +1868,7 @@ mod tests {
         rt().block_on(async {
             store.submit("t-1", "agent-1", "ping", None).unwrap();
             let snapshot = store.wait_for("t-1", 5_000).await.unwrap();
-            assert_eq!(snapshot["status"], "Completed");
+            assert_eq!(snapshot["status"], "success");
             assert_eq!(snapshot["result"], "done");
             assert_eq!(snapshot["agentId"], "agent-1");
             assert_eq!(snapshot["awaitingConfirm"], false);
@@ -2021,16 +2050,49 @@ mod tests {
         );
     }
 
+    // Java `#mapStatus` (`:585-596`) speaks `pending`/`running`/`success`/`error`/`cancelled`;
+    // this crate used to emit `TaskStatus::as_str()`, so a Java client never saw `success`.
     #[test]
-    fn snapshot_uses_camel_case_and_scalar_status() {
+    fn status_words_follow_java_map_status() {
+        let table = [
+            (TaskStatus::Pending, "pending"),
+            (TaskStatus::Running, "running"),
+            (TaskStatus::Completed, "success"),
+            (TaskStatus::Failed, "error"),
+            (TaskStatus::Cancelled, "cancelled"),
+        ];
+        for (status, expected) in table {
+            let mut record = harness_record("t-1");
+            record.status = status;
+            assert_eq!(snapshot_value(&record)["status"], expected, "{status:?}");
+        }
+    }
+
+    // A parked run is still `Running` internally; Java reports the pause instead.
+    #[test]
+    fn awaiting_confirm_wins_over_the_running_status() {
+        let mut record = harness_record("t-1");
+        record.status = TaskStatus::Running;
+        record.awaiting_confirm = true;
+        let snapshot = snapshot_value(&record);
+        assert_eq!(snapshot["status"], "awaiting_confirm");
+        assert_eq!(snapshot["awaiting_confirm"], true);
+    }
+
+    #[test]
+    fn snapshot_serves_both_java_and_camel_case_keys() {
         let mut record = harness_record("t-1");
         record.status = TaskStatus::Failed;
         record.error_message = Some("boom".to_string());
         let snapshot = snapshot_value(&record);
+        assert_eq!(snapshot["task_id"], "t-1");
         assert_eq!(snapshot["taskId"], "t-1");
-        assert_eq!(snapshot["status"], "Failed");
+        assert_eq!(snapshot["agent_id"], record.sub_agent_id);
+        assert_eq!(snapshot["agentId"], record.sub_agent_id);
+        assert_eq!(snapshot["status"], "error");
         assert_eq!(snapshot["error"], "boom");
-        assert!(snapshot.get("task_id").is_none());
+        assert_eq!(snapshot["awaiting_confirm"], false);
+        assert_eq!(snapshot["awaitingConfirm"], false);
     }
 
     #[test]
@@ -2161,6 +2223,25 @@ mod tests {
         (status, body)
     }
 
+    /// Java's wire status words (`AgentProtocolTaskStore#mapStatus`).
+    const JAVA_STATUS_WORDS: [&str; 6] = [
+        "pending",
+        "running",
+        "success",
+        "error",
+        "cancelled",
+        "awaiting_confirm",
+    ];
+
+    /// Asserts the body reports a status word a Java client can interpret.
+    fn assert_java_status(body: &Value) {
+        let status = body["status"].as_str().expect("status is reported");
+        assert!(
+            JAVA_STATUS_WORDS.contains(&status),
+            "unexpected status word: {status} ({body})"
+        );
+    }
+
     // Java: `AgentProtocolController#submit` answers `200` + `{task_id, status}` (`:79-84`). This
     // handler keeps the richer snapshot, so `task_id` must join the protocol's `taskId`.
     #[test]
@@ -2183,7 +2264,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body["task_id"], "t-1");
         assert_eq!(body["taskId"], "t-1");
-        assert!(body["status"].is_string(), "status is reported: {body}");
+        assert_java_status(&body);
     }
 
     // Java: `#cancel` answers `200` with an empty body (`:106-110`).
@@ -2239,7 +2320,7 @@ mod tests {
         });
         assert_eq!(status, 200);
         assert_eq!(body["task_id"], "t-1");
-        assert!(body["status"].is_string(), "status is reported: {body}");
+        assert_java_status(&body);
         // The snake-case decision was applied, so the task is no longer parked.
         assert!(!store.task_repository().find("t-1").unwrap().awaiting_confirm);
     }
