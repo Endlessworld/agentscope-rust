@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 use agentscope_core::agent::CallableAgent;
@@ -23,15 +23,58 @@ use crate::studio::websocket::{StudioWebSocketClient, UserInputData};
 /// Default timeout for waiting on Studio user input (30 minutes).
 pub const DEFAULT_INPUT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// The interactive terminal seam used by [`StudioUserAgent::input_from_terminal`].
+///
+/// Java reads `System.in` and prints `System.out` directly; an injectable seam keeps the
+/// interactive path testable without touching the real terminal (STUDIO-11).
+#[async_trait::async_trait]
+pub trait TerminalIo: Send + Sync {
+    /// Writes `text` without a trailing newline and flushes it, so the user sees the prompt.
+    async fn print(&self, text: &str) -> StudioResult<()>;
+    /// Reads one line, without its trailing line terminator.
+    async fn read_line(&self) -> StudioResult<String>;
+}
+
+/// The real terminal: `tokio::io::stdout` for the prompt, `tokio::io::stdin` for input.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StdTerminalIo;
+
+#[async_trait::async_trait]
+impl TerminalIo for StdTerminalIo {
+    async fn print(&self, text: &str) -> StudioResult<()> {
+        let mut stdout = tokio::io::stdout();
+        stdout
+            .write_all(text.as_bytes())
+            .await
+            .map_err(|err| StudioError::Transport(format!("terminal write failed: {err}")))?;
+        stdout
+            .flush()
+            .await
+            .map_err(|err| StudioError::Transport(format!("terminal flush failed: {err}")))
+    }
+
+    async fn read_line(&self) -> StudioResult<String> {
+        let mut reader = BufReader::new(tokio::io::stdin());
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|err| StudioError::Transport(format!("terminal read failed: {err}")))?;
+        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    }
+}
+
 /// A user proxy that produces user-role messages from either the terminal or
 /// the Studio web interface.
 #[derive(Clone)]
 pub struct StudioUserAgent {
     name: String,
+    agent_id: String,
     description: Option<String>,
     studio_client: Option<Arc<StudioClient>>,
     ws_client: Option<Arc<StudioWebSocketClient>>,
     input_timeout: Duration,
+    terminal: Arc<dyn TerminalIo>,
 }
 
 impl StudioUserAgent {
@@ -43,6 +86,14 @@ impl StudioUserAgent {
     /// The agent name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The agent id sent to Studio (`requestUserInput.agentId`).
+    ///
+    /// Java sends `getAgentId()`, not the name; it falls back to the name when the host does not
+    /// configure one (STUDIO-10).
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
     }
 
     /// The agent description, if any.
@@ -112,12 +163,20 @@ impl StudioUserAgent {
             .map_err(|err| StudioError::Agent(err.to_string()))
     }
 
-    /// Reads a line from stdin and wraps it in a user message.
+    /// Prints the `Name > ` prompt (like Java `System.out.print`) and reads a line from the
+    /// terminal seam.
     pub async fn input_from_terminal(&self) -> Msg {
-        let mut reader = BufReader::new(tokio::io::stdin());
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line).await;
-        let input = line.trim_end_matches(['\n', '\r']).to_string();
+        // Java `getInputFromTerminal`: print `getName() + " > "`, flush, then read a line.
+        if let Err(err) = self.terminal.print(&format!("{} > ", self.name)).await {
+            tracing::warn!(error = %err, "failed to write the studio prompt to the terminal");
+        }
+        let input = match self.terminal.read_line().await {
+            Ok(line) => line,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to read from the terminal");
+                String::new()
+            }
+        };
 
         let mut metadata = JsonMap::new();
         metadata.insert(
@@ -141,7 +200,7 @@ impl StudioUserAgent {
         };
 
         let request_id = client
-            .request_user_input(&self.name, &self.name, None)
+            .request_user_input(&self.agent_id, &self.name, None)
             .await?;
         let input = ws.wait_for_input(&request_id, self.input_timeout).await?;
         Ok(self.build_msg(request_id, input))
@@ -171,23 +230,39 @@ impl StudioUserAgent {
 }
 
 /// Builder for [`StudioUserAgent`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StudioUserAgentBuilder {
     name: String,
+    agent_id: Option<String>,
     description: Option<String>,
     studio_client: Option<Arc<StudioClient>>,
     ws_client: Option<Arc<StudioWebSocketClient>>,
     input_timeout: Duration,
+    terminal: Option<Arc<dyn TerminalIo>>,
+}
+
+impl std::fmt::Debug for StudioUserAgentBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The terminal seam is a trait object without `Debug`; report it opaquely.
+        f.debug_struct("StudioUserAgentBuilder")
+            .field("name", &self.name)
+            .field("agent_id", &self.agent_id)
+            .field("description", &self.description)
+            .field("input_timeout", &self.input_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for StudioUserAgentBuilder {
     fn default() -> Self {
         Self {
             name: "User".to_string(),
+            agent_id: None,
             description: None,
             studio_client: None,
             ws_client: None,
             input_timeout: DEFAULT_INPUT_TIMEOUT,
+            terminal: None,
         }
     }
 }
@@ -196,6 +271,12 @@ impl StudioUserAgentBuilder {
     /// Sets the agent name (default `User`).
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self
+    }
+
+    /// Sets the agent id sent to Studio (defaults to the name, like Java's agent id).
+    pub fn agent_id(mut self, agent_id: impl Into<String>) -> Self {
+        self.agent_id = Some(agent_id.into());
         self
     }
 
@@ -223,6 +304,13 @@ impl StudioUserAgentBuilder {
         self
     }
 
+    /// Sets the terminal seam used by [`StudioUserAgent::input_from_terminal`]
+    /// (defaults to the real stdin/stdout).
+    pub fn terminal(mut self, terminal: Arc<dyn TerminalIo>) -> Self {
+        self.terminal = Some(terminal);
+        self
+    }
+
     /// Builds the user agent.
     ///
     /// Mirrors Java's `StudioUserAgent.Builder.build()` (`StudioUserAgent.java:327-331`),
@@ -235,11 +323,13 @@ impl StudioUserAgentBuilder {
             ));
         }
         Ok(StudioUserAgent {
+            agent_id: self.agent_id.unwrap_or_else(|| self.name.clone()),
             name: self.name,
             description: self.description,
             studio_client: self.studio_client,
             ws_client: self.ws_client,
             input_timeout: self.input_timeout,
+            terminal: self.terminal.unwrap_or_else(|| Arc::new(StdTerminalIo)),
         })
     }
 }
@@ -403,6 +493,77 @@ mod tests {
             .await
             .expect_err("agent error surfaces");
         assert!(matches!(err, StudioError::Agent(_)), "got {err:?}");
+    }
+
+    /// A scripted terminal: records every prompt and returns one canned line.
+    #[derive(Debug, Default)]
+    struct ScriptedTerminal {
+        prompts: std::sync::Mutex<Vec<String>>,
+        line: String,
+    }
+
+    impl ScriptedTerminal {
+        fn new(line: &str) -> Self {
+            Self {
+                prompts: std::sync::Mutex::new(Vec::new()),
+                line: line.to_string(),
+            }
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().expect("prompt log").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::TerminalIo for ScriptedTerminal {
+        async fn print(&self, text: &str) -> crate::error::StudioResult<()> {
+            self.prompts
+                .lock()
+                .expect("prompt log")
+                .push(text.to_string());
+            Ok(())
+        }
+
+        async fn read_line(&self) -> crate::error::StudioResult<String> {
+            Ok(self.line.clone())
+        }
+    }
+
+    /// STUDIO-11: Java `getInputFromTerminal` prints `getName() + " > "` before reading. The
+    /// prompt goes through the injected terminal seam, so no real stdin/stdout is touched.
+    #[tokio::test]
+    async fn terminal_input_prints_the_prompt_then_reads_a_line() {
+        let terminal = Arc::new(ScriptedTerminal::new("typed answer"));
+        let user = StudioUserAgent::builder()
+            .name("User")
+            .terminal(terminal.clone())
+            .build()
+            .expect("valid name");
+
+        let msg = user.input_from_terminal().await;
+
+        assert_eq!(terminal.prompts(), vec!["User > ".to_string()]);
+        assert_eq!(msg.text_content(), "typed answer");
+        assert_eq!(msg.role(), agentscope_core::message::MsgRole::User);
+    }
+
+    /// STUDIO-10: `agentId` is the agent id, not the name; the name is only the fallback.
+    #[test]
+    fn agent_id_defaults_to_the_name_and_can_be_overridden() {
+        let default = StudioUserAgent::builder()
+            .name("User")
+            .build()
+            .expect("valid name");
+        assert_eq!(default.agent_id(), "User");
+
+        let custom = StudioUserAgent::builder()
+            .name("User")
+            .agent_id("user-1")
+            .build()
+            .expect("valid name");
+        assert_eq!(custom.agent_id(), "user-1");
+        assert_eq!(custom.name(), "User");
     }
 
     /// Tracker §6.4 P2-4: Java's `StudioUserAgent.Builder.build()` rejects a blank name.

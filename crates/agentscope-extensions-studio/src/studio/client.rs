@@ -2,7 +2,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local};
 use uuid::Uuid;
 
 use agentscope_core::message::{Msg, MsgRole};
@@ -12,8 +12,11 @@ use crate::studio::config::StudioConfig;
 use crate::studio::http::{ReqwestStudioTransport, StudioHttpRequest, StudioHttpTransport};
 use crate::studio::pojo::{PushMessageRequest, RegisterRunRequest, RequestUserInputRequest};
 
-/// Timestamp format used by Studio (`yyyy-MM-dd HH:mm:ss.SSS`), UTC.
-fn format_timestamp(ts: DateTime<Utc>) -> String {
+/// Timestamp format used by Studio (`yyyy-MM-dd HH:mm:ss.SSS`), in the host's local zone.
+///
+/// Java `StudioClient.TIMESTAMP_FORMATTER` uses `ZoneId.systemDefault()`, so a run is stamped
+/// with the local wall clock; emitting UTC shifted it by the host's offset (STUDIO-08).
+fn format_timestamp(ts: DateTime<Local>) -> String {
     ts.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
 
@@ -74,7 +77,7 @@ impl StudioClient {
             .id(self.config.run_id())
             .project(self.config.project())
             .name(self.config.run_name())
-            .timestamp(format_timestamp(Utc::now()))
+            .timestamp(format_timestamp(Local::now()))
             .pid(std::process::id() as u64)
             .status("running")
             .run_dir("")
@@ -262,6 +265,22 @@ mod tests {
             .expect("timestamp uses yyyy-MM-dd HH:mm:ss.SSS");
     }
 
+    #[test]
+    fn timestamps_use_the_local_zone() {
+        use chrono::TimeZone;
+
+        // STUDIO-08: Java formats with `ZoneId.systemDefault()`, so Studio receives the local
+        // wall clock. A fixed instant keeps the assertion independent of the machine's zone.
+        let ts = chrono::NaiveDate::from_ymd_opt(2026, 6, 15)
+            .and_then(|date| date.and_hms_milli_opt(12, 34, 56, 700))
+            .expect("a valid naive local time");
+        let local = chrono::Local
+            .from_local_datetime(&ts)
+            .single()
+            .expect("an unambiguous local time");
+        assert_eq!(super::format_timestamp(local), "2026-06-15 12:34:56.700");
+    }
+
     /// §3.2 / Java `StudioClient.pushMessage`: camelCase payload, lowercased role.
     #[tokio::test]
     async fn push_message_posts_java_shaped_request() {
@@ -309,7 +328,7 @@ mod tests {
     }
 
     /// §3.2 / Java `StudioClient.requestUserInput`: the returned id is the payload's
-    /// `requestId`; `structuredInput` is omitted when no schema is given.
+    /// `requestId`; without a schema `structuredInput` is an empty object (Java `Map.of()`).
     #[tokio::test]
     async fn request_user_input_posts_java_shaped_request() {
         let transport = Arc::new(ScriptedTransport::always(Outcome::ok(200, "")));
@@ -328,7 +347,7 @@ mod tests {
         assert_eq!(body["runId"], "run-123");
         assert_eq!(body["agentId"], "agent-1");
         assert_eq!(body["agentName"], "Agent One");
-        assert!(body.get("structuredInput").is_none());
+        assert_eq!(body["structuredInput"], serde_json::json!({}));
     }
 
     /// §3.2 / Java `requestUserInput(..., structuredSchema)`: the schema is forwarded as is.

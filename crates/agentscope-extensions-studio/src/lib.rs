@@ -30,7 +30,8 @@ pub mod telemetry;
 
 pub use error::{StudioError, StudioResult};
 pub use studio::{
-    NoopStudioTransport, PendingInputRegistry, ReqwestStudioTransport, StudioClient, StudioConfig,
-    StudioConfigBuilder, StudioHttpRequest, StudioHttpResponse, StudioHttpTransport, StudioManager,
-    StudioMessageHook, StudioTransport, StudioUserAgent, StudioWebSocketClient, UserInputData,
+    NoopStudioTransport, PendingInputRegistry, ReqwestStudioTransport, StdTerminalIo, StudioClient,
+    StudioConfig, StudioConfigBuilder, StudioHttpRequest, StudioHttpResponse, StudioHttpTransport,
+    StudioManager, StudioMessageHook, StudioTransport, StudioUserAgent, StudioWebSocketClient,
+    TerminalIo, UserInputData,
 };

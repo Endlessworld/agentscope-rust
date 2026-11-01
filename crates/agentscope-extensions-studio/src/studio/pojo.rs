@@ -171,9 +171,18 @@ pub struct RequestUserInputRequest {
     pub agent_id: String,
     /// Agent name requesting input.
     pub agent_name: String,
-    /// Optional JSON schema for structured input (`null` when absent).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Structured input payload.
+    ///
+    /// Java's builder defaults to `Map.of()` and always puts the key on the wire, so the default
+    /// here is `Some({})`: Studio distinguishes an empty form payload from a missing one
+    /// (STUDIO-10).
+    #[serde(default = "empty_structured_input")]
     pub structured_input: Option<serde_json::Value>,
+}
+
+/// Default `structuredInput` payload: an empty JSON object (Java `Map.of()`).
+fn empty_structured_input() -> Option<serde_json::Value> {
+    Some(serde_json::Value::Object(serde_json::Map::new()))
 }
 
 impl RequestUserInputRequest {
@@ -222,7 +231,10 @@ impl RequestUserInputRequestBuilder {
             run_id: self.run_id.unwrap_or_default(),
             agent_id: self.agent_id.unwrap_or_default(),
             agent_name: self.agent_name.unwrap_or_default(),
-            structured_input: self.structured_input,
+            structured_input: Some(
+                self.structured_input
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+            ),
         }
     }
 }
@@ -354,7 +366,9 @@ mod tests {
     }
 
     #[test]
-    fn request_user_input_omits_absent_structured_input() {
+    fn request_user_input_defaults_structured_input_to_an_empty_object() {
+        // Java `RequestUserInputRequest.Builder` defaults `structuredInput` to `Map.of()` and
+        // always writes the key, so the payload carries `{}` instead of omitting it (STUDIO-10).
         let req = RequestUserInputRequest::builder()
             .request_id("q1")
             .run_id("r1")
@@ -363,7 +377,7 @@ mod tests {
             .build();
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(value["requestId"], "q1");
-        assert!(value.get("structuredInput").is_none());
+        assert_eq!(value["structuredInput"], serde_json::json!({}));
 
         let with_schema = RequestUserInputRequest::builder()
             .request_id("q2")
@@ -371,6 +385,10 @@ mod tests {
             .build();
         let value2 = serde_json::to_value(&with_schema).unwrap();
         assert_eq!(value2["structuredInput"]["type"], "object");
+
+        // The key is always present, so a round trip preserves it.
+        let back: RequestUserInputRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(back, req);
     }
 
     #[test]

@@ -20,10 +20,10 @@ pub use http::{
 };
 pub use message_hook::StudioMessageHook;
 pub use socket_io::{
-    EngineIoHandshake, ProtocolAction, SocketIoEvent, SocketIoProtocol, SocketIoTransport,
-    DEFAULT_NAMESPACE, ENGINE_IO_VERSION,
+    ConnectionState, EngineIoHandshake, ProtocolAction, SocketIoEvent, SocketIoProtocol,
+    SocketIoTransport, DEFAULT_CONNECT_TIMEOUT, DEFAULT_NAMESPACE, ENGINE_IO_VERSION,
 };
-pub use user_agent::StudioUserAgent;
+pub use user_agent::{StdTerminalIo, StudioUserAgent, TerminalIo};
 pub use websocket::{
     normalize_tool_result, parse_content_blocks, parse_user_input, preprocess_tool_result_block,
     NoopStudioTransport, PendingInputRegistry, StudioTransport, StudioWebSocketClient,
@@ -93,7 +93,7 @@ impl StudioManager {
         }
     }
 
-    /// Runs initialization directly (non-builder convenience).
+    /// Runs initialization directly (non-builder convenience), with a no-op WebSocket transport.
     pub async fn initialize_with(config: StudioConfig) -> StudioResult<()> {
         Self::initialize_with_transport(config, Arc::new(NoopStudioTransport)).await
     }
@@ -160,15 +160,42 @@ impl StudioManager {
 }
 
 /// Builder for configuring and initializing Studio integration.
-#[derive(Debug, Clone, Default)]
+///
+/// [`Self::initialize`] keeps [`NoopStudioTransport`] as the WebSocket default so offline hosts
+/// and tests never dial `localhost:3000`; production hosts pass the real socket with
+/// [`Self::transport`] — typically
+/// [`SocketIoTransport`](super::socket_io::SocketIoTransport), whose own
+/// [`PendingInputRegistry`] the installed client then reuses (STUDIO-09).
+#[derive(Clone)]
 pub struct StudioManagerBuilder {
     config: StudioConfigBuilder,
+    http_transport: Option<Arc<dyn StudioHttpTransport>>,
+    transport: Option<Arc<dyn StudioTransport>>,
+}
+
+impl std::fmt::Debug for StudioManagerBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The transports are trait objects without `Debug`; report them opaquely.
+        f.debug_struct("StudioManagerBuilder")
+            .field("config", &self.config)
+            .field("http_transport", &self.http_transport.is_some())
+            .field("transport", &self.transport.is_some())
+            .finish()
+    }
+}
+
+impl Default for StudioManagerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StudioManagerBuilder {
     fn new() -> Self {
         Self {
             config: StudioConfig::builder(),
+            http_transport: None,
+            transport: None,
         }
     }
 
@@ -219,10 +246,95 @@ impl StudioManagerBuilder {
         self.config.build()
     }
 
+    /// Sets the REST transport (defaults to the `reqwest` one with 10s/30s timeouts).
+    pub fn http_transport(mut self, http_transport: Arc<dyn StudioHttpTransport>) -> Self {
+        self.http_transport = Some(http_transport);
+        self
+    }
+
+    /// Sets the WebSocket transport used to receive `forwardUserInput` events.
+    ///
+    /// Defaults to [`NoopStudioTransport`]: initialization never connects to a server the host
+    /// did not configure. Pass a real transport (e.g.
+    /// [`SocketIoTransport`](super::socket_io::SocketIoTransport)) in production.
+    pub fn transport(mut self, transport: Arc<dyn StudioTransport>) -> Self {
+        self.transport = Some(transport);
+        self
+    }
+
     /// Initializes Studio integration: builds config, creates clients, registers
     /// the run, and (best-effort) connects the WebSocket.
     pub async fn initialize(self) -> StudioResult<()> {
         let config = self.config.build();
-        StudioManager::initialize_with(config).await
+        let http_transport = self
+            .http_transport
+            .unwrap_or_else(|| Arc::new(ReqwestStudioTransport::new()));
+        // A no-op transport stays the default: tests and offline hosts must never dial Studio.
+        let transport = self
+            .transport
+            .unwrap_or_else(|| Arc::new(NoopStudioTransport));
+        StudioManager::initialize_with_transports(config, http_transport, transport).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::studio::http::testing::{Outcome, ScriptedTransport};
+
+    /// A transport that records connects and always reports a ready connection.
+    #[derive(Debug, Default)]
+    struct ReadyTransport {
+        connects: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl StudioTransport for ReadyTransport {
+        async fn connect(&self) -> StudioResult<()> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&self) -> StudioResult<()> {
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    /// STUDIO-09: the builder's main entry point installs the transports it was handed, so a
+    /// production host does not have to reach for `initialize_with_transports`.
+    #[tokio::test]
+    async fn the_builder_installs_the_injected_transports() {
+        let scripted = Arc::new(ScriptedTransport::always(Outcome::ok(200, "")));
+        let http: Arc<dyn StudioHttpTransport> = scripted.clone();
+        let transport = Arc::new(ReadyTransport::default());
+
+        StudioManager::init()
+            .studio_url("http://127.0.0.1:3000")
+            .run_id("run-9")
+            .http_transport(http)
+            .transport(transport.clone())
+            .initialize()
+            .await
+            .expect("initializes offline");
+
+        assert_eq!(transport.connects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scripted.attempt_count(),
+            1,
+            "registerRun must use the injected REST transport"
+        );
+        let client = StudioManager::web_socket_client().expect("installed by the builder");
+        assert!(
+            client.is_connected(),
+            "the injected transport is the installed one"
+        );
+        StudioManager::shutdown();
     }
 }

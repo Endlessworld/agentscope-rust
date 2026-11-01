@@ -12,13 +12,12 @@
 //!   [`StudioWebSocketClient::wait_for_input`](super::websocket::StudioWebSocketClient::wait_for_input)
 //!   unblocks.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -211,7 +210,7 @@ pub enum ProtocolAction {
 pub struct SocketIoProtocol {
     namespace: String,
     auth: Value,
-    sid: Option<String>,
+    handshake: Option<EngineIoHandshake>,
     connected: bool,
 }
 
@@ -221,14 +220,33 @@ impl SocketIoProtocol {
         Self {
             namespace: namespace.into(),
             auth,
-            sid: None,
+            handshake: None,
             connected: false,
         }
     }
 
     /// The Engine.IO session id, once the handshake was seen.
     pub fn sid(&self) -> Option<&str> {
-        self.sid.as_deref()
+        self.handshake.as_ref().map(|handshake| handshake.sid.as_str())
+    }
+
+    /// The Engine.IO handshake, once the open packet was seen.
+    pub fn handshake(&self) -> Option<&EngineIoHandshake> {
+        self.handshake.as_ref()
+    }
+
+    /// How long the transport may stay silent before the connection counts as half-open.
+    ///
+    /// Engine.IO v4: the server pings every `pingInterval` and gives the client `pingTimeout`
+    /// to answer, so a silent window longer than the sum means the socket is dead (STUDIO-05).
+    pub fn heartbeat_window(&self) -> Option<Duration> {
+        self.handshake.as_ref().map(|handshake| {
+            Duration::from_millis(
+                handshake
+                    .ping_interval_ms
+                    .saturating_add(handshake.ping_timeout_ms),
+            )
+        })
     }
 
     /// Whether the namespace connect was acknowledged.
@@ -241,7 +259,7 @@ impl SocketIoProtocol {
         if frame.starts_with('0') {
             return match parse_engine_io_open(frame) {
                 Ok(handshake) => {
-                    self.sid = Some(handshake.sid);
+                    self.handshake = Some(handshake);
                     vec![ProtocolAction::Send(namespace_connect_frame(
                         &self.namespace,
                         &self.auth,
@@ -291,6 +309,23 @@ struct Connection {
     task: JoinHandle<()>,
 }
 
+/// How long [`StudioTransport::connect`] waits for the namespace acknowledgement by default
+/// (Java `StudioWebSocketClient#connect` applies `.timeout(Duration.ofSeconds(10))`).
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Lifecycle of the transport's connection, observed by [`SocketIoTransport::wait_ready`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// Connecting, handshaking, or waiting for the next reconnect attempt.
+    Connecting,
+    /// The namespace connect was acknowledged (`40`); frames flow.
+    Ready,
+    /// The connection was abandoned for good (handshake failed or retries exhausted).
+    Failed(String),
+    /// [`StudioTransport::close`] was called.
+    Closed,
+}
+
 /// Real Socket.IO transport backed by `tokio-tungstenite`.
 ///
 /// Reconnects on an unexpected close, with `StudioConfig`'s attempt/delay bounds. Decoded
@@ -304,7 +339,8 @@ pub struct SocketIoTransport {
     reconnect_delay: Duration,
     reconnect_max_delay: Duration,
     connection: Mutex<Option<Connection>>,
-    connected: Arc<AtomicBool>,
+    connect_timeout: Duration,
+    state: Arc<watch::Sender<ConnectionState>>,
 }
 
 impl std::fmt::Debug for SocketIoTransport {
@@ -312,7 +348,7 @@ impl std::fmt::Debug for SocketIoTransport {
         f.debug_struct("SocketIoTransport")
             .field("url", &self.url)
             .field("namespace", &self.namespace)
-            .field("connected", &self.connected.load(Ordering::SeqCst))
+            .field("state", &self.state())
             .finish_non_exhaustive()
     }
 }
@@ -322,6 +358,7 @@ impl SocketIoTransport {
     pub fn new(config: &StudioConfig, registry: Arc<PendingInputRegistry>) -> StudioResult<Self> {
         // Java `StudioWebSocketClient.java:98` sends `run_id`; see [`auth_payload`].
         let auth = auth_payload(config.run_id(), false);
+        let (state, _) = watch::channel(ConnectionState::Connecting);
         Ok(Self {
             url: socket_io_url(&config.socket_url())?,
             namespace: DEFAULT_NAMESPACE.to_string(),
@@ -331,7 +368,8 @@ impl SocketIoTransport {
             reconnect_delay: config.reconnect_delay(),
             reconnect_max_delay: config.reconnect_max_delay(),
             connection: Mutex::new(None),
-            connected: Arc::new(AtomicBool::new(false)),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            state: Arc::new(state),
         })
     }
 
@@ -371,25 +409,79 @@ impl SocketIoTransport {
     pub fn registry(&self) -> Arc<PendingInputRegistry> {
         Arc::clone(&self.registry)
     }
+
+    /// Overrides how long [`StudioTransport::connect`] waits for the namespace acknowledgement
+    /// (default 10s, the Java `EVENT_CONNECT` timeout).
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
+    /// The current connection state.
+    pub fn state(&self) -> ConnectionState {
+        ConnectionState::clone(&self.state.borrow())
+    }
+
+    /// Waits until the namespace connect is acknowledged.
+    ///
+    /// Java's `StudioWebSocketClient#connect` signals on `EVENT_CONNECT`, errors on
+    /// `EVENT_CONNECT_ERROR` and wraps the whole thing in a 10s timeout; this is that contract.
+    /// A timeout or terminal failure tells the caller the socket is **not** usable, instead of
+    /// the previous "spawn and pretend it worked" (STUDIO-03).
+    pub async fn wait_ready(&self, timeout: Duration) -> StudioResult<()> {
+        let mut state = self.state.subscribe();
+        let wait = async {
+            loop {
+                match &*state.borrow_and_update() {
+                    ConnectionState::Ready => return Ok(()),
+                    ConnectionState::Failed(reason) => {
+                        return Err(StudioError::WebSocket(format!(
+                            "socket.io connection failed: {reason}"
+                        )))
+                    }
+                    ConnectionState::Closed => {
+                        return Err(StudioError::WebSocket(
+                            "socket.io transport is closed".to_string(),
+                        ))
+                    }
+                    ConnectionState::Connecting => {}
+                }
+                if state.changed().await.is_err() {
+                    return Err(StudioError::WebSocket(
+                        "socket.io transport was dropped".to_string(),
+                    ));
+                }
+            }
+        };
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(result) => result,
+            Err(_) => Err(StudioError::WebSocket(format!(
+                "socket.io namespace connect did not complete within {timeout:?}"
+            ))),
+        }
+    }
 }
 
 #[async_trait]
 impl StudioTransport for SocketIoTransport {
     async fn connect(&self) -> StudioResult<()> {
-        if self
+        // STUDIO-03: Java's `connect()` completes on `EVENT_CONNECT` (the namespace ACK), not
+        // when the WebSocket opens, and fails on `EVENT_CONNECT_ERROR` or after 10s.
+        let already_running = self
             .connection
             .lock()
             .map(|conn| conn.is_some())
-            .unwrap_or(false)
-        {
-            return Ok(());
+            .unwrap_or(false);
+        if already_running {
+            return self.wait_ready(self.connect_timeout).await;
         }
+        self.state.send_replace(ConnectionState::Connecting);
         let (sender, receiver) = mpsc::unbounded_channel::<String>();
         let url = self.url.clone();
         let namespace = self.namespace.clone();
         let auth = self.auth.clone();
         let registry = Arc::clone(&self.registry);
-        let connected = Arc::clone(&self.connected);
+        let state = Arc::clone(&self.state);
         let attempts = self.reconnect_attempts;
         let base_delay = self.reconnect_delay;
         let max_delay = self.reconnect_max_delay;
@@ -403,13 +495,16 @@ impl StudioTransport for SocketIoTransport {
                     Ok((stream, _)) => {
                         use futures::StreamExt;
                         attempt = 0;
-                        connected.store(true, Ordering::SeqCst);
+                        // The socket is open but the namespace is not joined yet: `is_connected`
+                        // must stay false until the `40` ACK (STUDIO-03).
+                        state.send_replace(ConnectionState::Connecting);
                         stream.split()
                     }
                     Err(err) => {
-                        connected.store(false, Ordering::SeqCst);
+                        state.send_replace(ConnectionState::Connecting);
                         if attempt >= attempts {
                             tracing::warn!(error = %err, "studio socket.io connect failed; giving up");
+                            state.send_replace(ConnectionState::Failed(err.to_string()));
                             return;
                         }
                         attempt += 1;
@@ -420,7 +515,18 @@ impl StudioTransport for SocketIoTransport {
                 use futures::{SinkExt, StreamExt};
                 let mut protocol = SocketIoProtocol::new(namespace.clone(), auth.clone());
                 let mut stop = false;
+                // STUDIO-05: Engine.IO v4 heartbeat deadline. Refreshed on every inbound frame;
+                // a silent window longer than `pingInterval + pingTimeout` means half-open.
+                let mut heartbeat: Option<tokio::time::Instant> = None;
                 loop {
+                    let incoming = async {
+                        match heartbeat {
+                            Some(deadline) => tokio::time::timeout_at(deadline, source.next())
+                                .await
+                                .map_err(|_| ()),
+                            None => Ok(source.next().await),
+                        }
+                    };
                     tokio::select! {
                         outgoing = receiver.recv() => match outgoing {
                             Some(text) => {
@@ -434,8 +540,16 @@ impl StudioTransport for SocketIoTransport {
                                 break;
                             }
                         },
-                        incoming = source.next() => match incoming {
-                            Some(Ok(Message::Text(text))) => {
+                        incoming = incoming => match incoming {
+                            // No frame within the heartbeat window: drop the half-open socket
+                            // and let the backoff below reconnect.
+                            Err(()) => {
+                                tracing::warn!(
+                                    "studio socket.io heartbeat timed out; reconnecting"
+                                );
+                                break;
+                            }
+                            Ok(Some(Ok(Message::Text(text)))) => {
                                 for action in protocol.on_text(text.to_string().as_str()) {
                                     match action {
                                         ProtocolAction::Send(frame) => {
@@ -443,6 +557,7 @@ impl StudioTransport for SocketIoTransport {
                                         }
                                         ProtocolAction::Connected => {
                                             tracing::debug!("studio socket.io namespace joined");
+                                            state.send_replace(ConnectionState::Ready);
                                         }
                                         ProtocolAction::UserInput {
                                             request_id,
@@ -457,20 +572,28 @@ impl StudioTransport for SocketIoTransport {
                                         }
                                     }
                                 }
+                                if let Some(window) = protocol.heartbeat_window() {
+                                    heartbeat = Some(tokio::time::Instant::now() + window);
+                                }
                             }
-                            Some(Ok(Message::Close(_))) | None => break,
-                            Some(Err(err)) => {
+                            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                            Ok(Some(Err(err))) => {
                                 tracing::warn!(error = %err, "studio socket.io read error");
                                 break;
                             }
-                            Some(Ok(_)) => {}
+                            Ok(Some(Ok(_))) => {}
                         },
                     }
                 }
-                connected.store(false, Ordering::SeqCst);
+                state.send_replace(ConnectionState::Connecting);
                 if stop || attempt >= attempts {
-                    if !stop {
+                    if stop {
+                        state.send_replace(ConnectionState::Closed);
+                    } else {
                         tracing::warn!("studio socket.io reconnect attempts exhausted");
+                        state.send_replace(ConnectionState::Failed(
+                            "reconnect attempts exhausted".to_string(),
+                        ));
                     }
                     return;
                 }
@@ -479,12 +602,19 @@ impl StudioTransport for SocketIoTransport {
             }
         });
 
-        let mut guard = self
-            .connection
-            .lock()
-            .map_err(|_| StudioError::WebSocket("socket.io transport lock poisoned".to_string()))?;
-        *guard = Some(Connection { sender, task });
-        Ok(())
+        {
+            let mut guard = self.connection.lock().map_err(|_| {
+                StudioError::WebSocket("socket.io transport lock poisoned".to_string())
+            })?;
+            *guard = Some(Connection { sender, task });
+        }
+
+        let ready = self.wait_ready(self.connect_timeout).await;
+        if ready.is_err() {
+            // Drop the abandoned attempt so a later `connect()` can start from scratch.
+            let _ = self.close().await;
+        }
+        ready
     }
 
     async fn close(&self) -> StudioResult<()> {
@@ -498,12 +628,14 @@ impl StudioTransport for SocketIoTransport {
             drop(connection.sender);
             connection.task.abort();
         }
-        self.connected.store(false, Ordering::SeqCst);
+        self.state.send_replace(ConnectionState::Closed);
         Ok(())
     }
 
     fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
+        // STUDIO-03: "connected" means the namespace was joined (`40` ACK), not merely that a
+        // TCP/WS socket is open.
+        matches!(*self.state.borrow(), ConnectionState::Ready)
     }
 
     fn input_registry(&self) -> Option<Arc<PendingInputRegistry>> {
@@ -513,6 +645,11 @@ impl StudioTransport for SocketIoTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+
     use super::*;
 
     #[test]
@@ -728,5 +865,169 @@ mod tests {
         assert!(!transport.is_connected());
         // Closing a never-connected transport is a no-op.
         assert!(futures::executor::block_on(transport.close()).is_ok());
+    }
+
+    fn transport_for(port: u16, attempts: u32) -> SocketIoTransport {
+        let config = StudioConfig::builder()
+            .studio_url(format!("http://127.0.0.1:{port}"))
+            .run_id("run-socket-io")
+            .reconnect_attempts(attempts)
+            .reconnect_delay(Duration::from_millis(50))
+            .reconnect_max_delay(Duration::from_millis(50))
+            .build();
+        SocketIoTransport::new(&config, Arc::new(PendingInputRegistry::new()))
+            .expect("build the socket.io transport")
+    }
+
+    /// Plays Studio for one connection: Engine.IO open packet, wait for the namespace join,
+    /// then acknowledge it. `acked` is set immediately before the ACK is written.
+    async fn serve_one_connection(
+        listener: TcpListener,
+        open_packet: &str,
+        acked: Arc<AtomicBool>,
+    ) {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        ws.send(Message::Text(open_packet.to_string().into()))
+            .await
+            .expect("send the engine.io open packet");
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            if text.starts_with("40") {
+                break;
+            }
+        }
+        // A deliberate pause: `connect()` must not return before the ACK below.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        acked.store(true, Ordering::SeqCst);
+        let _ = ws
+            .send(Message::Text(
+                "40/python,{\"sid\":\"s-1\"}".to_string().into(),
+            ))
+            .await;
+        // Keep the socket open; the test aborts the task when it is done.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+
+    /// STUDIO-03: an unreachable Studio must make `connect()` fail instead of reporting success.
+    #[tokio::test]
+    async fn connect_fails_when_studio_is_unreachable() {
+        // Bind then drop, so the port is (almost certainly) closed.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a probe socket");
+        let port = listener.local_addr().expect("local address").port();
+        drop(listener);
+
+        let transport = transport_for(port, 0).with_connect_timeout(Duration::from_secs(2));
+        let err = transport
+            .connect()
+            .await
+            .expect_err("an unreachable Studio must not report success");
+
+        assert!(matches!(err, StudioError::WebSocket(_)), "got {err:?}");
+        assert!(!transport.is_connected());
+    }
+
+    /// STUDIO-03: `connect()` completes only on the namespace ACK (`EVENT_CONNECT`), not when
+    /// the WebSocket opens.
+    #[tokio::test]
+    async fn connect_waits_for_the_namespace_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local studio double");
+        let port = listener.local_addr().expect("local address").port();
+        let acked = Arc::new(AtomicBool::new(false));
+        let server = tokio::spawn(serve_one_connection(
+            listener,
+            "0{\"sid\":\"s-1\",\"pingInterval\":25000,\"pingTimeout\":20000}",
+            Arc::clone(&acked),
+        ));
+
+        let transport = transport_for(port, 0).with_connect_timeout(Duration::from_secs(5));
+        transport
+            .connect()
+            .await
+            .expect("connects once the namespace is acknowledged");
+
+        assert!(
+            acked.load(Ordering::SeqCst),
+            "connect() must not return before the namespace ACK"
+        );
+        assert!(transport.is_connected());
+        assert_eq!(transport.state(), ConnectionState::Ready);
+
+        transport.close().await.expect("closes");
+        assert!(!transport.is_connected());
+        server.abort();
+    }
+
+    /// STUDIO-05: a server that handshakes and then goes silent never pings again. Without a
+    /// heartbeat watchdog the transport would look connected forever; it must drop the socket
+    /// and reconnect.
+    #[tokio::test]
+    async fn a_silent_server_trips_the_heartbeat_watchdog_and_reconnects() {
+        // A 100ms window (50 + 50) keeps the test quick; production uses 25s + 20s.
+        const OPEN: &str = "0{\"sid\":\"s-1\",\"pingInterval\":50,\"pingTimeout\":50}";
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local studio double");
+        let port = listener.local_addr().expect("local address").port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&accepts);
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut second_tx = Some(second_tx);
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let count = accepted.fetch_add(1, Ordering::SeqCst) + 1;
+                if count == 2 {
+                    if let Some(tx) = second_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    if ws
+                        .send(Message::Text(OPEN.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        if text.starts_with("40") {
+                            let _ = ws
+                                .send(Message::Text(
+                                    "40/python,{\"sid\":\"s-1\"}".to_string().into(),
+                                ))
+                                .await;
+                            break;
+                        }
+                    }
+                    // Never ping: the client's watchdog has to notice the silence.
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                });
+            }
+        });
+
+        let transport = transport_for(port, 2);
+        transport.connect().await.expect("the first socket is ready");
+        tokio::time::timeout(Duration::from_secs(5), second_rx)
+            .await
+            .expect("the heartbeat timeout must trigger a reconnect")
+            .expect("the double accepted a second connection");
+
+        assert!(accepts.load(Ordering::SeqCst) >= 2);
+        transport.close().await.expect("closes");
+        server.abort();
     }
 }

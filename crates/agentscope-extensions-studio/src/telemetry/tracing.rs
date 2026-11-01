@@ -712,8 +712,10 @@ impl Stream for SpanStream {
 
 impl Drop for SpanStream {
     fn drop(&mut self) {
-        // Dropped mid-flight (timeout, abort, lost lease): the spans still end.
-        self.finish(SpanStatus::Ok);
+        // Dropped mid-flight (timeout, abort, lost lease): the spans still end, but the run did
+        // not succeed — leave the status unset like Java's `doFinally(span::end)`, which never
+        // marks a cancelled call as `Ok` (STUDIO-07).
+        self.finish(SpanStatus::Unset);
     }
 }
 
@@ -1100,6 +1102,9 @@ mod tests {
         let spans = exporter.spans();
         assert_eq!(spans.len(), 1, "a dropped run must still export its span");
         assert_eq!(spans[0].name, expected_agent_span_name());
+        // STUDIO-07: cancellation is not success — the status stays unset, exactly like
+        // `SpanGuard::drop` and Java's `doFinally(span::end)`.
+        assert_eq!(spans[0].status, SpanStatus::Unset);
     }
 
     #[tokio::test]
