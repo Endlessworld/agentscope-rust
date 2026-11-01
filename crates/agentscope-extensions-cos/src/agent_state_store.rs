@@ -8,6 +8,18 @@
 //! {prefix}{userId}/{sessionId}/{stateKey}.list.json  — List<State> as JSON array
 //! {prefix}{userId}/{sessionId}/{stateKey}.list.hash  — hash for incremental append
 //! ```
+//!
+//! Two surfaces are offered, matching the core trait:
+//!
+//! * the infallible `save`/`save_list`/`get`/`get_list`/`exists`/`delete`/`list_session_ids`
+//!   methods are **best-effort** — a failure is logged and degraded (a corrupt payload or an
+//!   unreachable backend reads as "nothing stored" / `false` / empty), which keeps existing
+//!   callers that treat state as a cache working;
+//! * the `try_*` methods (in particular [`AgentStateStore::try_get`],
+//!   [`AgentStateStore::try_exists`], [`AgentStateStore::try_delete`]) report the same failures
+//!   as `Err` — a corrupt payload is **never** disguised as an absent key and a failed
+//!   existence check is never reported as `false`. Use them whenever a wrong answer would be
+//!   acted upon. `NotFound` / an empty list stay `Ok(None)` / `Ok(vec![])`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -144,6 +156,175 @@ impl CosAgentStateStore {
             .await?;
         Ok(next)
     }
+
+    /// Shared body of [`AgentStateStore::save`] and [`AgentStateStore::try_save`].
+    async fn write_state(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> agentscope_core::error::Result<()> {
+        let object_key = self.state_key(user_id, session_id, key).map_err(to_core)?;
+        let json = serde_json::to_string(&value).map_err(|e| {
+            to_core(CosError::Serialization(format!(
+                "failed to serialize state {key}: {e}"
+            )))
+        })?;
+        self.object_store
+            .put_string(&object_key, &json)
+            .await
+            .map_err(to_core)?;
+        // Keep the CAS counter in step with the value even on the unconditional path.
+        let version_key = self
+            .version_key(user_id, session_id, key)
+            .map_err(to_core)?;
+        self.bump_version(&version_key).await.map_err(to_core)?;
+        Ok(())
+    }
+
+    /// Shared body of [`AgentStateStore::save_list`] and [`AgentStateStore::try_save_list`].
+    ///
+    /// The two surfaces differ only in how a failure to read the *existing* list/hash objects
+    /// is treated: `lenient_reads` keeps the infallible `save_list` best-effort (an unreadable
+    /// object is logged and treated as absent, as before), while `try_save_list` reports it —
+    /// guessing "nothing stored" would skip the full rewrite that an incremental append
+    /// depends on.
+    async fn write_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        values: &[serde_json::Value],
+        lenient_reads: bool,
+    ) -> agentscope_core::error::Result<()> {
+        let list_key = self.list_key(user_id, session_id, key).map_err(to_core)?;
+        let hash_key = self.hash_key(user_id, session_id, key).map_err(to_core)?;
+
+        let list_content = match self.object_store.get_string(&list_key).await {
+            Ok(content) => content,
+            Err(e) if lenient_reads => {
+                tracing::error!(error = %e, "Failed to read COS list object: {list_key}");
+                None
+            }
+            Err(e) => return Err(to_core(e)),
+        };
+        // `existing_count` mirrors Java's `existingCount`: the length of the list
+        // currently stored, independent of whether a hash object exists. Keeping
+        // these decoupled is what makes `needs_full_rewrite` Case 2 (missing hash
+        // but existing data) reachable.
+        let existing_count = match list_content {
+            Some(json) => match serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                Ok(stored) => stored.len(),
+                Err(e) if lenient_reads => {
+                    tracing::error!(error = %e, "Failed to parse COS list object: {list_key}");
+                    0
+                }
+                Err(e) => {
+                    return Err(to_core(CosError::Serialization(format!(
+                        "list object {list_key} is not a JSON array: {e}"
+                    ))))
+                }
+            },
+            None => 0,
+        };
+        let stored_hash = match self.object_store.get_string(&hash_key).await {
+            Ok(hash) => hash,
+            Err(e) if lenient_reads => {
+                tracing::error!(error = %e, "Failed to read COS list hash object: {hash_key}");
+                None
+            }
+            Err(e) => return Err(to_core(e)),
+        };
+
+        let current_hash = compute_hash(values);
+        if Self::needs_full_write(values, stored_hash.as_deref(), existing_count) {
+            let json = serde_json::to_string(values).map_err(|e| {
+                to_core(CosError::Serialization(format!(
+                    "failed to serialize list {key}: {e}"
+                )))
+            })?;
+            if let Err(e) = self.object_store.put_string(&list_key, &json).await {
+                if !lenient_reads {
+                    return Err(to_core(e));
+                }
+                tracing::error!(error = %e, "Failed to write COS list object: {list_key}");
+                return Ok(());
+            }
+        }
+        if let Err(e) = self.object_store.put_string(&hash_key, &current_hash).await {
+            if !lenient_reads {
+                return Err(to_core(e));
+            }
+            tracing::error!(error = %e, "Failed to write COS hash object: {hash_key}");
+        }
+        Ok(())
+    }
+
+    /// Whether the list object must be rewritten: the shared hash predicate plus the
+    /// "length changed" fast path (which also covers an unreadable `existing_count`).
+    fn needs_full_write(
+        values: &[serde_json::Value],
+        stored_hash: Option<&str>,
+        existing_count: usize,
+    ) -> bool {
+        needs_full_rewrite(values, stored_hash, existing_count) || values.len() != existing_count
+    }
+
+    /// Shared body of [`AgentStateStore::get`] and [`AgentStateStore::try_get`].
+    ///
+    /// A corrupt payload is an error, not "nothing stored": reporting `None` would let a
+    /// caller silently restart from an empty state on top of data that is actually there.
+    async fn read_state(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::error::Result<Option<serde_json::Value>> {
+        let object_key = self.state_key(user_id, session_id, key).map_err(to_core)?;
+        let Some(json) = self
+            .object_store
+            .get_string(&object_key)
+            .await
+            .map_err(to_core)?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_str(&json).map(Some).map_err(|e| {
+            to_core(CosError::Serialization(format!(
+                "state object {object_key} is not valid JSON: {e}"
+            )))
+        })
+    }
+
+    /// Shared body of [`AgentStateStore::get_list`] and [`AgentStateStore::try_get_list`]
+    /// (same corrupt-payload rule as [`CosAgentStateStore::read_state`]).
+    async fn read_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::error::Result<Vec<serde_json::Value>> {
+        let list_key = self.list_key(user_id, session_id, key).map_err(to_core)?;
+        let Some(json) = self
+            .object_store
+            .get_string(&list_key)
+            .await
+            .map_err(to_core)?
+        else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&json).map_err(|e| {
+            to_core(CosError::Serialization(format!(
+                "list object {list_key} is not a JSON array: {e}"
+            )))
+        })
+    }
+}
+
+/// Maps a [`CosError`] onto the core error type reported by the `try_*` surface.
+fn to_core(e: CosError) -> agentscope_core::error::Error {
+    agentscope_core::error::Error::Other(format!("COS agent state store: {e}"))
 }
 
 /// Builder for [`CosAgentStateStore`].
@@ -187,33 +368,22 @@ impl AgentStateStore for CosAgentStateStore {
         key: &str,
         value: serde_json::Value,
     ) {
-        let object_key = match self.state_key(user_id, session_id, key) {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to save state: {key}");
-                return;
-            }
-        };
-        let json = match serde_json::to_string(&value) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to serialize state: {key}");
-                return;
-            }
-        };
-        if let Err(e) = self.object_store.put_string(&object_key, &json).await {
-            tracing::error!(error = %e, "Failed to write COS object: {object_key}");
-            return;
+        // Best-effort surface: the write is attempted and a failure is only logged, so that
+        // existing callers keep their "state is a cache" behaviour. Use
+        // [`AgentStateStore::try_save`] when a lost write must not go unnoticed.
+        if let Err(e) = self.write_state(user_id, session_id, key, value).await {
+            tracing::error!(error = %e, "Failed to save state: {key}");
         }
-        // Keep the CAS counter in step with the value even on the unconditional path.
-        match self.version_key(user_id, session_id, key) {
-            Ok(version_key) => {
-                if let Err(e) = self.bump_version(&version_key).await {
-                    tracing::error!(error = %e, "Failed to bump COS state version: {version_key}");
-                }
-            }
-            Err(e) => tracing::error!(error = %e, "Failed to resolve version key: {key}"),
-        }
+    }
+
+    async fn try_save(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> agentscope_core::error::Result<()> {
+        self.write_state(user_id, session_id, key, value).await
     }
 
     async fn save_list(
@@ -223,50 +393,24 @@ impl AgentStateStore for CosAgentStateStore {
         key: &str,
         values: &[serde_json::Value],
     ) {
-        let list_key = match self.list_key(user_id, session_id, key) {
-            Ok(k) => k,
-            Err(_) => return,
-        };
-        let hash_key = match self.hash_key(user_id, session_id, key) {
-            Ok(k) => k,
-            Err(_) => return,
-        };
-
-        // `existing_count` mirrors Java's `existingCount`: the length of the list
-        // currently stored, independent of whether a hash object exists. Keeping
-        // these decoupled is what makes `needs_full_rewrite` Case 2 (missing hash
-        // but existing data) reachable.
-        let existing_count = match self
-            .object_store
-            .get_string(&list_key)
+        // Best-effort surface: see `save`. `try_save_list` reports the same failures.
+        if let Err(e) = self
+            .write_list(user_id, session_id, key, values, true)
             .await
-            .unwrap_or(None)
         {
-            Some(json) => serde_json::from_str::<Vec<serde_json::Value>>(&json)
-                .map(|v| v.len())
-                .unwrap_or(0),
-            None => 0,
-        };
-        let stored_hash = self
-            .object_store
-            .get_string(&hash_key)
+            tracing::error!(error = %e, "Failed to save list: {key}");
+        }
+    }
+
+    async fn try_save_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        values: &[serde_json::Value],
+    ) -> agentscope_core::error::Result<()> {
+        self.write_list(user_id, session_id, key, values, false)
             .await
-            .unwrap_or(None);
-
-        let current_hash = compute_hash(values);
-        let full_rewrite = needs_full_rewrite(values, stored_hash.as_deref(), existing_count);
-
-        if full_rewrite || values.len() != existing_count {
-            if let Ok(json) = serde_json::to_string(values) {
-                if let Err(e) = self.object_store.put_string(&list_key, &json).await {
-                    tracing::error!(error = %e, "Failed to write COS list object: {list_key}");
-                    return;
-                }
-            }
-        }
-        if let Err(e) = self.object_store.put_string(&hash_key, &current_hash).await {
-            tracing::error!(error = %e, "Failed to write COS hash object: {hash_key}");
-        }
     }
 
     async fn get(
@@ -275,9 +419,24 @@ impl AgentStateStore for CosAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> Option<serde_json::Value> {
-        let object_key = self.state_key(user_id, session_id, key).ok()?;
-        let json = self.object_store.get_string(&object_key).await.ok()??;
-        serde_json::from_str(&json).ok()
+        // Best-effort surface: an unreadable or corrupt object reads as "nothing stored"
+        // (logged). Use [`AgentStateStore::try_get`] to tell the two apart.
+        match self.read_state(user_id, session_id, key).await {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to read state: {key}");
+                None
+            }
+        }
+    }
+
+    async fn try_get(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::error::Result<Option<serde_json::Value>> {
+        self.read_state(user_id, session_id, key).await
     }
 
     async fn get_list(
@@ -286,41 +445,80 @@ impl AgentStateStore for CosAgentStateStore {
         session_id: &str,
         key: &str,
     ) -> Vec<serde_json::Value> {
-        let list_key = match self.list_key(user_id, session_id, key) {
-            Ok(k) => k,
-            Err(_) => return Vec::new(),
-        };
-        match self.object_store.get_string(&list_key).await.ok().flatten() {
-            Some(json) => serde_json::from_str(&json).unwrap_or_default(),
-            None => Vec::new(),
+        // Best-effort surface: see `get`; `try_get_list` reports the failure instead.
+        match self.read_list(user_id, session_id, key).await {
+            Ok(values) => values,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to read list: {key}");
+                Vec::new()
+            }
         }
+    }
+
+    async fn try_get_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::error::Result<Vec<serde_json::Value>> {
+        self.read_list(user_id, session_id, key).await
     }
 
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
-        let prefix = match session_prefix(&self.key_prefix, user_id, session_id) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        // One object is all that is needed, so ask for a single key instead of
-        // listing the whole session prefix (Java `CosAgentStateStore.exists` sets
-        // `maxKeys=1` for the same reason).
-        match self.object_store.list_page(&prefix, None, 1).await {
-            Ok(page) => !page.keys.is_empty(),
-            Err(_) => false,
+        // Best-effort surface: a backend failure reads as "no state" (logged). Use
+        // [`AgentStateStore::try_exists`] when a wrong `false` would be acted upon.
+        match self.try_exists(user_id, session_id).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to check session existence");
+                false
+            }
         }
     }
 
+    async fn try_exists(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+    ) -> agentscope_core::error::Result<bool> {
+        let prefix = session_prefix(&self.key_prefix, user_id, session_id).map_err(to_core)?;
+        // One object is all that is needed, so ask for a single key instead of
+        // listing the whole session prefix (Java `CosAgentStateStore.exists` sets
+        // `maxKeys=1` for the same reason).
+        let page = self
+            .object_store
+            .list_page(&prefix, None, 1)
+            .await
+            .map_err(to_core)?;
+        Ok(!page.keys.is_empty())
+    }
+
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {
-        let prefix = match session_prefix(&self.key_prefix, user_id, session_id) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        if let Ok(keys) = self.object_store.list_prefix(&prefix).await {
-            // Batch delete (Java `deleteKeys`: 1000 keys per `deleteObjects` call).
-            if !keys.is_empty() {
-                let _ = self.object_store.delete_many(&keys).await;
-            }
+        // Best-effort surface: a failed enumeration/delete is logged and the session is
+        // left as it was. Use [`AgentStateStore::try_delete`] to see the failure.
+        if let Err(e) = self.try_delete(user_id, session_id).await {
+            tracing::error!(error = %e, "Failed to delete session state");
         }
+    }
+
+    async fn try_delete(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+    ) -> agentscope_core::error::Result<()> {
+        let prefix = session_prefix(&self.key_prefix, user_id, session_id).map_err(to_core)?;
+        let keys = self
+            .object_store
+            .list_prefix(&prefix)
+            .await
+            .map_err(to_core)?;
+        if keys.is_empty() {
+            // Nothing stored: no batch call (an empty `deleteObjects` would be a no-op
+            // anyway, and the infallible path has always skipped it).
+            return Ok(());
+        }
+        // Batch delete (Java `deleteKeys`: 1000 keys per `deleteObjects` call).
+        self.object_store.delete_many(&keys).await.map_err(to_core)
     }
 
     async fn delete_key(
@@ -527,15 +725,31 @@ impl AgentStateStore for CosAgentStateStore {
     }
 
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
+        // Best-effort surface: a failed enumeration yields an empty list (logged). Use
+        // [`AgentStateStore::try_list_session_ids`] to tell "no sessions" from "listing broke".
+        match self.try_list_session_ids(user_id).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to list COS sessions");
+                Vec::new()
+            }
+        }
+    }
+
+    async fn try_list_session_ids(
+        &self,
+        user_id: Option<&str>,
+    ) -> agentscope_core::error::Result<Vec<String>> {
         let user_prefix = format!(
             "{}{}/",
             self.key_prefix,
             crate::layout::normalize_user(user_id)
         );
-        let keys = match self.object_store.list_prefix(&user_prefix).await {
-            Ok(k) => k,
-            Err(_) => return Vec::new(),
-        };
+        let keys = self
+            .object_store
+            .list_prefix(&user_prefix)
+            .await
+            .map_err(to_core)?;
         let mut session_ids = BTreeSet::new();
         for key in keys {
             let remainder = &key[user_prefix.len()..];
@@ -545,7 +759,7 @@ impl AgentStateStore for CosAgentStateStore {
                 }
             }
         }
-        session_ids.into_iter().collect()
+        Ok(session_ids.into_iter().collect())
     }
 }
 
@@ -1252,6 +1466,162 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("boom"), "got: {err}");
         assert_eq!(s.get(Some("u1"), "s1", "k").await, None);
+    }
+
+    /// Every `try_*` operation with a real failure source reports the backend error instead of
+    /// degrading to "nothing stored" / `false` / empty list. The infallible counterparts keep
+    /// their best-effort behaviour (COS-02: `try_*` is the fail-fast surface).
+    #[tokio::test]
+    async fn try_surface_reports_failures_while_infallible_degrades() {
+        #[derive(Debug)]
+        struct FailingStore;
+
+        #[async_trait]
+        impl crate::CosObjectStore for FailingStore {
+            async fn get(&self, _key: &str) -> crate::Result<Option<Vec<u8>>> {
+                Err(CosError::Backend("boom".to_string()))
+            }
+            async fn put(&self, _key: &str, _data: &[u8]) -> crate::Result<()> {
+                Err(CosError::Backend("boom".to_string()))
+            }
+            async fn delete(&self, _key: &str) -> crate::Result<()> {
+                Err(CosError::Backend("boom".to_string()))
+            }
+            async fn exists(&self, _key: &str) -> crate::Result<bool> {
+                Err(CosError::Backend("boom".to_string()))
+            }
+            async fn list_prefix(&self, _prefix: &str) -> crate::Result<Vec<String>> {
+                Err(CosError::Backend("boom".to_string()))
+            }
+        }
+
+        let s = CosAgentStateStore::builder()
+            .object_store(Arc::new(FailingStore))
+            .build()
+            .unwrap();
+
+        let failures = [
+            s.try_save(Some("u1"), "s1", "k", serde_json::json!(1))
+                .await
+                .err(),
+            s.try_save_list(Some("u1"), "s1", "items", &[serde_json::json!(1)])
+                .await
+                .err(),
+            s.try_get(Some("u1"), "s1", "k").await.err(),
+            s.try_get_list(Some("u1"), "s1", "items").await.err(),
+            s.try_exists(Some("u1"), "s1").await.err(),
+            s.try_delete(Some("u1"), "s1").await.err(),
+            // `try_delete_key` inherits the fallible `delete_key`; the batch call fails too.
+            s.try_delete_key(Some("u1"), "s1", "k").await.err(),
+            s.try_list_session_ids(Some("u1")).await.err(),
+        ];
+        for (index, err) in failures.iter().enumerate() {
+            let err = err
+                .as_ref()
+                .unwrap_or_else(|| panic!("try_* #{index} swallowed the backend failure"));
+            assert!(err.to_string().contains("boom"), "try_* #{index}: {err}");
+        }
+
+        // Infallible surface: unchanged best-effort degradation, not an error.
+        s.save(Some("u1"), "s1", "k", serde_json::json!(1)).await;
+        s.save_list(Some("u1"), "s1", "items", &[serde_json::json!(1)])
+            .await;
+        assert_eq!(s.get(Some("u1"), "s1", "k").await, None);
+        assert!(s.get_list(Some("u1"), "s1", "items").await.is_empty());
+        assert!(!s.exists(Some("u1"), "s1").await);
+        assert!(s.list_session_ids(Some("u1")).await.is_empty());
+        s.delete(Some("u1"), "s1").await;
+    }
+
+    /// A corrupt payload is a failure, never "absent": otherwise a caller restarts from an
+    /// empty state on top of data that is actually stored (COS-02 ruling).
+    #[tokio::test]
+    async fn corrupt_payloads_are_not_reported_as_absent() {
+        let backend = InMemoryCosObjectStore::new().shared();
+        let s = CosAgentStateStore::builder()
+            .object_store(backend.clone())
+            .build()
+            .unwrap();
+
+        let state_key = s.state_key(Some("u1"), "s1", "k").unwrap();
+        backend.put_string(&state_key, "{not json").await.unwrap();
+        let err = s.try_get(Some("u1"), "s1", "k").await.unwrap_err();
+        assert!(err.to_string().contains("not valid JSON"), "got: {err}");
+        assert_eq!(s.get(Some("u1"), "s1", "k").await, None);
+
+        let list_key = s.list_key(Some("u1"), "s1", "items").unwrap();
+        backend
+            .put_string(&list_key, "{\"not\":\"an array\"}")
+            .await
+            .unwrap();
+        let err = s.try_get_list(Some("u1"), "s1", "items").await.unwrap_err();
+        assert!(err.to_string().contains("not a JSON array"), "got: {err}");
+        assert!(s.get_list(Some("u1"), "s1", "items").await.is_empty());
+
+        // `try_save_list` must not read the corrupt list as "nothing stored" and append onto it.
+        let err = s
+            .try_save_list(Some("u1"), "s1", "items", &[serde_json::json!(1)])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a JSON array"), "got: {err}");
+        // ... while the infallible path keeps its best-effort full rewrite.
+        s.save_list(Some("u1"), "s1", "items", &[serde_json::json!(1)])
+            .await;
+        assert_eq!(
+            s.get_list(Some("u1"), "s1", "items").await,
+            vec![serde_json::json!(1)]
+        );
+
+        // A blank session id is an error on the fallible surface, as in the core default.
+        assert!(s.try_get(Some("u1"), " ", "k").await.is_err());
+        assert!(s.try_exists(Some("u1"), " ").await.is_err());
+    }
+
+    /// On the happy path both surfaces agree — the `try_*` overrides must not change results.
+    #[tokio::test]
+    async fn try_surface_matches_the_infallible_one_on_success() {
+        let s = store();
+        let items = vec![serde_json::json!("a"), serde_json::json!("b")];
+
+        s.try_save(Some("u1"), "s1", "k", serde_json::json!({"v": 1}))
+            .await
+            .unwrap();
+        s.try_save_list(Some("u1"), "s1", "items", &items)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.try_get(Some("u1"), "s1", "k").await.unwrap(),
+            s.get(Some("u1"), "s1", "k").await
+        );
+        assert_eq!(
+            s.try_get_list(Some("u1"), "s1", "items").await.unwrap(),
+            s.get_list(Some("u1"), "s1", "items").await
+        );
+        assert_eq!(
+            s.try_exists(Some("u1"), "s1").await.unwrap(),
+            s.exists(Some("u1"), "s1").await
+        );
+        assert_eq!(
+            s.try_list_session_ids(Some("u1")).await.unwrap(),
+            s.list_session_ids(Some("u1")).await
+        );
+
+        // Absent key / list are `Ok(None)` / `Ok(vec![])`, not errors.
+        assert_eq!(s.try_get(Some("u1"), "s1", "missing").await.unwrap(), None);
+        assert!(s
+            .try_get_list(Some("u1"), "s1", "missing")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Per-key delete succeeds through the inherited `delete_key` and drops the value.
+        s.try_delete_key(Some("u1"), "s1", "k").await.unwrap();
+        assert_eq!(s.try_get(Some("u1"), "s1", "k").await.unwrap(), None);
+
+        s.try_delete(Some("u1"), "s1").await.unwrap();
+        assert!(!s.try_exists(Some("u1"), "s1").await.unwrap());
+        assert!(s.try_list_session_ids(Some("u1")).await.unwrap().is_empty());
     }
 
     /// Blank / `/`-only / backslash / leading-slash prefixes all normalize the Java
