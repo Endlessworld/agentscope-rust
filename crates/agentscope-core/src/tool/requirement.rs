@@ -1,9 +1,10 @@
 //! Built-in `task_requirement_propose` tool, mirroring
 //! `io.agentscope.core.tool.builtin.RequirementTools#proposeRequirement`.
 //!
-//! Opt-in: the host registers the tool itself, so a session that never asked for requirement
-//! tracking does not grow a model-callable surface. A proposal records a candidate only; it
-//! cannot confirm authority, rewrite confirmed text, or mark criteria satisfied.
+//! Opt-in: `ReActAgent::builder().task_requirements_enabled(true)` registers it (Java
+//! `enableTaskRequirements`), so a session that never asked for requirement tracking does not
+//! grow a model-callable surface. A proposal records a candidate only; it cannot confirm
+//! authority, rewrite confirmed text, or mark criteria satisfied.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +12,8 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::message::{JsonMap, ToolResultBlock};
-use crate::state::{AgentState, RequirementKind, RequirementStatus};
+use crate::state::context::TaskContextState;
+use crate::state::{RequirementKind, RequirementStatus};
 
 use super::tool::{Tool, ToolExecutionContext};
 
@@ -25,20 +27,21 @@ const KIND_INVALID: &str = "Requirement kind must be CONSTRAINT or ACCEPTANCE_CR
 
 /// Records one candidate requirement on the session task context.
 ///
-/// Mirrors the Java `stateInjected = true` tool: the live [`AgentState`] is injected by the host,
-/// and a host with no state to inject leaves it `None`, which mirrors Java's `state == null`
-/// error result.
+/// Mirrors the Java `stateInjected = true` tool: the host injects the agent's live task context
+/// and a host with nothing to inject leaves it `None`, which mirrors Java's `state == null` error
+/// result. The task bag (not the whole `AgentState`) is injected because that is the object the
+/// loop reads and persists: `AgentState.tasks_context` is a snapshot refreshed from it.
 pub struct RequirementProposeTool {
-    state: Option<Arc<Mutex<AgentState>>>,
+    tasks: Option<Arc<Mutex<TaskContextState>>>,
 }
 
 impl RequirementProposeTool {
-    /// Builds the tool over the agent state it proposes into.
+    /// Builds the tool over the task context it proposes into.
     ///
-    /// `None` means the host has no state to inject; the tool then refuses every call instead
-    /// of inventing a detached task context the agent loop would never see.
-    pub fn new(state: Option<Arc<Mutex<AgentState>>>) -> Self {
-        Self { state }
+    /// `None` means the host has no task context to inject; the tool then refuses every call
+    /// instead of inventing a detached task context the agent loop would never see.
+    pub fn new(tasks: Option<Arc<Mutex<TaskContextState>>>) -> Self {
+        Self { tasks }
     }
 }
 
@@ -80,7 +83,7 @@ impl Tool for RequirementProposeTool {
     }
 
     async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
-        let Some(state) = self.state.as_ref() else {
+        let Some(tasks) = self.tasks.as_ref() else {
             return Ok(ToolResultBlock::error("Agent state unavailable"));
         };
         let kind = match args.get("kind").and_then(|value| value.as_str()) {
@@ -96,8 +99,8 @@ impl Tool for RequirementProposeTool {
             .and_then(|value| value.as_str())
             .unwrap_or("");
 
-        let mut guard = state.lock().unwrap();
-        match guard.tasks_context.propose(kind, text, source_ref) {
+        let mut guard = tasks.lock().unwrap();
+        match guard.propose(kind, text, source_ref) {
             Ok(id) => Ok(ToolResultBlock::text(format!(
                 "Requirement {id} recorded; status={}. Use current TASK_STATE for requirements. \
                  This receipt does not confirm authority or verification.",
@@ -114,9 +117,9 @@ mod tests {
     use crate::message::ToolResultState;
     use crate::state::TaskRequirement;
 
-    fn tool_with_state() -> (RequirementProposeTool, Arc<Mutex<AgentState>>) {
-        let state = Arc::new(Mutex::new(AgentState::default()));
-        (RequirementProposeTool::new(Some(Arc::clone(&state))), state)
+    fn tool_with_state() -> (RequirementProposeTool, Arc<Mutex<TaskContextState>>) {
+        let tasks = Arc::new(Mutex::new(TaskContextState::default()));
+        (RequirementProposeTool::new(Some(Arc::clone(&tasks))), tasks)
     }
 
     fn call(tool: &RequirementProposeTool, kind: &str) -> ToolResultBlock {
@@ -131,15 +134,15 @@ mod tests {
 
     #[test]
     fn a_proposal_becomes_a_candidate_requirement() {
-        let (tool, state) = tool_with_state();
+        let (tool, tasks) = tool_with_state();
 
         let result = call(&tool, "CONSTRAINT");
 
         assert_eq!(result.final_state(), ToolResultState::Success);
         let receipt = result.text_content();
         assert!(receipt.contains("status=CANDIDATE"), "receipt was {receipt}");
-        let state = state.lock().unwrap();
-        let requirements: &[TaskRequirement] = state.tasks_context.requirements();
+        let tasks = tasks.lock().unwrap();
+        let requirements: &[TaskRequirement] = tasks.requirements();
         assert_eq!(requirements.len(), 1);
         assert_eq!(requirements[0].kind, RequirementKind::Constraint);
         assert_eq!(requirements[0].status, RequirementStatus::Candidate);
@@ -148,13 +151,13 @@ mod tests {
 
     #[test]
     fn an_invalid_kind_is_an_error_result() {
-        let (tool, state) = tool_with_state();
+        let (tool, tasks) = tool_with_state();
 
         let result = call(&tool, "MUST_HAVE");
 
         assert_eq!(result.final_state(), ToolResultState::Error);
         assert!(result.text_content().contains(KIND_INVALID));
-        assert!(state.lock().unwrap().tasks_context.requirements().is_empty());
+        assert!(tasks.lock().unwrap().requirements().is_empty());
     }
 
     #[test]
@@ -179,7 +182,7 @@ mod tests {
 
     #[test]
     fn a_blank_requirement_text_is_rejected_without_touching_the_state() {
-        let (tool, state) = tool_with_state();
+        let (tool, tasks) = tool_with_state();
         let args: JsonMap = serde_json::from_value(serde_json::json!({
             "kind": "CONSTRAINT",
             "text": "   ",
@@ -191,6 +194,6 @@ mod tests {
             futures::executor::block_on(tool.call(args, ToolExecutionContext::default())).unwrap();
 
         assert_eq!(result.final_state(), ToolResultState::Error);
-        assert!(state.lock().unwrap().tasks_context.requirements().is_empty());
+        assert!(tasks.lock().unwrap().requirements().is_empty());
     }
 }

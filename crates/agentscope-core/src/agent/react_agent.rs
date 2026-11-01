@@ -45,7 +45,7 @@ use crate::session::{
 };
 use crate::state::context::TaskContextState;
 use crate::state::AgentState;
-use crate::tool::{TodoWriteTool, ToolExecutionContext, Toolkit};
+use crate::tool::{RequirementProposeTool, TodoWriteTool, ToolExecutionContext, Toolkit};
 
 /// A boxed event sink registered via [`ObservableAgent::subscribe`].
 type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
@@ -93,6 +93,9 @@ struct AgentCore {
     /// Whether a permission rejection of any tool call ends the turn instead of being fed
     /// back to the model. Mirrors Java `ReactConfig.stopOnReject` (default `false`).
     stop_on_reject: bool,
+    /// Whether the built-in `task_requirement_propose` tool was registered at build time.
+    /// Mirrors Java `ReactConfig.taskRequirementsEnabled` (default `false`).
+    task_requirements_enabled: bool,
     state: Arc<Mutex<AgentState>>,
     #[allow(dead_code)]
     enable_pending_tool_recovery: bool,
@@ -415,6 +418,12 @@ impl ReActAgent {
     /// `ReActAgent`'s `ReactConfig.stopOnReject`).
     pub fn stop_on_reject(&self) -> bool {
         self.core.stop_on_reject
+    }
+
+    /// Whether the built-in `task_requirement_propose` tool is registered on this agent
+    /// (mirrors Java `ReactConfig.taskRequirementsEnabled`, default `false`).
+    pub fn task_requirements_enabled(&self) -> bool {
+        self.core.task_requirements_enabled
     }
 
     /// Whether orphaned pending tool calls are auto-patched with synthetic error
@@ -1294,6 +1303,7 @@ pub struct ReActAgentBuilder {
     sys_prompt: String,
     max_iters: i32,
     stop_on_reject: bool,
+    task_requirements_enabled: bool,
     middleware_chain: Option<MiddlewareChain>,
     state: Option<AgentState>,
     enable_pending_tool_recovery: bool,
@@ -1322,6 +1332,7 @@ impl Default for ReActAgentBuilder {
             sys_prompt: String::new(),
             max_iters: 0,
             stop_on_reject: false,
+            task_requirements_enabled: false,
             middleware_chain: None,
             state: None,
             enable_pending_tool_recovery: false,
@@ -1421,6 +1432,16 @@ impl ReActAgentBuilder {
     /// Mirrors Java `ReActAgent.Builder.stopOnReject` / `ReactConfig.stopOnReject`.
     pub fn stop_on_reject(mut self, stop_on_reject: bool) -> Self {
         self.stop_on_reject = stop_on_reject;
+        self
+    }
+    /// Enables candidate requirement proposals independently from todo tracking
+    /// (default `false`). Mirrors Java `ReActAgent.Builder.enableTaskRequirements`.
+    ///
+    /// When enabled, `build()` registers the built-in `task_requirement_propose` tool over
+    /// this agent's own state handle; when disabled the tool is absent, so the model never
+    /// sees it.
+    pub fn task_requirements_enabled(mut self, enabled: bool) -> Self {
+        self.task_requirements_enabled = enabled;
         self
     }
     /// Sets the middleware chain.
@@ -1539,6 +1560,14 @@ impl ReActAgentBuilder {
             toolkit.register_tool(Arc::new(TodoWriteTool::new(Arc::clone(&tasks))));
             chain.add(Box::new(TaskReminderMiddleware::new(Arc::clone(&tasks))));
         }
+        // Java `configureTodoTools`: requirement proposals are an independent opt-in. The tool
+        // gets the shared task bag (Java `stateInjected` mutates `AgentState.tasksContext`) so a
+        // proposal is visible in the same object the loop reads and persists.
+        if self.task_requirements_enabled {
+            toolkit.register_tool(Arc::new(RequirementProposeTool::new(Some(Arc::clone(
+                &tasks,
+            )))));
+        }
 
         let core = Arc::new(AgentCore {
             model: Mutex::new(model),
@@ -1549,6 +1578,7 @@ impl ReActAgentBuilder {
             sys_prompt: self.sys_prompt,
             max_iters,
             stop_on_reject: self.stop_on_reject,
+            task_requirements_enabled: self.task_requirements_enabled,
             state: Arc::new(Mutex::new(initial_state)),
             enable_pending_tool_recovery: self.enable_pending_tool_recovery,
             permission_engine: Mutex::new(PermissionEngine::new(
@@ -8383,6 +8413,88 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].subject, "step one");
         assert_eq!(tasks[0].state, crate::state::context::TaskState::InProgress);
+    }
+
+    #[test]
+    fn task_requirements_are_off_by_default() {
+        // Java `ReactConfig.taskRequirementsEnabled` defaults to false: a session that never
+        // asked for requirement tracking must not grow the model-callable surface.
+        let agent = ReActAgent::builder()
+            .name("t-req-off")
+            .model(Arc::new(MockModel::new("mock", Vec::new())))
+            .build()
+            .unwrap();
+
+        assert!(!agent.task_requirements_enabled());
+        assert!(agent
+            .toolkit()
+            .get_tool("task_requirement_propose")
+            .is_none());
+    }
+
+    #[test]
+    fn task_requirements_register_the_propose_tool() {
+        let agent = ReActAgent::builder()
+            .name("t-req-on")
+            .model(Arc::new(MockModel::new("mock", Vec::new())))
+            .task_requirements_enabled(true)
+            .build()
+            .unwrap();
+
+        assert!(agent.task_requirements_enabled());
+        let tool = agent
+            .toolkit()
+            .get_tool("task_requirement_propose")
+            .expect("the propose tool must be registered");
+        let args: JsonMap = serde_json::from_value(serde_json::json!({
+            "kind": "ACCEPTANCE_CRITERION",
+            "text": "The report must end with a cost table",
+            "source_ref": "user-message-3"
+        }))
+        .unwrap();
+
+        let result =
+            futures::executor::block_on(tool.call(args, ToolExecutionContext::default())).unwrap();
+
+        assert_eq!(
+            result.final_state(),
+            crate::message::ToolResultState::Success
+        );
+        assert!(result.text_content().contains("status=CANDIDATE"));
+    }
+
+    #[tokio::test]
+    async fn a_proposal_made_during_a_call_survives_into_the_agents_state() {
+        // The tool proposes into the shared task bag; the turn boundary must carry that write
+        // into the persisted `AgentState.tasks_context`, not overwrite it with a stale copy.
+        let mut input = JsonMap::new();
+        input.insert("kind".to_string(), serde_json::json!("CONSTRAINT"));
+        input.insert(
+            "text".to_string(),
+            serde_json::json!("Never call the billing API twice"),
+        );
+        input.insert("source_ref".to_string(), serde_json::json!("user-message-5"));
+        let agent = ReActAgent::builder()
+            .name("t-req-state")
+            .model(Arc::new(MockModel::new(
+                "mock",
+                vec![
+                    tool_use_response("r1", "task_requirement_propose", input),
+                    text_response("noted"),
+                ],
+            )))
+            .task_requirements_enabled(true)
+            .build()
+            .unwrap();
+
+        agent.call(vec![Msg::user("remember the constraint")]).await.unwrap();
+
+        let state = agent.agent_state();
+        let requirements = state.tasks_context().requirements();
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].kind, crate::state::RequirementKind::Constraint);
+        assert_eq!(requirements[0].text, "Never call the billing API twice");
+        assert_eq!(requirements[0].proposed_source_ref, "user-message-5");
     }
 
     #[tokio::test]
