@@ -28,10 +28,10 @@ use agentscope_core::{
 use super::dto::{
     AnthropicCacheControl, AnthropicContentBlock, AnthropicImageBlock, AnthropicImageSource,
     AnthropicMessage, AnthropicRequest, AnthropicServerToolUseBlock, AnthropicTextBlock,
-    AnthropicTool, AnthropicToolChoice, AnthropicToolEntry, AnthropicToolResultBlock,
-    AnthropicToolResultContent, AnthropicToolUseBlock, SystemPrompt,
+    AnthropicThinkingBlock, AnthropicTool, AnthropicToolChoice, AnthropicToolEntry,
+    AnthropicToolResultBlock, AnthropicToolResultContent, AnthropicToolUseBlock, SystemPrompt,
 };
-use super::parser::METADATA_SERVER_TOOL_RESULT;
+use super::parser::{METADATA_SERVER_TOOL_RESULT, METADATA_THINKING_SIGNATURE};
 use super::server_tool::AnthropicServerTool;
 use crate::common::tool_search;
 
@@ -218,6 +218,16 @@ fn tool_use_block(block: &ToolUseBlock, fmt: &ChatFormatOptions) -> AnthropicCon
     })
 }
 
+/// Extracts the extended-thinking signature kept in the block metadata.
+fn thinking_signature(thinking: &agentscope_core::ThinkingBlock) -> Option<&str> {
+    thinking
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(METADATA_THINKING_SIGNATURE))
+        .and_then(|value| value.as_str())
+        .filter(|signature| !signature.is_empty())
+}
+
 /// Converts non-tool-result blocks of one message into Anthropic content blocks.
 ///
 /// Returns an empty list when the message carries nothing transferable, which
@@ -241,15 +251,25 @@ pub fn message_content_blocks(
                     cache_control: fmt.cache_control.then(|| fmt.marker()),
                 }));
             }
-            ContentBlock::Thinking(t) => {
-                // Java sends thinking back as plain text (the SDK has no
-                // thinking request block param).
-                if !t.thinking.is_empty() {
-                    out.push(AnthropicContentBlock::Text(AnthropicTextBlock::new(
-                        t.thinking.clone(),
-                    )));
+            ContentBlock::Thinking(t) => match thinking_signature(t) {
+                // A signed block is replayed as a `thinking` input block: Anthropic
+                // requires it once the history mixes thinking with tool use
+                // (MODEL-18). Java replays thinking as plain text, which loses the
+                // signature, so this is a hardening addition, not an alignment gap.
+                Some(signature) => out.push(AnthropicContentBlock::Thinking(
+                    AnthropicThinkingBlock {
+                        thinking: t.thinking.clone(),
+                        signature: Some(signature.to_string()),
+                    },
+                )),
+                None => {
+                    if !t.thinking.is_empty() {
+                        out.push(AnthropicContentBlock::Text(AnthropicTextBlock::new(
+                            t.thinking.clone(),
+                        )));
+                    }
                 }
-            }
+            },
             ContentBlock::Image(i) => out.push(image_content_block(i, fmt)),
             ContentBlock::Data(d) => out.push(data_content_block(d, fmt)),
             ContentBlock::ToolUse(t) => out.push(tool_use_block(t, fmt)),
@@ -775,7 +795,8 @@ pub fn apply_cache_control(messages: &mut [AnthropicMessage], fmt: &ChatFormatOp
             }
             // Provider-executed blocks carry no cache marker, but keep scanning:
             // an earlier cacheable block may still precede them.
-            AnthropicContentBlock::ServerToolUse(_)
+            AnthropicContentBlock::Thinking(_)
+            | AnthropicContentBlock::ServerToolUse(_)
             | AnthropicContentBlock::WebSearchToolResult(_)
             | AnthropicContentBlock::WebFetchToolResult(_)
             | AnthropicContentBlock::CodeExecutionToolResult(_)
@@ -1630,6 +1651,31 @@ mod tests {
         match &out[0].content[0] {
             AnthropicContentBlock::Text(t) => assert_eq!(t.text, "reasoning"),
             other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signed_thinking_blocks_are_replayed_as_thinking_blocks() {
+        // MODEL-18: with a signature (kept from the original response) the block
+        // must go back as a `thinking` block, otherwise Anthropic rejects the
+        // thinking + tool_use history.
+        let parsed = crate::anthropic::parser::parse_message(
+            &serde_json::from_value(serde_json::json!({
+                "id": "msg_t",
+                "content": [
+                    { "type": "thinking", "thinking": "let me check", "signature": "sig-1" }
+                ]
+            }))
+            .unwrap(),
+        );
+        let messages = vec![Msg::assistant_blocks(parsed.content.clone())];
+        let out = to_anthropic_messages(&messages, &plain());
+        match &out[0].content[0] {
+            AnthropicContentBlock::Thinking(t) => {
+                assert_eq!(t.thinking, "let me check");
+                assert_eq!(t.signature.as_deref(), Some("sig-1"));
+            }
+            other => panic!("expected thinking block, got {other:?}"),
         }
     }
 

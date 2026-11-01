@@ -14,6 +14,7 @@
 //! explicit multi-hop paths, mirroring new-api's converter registry.
 
 use agentscope_core::message::ContentBlock;
+use agentscope_core::model::finish_reasons as FinishReasons;
 use agentscope_core::model::ChatResponse;
 
 /// A client-facing protocol the gateway can encode a response into.
@@ -204,20 +205,24 @@ pub fn encode_error(format: RelayFormat, message: &str, error_type: &str) -> ser
 }
 
 fn finish_reason(response: &ChatResponse, claude: bool, gemini: bool) -> String {
-    let raw = response.finish_reason.as_deref().unwrap_or("stop");
+    let raw = response
+        .finish_reason
+        .as_deref()
+        .unwrap_or(FinishReasons::STOP);
     if gemini {
         return match raw {
-            "length" => "MAX_TOKENS".into(),
-            "tool_calls" | "function_call" => "STOP".into(),
+            // Gemini spells its own reasons in upper case; core has no such spelling.
+            FinishReasons::LENGTH => "MAX_TOKENS".into(),
+            FinishReasons::TOOL_CALLS | "function_call" => "STOP".into(),
             "content_filter" => "SAFETY".into(),
             _ => "STOP".into(),
         };
     }
     if claude {
         return match raw {
-            "length" => "max_tokens".into(),
-            "tool_calls" | "function_call" => "tool_use".into(),
-            _ => "end_turn".into(),
+            FinishReasons::LENGTH => FinishReasons::MAX_TOKENS.into(),
+            FinishReasons::TOOL_CALLS | "function_call" => FinishReasons::TOOL_USE.into(),
+            _ => FinishReasons::END_TURN.into(),
         };
     }
     raw.to_string()

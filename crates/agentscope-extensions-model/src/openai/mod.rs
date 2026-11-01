@@ -8,7 +8,7 @@
 //! OpenAI-compatible gateway (DeepSeek/Kimi/GLM/Ollama/... ) by overriding the
 //! base URL and API key.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -28,8 +28,9 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionToolChoiceOption,
     ChatCompletionTools, CompletionUsage, CreateChatCompletionRequest, FinishReason, FunctionCall,
-    FunctionName, FunctionObject, ImageUrl, InputAudio, InputAudioFormat, ReasoningEffort,
-    ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema, ToolChoiceOptions,
+    FunctionName, FunctionObject, ImageDetail, ImageUrl, InputAudio, InputAudioFormat,
+    ReasoningEffort, ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema,
+    ToolChoiceOptions,
 };
 use async_openai::Client;
 use futures::stream::BoxStream;
@@ -40,10 +41,12 @@ use agentscope_core::formatter::{
     convert_tool_result_to_string, extract_text_content, ResponseFormat,
 };
 use agentscope_core::message::{
-    ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, Source, TextBlock, ThinkingBlock, ToolUseBlock,
+    ChatUsage, ContentBlock, ImageDetail as BlockImageDetail, JsonMap, Msg, MsgRole, Source,
+    TextBlock, ThinkingBlock, ToolUseBlock,
 };
 use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
 use agentscope_core::model::context_windows::resolve_context_window;
+use agentscope_core::model::finish_reasons as FinishReasons;
 use agentscope_core::model::generate_options::GenerateOptions;
 use agentscope_core::model::model::{Model, ModelCapabilities};
 use agentscope_core::model::provider::{
@@ -93,6 +96,10 @@ pub struct OpenAiChatModel {
     /// Model-level default for the JSON-schema `strict` flag, applied only when the
     /// request-level schema leaves `strict` unset. Mirrors Java `strictJsonSchema`.
     strict_json_schema: Option<bool>,
+    /// Whether a request-level `ToolChoice::Specific` is honoured. Java enables it
+    /// only on the official endpoint (`OpenAIModelProvider#create`); many
+    /// OpenAI-compatible gateways accept the field but ignore the forced name.
+    supports_tool_choice_specific: bool,
     /// Creation-time options, merged *under* every per-call request.
     ///
     /// Mirrors Java `OpenAIChatModel`: the builder options are merged into the
@@ -146,20 +153,25 @@ impl OpenAiChatModel {
         }
         let client = Client::with_config(cfg).with_http_client(build_http_client());
         let descriptor = descriptor_for(None, &model_name, base_url_for_catalog.as_deref());
-        let context = descriptor
-            .as_ref()
-            .and_then(|descriptor| descriptor.effective_context())
-            .unwrap_or_else(|| resolve_context_window(&model_name));
+        let (capabilities, supports_tool_choice_specific) = resolve_model_capabilities(
+            &HashMap::new(),
+            base_url_for_catalog
+                .as_deref()
+                .unwrap_or(OFFICIAL_BASE_URL),
+            &model_name,
+            descriptor.as_deref(),
+        );
         let reasoning_passback = descriptor
             .as_ref()
             .is_some_and(|descriptor| descriptor.interleaved_field.is_some())
             || Self::requires_reasoning_passback(&model_name);
         Ok(Self {
             client,
-            capabilities: ModelCapabilities::new().context_window_size(context),
+            capabilities,
             descriptor,
             reasoning_passback,
             strict_json_schema: None,
+            supports_tool_choice_specific,
             default_options: GenerateOptions::default(),
             model_name,
         })
@@ -204,10 +216,12 @@ impl OpenAiChatModel {
                 Some(&base_url_for_catalog),
             )
         });
-        let context = descriptor
-            .as_ref()
-            .and_then(|descriptor| descriptor.effective_context())
-            .unwrap_or_else(|| resolve_context_window(&model_name));
+        let (capabilities, supports_tool_choice_specific) = resolve_model_capabilities(
+            &ctx.options.additional_body_params,
+            &base_url_for_catalog,
+            &model_name,
+            descriptor.as_deref(),
+        );
         let reasoning_passback = descriptor
             .as_ref()
             .is_some_and(|descriptor| descriptor.interleaved_field.is_some())
@@ -219,22 +233,30 @@ impl OpenAiChatModel {
             .and_then(|v| v.as_bool());
         // Creation-time options are merged *under* every per-call request
         // (Java `OpenAIChatModel#doStream0` → `mergeOptions(options, configuredOptions)`).
-        // `strictJsonSchema` was already consumed into the model-level default
-        // above and is a provider knob, not a wire field (MODEL-09), so it must
-        // not be re-sent through `additional_body_params`.
+        // `strictJsonSchema` and the capability flags were already consumed into
+        // model-level state above and are provider knobs, not wire fields
+        // (MODEL-06 / MODEL-09), so they must not be re-sent through
+        // `additional_body_params`.
         let mut default_options = ctx.options.clone();
-        default_options
-            .additional_body_params
-            .remove(STRICT_JSON_SCHEMA_OPTION);
+        for key in [
+            STRICT_JSON_SCHEMA_OPTION,
+            NATIVE_STRUCTURED_OUTPUT_OPTION,
+            NATIVE_STRUCTURED_OUTPUT_WITH_TOOLS_OPTION,
+            SUPPORTS_TOOL_CHOICE_SPECIFIC_OPTION,
+            CONTEXT_WINDOW_SIZE_OPTION,
+        ] {
+            default_options.additional_body_params.remove(key);
+        }
         if default_options.stream.is_none() {
             default_options.stream = ctx.stream;
         }
         Ok(Self {
             client,
-            capabilities: ModelCapabilities::new().context_window_size(context),
+            capabilities,
             descriptor,
             reasoning_passback,
             strict_json_schema,
+            supports_tool_choice_specific,
             default_options,
             model_name,
         })
@@ -511,13 +533,65 @@ impl Model for OpenAiChatModel {
     }
 
     fn supports_tool_choice_specific(&self) -> bool {
-        true
+        self.supports_tool_choice_specific
     }
 }
 
 /// Provider option key carrying the model-level JSON-schema `strict` default.
 /// Consumed by [`OpenAiChatModel::from_context`], never sent on the wire.
 const STRICT_JSON_SCHEMA_OPTION: &str = "strictJsonSchema";
+
+/// Provider option keys mirroring Java
+/// `OpenAIModelProviderSupport#applyAdvancedOptions`. They are provider knobs,
+/// never wire fields (the JSON body is built from the typed request).
+const NATIVE_STRUCTURED_OUTPUT_OPTION: &str = "nativeStructuredOutput";
+const NATIVE_STRUCTURED_OUTPUT_WITH_TOOLS_OPTION: &str = "nativeStructuredOutputWithTools";
+const SUPPORTS_TOOL_CHOICE_SPECIFIC_OPTION: &str = "supportsToolChoiceSpecific";
+const CONTEXT_WINDOW_SIZE_OPTION: &str = "contextWindowSize";
+
+/// Base URL of the official OpenAI endpoint (`OpenAIClient.DEFAULT_BASE_URL_WITH_VERSION`).
+const OFFICIAL_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Resolves the capability flags carried by the creation-time options.
+///
+/// Defaults mirror Java `OpenAIModelProvider#create` + `OpenAIChatModel.Builder#build`:
+/// native structured output is on, its with-tools variant follows it,
+/// `ToolChoice::Specific` is honoured only on the official endpoint, and the
+/// context window falls back to the catalog lookup.
+fn resolve_model_capabilities(
+    additional_body_params: &HashMap<String, serde_json::Value>,
+    base_url: &str,
+    model_name: &str,
+    descriptor: Option<&ModelDescriptor>,
+) -> (ModelCapabilities, bool) {
+    let flag = |key: &str| {
+        additional_body_params
+            .get(key)
+            .and_then(|value| value.as_bool())
+    };
+    let native_structured_output = flag(NATIVE_STRUCTURED_OUTPUT_OPTION).unwrap_or(true);
+    let native_structured_output_with_tools =
+        flag(NATIVE_STRUCTURED_OUTPUT_WITH_TOOLS_OPTION).unwrap_or(native_structured_output);
+    let context_window_size = additional_body_params
+        .get(CONTEXT_WINDOW_SIZE_OPTION)
+        .and_then(|value| value.as_u64())
+        .filter(|size| *size > 0)
+        .map(|size| size as usize)
+        .unwrap_or_else(|| {
+            descriptor
+                .and_then(|descriptor| descriptor.effective_context())
+                .unwrap_or_else(|| resolve_context_window(model_name))
+        });
+    let supports_tool_choice_specific = flag(SUPPORTS_TOOL_CHOICE_SPECIFIC_OPTION)
+        .unwrap_or_else(|| base_url.trim_end_matches('/') == OFFICIAL_BASE_URL);
+    (
+        ModelCapabilities::new()
+            .context_window_size(context_window_size)
+            .native_structured_output(native_structured_output)
+            .native_structured_output_with_tools(native_structured_output_with_tools),
+        supports_tool_choice_specific,
+    )
+}
 
 /// Maximum number of `cache_control` markers a provider accepts per request
 /// (Java `OpenAIBaseFormatter#MAX_CACHE_MARKERS`).
@@ -925,7 +999,16 @@ fn user_message_content(msg: &Msg) -> ChatCompletionRequestUserMessageContent {
                 };
                 parts.push(ChatCompletionRequestUserMessageContentPart::ImageUrl(
                     ChatCompletionRequestMessageContentPartImage {
-                        image_url: ImageUrl { url, detail: None },
+                        image_url: ImageUrl {
+                            url,
+                            // MODEL-17: the caller's `detail` reaches the wire;
+                            // `None` keeps the provider default (field omitted).
+                            detail: image.detail.map(|detail| match detail {
+                                BlockImageDetail::Low => ImageDetail::Low,
+                                BlockImageDetail::High => ImageDetail::High,
+                                BlockImageDetail::Auto => ImageDetail::Auto,
+                            }),
+                        },
                     },
                 ));
             }
@@ -1381,7 +1464,8 @@ fn to_response_format(
                     name,
                     schema: serde_json::Value::Object(js.schema.clone()),
                     strict,
-                    description: None,
+                    // MODEL-17: the schema description is forwarded verbatim.
+                    description: js.description.clone(),
                 },
             })
         }
@@ -1677,9 +1761,9 @@ impl StreamIncrementer {
 
 fn finish_reason_string(fr: FinishReason) -> String {
     match fr {
-        FinishReason::Stop => "stop".to_string(),
-        FinishReason::Length => "length".to_string(),
-        FinishReason::ToolCalls => "tool_calls".to_string(),
+        FinishReason::Stop => FinishReasons::STOP.to_string(),
+        FinishReason::Length => FinishReasons::LENGTH.to_string(),
+        FinishReason::ToolCalls => FinishReasons::TOOL_CALLS.to_string(),
         FinishReason::ContentFilter => "content_filter".to_string(),
         FinishReason::FunctionCall => "function_call".to_string(),
     }
@@ -2012,6 +2096,70 @@ mod tests {
             body.get(STRICT_JSON_SCHEMA_OPTION).is_none(),
             "provider knob leaked into the wire body: {body:?}"
         );
+    }
+
+    #[test]
+    fn provider_capability_defaults_match_java() {
+        // MODEL-06: Java `OpenAIModelProvider#create` defaults — native structured
+        // output on, its with-tools variant following it, and `ToolChoice::Specific`
+        // only on the official endpoint.
+        let gateway = OpenAiChatModel::from_context(
+            &ModelCreationContext::new("openai", "gpt-4o")
+                .api_key("sk-test")
+                .base_url("https://example.test/v1"),
+        )
+        .expect("model");
+        assert!(gateway.supports_native_structured_output());
+        assert!(gateway.supports_native_structured_output_with_tools());
+        assert!(
+            !gateway.supports_tool_choice_specific(),
+            "a third-party gateway accepts `tool_choice` but ignores the forced name"
+        );
+
+        let official = OpenAiChatModel::from_context(
+            &ModelCreationContext::new("openai", "gpt-4o")
+                .api_key("sk-test")
+                .base_url("https://api.openai.com/v1"),
+        )
+        .expect("model");
+        assert!(official.supports_tool_choice_specific());
+    }
+
+    #[test]
+    fn capability_options_override_the_defaults() {
+        let mut options = GenerateOptions::default();
+        for (key, value) in [
+            (NATIVE_STRUCTURED_OUTPUT_OPTION, serde_json::json!(false)),
+            (
+                NATIVE_STRUCTURED_OUTPUT_WITH_TOOLS_OPTION,
+                serde_json::json!(true),
+            ),
+            (
+                SUPPORTS_TOOL_CHOICE_SPECIFIC_OPTION,
+                serde_json::json!(true),
+            ),
+            (CONTEXT_WINDOW_SIZE_OPTION, serde_json::json!(32000)),
+        ] {
+            options
+                .additional_body_params
+                .insert(key.to_string(), value);
+        }
+        let model = OpenAiChatModel::from_context(
+            &ModelCreationContext::new("openai", "gateway-chat")
+                .api_key("sk-test")
+                .base_url("https://example.test/v1")
+                .options(options),
+        )
+        .expect("model");
+        assert!(!model.supports_native_structured_output());
+        assert!(model.supports_native_structured_output_with_tools());
+        assert!(model.supports_tool_choice_specific());
+        assert_eq!(model.context_window_size(), 32000);
+
+        // The knobs are provider-side only: they never reach the wire body.
+        let (body, _) = model.prepare_body(vec![sample_msg()], vec![], GenerateOptions::default());
+        assert!(body.get(NATIVE_STRUCTURED_OUTPUT_OPTION).is_none(), "{body:?}");
+        assert!(body.get(CONTEXT_WINDOW_SIZE_OPTION).is_none(), "{body:?}");
     }
 
     #[test]
@@ -2511,6 +2659,7 @@ mod tests {
                 name: Some("person".into()),
                 schema,
                 strict,
+                description: None,
             }),
         }
     }
@@ -2548,6 +2697,66 @@ mod tests {
                 assert_eq!(json_schema.strict, None);
             }
             other => panic!("expected JsonSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_schema_description_reaches_the_request_body() {
+        // MODEL-17: Java keeps the schema description (Java `JsonSchema.description`);
+        // dropping it silently loses caller intent.
+        let mut rf = json_schema_response_format(None);
+        rf.json_schema.as_mut().expect("schema").description = Some("a person".into());
+        let model = cache_capable_model();
+        let options = GenerateOptions::builder().response_format(rf).build();
+        let (body, _) = model.prepare_body(vec![sample_msg()], vec![], options);
+        assert_eq!(
+            body["response_format"]["json_schema"]["description"],
+            serde_json::json!("a person")
+        );
+    }
+
+    #[test]
+    fn image_detail_reaches_the_image_url_part() {
+        // MODEL-17: `ImageBlock.detail` maps onto `image_url.detail`; an unset
+        // detail leaves the field out so the provider default applies.
+        for (detail, expected) in [
+            (
+                Some(agentscope_core::message::ImageDetail::Low),
+                Some("low"),
+            ),
+            (
+                Some(agentscope_core::message::ImageDetail::High),
+                Some("high"),
+            ),
+            (
+                Some(agentscope_core::message::ImageDetail::Auto),
+                Some("auto"),
+            ),
+            (None, None),
+        ] {
+            let mut image = ImageBlock::new(Source::Url(
+                agentscope_core::message::URLSource::new("https://example.test/cat.png"),
+            ));
+            image.detail = detail;
+            let (req, _) = build_request(
+                "gpt-4o".into(),
+                vec![Msg::user_blocks(vec![ContentBlock::Image(image)])],
+                vec![],
+                GenerateOptions::default(),
+                false,
+                None,
+                None,
+            );
+            let body = serde_json::to_value(&req).unwrap();
+            let part = &body["messages"][0]["content"][0]["image_url"];
+            assert_eq!(part["url"], "https://example.test/cat.png");
+            match expected {
+                Some(expected) => assert_eq!(part["detail"], serde_json::json!(expected)),
+                None => assert!(
+                    part.get("detail").is_none(),
+                    "detail must be omitted when unset: {part:?}"
+                ),
+            }
         }
     }
 

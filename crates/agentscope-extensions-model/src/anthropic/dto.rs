@@ -94,6 +94,9 @@ pub enum AnthropicContentBlock {
     Text(AnthropicTextBlock),
     /// An image (base64 or remote URL source).
     Image(AnthropicImageBlock),
+    /// An extended-thinking block. Only replayed on request when the
+    /// signature from the original response is still available.
+    Thinking(AnthropicThinkingBlock),
     /// A model-issued tool call.
     ToolUse(AnthropicToolUseBlock),
     /// A tool execution result (always inside a `user` message).
@@ -151,6 +154,17 @@ impl AnthropicTextBlock {
             cache_control: None,
         }
     }
+}
+
+/// Extended-thinking block (`{"type":"thinking","thinking":...,"signature":...}`).
+///
+/// `signature` is only required when a thinking block is sent back to the API
+/// (thinking + tool use); a response block always carries one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnthropicThinkingBlock {
+    pub thinking: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// Image block.

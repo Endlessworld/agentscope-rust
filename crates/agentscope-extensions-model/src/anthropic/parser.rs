@@ -25,6 +25,14 @@ pub const FRAGMENT_PLACEHOLDER: &str = "__fragment__";
 /// Mirrors Java `AnthropicServerToolHelper.RESULT_METADATA`.
 pub const METADATA_SERVER_TOOL_RESULT: &str = "anthropicServerToolResult";
 
+/// Metadata key preserving the extended-thinking `signature`.
+///
+/// Anthropic requires a signed `thinking` block to be replayed verbatim when the
+/// history contains thinking followed by tool use, so the signature is kept on
+/// the `ThinkingBlock` and turned back into a `thinking` content block by the
+/// converter (MODEL-18, a hardening addition — Java replays thinking as text).
+pub const METADATA_THINKING_SIGNATURE: &str = "anthropicThinkingSignature";
+
 fn usage_of(usage: &AnthropicUsage) -> ChatUsage {
     ChatUsage {
         input_tokens: usage.total_input(),
@@ -58,6 +66,22 @@ pub fn blocks_of(content: &[AnthropicContentBlock]) -> Vec<ContentBlock> {
             }
             // Images never appear in a response.
             AnthropicContentBlock::Image(_) | AnthropicContentBlock::ToolResult(_) => {}
+            AnthropicContentBlock::Thinking(t) => {
+                if !t.thinking.is_empty() {
+                    let mut thinking = ThinkingBlock::new(t.thinking.clone());
+                    // Keep the signature so the block can be replayed as a
+                    // `thinking` input block on the next turn (MODEL-18).
+                    if let Some(signature) = t.signature.as_ref().filter(|s| !s.is_empty()) {
+                        let mut metadata = JsonMap::new();
+                        metadata.insert(
+                            METADATA_THINKING_SIGNATURE.to_string(),
+                            serde_json::json!(signature),
+                        );
+                        thinking.metadata = Some(metadata);
+                    }
+                    blocks.push(ContentBlock::Thinking(thinking));
+                }
+            }
             AnthropicContentBlock::ServerToolUse(t) => {
                 if t.name.is_empty() {
                     continue;

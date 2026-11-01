@@ -39,6 +39,7 @@ use agentscope_core::message::{
 };
 use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
 use agentscope_core::model::context_windows::resolve_context_window;
+use agentscope_core::model::finish_reasons as FinishReasons;
 use agentscope_core::model::generate_options::GenerateOptions;
 use agentscope_core::model::model::{Model, ModelCapabilities};
 use agentscope_core::model::provider::{
@@ -408,9 +409,10 @@ fn to_tool_choice(tc: &CoreToolChoice) -> Option<ToolChoice> {
 
 fn stop_reason_string(reason: &str) -> String {
     match reason {
-        "tool_use" => "tool_calls".to_string(),
-        "end_turn" | "stop_sequence" => "stop".to_string(),
-        "max_tokens" => "length".to_string(),
+        FinishReasons::TOOL_USE => FinishReasons::TOOL_CALLS.to_string(),
+        // `stop_sequence` has no core constant (Anthropic-only ending).
+        FinishReasons::END_TURN | "stop_sequence" => FinishReasons::STOP.to_string(),
+        FinishReasons::MAX_TOKENS => FinishReasons::LENGTH.to_string(),
         other => other.to_string(),
     }
 }

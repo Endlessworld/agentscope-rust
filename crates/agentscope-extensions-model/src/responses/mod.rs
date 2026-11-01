@@ -20,10 +20,11 @@ use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
     CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
-    FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, ImageDetail, InputContent,
-    InputImageContent, InputItem, InputParam, InputTextContent, Item, MessageType, OutputItem,
-    ResponseFormatJsonSchema, ResponseStreamEvent, ResponseTextParam, Role, Status,
-    TextResponseFormatConfiguration, Tool, ToolChoiceFunction, ToolChoiceOptions, ToolChoiceParam,
+    FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, ImageDetail, IncludeEnum,
+    InputContent, InputImageContent, InputItem, InputParam, InputTextContent, Item, MessageType,
+    OutputItem, ReasoningItem, ResponseFormatJsonSchema, ResponseStreamEvent, ResponseTextParam,
+    Role, Status, SummaryPart, SummaryTextContent, TextResponseFormatConfiguration, Tool,
+    ToolChoiceFunction, ToolChoiceOptions, ToolChoiceParam,
 };
 use async_openai::Client;
 use futures::stream::BoxStream;
@@ -35,6 +36,7 @@ use agentscope_core::message::{
     ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, Source, TextBlock, ThinkingBlock, ToolUseBlock,
 };
 use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
+use agentscope_core::model::finish_reasons as FinishReasons;
 use agentscope_core::model::context_windows::resolve_context_window;
 use agentscope_core::model::generate_options::GenerateOptions;
 use agentscope_core::model::model::{Model, ModelCapabilities};
@@ -46,6 +48,9 @@ use agentscope_core::model::tool_schema::ToolSchema;
 
 use crate::common::error::{ErrorKind, ModelError};
 use crate::common::{clamp_max_tokens, diagnostics, resolve_capabilities_with, usage};
+// Replay metadata keys are shared with `openai_official`: one namespace for the
+// whole Responses protocol, so a history produced by either provider replays.
+use crate::openai_official::constants::{MD_REASONING_ENCRYPTED_CONTENT, MD_REASONING_TEXT};
 
 /// An OpenAI Responses API model backed by `async-openai`.
 pub struct OpenAiResponsesModel {
@@ -291,6 +296,8 @@ fn build_request(
 
     let mut instructions: Vec<String> = Vec::new();
     let mut items: Vec<InputItem> = Vec::new();
+    // Whether the history carries reasoning, which decides the `include` list.
+    let mut saw_thinking = false;
 
     for msg in messages {
         match msg.role {
@@ -302,6 +309,20 @@ fn build_request(
             }
             MsgRole::User => items.push(user_input_item(&msg)),
             MsgRole::Assistant => {
+                for thinking in msg.content.iter().filter_map(|block| match block {
+                    ContentBlock::Thinking(thinking) => Some(thinking),
+                    _ => None,
+                }) {
+                    saw_thinking = true;
+                    match reasoning_input_item(thinking) {
+                        Some(item) => items.push(item),
+                        None => diagnostics::warn(
+                            "reasoning_replay_skipped",
+                            "input.reasoning",
+                            "a ThinkingBlock without encrypted reasoning content cannot be replayed as a reasoning item; the block is omitted",
+                        ),
+                    }
+                }
                 let text = extract_text_content(&msg);
                 if !text.is_empty() {
                     items.push(easy_message(Role::Assistant, text));
@@ -384,7 +405,44 @@ fn build_request(
             req.text = Some(text);
         }
     }
+    // Reasoning replay needs the encrypted payload, which the API only emits on
+    // request. Asking for it when nothing in this turn reasons would just bloat
+    // the stream, so the flag is tied to the history / the current options.
+    if saw_thinking || options.reasoning_effort.is_some() || options.thinking_budget.is_some() {
+        req.include = Some(vec![IncludeEnum::ReasoningEncryptedContent]);
+    }
     req
+}
+
+/// Builds the reasoning input item that replays one historical thinking block.
+///
+/// The Responses API only accepts a reasoning item back together with its
+/// `encrypted_content` (see [`IncludeEnum::ReasoningEncryptedContent`]). A block
+/// without that payload is skipped with a diagnostic instead of failing: unlike
+/// `openai_official`, this model also serves OpenAI-compatible gateways, where a
+/// hard error would turn a previously working request into a 400.
+fn reasoning_input_item(thinking: &ThinkingBlock) -> Option<InputItem> {
+    let encrypted = thinking
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(MD_REASONING_ENCRYPTED_CONTENT))
+        .and_then(serde_json::Value::as_str)
+        .filter(|encrypted| !encrypted.is_empty())?;
+    let summary = thinking.thinking.trim();
+    let summary = if summary.is_empty() {
+        Vec::new()
+    } else {
+        vec![SummaryPart::SummaryText(SummaryTextContent {
+            text: summary.to_string(),
+        })]
+    };
+    Some(InputItem::Item(Item::Reasoning(ReasoningItem {
+        id: None,
+        summary,
+        content: None,
+        encrypted_content: Some(encrypted.to_string()),
+        status: None,
+    })))
 }
 
 /// Resolves a media source to the URL a Responses input expects (remote URLs are
@@ -531,8 +589,8 @@ fn to_tool_choice(tc: &ToolChoice) -> Option<ToolChoiceParam> {
 
 fn status_string(status: &Status) -> String {
     match status {
-        Status::Completed => "stop".to_string(),
-        Status::Incomplete => "length".to_string(),
+        Status::Completed => FinishReasons::STOP.to_string(),
+        Status::Incomplete => FinishReasons::LENGTH.to_string(),
         Status::Failed => "failed".to_string(),
         Status::Cancelled => "cancelled".to_string(),
         Status::Queued => "queued".to_string(),
@@ -558,9 +616,50 @@ struct ResponsesIncrementer {
     tool_calls: BTreeMap<u32, ToolCallFragment>,
     usage: Option<ChatUsage>,
     finish_reason: Option<String>,
+    /// Encrypted reasoning payload of this turn, replayed on the next one.
+    reasoning_encrypted: Option<String>,
+    /// Reasoning summary / text of the reasoning item, kept alongside it.
+    reasoning_text: String,
 }
 
 impl ResponsesIncrementer {
+    /// Records the reasoning item emitted as `output_item.done` or repeated in
+    /// the terminal response, so the final chunk can carry the replay metadata.
+    ///
+    /// The reasoning text itself is streamed as `response.reasoning_text.delta`,
+    /// so this only keeps what those deltas cannot express.
+    fn note_reasoning(&mut self, item: &ReasoningItem) {
+        if self.reasoning_encrypted.is_none() {
+            self.reasoning_encrypted = item
+                .encrypted_content
+                .clone()
+                .filter(|encrypted| !encrypted.is_empty());
+        }
+        if self.reasoning_text.is_empty() {
+            let text = item
+                .content
+                .iter()
+                .flatten()
+                .map(|part| match part {
+                    async_openai::types::responses::ReasoningItemContent::ReasoningText(text) => {
+                        text.text.as_str()
+                    }
+                })
+                .collect::<String>();
+            let text = if text.is_empty() {
+                item.summary
+                    .iter()
+                    .map(|part| match part {
+                        SummaryPart::SummaryText(summary) => summary.text.as_str(),
+                    })
+                    .collect::<String>()
+            } else {
+                text
+            };
+            self.reasoning_text = text;
+        }
+    }
+
     fn accumulate(
         &mut self,
         event: &ResponseStreamEvent,
@@ -598,9 +697,19 @@ impl ResponsesIncrementer {
                     frag.name = name.clone();
                 }
             }
+            ResponseStreamEvent::ResponseOutputItemDone(e) => {
+                if let OutputItem::Reasoning(reasoning) = &e.item {
+                    self.note_reasoning(reasoning);
+                }
+            }
             ResponseStreamEvent::ResponseCompleted(e) => {
                 if self.id.is_empty() {
                     self.id = e.response.id.clone();
+                }
+                for item in &e.response.output {
+                    if let OutputItem::Reasoning(reasoning) = item {
+                        self.note_reasoning(reasoning);
+                    }
                 }
                 if let Some(u) = &e.response.usage {
                     let incoming = ChatUsage {
@@ -650,6 +759,26 @@ impl ResponsesIncrementer {
 
     fn into_final(self) -> Option<agentscope_core::model::ChatResponse> {
         let mut blocks: Vec<ContentBlock> = Vec::new();
+        let mut thinking_metadata: JsonMap = JsonMap::new();
+        if let Some(encrypted) = &self.reasoning_encrypted {
+            thinking_metadata.insert(
+                MD_REASONING_ENCRYPTED_CONTENT.to_string(),
+                serde_json::json!(encrypted),
+            );
+        }
+        if !self.reasoning_text.is_empty() {
+            thinking_metadata.insert(
+                MD_REASONING_TEXT.to_string(),
+                serde_json::json!(self.reasoning_text),
+            );
+        }
+        // Emitted without text: the reasoning deltas already produced the visible
+        // thinking content, this block only carries the replay payload.
+        if !thinking_metadata.is_empty() {
+            blocks.push(ContentBlock::Thinking(
+                ThinkingBlock::builder().metadata(thinking_metadata).build(),
+            ));
+        }
         for frag in self.tool_calls.values() {
             let input = parse_arguments(&frag.arguments);
             let mut tool_use = ToolUseBlock::new(frag.id.clone(), frag.name.clone(), input);
@@ -684,7 +813,7 @@ mod tests {
     use agentscope_core::message::{TextBlock, ToolResultBlock};
     use async_openai::types::responses::{
         ResponseFunctionCallArgumentsDeltaEvent, ResponseOutputItemAddedEvent,
-        ResponseTextDeltaEvent,
+        ResponseOutputItemDoneEvent, ResponseTextDeltaEvent,
     };
 
     fn user_msg(text: &str) -> Msg {
@@ -843,6 +972,180 @@ mod tests {
                 assert_eq!(schema.schema["type"], serde_json::json!("object"));
             }
             other => panic!("expected json_schema, got {other:?}"),
+        }
+    }
+
+    fn assistant_thinking(text: &str, encrypted: Option<&str>) -> Msg {
+        let mut thinking = ThinkingBlock::new(text);
+        if let Some(encrypted) = encrypted {
+            let mut metadata = JsonMap::new();
+            metadata.insert(
+                MD_REASONING_ENCRYPTED_CONTENT.to_string(),
+                serde_json::json!(encrypted),
+            );
+            thinking.metadata = Some(metadata);
+        }
+        Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Thinking(thinking)])
+            .build()
+    }
+
+    #[test]
+    fn encrypted_thinking_replays_as_reasoning_item() {
+        // MODEL-10: a reasoning item round-trips only with its encrypted payload.
+        let req = build_request(
+            "gpt-5".to_string(),
+            vec![assistant_thinking("pondering", Some("enc-1"))],
+            vec![],
+            GenerateOptions::default(),
+            None,
+        );
+        match &req.input {
+            InputParam::Items(items) => match &items[0] {
+                InputItem::Item(Item::Reasoning(reasoning)) => {
+                    assert_eq!(reasoning.encrypted_content.as_deref(), Some("enc-1"));
+                    match &reasoning.summary[0] {
+                        SummaryPart::SummaryText(summary) => assert_eq!(summary.text, "pondering"),
+                    }
+                }
+                other => panic!("expected reasoning item, got {other:?}"),
+            },
+            _ => panic!("expected items"),
+        }
+    }
+
+    #[test]
+    fn thinking_without_encrypted_content_is_skipped_not_rejected() {
+        // A gateway that never returned `encrypted_content` must keep working:
+        // the block is dropped, the request is still built.
+        let req = build_request(
+            "gpt-5".to_string(),
+            vec![assistant_thinking("pondering", None)],
+            vec![],
+            GenerateOptions::default(),
+            None,
+        );
+        match &req.input {
+            InputParam::Items(items) => assert!(items.is_empty(), "{items:?}"),
+            _ => panic!("expected items"),
+        }
+    }
+
+    #[test]
+    fn include_requests_reasoning_encrypted_content_only_when_reasoning_is_involved() {
+        let with_history = build_request(
+            "gpt-5".to_string(),
+            vec![assistant_thinking("", Some("enc-1"))],
+            vec![],
+            GenerateOptions::default(),
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(&with_history).unwrap()["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+
+        let with_options = build_request(
+            "gpt-5".to_string(),
+            vec![user_msg("hi")],
+            vec![],
+            GenerateOptions::builder().reasoning_effort("high").build(),
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(&with_options).unwrap()["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+
+        let plain = build_request(
+            "gpt-5".to_string(),
+            vec![user_msg("hi")],
+            vec![],
+            GenerateOptions::default(),
+            None,
+        );
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("include")
+            .is_none());
+    }
+
+    fn reasoning_item(encrypted: &str) -> ReasoningItem {
+        ReasoningItem {
+            id: Some("rs_1".to_string()),
+            summary: vec![SummaryPart::SummaryText(SummaryTextContent {
+                text: "short summary".to_string(),
+            })],
+            content: None,
+            encrypted_content: Some(encrypted.to_string()),
+            status: None,
+        }
+    }
+
+    #[test]
+    fn streamed_reasoning_item_carries_replay_metadata() {
+        let mut acc = ResponsesIncrementer::default();
+        acc.accumulate(&ResponseStreamEvent::ResponseOutputItemDone(
+            ResponseOutputItemDoneEvent {
+                sequence_number: 2,
+                output_index: 0,
+                item: OutputItem::Reasoning(reasoning_item("enc-1")),
+            },
+        ));
+        let final_resp = acc.into_final().expect("final response");
+        assert_eq!(final_resp.content.len(), 1);
+        match &final_resp.content[0] {
+            ContentBlock::Thinking(thinking) => {
+                let metadata = thinking.metadata.as_ref().expect("metadata");
+                assert_eq!(
+                    metadata
+                        .get(MD_REASONING_ENCRYPTED_CONTENT)
+                        .and_then(|v| v.as_str()),
+                    Some("enc-1")
+                );
+                assert_eq!(
+                    metadata.get(MD_REASONING_TEXT).and_then(|v| v.as_str()),
+                    Some("short summary")
+                );
+            }
+            other => panic!("expected thinking block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completed_event_reasoning_item_carries_replay_metadata() {
+        let mut acc = ResponsesIncrementer::default();
+        let event: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "gpt-5",
+                "status": "completed",
+                "output": [{
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{ "type": "summary_text", "text": "short summary" }],
+                    "encrypted_content": "enc-1"
+                }]
+            }
+        }))
+        .expect("completed event");
+        let _ = acc.accumulate(&event);
+        let final_resp = acc.into_final().expect("final response");
+        match &final_resp.content[0] {
+            ContentBlock::Thinking(thinking) => assert_eq!(
+                thinking
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(MD_REASONING_ENCRYPTED_CONTENT))
+                    .and_then(|v| v.as_str()),
+                Some("enc-1")
+            ),
+            other => panic!("expected thinking block, got {other:?}"),
         }
     }
 

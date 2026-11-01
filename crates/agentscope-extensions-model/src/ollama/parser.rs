@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use agentscope_core::model::finish_reasons as FinishReasons;
 use agentscope_core::{ChatResponse, ChatUsage, ContentBlock, JsonMap, TextBlock, ToolUseBlock};
 use uuid::Uuid;
 
@@ -95,7 +96,7 @@ pub fn parse_response(response: &OllamaResponse) -> ChatResponse {
 
     let finish_reason = response.done_reason.clone().or_else(|| {
         if response.done == Some(true) {
-            Some("stop".to_string())
+            Some(FinishReasons::STOP.to_string())
         } else {
             None
         }
@@ -175,7 +176,7 @@ impl OllamaStreamIncrementer {
         if let Some(reason) = &response.done_reason {
             self.finish_reason = Some(reason.clone());
         } else if response.done == Some(true) {
-            self.finish_reason = Some("stop".to_string());
+            self.finish_reason = Some(FinishReasons::STOP.to_string());
         }
 
         if blocks.is_empty() {
