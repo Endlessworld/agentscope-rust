@@ -9,6 +9,7 @@ pub mod emitter;
 pub mod executor;
 pub mod file;
 pub mod group;
+pub mod interceptor;
 pub mod mcp;
 pub mod meta;
 pub mod registration;
@@ -31,6 +32,7 @@ pub use emitter::{
 pub use executor::ToolExecutor;
 pub use file::FilesystemTool;
 pub use group::{ToolGroup, ToolGroupBuilder, ToolGroupManager, ToolGroupScope};
+pub use interceptor::{InterceptorFuture, InterceptorNext, ToolCallInterceptor, ToolInvocation};
 pub use mcp::{McpAsyncHandler, McpTool};
 pub use meta::ToolCallParamBuilder;
 pub use meta::{ExtendedModel, MetaToolFactory, SimpleExtendedModel, ToolCallParam};

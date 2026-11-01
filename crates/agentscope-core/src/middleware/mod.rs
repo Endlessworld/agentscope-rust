@@ -1,11 +1,13 @@
 //! Middleware layer for intercepting agent execution.
 //! Mirrors `io.agentscope.core.middleware`.
 
+pub mod final_answer_filter;
 pub mod input;
 pub mod middleware;
 pub mod task_context_projection;
 pub mod task_reminder;
 
+pub use final_answer_filter::FinalAnswerFilterMiddleware;
 pub use input::{
     ActingInput, ActingResultsHandle, ActingResultsSnapshot, AgentInput, EventStream,
     ModelCallInput, ReasoningInput,

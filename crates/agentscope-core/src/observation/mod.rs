@@ -3,16 +3,17 @@
 //! An observation is a *persistence* boundary, not a best-effort telemetry callback: a failed
 //! acknowledgement must propagate instead of turning into a tool result the model may retry.
 //!
-//! Rust has no `ToolExecutionDetails` / `EvidenceBinding` equivalents in core yet, so the
-//! observation carries only identities, timing, status and error type. Raw arguments, raw
-//! output and exception messages are deliberately never copied into an observation event.
+//! Rust has no `EvidenceBinding` equivalent in core yet, so the observation carries only
+//! identities, timing, status, error type and the producer-supplied [`ToolExecutionDetails`]
+//! (when the tool reported any). Raw arguments, raw output and exception messages are
+//! deliberately never copied into an observation event.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::RuntimeContext;
 use crate::error::Result;
-use crate::message::{ToolResultBlock, ToolResultState, ToolUseBlock};
+use crate::message::{ToolExecutionDetails, ToolResultBlock, ToolResultState, ToolUseBlock};
 use crate::session::SessionRecorder;
 
 /// Runtime-context key carrying a caller-supplied [`ActionObserver`].
@@ -64,6 +65,8 @@ pub struct ActionObservation {
     pub ended_at: Option<i64>,
     pub status: ActionStatus,
     pub error_type: Option<String>,
+    /// Producer-supplied execution facts, when the tool reported any.
+    pub execution_details: Option<ToolExecutionDetails>,
 }
 
 impl ActionObservation {
@@ -80,6 +83,7 @@ impl ActionObservation {
             ended_at: None,
             status: ActionStatus::Started,
             error_type: None,
+            execution_details: None,
         }
     }
 
@@ -89,6 +93,22 @@ impl ActionObservation {
             ended_at: Some(now_millis()),
             status,
             error_type,
+            ..self.clone()
+        }
+    }
+
+    /// Settles the attempt from the result the tool returned: the status follows the
+    /// result state and the producer-supplied execution details travel with it.
+    ///
+    /// Mirrors Java `ActionObservation(..., ToolExecutionDetails executionDetails)`: a
+    /// returned result is not a business verdict, so the status stays factual and the
+    /// details are the producer's own judgement.
+    pub fn settled_from_result(&self, result: &ToolResultBlock) -> Self {
+        Self {
+            ended_at: Some(now_millis()),
+            status: status_of(result),
+            error_type: None,
+            execution_details: result.execution_details(),
             ..self.clone()
         }
     }
@@ -108,6 +128,11 @@ impl ActionObservation {
         }
         if let Some(error_type) = &self.error_type {
             payload.insert("error_type".into(), serde_json::json!(error_type));
+        }
+        if let Some(details) = &self.execution_details {
+            if let Ok(value) = serde_json::to_value(details) {
+                payload.insert("execution_details".into(), value);
+            }
         }
         serde_json::Value::Object(payload)
     }
@@ -258,7 +283,7 @@ where
             let mut identified = result;
             identified.id = Some(call.id.clone());
             identified.name = Some(call.name.clone());
-            let settled = started.settled(status_of(&identified), None);
+            let settled = started.settled_from_result(&identified);
             observer
                 .record(&settled, Some(&identified))
                 .await
@@ -543,5 +568,59 @@ mod tests {
         // The action id is correlated with the tool call.
         assert!(!recorder.action_id("call-1").is_empty());
         recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_settled_observation_carries_the_producer_execution_details() {
+        let ctx = ctx_with(Arc::new(RecordingObserver::default()));
+        let details = crate::message::ToolExecutionDetails::new(
+            "shell",
+            crate::message::ToolExecutionOutcome::Succeeded,
+        )
+        .with_exit_code(0)
+        .with_output_truncated(true);
+
+        let result = observe(&ctx, &call(), async move {
+            Ok(ToolResultBlock::new("x", "y", vec![]).with_execution_details(details))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.execution_details(),
+            Some(
+                crate::message::ToolExecutionDetails::new(
+                    "shell",
+                    crate::message::ToolExecutionOutcome::Succeeded
+                )
+                .with_exit_code(0)
+                .with_output_truncated(true)
+            )
+        );
+    }
+
+    #[test]
+    fn settled_from_result_projects_status_and_details() {
+        let started = ActionObservation::start(&RuntimeContext::new(), &call());
+        assert!(started.execution_details.is_none());
+
+        let result = ToolResultBlock::new("call-1", "read_file", vec![])
+            .with_execution_details(crate::message::ToolExecutionDetails::new(
+                "file_read",
+                crate::message::ToolExecutionOutcome::Failed,
+            ))
+            .with_state(ToolResultState::Denied);
+
+        let settled = started.settled_from_result(&result);
+        assert_eq!(settled.status, ActionStatus::Denied);
+        assert_eq!(
+            settled.execution_details.as_ref().map(|d| d.outcome),
+            Some(crate::message::ToolExecutionOutcome::Failed)
+        );
+        // The facts are projected into the event payload, not dropped.
+        assert_eq!(
+            settled.event_payload()["execution_details"]["kind"],
+            serde_json::json!("file_read")
+        );
     }
 }

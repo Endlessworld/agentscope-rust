@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::message::{JsonMap, ToolResultBlock, ToolUseBlock};
 use crate::model::ExecutionConfig;
 
+use super::interceptor::{run_interceptor_chain, ToolInvocation};
 use super::tool::{Tool, ToolExecutionContext};
 use super::toolkit::Toolkit;
 use super::validator::ToolValidator;
@@ -63,7 +64,44 @@ impl ToolExecutor {
         }
         // 5. Preset parameters override (preset wins over LLM input).
         let input = toolkit.merge_presets(&call.name, call.input.clone());
-        // 6. Timeout + retry around the raw call.
+        // 6. Per-call interception (Java `ToolCallInterceptor`): after schema validation
+        //    and preset merging, before real execution. External tools never reach it
+        //    (they short-circuited above).
+        let interceptors = toolkit.config().call_interceptors.clone();
+        if !interceptors.is_empty() {
+            let invocation = ToolInvocation {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                tool: Arc::clone(&tool),
+                input,
+                runtime: ctx.runtime.clone(),
+            };
+            let owned_call = call.clone();
+            let owned_ctx = ctx.clone();
+            let owned_config = config.cloned();
+            let execution: super::interceptor::InterceptorNext =
+                Box::new(move |invocation: ToolInvocation| {
+                    let call = owned_call.clone();
+                    let ctx = owned_ctx.clone();
+                    let config = owned_config.clone();
+                    Box::pin(async move {
+                        let tool = Arc::clone(&invocation.tool);
+                        execute_with_policy(&tool, &call, ctx, invocation.input, config.as_ref())
+                            .await
+                    })
+                });
+            let call_id = call.id.clone();
+            let call_name = call.name.clone();
+            return match run_interceptor_chain(&interceptors, invocation, execution).await {
+                // A suspend raised by an interceptor has the same semantics as one raised
+                // by the tool itself: the call halts for external execution.
+                Err(Error::ToolSuspended(reason)) => {
+                    Ok(ToolResultBlock::suspended(reason, &call_id, &call_name))
+                }
+                other => other,
+            };
+        }
+        // 7. Timeout + retry around the raw call.
         execute_with_policy(&tool, call, ctx, input, config).await
     }
 

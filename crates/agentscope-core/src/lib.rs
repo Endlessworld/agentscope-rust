@@ -53,11 +53,13 @@ pub use memory::{InMemoryMemory, Memory, StateBackedMemory};
 pub use message::{
     metadata_keys, AudioBlock, Base64Source, ChatUsage, ContentBlock, DataBlock, GenerateReason,
     HintBlock, ImageBlock, JsonMap, Msg, MsgBuilder, MsgRole, Source, TextBlock, ThinkingBlock,
-    ToolCallState, ToolResultBlock, ToolResultState, ToolUseBlock, URLSource, VideoBlock,
+    ToolCallState, ToolExecutionDetails, ToolExecutionOutcome, ToolResultBlock, ToolResultState,
+    ToolUseBlock, URLSource, VideoBlock,
 };
 pub use middleware::{
     ActingInput, ActingResultsHandle, ActingResultsSnapshot, AgentInput, ExtensionPoint,
-    Middleware, MiddlewareChain, ModelCallInput, Next, ReasoningInput, TaskReminderMiddleware,
+    FinalAnswerFilterMiddleware, Middleware, MiddlewareChain, ModelCallInput, Next, ReasoningInput,
+    TaskReminderMiddleware,
 };
 pub use model::{
     resolve_context_window, CachePolicy, ChatResponse, ChatResponseBuilder, ExecutionConfig,
@@ -86,8 +88,9 @@ pub use state::{
 pub use tool::{
     is_dangerous_command, is_dangerous_path, DefaultToolResultConverter, ExtendedModel,
     FunctionTool, MetaToolFactory, SchemaOnlyTool, SimpleExtendedModel, TodoWriteTool, Tool,
-    ToolCallParam, ToolExecutionContext, ToolExecutor, ToolGroup, ToolGroupBuilder,
-    ToolGroupManager, ToolGroupScope, ToolRegistration, ToolResultConverter,
+    ToolCallParam, ToolCallInterceptor, ToolExecutionContext, ToolExecutor, ToolGroup,
+    ToolGroupBuilder, ToolGroupManager, ToolGroupScope, ToolInvocation, ToolRegistration,
+    ToolResultConverter,
     ToolResultMessageBuilder, ToolSuspendException, ToolValidator, Toolkit, ToolkitConfig,
     ToolkitConfigBuilder,
 };

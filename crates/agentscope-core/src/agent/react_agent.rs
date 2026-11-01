@@ -78,6 +78,12 @@ struct AgentCore {
     /// The model bound to this agent. Guarded by a mutex so a session can swap
     /// the model at runtime (dynamic model switching) without rebuilding.
     model: Mutex<Arc<dyn Model>>,
+    /// Optional fallback model invoked once the primary exhausts its retry budget.
+    /// Mirrors Java `ModelConfig.fallbackModel`; `None` leaves the behaviour unchanged.
+    fallback_model: Option<Arc<dyn Model>>,
+    /// Observer notified when the fallback takes over. Mirrors Java
+    /// `ModelConfig.failoverListener`.
+    failover_listener: Option<Arc<dyn crate::agent::FailoverListener>>,
     /// Per-call generation defaults (reasoning effort, retry policy, ...)
     /// merged into every model request built by this agent.
     generate_options_defaults: Mutex<GenerateOptions>,
@@ -1245,6 +1251,8 @@ pub struct ReActAgentBuilder {
     name: String,
     description: String,
     model: Option<Arc<dyn Model>>,
+    fallback_model: Option<Arc<dyn Model>>,
+    failover_listener: Option<Arc<dyn crate::agent::FailoverListener>>,
     toolkit: Option<Toolkit>,
     sys_prompt: String,
     max_iters: i32,
@@ -1270,6 +1278,8 @@ impl Default for ReActAgentBuilder {
             name: String::new(),
             description: String::new(),
             model: None,
+            fallback_model: None,
+            failover_listener: None,
             toolkit: None,
             sys_prompt: String::new(),
             max_iters: 0,
@@ -1314,6 +1324,23 @@ impl ReActAgentBuilder {
     /// Sets the backing model (required).
     pub fn model(mut self, model: Arc<dyn Model>) -> Self {
         self.model = Some(model);
+        self
+    }
+    /// Sets the fallback model, invoked once the primary exhausts its retry budget.
+    ///
+    /// The fallback gets the same retry budget of its own. Mirrors Java
+    /// `ReActAgent.Builder.fallbackModel(Model)`.
+    pub fn fallback_model(mut self, model: Arc<dyn Model>) -> Self {
+        self.fallback_model = Some(model);
+        self
+    }
+    /// Sets the observer notified when the fallback takes over. Mirrors Java
+    /// `ReActAgent.Builder.failoverListener`.
+    pub fn failover_listener(
+        mut self,
+        listener: Arc<dyn crate::agent::FailoverListener>,
+    ) -> Self {
+        self.failover_listener = Some(listener);
         self
     }
     /// Sets the toolkit used for tool execution.
@@ -1469,6 +1496,8 @@ impl ReActAgentBuilder {
 
         let core = Arc::new(AgentCore {
             model: Mutex::new(model),
+            fallback_model: self.fallback_model,
+            failover_listener: self.failover_listener,
             generate_options_defaults: Mutex::new(GenerateOptions::default()),
             toolkit,
             sys_prompt: self.sys_prompt,
@@ -1705,6 +1734,13 @@ async fn execute_iteration(
         let msg = reasoning_phase(core, ctx, state, iter, system_msg).await?;
         let reason = msg.generate_reason();
         let has_tool_calls = has_actionable_tool_calls(&msg);
+        // The calls this round asked for, captured before the acting phase so the
+        // all-denied check below does not have to re-read the assistant message.
+        let round_calls: Vec<ToolUseBlock> = if has_tool_calls {
+            msg.tool_use_blocks().cloned().collect()
+        } else {
+            Vec::new()
+        };
         let outcome = match reason {
             GenerateReason::ModelStop | GenerateReason::ToolCalls => {
                 if has_tool_calls {
@@ -1737,6 +1773,15 @@ async fn execute_iteration(
             // The stop message is the turn's result; the acting phase already persisted the
             // results that ran before the stop, so the context stays well formed.
             return Ok(stopped);
+        }
+        // Every tool call of this round was denied (permission rules, plan mode or HITL):
+        // emit `AllToolsDenied` through the acting middlewares so one of them can stop the
+        // turn. Without a stop the loop reasons again, exactly as it did before this signal
+        // existed. Mirrors Java `emitAllToolsDeniedThroughMiddleware`.
+        if all_tool_calls_denied(state, &round_calls) {
+            if let Some(reason) = emit_all_tools_denied(core, ctx, &round_calls).await {
+                return Ok(last_assistant_message_with_reason(state, reason));
+            }
         }
         if outcome.return_direct {
             // returnDirect short-circuit: the successful tool result *is* the turn's
@@ -2649,7 +2694,7 @@ async fn model_call_impl(
     emit_reaches_consumer: bool,
     mut emit: impl FnMut(Result<AgentEvent>),
 ) -> Result<Msg> {
-    let model = Arc::clone(&mc_input.model);
+    let mut model = Arc::clone(&mc_input.model);
     let messages = mc_input.messages;
     let tools = mc_input.tools;
     let options = mc_input.options;
@@ -2679,6 +2724,9 @@ async fn model_call_impl(
     let mut visible_output_emitted = false;
 
     let mut attempt: u32 = 0;
+    // Whether the call already switched from the primary model to the fallback; the chain
+    // switches at most once per model call.
+    let mut using_fallback = false;
     loop {
         let mut acc = ReasoningContext::default();
         let mut block_lifecycle = BlockLifecycle::new(reply_id.clone());
@@ -2797,6 +2845,8 @@ async fn model_call_impl(
                 return Ok(acc.build_final_message());
             }
             Err(e) => {
+                // The stream borrows the model: release it before a possible switch.
+                drop(stream);
                 attempt += 1;
                 // Retrying is only safe while nothing has been shown to the user.
                 // Once visible text has been streamed, re-running the request would
@@ -2815,6 +2865,31 @@ async fn model_call_impl(
                     return Err(retry_suppressed_error(e));
                 }
                 if attempt >= max_attempts || !e.is_retryable() {
+                    // The primary model gave up: switch to the configured fallback and
+                    // give it its own (identical) retry budget. Interrupts and
+                    // cancellations are not provider failures, so they never fail over;
+                    // a call that already streamed visible output never does either
+                    // (that case returned above, because replaying the request would
+                    // render the prefix twice). Mirrors Java `ModelConfig.fallbackModel`.
+                    if !using_fallback
+                        && !matches!(e, Error::Interrupted(_) | Error::Cancelled(_))
+                    {
+                        if let Some(fallback) = core.fallback_model.as_ref() {
+                            if let Some(listener) = core.failover_listener.as_ref() {
+                                listener.on_failover(model.model_name(), &e);
+                            }
+                            tracing::warn!(
+                                primary = model.model_name(),
+                                fallback = fallback.model_name(),
+                                error = %e,
+                                "primary model failed; switching to the fallback model"
+                            );
+                            model = Arc::clone(fallback);
+                            using_fallback = true;
+                            attempt = 0;
+                            continue;
+                        }
+                    }
                     // Preserve what the model had already produced when the call was
                     // interrupted, so the turn can reconcile its dangling tool_use
                     // instead of silently dropping the partial response. Other
@@ -4142,6 +4217,98 @@ fn strip_event_only_metadata(core: &AgentCore, bound: &mut ToolResultBlock) {
     }
     for key in &core.event_only_tool_metadata {
         bound.metadata.remove(key);
+    }
+}
+
+/// Whether every call in `calls` already has a `tool_result` in `state` and all of them are
+/// `Denied`, mirroring Java `MessageUtils.allToolCallsDenied`.
+///
+/// A malformed call (whose result is an `ERROR`) or a call still missing its result keeps
+/// the round from counting as "all denied": the loop must keep going in both cases.
+fn all_tool_calls_denied(state: &AgentState, calls: &[ToolUseBlock]) -> bool {
+    if calls.is_empty() {
+        return false;
+    }
+    let ids: std::collections::HashSet<&str> = calls.iter().map(|c| c.id.as_str()).collect();
+    let mut states: std::collections::HashMap<&str, ToolResultState> =
+        std::collections::HashMap::new();
+    for message in state.context() {
+        for result in message.tool_result_blocks() {
+            if let Some(id) = result.id.as_deref() {
+                if ids.contains(id) {
+                    states.insert(id, result.final_state());
+                }
+            }
+        }
+    }
+    states.len() == ids.len() && states.values().all(|s| *s == ToolResultState::Denied)
+}
+
+/// Emits `AllToolsDenied` through the acting middleware chain, giving middlewares the
+/// opportunity to stop the turn, and returns the reason they requested.
+///
+/// Mirrors Java `ReActAgent.emitAllToolsDeniedThroughMiddleware`: the event is the only
+/// signal (no tool ran), and a stop is honoured only when a middleware asks for it — the
+/// default `GenerateReason::AllToolsDenied` applies when the request carries none.
+async fn emit_all_tools_denied(
+    core: &Arc<AgentCore>,
+    ctx: &crate::agent::RuntimeContext,
+    denied: &[ToolUseBlock],
+) -> Option<GenerateReason> {
+    let mut fields = JsonMap::new();
+    fields.insert(
+        "denied_tool_calls".to_string(),
+        serde_json::to_value(denied).unwrap_or_default(),
+    );
+    let event = AgentEvent::with_fields(AgentEventType::AllToolsDenied, fields);
+    if core
+        .middleware_chain
+        .participants(ExtensionPoint::OnActing)
+        .is_empty()
+    {
+        // Nobody can react to the signal: it still reaches the observers and the loop
+        // continues with the next reasoning step.
+        emit_delta(&ctx.delta_tx, event);
+        return None;
+    }
+    let mut stream = core.middleware_chain.wrap_acting(
+        ctx.clone(),
+        ActingInput::new(denied.to_vec()),
+        Box::new(move |_input: ActingInput| {
+            Box::pin(futures::stream::iter(vec![Ok(event)])) as EventStream
+        }),
+    );
+    let mut stop = None;
+    while let Some(item) = stream.next().await {
+        let Ok(event) = item else { continue };
+        let is_stop = matches!(&event, AgentEvent::RequestStop(_));
+        if let AgentEvent::RequestStop(data) = &event {
+            stop = Some(stop_reason(data, GenerateReason::AllToolsDenied));
+        }
+        emit_delta(&ctx.delta_tx, event);
+        if is_stop {
+            break;
+        }
+    }
+    stop
+}
+
+/// Builds the turn's result when a middleware stopped it outside the acting stream: the last
+/// assistant message carries the requested reason (Java returns
+/// `lastAssistantMessage().withGenerateReason(reason)`).
+fn last_assistant_message_with_reason(state: &AgentState, reason: GenerateReason) -> Msg {
+    match state
+        .context()
+        .iter()
+        .rev()
+        .find(|message| message.role == MsgRole::Assistant)
+    {
+        Some(message) => message.with_generate_reason(reason),
+        None => Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Text(TextBlock::new(String::new()))])
+            .generate_reason(reason)
+            .build(),
     }
 }
 
@@ -5867,6 +6034,160 @@ mod tests {
         );
     }
 
+    /// A model that always fails retryably and counts its invocations.
+    struct AlwaysFailingModel {
+        name: &'static str,
+        message: &'static str,
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl Model for AlwaysFailingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            *self.calls.lock().unwrap() += 1;
+            let message = self.message;
+            Box::pin(futures::stream::iter(vec![Err(Error::http_status(
+                503, message,
+            ))]))
+        }
+
+        fn model_name(&self) -> &str {
+            self.name
+        }
+    }
+
+    /// Answers with a fixed text and counts its invocations.
+    struct CountingTextModel {
+        name: &'static str,
+        text: &'static str,
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl Model for CountingTextModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            *self.calls.lock().unwrap() += 1;
+            let text = self.text;
+            Box::pin(futures::stream::once(async move {
+                Ok(text_response(text))
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            self.name
+        }
+    }
+
+    /// Records what a failover reported.
+    #[derive(Default)]
+    struct RecordingFailover {
+        primaries: Arc<Mutex<Vec<String>>>,
+        error: Arc<Mutex<Option<String>>>,
+    }
+
+    impl crate::agent::FailoverListener for RecordingFailover {
+        fn on_failover(&self, primary_model: &str, error: &Error) {
+            self.primaries
+                .lock()
+                .unwrap()
+                .push(primary_model.to_string());
+            *self.error.lock().unwrap() = Some(error.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_model_takes_over_after_the_primary_exhausts_its_budget() {
+        // CORE-03: core had a single model and no switch, so a failing primary surfaced
+        // its error instead of trying the configured backup.
+        let primary_calls = Arc::new(Mutex::new(0));
+        let fallback_calls = Arc::new(Mutex::new(0));
+        let listener: Arc<RecordingFailover> = Arc::new(RecordingFailover::default());
+        let listener_for_agent = Arc::clone(&listener);
+        let agent = ReActAgent::builder()
+            .name("t-failover")
+            .model(Arc::new(AlwaysFailingModel {
+                name: "primary",
+                message: "primary down",
+                calls: Arc::clone(&primary_calls),
+            }))
+            .fallback_model(Arc::new(CountingTextModel {
+                name: "fallback",
+                text: "from fallback",
+                calls: Arc::clone(&fallback_calls),
+            }))
+            .failover_listener(listener_for_agent)
+            .build()
+            .unwrap();
+        agent.set_generate_options_defaults(fast_retry_options(2));
+
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+
+        assert_eq!(reply.text_content(), "from fallback");
+        assert_eq!(
+            *primary_calls.lock().unwrap(),
+            2,
+            "the primary must exhaust its own retry budget first"
+        );
+        assert_eq!(*fallback_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *listener.primaries.lock().unwrap(),
+            vec!["primary".to_string()],
+            "the switch must be observable exactly once"
+        );
+        assert!(listener
+            .error
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap_or_default()
+            .contains("primary down"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_fallback_surfaces_its_error_without_switching_again() {
+        let primary_calls = Arc::new(Mutex::new(0));
+        let fallback_calls = Arc::new(Mutex::new(0));
+        let listener: Arc<RecordingFailover> = Arc::new(RecordingFailover::default());
+        let listener_for_agent = Arc::clone(&listener);
+        let agent = ReActAgent::builder()
+            .name("t-failover-failing")
+            .model(Arc::new(AlwaysFailingModel {
+                name: "primary",
+                message: "primary down",
+                calls: Arc::clone(&primary_calls),
+            }))
+            .fallback_model(Arc::new(AlwaysFailingModel {
+                name: "fallback",
+                message: "fallback down",
+                calls: Arc::clone(&fallback_calls),
+            }))
+            .failover_listener(listener_for_agent)
+            .build()
+            .unwrap();
+        agent.set_generate_options_defaults(fast_retry_options(1));
+
+        let err = agent.call(vec![Msg::user("hi")]).await.unwrap_err();
+
+        assert!(err.to_string().contains("fallback down"), "{err}");
+        assert_eq!(*primary_calls.lock().unwrap(), 1);
+        assert_eq!(*fallback_calls.lock().unwrap(), 1);
+        assert_eq!(
+            listener.primaries.lock().unwrap().len(),
+            1,
+            "a failing fallback must not report a second switch"
+        );
+    }
+
     /// Streams a thinking chunk, then fails retryably; succeeds on the second call.
     #[derive(Default)]
     struct ThinkingThenFailModel {
@@ -6927,6 +7248,229 @@ mod tests {
         let results: Vec<ToolResultBlock> = reply.tool_result_blocks().cloned().collect();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.as_deref(), Some("c-partial"));
+    }
+
+    /// Watches the acting stream and, when it sees `AllToolsDenied`, records it and
+    /// optionally asks the agent to stop — the Java middleware reaction.
+    struct AllToolsDeniedWatcher {
+        stop_with: Option<Option<GenerateReason>>,
+        seen: Arc<Mutex<u32>>,
+    }
+
+    impl Middleware for AllToolsDeniedWatcher {
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            vec![ExtensionPoint::OnActing]
+        }
+
+        fn on_acting(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            input: ActingInput,
+            next: Next<ActingInput>,
+        ) -> EventStream {
+            let mut inner = next(input);
+            let seen = Arc::clone(&self.seen);
+            let stop_with = self.stop_with;
+            Box::pin(async_stream::stream! {
+                while let Some(item) = inner.next().await {
+                    let denied = matches!(&item, Ok(AgentEvent::AllToolsDenied(_)));
+                    if denied {
+                        *seen.lock().unwrap() += 1;
+                    }
+                    yield item;
+                    if denied {
+                        if let Some(reason) = stop_with {
+                            yield Ok(stop_event(reason));
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    /// A permission context that denies the `add` tool.
+    fn deny_add() -> PermissionContextState {
+        PermissionContextState::builder()
+            .add_deny_rule(
+                "add",
+                PermissionRule::new("add", None, PermissionBehavior::Deny, "test"),
+            )
+            .build()
+    }
+
+    #[tokio::test]
+    async fn an_all_denied_round_lets_a_middleware_stop_the_turn() {
+        // CORE-02: `AllToolsDenied` had no emission point, so a middleware could never
+        // observe "nothing ran" and stop the turn; the agent reasoned again instead.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", input),
+                text_response("must not be reached"),
+            ],
+        ));
+        let seen = Arc::new(Mutex::new(0));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(AllToolsDeniedWatcher {
+            stop_with: Some(None),
+            seen: Arc::clone(&seen),
+        }));
+        let agent = ReActAgent::builder()
+            .name("t-all-denied-stop")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(deny_add())
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        // A stop without an explicit reason defaults to `AllToolsDenied`.
+        assert_eq!(reply.generate_reason(), GenerateReason::AllToolsDenied);
+        assert_eq!(*counter.lock().unwrap(), 0);
+        assert_eq!(*seen.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_all_denied_round_without_a_stop_keeps_reasoning() {
+        // Backward compatible: the signal alone changes nothing.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", JsonMap::new()),
+                text_response("done"),
+            ],
+        ));
+        let seen = Arc::new(Mutex::new(0));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(AllToolsDeniedWatcher {
+            stop_with: None,
+            seen: Arc::clone(&seen),
+        }));
+        let agent = ReActAgent::builder()
+            .name("t-all-denied-continue")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(deny_add())
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        assert_eq!(reply.text_content(), "done");
+        assert_eq!(reply.generate_reason(), GenerateReason::ModelStop);
+        assert_eq!(*counter.lock().unwrap(), 0);
+        assert_eq!(*seen.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_partially_denied_round_is_not_reported_as_all_denied() {
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "echo",
+            "echoes its input",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_args: JsonMap, _ctx: ToolExecutionContext| {
+                Ok(ToolResultBlock::text("echoed"))
+            }),
+        )));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                // One round with a denied call and an allowed one: the round as a whole is
+                // not "all denied", so no signal and no stop.
+                ChatResponse::builder()
+                    .content(vec![
+                        ContentBlock::ToolUse(ToolUseBlock::new("c1", "add", JsonMap::new())),
+                        ContentBlock::ToolUse(ToolUseBlock::new("c2", "echo", JsonMap::new())),
+                    ])
+                    .build(),
+                text_response("done"),
+            ],
+        ));
+        let seen = Arc::new(Mutex::new(0));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(AllToolsDeniedWatcher {
+            stop_with: Some(None),
+            seen: Arc::clone(&seen),
+        }));
+        let agent = ReActAgent::builder()
+            .name("t-partial-denied")
+            .model(model)
+            .toolkit(toolkit)
+            // A non-trivial context asks for every unlisted mutating tool, so the allowed
+            // call needs an explicit allow rule (the round must contain a real success).
+            .permission_context(
+                PermissionContextState::builder()
+                    .add_deny_rule(
+                        "add",
+                        PermissionRule::new("add", None, PermissionBehavior::Deny, "test"),
+                    )
+                    .add_allow_rule(
+                        "echo",
+                        PermissionRule::new("echo", None, PermissionBehavior::Allow, "test"),
+                    )
+                    .build(),
+            )
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        assert_eq!(reply.text_content(), "done");
+        assert_eq!(*seen.lock().unwrap(), 0, "one allowed call disqualifies the round");
+        assert_eq!(*counter.lock().unwrap(), 0, "the denied call never runs");
+    }
+
+    #[test]
+    fn all_tool_calls_denied_requires_a_denied_result_for_every_call() {
+        let calls = vec![
+            ToolUseBlock::new("c1", "add", JsonMap::new()),
+            ToolUseBlock::new("c2", "echo", JsonMap::new()),
+        ];
+        let denied = |id: &str, name: &str| ToolResultBlock {
+            id: Some(id.to_string()),
+            name: Some(name.to_string()),
+            output: vec![],
+            metadata: Default::default(),
+            state: ToolResultState::Denied,
+        };
+        let mut state = AgentState::default();
+
+        // No result at all: the round cannot be judged as all-denied.
+        assert!(!all_tool_calls_denied(&state, &calls));
+        // Only one of two calls answered: same.
+        state.context_mut().push(Msg::builder().role(MsgRole::Tool).content(vec![
+            ContentBlock::ToolResult(denied("c1", "add")),
+        ]).build());
+        assert!(!all_tool_calls_denied(&state, &calls));
+        // A denied call plus an errored one: not all denied.
+        state.context_mut().push(Msg::builder().role(MsgRole::Tool).content(vec![
+            ContentBlock::ToolResult(error_result(&calls[1], "bad input")),
+        ]).build());
+        assert!(!all_tool_calls_denied(&state, &calls));
+
+        let mut state = AgentState::default();
+        state.context_mut().push(Msg::builder().role(MsgRole::Tool).content(vec![
+            ContentBlock::ToolResult(denied("c1", "add")),
+            ContentBlock::ToolResult(denied("c2", "echo")),
+        ]).build());
+        assert!(all_tool_calls_denied(&state, &calls));
+        assert!(!all_tool_calls_denied(&state, &[]));
     }
 
     /// A model that records the `response_format` of every request it serves.

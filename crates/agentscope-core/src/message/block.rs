@@ -503,6 +503,16 @@ impl ToolResultBlock {
     /// Mirrors the Java `ToolResultBlock.METADATA_SERVER_TOOL`.
     pub const METADATA_SERVER_TOOL: &'static str = "serverTool";
 
+    /// Metadata key carrying the serialized [`ToolExecutionDetails`], named after the Java
+    /// `ToolResultBlock.executionDetails` property.
+    ///
+    /// The facts live in `metadata` rather than in their own field so every existing
+    /// `ToolResultBlock { .. }` construction keeps compiling; [`Self::execution_details`]
+    /// and [`Self::with_execution_details`] are the typed accessors.
+    ///
+    /// [`ToolExecutionDetails`]: super::ToolExecutionDetails
+    pub const METADATA_EXECUTION_DETAILS: &'static str = "executionDetails";
+
     pub fn new(id: &str, name: &str, output: Vec<ContentBlock>) -> Self {
         Self {
             id: Some(id.to_string()),
@@ -682,6 +692,26 @@ impl ToolResultBlock {
         self.metadata
             .get(Self::METADATA_SUSPEND_REASON)
             .and_then(|v| v.as_str())
+    }
+
+    /// Attaches producer-supplied execution facts.
+    ///
+    /// Mirrors Java `ToolResultBlock.withExecutionDetails`.
+    pub fn with_execution_details(mut self, details: super::ToolExecutionDetails) -> Self {
+        if let Ok(value) = serde_json::to_value(&details) {
+            self.metadata
+                .insert(Self::METADATA_EXECUTION_DETAILS.to_string(), value);
+        }
+        self
+    }
+
+    /// The producer-supplied execution facts, when the tool supplied any.
+    ///
+    /// Mirrors Java `ToolResultBlock.getExecutionDetails`.
+    pub fn execution_details(&self) -> Option<super::ToolExecutionDetails> {
+        self.metadata
+            .get(Self::METADATA_EXECUTION_DETAILS)
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
     }
 
     /// Whether this result was produced by a provider-side (server) tool.
