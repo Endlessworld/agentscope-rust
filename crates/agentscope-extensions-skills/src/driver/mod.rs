@@ -5,10 +5,10 @@
 //! drivers offered by the Rust ecosystem are **async**, so this module provides the missing
 //! bridge plus one adapter per backend:
 //!
-//! | backend | driver crate | feature |
-//! |---|---|---|
-//! | PostgreSQL | `tokio-postgres` 0.7 | `postgres-driver` |
-//! | MySQL | `mysql_async` 0.37 | `mysql-driver` |
+//! | backend | driver crate | feature | TLS feature |
+//! |---|---|---|---|
+//! | PostgreSQL | `tokio-postgres` 0.7 | `postgres-driver` | `postgres-tls` (`rustls`) |
+//! | MySQL | `mysql_async` 0.37 | `mysql-driver` | `mysql-tls` (`rustls`) |
 //!
 //! ## Why these two (selection rationale)
 //!
@@ -24,7 +24,16 @@
 //!   its `Any` backend erases the typed decoding these repositories rely on.
 //! * **`mysql_async` uses the `minimal` feature set** (no TLS backend), which keeps the build
 //!   free of `aws-lc-sys` / OpenSSL. Plain-TCP connections are the common in-cluster case; a
-//!   TLS-requiring server must be fronted by a proxy (documented in the tracker).
+//!   TLS-requiring server needs the opt-in `mysql-tls` feature (`rustls` + `ring`, still no
+//!   `aws-lc-sys`) or a plain-TCP proxy.
+//!
+//! ## TLS is opt-in
+//!
+//! `postgres-tls` / `mysql-tls` add the `rustls` stack (plus `tokio-rustls`,
+//! `rustls-native-certs` and `webpki-roots` for PostgreSQL) to the build. Neither the default
+//! build nor a driver-only build compiles any of it: TLS is a deliberate, explicit choice, and
+//! the connection string (`sslmode=require` / `?require_ssl=true`) then decides whether it is
+//! used.
 //!
 //! ## Default build stays dependency-free
 //!
@@ -39,6 +48,8 @@ use crate::error::SkillRepositoryError;
 
 #[cfg(feature = "mysql-driver")]
 mod mysql;
+#[cfg(all(feature = "postgres-driver", feature = "postgres-tls"))]
+mod pg_tls;
 #[cfg(feature = "postgres-driver")]
 mod postgres;
 

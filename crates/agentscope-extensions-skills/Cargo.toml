@@ -11,8 +11,24 @@ rust-version.workspace = true
 default = []
 # Real PostgreSQL `SqlDatabase` over `tokio-postgres` (`src/driver/postgres.rs`).
 postgres-driver = ["dep:tokio", "dep:tokio-postgres", "tokio/rt-multi-thread"]
+# TLS for the PostgreSQL driver, over `rustls` (`src/driver/pg_tls.rs`). Opt-in: the default and
+# driver-only builds compile no TLS backend at all.
+postgres-tls = [
+    "postgres-driver",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:webpki-roots",
+]
 # Real MySQL `SqlDatabase` over `mysql_async` (`src/driver/mysql.rs`).
 mysql-driver = ["dep:tokio", "dep:mysql_async", "tokio/rt-multi-thread"]
+# TLS for the MySQL driver: `mysql_async`'s own `rustls` backend (`ring`, no `aws-lc-sys`).
+mysql-tls = [
+    "mysql-driver",
+    "mysql_async/rustls-tls",
+    "mysql_async/tls12",
+    "mysql_async/ring",
+]
 
 [dependencies]
 agentscope-harness = { path = "../agentscope-harness" }
@@ -33,6 +49,24 @@ tokio-postgres = { workspace = true, optional = true, features = ["runtime"] }
 # (`default-features` was not specified for `workspace.dependencies.mysql_async`) and warns on
 # every build, without changing the resolved feature set.
 mysql_async = { workspace = true, optional = true, features = ["minimal"] }
+
+# TLS backends (opt-in through `postgres-tls` / `mysql-tls`). Not inherited from the workspace
+# because these are only needed here; the versions mirror the ones already resolved in
+# `Cargo.lock`. `default-features = false` on both rustls consumers keeps the `aws-lc-rs`
+# provider (and its `aws-lc-sys` C build) out of the graph: only the pure-Rust `ring` provider
+# is compiled.
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = [
+    "logging",
+    "tls12",
+    "ring",
+] }
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+rustls-native-certs = { version = "0.8", optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 # P2-10: `agentscope-core`, `async-trait`, `futures`, `chrono` and `serde` had zero references in
 # `src/` (including derive macros), and `tokio` was only named in a doc comment - all removed,

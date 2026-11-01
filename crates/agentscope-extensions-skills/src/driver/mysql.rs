@@ -6,12 +6,14 @@
 //! `set_auto_commit(false)` → `START TRANSACTION`, `commit` → `COMMIT`, `rollback` →
 //! `ROLLBACK`.
 //!
-//! Built with `mysql_async`'s `minimal` feature set (no TLS backend); see [`super`].
+//! Built with `mysql_async`'s `minimal` feature set by default (no TLS backend); the opt-in
+//! `mysql-tls` feature adds its `rustls` backend, after which the connection URL decides whether
+//! TLS is used (`?require_ssl=true`).
 
 use std::sync::Arc;
 
 use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Params, Value};
+use mysql_async::{Conn, Opts, Params, Value};
 
 use super::{db_error, SyncBridge};
 use crate::error::SkillRepositoryError;
@@ -27,6 +29,14 @@ const BACKEND: &str = "mysql";
 /// let _conn = db.connection()?;
 /// # Ok::<(), agentscope_extensions_skills::SkillRepositoryError>(())
 /// ```
+///
+/// # TLS
+///
+/// TLS is enabled with the `mysql-tls` feature and requested by the URL: `?require_ssl=true`
+/// makes `mysql_async` wrap the connection in `rustls` (`SslOpts::default()`: the bundled
+/// `webpki-roots` as trust anchors, server name validated), `verify_identity=false` drops the
+/// name check and `verify_ca=false` accepts any certificate. Without the feature a URL carrying
+/// `require_ssl=true` is rejected at construction instead of failing at the handshake.
 pub struct MysqlSqlDatabase {
     bridge: Arc<SyncBridge>,
     url: String,
@@ -56,7 +66,7 @@ impl MysqlSqlDatabase {
 
     fn open(&self) -> Result<Conn, SkillRepositoryError> {
         self.bridge
-            .run(Conn::from_url(&self.url))
+            .run(Conn::new(assemble(&self.url)?))
             .map_err(|e| db_error(BACKEND, e))?
             .map_err(|e| db_error(BACKEND, format!("connection failed: {e}")))
     }
@@ -67,6 +77,23 @@ impl MysqlSqlDatabase {
             .map_err(|e| db_error(BACKEND, e))?
             .map_err(|e| db_error(BACKEND, format!("disconnect failed: {e}")))
     }
+}
+
+/// Parses the connection URL into driver options and enforces the TLS contract.
+///
+/// `mysql_async` turns `?require_ssl=true` into `SslOpts::default()`, which only works when a TLS
+/// backend is compiled in (`mysql-tls`); without one the handshake would fail on first use.
+fn assemble(url: &str) -> Result<Opts, SkillRepositoryError> {
+    let opts = Opts::from_url(url)
+        .map_err(|e| db_error(BACKEND, format!("invalid connection URL: {e}")))?;
+    if !cfg!(feature = "mysql-tls") && opts.ssl_opts().is_some() {
+        return Err(db_error(
+            BACKEND,
+            "the connection URL requires TLS (`require_ssl=true`) but this build has no TLS \
+             backend; enable the `mysql-tls` feature",
+        ));
+    }
+    Ok(opts)
 }
 
 impl SqlDatabase for MysqlSqlDatabase {
@@ -238,6 +265,47 @@ mod tests {
             }
             _ => panic!("expected positional parameters"),
         }
+    }
+
+    #[test]
+    fn plain_urls_stay_plain_tcp() {
+        let opts = assemble("mysql://root@127.0.0.1:3306/agentscope").expect("opts");
+        assert!(opts.ssl_opts().is_none());
+    }
+
+    #[test]
+    fn tls_urls_are_rejected_exactly_when_no_backend_is_compiled_in() {
+        let assembled = assemble("mysql://root@127.0.0.1:3306/agentscope?require_ssl=true");
+        assert_eq!(
+            assembled.is_ok(),
+            cfg!(feature = "mysql-tls"),
+            "`require_ssl=true` must fail exactly when no TLS backend is compiled in"
+        );
+    }
+
+    #[cfg(feature = "mysql-tls")]
+    #[test]
+    fn a_tls_url_assembles_the_default_ssl_opts() {
+        let opts =
+            assemble("mysql://root@127.0.0.1:3306/agentscope?require_ssl=true").expect("opts");
+        assert_eq!(opts.ssl_opts(), Some(&mysql_async::SslOpts::default()));
+
+        let relaxed = assemble(
+            "mysql://root@127.0.0.1:3306/agentscope?require_ssl=true&verify_identity=false",
+        )
+        .expect("opts");
+        assert!(relaxed.ssl_opts().expect("ssl opts").skip_domain_validation());
+    }
+
+    #[cfg(not(feature = "mysql-tls"))]
+    #[test]
+    fn connect_rejects_require_ssl_without_a_tls_backend() {
+        // Rejected before any I/O (port 1 never accepts a TCP connection), so this stays offline.
+        let error = match MysqlSqlDatabase::connect("mysql://root@127.0.0.1:1/none?require_ssl=true") {
+            Ok(_) => panic!("a TLS-only URL must be rejected"),
+            Err(e) => e,
+        };
+        assert!(error.to_string().contains("mysql-tls"), "{error}");
     }
 
     #[test]

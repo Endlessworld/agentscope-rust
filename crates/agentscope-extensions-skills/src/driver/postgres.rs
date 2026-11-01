@@ -8,12 +8,20 @@
 //!   `COMMIT`, `rollback` → `ROLLBACK`) on one session, so a write transaction is atomic.
 //!
 //! The seam is synchronous while the driver is async — see [`super::SyncBridge`].
+//!
+//! With the `postgres-tls` feature the connection is negotiated through [`super::pg_tls`]
+//! (`rustls`); without it the driver speaks plain TCP.
 
 use std::sync::Arc;
 
 use tokio_postgres::types::{ToSql, Type};
-use tokio_postgres::{Client, Config, NoTls};
+use tokio_postgres::config::SslMode;
+use tokio_postgres::{Client, Config};
+#[cfg(not(feature = "postgres-tls"))]
+use tokio_postgres::NoTls;
 
+#[cfg(feature = "postgres-tls")]
+use super::pg_tls;
 use super::{db_error, pg_placeholders, SyncBridge};
 use crate::error::SkillRepositoryError;
 use crate::sql::{SqlConnection, SqlDatabase, SqlParam, SqlRow, SqlValue};
@@ -28,11 +36,23 @@ const BACKEND: &str = "postgres";
 /// let _conn = db.connection()?;
 /// # Ok::<(), agentscope_extensions_skills::SkillRepositoryError>(())
 /// ```
+///
+/// # TLS
+///
+/// The connection string decides *whether* TLS is used, the `postgres-tls` feature decides
+/// whether it *can* be: with it, `sslmode=require` (or `SslMode::Require` on a [`Config`])
+/// enforces a `rustls` handshake against the platform trust store (`webpki-roots` is used when
+/// the platform store yields no usable certificate), and the default `sslmode=prefer` uses TLS
+/// whenever the server offers it. Without the feature a `sslmode=require` string is rejected at
+/// construction instead of failing at the handshake.
 pub struct PgSqlDatabase {
     bridge: Arc<SyncBridge>,
     config: Config,
     /// Column returned by `insert_returning_id` (`id` by default, matching the crate DDL).
     returning_column: String,
+    /// TLS connector (`postgres-tls`), built once so the trust anchors are parsed once per handle.
+    #[cfg(feature = "postgres-tls")]
+    tls: pg_tls::MakeRustlsConnect,
 }
 
 impl PgSqlDatabase {
@@ -42,12 +62,15 @@ impl PgSqlDatabase {
         let config: Config = connection_string
             .parse()
             .map_err(|e| db_error(BACKEND, format!("invalid connection string: {e}")))?;
+        ensure_tls_supported(&config)?;
         let bridge = Arc::new(SyncBridge::new(BACKEND)?);
         // Fail fast: a bad DSN / unreachable server must surface at construction time.
         let database = Self {
             bridge,
             config,
             returning_column: "id".to_string(),
+            #[cfg(feature = "postgres-tls")]
+            tls: pg_tls::MakeRustlsConnect::new()?,
         };
         database.connection()?;
         Ok(database)
@@ -65,10 +88,16 @@ impl PgSqlDatabase {
     }
 
     fn open(&self) -> Result<Client, SkillRepositoryError> {
-        let connected = self
-            .bridge
-            .run(async { self.config.connect(NoTls).await })
-            .map_err(|e| db_error(BACKEND, e))?;
+        // `postgres-tls` swaps `NoTls` for the rustls connector; the DSN still decides whether
+        // TLS is actually negotiated (`sslmode`).
+        #[cfg(feature = "postgres-tls")]
+        let connected = {
+            let tls = self.tls.clone();
+            self.bridge.run(async { self.config.connect(tls).await })
+        };
+        #[cfg(not(feature = "postgres-tls"))]
+        let connected = self.bridge.run(async { self.config.connect(NoTls).await });
+        let connected = connected.map_err(|e| db_error(BACKEND, e))?;
         let (client, connection) = connected.map_err(|e| {
             db_error(
                 BACKEND,
@@ -82,6 +111,22 @@ impl PgSqlDatabase {
         });
         Ok(client)
     }
+}
+
+/// Rejects a connection string that demands TLS when no TLS backend was compiled in.
+///
+/// `tokio-postgres` only reports this at handshake time, after the TCP connect; failing at
+/// construction keeps the message actionable. `sslmode=prefer` (the default) stays allowed: it
+/// simply means "TLS when the server offers it".
+fn ensure_tls_supported(config: &Config) -> Result<(), SkillRepositoryError> {
+    if !cfg!(feature = "postgres-tls") && config.get_ssl_mode() == SslMode::Require {
+        return Err(db_error(
+            BACKEND,
+            "the connection string requires TLS (sslmode=require) but this build has no TLS \
+             backend; enable the `postgres-tls` feature",
+        ));
+    }
+    Ok(())
 }
 
 impl SqlDatabase for PgSqlDatabase {
@@ -370,6 +415,46 @@ mod tests {
     }
 
     #[test]
+    fn only_sslmode_require_needs_a_tls_backend() {
+        let required: Config = "host=127.0.0.1 user=none sslmode=require".parse().unwrap();
+        assert_eq!(
+            ensure_tls_supported(&required).is_ok(),
+            cfg!(feature = "postgres-tls"),
+            "sslmode=require must be rejected exactly when no TLS backend is compiled in"
+        );
+        for dsn in [
+            "host=127.0.0.1 user=none",
+            "host=127.0.0.1 user=none sslmode=prefer",
+            "host=127.0.0.1 user=none sslmode=disable",
+        ] {
+            let config: Config = dsn.parse().unwrap();
+            assert!(ensure_tls_supported(&config).is_ok(), "{dsn}");
+        }
+    }
+
+    #[cfg(not(feature = "postgres-tls"))]
+    #[test]
+    fn connect_rejects_sslmode_require_without_a_tls_backend() {
+        // Rejected before any I/O (port 1 never accepts a TCP connection), so this stays offline.
+        let error = match PgSqlDatabase::connect("host=127.0.0.1 port=1 user=none sslmode=require") {
+            Ok(_) => panic!("a TLS-only connection string must be rejected"),
+            Err(e) => e,
+        };
+        assert!(error.to_string().contains("postgres-tls"), "{error}");
+    }
+
+    #[cfg(feature = "postgres-tls")]
+    #[test]
+    fn a_tls_build_still_accepts_a_plain_tcp_connection_string() {
+        // `sslmode=prefer` (the default) must not force TLS now that a backend exists.
+        let error = match PgSqlDatabase::connect("host=127.0.0.1 port=1 user=none") {
+            Ok(_) => panic!("connecting to a closed port must fail"),
+            Err(e) => e,
+        };
+        assert!(error.to_string().contains("connection failed"), "{error}");
+    }
+
+    #[test]
     fn the_returning_column_defaults_to_id() {
         // Constructor validation needs a live server, so only the accessor is asserted here.
         let config: Config = "host=localhost".parse().unwrap();
@@ -377,6 +462,8 @@ mod tests {
             bridge: Arc::new(SyncBridge::new(BACKEND).unwrap()),
             config,
             returning_column: "id".to_string(),
+            #[cfg(feature = "postgres-tls")]
+            tls: pg_tls::MakeRustlsConnect::new().unwrap(),
         };
         assert_eq!(database.returning_column(), "id");
     }

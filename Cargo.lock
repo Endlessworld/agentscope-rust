@@ -568,11 +568,15 @@ dependencies = [
  "agentscope-harness",
  "base64 0.22.1",
  "mysql_async",
+ "rustls",
+ "rustls-native-certs",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -3598,13 +3602,16 @@ dependencies = [
  "mysql_common",
  "percent-encoding",
  "rand 0.10.2",
+ "rustls",
  "serde",
  "socket2 0.6.5",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "twox-hash",
  "url",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
