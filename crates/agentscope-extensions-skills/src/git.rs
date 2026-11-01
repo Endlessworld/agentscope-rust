@@ -33,7 +33,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentscope_harness::agent::skill::model::AgentSkill;
-use agentscope_harness::agent::skill::repository::load_skills_from_dir;
+use agentscope_harness::agent::skill::repository::{load_skill_from_dir, load_skills_from_dir};
 
 use crate::error::SkillRepositoryError;
 use crate::repository::{AgentSkillRepository, AgentSkillRepositoryInfo};
@@ -492,18 +492,39 @@ impl GitSkillRepository {
         self.ensure_repository_synced()
     }
 
-    /// Loads all skills from the resolved skills directory, applying the Java frontmatter
-    /// identity (`SkillFileSystemHelper`: name/description from the `SKILL.md` frontmatter).
-    fn load_all(&self) -> Result<Vec<AgentSkill>, SkillRepositoryError> {
+    /// The resolved on-disk skills directory (after a sync pass).
+    fn skills_path(&self) -> Result<PathBuf, SkillRepositoryError> {
         self.ensure_auto_synced()?;
-        let path = self
-            .state
+        self.state
             .lock()
             .unwrap()
             .skills_path
             .clone()
-            .ok_or_else(|| SkillRepositoryError::Git("skills path not initialized".into()))?;
+            .ok_or_else(|| SkillRepositoryError::Git("skills path not initialized".into()))
+    }
+
+    /// Loads **every** skill (all `SKILL.md` files and all resources) from the resolved skills
+    /// directory, applying the Java frontmatter identity (`SkillFileSystemHelper`:
+    /// name/description from the `SKILL.md` frontmatter).
+    ///
+    /// SKILLS-06: this is the bulk read and costs O(repository bytes). Name-only and
+    /// single-skill reads must not go through it - [`Self::get_skill`] loads one directory
+    /// ([`load_skill_from_dir`]) and [`Self::get_all_skill_names`] parses frontmatter only
+    /// ([`skill_names_in_dir`]), matching Java `SkillFileSystemHelper.loadSkill` /
+    /// `getAllSkillNames`. Only whole-repository reads (`get_all_skills`) and the existence probe
+    /// that keeps `SkillFileSystemHelper#skillExists` semantics (`skill_exists`) use it.
+    fn load_all(&self) -> Result<Vec<AgentSkill>, SkillRepositoryError> {
+        let path = self.skills_path()?;
         Ok(load_skills_with_frontmatter(&path, &self.get_source()))
+    }
+
+    /// Names of every skill in the resolved skills directory.
+    ///
+    /// Reads only each skill's `SKILL.md` frontmatter - no resource is loaded - so listing names
+    /// is O(#skills) small reads instead of O(repository bytes).
+    fn load_all_names(&self) -> Result<Vec<String>, SkillRepositoryError> {
+        let path = self.skills_path()?;
+        Ok(skill_names_in_dir(&path))
     }
 
     /// Resolves the on-disk directory of a skill, matching on the frontmatter `name` (the same
@@ -523,6 +544,9 @@ impl GitSkillRepository {
                 continue;
             }
             let dir_name = entry.file_name().to_string_lossy().to_string();
+            if !is_reportable_skill_dir(&dir_name) {
+                continue;
+            }
             let name = match std::fs::read_to_string(dir.join("SKILL.md")) {
                 Ok(md) => skill_identity(&md, &dir_name).0,
                 Err(_) => dir_name,
@@ -536,22 +560,27 @@ impl GitSkillRepository {
 }
 
 impl AgentSkillRepository for GitSkillRepository {
+    /// Loads a single skill by its frontmatter `name`.
+    ///
+    /// SKILLS-06: mirrors `SkillFileSystemHelper.loadSkill` - the directory is resolved first
+    /// (frontmatter `name`, directory-name fallback) and only that directory is loaded, so the
+    /// cost is O(target skill bytes) instead of O(repository bytes).
     fn get_skill(&self, name: &str) -> Result<AgentSkill, SkillRepositoryError> {
         crate::util::validate_skill_name(name)?;
-        self.load_all()?
-            .into_iter()
-            .find(|s| s.name() == name)
+        // Surface sync failures as errors (as the old whole-repository load did) instead of
+        // letting `resolve_skill_dir` turn them into a `NotFound`.
+        self.ensure_auto_synced()?;
+        let dir = self
+            .resolve_skill_dir(name)
+            .ok_or_else(|| SkillRepositoryError::NotFound(name.to_string()))?;
+        load_skill_from_dir(&dir, &self.get_source())
+            .map(apply_frontmatter_identity)
+            .filter(|skill| skill.name() == name)
             .ok_or_else(|| SkillRepositoryError::NotFound(name.to_string()))
     }
 
     fn get_all_skill_names(&self) -> Result<Vec<String>, SkillRepositoryError> {
-        let mut names: Vec<String> = self
-            .load_all()?
-            .into_iter()
-            .map(|s| s.name().to_string())
-            .collect();
-        names.sort();
-        Ok(names)
+        self.load_all_names()
     }
 
     fn get_all_skills(&self) -> Result<Vec<AgentSkill>, SkillRepositoryError> {
@@ -714,6 +743,31 @@ fn load_skills_with_frontmatter(root: &Path, source: &str) -> Vec<AgentSkill> {
     skills
 }
 
+/// Names of the skills under `root`, parsed from each `SKILL.md` frontmatter only.
+///
+/// SKILLS-06: mirrors Java `SkillFileSystemHelper.getAllSkillNames` - a directory contributes its
+/// frontmatter `name` (directory-name fallback, same identity as [`load_skills_with_frontmatter`])
+/// and nothing else is read. Directory skipping matches [`load_skills_from_dir`] (hidden entries
+/// and `_drafts`), and a directory without a readable `SKILL.md` has no skill, so it is skipped.
+fn skill_names_in_dir(root: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        if !dir.is_dir() || !is_reportable_skill_dir(&dir_name) {
+            continue;
+        }
+        if let Ok(skill_md) = std::fs::read_to_string(dir.join("SKILL.md")) {
+            names.push(skill_identity(&skill_md, &dir_name).0);
+        }
+    }
+    names.sort();
+    names
+}
+
 /// Rewrites a harness-loaded skill with the frontmatter-derived name / description.
 fn apply_frontmatter_identity(skill: AgentSkill) -> AgentSkill {
     let dir_name = skill.name().to_string();
@@ -765,6 +819,13 @@ fn skill_identity(skill_md: &str, dir_name: &str) -> (String, String) {
 
 fn is_safe_skill_name(name: &str) -> bool {
     !name.contains("..") && !name.contains('/') && !name.contains('\\')
+}
+
+/// Whether a directory under the skills root can hold a skill: hidden entries and `_drafts` are
+/// skipped (the harness `load_skills_from_dir` scan skips both), so name listing, single-skill
+/// loads and bulk loads all report the same set (SKILLS-06).
+fn is_reportable_skill_dir(dir_name: &str) -> bool {
+    !dir_name.starts_with('.') && dir_name != "_drafts"
 }
 
 /// First non-empty body line with leading `#` stripped (harness `skill_description` semantics,
@@ -1794,6 +1855,150 @@ mod tests {
             assert_eq!(names, vec!["one".to_string()]);
         }
         assert_eq!(repo.clone_count(), 1, "the clone must run once");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ------------------------------------------------------------------
+    // SKILLS-06: per-name reads must not load the whole repository
+    // ------------------------------------------------------------------
+
+    /// SKILLS-06: `get_skill` loads only the resolved skill directory, so a sibling skill's
+    /// resources neither leak into the result nor have to be read.
+    #[test]
+    fn get_skill_loads_only_the_target_skill_directory() {
+        let root = unique_dir("single-skill");
+        let remote = root.join("remote");
+        init_repo(&remote);
+
+        let target = remote.join("skills/target");
+        std::fs::create_dir_all(target.join("ref")).unwrap();
+        std::fs::write(
+            target.join("SKILL.md"),
+            "---\nname: target\ndescription: Target\n---\n\n# Target\n",
+        )
+        .unwrap();
+        std::fs::write(target.join("ref/own.md"), "own").unwrap();
+
+        // The sibling carries resources a whole-repository load would have read.
+        let sibling = remote.join("skills/sibling");
+        std::fs::create_dir_all(sibling.join("ref")).unwrap();
+        std::fs::write(
+            sibling.join("SKILL.md"),
+            "---\nname: sibling\ndescription: Sibling\n---\n\n# Sibling\n",
+        )
+        .unwrap();
+        std::fs::write(sibling.join("ref/sibling-only.md"), "sibling").unwrap();
+        std::fs::write(sibling.join("bulk.txt"), "x".repeat(256 * 1024)).unwrap();
+        commit_all(&remote, "initial");
+
+        let repo = repo_for(&file_url(&remote), &root.join("clone"));
+        let skill = repo.get_skill("target").unwrap();
+        assert_eq!(skill.name(), "target");
+        let keys: Vec<&str> = skill.resources().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["SKILL.md", "ref/own.md"]);
+        assert!(!skill.resources().contains_key("ref/sibling-only.md"));
+        assert!(!skill.resources().contains_key("bulk.txt"));
+
+        // The sibling is still reachable on its own.
+        let sibling_skill = repo.get_skill("sibling").unwrap();
+        assert!(sibling_skill
+            .resources()
+            .contains_key("ref/sibling-only.md"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// SKILLS-06: `get_all_skill_names` parses each `SKILL.md` frontmatter and never loads a
+    /// resource, so a huge or non-UTF8 resource changes nothing - and the cheap path reports
+    /// exactly the set the bulk path reports.
+    #[test]
+    fn get_all_skill_names_reads_only_frontmatter() {
+        let root = unique_dir("names-only");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/plain-dir", "plain-name", "P");
+
+        let heavy = remote.join("skills/heavy-dir");
+        std::fs::create_dir_all(heavy.join("assets")).unwrap();
+        std::fs::write(
+            heavy.join("SKILL.md"),
+            "---\nname: heavy-name\n---\n# Heavy\n",
+        )
+        .unwrap();
+        std::fs::write(heavy.join("assets/huge.txt"), "x".repeat(4 * 1024 * 1024)).unwrap();
+        std::fs::write(heavy.join("assets/blob.bin"), [0xff_u8, 0xfe, 0x00, 0x01]).unwrap();
+        commit_all(&remote, "initial");
+
+        let repo = repo_for(&file_url(&remote), &root.join("clone"));
+        let names = repo.get_all_skill_names().unwrap();
+        assert_eq!(
+            names,
+            vec!["heavy-name".to_string(), "plain-name".to_string()]
+        );
+        // Parity with the bulk read: the name-only path must not lose or invent a skill.
+        assert_eq!(
+            names,
+            repo.get_all_skills()
+                .unwrap()
+                .iter()
+                .map(|s| s.name().to_string())
+                .collect::<Vec<_>>()
+        );
+        // The single-skill path still sees the resources it owns.
+        let heavy_skill = repo.get_skill("heavy-name").unwrap();
+        assert!(heavy_skill.resources().contains_key("assets/huge.txt"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// SKILLS-06: the name-only scan applies the same directory filter and frontmatter identity
+    /// as the bulk scan.
+    #[test]
+    fn skill_names_in_dir_skips_hidden_drafts_and_entries_without_skill_md() {
+        let root = unique_dir("names-unit");
+        write_skill(&root, "dir-alpha", "alpha-skill", "a");
+        write_skill(&root, "brvo", "zed-skill", "z");
+        write_skill(&root, ".hidden", "hidden-skill", "h");
+        write_skill(&root, "_drafts", "draft-skill", "d");
+        std::fs::create_dir_all(root.join("no-skill")).unwrap();
+        std::fs::write(root.join("no-skill/README.md"), "no SKILL.md").unwrap();
+        std::fs::write(root.join("stray.md"), "a file, not a directory").unwrap();
+
+        assert_eq!(
+            skill_names_in_dir(&root),
+            vec!["alpha-skill".to_string(), "zed-skill".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// SKILLS-06 parity: hidden directories are not skills for the bulk scan, so the per-name
+    /// reads must not report them either (and a draft nested under `_drafts` is never a skill).
+    #[test]
+    fn hidden_and_draft_directories_are_not_reported_as_skills() {
+        let root = unique_dir("drafts");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        write_skill(&remote, "skills/visible", "visible", "v");
+        write_skill(&remote, "skills/_drafts/pending", "pending", "p");
+        write_skill(&remote, "skills/.hidden-skill", "hidden-skill", "h");
+        commit_all(&remote, "initial");
+
+        let repo = repo_for(&file_url(&remote), &root.join("clone"));
+        assert_eq!(
+            repo.get_all_skill_names().unwrap(),
+            vec!["visible".to_string()]
+        );
+        assert_eq!(repo.get_all_skills().unwrap().len(), 1);
+        for name in ["pending", "hidden-skill"] {
+            assert!(
+                matches!(repo.get_skill(name), Err(SkillRepositoryError::NotFound(_))),
+                "`{name}` must not be loadable by name"
+            );
+            assert!(!repo.skill_exists(name).unwrap());
+        }
+        assert!(repo.skill_dir("hidden-skill").is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
