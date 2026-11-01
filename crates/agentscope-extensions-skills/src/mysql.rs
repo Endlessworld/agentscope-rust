@@ -14,8 +14,9 @@ use crate::error::SkillRepositoryError;
 use crate::repository::{AgentSkillRepository, AgentSkillRepositoryInfo};
 use crate::sql::{SqlConnection, SqlDatabase, SqlParam};
 use crate::util::{
-    build_skill, has_extended_metadata, resolve_identifier, serialize_metadata,
-    validate_identifier, validate_resource_path, validate_skill_name,
+    build_skill, has_extended_metadata, is_skill_document, resolve_identifier,
+    serialize_metadata, skill_body, validate_identifier, validate_resource_path,
+    validate_skill_name,
 };
 
 /// Default database name.
@@ -393,14 +394,17 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
 
     /// The skill body persisted in the `skill_content` column.
     ///
-    /// The harness `AgentSkill` folds the body into the `SKILL.md` resource; the column keeps
-    /// that body for Java schema interoperability.
+    /// The harness `AgentSkill` folds the body into the `SKILL.md` resource; Java keeps it in a
+    /// separate `content` field that *excludes* the YAML frontmatter (`SkillUtil.createFrom` →
+    /// `parsed.getContent()`). Storing the whole document put the frontmatter where Java expects
+    /// prose, so a shared database served `---` as the body (SKILLS-08); the column now holds the
+    /// body only, exactly like Java.
     fn skill_content(&self, skill: &AgentSkill) -> String {
         skill
             .resources()
             .iter()
-            .find(|(path, _)| path.ends_with("SKILL.md"))
-            .map(|(_, content)| content.clone())
+            .find(|(path, _)| is_skill_document(path))
+            .map(|(_, content)| skill_body(content).to_string())
             .unwrap_or_default()
     }
 
@@ -417,15 +421,11 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
         skill_id: i64,
         resources: &SkillResources,
     ) -> Result<(), SkillRepositoryError> {
-        if resources.is_empty() {
-            return Ok(());
-        }
-        let sql = format!(
-            "INSERT INTO {} (id, resource_path, resource_content) VALUES (?, ?, ?)",
-            self.full_table_name(&self.cfg.resources_table_name)
-        );
+        // SKILLS-08: Java `SkillFileSystemHelper.isValidResource` keeps `SKILL.md` out of the
+        // resources map - the document is the `skill_content` column, not a resource row.
         let batch: Vec<Vec<SqlParam>> = resources
             .iter()
+            .filter(|(path, _)| !is_skill_document(path))
             .map(|(path, content)| {
                 vec![
                     SqlParam::Int(skill_id),
@@ -434,12 +434,19 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
                 ]
             })
             .collect();
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let sql = format!(
+            "INSERT INTO {} (id, resource_path, resource_content) VALUES (?, ?, ?)",
+            self.full_table_name(&self.cfg.resources_table_name)
+        );
         let inserted = conn.execute_batch(&sql, &batch)?;
-        if inserted != resources.len() {
+        if inserted != batch.len() {
             // Java throws `SQLException` when `executeBatch` reports fewer rows than the batch.
             return Err(SkillRepositoryError::Database(format!(
                 "failed to insert all resources for id '{skill_id}': expected {}, inserted {inserted}",
-                resources.len()
+                batch.len()
             )));
         }
         Ok(())
@@ -957,10 +964,73 @@ mod tests {
         let r = MysqlSkillRepository::new(db.clone()).unwrap();
         r.save(&[skill("calc", "calc skill")], false).unwrap();
 
-        // `skill()` carries SKILL.md + a.txt, both in a single execute_batch call.
-        assert_eq!(db.batch_sizes(), vec![2]);
-        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 2);
+        // `skill()` carries SKILL.md + a.txt; SKILL.md is the `skill_content` column, so only
+        // a.txt is a resource row (SKILLS-08, Java `isValidResource`) - still one batch.
+        assert_eq!(db.batch_sizes(), vec![1]);
+        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 1);
+        // The body comes back from `skill_content`, so the caller still sees two resources.
         assert_eq!(r.get_skill("calc").unwrap().resources().len(), 2);
+    }
+
+    /// SKILLS-08: Java `SkillUtil.createFrom` stores `parsed.getContent()` - the body after the
+    /// YAML frontmatter - in `skill_content`. Storing the whole document made a shared database
+    /// serve `---` as the skill body to Java readers.
+    #[test]
+    fn skill_content_stores_the_body_without_frontmatter() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let r = MysqlSkillRepository::new(db.clone()).unwrap();
+        let document = AgentSkill::builder()
+            .name("calc")
+            .source("custom")
+            .description("A calculator")
+            .add_resource(
+                "SKILL.md",
+                "---\nname: calc\ndescription: A calculator\n---\n# Calc\nrun it\n",
+            )
+            .add_resource("scripts/run.sh", "echo hi")
+            .build();
+        r.save(&[document], false).unwrap();
+
+        let rows = db.rows("agentscope_skills");
+        assert_eq!(rows.len(), 1);
+        let content = rows[0]
+            .get("skill_content")
+            .and_then(|value| value.as_text())
+            .expect("skill_content")
+            .to_string();
+        assert_eq!(content, "# Calc\nrun it\n");
+        assert!(!content.contains("---"), "frontmatter leaked: {content}");
+        // `SKILL.md` is the body column, never a resource row.
+        assert_eq!(db.rows("agentscope_skill_resources").len(), 1);
+    }
+
+    /// A row written by Java (body only, no `SKILL.md` resource row) reads back with the column
+    /// identity and the body restored as `SKILL.md`.
+    #[test]
+    fn java_shaped_rows_are_read_back_with_their_identity() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let r = MysqlSkillRepository::new(db.clone()).unwrap();
+        let mut conn = db.connection().unwrap();
+        conn.execute(
+            "INSERT INTO agentscope.agentscope_skills (name, description, skill_content, source) \
+             VALUES (?, ?, ?, ?)",
+            &[
+                SqlParam::Text("calc".to_string()),
+                SqlParam::Text("A calculator".to_string()),
+                SqlParam::Text("# Calc\nrun it\n".to_string()),
+                SqlParam::Text("custom".to_string()),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let skill = r.get_skill("calc").unwrap();
+        assert_eq!(skill.name(), "calc");
+        assert_eq!(skill.description(), "A calculator");
+        assert_eq!(
+            skill.resources().get("SKILL.md").map(String::as_str),
+            Some("# Calc\nrun it\n")
+        );
     }
 
     /// Java throws when `executeBatch` reports fewer rows than the batch held.
@@ -971,11 +1041,11 @@ mod tests {
         let err = r.save(&[skill("calc", "calc skill")], false).unwrap_err();
         match err {
             SkillRepositoryError::Database(message) => {
-                assert!(message.contains("expected 2, inserted 1"), "{message}")
+                assert!(message.contains("expected 1, inserted 0"), "{message}")
             }
             other => panic!("unexpected error: {other:?}"),
         }
-        assert_eq!(db.batch_sizes(), vec![2], "one batch, then the row check");
+        assert_eq!(db.batch_sizes(), vec![1], "one batch, then the row check");
     }
 
     // ------------------------------------------------------------------
@@ -989,7 +1059,7 @@ mod tests {
         let db = Arc::new(InterceptingSqlDatabase::failing("DELETE FROM", 1));
         let r = MysqlSkillRepository::new(db.clone()).unwrap();
         r.save(&[skill("a", "1")], false).unwrap();
-        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 2);
+        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 1);
 
         let err = r.delete("a").unwrap_err();
         assert!(
@@ -999,7 +1069,7 @@ mod tests {
         assert_eq!(db.failures(), 1, "only the skill-row DELETE may fail");
 
         // Rolled back: the resource rows survived the failed DELETE.
-        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 2);
+        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 1);
         assert!(r.skill_exists("a").unwrap());
         let loaded = r.get_skill("a").unwrap();
         assert_eq!(

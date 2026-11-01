@@ -29,7 +29,10 @@ tokio = { workspace = true, optional = true }
 # `runtime` enables `Config::connect` / `tokio_postgres::connect` (feature-gated in 0.7).
 tokio-postgres = { workspace = true, optional = true, features = ["runtime"] }
 # `minimal` keeps the build free of TLS backends (no `aws-lc-sys` / OpenSSL); plain TCP only.
-mysql_async = { workspace = true, optional = true, default-features = false, features = ["minimal"] }
+# `default-features` is deliberately absent: cargo ignores it for a workspace dependency
+# (`default-features` was not specified for `workspace.dependencies.mysql_async`) and warns on
+# every build, without changing the resolved feature set.
+mysql_async = { workspace = true, optional = true, features = ["minimal"] }
 
 # P2-10: `agentscope-core`, `async-trait`, `futures`, `chrono` and `serde` had zero references in
 # `src/` (including derive macros), and `tokio` was only named in a doc comment - all removed,

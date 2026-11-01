@@ -37,6 +37,7 @@ use agentscope_harness::agent::skill::repository::{load_skill_from_dir, load_ski
 
 use crate::error::SkillRepositoryError;
 use crate::repository::{AgentSkillRepository, AgentSkillRepositoryInfo};
+use crate::util::split_frontmatter;
 
 /// Configuration for [`GitSkillRepository`].
 #[derive(Debug, Clone)]
@@ -838,42 +839,6 @@ fn first_body_line(skill_md: &str) -> Option<String> {
         .find(|line| !line.is_empty())
         .map(|line| line.trim_start_matches('#').trim().to_string())
         .filter(|line| !line.is_empty())
-}
-
-/// Splits `---`-fenced YAML frontmatter into `(frontmatter, body)`.
-fn split_frontmatter(markdown: &str) -> (Option<&str>, &str) {
-    let text = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
-    let rest = match text.strip_prefix("---") {
-        // Java `MarkdownSkillParser.FRONTMATTER_PATTERN` is `^\uFEFF?---\s*[\r\n]+...`, so blank
-        // space between the opening fence and the line break is allowed (SKILLS-05); a suffix
-        // (`---x`) is not a fence.
-        Some(rest) => {
-            let after_blanks = rest.trim_start_matches([' ', '\t']);
-            match after_blanks
-                .strip_prefix("\r\n")
-                .or_else(|| after_blanks.strip_prefix('\n'))
-            {
-                None => return (None, text),
-                Some(after) => after.trim_start_matches(['\r', '\n']),
-            }
-        }
-        None => return (None, text),
-    };
-    let mut offset = 0usize;
-    for line in rest.split_inclusive('\n') {
-        // Java `MarkdownSkillParser.FRONTMATTER_PATTERN` requires the closing `---` / `...` to
-        // occupy the whole line on its own: it must directly follow a `\r` / `\n` (lookbehind),
-        // and only blank space may follow it before the next line break. So no leading
-        // indentation is allowed (an indented `  ---` is `|` / `>` block content), while
-        // trailing spaces / tabs stay permitted.
-        let raw = line.trim_end_matches(['\r', '\n']);
-        let candidate = raw.trim_end_matches([' ', '\t']);
-        if candidate == "---" || candidate == "..." {
-            return (Some(&rest[..offset]), &rest[offset + line.len()..]);
-        }
-        offset += line.len();
-    }
-    (None, text)
 }
 
 /// Extracts the top-level scalar keys of the YAML frontmatter (the subset the skill identity
@@ -1999,6 +1964,66 @@ mod tests {
             assert!(!repo.skill_exists(name).unwrap());
         }
         assert!(repo.skill_dir("hidden-skill").is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ------------------------------------------------------------------
+    // SKILLS-11: real assembly path (`HarnessAgentBuilder::skill_repository`)
+    // ------------------------------------------------------------------
+
+    /// The adapter was unit-tested in isolation only: no case proved that a repository handed to
+    /// `HarnessAgentBuilder::skill_repository` survives `build()` and still answers `load()` /
+    /// `skill_dir()` there ("tests green != production path correct"). This walks the real entry
+    /// point: a `file://` git repository -> `RepoBackedSkillRepository` -> builder -> composed
+    /// repository list.
+    #[test]
+    fn adapter_is_mounted_through_the_harness_assembly_path() {
+        use std::sync::Arc;
+
+        use agentscope_harness::agent::skill::SkillRepository;
+        use agentscope_harness::agent::HarnessAgent;
+
+        let root = unique_dir("assembly");
+        let remote = root.join("remote");
+        init_repo(&remote);
+        // Directory name differs from the frontmatter name so the identity is observable.
+        write_skill(&remote, "calc-dir", "calc-skill", "A calculator");
+        commit_all(&remote, "initial");
+
+        let git = Arc::new(repo_for(&file_url(&remote), &root.join("clone")));
+        let adapter: Arc<dyn SkillRepository> =
+            Arc::new(crate::repository::RepoBackedSkillRepository::new(git, None));
+        let repo_id = adapter.repo_id();
+
+        let cwd = root.join("cwd");
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let agent = HarnessAgent::builder()
+            .cwd(cwd)
+            .workspace(workspace)
+            .skill_repository(Arc::clone(&adapter))
+            .build();
+
+        let mounted = agent
+            .skill_repositories()
+            .iter()
+            .find(|repo| repo.repo_id() == repo_id)
+            .expect("the builder must mount the extension repository");
+        assert!(
+            Arc::ptr_eq(mounted, &adapter),
+            "the builder must mount the caller's instance, not a copy"
+        );
+
+        let skills = mounted.load();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name(), "calc-skill");
+        assert_eq!(skills[0].description(), "A calculator");
+        let dir = mounted
+            .skill_dir("calc-skill")
+            .expect("git repositories expose the checkout directory");
+        assert!(dir.join("SKILL.md").is_file());
 
         let _ = std::fs::remove_dir_all(&root);
     }

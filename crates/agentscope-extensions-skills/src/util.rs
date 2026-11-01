@@ -115,6 +115,60 @@ pub fn validate_identifier(
     Ok(())
 }
 
+/// Splits `---`-fenced YAML frontmatter into `(frontmatter, body)`.
+///
+/// Lives here rather than in [`crate::git`] because the SQL backends need the same parse to
+/// persist the Java-shaped `skill_content` column (body only; SKILLS-08), and a second copy of
+/// the fence rules would drift from the git loader.
+pub fn split_frontmatter(markdown: &str) -> (Option<&str>, &str) {
+    let text = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
+    let rest = match text.strip_prefix("---") {
+        // Java `MarkdownSkillParser.FRONTMATTER_PATTERN` is `^\uFEFF?---\s*[\r\n]+...`, so blank
+        // space between the opening fence and the line break is allowed (SKILLS-05); a suffix
+        // (`---x`) is not a fence.
+        Some(rest) => {
+            let after_blanks = rest.trim_start_matches([' ', '\t']);
+            match after_blanks
+                .strip_prefix("\r\n")
+                .or_else(|| after_blanks.strip_prefix('\n'))
+            {
+                None => return (None, text),
+                Some(after) => after.trim_start_matches(['\r', '\n']),
+            }
+        }
+        None => return (None, text),
+    };
+    let mut offset = 0usize;
+    for line in rest.split_inclusive('\n') {
+        // Java `MarkdownSkillParser.FRONTMATTER_PATTERN` requires the closing `---` / `...` to
+        // occupy the whole line on its own: it must directly follow a `\r` / `\n` (lookbehind),
+        // and only blank space may follow it before the next line break. So no leading
+        // indentation is allowed (an indented `  ---` is `|` / `>` block content), while
+        // trailing spaces / tabs stay permitted.
+        let raw = line.trim_end_matches(['\r', '\n']);
+        let candidate = raw.trim_end_matches([' ', '\t']);
+        if candidate == "---" || candidate == "..." {
+            return (Some(&rest[..offset]), &rest[offset + line.len()..]);
+        }
+        offset += line.len();
+    }
+    (None, text)
+}
+
+/// The skill body as Java persists it in `skill_content`: the `SKILL.md` markdown **without** its
+/// YAML frontmatter (`SkillUtil.createFrom` → `parsed.getContent()`).
+pub fn skill_body(markdown: &str) -> &str {
+    split_frontmatter(markdown).1
+}
+
+/// Whether a resource path is the skill document itself.
+///
+/// Java `SkillFileSystemHelper.isValidResource` keeps `SKILL.md` out of the resources map: the
+/// document is the skill *body* (`skill_content` column), everything else is a resource row.
+pub fn is_skill_document(path: &str) -> bool {
+    path.ends_with("SKILL.md")
+}
+
 /// Serializes a skill's metadata tree for the `metadata_json` column.
 pub fn serialize_metadata(metadata: &Metadata) -> String {
     serde_json::to_string(metadata).unwrap_or_else(|_| "{}".to_string())
@@ -208,6 +262,20 @@ mod tests {
         assert!(validate_identifier("9bad", "table", 64).is_err());
         assert!(validate_identifier("bad-name", "table", 64).is_err());
         assert!(validate_identifier("drop;table", "table", 64).is_err());
+    }
+
+    // SKILLS-08: the SQL backends persist this body in `skill_content`.
+    #[test]
+    fn skill_body_drops_only_the_frontmatter() {
+        assert_eq!(
+            skill_body("---\nname: x\ndescription: d\n---\n# Body\ntext\n"),
+            "# Body\ntext\n"
+        );
+        // No frontmatter: the whole document is the body.
+        assert_eq!(skill_body("# Body\ntext\n"), "# Body\ntext\n");
+        assert!(is_skill_document("SKILL.md"));
+        assert!(is_skill_document("sub/SKILL.md"));
+        assert!(!is_skill_document("sub/a.md"));
     }
 
     #[test]

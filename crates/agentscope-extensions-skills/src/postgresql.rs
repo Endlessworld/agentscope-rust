@@ -16,8 +16,9 @@ use crate::error::SkillRepositoryError;
 use crate::repository::{AgentSkillRepository, AgentSkillRepositoryInfo};
 use crate::sql::{SqlConnection, SqlDatabase, SqlParam};
 use crate::util::{
-    build_skill, has_extended_metadata, resolve_identifier, serialize_metadata,
-    validate_identifier, validate_resource_path, validate_skill_name,
+    build_skill, has_extended_metadata, is_skill_document, resolve_identifier,
+    serialize_metadata, skill_body, validate_identifier, validate_resource_path,
+    validate_skill_name,
 };
 
 /// Default schema name.
@@ -425,12 +426,15 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
         }
     }
 
+    /// The skill body persisted in `skill_content`: the `SKILL.md` document **without** its YAML
+    /// frontmatter, matching Java `SkillUtil.createFrom` (`parsed.getContent()`). Keeping the
+    /// whole document here served `---` as the body to Java readers sharing the table (SKILLS-08).
     fn skill_content(&self, skill: &AgentSkill) -> String {
         skill
             .resources()
             .iter()
-            .find(|(path, _)| path.ends_with("SKILL.md"))
-            .map(|(_, content)| content.clone())
+            .find(|(path, _)| is_skill_document(path))
+            .map(|(_, content)| skill_body(content).to_string())
             .unwrap_or_default()
     }
 
@@ -445,16 +449,17 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
         skill_id: i64,
         resources: &SkillResources,
     ) -> Result<(), SkillRepositoryError> {
-        if resources.is_empty() {
-            return Ok(());
-        }
+        // SKILLS-08: Java `SkillFileSystemHelper.isValidResource` keeps `SKILL.md` out of the
+        // resources map - the document is the `skill_content` column, not a resource row.
         let sql = format!(
             "INSERT INTO {} (id, resource_path, resource_content) VALUES (?, ?, ?)",
             self.full_table_name(&self.cfg.resources_table_name)
         );
         let mut batch: Vec<Vec<SqlParam>> = Vec::with_capacity(RESOURCE_BATCH_SIZE);
         let mut inserted = 0usize;
-        for (path, content) in resources {
+        let mut expected = 0usize;
+        for (path, content) in resources.iter().filter(|(p, _)| !is_skill_document(p)) {
+            expected += 1;
             batch.push(vec![
                 SqlParam::Int(skill_id),
                 SqlParam::Text(path.clone()),
@@ -468,11 +473,10 @@ impl<D: SqlDatabase> PostgresSkillRepository<D> {
         if !batch.is_empty() {
             inserted += conn.execute_batch(&sql, &batch)?;
         }
-        if inserted < resources.len() {
+        if inserted < expected {
             // Java throws when `executeBatch` reports fewer rows than the batch held.
             return Err(SkillRepositoryError::Database(format!(
-                "failed to insert all resources for id '{skill_id}': expected {}, inserted {inserted}",
-                resources.len()
+                "failed to insert all resources for id '{skill_id}': expected {expected}, inserted {inserted}"
             )));
         }
         Ok(())
@@ -984,7 +988,8 @@ mod tests {
         let db = Arc::new(InterceptingSqlDatabase::failing("DELETE FROM", 1));
         let r = PostgresSkillRepository::new(db.clone()).unwrap();
         r.save(&[skill("a", "1")], false).unwrap();
-        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 2);
+        // `SKILL.md` is the `skill_content` column, so only `r/data.json` is a resource row.
+        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 1);
 
         let err = r.delete("a").unwrap_err();
         assert!(
@@ -993,7 +998,7 @@ mod tests {
         );
         assert_eq!(db.failures(), 1, "only the skill-row DELETE may fail");
 
-        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 2);
+        assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 1);
         assert!(r.skill_exists("a").unwrap());
         let loaded = r.get_skill("a").unwrap();
         assert_eq!(
@@ -1024,8 +1029,9 @@ mod tests {
         }
         r.save(&[builder.build()], false).unwrap();
 
-        // 2501 rows -> 1000 + 1000 + 501.
-        assert_eq!(db.batch_sizes(), vec![1000, 1000, 501]);
+        // 2500 resource rows (`SKILL.md` lives in `skill_content`) -> 1000 + 1000 + 500.
+        assert_eq!(db.batch_sizes(), vec![1000, 1000, 500]);
+        // The body is restored from the column, so the caller still sees 2501 resources.
         assert_eq!(r.get_skill("big").unwrap().resources().len(), 2501);
     }
 
@@ -1035,7 +1041,71 @@ mod tests {
         let db = Arc::new(InterceptingSqlDatabase::recording());
         let r = PostgresSkillRepository::new(db.clone()).unwrap();
         r.save(&[skill("a", "1")], false).unwrap();
-        assert_eq!(db.batch_sizes(), vec![2]);
+        assert_eq!(db.batch_sizes(), vec![1]);
+    }
+
+    // ------------------------------------------------------------------
+    // SKILLS-08: Java-shaped `skill_content` (body only) + no `SKILL.md` resource row
+    // ------------------------------------------------------------------
+
+    /// Java `SkillUtil.createFrom` persists `parsed.getContent()` (the body after the YAML
+    /// frontmatter); `SkillFileSystemHelper.isValidResource` keeps `SKILL.md` out of the resource
+    /// map. Storing the whole document made a shared table serve `---` as the body to Java readers.
+    #[test]
+    fn skill_content_stores_the_body_without_frontmatter() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let r = PostgresSkillRepository::new(db.clone()).unwrap();
+        let document = AgentSkill::builder()
+            .name("calc")
+            .source("custom")
+            .description("A calculator")
+            .add_resource(
+                "SKILL.md",
+                "---\nname: calc\ndescription: A calculator\n---\n# Calc\nrun it\n",
+            )
+            .add_resource("r/run.sh", "echo hi")
+            .build();
+        r.save(&[document], false).unwrap();
+
+        let rows = db.rows("agentscope_skills");
+        assert_eq!(rows.len(), 1);
+        let content = rows[0]
+            .get("skill_content")
+            .and_then(|value| value.as_text())
+            .expect("skill_content")
+            .to_string();
+        assert_eq!(content, "# Calc\nrun it\n");
+        assert!(!content.contains("---"), "frontmatter leaked: {content}");
+        assert_eq!(db.rows("agentscope_skill_resources").len(), 1);
+    }
+
+    /// A row written by Java (body only, no `SKILL.md` resource row) reads back with the column
+    /// identity and the body restored as `SKILL.md`.
+    #[test]
+    fn java_shaped_rows_are_read_back_with_their_identity() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let r = PostgresSkillRepository::new(db.clone()).unwrap();
+        let mut conn = db.connection().unwrap();
+        conn.execute(
+            "INSERT INTO \"agentscope\".\"agentscope_skills\" \
+             (name, description, skill_content, source) VALUES (?, ?, ?, ?)",
+            &[
+                SqlParam::Text("calc".to_string()),
+                SqlParam::Text("A calculator".to_string()),
+                SqlParam::Text("# Calc\nrun it\n".to_string()),
+                SqlParam::Text("custom".to_string()),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let skill = r.get_skill("calc").unwrap();
+        assert_eq!(skill.name(), "calc");
+        assert_eq!(skill.description(), "A calculator");
+        assert_eq!(
+            skill.resources().get("SKILL.md").map(String::as_str),
+            Some("# Calc\nrun it\n")
+        );
     }
 
     // ------------------------------------------------------------------
