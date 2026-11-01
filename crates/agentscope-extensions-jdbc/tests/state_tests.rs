@@ -1350,3 +1350,287 @@ async fn length_limits_count_utf16_code_units() {
         "256 UTF-16 code units must be rejected"
     );
 }
+
+// ---------------------------------------------------------------------------
+//  JDBC-12 (rest): every swallowing `AgentStateStore` method has a `try_*` twin
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Executor that fails every statement once armed — the "backend unreachable" case the
+/// infallible surface collapses into "nothing stored".
+///
+/// Reads and writes are armed separately so a test can fail a probe without also failing the
+/// seed write. Statements inside a transaction never reach [`Self::execute`]/[`Self::query`]
+/// (the inner backend owns the transaction), hence the explicit `in_transaction` guard.
+#[derive(Debug)]
+struct FailingExecutor {
+    inner: Arc<RusqliteExecutor>,
+    fail_reads: AtomicBool,
+    fail_writes: AtomicBool,
+}
+
+impl FailingExecutor {
+    fn new(inner: Arc<RusqliteExecutor>) -> Self {
+        Self {
+            inner,
+            fail_reads: AtomicBool::new(false),
+            fail_writes: AtomicBool::new(false),
+        }
+    }
+
+    fn fail_reads(&self) {
+        self.fail_reads.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_writes(&self) {
+        self.fail_writes.store(true, Ordering::SeqCst);
+    }
+}
+
+impl JdbcExecutor for FailingExecutor {
+    fn execute(&self, bound: &BoundSql) -> JdbcResult<usize> {
+        if self.fail_writes.load(Ordering::SeqCst) {
+            return Err(JdbcError::Database("injected write failure".into()));
+        }
+        self.inner.execute(bound)
+    }
+
+    fn query(&self, bound: &BoundSql) -> JdbcResult<Vec<Vec<ColumnValue>>> {
+        if self.fail_reads.load(Ordering::SeqCst) {
+            return Err(JdbcError::Database("injected read failure".into()));
+        }
+        self.inner.query(bound)
+    }
+
+    fn in_transaction(
+        &self,
+        work: &mut dyn FnMut(&mut dyn JdbcSession) -> JdbcResult<()>,
+    ) -> JdbcResult<()> {
+        if self.fail_writes.load(Ordering::SeqCst) {
+            return Err(JdbcError::Database("injected transaction failure".into()));
+        }
+        self.inner.in_transaction(work)
+    }
+}
+
+fn new_failing_store() -> (JdbcAgentStateStore, Arc<FailingExecutor>) {
+    let inner = Arc::new(RusqliteExecutor::in_memory().unwrap());
+    let failing = Arc::new(FailingExecutor::new(inner));
+    let executor: Arc<dyn JdbcExecutor> = failing.clone();
+    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
+    let store = JdbcAgentStateStore::with_schema(executor, dialect).unwrap();
+    (store, failing)
+}
+
+#[tokio::test]
+async fn try_star_agrees_with_the_infallible_surface_on_the_happy_path() {
+    // The `try_*` overrides share their implementation with the infallible methods, so a
+    // caller switching to the fallible channel must observe exactly the same data.
+    let store = new_store();
+    AgentStateStore::try_save(&store, Some("u"), "s", "k", text("a"))
+        .await
+        .expect("a healthy write must succeed");
+    assert_eq!(
+        AgentStateStore::try_get(&store, Some("u"), "s", "k")
+            .await
+            .unwrap()
+            .map(|v| text_of(&v)),
+        AgentStateStore::get(&store, Some("u"), "s", "k")
+            .await
+            .map(|v| text_of(&v)),
+    );
+    assert_eq!(
+        store.get(Some("u"), "s", "k").await.map(|v| text_of(&v)),
+        Some("a".to_string())
+    );
+
+    AgentStateStore::try_save_list(&store, Some("u"), "s", "l", &[text("x"), text("y")])
+        .await
+        .expect("a healthy list write must succeed");
+    let via_try = AgentStateStore::try_get_list(&store, Some("u"), "s", "l")
+        .await
+        .unwrap();
+    assert_eq!(
+        via_try,
+        AgentStateStore::get_list(&store, Some("u"), "s", "l").await
+    );
+    assert_eq!(via_try.len(), 2);
+
+    assert!(AgentStateStore::try_exists(&store, Some("u"), "s")
+        .await
+        .unwrap());
+    assert_eq!(
+        AgentStateStore::try_list_session_ids(&store, Some("u"))
+            .await
+            .unwrap(),
+        AgentStateStore::list_session_ids(&store, Some("u")).await
+    );
+
+    // An absent key/list is not a failure.
+    assert!(AgentStateStore::try_get(&store, Some("u"), "s", "missing")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        AgentStateStore::try_get_list(&store, Some("u"), "s", "missing")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    AgentStateStore::try_delete(&store, Some("u"), "s")
+        .await
+        .expect("deleting an existing session must succeed");
+    assert!(!AgentStateStore::exists(&store, Some("u"), "s").await);
+    // Deleting an already-absent session is a no-op, not an error.
+    AgentStateStore::try_delete(&store, Some("u"), "s")
+        .await
+        .expect("deleting an absent session must not fail");
+}
+
+#[tokio::test]
+async fn try_save_reports_a_backend_failure_and_an_invalid_id() {
+    let (store, failing) = new_failing_store();
+    failing.fail_writes();
+
+    let err = AgentStateStore::try_save(&store, Some("u"), "s", "k", text("a"))
+        .await
+        .expect_err("a failed write must not be reported as success");
+    assert!(err.to_string().contains("injected write failure"), "{err}");
+    assert!(matches!(err, agentscope_core::Error::Session(_)), "{err:?}");
+
+    let err = AgentStateStore::try_save_list(&store, Some("u"), "s", "l", &[text("a")])
+        .await
+        .expect_err("a rolled-back append must not be reported as success");
+    assert!(
+        err.to_string().contains("injected transaction failure"),
+        "{err}"
+    );
+
+    // Identifier validation is part of the same fallible channel; the infallible method keeps
+    // silently refusing (its `()` signature cannot say why).
+    let healthy = new_store();
+    assert!(
+        AgentStateStore::try_save(&healthy, Some("u"), "  ", "k", text("a"))
+            .await
+            .is_err()
+    );
+    assert!(
+        AgentStateStore::try_save(&healthy, Some("u"), "s", &"k".repeat(256), text("a"))
+            .await
+            .is_err()
+    );
+    assert!(AgentStateStore::get(&healthy, Some("u"), "s", "k")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn try_get_reports_a_corrupt_payload_instead_of_an_absent_key() {
+    // Same ruling as `try_get_versioned`: a row exists, so its unreadable payload is a torn
+    // row — reporting `Ok(None)` would let the next write overwrite it unnoticed.
+    let (store, executor) = new_store_with_executor();
+    let dialect = SqliteDialect::new();
+    executor
+        .execute(&dialect.session_state_upsert("u:s", "k", 0, "{not json"))
+        .expect("seeding a corrupt payload must succeed");
+    executor
+        .execute(&BoundSql::no_params(
+            "INSERT INTO agentscope_sessions (session_id, state_key, item_index, state_data, \
+             version) VALUES ('u:s', 'blob', 0, x'00', 1)",
+        ))
+        .expect("seeding a non-text payload must succeed");
+
+    let err = AgentStateStore::try_get(&store, Some("u"), "s", "k")
+        .await
+        .expect_err("a corrupt payload must be an error");
+    assert!(err.to_string().contains("deserialize state"), "{err}");
+    assert!(matches!(err, agentscope_core::Error::Session(_)), "{err:?}");
+
+    let err = AgentStateStore::try_get(&store, Some("u"), "s", "blob")
+        .await
+        .expect_err("an unreadable payload must be an error");
+    assert!(err.to_string().contains("no readable payload"), "{err}");
+}
+
+#[tokio::test]
+async fn try_get_list_reports_a_corrupt_item() {
+    let (store, executor) = new_store_with_executor();
+    let dialect = SqliteDialect::new();
+    for (index, payload) in [(0, text("ok")), (1, text("ok"))].into_iter() {
+        executor
+            .execute(&dialect.session_state_insert(
+                "u:s",
+                "l",
+                index,
+                &serde_json::to_string(&payload).unwrap(),
+            ))
+            .expect("seeding a list item must succeed");
+    }
+    executor
+        .execute(&dialect.session_state_insert("u:s", "bad", 0, "{not json"))
+        .expect("seeding a corrupt item must succeed");
+
+    assert_eq!(
+        AgentStateStore::try_get_list(&store, Some("u"), "s", "l")
+            .await
+            .expect("a healthy list must load")
+            .len(),
+        2
+    );
+    let err = AgentStateStore::try_get_list(&store, Some("u"), "s", "bad")
+        .await
+        .expect_err("a corrupt item must not be dropped silently");
+    assert!(err.to_string().contains("deserialize list item 0"), "{err}");
+}
+
+#[tokio::test]
+async fn try_exists_reports_a_backend_failure_instead_of_false() {
+    let (store, failing) = new_failing_store();
+    AgentStateStore::try_save(&store, Some("u"), "s", "k", text("a"))
+        .await
+        .expect("the seed write must succeed");
+    assert!(AgentStateStore::try_exists(&store, Some("u"), "s")
+        .await
+        .unwrap());
+
+    failing.fail_reads();
+    let err = AgentStateStore::try_exists(&store, Some("u"), "s")
+        .await
+        .expect_err("an unreachable backend must not read as 'no state'");
+    assert!(err.to_string().contains("injected read failure"), "{err}");
+    // The infallible surface still degrades, which is exactly why the `try_*` twin exists.
+    assert!(!AgentStateStore::exists(&store, Some("u"), "s").await);
+
+    let err = AgentStateStore::try_list_session_ids(&store, Some("u"))
+        .await
+        .expect_err("an unreachable backend must not read as 'no sessions'");
+    assert!(err.to_string().contains("injected read failure"), "{err}");
+    assert!(AgentStateStore::list_session_ids(&store, Some("u"))
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn try_delete_reports_a_backend_failure() {
+    let (store, failing) = new_failing_store();
+    AgentStateStore::try_save(&store, Some("u"), "s", "k", text("a"))
+        .await
+        .expect("the seed write must succeed");
+
+    failing.fail_writes();
+    let err = AgentStateStore::try_delete(&store, Some("u"), "s")
+        .await
+        .expect_err("a failed delete must not report success");
+    assert!(err.to_string().contains("injected write failure"), "{err}");
+    assert!(matches!(err, agentscope_core::Error::Session(_)), "{err:?}");
+
+    assert!(
+        AgentStateStore::try_get(&store, Some("u"), "s", "k")
+            .await
+            .unwrap()
+            .is_some(),
+        "the failed delete must have left the row in place"
+    );
+}

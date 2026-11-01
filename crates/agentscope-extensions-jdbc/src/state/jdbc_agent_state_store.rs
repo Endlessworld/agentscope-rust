@@ -535,96 +535,96 @@ impl JdbcAgentStateStore {
                 Ok(())
             })
     }
-}
 
-#[async_trait]
-impl AgentStateStore for JdbcAgentStateStore {
-    async fn save(&self, user_id: Option<&str>, session_id: &str, key: &str, value: Value) {
-        let Ok(slot) = Self::validate_ids(user_id, session_id, Some(key)) else {
-            return;
-        };
-        let Ok(json) = Self::json_of(&value) else {
-            return;
-        };
-        if let Err(e) = self.save_single(&slot, key, &json) {
-            tracing::warn!("[jdbc-state] save failed for {key}: {e}");
-        }
+    // --- Fallible primitives shared by the infallible and `try_*` surfaces ---------------
+    //
+    // Each operation has exactly one implementation: the infallible trait methods degrade a
+    // failure to "nothing stored" (and warn where they always did), while the `try_*`
+    // overrides report it. Hence the two views can never disagree about what is stored.
+
+    /// Validates the identifiers, serializes the value and writes one row.
+    fn save_checked(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: &Value,
+    ) -> JdbcResult<()> {
+        let slot = Self::validate_ids(user_id, session_id, Some(key))?;
+        let json = Self::json_of(value)?;
+        self.save_single(&slot, key, &json)
     }
 
-    async fn save_list(
+    /// [`Self::save_list_impl`] with the identifier checks applied first.
+    fn save_list_checked(
         &self,
         user_id: Option<&str>,
         session_id: &str,
         key: &str,
         values: &[Value],
-    ) {
-        let Ok(slot) = Self::validate_ids(user_id, session_id, Some(key)) else {
-            return;
-        };
-        if let Err(e) = self.save_list_impl(&slot, key, values) {
-            // The read-modify-write runs in one transaction, so a failure here means the whole
-            // append was rolled back — the stored list is still at its previous length, never
-            // half written. (A caller-visible failure channel is JDBC-12, blocked on core.)
-            tracing::warn!(
-                "[jdbc-state] save_list failed for {key}; the whole append was rolled back: {e}"
-            );
-        }
+    ) -> JdbcResult<()> {
+        let slot = Self::validate_ids(user_id, session_id, Some(key))?;
+        self.save_list_impl(&slot, key, values)
     }
 
-    async fn get(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Option<Value> {
-        let slot = Self::validate_ids(user_id, session_id, Some(key)).ok()?;
+    /// Loads a single value: `Ok(None)` means "no row", a torn row is an error.
+    fn load_single(&self, slot_id: &str, key: &str) -> JdbcResult<Option<Value>> {
         let bound = self
             .dialect
-            .session_state_select(&slot, key, SINGLE_STATE_INDEX as i32);
-        let rows = self.executor.query(&bound).ok()?;
-        let json = rows
+            .session_state_select(slot_id, key, SINGLE_STATE_INDEX as i32);
+        let rows = self.executor.query(&bound)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        // Same ruling as `get_versioned`: `state_data` is `NOT NULL`, so a row whose payload
+        // cannot be read is torn, not absent — reporting `None` would hide the loss.
+        let json = row
             .into_iter()
             .next()
-            .and_then(|r| r.into_iter().next())
-            .and_then(|c| c.as_text().map(|s| s.to_string()))?;
-        serde_json::from_str(&json).ok()
+            .and_then(|c| c.as_text().map(str::to_string))
+            .ok_or_else(|| {
+                JdbcError::Database(format!("state row for key '{key}' has no readable payload"))
+            })?;
+        let value = serde_json::from_str(&json)
+            .map_err(|e| JdbcError::Database(format!("deserialize state: {e}")))?;
+        Ok(Some(value))
     }
 
-    async fn get_list(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Vec<Value> {
-        let Ok(slot) = Self::validate_ids(user_id, session_id, Some(key)) else {
-            return Vec::new();
-        };
-        let bound = self.dialect.session_state_select_list(&slot, key);
-        let Ok(rows) = self.executor.query(&bound) else {
-            return Vec::new();
-        };
-        rows.into_iter()
-            .filter_map(|r| {
-                r.into_iter()
-                    .next()
-                    .and_then(|c| c.as_text().map(|s| s.to_string()))
-                    .and_then(|json| serde_json::from_str(&json).ok())
-            })
-            .collect()
-    }
-
-    async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
-        let Ok(slot) = Self::validate_ids(user_id, session_id, None) else {
-            return false;
-        };
-        let bound = self.dialect.session_state_exists(&slot);
-        self.executor
-            .query(&bound)
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(false)
-    }
-
-    async fn delete(&self, user_id: Option<&str>, session_id: &str) {
-        let Ok(slot) = Self::validate_ids(user_id, session_id, None) else {
-            return;
-        };
-        let bound = self.dialect.session_state_delete_session(&slot);
-        if let Err(e) = self.executor.execute(&bound) {
-            tracing::warn!("[jdbc-state] delete failed for session {session_id}: {e}");
+    /// Loads a list; a corrupt element is an error instead of a silently dropped item.
+    fn load_list(&self, slot_id: &str, key: &str) -> JdbcResult<Vec<Value>> {
+        let bound = self.dialect.session_state_select_list(slot_id, key);
+        let rows = self.executor.query(&bound)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (index, row) in rows.into_iter().enumerate() {
+            let json = row
+                .into_iter()
+                .next()
+                .and_then(|c| c.as_text().map(str::to_string))
+                .ok_or_else(|| {
+                    JdbcError::Database(format!(
+                        "list row {index} for key '{key}' has no readable payload"
+                    ))
+                })?;
+            out.push(
+                serde_json::from_str(&json).map_err(|e| {
+                    JdbcError::Database(format!("deserialize list item {index}: {e}"))
+                })?,
+            );
         }
+        Ok(out)
     }
 
-    async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
+    fn exists_impl(&self, slot_id: &str) -> JdbcResult<bool> {
+        let bound = self.dialect.session_state_exists(slot_id);
+        Ok(!self.executor.query(&bound)?.is_empty())
+    }
+
+    fn delete_session_impl(&self, slot_id: &str) -> JdbcResult<()> {
+        let bound = self.dialect.session_state_delete_session(slot_id);
+        self.executor.execute(&bound).map(|_| ())
+    }
+
+    fn list_session_ids_impl(&self, user_id: Option<&str>) -> JdbcResult<Vec<String>> {
         let user_segment = match user_id {
             Some(u) if !u.trim().is_empty() => u.to_string(),
             _ => ANON_USER.to_string(),
@@ -632,9 +632,7 @@ impl AgentStateStore for JdbcAgentStateStore {
         let prefix = format!("{user_segment}{SLOT_SEPARATOR}");
         let pattern = like_prefix_pattern(&prefix, self.dialect.session_state_like_escape_char());
         let bound = self.dialect.session_state_list_session_ids(&pattern);
-        let Ok(rows) = self.executor.query(&bound) else {
-            return Vec::new();
-        };
+        let rows = self.executor.query(&bound)?;
         let mut out: Vec<String> = rows
             .into_iter()
             .filter_map(|r| {
@@ -646,7 +644,148 @@ impl AgentStateStore for JdbcAgentStateStore {
             .collect();
         out.sort();
         out.dedup();
-        out
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl AgentStateStore for JdbcAgentStateStore {
+    async fn save(&self, user_id: Option<&str>, session_id: &str, key: &str, value: Value) {
+        if let Err(e) = self.save_checked(user_id, session_id, key, &value) {
+            tracing::warn!("[jdbc-state] save failed for {key}: {e}");
+        }
+    }
+
+    /// Fallible [`AgentStateStore::save`].
+    ///
+    /// The infallible method can only warn, so a caller that must not continue on a lost
+    /// write asks here instead (JDBC-12). Both share [`Self::save_checked`].
+    async fn try_save(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: Value,
+    ) -> agentscope_core::Result<()> {
+        self.save_checked(user_id, session_id, key, &value)
+            .map_err(state_error)
+    }
+
+    async fn save_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        values: &[Value],
+    ) {
+        if let Err(e) = self.save_list_checked(user_id, session_id, key, values) {
+            // The read-modify-write runs in one transaction, so a failure here means the whole
+            // append was rolled back — the stored list is still at its previous length, never
+            // half written.
+            tracing::warn!(
+                "[jdbc-state] save_list failed for {key}; the whole append was rolled back: {e}"
+            );
+        }
+    }
+
+    /// Fallible [`AgentStateStore::save_list`] (same contract as
+    /// [`AgentStateStore::try_save`]).
+    async fn try_save_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        values: &[Value],
+    ) -> agentscope_core::Result<()> {
+        self.save_list_checked(user_id, session_id, key, values)
+            .map_err(state_error)
+    }
+
+    async fn get(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Option<Value> {
+        let slot = Self::validate_ids(user_id, session_id, Some(key)).ok()?;
+        self.load_single(&slot, key).ok().flatten()
+    }
+
+    /// Fallible [`AgentStateStore::get`]: an absent key is `Ok(None)`, but a backend failure
+    /// or a torn row is an `Err` (same ruling as `try_get_versioned`).
+    async fn try_get(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::Result<Option<Value>> {
+        let slot = Self::validate_ids(user_id, session_id, Some(key)).map_err(state_error)?;
+        self.load_single(&slot, key).map_err(state_error)
+    }
+
+    async fn get_list(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Vec<Value> {
+        let Ok(slot) = Self::validate_ids(user_id, session_id, Some(key)) else {
+            return Vec::new();
+        };
+        self.load_list(&slot, key).unwrap_or_default()
+    }
+
+    /// Fallible [`AgentStateStore::get_list`]: an absent list is `Ok(vec![])`, a backend
+    /// failure or an unreadable item is an `Err`.
+    async fn try_get_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> agentscope_core::Result<Vec<Value>> {
+        let slot = Self::validate_ids(user_id, session_id, Some(key)).map_err(state_error)?;
+        self.load_list(&slot, key).map_err(state_error)
+    }
+
+    async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
+        let Ok(slot) = Self::validate_ids(user_id, session_id, None) else {
+            return false;
+        };
+        self.exists_impl(&slot).unwrap_or(false)
+    }
+
+    /// Fallible [`AgentStateStore::exists`]: a connection/SQL failure must not read as
+    /// "no state for this session".
+    async fn try_exists(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+    ) -> agentscope_core::Result<bool> {
+        let slot = Self::validate_ids(user_id, session_id, None).map_err(state_error)?;
+        self.exists_impl(&slot).map_err(state_error)
+    }
+
+    async fn delete(&self, user_id: Option<&str>, session_id: &str) {
+        let Ok(slot) = Self::validate_ids(user_id, session_id, None) else {
+            return;
+        };
+        if let Err(e) = self.delete_session_impl(&slot) {
+            tracing::warn!("[jdbc-state] delete failed for session {session_id}: {e}");
+        }
+    }
+
+    /// Fallible [`AgentStateStore::delete`]: deleting an already-absent session is a no-op,
+    /// anything else that fails is an `Err`.
+    async fn try_delete(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+    ) -> agentscope_core::Result<()> {
+        let slot = Self::validate_ids(user_id, session_id, None).map_err(state_error)?;
+        self.delete_session_impl(&slot).map_err(state_error)
+    }
+
+    async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
+        self.list_session_ids_impl(user_id).unwrap_or_default()
+    }
+
+    /// Fallible [`AgentStateStore::list_session_ids`]: an unreadable table must not look
+    /// like "this user has no sessions".
+    async fn try_list_session_ids(
+        &self,
+        user_id: Option<&str>,
+    ) -> agentscope_core::Result<Vec<String>> {
+        self.list_session_ids_impl(user_id).map_err(state_error)
     }
 
     fn supports_versioning(&self) -> bool {
