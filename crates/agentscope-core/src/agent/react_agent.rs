@@ -1099,14 +1099,22 @@ impl ReActAgent {
             }),
         )));
 
-        let mut state = self.core.state.lock().unwrap().clone();
-        for m in messages {
-            state.context_mut().push(m);
+        {
+            let mut live = self.core.state.lock().unwrap();
+            for m in messages {
+                live.context_mut().push(m);
+            }
         }
         // The reminder is request-local: it steers this retry request only and never
         // enters `state.context`, so hooks, middleware and session persistence observe
         // only the caller's real messages (Java `appendTransientSoToolReminder`).
         let so_reminder = structured_output_reminder(&schema);
+        // Request preparation happens inside the middleware chain, so it needs the
+        // call-scoped identity a normal run would carry. The live agent state stays the
+        // source of truth: preparation may rewrite it (overflow compaction), so this path
+        // appends its own messages instead of writing back a stale snapshot.
+        let history = self.core.state.lock().unwrap().context().to_vec();
+        let ctx = self.new_context(&AgentInput::new(history));
 
         let tools = toolkit.tool_schemas();
         let mut last_text = String::new();
@@ -1117,7 +1125,7 @@ impl ReActAgent {
         // tool call. Capped at 3 (Java `soForceToolChoiceCount`) to avoid an endless loop.
         let mut force_retries = 0u32;
         for _ in 0..self.core.max_iters {
-            let mut msgs = state.context().to_vec();
+            let mut msgs = self.core.state.lock().unwrap().context().to_vec();
             // Append the transient reminder to the request-local copy only.
             msgs.push(so_reminder.clone());
             let model = self.core.model.lock().unwrap().clone();
@@ -1131,10 +1139,11 @@ impl ReActAgent {
                 ));
             }
             let input = ModelCallInput::new(msgs, tools.clone(), options, Arc::clone(&model));
-            // The structured-output retry path is not streamed: this emitter drops
-            // every event, so nothing becomes visible and retries stay allowed.
-            let msg = model_call_impl(&self.core, None, input, false, |_| {}).await?;
-            state.context_mut().push(msg.clone());
+            // The reminder and the `generate_response` schema travel *into* preparation,
+            // so the prepared request is the one the provider actually receives
+            // (Java 51a74e2ef: append reminder/schema -> prepare -> model).
+            let msg = model_call_through_chain(&self.core, &ctx, input).await?;
+            self.core.state.lock().unwrap().context_mut().push(msg.clone());
 
             let mut gen_called = false;
             for tc in msg.tool_use_blocks() {
@@ -1143,7 +1152,7 @@ impl ReActAgent {
                     // streamed, so the emitter (still carrying the call id) discards.
                     let tctx = tool_execution_context(tc, Default::default(), &None, None, "");
                     if let Ok(rb) = toolkit.call_tool(tc, tctx).await {
-                        state.context_mut().push(
+                        self.core.state.lock().unwrap().context_mut().push(
                             Msg::builder()
                                 .role(MsgRole::Tool)
                                 .content(vec![ContentBlock::ToolResult(rb)])
@@ -1175,7 +1184,6 @@ impl ReActAgent {
             }
             // Other (non-structured) tool calls: keep looping, bounded by `max_iters`.
         }
-        *self.core.state.lock().unwrap() = state;
 
         let structured = captured.lock().unwrap().clone().or_else(|| {
             let t = last_text.trim();
@@ -2297,6 +2305,60 @@ fn stop_message(
         builder = builder.name(name);
     }
     builder.build()
+}
+
+/// Dispatches one prepared model call through the middleware chain.
+///
+/// The structured-output fallback path builds its request by hand (the transient
+/// reminder plus the synthetic `generate_response` schema), so it must not call the
+/// provider directly: the chain's `on_model_call` middleware is the request
+/// preparation boundary (harness `ContextMiddleware` mirrors Java
+/// `ModelRequestPreparer`), and it has to see the *complete* request — including the
+/// reminder and the extra tool — before any budget check runs (Java 51a74e2ef).
+async fn model_call_through_chain(
+    core: &Arc<AgentCore>,
+    ctx: &crate::agent::RuntimeContext,
+    input: ModelCallInput,
+) -> Result<Msg> {
+    let slot: Arc<Mutex<Option<Result<Msg>>>> = Arc::new(Mutex::new(None));
+    let chain = Arc::clone(&core.middleware_chain);
+    let model_core: Next<ModelCallInput> = {
+        let slot = Arc::clone(&slot);
+        let core = Arc::clone(core);
+        let ctx = ctx.clone();
+        Box::new(move |mc_input: ModelCallInput| -> EventStream {
+            let slot = Arc::clone(&slot);
+            let core = Arc::clone(&core);
+            let ctx = ctx.clone();
+            let fut = async move {
+                // This path is not streamed, so nothing is emitted to a consumer and
+                // the retries stay allowed.
+                let msg = model_call_impl(&core, Some(&ctx), mc_input, false, |_| {}).await;
+                *slot.lock().unwrap() = Some(msg);
+                Ok(AgentEvent::ModelCallEnd(EventData::default()))
+            };
+            Box::pin(futures::stream::once(fut))
+        })
+    };
+    let mut stream = chain.wrap_model_call(ctx.clone(), input, model_core);
+    // A middleware can reject the request before the model core runs (over-budget
+    // context, for instance). That failure only exists as a stream item, so it has to
+    // be carried out explicitly instead of turning into "model produced no message".
+    let mut first_error: Option<Error> = None;
+    while let Some(item) = stream.next().await {
+        if let Err(error) = item {
+            first_error = Some(error);
+            break;
+        }
+    }
+    drop(stream);
+    let produced = slot.lock().unwrap().take();
+    match produced {
+        Some(result) => result,
+        None => {
+            Err(first_error.unwrap_or_else(|| Error::Agent("model produced no message".into())))
+        }
+    }
 }
 
 /// Runs the reasoning phase through the middleware chain, wrapping the raw model
@@ -4043,6 +4105,13 @@ fn structured_output_reminder(schema: &JsonSchema) -> Msg {
     metadata.insert(
         crate::message::keys::metadata_keys::SYNTHETIC.to_string(),
         serde_json::json!(true),
+    );
+    // The reminder is injected before request preparation now, so it is marked as a
+    // synthetic reminder of kind `structured_output`: the context renderer keeps it
+    // out of the canonical history it compares for compaction (Java 51a74e2ef).
+    metadata.insert(
+        crate::message::keys::metadata_keys::REMINDER_KIND.to_string(),
+        serde_json::json!("structured_output"),
     );
     metadata.insert(
         crate::message::keys::metadata_keys::STRUCTURED_OUTPUT_REMINDER.to_string(),
@@ -8273,6 +8342,234 @@ mod tests {
         let data = reply.structured_data().unwrap();
         assert_eq!(data["name"], serde_json::json!("bob"));
         assert_eq!(data["age"], serde_json::json!(42));
+    }
+
+    /// The `generate_response` arguments used by the structured-output tests.
+    fn structured_response_input() -> JsonMap {
+        let mut input = JsonMap::new();
+        input.insert(
+            "response".to_string(),
+            serde_json::json!({"name": "bob", "age": 42}),
+        );
+        input
+    }
+
+    /// Records the messages/tools each provider call receives.
+    struct RequestRecordingModel {
+        responses: Arc<Mutex<Vec<ChatResponse>>>,
+        seen: Arc<Mutex<Vec<(Vec<Msg>, Vec<String>)>>>,
+    }
+
+    impl RequestRecordingModel {
+        fn new(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses)),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Model for RequestRecordingModel {
+        fn stream(
+            &self,
+            messages: Vec<Msg>,
+            tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((messages, tools.into_iter().map(|t| t.name).collect()));
+            let responses = Arc::clone(&self.responses);
+            Box::pin(futures::stream::once(async move {
+                let mut g = responses.lock().unwrap();
+                let r = if g.is_empty() {
+                    text_response("done")
+                } else {
+                    g.remove(0)
+                };
+                Ok(r)
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "request-recording"
+        }
+    }
+
+    /// Captures what the request-preparation seam (`on_model_call`) receives.
+    struct PreparationProbe {
+        seen: Arc<Mutex<Vec<(usize, bool, bool)>>>,
+    }
+
+    #[async_trait]
+    impl Middleware for PreparationProbe {
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            vec![ExtensionPoint::OnModelCall]
+        }
+
+        fn on_model_call(
+            &self,
+            _ctx: &crate::agent::RuntimeContext,
+            input: ModelCallInput,
+            next: Next<ModelCallInput>,
+        ) -> EventStream {
+            let reminder = input
+                .messages
+                .iter()
+                .any(|m| m.text_content().contains(STRUCTURED_OUTPUT_TOOL_NAME));
+            let so_tool = input
+                .tools
+                .iter()
+                .any(|t| t.name == STRUCTURED_OUTPUT_TOOL_NAME);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((input.messages.len(), reminder, so_tool));
+            next(input)
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_output_request_is_prepared_with_reminder_and_schema() {
+        // Java 51a74e2ef: the reminder and the synthetic `generate_response` schema must be
+        // part of the request *before* preparation, so a budget check inspects exactly what
+        // the provider receives.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(PreparationProbe {
+            seen: Arc::clone(&seen),
+        }));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response(
+                "g1",
+                STRUCTURED_OUTPUT_TOOL_NAME,
+                structured_response_input(),
+            )],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-so-prepare")
+            .model(model)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        agent
+            .call_with_schema(vec![Msg::user("give json")], person_schema())
+            .await
+            .unwrap();
+
+        let captured = seen.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "one prepared request");
+        let (count, reminder, so_tool) = captured[0];
+        assert!(
+            count >= 2,
+            "the reminder is a separate request-local message, got {count} messages"
+        );
+        assert!(
+            reminder,
+            "preparation must see the structured-output reminder"
+        );
+        assert!(so_tool, "preparation must see the generate_response schema");
+    }
+
+    #[tokio::test]
+    async fn structured_output_uses_the_prepared_request() {
+        // The provider must receive the request the preparation seam handed over, not the
+        // one built before it (Java: "Use the preparer's returned messages, tools, and
+        // options directly").
+        struct Rewriter;
+
+        #[async_trait]
+        impl Middleware for Rewriter {
+            fn active_points(&self) -> Vec<ExtensionPoint> {
+                vec![ExtensionPoint::OnModelCall]
+            }
+
+            fn on_model_call(
+                &self,
+                _ctx: &crate::agent::RuntimeContext,
+                mut input: ModelCallInput,
+                next: Next<ModelCallInput>,
+            ) -> EventStream {
+                input.messages.push(Msg::user("PREPARED-MARKER"));
+                next(input)
+            }
+        }
+
+        let model = Arc::new(RequestRecordingModel::new(vec![tool_use_response(
+            "g1",
+            STRUCTURED_OUTPUT_TOOL_NAME,
+            structured_response_input(),
+        )]));
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(Rewriter));
+        let agent = ReActAgent::builder()
+            .name("t-so-prepared")
+            .model(Arc::clone(&model) as Arc<dyn Model>)
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let reply = agent
+            .call_with_schema(vec![Msg::user("give json")], person_schema())
+            .await
+            .unwrap();
+        assert!(reply.has_structured_data());
+
+        let seen = model.seen.lock().unwrap().clone();
+        let (messages, _tools) = &seen[0];
+        assert!(
+            messages
+                .last()
+                .is_some_and(|m| m.text_content().contains("PREPARED-MARKER")),
+            "the prepared request must reach the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_output_propagates_preparation_rejection() {
+        // A rejection that happens before any provider call must surface as that error, not
+        // as the indistinguishable "model produced no message".
+        struct Rejecter;
+
+        #[async_trait]
+        impl Middleware for Rejecter {
+            fn active_points(&self) -> Vec<ExtensionPoint> {
+                vec![ExtensionPoint::OnModelCall]
+            }
+
+            fn on_model_call(
+                &self,
+                _ctx: &crate::agent::RuntimeContext,
+                _input: ModelCallInput,
+                _next: Next<ModelCallInput>,
+            ) -> EventStream {
+                Box::pin(futures::stream::once(async {
+                    Err(Error::Agent("request rejected by preparation".into()))
+                }))
+            }
+        }
+
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(Rejecter));
+        let agent = ReActAgent::builder()
+            .name("t-so-reject")
+            .model(Arc::new(MockModel::new("mock", Vec::new())))
+            .middleware_chain(chain)
+            .build()
+            .unwrap();
+
+        let err = agent
+            .call_with_schema(vec![Msg::user("give json")], person_schema())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("request rejected by preparation"),
+            "got {err}"
+        );
     }
 
     /// A schema that requires `name:string` and `age:integer`.
