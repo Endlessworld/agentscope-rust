@@ -278,13 +278,26 @@ pub async fn try_bridge_mcp_tools_to_toolkit(
         let Ok(tools) = manager.list_tools(&client_id).await else {
             continue;
         };
+        let prefix_tool_names = manager
+            .get_client(&client_id)
+            .await
+            .map(|client| client.config.prefix_tool_names)
+            .unwrap_or(false);
         let manager = std::sync::Arc::clone(manager);
         for info in tools {
             let server = info.server.clone();
             let tool_name = info.name.clone();
             let description = info.description.clone().unwrap_or_default();
             let propagate_meta = options.effective_for(&tool_name);
+            // Overrides are keyed by the remote name, before any prefix.
             bridged_names.push(tool_name.clone());
+            // Only the *registered* name is prefixed: the remote call still uses the tool
+            // name the server advertised, and error text keeps the bare name.
+            let registered_name = if prefix_tool_names {
+                format!("{server}__{tool_name}")
+            } else {
+                tool_name.clone()
+            };
             // Clones captured by the (move) async handler closure; the originals
             // stay owned by the loop so we can still build the `McpTool` below.
             let h_server = server.clone();
@@ -327,7 +340,7 @@ pub async fn try_bridge_mcp_tools_to_toolkit(
             });
             let mut tool = agentscope_core::tool::McpTool::new(
                 server.clone(),
-                tool_name.clone(),
+                registered_name,
                 description,
                 info.parameters,
                 Box::new(|_t, _a| {

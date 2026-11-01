@@ -14,6 +14,7 @@ pub mod loader;
 pub mod manager;
 pub mod materialize;
 pub mod protocol;
+pub mod spec_generator;
 pub mod task;
 
 pub use entry::{SubagentEntry, SubagentFactory, SubagentSessionRepair};
@@ -26,6 +27,7 @@ pub use materialize::{
     declared_skill_filter, derive_child_session_id, resolve_declared_model, SharedModelSlot,
     SubagentBlueprint, SUBAGENT_CONTEXT_SECTION,
 };
+pub use spec_generator::{GeneratedSpec, SubagentSpecGenerator};
 pub use task::{
     BackgroundTask, TaskCompletionCallback, TaskDelivery, TaskRecord, TaskRepository, TaskRunSpec,
     TaskStatus, WorkspaceTaskRepository, SUPPRESS_COMPLETION_CALLBACK,

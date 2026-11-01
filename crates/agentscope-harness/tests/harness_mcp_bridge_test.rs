@@ -78,6 +78,54 @@ async fn bridge_mcp_server_tool_and_call() {
 }
 
 #[tokio::test]
+async fn prefix_tool_names_registers_server_prefixed_tool() {
+    if !node_available() {
+        eprintln!("skipping: node not available on PATH");
+        return;
+    }
+    let script = fixture_server_path();
+    if !script.exists() {
+        panic!("fixture MCP server not found: {}", script.display());
+    }
+
+    let manager = Arc::new(McpClientManager::new());
+    let config = McpServerConfig::new("echo-server")
+        .command(format!("node {}", script.display()))
+        .prefix_tool_names(true);
+    let client_id = manager.create_client(config).await.expect("create client");
+    manager.connect(&client_id).await.expect("connect");
+
+    let toolkit = Toolkit::new();
+    let n = bridge_mcp_tools_to_toolkit(&manager, &toolkit).await;
+    assert_eq!(n, 1);
+    assert!(
+        toolkit.get_tool("echo_message").is_none(),
+        "the bare remote name must not be registered when the prefix is on"
+    );
+
+    let tool = toolkit
+        .get_tool("echo-server__echo_message")
+        .expect("prefixed tool registered");
+    let args = serde_json::json!({ "message": "prefixed" });
+    let result = tool
+        .call(args.as_object().unwrap().clone(), Default::default())
+        .await
+        .expect("tool call");
+    let text = result
+        .output
+        .iter()
+        .filter_map(|b| match b {
+            agentscope_core::message::ContentBlock::Text(TextBlock { text, .. }) => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(text.contains("echo: prefixed"), "unexpected output: {text}");
+}
+
+#[tokio::test]
 async fn bridge_with_no_connected_clients_returns_zero() {
     let manager = Arc::new(McpClientManager::new());
     let toolkit = Toolkit::new();

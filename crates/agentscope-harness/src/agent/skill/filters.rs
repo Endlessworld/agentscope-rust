@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::curator::{SkillCandidate, SkillUsageRecord};
 use super::promoter::{PromotionDecision, SkillPromotionGate};
+use crate::filesystem::{BaseStore, StoreItem, StoreValue};
 
 // ---------------------------------------------------------------------------
 // SkillUsageBackend
@@ -123,6 +124,125 @@ impl SkillUsageBackend for FilesystemSkillUsageBackend {
     fn replace_all(&self, data: BTreeMap<String, SkillUsageRecord>) {
         let _guard = self.lock.lock().unwrap();
         self.save_all(&data);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BaseStoreSkillUsageBackend
+// ---------------------------------------------------------------------------
+
+/// Namespace holding one usage record per skill in a [`BaseStore`].
+pub const USAGE_STORE_NAMESPACE: [&str; 2] = ["skills", "usage"];
+/// Compare-and-set attempts before giving up on a contended record.
+const MAX_CAS_RETRIES: usize = 5;
+/// Page size used when scanning every record.
+const SCAN_PAGE_SIZE: usize = 1000;
+
+fn usage_namespace() -> Vec<String> {
+    USAGE_STORE_NAMESPACE.iter().map(|s| s.to_string()).collect()
+}
+
+fn record_from_item(item: &StoreItem) -> Option<SkillUsageRecord> {
+    serde_json::from_value(serde_json::Value::Object(item.value.clone())).ok()
+}
+
+fn record_to_value(record: &SkillUsageRecord) -> StoreValue {
+    match serde_json::to_value(record) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => StoreValue::new(),
+    }
+}
+
+/// Distributed [`SkillUsageBackend`] storing one record per skill under
+/// `["skills", "usage"]`, mirroring Java `BaseStoreSkillUsageBackend`.
+///
+/// Writes go through [`BaseStore::put_if_version`], so two replicas updating the same
+/// skill either win the compare-and-set or retry against the fresh record. Stores whose
+/// conditional write is not a real CAS simply lose the update, exactly like Java.
+pub struct BaseStoreSkillUsageBackend {
+    store: Arc<dyn BaseStore>,
+}
+
+impl BaseStoreSkillUsageBackend {
+    pub fn new(store: Arc<dyn BaseStore>) -> Self {
+        Self { store }
+    }
+
+    pub fn store(&self) -> &Arc<dyn BaseStore> {
+        &self.store
+    }
+}
+
+impl SkillUsageBackend for BaseStoreSkillUsageBackend {
+    fn load_all(&self) -> BTreeMap<String, SkillUsageRecord> {
+        let mut out = BTreeMap::new();
+        for item in self.store.search(&usage_namespace(), SCAN_PAGE_SIZE, 0) {
+            if let Some(record) = record_from_item(&item) {
+                out.insert(item.key.clone(), record);
+            }
+        }
+        out
+    }
+
+    fn get(&self, name: &str) -> Option<SkillUsageRecord> {
+        if name.trim().is_empty() {
+            return None;
+        }
+        self.store
+            .get(&usage_namespace(), name)
+            .and_then(|item| record_from_item(&item))
+    }
+
+    fn mutate(
+        &self,
+        name: &str,
+        mutator: &mut dyn FnMut(SkillUsageRecord) -> Option<SkillUsageRecord>,
+    ) {
+        if name.trim().is_empty() {
+            return;
+        }
+        let namespace = usage_namespace();
+        for _ in 0..MAX_CAS_RETRIES {
+            let item = self.store.get(&namespace, name);
+            let expected_version = item.as_ref().map(|i| i.version).unwrap_or(0);
+            let current = item
+                .as_ref()
+                .and_then(record_from_item)
+                .unwrap_or_else(|| {
+                    SkillUsageRecord::agent_created(
+                        super::curator::SkillState::Active,
+                        chrono::Utc::now(),
+                    )
+                });
+            let updated = mutator(current.clone());
+            if updated.as_ref() == Some(&current) {
+                // Explicit no-op (e.g. a provenance gate denied the change).
+                return;
+            }
+            let Some(updated) = updated else {
+                if item.is_some() {
+                    self.store.delete(&namespace, name);
+                }
+                return;
+            };
+            if self.store.put_if_version(
+                &namespace,
+                name,
+                record_to_value(&updated),
+                expected_version,
+            ) {
+                return;
+            }
+        }
+        tracing::warn!("BaseStoreSkillUsageBackend.mutate({name}) exhausted CAS retries");
+    }
+
+    fn replace_all(&self, data: BTreeMap<String, SkillUsageRecord>) {
+        // Multi-key store: upsert the provided keys only. Removing absent keys would need a
+        // cross-key transaction the store does not offer.
+        for (name, record) in data {
+            self.mutate(&name, &mut |_| Some(record.clone()));
+        }
     }
 }
 
@@ -398,6 +518,54 @@ mod tests {
         assert!(backend.get("b").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn base_store_backend_roundtrip_and_cas_versions() {
+        let store = Arc::new(crate::filesystem::InMemoryStore::new());
+        let backend = BaseStoreSkillUsageBackend::new(Arc::clone(&store) as Arc<dyn BaseStore>);
+
+        backend.mutate("a", &mut |mut r| {
+            r.pinned = true;
+            Some(r)
+        });
+        assert!(backend.get("a").unwrap().pinned);
+        let namespace = usage_namespace();
+        assert_eq!(store.get(&namespace, "a").unwrap().version, 1);
+
+        backend.mutate("a", &mut |mut r| {
+            r.pinned = false;
+            Some(r)
+        });
+        assert!(!backend.get("a").unwrap().pinned);
+        assert_eq!(store.get(&namespace, "a").unwrap().version, 2);
+
+        backend.replace_all(BTreeMap::from([("b".to_string(), rec("agent", vec![]))]));
+        assert_eq!(backend.load_all().keys().cloned().collect::<Vec<_>>(), vec!["a", "b"]);
+
+        backend.mutate("a", &mut |_| None);
+        assert!(backend.get("a").is_none());
+        assert!(backend.get("   ").is_none());
+    }
+
+    #[test]
+    fn base_store_backend_ignores_malformed_records() {
+        let store = Arc::new(crate::filesystem::InMemoryStore::new());
+        let backend = BaseStoreSkillUsageBackend::new(Arc::clone(&store) as Arc<dyn BaseStore>);
+        let mut bogus = StoreValue::new();
+        bogus.insert("nonsense".into(), serde_json::json!(1));
+        store.put(&usage_namespace(), "junk", bogus);
+
+        assert!(backend.get("junk").is_none());
+        assert!(backend.load_all().is_empty());
+    }
+
+    #[test]
+    fn base_store_backend_no_op_mutation_does_not_write() {
+        let store = Arc::new(crate::filesystem::InMemoryStore::new());
+        let backend = BaseStoreSkillUsageBackend::new(Arc::clone(&store) as Arc<dyn BaseStore>);
+        backend.mutate("a", &mut |r| Some(r)); // returns the current record unchanged
+        assert!(store.get(&usage_namespace(), "a").is_none());
     }
 
     #[test]

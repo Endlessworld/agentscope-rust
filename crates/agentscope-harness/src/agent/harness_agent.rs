@@ -818,6 +818,10 @@ pub struct HarnessAgentBuilder {
     /// Per-call generation defaults (e.g. additional request headers) applied
     /// to the embedded ReActAgent at build time.
     generate_options_defaults: Option<agentscope_core::model::GenerateOptions>,
+    /// Retry/timeout policy for model calls (Java `modelExecutionConfig`).
+    model_execution_config: Option<agentscope_core::model::ExecutionConfig>,
+    /// Retry/timeout policy for tool calls (Java `toolExecutionConfig`).
+    tool_execution_config: Option<agentscope_core::model::ExecutionConfig>,
     // ---- Java parity setters (D2) ----
     agent_id: Option<String>,
     description: String,
@@ -935,6 +939,8 @@ impl Default for HarnessAgentBuilder {
             confirm_handler: None,
             permission_context: None,
             generate_options_defaults: None,
+            model_execution_config: None,
+            tool_execution_config: None,
             agent_id: None,
             description: String::new(),
             check_running: true,
@@ -1443,6 +1449,48 @@ impl HarnessAgentBuilder {
         self
     }
 
+    /// Sets the model-call retry/timeout policy (mirrors Java
+    /// `HarnessAgent.Builder.modelExecutionConfig`).
+    ///
+    /// The policy reaches every model call of the embedded agent through its generation
+    /// defaults; without it core applies the standard `ExecutionConfig::model_defaults()`
+    /// (7 attempts, 2s→60s backoff).
+    pub fn model_execution_config(
+        mut self,
+        config: agentscope_core::model::ExecutionConfig,
+    ) -> Self {
+        self.model_execution_config = Some(config);
+        self
+    }
+
+    /// Sets the tool-call retry/timeout policy (mirrors Java
+    /// `HarnessAgent.Builder.toolExecutionConfig`). Subagents inherit it with the toolkit.
+    pub fn tool_execution_config(
+        mut self,
+        config: agentscope_core::model::ExecutionConfig,
+    ) -> Self {
+        self.tool_execution_config = Some(config);
+        self
+    }
+
+    /// Generation defaults after overlaying [`HarnessAgentBuilder::model_execution_config`].
+    fn effective_generate_options(&self) -> Option<agentscope_core::model::GenerateOptions> {
+        match (&self.generate_options_defaults, &self.model_execution_config) {
+            (None, None) => None,
+            (Some(options), None) => Some(options.clone()),
+            (None, Some(config)) => Some(
+                agentscope_core::model::GenerateOptions::builder()
+                    .execution_config(config.clone())
+                    .build(),
+            ),
+            (Some(options), Some(config)) => {
+                let mut options = options.clone();
+                options.execution_config = Some(config.clone());
+                Some(options)
+            }
+        }
+    }
+
     // ---- Java-parity setters (D2) ----
 
     /// Sets the stable agent id (mirrors Java `agentId`). Defaults to `name` when unset.
@@ -1709,7 +1757,18 @@ impl HarnessAgentBuilder {
         // Toolkit deep-copy: each agent gets its own toolkit so harness-registered tools
         // never bleed across builds. A caller-supplied base toolkit is copied in first so
         // subagents declared on it inherit exactly the parent's tools (Java `Builder.toolkit`).
-        let toolkit = self.toolkit.clone().unwrap_or_default();
+        // Java delegates `toolExecutionConfig` to the core toolkit; here the policy lives in
+        // `ToolkitConfig`, so it must be installed before any tool runs (and before the
+        // subagent blueprints copy the toolkit).
+        let mut toolkit = self.toolkit.clone().unwrap_or_default();
+        if let Some(config) = &self.tool_execution_config {
+            let mut toolkit_config = toolkit.config().clone();
+            toolkit_config.execution_config = Some(config.clone());
+            toolkit.set_config(toolkit_config);
+        }
+        // Model policy + caller defaults in one value: `build()` applies it to the embedded
+        // agent and hands the same snapshot to subagents.
+        let generate_options_defaults = self.effective_generate_options();
 
         // ---- Workspace + filesystem orchestration ----
         let workspace_index = WorkspaceIndex::open(&resolved_workspace);
@@ -2237,7 +2296,7 @@ impl HarnessAgentBuilder {
                 model: subagent_model_slot.clone(),
                 model_resolver: self.model_resolver.clone(),
                 skill_filter: self.skill_filter.clone(),
-                generate_options: self.generate_options_defaults.clone(),
+                generate_options: generate_options_defaults.clone(),
                 // Snapshot taken before the agent tools join the toolkit: a child must not
                 // inherit `agent_spawn`, since it is a leaf worker.
                 toolkit: toolkit.copy(),
@@ -2488,7 +2547,7 @@ impl HarnessAgentBuilder {
                 }
             }
             let agent = agent_builder.build().expect("build ReActAgent");
-            if let Some(opts) = &self.generate_options_defaults {
+            if let Some(opts) = &generate_options_defaults {
                 agent.set_generate_options_defaults(opts.clone());
             }
             // Register the plan-control tools bound to the session state, so
@@ -2638,6 +2697,57 @@ mod tests {
         assert_eq!(handle.description(), agent.description());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn tool_execution_config_reaches_the_built_toolkit() {
+        let root = temp_root("tool_exec_cfg");
+        let config = agentscope_core::model::ExecutionConfig::builder()
+            .max_attempts(3)
+            .build();
+        let agent = HarnessAgent::builder()
+            .name("tool-exec-agent")
+            .model(Arc::new(NoopModel))
+            .tool_execution_config(config.clone())
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .disable_web_tools()
+            .build();
+
+        assert_eq!(
+            agent.toolkit().config().execution_config.as_ref(),
+            Some(&config)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn model_execution_config_overlays_the_generation_defaults() {
+        let config = agentscope_core::model::ExecutionConfig::builder()
+            .max_attempts(2)
+            .build();
+        let builder = HarnessAgent::builder()
+            .model_execution_config(config.clone())
+            .generate_options_defaults(GenerateOptions {
+                temperature: Some(0.2),
+                ..Default::default()
+            });
+        let options = builder
+            .effective_generate_options()
+            .expect("the overlay produces options");
+        assert_eq!(options.execution_config.as_ref(), Some(&config));
+        assert_eq!(options.temperature, Some(0.2));
+
+        let only_config = HarnessAgent::builder().model_execution_config(config.clone());
+        assert_eq!(
+            only_config
+                .effective_generate_options()
+                .expect("model policy alone still yields options")
+                .execution_config
+                .as_ref(),
+            Some(&config)
+        );
+        assert!(HarnessAgent::builder().effective_generate_options().is_none());
     }
 
     #[tokio::test]

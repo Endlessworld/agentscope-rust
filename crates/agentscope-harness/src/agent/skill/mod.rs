@@ -28,9 +28,9 @@ pub use curator::{
     SkillState, SkillUsageRecord, SkillUsageStore, TransitionCounts, UmbrellaPassMode,
 };
 pub use filters::{
-    CanaryFilter, EnvironmentFilter, FilesystemSkillUsageBackend, LoggingNotificationSink,
-    NoopNotificationSink, NotificationSink, NotifyAndWaitGate, SkillUsageBackend,
-    DEFAULT_USAGE_RELATIVE_PATH,
+    BaseStoreSkillUsageBackend, CanaryFilter, EnvironmentFilter, FilesystemSkillUsageBackend,
+    LoggingNotificationSink, NoopNotificationSink, NotificationSink, NotifyAndWaitGate,
+    SkillUsageBackend, DEFAULT_USAGE_RELATIVE_PATH, USAGE_STORE_NAMESPACE,
 };
 pub use load_tool::{LazyLoadSkillTool, LoadSkillTool};
 pub use manage::{
@@ -41,8 +41,9 @@ pub use model::{
     SkillFilter,
 };
 pub use promoter::{
-    AllowListFilter, AllowListGate, AuditEntry, DenyListFilter, PromotionDecision, PromotionResult,
-    RejectAllGate, SkillAuditLog, SkillPromoter, SkillPromotionGate, SkillVisibilityFilter,
+    AllowListFilter, AllowListGate, AuditEntry, CompositeFilter, DenyListFilter, PromotionDecision,
+    PromotionResult, RejectAllGate, SkillAuditLog, SkillPromoter, SkillPromotionGate,
+    SkillVisibilityFilter,
 };
 pub use prompt::{SkillPromptBuilder, DEFAULT_CODE_EXECUTION_INSTRUCTION, DEFAULT_HEADER};
 pub use repository::{

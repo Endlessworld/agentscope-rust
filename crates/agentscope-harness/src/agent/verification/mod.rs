@@ -247,6 +247,7 @@ mod tests {
                 ended_at: Some(2),
                 status: ActionStatus::Returned,
                 error_type: None,
+                execution_details: None,
             },
             result: Some(ToolResultBlock::text("all green")),
             evidence_binding: task.evidence_binding(),

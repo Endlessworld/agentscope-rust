@@ -105,10 +105,10 @@ pub use skill::{
 };
 pub use subagent::{
     load_from_directory, load_from_file, load_from_filesystem, parse, BackgroundTask,
-    DefaultAgentManager, RemoteAskPolicy, SubagentDeclaration, SubagentEntry, SubagentFactory,
-    SubagentMode, SubagentWorkspaceMode, TaskCompletionCallback, TaskDelivery, TaskRecord,
-    TaskRepository, TaskRunSpec, TaskStatus, WorkspaceTaskRepository, SUBAGENTS_DIR, SUBAGENT_GLOB,
-    SUPPRESS_COMPLETION_CALLBACK,
+    DefaultAgentManager, GeneratedSpec, RemoteAskPolicy, SubagentDeclaration, SubagentEntry,
+    SubagentFactory, SubagentMode, SubagentSpecGenerator, SubagentWorkspaceMode,
+    TaskCompletionCallback, TaskDelivery, TaskRecord, TaskRepository, TaskRunSpec, TaskStatus,
+    WorkspaceTaskRepository, SUBAGENTS_DIR, SUBAGENT_GLOB, SUPPRESS_COMPLETION_CALLBACK,
 };
 pub use tools::{
     HarnessPlatformTools, McpServerEntry, ToolFilter, ToolsConfig, ToolsConfigLoader,

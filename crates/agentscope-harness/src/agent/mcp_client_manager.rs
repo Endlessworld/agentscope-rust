@@ -161,6 +161,10 @@ pub struct McpServerConfig {
     /// [`McpTransport`]): `command` -> stdio, an `/sse` URL -> SSE, any other URL ->
     /// Streamable HTTP. Mirrors Java `tools/McpServerConfig.transport`.
     pub transport: Option<McpTransport>,
+    /// Registers bridged tools as `<server>__<tool>` instead of the bare remote name, so two
+    /// servers advertising the same tool name cannot overwrite each other. Mirrors Java
+    /// `McpServerConfig.prefixToolNames` (default `false`).
+    pub prefix_tool_names: bool,
 }
 
 impl McpServerConfig {
@@ -172,6 +176,7 @@ impl McpServerConfig {
             headers: Vec::new(),
             propagate_meta: true,
             transport: None,
+            prefix_tool_names: false,
         }
     }
 
@@ -203,6 +208,13 @@ impl McpServerConfig {
     /// `McpClientBuilder.propagateMeta`.
     pub fn propagate_meta(mut self, propagate_meta: bool) -> Self {
         self.propagate_meta = propagate_meta;
+        self
+    }
+
+    /// Registers bridged tools with a `<server>__` prefix. Mirrors Java
+    /// `McpServerConfig.setPrefixToolNames`.
+    pub fn prefix_tool_names(mut self, prefix: bool) -> Self {
+        self.prefix_tool_names = prefix;
         self
     }
 }

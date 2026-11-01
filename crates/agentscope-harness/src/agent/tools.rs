@@ -103,6 +103,8 @@ pub struct McpServerEntry {
     pub enable_tools: Vec<String>,
     /// Connection-level request-metadata propagation switch.
     pub propagate_meta: Option<bool>,
+    /// Register bridged tools as `<server>__<tool>`. Absent keeps the bare remote name.
+    pub prefix_tool_names: Option<bool>,
 }
 
 impl McpServerEntry {
@@ -148,6 +150,7 @@ impl McpServerEntry {
             .collect();
         config.propagate_meta = self.propagate_meta.unwrap_or(true);
         config.transport = transport;
+        config.prefix_tool_names = self.prefix_tool_names.unwrap_or(false);
         Ok(config)
     }
 }

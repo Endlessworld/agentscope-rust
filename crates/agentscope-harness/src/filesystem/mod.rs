@@ -30,7 +30,9 @@ pub use result::{
     EditResult, FileDownloadResponse, FileUploadResponse, GlobResult, GrepResult, LsResult,
     ReadResult, WriteResult,
 };
-pub use sandbox::{SandboxBackedFilesystem, SandboxFilesystem};
+pub use sandbox::{
+    PinnedSandboxFilesystem, RoutedSandboxFilesystem, SandboxBackedFilesystem, SandboxFilesystem,
+};
 
 /// Directory/listing entry.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -48,6 +48,29 @@ impl SkillVisibilityFilter for DenyListFilter {
     }
 }
 
+/// Chains several visibility filters with AND semantics: a candidate is visible only
+/// when every filter admits it. Mirrors Java `curator/CompositeFilter`.
+#[derive(Default)]
+pub struct CompositeFilter {
+    filters: Vec<Arc<dyn SkillVisibilityFilter>>,
+}
+
+impl CompositeFilter {
+    pub fn new(filters: Vec<Arc<dyn SkillVisibilityFilter>>) -> Self {
+        Self { filters }
+    }
+
+    pub fn filters(&self) -> &[Arc<dyn SkillVisibilityFilter>] {
+        &self.filters
+    }
+}
+
+impl SkillVisibilityFilter for CompositeFilter {
+    fn is_visible(&self, candidate: &SkillCandidate) -> bool {
+        self.filters.iter().all(|f| f.is_visible(candidate))
+    }
+}
+
 /// Decision returned by a [`SkillPromotionGate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromotionDecision {
@@ -301,6 +324,21 @@ mod tests {
             support_file_paths: vec![],
             script_files: vec![],
         }
+    }
+
+    #[test]
+    fn composite_filter_requires_every_filter_to_admit() {
+        let filter = CompositeFilter::new(vec![
+            Arc::new(AllowListFilter::new(vec![
+                "a".to_string(),
+                "b".to_string(),
+            ])),
+            Arc::new(DenyListFilter::new(vec!["b".to_string()])),
+        ]);
+        assert!(filter.is_visible(&candidate("a")));
+        assert!(!filter.is_visible(&candidate("b")));
+        assert!(!filter.is_visible(&candidate("c")));
+        assert!(CompositeFilter::default().is_visible(&candidate("c")));
     }
 
     #[test]

@@ -10,6 +10,7 @@
 
 pub mod builder;
 pub mod context_middleware;
+pub mod conventions;
 pub mod item;
 pub mod model_calls;
 pub mod policy;
@@ -22,6 +23,7 @@ pub use builder::{
     PreparedRequest, MANIFEST_ATTRIBUTE_PREFIX,
 };
 pub use context_middleware::ContextMiddleware;
+pub use conventions::{CONTEXT_CONVENTIONS, CONTEXT_CONVENTIONS_INSTRUCTION_ID};
 pub use item::{content_hash, ContextBlock, ContextItem, ContextItemPlacement, ContextPurpose};
 pub use model_calls::{auxiliary, auxiliary_text};
 pub use policy::{

@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use base64::Engine;
 use tokio::io::AsyncReadExt;
 
-use super::{ExecuteResponse, FileData, FileInfo, Filesystem, GrepMatch};
+use super::{ExecuteResponse, FileData, FileInfo, Filesystem, FilesystemKind, GrepMatch};
+use super::CompositeFilesystem;
 
 /// A `Filesystem` that additionally supports shell command execution.
 #[async_trait]
@@ -274,5 +275,330 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
             exit_code: exit_status.code().unwrap_or(-1),
             truncated: false,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PinnedSandboxFilesystem
+// ---------------------------------------------------------------------------
+
+/// A [`SandboxFilesystem`] pinned to one already-acquired sandbox.
+///
+/// Mirrors Java `PinnedSandboxFilesystem`: the instance holds the sandbox filesystem it was
+/// created from for its whole lifetime, so an out-of-call consumer (the async session mirror)
+/// never re-enters the manager and never acquires a second sandbox. [`release`](Self::release)
+/// publishes a latch that rejects every later operation, because a self-managed sandbox is
+/// gone once its call releases it.
+pub struct PinnedSandboxFilesystem {
+    inner: Arc<dyn SandboxFilesystem>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PinnedSandboxFilesystem {
+    pub fn new(inner: Arc<dyn SandboxFilesystem>) -> Self {
+        Self {
+            inner,
+            released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// The pinned sandbox filesystem. It is the same instance the pin was built from.
+    pub fn inner(&self) -> &Arc<dyn SandboxFilesystem> {
+        &self.inner
+    }
+
+    /// Publishes the release latch. Idempotent; unlike Java's
+    /// `clearSandboxIfCurrent` it never unpins the inner filesystem.
+    pub fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_released(&self) -> bool {
+        self.released.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn ensure_live(&self) -> Result<()> {
+        if self.is_released() {
+            return Err(Error::Tool("Sandbox has been released".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Filesystem for PinnedSandboxFilesystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> FilesystemKind {
+        FilesystemKind::Sandbox
+    }
+
+    async fn ls(&self, ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
+        self.ensure_live()?;
+        self.inner.ls(ctx, path).await
+    }
+
+    async fn read(
+        &self,
+        ctx: &RuntimeContext,
+        path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<FileData> {
+        self.ensure_live()?;
+        self.inner.read(ctx, path, offset, limit).await
+    }
+
+    async fn write(&self, ctx: &RuntimeContext, path: &str, content: &str) -> Result<()> {
+        self.ensure_live()?;
+        self.inner.write(ctx, path, content).await
+    }
+
+    async fn edit(
+        &self,
+        ctx: &RuntimeContext,
+        path: &str,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+    ) -> Result<usize> {
+        self.ensure_live()?;
+        self.inner.edit(ctx, path, old, new, replace_all).await
+    }
+
+    async fn grep(
+        &self,
+        ctx: &RuntimeContext,
+        pattern: &str,
+        path: Option<&str>,
+        glob: Option<&str>,
+    ) -> Result<Vec<GrepMatch>> {
+        self.ensure_live()?;
+        self.inner.grep(ctx, pattern, path, glob).await
+    }
+
+    async fn glob(&self, ctx: &RuntimeContext, pattern: &str, path: &str) -> Result<Vec<FileInfo>> {
+        self.ensure_live()?;
+        self.inner.glob(ctx, pattern, path).await
+    }
+
+    async fn delete(&self, ctx: &RuntimeContext, path: &str) -> Result<()> {
+        self.ensure_live()?;
+        self.inner.delete(ctx, path).await
+    }
+
+    async fn move_path(&self, ctx: &RuntimeContext, from: &str, to: &str) -> Result<()> {
+        self.ensure_live()?;
+        self.inner.move_path(ctx, from, to).await
+    }
+
+    async fn exists(&self, ctx: &RuntimeContext, path: &str) -> Result<bool> {
+        self.ensure_live()?;
+        self.inner.exists(ctx, path).await
+    }
+
+    async fn sync(&self, ctx: &RuntimeContext, path: &str) -> Result<()> {
+        self.ensure_live()?;
+        self.inner.sync(ctx, path).await
+    }
+}
+
+#[async_trait]
+impl SandboxFilesystem for PinnedSandboxFilesystem {
+    async fn execute(
+        &self,
+        ctx: &RuntimeContext,
+        command: &str,
+        timeout_seconds: u32,
+    ) -> Result<ExecuteResponse> {
+        self.ensure_live()?;
+        self.inner.execute(ctx, command, timeout_seconds).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RoutedSandboxFilesystem
+// ---------------------------------------------------------------------------
+
+/// Prefix-routed filesystem that keeps shell execution on its primary sandbox.
+///
+/// Mirrors Java `RoutedSandboxFilesystem`: file operations go through a
+/// [`CompositeFilesystem`] (primary as the default backend plus optional routes, longest
+/// prefix first), while `execute` always reaches the primary. A caller can therefore mount
+/// extra stores (e.g. `memory-stores/`) without losing `shell_execute`.
+pub struct RoutedSandboxFilesystem {
+    primary: Arc<dyn SandboxFilesystem>,
+    composite: CompositeFilesystem,
+}
+
+impl RoutedSandboxFilesystem {
+    pub fn new(
+        primary: Arc<dyn SandboxFilesystem>,
+        routes: Vec<(String, Arc<dyn Filesystem>)>,
+    ) -> Self {
+        let composite =
+            CompositeFilesystem::new(Arc::clone(&primary) as Arc<dyn Filesystem>, routes);
+        Self { primary, composite }
+    }
+
+    /// The primary sandbox filesystem (the lifecycle middleware injects into this).
+    pub fn primary(&self) -> &Arc<dyn SandboxFilesystem> {
+        &self.primary
+    }
+}
+
+#[async_trait]
+impl Filesystem for RoutedSandboxFilesystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn kind(&self) -> FilesystemKind {
+        FilesystemKind::Sandbox
+    }
+
+    async fn ls(&self, ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
+        self.composite.ls(ctx, path).await
+    }
+
+    async fn read(
+        &self,
+        ctx: &RuntimeContext,
+        path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<FileData> {
+        self.composite.read(ctx, path, offset, limit).await
+    }
+
+    async fn write(&self, ctx: &RuntimeContext, path: &str, content: &str) -> Result<()> {
+        self.composite.write(ctx, path, content).await
+    }
+
+    async fn edit(
+        &self,
+        ctx: &RuntimeContext,
+        path: &str,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+    ) -> Result<usize> {
+        self.composite.edit(ctx, path, old, new, replace_all).await
+    }
+
+    async fn grep(
+        &self,
+        ctx: &RuntimeContext,
+        pattern: &str,
+        path: Option<&str>,
+        glob: Option<&str>,
+    ) -> Result<Vec<GrepMatch>> {
+        self.composite.grep(ctx, pattern, path, glob).await
+    }
+
+    async fn glob(&self, ctx: &RuntimeContext, pattern: &str, path: &str) -> Result<Vec<FileInfo>> {
+        self.composite.glob(ctx, pattern, path).await
+    }
+
+    async fn delete(&self, ctx: &RuntimeContext, path: &str) -> Result<()> {
+        self.composite.delete(ctx, path).await
+    }
+
+    async fn move_path(&self, ctx: &RuntimeContext, from: &str, to: &str) -> Result<()> {
+        self.composite.move_path(ctx, from, to).await
+    }
+
+    async fn exists(&self, ctx: &RuntimeContext, path: &str) -> Result<bool> {
+        self.composite.exists(ctx, path).await
+    }
+
+    async fn sync(&self, ctx: &RuntimeContext, path: &str) -> Result<()> {
+        self.composite.sync(ctx, path).await
+    }
+}
+
+#[async_trait]
+impl SandboxFilesystem for RoutedSandboxFilesystem {
+    async fn execute(
+        &self,
+        ctx: &RuntimeContext,
+        command: &str,
+        timeout_seconds: u32,
+    ) -> Result<ExecuteResponse> {
+        self.primary.execute(ctx, command, timeout_seconds).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filesystem::LocalFilesystem;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("asr_fs_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sandbox_fs(dir: &std::path::Path) -> Arc<dyn SandboxFilesystem> {
+        Arc::new(SandboxBackedFilesystem::new(
+            Arc::new(LocalFilesystem::sandboxed(dir)),
+            dir,
+        ))
+    }
+
+    #[tokio::test]
+    async fn pinned_keeps_the_acquired_filesystem_and_rejects_after_release() {
+        let dir = temp_dir("pinned");
+        let inner = sandbox_fs(&dir);
+        let pinned = PinnedSandboxFilesystem::new(Arc::clone(&inner));
+        assert!(Arc::ptr_eq(pinned.inner(), &inner), "must not re-acquire");
+
+        let ctx = RuntimeContext::default();
+        pinned.write(&ctx, "mirror.txt", "hello").await.unwrap();
+        assert_eq!(pinned.read(&ctx, "mirror.txt", 0, 10).await.unwrap().content, "hello");
+        assert!(!pinned.is_released());
+
+        pinned.release();
+        pinned.release(); // idempotent
+        assert!(pinned.is_released());
+        let error = pinned.read(&ctx, "mirror.txt", 0, 10).await.unwrap_err();
+        assert!(error.to_string().contains("released"), "{error}");
+        assert!(pinned.exists(&ctx, "mirror.txt").await.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn routed_sends_prefixed_paths_to_the_route_and_keeps_execute_on_primary() {
+        let primary_dir = temp_dir("routed_primary");
+        let memory_dir = temp_dir("routed_memory");
+        std::fs::write(memory_dir.join("m.md"), "from the store").unwrap();
+
+        let primary = sandbox_fs(&primary_dir);
+        let routed = RoutedSandboxFilesystem::new(
+            Arc::clone(&primary),
+            vec![(
+                "memory/".to_string(),
+                Arc::new(LocalFilesystem::sandboxed(&memory_dir)) as Arc<dyn Filesystem>,
+            )],
+        );
+        assert!(Arc::ptr_eq(routed.primary(), &primary));
+
+        let ctx = RuntimeContext::default();
+        assert_eq!(
+            routed.read(&ctx, "memory/m.md", 0, 100).await.unwrap().content,
+            "from the store"
+        );
+        routed.write(&ctx, "notes.txt", "primary").await.unwrap();
+        assert!(primary_dir.join("notes.txt").exists());
+        assert!(!memory_dir.join("notes.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&primary_dir);
+        let _ = std::fs::remove_dir_all(&memory_dir);
     }
 }
