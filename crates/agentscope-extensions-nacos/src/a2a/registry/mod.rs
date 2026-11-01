@@ -675,9 +675,13 @@ impl NacosAgentRegistry {
         &self,
         transport_properties: Vec<TransportProperties>,
     ) -> Result<Vec<NacosA2aTransportProperties>, String> {
+        // A transport rejected by the builder (empty `transport`) fails the whole
+        // registration instead of being silently dropped, mirroring Java where the builder's
+        // `IllegalArgumentException` is not caught and `register` fails (NACOS-08).
         let mut result: HashMap<String, NacosA2aTransportProperties> = transport_properties
             .into_iter()
-            .filter_map(|p| {
+            .map(|p| {
+                let transport_type = p.transport_type.clone();
                 NacosA2aTransportProperties::builder()
                     .transport(p.transport_type)
                     .host(p.host)
@@ -685,10 +689,12 @@ impl NacosAgentRegistry {
                     .path(p.path.unwrap_or_default())
                     .support_tls(p.support_tls)
                     .build()
-                    .ok()
+                    .map(|built| (built.transport.to_uppercase(), built))
+                    .map_err(|error| {
+                        format!("Invalid A2A transport `{transport_type}`: {error}")
+                    })
             })
-            .map(|p| (p.transport.to_uppercase(), p))
-            .collect();
+            .collect::<Result<_, String>>()?;
 
         for (transport, from_env) in
             NacosA2aTransportPropertiesEnvParser::from_env().map_err(|e| e.to_string())?
@@ -827,9 +833,17 @@ fn do_overwrite(
 
 /// Builds `[protocol://]host:port[/path][?query]`, mirroring
 /// `NacosAgentRegistry#generateNewUrl`.
+///
+/// The host goes through [`format_host_for_url`] first, like Java's
+/// `NetworkUtils.formatHostForUrl` (NACOS-09).
 fn generate_new_url(transport: &NacosA2aTransportProperties) -> String {
     let protocol = transport.effective_protocol();
-    let mut url = format!("{}://{}:{}", protocol, transport.host, transport.port);
+    let mut url = format!(
+        "{}://{}:{}",
+        protocol,
+        format_host_for_url(&transport.host),
+        transport.port
+    );
     if let Some(path) = transport.path.as_deref().filter(|p| !p.trim().is_empty()) {
         url.push_str(if path.starts_with('/') { path } else { "/" });
         if !path.starts_with('/') {
@@ -841,6 +855,18 @@ fn generate_new_url(transport: &NacosA2aTransportProperties) -> String {
         url.push_str(query);
     }
     url
+}
+
+/// Brackets a bare IPv6 literal, mirroring `NetworkUtils#formatHostForUrl`.
+///
+/// `::1` must become `[::1]`, otherwise `http://::1:8080` is not a valid URL.
+fn format_host_for_url(host: &str) -> String {
+    let already_bracketed = host.starts_with('[') && host.ends_with(']');
+    if host.contains(':') && !already_bracketed {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -923,6 +949,41 @@ mod tests {
             query: Some("a=1".into()),
         };
         assert_eq!(generate_new_url(&t), "http://h:9/api?a=1");
+    }
+
+    /// NACOS-09: an IPv6 literal is bracketed, otherwise the port separator makes the URL
+    /// invalid (`http://::1:8080`).
+    #[test]
+    fn generate_new_url_brackets_ipv6_hosts() {
+        let url = |host: &str| {
+            let t = NacosA2aTransportProperties::builder()
+                .transport("JSONRPC")
+                .host(host)
+                .port(8080)
+                .build()
+                .unwrap();
+            generate_new_url(&t)
+        };
+        assert_eq!(url("::1"), "http://[::1]:8080");
+        assert_eq!(url("[::1]"), "http://[::1]:8080");
+        assert_eq!(url("127.0.0.1"), "http://127.0.0.1:8080");
+    }
+
+    /// NACOS-08: a transport the builder rejects fails the registration instead of being
+    /// silently dropped (Java: uncaught `IllegalArgumentException`).
+    #[tokio::test]
+    async fn an_invalid_transport_fails_the_registration() {
+        let svc = Arc::new(InMemoryNacosAiService::new());
+        let registry = NacosAgentRegistry::builder(svc.clone()).build();
+        let card = A2aAgentCard::new("agent", "http://localhost:8080");
+
+        let error = registry
+            .register(&card, vec![TransportProperties::new("   ", "localhost", 8080)])
+            .await
+            .unwrap_err();
+        assert!(error.contains("`transport`"), "{error}");
+        assert!(svc.released_cards().is_empty());
+        assert!(svc.registered_endpoints().is_empty());
     }
 
     #[tokio::test]

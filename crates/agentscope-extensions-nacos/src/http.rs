@@ -39,8 +39,11 @@
 //! Nacos pushes updates over gRPC; this HTTP client cannot hold such a stream, so
 //! `subscribe_*` performs the initial fetch, remembers the listener and exposes
 //! [`NacosHttpAiService::poll_once`] for change detection. An embedder that needs push-like
-//! behaviour drives `poll_once` from its own loop (or `spawn_polling` from the `http-client`
-//! feature).
+//! behaviour drives `poll_once` from its own loop, or lets
+//! [`NacosHttpAiService::polling`] (also exposed as `spawn_polling` with the `http-client`
+//! feature) do it. [`NacosHttpAiService::unsubscribe_prompt`] /
+//! [`NacosHttpAiService::unsubscribe_agent_card`] / [`NacosHttpAiService::close`] prune the
+//! subscription table (NACOS-12).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -348,6 +351,22 @@ fn refresh_deadline(ttl: std::time::Duration, ratio: f64) -> std::time::Duration
     ttl.mul_f64(ratio)
 }
 
+/// Upper bound of the polling backoff, mirroring the model-call retry cap.
+pub const MAX_POLLING_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The delay before the next [`NacosHttpAiService::polling`] tick after `failures` consecutive
+/// failures (NACOS-06).
+///
+/// A healthy service polls every `interval`; a failing one backs off exponentially and is capped
+/// at [`MAX_POLLING_BACKOFF`], so a broken connection does not hammer the server. Kept as a pure
+/// function so the schedule is unit-testable without sleeping.
+pub fn polling_backoff(
+    interval: std::time::Duration,
+    failures: u32,
+) -> std::time::Duration {
+    crate::service::exponential_backoff(interval, failures, MAX_POLLING_BACKOFF)
+}
+
 /// Cached credential-based access token (NACOS-03).
 #[derive(Default)]
 struct AuthState {
@@ -483,6 +502,66 @@ impl NacosHttpAiService {
             }
         }
         Ok(fired)
+    }
+
+    /// Stops pushing changes for `prompt_key`, returning whether a subscription was removed.
+    ///
+    /// Nacos has no unsubscribe call (the Java module relies on disposing the whole `AiService`),
+    /// so this prunes the local subscription table only — after which [`Self::poll_once`] no
+    /// longer re-fetches the key (NACOS-12).
+    pub fn unsubscribe_prompt(&self, prompt_key: &str) -> bool {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .prompt_listeners
+            .remove(prompt_key)
+            .is_some()
+    }
+
+    /// Stops pushing changes for `agent_name`; see [`Self::unsubscribe_prompt`] (NACOS-12).
+    pub fn unsubscribe_agent_card(&self, agent_name: &str) -> bool {
+        let mut guard = self.subscriptions.lock().unwrap();
+        let removed = guard.card_listeners.remove(agent_name).is_some();
+        guard.card_last.remove(agent_name);
+        removed
+    }
+
+    /// Drops every subscription, mirroring the disposal of a Nacos `AiService` client
+    /// (NACOS-12).
+    ///
+    /// The service stays usable: a later `subscribe_*` call registers again.
+    pub fn close(&self) {
+        let mut guard = self.subscriptions.lock().unwrap();
+        guard.card_listeners.clear();
+        guard.card_last.clear();
+        guard.prompt_listeners.clear();
+    }
+
+    /// Drives [`Self::poll_once`] every `interval` until the returned handle is aborted.
+    ///
+    /// This is the HTTP stand-in for the Nacos client's gRPC push stream: subscribed AgentCards /
+    /// prompts are re-fetched and changed values are pushed to the listeners. A failed tick is
+    /// logged and retried with exponential backoff ([`polling_backoff`], capped at
+    /// [`MAX_POLLING_BACKOFF`]); a successful tick resets the schedule. `interval` is injectable,
+    /// so the loop is testable with millisecond ticks (NACOS-06/13).
+    pub fn polling(self: &Arc<Self>, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut failures = 0u32;
+            loop {
+                match service.poll_once().await {
+                    Ok(_) => failures = 0,
+                    Err(error) => {
+                        failures = failures.saturating_add(1);
+                        warn!(error = %error, failures, "nacos ai service poll failed");
+                    }
+                }
+                let delay = polling_backoff(interval, failures);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        })
     }
 
     // ---- internals ----
@@ -965,6 +1044,8 @@ pub use reqwest_transport::{spawn_polling, ReqwestNacosTransport};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::a2a::discovery::NacosAgentCardResolver;
+    use crate::prompt::NacosPromptListener;
     use crate::service::{InMemoryNacosAiService, A2A_ENDPOINT_TYPE_SERVICE};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1194,6 +1275,148 @@ mod tests {
         let noop: AgentCardListener = Arc::new(|_, _| {});
         let error = service.subscribe_agent_card("gone", noop).await.unwrap_err();
         assert!(error.is_not_found());
+    }
+
+    /// NACOS-12: unsubscribing / closing prunes the subscription table, so `poll_once` no longer
+    /// re-fetches that key.
+    #[tokio::test]
+    async fn unsubscribing_and_close_stop_polling_the_key() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(200, card_json("remote")),
+            HttpResponse::new(200, "{\"template\":\"hi\"}"),
+            HttpResponse::new(200, card_json("remote")),
+            HttpResponse::new(200, card_json("remote")),
+        ]);
+        let http = Arc::new(service(Arc::clone(&transport)));
+        let card_listener: AgentCardListener = Arc::new(|_, _| {});
+        let prompt_listener: PromptListener = Arc::new(|_, _| {});
+        http.subscribe_agent_card("remote", card_listener)
+            .await
+            .unwrap();
+        http.subscribe_prompt("greet", None, None, prompt_listener)
+            .await
+            .unwrap();
+        assert_eq!(transport.requests().len(), 2);
+
+        assert!(http.unsubscribe_prompt("greet"));
+        assert!(!http.unsubscribe_prompt("greet"));
+
+        // The card is still subscribed, so it is re-fetched; the pruned prompt is not.
+        assert_eq!(http.poll_once().await.unwrap(), 0);
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].url.contains("agentName=remote"));
+        assert!(!requests[2].url.contains("promptKey"));
+
+        assert!(http.unsubscribe_agent_card("remote"));
+        // Nothing is subscribed now, so `poll_once` issues no request at all (the queue is empty,
+        // so a re-fetch would surface as a transport error).
+        assert_eq!(http.poll_once().await.unwrap(), 0);
+        assert_eq!(transport.requests().len(), 3);
+
+        // Subscribing again after an unsubscribe works, and `close()` drops everything.
+        let again: AgentCardListener = Arc::new(|_, _| {});
+        http.subscribe_agent_card("remote", again).await.unwrap();
+        http.close();
+        assert_eq!(http.poll_once().await.unwrap(), 0);
+        assert_eq!(transport.requests().len(), 4);
+    }
+
+    /// NACOS-13: the polling chain feeds the real consumers — a changed prompt reaches
+    /// `NacosPromptListener` and a changed card reaches `NacosAgentCardResolver`, and both then
+    /// answer from cache (no extra request).
+    #[tokio::test]
+    async fn polling_refreshes_the_prompt_listener_and_the_card_resolver() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(200, card_json("remote")),
+            HttpResponse::new(200, "{\"template\":\"hello {{name}}\"}"),
+        ]);
+        let http = Arc::new(service(Arc::clone(&transport)));
+        let nacos: Arc<dyn NacosAiService> = http.clone();
+        let resolver = NacosAgentCardResolver::new(Arc::clone(&nacos));
+        let listener = NacosPromptListener::new(nacos);
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), "ada".to_string());
+        assert_eq!(
+            resolver.resolve_detailed("remote").await.unwrap().url,
+            "http://agent:9000"
+        );
+        assert_eq!(
+            listener
+                .get_prompt_with_args("greet", Some(&args))
+                .await
+                .unwrap(),
+            "hello ada"
+        );
+        assert_eq!(transport.requests().len(), 2);
+
+        // Nacos now serves a new card and a new template.
+        let mut changed = NacosAgentCard::new("remote", "http://agent:9999");
+        changed.version = Some("2".to_string());
+        transport.push(HttpResponse::new(200, serde_json::to_string(&changed).unwrap()));
+        transport.push(HttpResponse::new(
+            200,
+            "{\"template\":\"hi {{name}}\",\"version\":\"2\",\"label\":\"prod\"}",
+        ));
+        assert_eq!(http.poll_once().await.unwrap(), 2);
+
+        // Both consumers see the pushed value without issuing another request.
+        assert_eq!(
+            resolver.resolve_detailed("remote").await.unwrap().url,
+            "http://agent:9999"
+        );
+        assert_eq!(
+            listener
+                .get_prompt_with_args("greet", Some(&args))
+                .await
+                .unwrap(),
+            "hi ada"
+        );
+        assert_eq!(transport.requests().len(), 4);
+    }
+
+    /// NACOS-13: `polling` is the built-in timer for `poll_once`, so a host needs no loop.
+    #[tokio::test]
+    async fn polling_pushes_changes_to_subscribers_until_aborted() {
+        let transport = FakeTransport::new(vec![HttpResponse::new(200, card_json("remote"))]);
+        let http = Arc::new(service(Arc::clone(&transport)));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&seen);
+        let listener: AgentCardListener = Arc::new(move |name: &str, card: &NacosAgentCard| {
+            sink.lock()
+                .unwrap()
+                .push(format!("{name}:{}", card.url.clone().unwrap_or_default()));
+        });
+        http.subscribe_agent_card("remote", listener).await.unwrap();
+
+        let mut changed = NacosAgentCard::new("remote", "http://agent:9999");
+        changed.version = Some("2".to_string());
+        transport.push(HttpResponse::new(200, serde_json::to_string(&changed).unwrap()));
+
+        let handle = http.polling(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["remote:http://agent:9999".to_string()]
+        );
+    }
+
+    /// NACOS-06/13: the polling schedule backs off exponentially and is capped.
+    #[test]
+    fn polling_backs_off_exponentially_until_the_cap() {
+        let interval = Duration::from_secs(1);
+        assert_eq!(polling_backoff(interval, 0), interval);
+        assert_eq!(polling_backoff(interval, 1), Duration::from_secs(2));
+        assert_eq!(polling_backoff(interval, 3), Duration::from_secs(8));
+        // Capped, so a long outage stops growing the delay.
+        assert_eq!(polling_backoff(interval, 40), MAX_POLLING_BACKOFF);
+        // A sub-second interval is still honoured while healthy.
+        let fast = Duration::from_millis(5);
+        assert_eq!(polling_backoff(fast, 0), fast);
+        assert_eq!(polling_backoff(fast, 1), Duration::from_millis(10));
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use agentscope_harness::agent::skill::model::AgentSkill;
 use agentscope_harness::agent::skill::repository::SkillRepository;
 use agentscope_harness::agent::skill::stager::SkillRepo;
 
-use crate::service::{AiServiceError, NacosAiService};
+use crate::service::{AiServiceError, AiServiceResult, NacosAiService};
 
 pub mod frontmatter;
 
@@ -60,7 +60,7 @@ pub struct NacosSkillRepository {
 pub struct NacosSkillRepositoryInfo {
     /// Repository type (`nacos`).
     pub repo_type: String,
-    /// Repository location (`nacos://<namespace>`).
+    /// Repository location (`namespace:<id>`), mirroring Java's `LOCATION_PREFIX`.
     pub location: String,
     /// Always `false`: Nacos skill packages are read-only.
     pub writeable: bool,
@@ -222,14 +222,36 @@ impl NacosSkillRepository {
     }
 
     /// Whether a skill exists in Nacos, mirroring `skillExists(String)`.
+    ///
+    /// A `NOT_FOUND` is reported as `false`; any other failure is logged (Java `log.warn`) and
+    /// also reported as `false` so an existence probe never aborts a caller. Use
+    /// [`Self::skill_exists_detailed`] when the error matters (NACOS-10).
     pub async fn skill_exists(&self, skill_name: &str) -> bool {
+        match self.skill_exists_detailed(skill_name).await {
+            Ok(exists) => exists,
+            Err(error) => {
+                warn!(
+                    skill = %skill_name,
+                    error = %error,
+                    "Failed to check whether the skill exists in Nacos, treating it as missing"
+                );
+                false
+            }
+        }
+    }
+
+    /// [`Self::skill_exists`] with the error surfaced (NACOS-10).
+    ///
+    /// `Ok(false)` covers both `NOT_FOUND` and a blank name; only an unexpected failure (a
+    /// transport error, a `5xx`, a business code other than `NOT_FOUND`, …) is an `Err`.
+    pub async fn skill_exists_detailed(&self, skill_name: &str) -> AiServiceResult<bool> {
         if skill_name.trim().is_empty() {
-            return false;
+            return Ok(false);
         }
         match self.download_skill_zip_bytes(skill_name.trim()).await {
-            Ok(bytes) => !bytes.is_empty(),
-            Err(e) if e.is_not_found() => false,
-            Err(_) => false,
+            Ok(bytes) => Ok(!bytes.is_empty()),
+            Err(error) if error.is_not_found() => Ok(false),
+            Err(error) => Err(error),
         }
     }
 }
@@ -394,6 +416,38 @@ mod tests {
         let repo = NacosSkillRepository::new(svc, "public");
         assert!(repo.skill_exists("demo").await);
         assert!(!repo.skill_exists("nope").await);
+        assert!(repo.skill_exists_detailed("demo").await.unwrap());
+        assert!(!repo.skill_exists_detailed("nope").await.unwrap());
+    }
+
+    /// A transport answering `500` for every request, so a failure other than `NOT_FOUND` is
+    /// observable (NACOS-10).
+    struct ServerErrorTransport;
+
+    #[async_trait::async_trait]
+    impl crate::http::NacosHttpTransport for ServerErrorTransport {
+        async fn execute(
+            &self,
+            _request: crate::http::HttpRequest,
+        ) -> Result<crate::http::HttpResponse, String> {
+            Ok(crate::http::HttpResponse::new(500, "boom"))
+        }
+    }
+
+    /// NACOS-10: a non-`NOT_FOUND` failure is reported as missing but its error stays
+    /// observable through `skill_exists_detailed`.
+    #[tokio::test]
+    async fn a_non_not_found_failure_is_not_swallowed() {
+        let svc = Arc::new(crate::http::NacosHttpAiService::new(
+            crate::http::NacosHttpConfig::new("http://nacos:8848/nacos", "public")
+                .with_retry(crate::http::RetryPolicy::none()),
+            Arc::new(ServerErrorTransport),
+        ));
+        let repo = NacosSkillRepository::new(svc, "public");
+        assert!(!repo.skill_exists("demo").await);
+        let error = repo.skill_exists_detailed("demo").await.unwrap_err();
+        assert_eq!(error.code(), 500);
+        assert!(!error.is_not_found());
     }
 
     #[tokio::test]
