@@ -676,7 +676,10 @@ async fn distributed_lease_uses_set_nx_and_a_token_cas_release() {
         (0..=30_000).contains(&ttl),
         "the lease must carry a PX expiry, got {ttl}"
     );
-    assert!(guard.is_held(&isolation_key).await);
+    assert!(guard
+        .probe_is_held(&isolation_key)
+        .await
+        .expect("EXISTS probe"));
 
     // Contention: a second acquisition against the live lock cannot succeed. `try_enter`
     // retries forever, so bound it with a timeout instead of hanging the suite.
@@ -689,7 +692,10 @@ async fn distributed_lease_uses_set_nx_and_a_token_cas_release() {
 
     // Success branch of the token CAS: the owner releases, and only once.
     assert!(lease.release().await, "the owner's token releases the lock");
-    assert!(!guard.is_held(&isolation_key).await);
+    assert!(!guard
+        .probe_is_held(&isolation_key)
+        .await
+        .expect("EXISTS probe"));
     assert!(
         !lease.release().await,
         "release is idempotent and never re-runs the script"

@@ -11,6 +11,23 @@
 //! serialisation, backed by a Redis `SET NX PX` lease. The trait impl awaits the
 //! acquisition directly — no `futures::executor::block_on` bridge.
 //!
+//! ## Diagnostics: local view vs distributed probe
+//!
+//! `SandboxGuard::is_held` is synchronous, so it cannot round-trip to Redis. On this guard
+//! it answers from the **local** lease registry (the keys this process acquired through the
+//! trait) and never touches the network — blocked Tokio workers and deadlocked
+//! `current_thread` runtimes are exactly why (REDIS-07). Two surfaces give the distributed
+//! answer instead:
+//!
+//! * [`SandboxGuard::try_is_held`] — the async trait seam, which awaits a real `EXISTS`
+//!   probe and returns the error instead of reporting "free" (`Ok(false)`) when Redis is
+//!   unreachable. Callers that can `await` should prefer it.
+//! * [`RedisSandboxExecutionGuard::probe_is_held`] — the same probe as an inherent method.
+//!
+//! The local view also cannot see a lease held by *another* process, and it ignores leases
+//! taken through the inherent [`RedisSandboxExecutionGuard::try_enter`] (which are not
+//! tracked here); only the distributed probe answers those.
+//!
 //! ## Mechanism
 //!
 //! 1. [`RedisSandboxExecutionGuard::try_enter`] writes a unique token to a Redis key with
@@ -195,20 +212,15 @@ impl RedisSandboxExecutionGuard {
         }
     }
 
-    /// Whether the given key is currently held (by anyone).
+    /// Whether the given key is currently held in **Redis**, by this process or any other.
     ///
-    /// Diagnostics only, and deliberately not fail-open: a Redis error must not read as
-    /// "the slot is free", so it is logged at `warn` before reporting `false` (the harness
-    /// trait method is synchronous and cannot return `Result`).
-    pub async fn is_held(&self, key: &SandboxIsolationKey) -> bool {
+    /// Awaits a single `EXISTS` round-trip; the error is propagated, so a Redis failure can
+    /// never read as "the slot is free". This is the distributed counterpart of the
+    /// synchronous [`SandboxGuard::is_held`] local view, and what
+    /// [`SandboxGuard::try_is_held`] delegates to.
+    pub async fn probe_is_held(&self, key: &SandboxIsolationKey) -> Result<bool> {
         let redis_key = self.compose_key(key);
-        match self.commands.exists(&redis_key).await {
-            Ok(held) => held,
-            Err(e) => {
-                tracing::warn!("[sandbox-guard] failed to probe Redis lease {redis_key}: {e}");
-                false
-            }
-        }
+        self.commands.exists(&redis_key).await
     }
 }
 
@@ -265,13 +277,29 @@ impl SandboxGuard for RedisSandboxExecutionGuard {
         }
     }
 
-    /// Synchronous `EXISTS` probe.
+    /// Local view: is this process currently holding a lease for `key`?
     ///
-    /// The harness contract keeps `is_held` synchronous; this probe performs a **single**
-    /// round-trip (no polling, no timers) and is diagnostics-only — the acquire/release path
-    /// is fully async.
+    /// Answers from the in-process registry of trait-acquired leases and performs **no**
+    /// Redis round-trip, so it is safe to call from a synchronous context inside an async
+    /// task. It cannot see a lease held by another process (and does not model leases taken
+    /// through the inherent [`RedisSandboxExecutionGuard::try_enter`]). Callers that can
+    /// `await` and need the distributed answer must use
+    /// [`SandboxGuard::try_is_held`]; this method used to bridge to `EXISTS` with
+    /// `futures::executor::block_on`, which blocked a Tokio worker and could hang a
+    /// `current_thread` runtime (REDIS-07).
     fn is_held(&self, key: &SandboxIsolationKey) -> bool {
-        futures::executor::block_on(RedisSandboxExecutionGuard::is_held(self, key))
+        self.trait_leases
+            .lock()
+            .map(|leases| leases.get(key).is_some_and(|stack| !stack.is_empty()))
+            .unwrap_or(false)
+    }
+
+    /// Async diagnostics probe: awaits the Redis `EXISTS` round-trip.
+    ///
+    /// Unlike the synchronous local view above this sees every holder, and a failing probe
+    /// is an `Err` rather than a silent `false`.
+    async fn try_is_held(&self, key: &SandboxIsolationKey) -> Result<bool> {
+        self.probe_is_held(key).await
     }
 
     fn active_count(&self) -> usize {
@@ -493,7 +521,7 @@ mod tests {
         );
         // lease_ttl default is 30min -> milliseconds, converted to seconds by the double
         assert_eq!(commands.expiration_of("lock:agent:a"), Some(1800));
-        assert!(guard.is_held(&key).await);
+        assert!(guard.probe_is_held(&key).await.expect("probe answers"));
 
         lease.release().await;
     }
@@ -506,7 +534,7 @@ mod tests {
 
         assert!(lease.release().await, "first release owns the token");
         assert!(lease.is_released());
-        assert!(!guard.is_held(&key).await);
+        assert!(!guard.probe_is_held(&key).await.expect("probe answers"));
         let evals_after_first = commands.release_eval_calls();
 
         assert!(!lease.release().await, "second release is a no-op");
@@ -528,7 +556,7 @@ mod tests {
         let key = SandboxIsolationKey::new("Agent", "drop");
         {
             let _lease = guard.try_enter(&key).await.unwrap();
-            assert!(guard.is_held(&key).await);
+            assert!(guard.probe_is_held(&key).await.expect("probe answers"));
         }
         // Drop scheduled the CAS release on the ambient runtime
         tokio::task::yield_now().await;
@@ -537,7 +565,10 @@ mod tests {
             1,
             "Drop ran the release script once"
         );
-        assert!(!guard.is_held(&key).await, "slot freed by Drop");
+        assert!(
+            !guard.probe_is_held(&key).await.expect("probe answers"),
+            "slot freed by Drop"
+        );
     }
 
     #[tokio::test]
@@ -587,7 +618,7 @@ mod tests {
             .await
             .expect("acquire after release")
             .unwrap();
-        assert!(guard.is_held(&key).await);
+        assert!(guard.probe_is_held(&key).await.expect("probe answers"));
         assert!(second.release().await);
     }
 
@@ -611,7 +642,7 @@ mod tests {
 
         assert!(guard.release(&key).await, "DEL removed the key");
         assert!(!guard.release(&key).await, "nothing left to delete");
-        assert!(!guard.is_held(&key).await);
+        assert!(!guard.probe_is_held(&key).await.expect("probe answers"));
         assert!(!lease.release().await, "token CAS finds no lock");
         assert!(lease.is_released());
     }
@@ -716,7 +747,7 @@ mod tests {
         )
         .await
         .expect("trait release must not deadlock the runtime");
-        assert!(!guard.is_held(&key).await);
+        assert!(!guard.probe_is_held(&key).await.expect("probe answers"));
         assert!(commands.stored_bytes("lock:session:awaitable").is_none());
     }
 
@@ -746,7 +777,7 @@ mod tests {
             0,
             "no lease may be retained after a failed acquisition"
         );
-        assert!(!guard.is_held(&key).await);
+        assert!(!guard.probe_is_held(&key).await.expect("probe answers"));
         assert!(
             commands.stored_bytes("lock:session:fail-closed").is_none(),
             "a rejected SET NX must not leave a lock key behind"
@@ -776,7 +807,7 @@ mod tests {
             .expect("the guard must recover once the lock store answers");
         assert!(!lease.is_noop());
         assert_eq!(SandboxGuard::active_count(&guard), 1);
-        assert!(guard.is_held(&key).await);
+        assert!(guard.probe_is_held(&key).await.expect("probe answers"));
 
         SandboxGuard::release(&guard, &key).await;
         assert_eq!(SandboxGuard::active_count(&guard), 0);
@@ -806,10 +837,13 @@ mod tests {
         SandboxGuard::release(&guard, &first).await;
         assert_eq!(SandboxGuard::active_count(&guard), 1);
         assert!(
-            !guard.is_held(&first).await,
+            !guard.probe_is_held(&first).await.expect("probe answers"),
             "the released slot is free again"
         );
-        assert!(guard.is_held(&second).await, "the other slot is untouched");
+        assert!(
+            guard.probe_is_held(&second).await.expect("probe answers"),
+            "the other slot is untouched"
+        );
 
         SandboxGuard::release(&guard, &second).await;
         assert_eq!(SandboxGuard::active_count(&guard), 0);
@@ -835,23 +869,99 @@ mod tests {
         again.release().await;
     }
 
-    /// REDIS-06: `is_held` must not report "free" silently when the probe itself fails;
-    /// the result is still `false` (synchronous harness contract) but the failure is logged
-    /// instead of being swallowed by `unwrap_or(false)`.
-    #[tokio::test]
-    async fn is_held_logs_a_failed_probe_instead_of_swallowing_it() {
+    /// REDIS-07: a failing probe must not read as "free". The async surface returns the
+    /// error, while the synchronous local view keeps answering from the in-process lease
+    /// registry without touching Redis.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_is_held_surfaces_a_failed_probe_instead_of_reporting_free() {
         let commands = Arc::new(MemoryRedisCommands::new());
         let guard = RedisSandboxExecutionGuard::builder_from_commands(commands.clone())
             .key_prefix("lock:")
             .build();
         let key = SandboxIsolationKey::new("session", "probe");
-        assert!(guard.try_enter(&key).await.is_ok());
+        SandboxGuard::try_enter(&guard, key.clone())
+            .await
+            .expect("trait acquisition succeeds");
 
         commands.configure(|d| d.fail_exists = true);
-        assert!(!guard.is_held(&key).await);
+        let error = SandboxGuard::try_is_held(&guard, &key)
+            .await
+            .expect_err("a failed probe must not be reported as a free slot");
+        assert!(
+            format!("{error}").contains("injected EXISTS failure"),
+            "{error}"
+        );
         assert_eq!(commands.exists_calls(), 1, "one probe, no retry storm");
 
+        assert!(
+            SandboxGuard::is_held(&guard, &key),
+            "the local view still knows this process holds the lease"
+        );
+        assert_eq!(
+            commands.exists_calls(),
+            1,
+            "the synchronous local view must not probe Redis"
+        );
+
         commands.configure(|d| d.fail_exists = false);
-        assert!(guard.is_held(&key).await);
+        assert!(SandboxGuard::try_is_held(&guard, &key)
+            .await
+            .expect("the probe recovers"));
+        assert_eq!(commands.exists_calls(), 2);
+
+        SandboxGuard::release(&guard, &key).await;
+        assert!(!SandboxGuard::is_held(&guard, &key));
+        assert!(!SandboxGuard::try_is_held(&guard, &key)
+            .await
+            .expect("a released slot is free"));
+    }
+
+    /// REDIS-07: `try_is_held` awaits the `EXISTS` round-trip instead of bridging it with
+    /// `futures::executor::block_on`, so it completes on a single-threaded runtime, and
+    /// the synchronous `is_held` reads only the local lease registry (no network).
+    #[tokio::test(flavor = "current_thread")]
+    async fn try_is_held_awaits_the_probe_without_blocking_a_current_thread_runtime() {
+        let (guard, commands) = guard("lock:", Duration::from_millis(1));
+        let key = SandboxIsolationKey::new("session", "current-thread");
+
+        // Nothing is held yet: both surfaces agree, and only `try_is_held` asked Redis.
+        assert!(!SandboxGuard::is_held(&guard, &key));
+        assert!(!SandboxGuard::try_is_held(&guard, &key)
+            .await
+            .expect("probe answers"));
+        assert_eq!(
+            commands.exists_calls(),
+            1,
+            "only the async probe round-tripped"
+        );
+
+        SandboxGuard::try_enter(&guard, key.clone())
+            .await
+            .expect("a lease is acquirable on a current_thread runtime");
+        let probes = commands.exists_calls();
+        assert!(
+            SandboxGuard::is_held(&guard, &key),
+            "the local view sees the lease"
+        );
+        assert_eq!(
+            commands.exists_calls(),
+            probes,
+            "the synchronous view never touches Redis"
+        );
+
+        let held = tokio::time::timeout(
+            Duration::from_millis(500),
+            SandboxGuard::try_is_held(&guard, &key),
+        )
+        .await
+        .expect("the awaitable probe must not block the runtime")
+        .expect("probe answers");
+        assert!(held);
+
+        SandboxGuard::release(&guard, &key).await;
+        assert!(!SandboxGuard::is_held(&guard, &key));
+        assert!(!SandboxGuard::try_is_held(&guard, &key)
+            .await
+            .expect("a released slot is free"));
     }
 }

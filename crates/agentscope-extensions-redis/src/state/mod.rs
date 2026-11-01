@@ -265,6 +265,21 @@ impl AgentStateStore for RedisAgentStateStore {
         }
     }
 
+    /// Fallible write: a rejected `SAVE_SCRIPT` (connection lost, AUTH failure, wrong type)
+    /// is returned instead of being logged away, so a lost write is never mistaken for a
+    /// successful one (REDIS-07).
+    async fn try_save(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        value: Value,
+    ) -> Result<()> {
+        self.save_versioned(user_id, session_id, key, &value, UNCONDITIONAL_EXPECTED)
+            .await
+            .map(|_| ())
+    }
+
     async fn save_list(
         &self,
         user_id: Option<&str>,
@@ -277,12 +292,21 @@ impl AgentStateStore for RedisAgentStateStore {
         }
     }
 
+    /// Fallible list write (same contract as [`AgentStateStore::try_save`]); a partially
+    /// written list stays partially written, but the caller can now see it (REDIS-07).
+    async fn try_save_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+        values: &[Value],
+    ) -> Result<()> {
+        self.save_list_inner(user_id, session_id, key, values).await
+    }
+
     async fn get(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Option<Value> {
-        let layout = self.resolve_key_layout(user_id, session_id).ok()?;
-        let redis_key = layout.state_key(key);
-        match self.client.get(&redis_key).await {
-            Ok(Some(json)) => serde_json::from_str(&json).ok(),
-            Ok(None) => None,
+        match self.get_inner(user_id, session_id, key).await {
+            Ok(value) => value,
             Err(e) => {
                 tracing::error!("RedisAgentStateStore::get failed for key {key}: {e}");
                 None
@@ -290,21 +314,51 @@ impl AgentStateStore for RedisAgentStateStore {
         }
     }
 
+    /// Fallible read: a transport failure or an undecodable payload is an `Err` instead of
+    /// the "nothing stored" the infallible getter reports (REDIS-07).
+    async fn try_get(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Option<Value>> {
+        self.get_inner(user_id, session_id, key).await
+    }
+
     async fn get_list(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Vec<Value> {
-        let Ok(layout) = self.resolve_key_layout(user_id, session_id) else {
-            return Vec::new();
-        };
-        let redis_key = layout.list_key(key);
-        match self.client.range_list(&redis_key, 0, -1).await {
+        match self.get_list_items(user_id, session_id, key).await {
             Ok(jsons) => jsons
                 .into_iter()
-                .filter_map(|j| serde_json::from_str(&j).ok())
+                .filter_map(|json| match serde_json::from_str(&json) {
+                    Ok(value) => Some(value),
+                    Err(e) => {
+                        tracing::warn!(
+                            "RedisAgentStateStore::get_list skipping an undecodable item of key {key}: {e}"
+                        );
+                        None
+                    }
+                })
                 .collect(),
             Err(e) => {
                 tracing::error!("RedisAgentStateStore::get_list failed for key {key}: {e}");
                 Vec::new()
             }
         }
+    }
+
+    /// Fallible list read: a transport failure **or** an undecodable item is an `Err`, so a
+    /// corrupt entry can no longer shrink the list silently (REDIS-07).
+    async fn try_get_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Vec<Value>> {
+        let jsons = self.get_list_items(user_id, session_id, key).await?;
+        jsons
+            .into_iter()
+            .map(|json| serde_json::from_str(&json).map_err(Error::from))
+            .collect()
     }
 
     /// Whether the session has at least one tracked key.
@@ -314,15 +368,7 @@ impl AgentStateStore for RedisAgentStateStore {
     /// an `EXISTS` first and discarded its answer (REDIS-13). A backend failure is still
     /// reported as `false` (the trait has no `Result` channel) but is now logged.
     async fn exists(&self, user_id: Option<&str>, session_id: &str) -> bool {
-        let probed = match self.resolve_key_layout(user_id, session_id) {
-            Ok(layout) => self
-                .client
-                .get_set_size(&layout.keys_key())
-                .await
-                .map(|size| size > 0),
-            Err(e) => Err(e),
-        };
-        match probed {
+        match self.exists_inner(user_id, session_id).await {
             Ok(exists) => exists,
             Err(e) => {
                 tracing::error!(
@@ -333,6 +379,12 @@ impl AgentStateStore for RedisAgentStateStore {
                 false
             }
         }
+    }
+
+    /// Fallible probe: a backend failure is an `Err` instead of `false`, so "could not ask"
+    /// cannot be mistaken for "the session is gone" (REDIS-07).
+    async fn try_exists(&self, user_id: Option<&str>, session_id: &str) -> Result<bool> {
+        self.exists_inner(user_id, session_id).await
     }
 
     async fn delete(&self, user_id: Option<&str>, session_id: &str) {
@@ -347,6 +399,12 @@ impl AgentStateStore for RedisAgentStateStore {
         }
     }
 
+    /// Fallible delete: a failed `DEL` / session-index read is returned instead of logged
+    /// away, so a half-deleted session is visible to the caller (REDIS-07).
+    async fn try_delete(&self, user_id: Option<&str>, session_id: &str) -> Result<()> {
+        self.delete_inner(user_id, session_id).await
+    }
+
     /// Deletes one state value, leaving the rest of the session intact.
     ///
     /// Redis can honour this, so the default "unsupported" error of the core trait would be
@@ -359,42 +417,32 @@ impl AgentStateStore for RedisAgentStateStore {
         self.delete_key_inner(user_id, session_id, key).await
     }
 
+    /// Fallible per-key delete: identical to [`AgentStateStore::delete_key`], which already
+    /// returns `Result`; the explicit override keeps the `try_*` family complete (REDIS-07).
+    async fn try_delete_key(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<()> {
+        self.delete_key_inner(user_id, session_id, key).await
+    }
+
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {
-        let user_segment = key_layout::normalize_user(user_id);
-        let pattern = match self.key_layout_version {
-            KeyLayoutVersion::V0 => v0_keys_pattern(&self.key_prefix, &user_segment),
-            KeyLayoutVersion::V1 => {
-                if let Err(e) = validate_v1_user_id(&user_segment) {
-                    tracing::error!("RedisAgentStateStore::list_session_ids failed: {e}");
-                    return Vec::new();
-                }
-                v1_keys_pattern(&self.key_prefix, &user_segment)
-            }
-        };
-        let keys = match self.client.find_keys_by_pattern(&pattern).await {
-            Ok(k) => k,
+        match self.list_session_ids_inner(user_id).await {
+            Ok(sessions) => sessions,
             Err(e) => {
                 tracing::error!("RedisAgentStateStore::list_session_ids failed: {e}");
-                return Vec::new();
-            }
-        };
-        let mut sessions = std::collections::HashSet::new();
-        for keys_key in keys {
-            let parsed = match self.key_layout_version {
-                KeyLayoutVersion::V0 => {
-                    parse_v0_session_id_from_keys_key(&keys_key, &self.key_prefix, &user_segment)
-                }
-                KeyLayoutVersion::V1 => {
-                    parse_v1_session_id_from_keys_key(&keys_key, &self.key_prefix, &user_segment)
-                }
-            };
-            if let Some(session_id) = parsed {
-                sessions.insert(session_id);
+                Vec::new()
             }
         }
-        let mut out: Vec<String> = sessions.into_iter().collect();
-        out.sort();
-        out
+    }
+
+    /// Fallible enumeration: a failed `SCAN` / invalid V1 user id is an `Err` instead of an
+    /// empty list, so "the user has no sessions" is distinguishable from "the scan failed"
+    /// (REDIS-07).
+    async fn try_list_session_ids(&self, user_id: Option<&str>) -> Result<Vec<String>> {
+        self.list_session_ids_inner(user_id).await
     }
 
     fn supports_versioning(&self) -> bool {
@@ -524,6 +572,72 @@ impl AgentStateStore for RedisAgentStateStore {
 }
 
 impl RedisAgentStateStore {
+    /// Strict single-value read shared by [`AgentStateStore::get`] and
+    /// [`AgentStateStore::try_get`]: `Ok(None)` when the key is absent, `Err` on a transport
+    /// failure or an undecodable payload.
+    async fn get_inner(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Option<Value>> {
+        let layout = self.resolve_key_layout(user_id, session_id)?;
+        let redis_key = layout.state_key(key);
+        match self.client.get(&redis_key).await? {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Raw list items (JSON strings) before decoding, shared by the lenient
+    /// [`AgentStateStore::get_list`] and the strict [`AgentStateStore::try_get_list`].
+    async fn get_list_items(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        key: &str,
+    ) -> Result<Vec<String>> {
+        let layout = self.resolve_key_layout(user_id, session_id)?;
+        self.client.range_list(&layout.list_key(key), 0, -1).await
+    }
+
+    /// `SCARD` on the session key index (`> 0` = the session has state).
+    async fn exists_inner(&self, user_id: Option<&str>, session_id: &str) -> Result<bool> {
+        let layout = self.resolve_key_layout(user_id, session_id)?;
+        Ok(self.client.get_set_size(&layout.keys_key()).await? > 0)
+    }
+
+    /// `SCAN` + key-name parsing shared by [`AgentStateStore::list_session_ids`] and
+    /// [`AgentStateStore::try_list_session_ids`].
+    async fn list_session_ids_inner(&self, user_id: Option<&str>) -> Result<Vec<String>> {
+        let user_segment = key_layout::normalize_user(user_id);
+        let pattern = match self.key_layout_version {
+            KeyLayoutVersion::V0 => v0_keys_pattern(&self.key_prefix, &user_segment),
+            KeyLayoutVersion::V1 => {
+                validate_v1_user_id(&user_segment)?;
+                v1_keys_pattern(&self.key_prefix, &user_segment)
+            }
+        };
+        let keys = self.client.find_keys_by_pattern(&pattern).await?;
+        let mut sessions = std::collections::HashSet::new();
+        for keys_key in keys {
+            let parsed = match self.key_layout_version {
+                KeyLayoutVersion::V0 => {
+                    parse_v0_session_id_from_keys_key(&keys_key, &self.key_prefix, &user_segment)
+                }
+                KeyLayoutVersion::V1 => {
+                    parse_v1_session_id_from_keys_key(&keys_key, &self.key_prefix, &user_segment)
+                }
+            };
+            if let Some(session_id) = parsed {
+                sessions.insert(session_id);
+            }
+        }
+        let mut out: Vec<String> = sessions.into_iter().collect();
+        out.sort();
+        Ok(out)
+    }
+
     async fn save_list_inner(
         &self,
         user_id: Option<&str>,
@@ -1750,6 +1864,198 @@ mod tests {
             adapter.scan_cursor_history().len() > 1,
             "deletion enumerated through several SCAN pages"
         );
+    }
+
+    // ---- fallible `try_*` surface (REDIS-07) ----------------------------
+
+    #[tokio::test]
+    async fn try_save_and_try_get_round_trip_and_surface_a_failure() {
+        let (store, adapter) = store();
+        assert!(
+            AgentStateStore::try_save(&store, Some("u1"), "  ", "k", json!(1))
+                .await
+                .is_err(),
+            "a blank session is rejected before any IO"
+        );
+
+        AgentStateStore::try_save(&store, Some("u1"), "s1", "k", json!({"n": 1}))
+            .await
+            .expect("a healthy write lands");
+        assert_eq!(
+            AgentStateStore::try_get(&store, Some("u1"), "s1", "k")
+                .await
+                .expect("a healthy read"),
+            Some(json!({"n": 1}))
+        );
+        assert_eq!(
+            AgentStateStore::try_get(&store, Some("u1"), "s1", "missing")
+                .await
+                .expect("an absent key is not an error"),
+            None
+        );
+
+        adapter.configure(|d| d.fail_eval = true);
+        assert!(
+            AgentStateStore::try_save(&store, Some("u1"), "s1", "k", json!(2))
+                .await
+                .is_err(),
+            "a rejected SAVE_SCRIPT must not look like a successful write"
+        );
+
+        adapter.configure(|d| {
+            d.fail_eval = false;
+            d.fail_get = true;
+        });
+        assert!(
+            AgentStateStore::try_get(&store, Some("u1"), "s1", "k")
+                .await
+                .is_err(),
+            "a lost connection must not read as 'nothing stored'"
+        );
+        assert_eq!(
+            store.get(Some("u1"), "s1", "k").await,
+            None,
+            "the infallible surface keeps degrading for existing callers"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_save_list_and_try_get_list_report_a_corrupt_item() {
+        let (store, adapter) = store();
+        AgentStateStore::try_save_list(&store, Some("u1"), "s1", "l", &[json!(1), json!(2)])
+            .await
+            .expect("a healthy list write");
+        assert_eq!(
+            AgentStateStore::try_get_list(&store, Some("u1"), "s1", "l")
+                .await
+                .expect("a healthy list read"),
+            vec![json!(1), json!(2)]
+        );
+
+        // A corrupt item is skipped by the infallible read but reported by the fallible one.
+        adapter.seed_list("t:session:u1/s1:l:list", &["1", "not-json"]);
+        assert_eq!(
+            store.get_list(Some("u1"), "s1", "l").await,
+            vec![json!(1)],
+            "the best-effort read still drops the bad item"
+        );
+        assert!(
+            AgentStateStore::try_get_list(&store, Some("u1"), "s1", "l")
+                .await
+                .is_err(),
+            "the fallible read surfaces the corrupt item"
+        );
+
+        adapter.configure(|d| {
+            d.fail_get = true;
+            d.fail_range = true;
+        });
+        assert!(
+            AgentStateStore::try_save_list(&store, Some("u1"), "s1", "l", &[json!(3)])
+                .await
+                .is_err()
+        );
+        assert!(AgentStateStore::try_get_list(&store, Some("u1"), "s1", "l")
+            .await
+            .is_err());
+        assert!(
+            store.get_list(Some("u1"), "s1", "l").await.is_empty(),
+            "the infallible read still degrades to an empty list"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_exists_separates_an_empty_session_from_a_backend_failure() {
+        let (store, adapter) = store();
+        assert!(!AgentStateStore::try_exists(&store, Some("u1"), "s1")
+            .await
+            .expect("an empty session is a clean `false`"));
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        assert!(AgentStateStore::try_exists(&store, Some("u1"), "s1")
+            .await
+            .expect("the session has state"));
+
+        adapter.configure(|d| d.fail_set_size = true);
+        assert!(
+            AgentStateStore::try_exists(&store, Some("u1"), "s1")
+                .await
+                .is_err(),
+            "a failed SCARD must not read as 'the session is gone'"
+        );
+        assert!(!store.exists(Some("u1"), "s1").await);
+    }
+
+    #[tokio::test]
+    async fn try_delete_and_try_delete_key_surface_a_failure() {
+        let (store, adapter) = store();
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        AgentStateStore::try_delete_key(&store, Some("u1"), "s1", "k")
+            .await
+            .expect("per-key delete");
+        assert!(!store.exists(Some("u1"), "s1").await);
+        assert!(
+            AgentStateStore::try_delete_key(&store, Some("u1"), "s1", " ")
+                .await
+                .is_err()
+        );
+
+        AgentStateStore::try_delete(&store, Some("u1"), "s1")
+            .await
+            .expect("deleting an empty session is a no-op");
+        store.save(Some("u1"), "s1", "k2", json!(2)).await;
+
+        adapter.configure(|d| d.fail_set_members = true);
+        assert!(AgentStateStore::try_delete(&store, Some("u1"), "s1")
+            .await
+            .is_err());
+        assert!(
+            AgentStateStore::try_delete_key(&store, Some("u1"), "s1", "k2")
+                .await
+                .is_err()
+        );
+        assert!(
+            AgentStateStore::try_delete(&store, Some("u1"), "  ")
+                .await
+                .is_err(),
+            "a blank session is rejected"
+        );
+
+        adapter.configure(|d| d.fail_set_members = false);
+        assert_eq!(
+            store.get(Some("u1"), "s1", "k2").await,
+            Some(json!(2)),
+            "the failed deletes left the value in place"
+        );
+        AgentStateStore::try_delete(&store, Some("u1"), "s1")
+            .await
+            .expect("delete succeeds once the store recovers");
+        assert!(!store.exists(Some("u1"), "s1").await);
+    }
+
+    #[tokio::test]
+    async fn try_list_session_ids_surfaces_a_scan_failure() {
+        let (store, adapter) = store();
+        assert!(AgentStateStore::try_list_session_ids(&store, Some("u1"))
+            .await
+            .expect("an empty enumeration is a clean empty list")
+            .is_empty());
+        store.save(Some("u1"), "s2", "k", json!(1)).await;
+        store.save(Some("u1"), "s1", "k", json!(1)).await;
+        assert_eq!(
+            AgentStateStore::try_list_session_ids(&store, Some("u1"))
+                .await
+                .expect("enumeration"),
+            vec!["s1".to_string(), "s2".to_string()]
+        );
+
+        adapter.configure(|d| d.fail_scan = true);
+        assert!(
+            AgentStateStore::try_list_session_ids(&store, Some("u1"))
+                .await
+                .is_err(),
+            "a failed SCAN must not read as 'no sessions'"
+        );
+        assert!(store.list_session_ids(Some("u1")).await.is_empty());
     }
 
     // ---- core list-hash semantics (persisted-hash contract) --------------

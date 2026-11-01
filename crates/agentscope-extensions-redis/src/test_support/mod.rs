@@ -70,6 +70,14 @@ pub(crate) struct MemoryRedisData {
     pub fail_get: bool,
     /// `eval_script` returns a transport error (CAS script path failure injection).
     pub fail_eval: bool,
+    /// `get_set_size` (`SCARD`) returns a transport error.
+    pub fail_set_size: bool,
+    /// `get_set_members` (`SMEMBERS`) returns a transport error.
+    pub fail_set_members: bool,
+    /// Key enumeration (`SCAN`) returns a transport error.
+    pub fail_scan: bool,
+    /// `range_list` (`LRANGE`) returns a transport error.
+    pub fail_range: bool,
     // --- call counters -----------------------------------------------------
     pub adapter_eval_calls: usize,
     pub adapter_delete_calls: usize,
@@ -380,6 +388,9 @@ impl RedisClientAdapter for MemoryRedisAdapter {
     }
 
     async fn range_list(&self, key: &str, start: i64, end: i64) -> Result<Vec<String>> {
+        if self.data_guard().fail_range {
+            return Err(Error::Other("injected Redis LRANGE failure".to_string()));
+        }
         let lists = self.lists_guard();
         let list = match lists.get(key) {
             Some(l) => l,
@@ -431,6 +442,9 @@ impl RedisClientAdapter for MemoryRedisAdapter {
     }
 
     async fn get_set_members(&self, key: &str) -> Result<Vec<String>> {
+        if self.data_guard().fail_set_members {
+            return Err(Error::Other("injected Redis SMEMBERS failure".to_string()));
+        }
         let mut out: Vec<String> = self
             .sets_guard()
             .get(key)
@@ -442,6 +456,9 @@ impl RedisClientAdapter for MemoryRedisAdapter {
 
     async fn get_set_size(&self, key: &str) -> Result<i64> {
         self.data_guard().adapter_set_size_calls += 1;
+        if self.data_guard().fail_set_size {
+            return Err(Error::Other("injected Redis SCARD failure".to_string()));
+        }
         Ok(self
             .sets_guard()
             .get(key)
@@ -463,6 +480,9 @@ impl RedisClientAdapter for MemoryRedisAdapter {
     /// (`crate::state::connection::collect_keys_across_nodes`) so the double exercises the
     /// real paging code; `with_scan_page_size` makes the walk span several pages.
     async fn find_keys_by_pattern(&self, pattern: &str) -> Result<Vec<String>> {
+        if self.data_guard().fail_scan {
+            return Err(Error::Other("injected Redis SCAN failure".to_string()));
+        }
         crate::state::connection::collect_keys_across_nodes(self, pattern).await
     }
 
