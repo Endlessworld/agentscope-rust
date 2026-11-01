@@ -447,6 +447,7 @@ dependencies = [
  "agentscope-harness",
  "async-trait",
  "httpmock",
+ "md5",
  "rust-s3",
  "serde_json",
  "thiserror 2.0.20",

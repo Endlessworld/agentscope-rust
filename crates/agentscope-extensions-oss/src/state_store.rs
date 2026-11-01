@@ -48,6 +48,9 @@ const JSON_SUFFIX: &str = ".json";
 const LIST_SUFFIX: &str = ".list.json";
 const HASH_SUFFIX: &str = ".list.hash";
 
+/// Keys per bulk delete request (S3/OSS `DeleteObjects` caps a request at 1000 keys).
+const DELETE_BATCH_SIZE: usize = 1000;
+
 /// OSS-backed persistent store for agent state, keyed by `(userId, sessionId)`.
 #[derive(Debug, Clone)]
 pub struct OssAgentStateStore {
@@ -202,14 +205,19 @@ impl OssAgentStateStore {
     }
 
     /// Deletes every object of a session, propagating the first failure.
+    ///
+    /// Keys are removed in [`DELETE_BATCH_SIZE`] batches through
+    /// [`OssClient::delete_many`], so a session with `N` objects costs `ceil(N / 1000)`
+    /// requests instead of `N` (mirrors Java `deleteKeys`).
     pub async fn delete_session_strict(
         &self,
         user_id: Option<&str>,
         session_id: &str,
     ) -> OssResult<()> {
         let prefix = self.session_prefix(user_id, session_id)?;
-        for key in self.client.list_all(&prefix)? {
-            self.client.delete(&key)?;
+        let keys = self.client.list_all(&prefix)?;
+        for batch in keys.chunks(DELETE_BATCH_SIZE) {
+            self.client.delete_many(batch)?;
         }
         Ok(())
     }

@@ -264,3 +264,130 @@ fn configuration_validation_rejects_missing_bucket_and_credentials() {
         .expect_err("secret key is required too");
     assert!(matches!(partial_credentials, OssError::MissingCredentials));
 }
+
+/// S3 part size used by the multipart tests (also the backend minimum).
+const PART_SIZE: usize = 5 * 1024 * 1024;
+
+/// The `ETag` S3 assigns to an uploaded part: the quoted MD5 of its bytes.
+fn part_etag(bytes: &[u8]) -> String {
+    format!("\"{:x}\"", md5::compute(bytes))
+}
+
+#[test]
+fn delete_many_sends_one_bulk_delete_request() {
+    let server = MockServer::start();
+    // `rust-s3` posts the bulk delete to `?delete` instead of one DELETE per key.
+    let bulk = server.mock(|when, then| {
+        when.method(POST)
+            .query_param_exists("delete")
+            .body_contains("<Key>logs/a</Key>")
+            .body_contains("<Key>logs/b</Key>");
+        then.status(200).body(
+            "<DeleteResult><Deleted><Key>logs/a</Key></Deleted>\
+             <Deleted><Key>logs/b</Key></Deleted></DeleteResult>",
+        );
+    });
+    let per_key = server.mock(|when, then| {
+        when.method(DELETE);
+        then.status(204);
+    });
+
+    let client = test_client(&server);
+    client
+        .delete_many(&["logs/a".to_string(), "logs/b".to_string()])
+        .expect("bulk delete");
+
+    bulk.assert_hits(1);
+    per_key.assert_hits(0);
+}
+
+#[test]
+fn delete_many_reports_per_key_failures() {
+    let server = MockServer::start();
+    let bulk = server.mock(|when, then| {
+        when.method(POST).query_param_exists("delete");
+        then.status(200).body(
+            "<DeleteResult><Error><Key>logs/a</Key><Code>AccessDenied</Code>\
+             <Message>denied</Message></Error></DeleteResult>",
+        );
+    });
+
+    let client = test_client(&server);
+    let error = client
+        .delete_many(&["logs/a".to_string()])
+        .expect_err("a failed key must not be reported as deleted");
+
+    assert!(matches!(error, OssError::Backend(_)), "{error:?}");
+    assert!(error.to_string().contains("AccessDenied"), "{error}");
+    bulk.assert_hits(1);
+}
+
+#[test]
+fn put_multipart_uploads_every_part_then_completes() {
+    let server = MockServer::start();
+    let object_path = format!("/{BUCKET}/big/object.bin");
+    let payload = vec![0xAB_u8; PART_SIZE + 1024];
+    let (first, second) = payload.split_at(PART_SIZE);
+
+    // Create the completion mock first: httpmock picks the lowest matching id, and both
+    // multipart POSTs share the path (they are told apart by their query/body).
+    let complete = server.mock(|when, then| {
+        when.method(POST)
+            .path(object_path.clone())
+            .query_param("uploadId", "upload-1")
+            .body_contains(format!(
+                "<PartNumber>1</PartNumber><ETag>{}</ETag>",
+                part_etag(first)
+            ))
+            .body_contains(format!(
+                "<PartNumber>2</PartNumber><ETag>{}</ETag>",
+                part_etag(second)
+            ));
+        then.status(200).body(
+            "<CompleteMultipartUploadResult><ETag>\"done\"</ETag>\
+             </CompleteMultipartUploadResult>",
+        );
+    });
+    let initiate = server.mock(|when, then| {
+        when.method(POST)
+            .path(object_path.clone())
+            .query_param_exists("uploads");
+        then.status(200).body(
+            "<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket>\
+             <Key>big/object.bin</Key><UploadId>upload-1</UploadId>\
+             </InitiateMultipartUploadResult>",
+        );
+    });
+    let part = server.mock(|when, then| {
+        when.method(PUT)
+            .path(object_path.clone())
+            .query_param("uploadId", "upload-1");
+        then.status(200);
+    });
+
+    let client = test_client(&server);
+    client
+        .put_multipart("big/object.bin", &payload, PART_SIZE)
+        .expect("multipart upload");
+
+    initiate.assert_hits(1);
+    part.assert_hits(2);
+    complete.assert_hits(1);
+}
+
+#[test]
+fn put_multipart_of_an_empty_object_uses_a_single_put() {
+    let server = MockServer::start();
+    let object_path = format!("/{BUCKET}/empty.bin");
+    let put = server.mock(|when, then| {
+        when.method(PUT).path(object_path.clone());
+        then.status(200);
+    });
+
+    let client = test_client(&server);
+    client
+        .put_multipart("empty.bin", b"", PART_SIZE)
+        .expect("empty object");
+
+    put.assert_hits(1);
+}

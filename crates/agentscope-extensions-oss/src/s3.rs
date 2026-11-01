@@ -76,6 +76,12 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 /// S3 maximum number of keys per `ListObjectsV2` page.
 const MAX_KEYS_PER_PAGE: usize = 1000;
 
+/// S3 minimum size of every multipart part except the last.
+const S3_MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+
+/// Content type used for multipart uploads (parts carry no other metadata).
+const MULTIPART_CONTENT_TYPE: &str = "application/octet-stream";
+
 /// S3-compatible implementation of [`OssClient`].
 ///
 /// Holds a dedicated worker thread (with its own Tokio runtime) plus a shared
@@ -760,6 +766,108 @@ impl OssClient for S3OssClient {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn delete_many(&self, object_keys: &[String]) -> OssResult<()> {
+        if object_keys.is_empty() {
+            return Ok(());
+        }
+        let keys = object_keys.to_vec();
+        let result = self.run(move |bucket| {
+            let keys = keys.clone();
+            async move {
+                let objects = keys
+                    .into_iter()
+                    .map(s3::serde_types::ObjectIdentifier::new)
+                    .collect::<Vec<_>>();
+                bucket.delete_objects(objects).await
+            }
+        })?;
+        // S3 answers 200 even when single keys could not be deleted; those failures are
+        // reported per key in the body and must not be swallowed.
+        match result.errors.first() {
+            Some(error) => Err(OssError::Backend(format!(
+                "S3 bulk delete failed for '{}': {} ({})",
+                error.key, error.message, error.code
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn put_multipart(&self, object_key: &str, content: &[u8], part_size: usize) -> OssResult<()> {
+        // An empty object has no parts; a single PUT is both correct and cheaper.
+        if content.is_empty() {
+            return self.put(object_key, content);
+        }
+        // S3 rejects non-final parts below 5 MiB, so a smaller request is raised to the
+        // minimum instead of failing mid-upload (it also keeps `chunks` non-zero).
+        let part_size = part_size.max(S3_MIN_PART_SIZE);
+        let key = object_key.to_string();
+        let body = Arc::new(content.to_vec());
+
+        let upload_id = self
+            .run({
+                let key = key.clone();
+                move |bucket| {
+                    let key = key.clone();
+                    async move {
+                        bucket
+                            .initiate_multipart_upload(&key, MULTIPART_CONTENT_TYPE)
+                            .await
+                    }
+                }
+            })?
+            .upload_id;
+
+        let mut parts = Vec::with_capacity(body.len().div_ceil(part_size));
+        for (index, chunk) in body.chunks(part_size).enumerate() {
+            let part_number = index as u32 + 1;
+            // `rust-s3` reads a part's ETag from the response **body**, but S3 sends it as a
+            // header and leaves the body empty, so the ETag is derived here instead: a
+            // part's ETag is the MD5 of its bytes (unless the bucket forces SSE-KMS, in
+            // which case `CompleteMultipartUpload` rejects the upload instead of silently
+            // committing wrong data). A failed part aborts the upload inside `rust-s3`.
+            let etag = format!("\"{:x}\"", md5::compute(chunk));
+            let chunk = chunk.to_vec();
+            self.run({
+                let key = key.clone();
+                let upload_id = upload_id.clone();
+                move |bucket| {
+                    let key = key.clone();
+                    let upload_id = upload_id.clone();
+                    let chunk = chunk.clone();
+                    async move {
+                        bucket
+                            .put_multipart_chunk(
+                                chunk,
+                                &key,
+                                part_number,
+                                &upload_id,
+                                MULTIPART_CONTENT_TYPE,
+                            )
+                            .await
+                    }
+                }
+            })?;
+            parts.push(s3::serde_types::Part { part_number, etag });
+        }
+
+        let parts = Arc::new(parts);
+        self.run({
+            let key = key.clone();
+            let upload_id = upload_id.clone();
+            move |bucket| {
+                let key = key.clone();
+                let upload_id = upload_id.clone();
+                let parts = Arc::clone(&parts);
+                async move {
+                    bucket
+                        .complete_multipart_upload(&key, &upload_id, (*parts).clone())
+                        .await
+                }
+            }
+        })?;
+        Ok(())
     }
 }
 

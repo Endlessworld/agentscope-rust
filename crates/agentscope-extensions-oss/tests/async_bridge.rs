@@ -200,7 +200,10 @@ async fn base_store_search_from_a_multi_thread_runtime_does_not_panic() {
                 .path(format!("/{BUCKET}/"))
                 .query_param("list-type", "2")
                 .query_param("prefix", namespace_prefix.clone())
-                .query_param("max-keys", "1000");
+                // `search(limit = 10, offset = 0)` only asks for the keys it needs
+                // (`remaining items × 2`, since each item is `{key}.json` + `{key}.version`)
+                // instead of listing the namespace.
+                .query_param("max-keys", "20");
             then.status(200)
                 .header("content-type", "application/xml")
                 .body(list_xml(&namespace_prefix, &[item_key.as_str()]));

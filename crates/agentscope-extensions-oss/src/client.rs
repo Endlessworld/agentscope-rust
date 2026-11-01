@@ -172,6 +172,34 @@ pub trait OssClient: Send + Sync + std::fmt::Debug {
         let _ = (object_key, content, condition);
         Err(OssError::Unsupported("conditional writes"))
     }
+
+    /// Deletes several objects at once.
+    ///
+    /// Default: one [`OssClient::delete`] per key, so clients written against the
+    /// single-key API keep working. Backends with a bulk delete API override this to send
+    /// one request per call (callers wanting a backend's batch limit must chunk
+    /// themselves). Keys that do not exist are not an error, exactly like `delete`.
+    fn delete_many(&self, object_keys: &[String]) -> OssResult<()> {
+        for object_key in object_keys {
+            self.delete(object_key)?;
+        }
+        Ok(())
+    }
+
+    /// Uploads `content` in parts of at most `part_size` bytes each (multipart upload).
+    ///
+    /// Default: [`OssError::Unsupported`]. The capability is opt-in because the default
+    /// single [`OssClient::put`] is correct for anything below the backend's per-request
+    /// limit; a multipart upload only lifts that limit (5 GiB on S3/OSS).
+    fn put_multipart(
+        &self,
+        object_key: &str,
+        content: &[u8],
+        part_size: usize,
+    ) -> OssResult<()> {
+        let _ = (object_key, content, part_size);
+        Err(OssError::Unsupported("multipart upload"))
+    }
 }
 
 /// In-memory [`OssClient`] for tests and local development.

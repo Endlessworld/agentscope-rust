@@ -13,7 +13,7 @@ default = []
 # Aliyun OSS S3-compatible endpoints, ...). Off by default so the crate still
 # builds without the HTTP/TLS dependency stack; the trait-based surface
 # (`OssClient` + `InMemoryOssClient`) is always available.
-s3 = ["dep:rust-s3", "dep:tokio"]
+s3 = ["dep:rust-s3", "dep:tokio", "dep:md5"]
 
 [dependencies]
 agentscope-core = { path = "../agentscope-core" }
@@ -31,9 +31,16 @@ tracing = { workspace = true }
 # non-2xx responses surface as typed `S3Error::HttpFailWithBody(status, body)`
 # instead of raw response objects, so error mapping stays structured.
 rust-s3 = { version = "0.38", optional = true, default-features = false, features = ["tokio-rustls-tls", "fail-on-err"] }
+# `rust-s3` reports a part's ETag from the response *body*, but S3 sends the part ETag as a
+# header and leaves the body empty. The multipart upload therefore derives the part ETags
+# itself (MD5 of the part, which is what S3 uses for non-KMS uploads); same version as the
+# one `rust-s3` already depends on.
+md5 = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Local fake S3 over real HTTP for end-to-end tests (no cloud credentials).
 httpmock = "0.7"
+# Expected multipart part ETags in the wire assertions (S3 uses the part's MD5).
+md5 = "0.8"
 

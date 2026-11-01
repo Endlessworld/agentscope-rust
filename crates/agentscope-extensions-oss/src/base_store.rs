@@ -51,6 +51,13 @@ pub const DEFAULT_KEY_PREFIX: &str = "agentscope/store/";
 const JSON_SUFFIX: &str = ".json";
 const VERSION_SUFFIX: &str = ".version";
 
+/// Keys requested per listing call in [`OssStore::search_strict`], relative to the number
+/// of items still needed (an item is two objects: `{key}.json` + `{key}.version`).
+const LIST_OVERSCAN: usize = 2;
+
+/// Upper bound of a single listing request (S3/OSS page limit).
+const MAX_KEYS_PER_LIST: usize = 1000;
+
 /// OSS-backed namespace key-value store for the harness remote filesystem.
 #[derive(Debug, Clone)]
 pub struct OssStore {
@@ -269,22 +276,52 @@ impl OssStore {
     /// signature has no error channel, so it delegates to this method and returns
     /// an empty page on error; callers that need the failure should call this
     /// inherent method directly.
+    ///
+    /// Listing stops as soon as `offset + limit` items are collected and every
+    /// [`OssClient::list_page`] call asks for a bounded number of keys, so the work is
+    /// bounded by the requested page instead of the namespace size.
     pub fn search_strict(
         &self,
         namespace: &[String],
         limit: usize,
         offset: usize,
     ) -> OssResult<Vec<StoreItem>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let prefix = self.namespace_prefix(namespace);
-        let mut data_keys: Vec<String> = self
-            .client
-            .list_all(&prefix)?
-            .into_iter()
-            // Only `.json` payloads are items; `.version` sidecars are excluded.
-            // (A `.list.json` payload can only appear under a state-store prefix,
-            // never under this store's namespace prefix.)
-            .filter(|k| k.ends_with(JSON_SUFFIX) && !k.ends_with(VERSION_SUFFIX))
-            .collect();
+        // Stop listing as soon as `offset + limit` items are in hand: the backend has no
+        // offset, so keys before `offset` must be walked, but there is no reason to list
+        // (and keep) the whole namespace.
+        let wanted = offset.saturating_add(limit);
+
+        let mut data_keys: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let remaining = wanted.saturating_sub(data_keys.len());
+            // Each item is two objects (`{key}.json` + `{key}.version`), so overscanning
+            // by the item count keeps the usual case down to one request.
+            let max_keys = remaining
+                .saturating_mul(LIST_OVERSCAN)
+                .clamp(1, MAX_KEYS_PER_LIST);
+            let page = self.client.list_page(&prefix, max_keys, token.as_deref())?;
+            data_keys.extend(
+                page.objects
+                    .into_iter()
+                    .map(|object| object.key)
+                    // Only `.json` payloads are items; `.version` sidecars are excluded.
+                    // (A `.list.json` payload can only appear under a state-store prefix,
+                    // never under this store's namespace prefix.)
+                    .filter(|key| key.ends_with(JSON_SUFFIX) && !key.ends_with(VERSION_SUFFIX)),
+            );
+            if !page.truncated || data_keys.len() >= wanted {
+                break;
+            }
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
         data_keys.sort();
 
         let start = offset.min(data_keys.len());
