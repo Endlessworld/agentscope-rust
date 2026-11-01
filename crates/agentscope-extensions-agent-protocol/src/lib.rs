@@ -1422,12 +1422,16 @@ fn wait_timeout_ms(params: &HashMap<String, String>, default_ms: u64) -> u64 {
 }
 
 /// `POST /tasks/{taskId}/cancel`.
+///
+/// Java `AgentProtocolController#cancel` answers `200` with an empty body
+/// (`ResponseEntity.ok().build()`); this server used to answer `202`, which some clients read as
+/// "accepted but not applied yet".
 async fn cancel_task(
     axum::extract::State(store): axum::extract::State<Arc<AgentProtocolTaskStore>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
 ) -> axum::response::Response {
     match store.cancel(&task_id) {
-        Ok(()) => axum::http::StatusCode::ACCEPTED.into_response(),
+        Ok(()) => axum::http::StatusCode::OK.into_response(),
         Err(err) => api_error(status_for(&err), err.to_string()),
     }
 }
@@ -1438,15 +1442,43 @@ async fn resume_task(
     axum::extract::Path(task_id): axum::extract::Path<String>,
     axum::Json(body): axum::Json<Value>,
 ) -> axum::response::Response {
-    let decisions: Vec<RemoteConfirmDecision> = body
-        .get("decisions")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
+    let decisions = parse_decisions(&body);
     match store.resume(&task_id, decisions) {
         Ok(()) => axum::Json(snapshot_for(&store, &task_id)).into_response(),
         Err(err) => api_error(status_for(&err), err.to_string()),
     }
+}
+
+/// One HITL decision as received on the wire.
+///
+/// Java `AgentProtocolController#parseDecisions` accepts the camelCase `toolCallId` and the snake
+/// `tool_call_id` spelling; the harness `RemoteConfirmDecision` only knows the former, so the body
+/// is decoded here and converted.
+#[derive(serde::Deserialize)]
+struct DecisionBody {
+    #[serde(default, alias = "toolCallId")]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    approved: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Decodes the `decisions` field of a resume body, tolerating an unknown shape like Java does.
+fn parse_decisions(body: &Value) -> Vec<RemoteConfirmDecision> {
+    let decisions: Vec<DecisionBody> = body
+        .get("decisions")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    decisions
+        .into_iter()
+        .map(|decision| RemoteConfirmDecision {
+            tool_call_id: decision.tool_call_id,
+            approved: decision.approved,
+            reason: decision.reason,
+        })
+        .collect()
 }
 
 /// `GET /tasks/{taskId}/events`, an SSE stream of `RemoteAgentEvent` frames.
@@ -1554,10 +1586,18 @@ fn sse_frame(event: &RemoteAgentEvent) -> Vec<u8> {
 }
 
 /// Reads the current snapshot, or an empty object when the task vanished mid-request.
+///
+/// Java answers `submit`/`resume` with `{task_id, status}` (`AgentProtocolController#submit`
+/// `:79-84`, `#resume` `:128-147`); this server keeps the richer snapshot but adds Java's snake
+/// `task_id` next to the protocol's `taskId`, so a client ported from Java finds the key it reads.
 fn snapshot_for(store: &Arc<AgentProtocolTaskStore>, task_id: &str) -> Value {
-    store
+    let mut snapshot = store
         .snapshot(task_id)
-        .unwrap_or_else(|| serde_json::json!({ "taskId": task_id }))
+        .unwrap_or_else(|| serde_json::json!({ "taskId": task_id }));
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("task_id".to_string(), Value::String(task_id.to_string()));
+    }
+    snapshot
 }
 
 #[cfg(test)]
@@ -2105,5 +2145,120 @@ mod tests {
             AgentProtocolConstants::PROTOCOL_AGENT_ID,
             AgentProtocolConstants::PROTOCOL_SESSION_ID,
         )
+    }
+
+    /// Reads a handler response as `(status code, JSON body)`; an empty body reads as `Null`.
+    async fn read_response(response: axum::response::Response) -> (u16, Value) {
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, body)
+    }
+
+    // Java: `AgentProtocolController#submit` answers `200` + `{task_id, status}` (`:79-84`). This
+    // handler keeps the richer snapshot, so `task_id` must join the protocol's `taskId`.
+    #[test]
+    fn submit_answers_with_the_java_task_keys() {
+        let store = store_for(Arc::new(ResultAgent {
+            reply: reply_msg("done"),
+        }));
+        let (status, body) = rt().block_on(async {
+            let response = submit_task(
+                axum::extract::State(store.clone()),
+                axum::Json(serde_json::json!({
+                    "task_id": "t-1",
+                    "agent_id": "agent-1",
+                    "input": "ping",
+                })),
+            )
+            .await;
+            read_response(response).await
+        });
+        assert_eq!(status, 200);
+        assert_eq!(body["task_id"], "t-1");
+        assert_eq!(body["taskId"], "t-1");
+        assert!(body["status"].is_string(), "status is reported: {body}");
+    }
+
+    // Java: `#cancel` answers `200` with an empty body (`:106-110`).
+    #[test]
+    fn cancel_answers_ok_with_an_empty_body() {
+        let store = store_for(Arc::new(ResultAgent {
+            reply: reply_msg("x"),
+        }));
+        let mut record = harness_record("t-9");
+        record.status = TaskStatus::Running;
+        store.task_repository().save(&record);
+
+        let (status, body) = rt().block_on(async {
+            let response = cancel_task(
+                axum::extract::State(store.clone()),
+                axum::extract::Path("t-9".to_string()),
+            )
+            .await;
+            read_response(response).await
+        });
+        assert_eq!(status, 200);
+        assert_eq!(body, Value::Null, "Java sends no body");
+        assert_eq!(
+            store.task_repository().find("t-9").unwrap().status,
+            TaskStatus::Cancelled
+        );
+    }
+
+    // Java: `#resume` answers `{task_id, status}` (`:128-147`) and `#parseDecisions` (`:151-166`)
+    // accepts the snake `tool_call_id` spelling.
+    #[test]
+    fn resume_answers_with_the_java_task_keys_and_accepts_snake_case_decisions() {
+        let store = store_for(Arc::new(ResultAgent {
+            reply: reply_msg("done"),
+        }));
+        let mut record = harness_record("t-1");
+        record.status = TaskStatus::Running;
+        record.awaiting_confirm = true;
+        record.pending_confirms =
+            Some(vec![RemotePendingConfirm::new("call-1", "write_file", None)]);
+        store.task_repository().save(&record);
+
+        let (status, body) = rt().block_on(async {
+            let response = resume_task(
+                axum::extract::State(store.clone()),
+                axum::extract::Path("t-1".to_string()),
+                axum::Json(serde_json::json!({
+                    "decisions": [{ "tool_call_id": "call-1", "approved": true }],
+                })),
+            )
+            .await;
+            read_response(response).await
+        });
+        assert_eq!(status, 200);
+        assert_eq!(body["task_id"], "t-1");
+        assert!(body["status"].is_string(), "status is reported: {body}");
+        // The snake-case decision was applied, so the task is no longer parked.
+        assert!(!store.task_repository().find("t-1").unwrap().awaiting_confirm);
+    }
+
+    // Java `#parseDecisions` reads `toolCallId`, then `tool_call_id`; both must land on one DTO.
+    #[test]
+    fn decisions_accept_both_the_camel_and_the_snake_tool_call_id() {
+        let body = serde_json::json!({
+            "decisions": [
+                { "toolCallId": "c-1", "approved": true },
+                { "tool_call_id": "c-2", "approved": false, "reason": "nope" },
+            ],
+        });
+        let decisions = parse_decisions(&body);
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].tool_call_id.as_deref(), Some("c-1"));
+        assert!(decisions[0].approved);
+        assert_eq!(decisions[1].tool_call_id.as_deref(), Some("c-2"));
+        assert!(!decisions[1].approved);
+        assert_eq!(decisions[1].reason.as_deref(), Some("nope"));
     }
 }

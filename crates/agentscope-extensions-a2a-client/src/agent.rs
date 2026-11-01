@@ -13,7 +13,10 @@
 //!   [`Agent::interrupt`] makes the running call issue `tasks/cancel` for that task
 //!   (Java `runningCalls` + `cancelRemoteTask`);
 //! * every call appends the input and the reply to the agent state's history, which is what
-//!   Java does through its session memory.
+//!   Java does through its session memory;
+//! * every call runs the configured `Middleware` chain: `on_agent` wraps the whole invocation
+//!   and `on_reasoning` wraps the exchange with the remote agent, mirroring Java `8cc6795b0`
+//!   (`agentMiddlewares` / `reasoningMiddlewares`).
 //!
 //! **Documented deviations from Java** (all forced by the Rust core surface, which is not
 //! changed by this crate):
@@ -28,20 +31,29 @@
 //!    core/harness tool injection does not apply to it.
 //! 4. The A2A wire protocol has no structured-output extension, so `call_with_schema` reports
 //!    [`A2aError::UnsupportedMethod`] instead of silently degrading.
+//! 5. Java's `Hook` (pre/post reasoning, handed to `ClientEventContext`) has no Rust trait; the
+//!    middlewares cover the same points — `on_reasoning` around the exchange and
+//!    `on_reasoning_result` with the message it produced.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agentscope_core::agent::RuntimeContext;
 use agentscope_core::event::{AgentEvent, EventData};
 use agentscope_core::message::Msg;
+use agentscope_core::middleware::{
+    AgentInput, EventStream, Middleware, MiddlewareChain, ReasoningInput,
+};
+use agentscope_core::model::GenerateOptions;
 use agentscope_core::state::AgentState;
 use agentscope_core::tool::Toolkit;
 use agentscope_core::{
     Agent, CallableAgent, Error, JsonSchema, ObservableAgent, Result as CoreResult,
 };
 use futures::stream::BoxStream;
+use futures::StreamExt;
 
 use crate::card::AgentCardResolver;
 use crate::client::{A2aClient, JsonRpcTransport, ReqwestJsonRpcTransport, SendResult};
@@ -247,15 +259,44 @@ impl Drop for CallGuard {
 /// A remote A2A agent usable as a local [`Agent`] / [`CallableAgent`].
 ///
 /// Mirrors Java `A2aAgent`: every call resolves the agent card again, calls of the same agent run
-/// one at a time (Java serializes them per session), and the conversation history is kept in the
-/// agent state.
+/// one at a time (Java serializes them per session), the conversation history is kept in the
+/// agent state, and the configured [`Middleware`] chain wraps every call (`on_agent`) and the
+/// exchange with the remote agent (`on_reasoning`).
 pub struct A2aAgent {
-    name: String,
+    /// Everything one call needs, owned so middleware closures can be `'static`.
+    parts: CallParts,
     description: String,
+    toolkit: Toolkit,
+}
+
+/// A subscriber registered through [`ObservableAgent::subscribe`].
+type A2aEventSink = Box<dyn Fn(AgentEvent) + Send + Sync>;
+
+/// The slot a call publishes its reply (or its failure) into.
+///
+/// Java keeps the reply of the exchange in an `AtomicReference` (`A2aAgent#execute`); publishing
+/// it here lets the agent-level stream emit it as `AgentResult` once the reasoning middlewares
+/// are done, i.e. where Java's `runAgent` emits it.
+type CallOutcome = Arc<Mutex<Option<Result<Msg, A2aError>>>>;
+
+/// How one call talks to the remote agent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallMode {
+    /// `message/send` plus `tasks/get` polls (the blocking `call` path, Java `doCall`).
+    Send,
+    /// `message/stream`, collected before the reply is returned (Java `streamEvents` collected).
+    StreamBuffered,
+    /// `message/stream`, relayed frame by frame (Java `streamEvents`).
+    StreamIncremental,
+}
+
+/// The owned handles of one call, cloned into the middleware closures.
+#[derive(Clone)]
+struct CallParts {
+    name: String,
     resolver: Arc<dyn AgentCardResolver>,
     config: A2aAgentConfig,
     state: Arc<Mutex<AgentState>>,
-    toolkit: Toolkit,
     running: Arc<Mutex<Vec<Arc<InFlightCall>>>>,
     /// Sinks registered through [`ObservableAgent::subscribe`], mirroring Java
     /// `ClientEventContext#setEventEmitter`.
@@ -263,18 +304,17 @@ pub struct A2aAgent {
     /// Serializes calls of this agent, mirroring Java `callSerializationKey(session)`.
     ///
     /// An async mutex because the guard is held across the request's awaits and
-    /// [`CallableAgent::call`] must stay `Send`; `stream_events` additionally takes an
+    /// [`CallableAgent::call`] must stay `Send`; the streaming path additionally takes an
     /// **owned** guard so the returned stream can be `'static`.
-    call_gate: Arc<tokio::sync::Mutex<()>>,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    /// The middlewares of this agent, in the core chain's priority order.
+    chain: MiddlewareChain,
 }
-
-/// A subscriber registered through [`ObservableAgent::subscribe`].
-type A2aEventSink = Box<dyn Fn(AgentEvent) + Send + Sync>;
 
 impl std::fmt::Debug for A2aAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("A2aAgent")
-            .field("name", &self.name)
+            .field("name", &self.parts.name)
             .field("description", &self.description)
             .finish_non_exhaustive()
     }
@@ -296,7 +336,7 @@ impl A2aAgent {
 
     /// The agent name sent to the remote peer and used to resolve the card.
     pub fn agent_name(&self) -> &str {
-        &self.name
+        &self.parts.name
     }
 
     /// The configured description, when the builder provided one.
@@ -318,23 +358,17 @@ impl A2aAgent {
 
     /// Resolves the remote card once, failing fast with the agent and resolver names.
     pub async fn resolve_card(&self) -> Result<crate::model::AgentCard, A2aError> {
-        self.client().agent_card().await
+        self.parts.client().agent_card().await
     }
 
     /// The current history of the agent state (Java `historyOf(session)`).
     pub fn history(&self) -> Vec<Msg> {
-        history_of(&self.state)
+        self.parts.history()
     }
 
     /// The running call ids, sorted for stable assertions.
     pub fn running_call_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .running
-            .lock()
-            .map(|running| running.iter().map(|call| call.request_id.clone()).collect())
-            .unwrap_or_default();
-        ids.sort();
-        ids
+        self.parts.running_call_ids()
     }
 
     /// Sends `messages` with `message/send` and returns the terminal reply.
@@ -342,27 +376,7 @@ impl A2aAgent {
     /// Mirrors Java `A2aAgent#doCall`: history plus the new input are sent, and the reply is
     /// appended to the history.
     pub async fn exchange(&self, messages: Vec<Msg>) -> Result<Msg, A2aError> {
-        // Java serializes calls that share a session: they share the history.
-        let _gate = self.call_gate.lock().await;
-        self.append_history(&messages);
-        let history = self.history();
-        let client = self.client();
-        let request_message = MessageConvert::convert_from_msgs(&history);
-        let params = MessageSendParams {
-            message: request_message,
-            configuration: None,
-            metadata: None,
-        };
-        let reply = match client.message_send(params).await? {
-            SendResult::Message(message) => {
-                Ok(MessageConvert::convert_from_message(&message, &self.name))
-            }
-            SendResult::Task(task) => self.settle(client, *task).await,
-        };
-        if let Ok(reply) = &reply {
-            self.append_history(std::slice::from_ref(reply));
-        }
-        reply
+        self.run_call(messages, CallMode::Send).await
     }
 
     /// Sends `messages` over `message/stream` and returns the terminal reply.
@@ -370,35 +384,13 @@ impl A2aAgent {
     /// Mirrors Java `A2aAgent#streamEvents` result handling: the reply is the one
     /// [`TaskResultAccumulator`](crate::result::TaskResultAccumulator) derives from the events.
     pub async fn exchange_stream(&self, messages: Vec<Msg>) -> Result<Msg, A2aError> {
-        let _gate = self.call_gate.lock().await;
-        self.append_history(&messages);
-        let history = self.history();
-        let client = self.client();
-        let params = MessageSendParams {
-            message: MessageConvert::convert_from_msgs(&history),
-            configuration: None,
-            metadata: None,
-        };
-        let events = client.message_stream(params).await?;
-        let mut accumulator = crate::result::TaskResultAccumulator::new();
-        for event in &events {
-            if let Some(reply) = accumulator.observe(event, &self.name) {
-                self.append_history(std::slice::from_ref(&reply));
-                return Ok(reply);
-            }
-        }
-        // A stream that carried a plain message reply ends with that message.
-        if let Some(message) = events.iter().find_map(|event| match event {
-            crate::model::StreamEvent::Message(message) => Some(message),
-            _ => None,
-        }) {
-            let reply = MessageConvert::convert_from_message(message, &self.name);
-            self.append_history(std::slice::from_ref(&reply));
-            return Ok(reply);
-        }
-        Err(A2aError::InvalidRequest(
-            "a2a stream ended without a terminal result".to_string(),
-        ))
+        self.run_call(messages, CallMode::StreamBuffered).await
+    }
+
+    /// Drives one call through the middleware chain and returns the reply it produced.
+    async fn run_call(&self, messages: Vec<Msg>, mode: CallMode) -> Result<Msg, A2aError> {
+        let (events, outcome) = self.parts.call_stream(messages, mode);
+        drain_call(events, outcome).await
     }
 
     /// Sends `messages` over `message/stream` and relays the remote run as core events.
@@ -415,38 +407,36 @@ impl A2aAgent {
         &self,
         messages: Vec<Msg>,
     ) -> BoxStream<'static, Result<AgentEvent, A2aError>> {
-        let state = AgentStreamState {
-            name: self.name.clone(),
-            resolver: self.resolver.clone(),
-            config: self.config.clone(),
-            agent_state: self.state.clone(),
-            sinks: self.sinks.clone(),
-            gate: self.call_gate.clone(),
-            _guard: None,
-            messages,
-            phase: AgentStreamPhase::Start,
-            accumulator: TaskResultAccumulator::new(),
-            started: false,
-            pending: VecDeque::new(),
-        };
-        Box::pin(futures::stream::unfold(state, next_agent_stream_item))
+        let (events, outcome) = self
+            .parts
+            .call_stream(messages, CallMode::StreamIncremental);
+        let sinks = self.parts.sinks.clone();
+        Box::pin(events.map(move |item| match item {
+            Ok(event) => {
+                emit_to_sinks(&sinks, &event);
+                Ok(event)
+            }
+            // `Middleware` streams carry core errors; restore the `A2aError` the call recorded so
+            // library callers still see the original variant.
+            Err(error) => Err(restore_error(error, &outcome)),
+        }))
     }
 
     /// Cancels the running call's remote task, mirroring Java `cancelRemoteTask`.
     ///
     /// Returns `None` when no call carries a task id yet.
     pub async fn cancel_remote_task(&self) -> Result<Option<Msg>, A2aError> {
-        let task_id = self
-            .running
-            .lock()
-            .ok()
-            .and_then(|running| running.iter().find_map(|call| call.task_id()));
+        let task_id = self.parts.running_task_id();
         let Some(task_id) = task_id else {
             return Ok(None);
         };
-        Ok(Some(self.cancel_task(&self.client(), &task_id).await?))
+        Ok(Some(
+            self.parts.cancel_task(&self.parts.client(), &task_id).await?,
+        ))
     }
+}
 
+impl CallParts {
     /// Builds a client for one call: the card is resolved when the client is used, i.e. once per
     /// call (Java `startCall` -> `Mono.using`).
     fn client(&self) -> A2aClient {
@@ -455,8 +445,42 @@ impl A2aAgent {
             .with_auth_headers(self.config.auth_headers.clone())
     }
 
+    fn history(&self) -> Vec<Msg> {
+        history_of(&self.state)
+    }
+
     fn append_history(&self, messages: &[Msg]) {
         append_to_history(&self.state, messages);
+    }
+
+    /// The runtime context handed to the middlewares: the session scope of the agent state.
+    fn runtime_context(&self) -> RuntimeContext {
+        let state = self.state.lock().map(|state| state.clone()).unwrap_or_default();
+        let mut context = RuntimeContext::new().with_agent_id(self.name.clone());
+        if !state.session_id.is_empty() {
+            context = context.with_session_id(state.session_id.clone());
+        }
+        if let Some(user_id) = state.user_id.clone() {
+            context = context.with_user_id(user_id);
+        }
+        context
+    }
+
+    fn running_call_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .running
+            .lock()
+            .map(|running| running.iter().map(|call| call.request_id.clone()).collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    fn running_task_id(&self) -> Option<String> {
+        self.running
+            .lock()
+            .ok()
+            .and_then(|running| running.iter().find_map(|call| call.task_id()))
     }
 
     fn register_call(&self, task: &Task) -> Arc<InFlightCall> {
@@ -468,6 +492,184 @@ impl A2aAgent {
             running.push(call.clone());
         }
         call
+    }
+
+    /// Sends `messages` with `message/send` and settles the task, mirroring Java `doCall`.
+    async fn send_call(&self, messages: Vec<Msg>) -> Result<Msg, A2aError> {
+        // Java serializes calls that share a session: they share the history.
+        let _gate = self.gate.lock().await;
+        self.append_history(&messages);
+        let params = MessageSendParams {
+            message: MessageConvert::convert_from_msgs(&self.history()),
+            configuration: None,
+            metadata: None,
+        };
+        let client = self.client();
+        let reply = match client.message_send(params).await? {
+            SendResult::Message(message) => {
+                Ok(MessageConvert::convert_from_message(&message, &self.name))
+            }
+            SendResult::Task(task) => self.settle(client, *task).await,
+        };
+        if let Ok(reply) = &reply {
+            self.append_history(std::slice::from_ref(reply));
+        }
+        reply
+    }
+
+    /// Sends `messages` over `message/stream` and returns the reply plus the relayed deltas.
+    async fn stream_call(&self, messages: Vec<Msg>) -> Result<(Msg, Vec<AgentEvent>), A2aError> {
+        let _gate = self.gate.lock().await;
+        self.append_history(&messages);
+        let params = MessageSendParams {
+            message: MessageConvert::convert_from_msgs(&self.history()),
+            configuration: None,
+            metadata: None,
+        };
+        let events = self.client().message_stream(params).await?;
+        let mut deltas = Vec::new();
+        let mut accumulator = TaskResultAccumulator::new();
+        for event in &events {
+            deltas.extend(stream_event_to_agent_events(event));
+            if let Some(reply) = accumulator.observe(event, &self.name) {
+                self.append_history(std::slice::from_ref(&reply));
+                return Ok((reply, deltas));
+            }
+        }
+        // A stream that carried a plain message reply ends with that message.
+        if let Some(message) = events.iter().find_map(|event| match event {
+            StreamEvent::Message(message) => Some(message),
+            _ => None,
+        }) {
+            let reply = MessageConvert::convert_from_message(message, &self.name);
+            self.append_history(std::slice::from_ref(&reply));
+            return Ok((reply, deltas));
+        }
+        Err(A2aError::InvalidRequest(
+            "a2a stream ended without a terminal result".to_string(),
+        ))
+    }
+
+    /// Runs one call through the middleware chain, as core events.
+    ///
+    /// The agent middlewares wrap the whole invocation (`AgentStart` … `AgentEnd`) and the
+    /// reasoning middlewares wrap the exchange with the remote agent, mirroring Java
+    /// `buildAgentStream` and `execute` (`8cc6795b0`). The reply is published as the terminal
+    /// `AgentResult`; a failure, including one a middleware injected, ends the stream with an
+    /// error carrying the original message.
+    fn call_stream(&self, messages: Vec<Msg>, mode: CallMode) -> (EventStream, CallOutcome) {
+        let outcome: CallOutcome = Arc::new(Mutex::new(None));
+        let handler = self.clone();
+        let core = {
+            let inner = handler.clone();
+            let outcome = outcome.clone();
+            Box::new(move |input: AgentInput| -> EventStream {
+                let context = inner.runtime_context();
+                let exchange = inner.clone();
+                let reasoning_outcome = outcome.clone();
+                let reasoning = inner.chain.wrap_reasoning(
+                    context.clone(),
+                    ReasoningInput::new(input.messages, Vec::new(), GenerateOptions::default()),
+                    Box::new(move |input: ReasoningInput| {
+                        exchange.exchange(input.messages, mode, reasoning_outcome)
+                    }),
+                );
+                let finish = inner.clone();
+                let tail = futures::stream::once(async move {
+                    finish.terminal_events(outcome, &context).await
+                })
+                .flat_map(futures::stream::iter);
+                Box::pin(
+                    futures::stream::once(async {
+                        Ok(AgentEvent::AgentStart(EventData::default()))
+                    })
+                    .chain(reasoning)
+                    .chain(tail)
+                    .chain(futures::stream::once(async {
+                        Ok(AgentEvent::AgentEnd(EventData::default()))
+                    })),
+                )
+            })
+        };
+        let events = self
+            .chain
+            .wrap_agent(self.runtime_context(), AgentInput::new(messages), core);
+        (events, outcome)
+    }
+
+    /// The agent-level tail of a call: the published reply as `AgentResult`, or its failure.
+    ///
+    /// The published outcome is **not** consumed here: `drain_call` (the blocking callers) and
+    /// `restore_error` (the streaming caller) read it afterwards to hand the caller the reply or the
+    /// original [`A2aError`] variant.
+    async fn terminal_events(
+        &self,
+        outcome: CallOutcome,
+        context: &RuntimeContext,
+    ) -> Vec<CoreResult<AgentEvent>> {
+        let published = outcome.lock().ok().and_then(|slot| match slot.as_ref() {
+            Some(Ok(reply)) => Some(Ok(reply.clone())),
+            Some(Err(error)) => Some(Err(error.to_string())),
+            None => None,
+        });
+        match published {
+            Some(Ok(reply)) => {
+                // Java `PostReasoningEvent`: the hooks see the message the remote agent produced.
+                self.chain.notify_reasoning_result(context, &reply).await;
+                let mut data = EventData::default();
+                if let Ok(value) = serde_json::to_value(&reply) {
+                    data.fields.insert("reply".to_string(), value);
+                }
+                vec![Ok(AgentEvent::AgentResult(data))]
+            }
+            Some(Err(text)) => vec![Err(Error::Agent(text))],
+            None => vec![Err(Error::Agent(
+                "a2a call finished without a result".to_string(),
+            ))],
+        }
+    }
+
+    /// Runs the exchange with the remote agent, mirroring Java `A2aAgent#exchange`.
+    ///
+    /// It relays the TEXT/THINKING deltas of the remote run and publishes the terminal reply.
+    fn exchange(&self, messages: Vec<Msg>, mode: CallMode, outcome: CallOutcome) -> EventStream {
+        match mode {
+            CallMode::Send => {
+                let handler = self.clone();
+                Box::pin(
+                    futures::stream::once(async move {
+                        let result = handler.send_call(messages).await;
+                        publish(&outcome, result);
+                        Vec::new()
+                    })
+                    .flat_map(futures::stream::iter),
+                )
+            }
+            CallMode::StreamBuffered => {
+                let handler = self.clone();
+                Box::pin(
+                    futures::stream::once(async move {
+                        let events: Vec<CoreResult<AgentEvent>> =
+                            match handler.stream_call(messages).await {
+                                Ok((reply, deltas)) => {
+                                    publish(&outcome, Ok(reply));
+                                    deltas.into_iter().map(Ok).collect()
+                                }
+                                Err(error) => {
+                                    publish(&outcome, Err(error));
+                                    Vec::new()
+                                }
+                            };
+                        events
+                    })
+                    .flat_map(futures::stream::iter),
+                )
+            }
+            CallMode::StreamIncremental => Box::pin(futures::stream::unfold(
+                IncrementalCall::new(self.clone(), messages, outcome),
+                next_incremental_item,
+            )),
+        }
     }
 
     /// Settles a non-terminal `message/send` task by polling `tasks/get`, mirroring the blocking
@@ -523,6 +725,46 @@ impl A2aAgent {
     }
 }
 
+/// Records the reply (or the failure) of one call, mirroring Java's `AtomicReference<Msg>`.
+fn publish(outcome: &CallOutcome, result: Result<Msg, A2aError>) {
+    if let Ok(mut slot) = outcome.lock() {
+        *slot = Some(result);
+    }
+}
+
+/// Maps a core error back to the failure the call recorded.
+///
+/// `Middleware` streams only carry core errors, so `stream_events` restores the original
+/// [`A2aError`] variant instead of flattening every failure into one kind.
+fn restore_error(error: Error, outcome: &CallOutcome) -> A2aError {
+    if let Ok(mut slot) = outcome.lock() {
+        if matches!(slot.as_ref(), Some(Err(_))) {
+            if let Some(Err(failure)) = slot.take() {
+                return failure;
+            }
+        }
+    }
+    A2aError::InvalidRequest(error.to_string())
+}
+
+/// Drives a call's event stream to the end and returns the reply the chain produced.
+async fn drain_call(events: EventStream, outcome: CallOutcome) -> Result<Msg, A2aError> {
+    let mut first_error = None;
+    let mut events = events;
+    while let Some(item) = events.next().await {
+        if let Err(error) = item {
+            first_error.get_or_insert(error);
+        }
+    }
+    match outcome.lock().ok().and_then(|mut slot| slot.take()) {
+        Some(result) => result,
+        None => Err(A2aError::InvalidRequest(match first_error {
+            Some(error) => error.to_string(),
+            None => "a2a call finished without a result".to_string(),
+        })),
+    }
+}
+
 /// The current history of the agent state, mirroring Java `historyOf(session)`.
 fn history_of(state: &Arc<Mutex<AgentState>>) -> Vec<Msg> {
     state
@@ -541,96 +783,104 @@ fn append_to_history(state: &Arc<Mutex<AgentState>>, messages: &[Msg]) {
     }
 }
 
-/// Phases of one [`A2aAgent::stream_events`] run.
-enum AgentStreamPhase {
-    /// Nothing requested yet: the call is serialized and the remote stream opened on first poll.
-    Start,
-    /// The remote stream is open; frames arrive incrementally.
-    Running(BoxStream<'static, Result<StreamEvent, A2aError>>),
-    /// The run settled (or failed); nothing more to emit.
-    Done,
-}
-
-/// State carried through `futures::stream::unfold` for one streaming call.
-struct AgentStreamState {
-    name: String,
-    resolver: Arc<dyn AgentCardResolver>,
-    config: A2aAgentConfig,
-    agent_state: Arc<Mutex<AgentState>>,
-    sinks: Arc<Mutex<Vec<A2aEventSink>>>,
-    gate: Arc<tokio::sync::Mutex<()>>,
-    /// Held for the whole stream, so two streaming calls of one agent never interleave.
-    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+/// One incremental `message/stream` call, mirroring Java `A2aAgent#streamEvents`' frame loop.
+struct IncrementalCall {
+    handler: CallParts,
+    outcome: CallOutcome,
     messages: Vec<Msg>,
-    phase: AgentStreamPhase,
+    /// Held for the whole stream, so two calls of one agent never interleave.
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    frames: Option<BoxStream<'static, Result<StreamEvent, A2aError>>>,
     accumulator: TaskResultAccumulator,
-    /// Whether `AGENT_START` was already emitted.
-    started: bool,
-    pending: VecDeque<Result<AgentEvent, A2aError>>,
+    /// The plain message reply, which ends a stream that carries no task.
+    message_reply: Option<Msg>,
+    pending: VecDeque<AgentEvent>,
+    done: bool,
 }
 
-/// One poll of a streaming call, mirroring Java `A2aAgent#streamEvents`.
-async fn next_agent_stream_item(
-    mut state: AgentStreamState,
-) -> Option<(Result<AgentEvent, A2aError>, AgentStreamState)> {
+impl IncrementalCall {
+    fn new(handler: CallParts, messages: Vec<Msg>, outcome: CallOutcome) -> Self {
+        Self {
+            handler,
+            outcome,
+            messages,
+            guard: None,
+            frames: None,
+            accumulator: TaskResultAccumulator::new(),
+            message_reply: None,
+            pending: VecDeque::new(),
+            done: false,
+        }
+    }
+
+    /// Serializes the call and opens the remote stream on the first poll.
+    async fn open(&mut self) {
+        self.guard = Some(self.handler.gate.clone().lock_owned().await);
+        self.handler.append_history(&self.messages);
+        let params = MessageSendParams {
+            message: MessageConvert::convert_from_msgs(&self.handler.history()),
+            configuration: None,
+            metadata: None,
+        };
+        match self.handler.client().message_stream_incremental(params).await {
+            Ok(frames) => self.frames = Some(frames),
+            Err(error) => {
+                publish(&self.outcome, Err(error));
+                self.done = true;
+            }
+        }
+    }
+}
+
+/// One poll of an incremental call, mirroring Java `A2aAgent#streamEvents`.
+async fn next_incremental_item(
+    mut call: IncrementalCall,
+) -> Option<(CoreResult<AgentEvent>, IncrementalCall)> {
     loop {
-        if let Some(item) = state.pending.pop_front() {
-            if let Ok(event) = &item {
-                emit_to_sinks(&state.sinks, event);
-            }
-            return Some((item, state));
+        if let Some(event) = call.pending.pop_front() {
+            return Some((Ok(event), call));
         }
-        if !state.started {
-            state.started = true;
-            state
-                .pending
-                .push_back(Ok(AgentEvent::AgentStart(EventData::default())));
+        if call.done {
+            return None;
+        }
+        let Some(mut frames) = call.frames.take() else {
+            call.open().await;
             continue;
-        }
-        match std::mem::replace(&mut state.phase, AgentStreamPhase::Done) {
-            AgentStreamPhase::Start => {
-                state._guard = Some(state.gate.clone().lock_owned().await);
-                append_to_history(&state.agent_state, &state.messages);
-                let history = history_of(&state.agent_state);
-                let client = A2aClient::new(state.name.clone(), state.resolver.clone())
-                    .with_transport(state.config.transport.clone())
-                    .with_auth_headers(state.config.auth_headers.clone());
-                let params = MessageSendParams {
-                    message: MessageConvert::convert_from_msgs(&history),
-                    configuration: None,
-                    metadata: None,
-                };
-                match client.message_stream_incremental(params).await {
-                    Ok(events) => state.phase = AgentStreamPhase::Running(events),
-                    Err(error) => state.pending.push_back(Err(error)),
-                }
-            }
-            AgentStreamPhase::Running(mut events) => {
-                match futures::StreamExt::next(&mut events).await {
-                    Some(Ok(event)) => {
-                        for mapped in stream_event_to_agent_events(&event) {
-                            state.pending.push_back(Ok(mapped));
-                        }
-                        match state.accumulator.observe(&event, &state.name) {
-                            Some(reply) => {
-                                append_to_history(&state.agent_state, std::slice::from_ref(&reply));
-                                let mut data = EventData::default();
-                                if let Ok(value) = serde_json::to_value(&reply) {
-                                    data.fields.insert("reply".to_string(), value);
-                                }
-                                state.pending.push_back(Ok(AgentEvent::AgentResult(data)));
-                                state
-                                    .pending
-                                    .push_back(Ok(AgentEvent::AgentEnd(EventData::default())));
-                            }
-                            None => state.phase = AgentStreamPhase::Running(events),
-                        }
+        };
+        match frames.next().await {
+            Some(Ok(event)) => {
+                call.pending.extend(stream_event_to_agent_events(&event));
+                if let Some(reply) = call.accumulator.observe(&event, &call.handler.name) {
+                    call.handler.append_history(std::slice::from_ref(&reply));
+                    publish(&call.outcome, Ok(reply));
+                    call.done = true;
+                } else {
+                    if let StreamEvent::Message(message) = &event {
+                        let reply = MessageConvert::convert_from_message(message, &call.handler.name);
+                        call.message_reply = Some(reply);
                     }
-                    Some(Err(error)) => state.pending.push_back(Err(error)),
-                    None => state.phase = AgentStreamPhase::Done,
+                    call.frames = Some(frames);
                 }
             }
-            AgentStreamPhase::Done => return None,
+            Some(Err(error)) => {
+                publish(&call.outcome, Err(error));
+                call.done = true;
+            }
+            None => {
+                match call.message_reply.take() {
+                    Some(reply) => {
+                        call.handler.append_history(std::slice::from_ref(&reply));
+                        publish(&call.outcome, Ok(reply));
+                    }
+                    None => publish(
+                        &call.outcome,
+                        Err(A2aError::InvalidRequest(
+                            "a2a stream ended without a terminal result".to_string(),
+                        )),
+                    ),
+                }
+                call.done = true;
+            }
         }
     }
 }
@@ -682,11 +932,11 @@ fn emit_to_sinks(sinks: &Arc<Mutex<Vec<A2aEventSink>>>, event: &AgentEvent) {
 
 impl Agent for A2aAgent {
     fn agent_id(&self) -> &str {
-        &self.name
+        &self.parts.name
     }
 
     fn name(&self) -> &str {
-        &self.name
+        &self.parts.name
     }
 
     fn description(&self) -> &str {
@@ -694,7 +944,7 @@ impl Agent for A2aAgent {
     }
 
     fn interrupt(&self) {
-        if let Ok(running) = self.running.lock() {
+        if let Ok(running) = self.parts.running.lock() {
             for call in running.iter() {
                 call.cancel();
             }
@@ -702,7 +952,8 @@ impl Agent for A2aAgent {
     }
 
     fn agent_state(&self) -> AgentState {
-        self.state
+        self.parts
+            .state
             .lock()
             .map(|state| state.clone())
             .unwrap_or_default()
@@ -715,7 +966,7 @@ impl Agent for A2aAgent {
 
 impl ObservableAgent for A2aAgent {
     fn subscribe(&self, sink: Box<dyn Fn(AgentEvent) + Send + Sync>) {
-        if let Ok(mut sinks) = self.sinks.lock() {
+        if let Ok(mut sinks) = self.parts.sinks.lock() {
             sinks.push(sink);
         }
     }
@@ -749,6 +1000,7 @@ pub struct A2aAgentBuilder {
     resolver: Arc<dyn AgentCardResolver>,
     config: A2aAgentConfig,
     state: AgentState,
+    middlewares: Vec<Arc<dyn Middleware>>,
 }
 
 impl std::fmt::Debug for A2aAgentBuilder {
@@ -768,6 +1020,7 @@ impl A2aAgentBuilder {
             resolver,
             config: A2aAgentConfig::default(),
             state: AgentState::default(),
+            middlewares: Vec::new(),
         }
     }
 
@@ -790,18 +1043,35 @@ impl A2aAgentBuilder {
         self
     }
 
+    /// Sets the middlewares of this agent, mirroring Java `A2aAgent.Builder#middleware`.
+    ///
+    /// `Middleware::on_agent` wraps the whole call and `Middleware::on_reasoning` wraps the
+    /// exchange with the remote agent; ordering, `active_points` filtering and the onion nesting
+    /// are the core `MiddlewareChain` semantics (higher `order()` wraps further out).
+    pub fn middlewares(mut self, middlewares: Vec<Arc<dyn Middleware>>) -> Self {
+        self.middlewares = middlewares;
+        self
+    }
+
     /// Builds the agent.
     pub fn build(self) -> A2aAgent {
+        let mut chain = MiddlewareChain::new();
+        for middleware in self.middlewares {
+            chain.add_arc(middleware);
+        }
         A2aAgent {
-            name: self.name,
+            parts: CallParts {
+                name: self.name,
+                resolver: self.resolver,
+                config: self.config,
+                state: Arc::new(Mutex::new(self.state)),
+                running: Arc::new(Mutex::new(Vec::new())),
+                sinks: Arc::new(Mutex::new(Vec::new())),
+                gate: Arc::new(tokio::sync::Mutex::new(())),
+                chain,
+            },
             description: self.description,
-            resolver: self.resolver,
-            config: self.config,
-            state: Arc::new(Mutex::new(self.state)),
             toolkit: Toolkit::new(),
-            running: Arc::new(Mutex::new(Vec::new())),
-            sinks: Arc::new(Mutex::new(Vec::new())),
-            call_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -811,6 +1081,8 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::pin::Pin;
+
+    use agentscope_core::middleware::{ExtensionPoint, Next};
 
     use crate::model::{
         methods, AgentCard, Artifact, JsonRpcRequest, JsonRpcResponse, Message, MessageRole, Part,
@@ -1243,5 +1515,200 @@ mod tests {
 
         // Every emitted event reached the sink.
         assert_eq!(*seen.lock().unwrap(), kinds);
+    }
+
+    /// Wraps `inner`, recording `<point>:<label>:out` once the stream is exhausted.
+    ///
+    /// `Middleware` has no "after" callback, so a middleware that wants to observe the leave leg of
+    /// the onion wraps the stream it got from `next` and notes its end.
+    fn record_leave(
+        seen: Arc<Mutex<Vec<String>>>,
+        label: &'static str,
+        point: &'static str,
+        inner: EventStream,
+    ) -> EventStream {
+        struct State {
+            inner: EventStream,
+            seen: Arc<Mutex<Vec<String>>>,
+            label: &'static str,
+            point: &'static str,
+        }
+        Box::pin(futures::stream::unfold(
+            State {
+                inner,
+                seen,
+                label,
+                point,
+            },
+            |mut state| async move {
+                match state.inner.next().await {
+                    Some(item) => Some((item, state)),
+                    None => {
+                        state
+                            .seen
+                            .lock()
+                            .unwrap()
+                            .push(format!("{}:{}:out", state.point, state.label));
+                        None
+                    }
+                }
+            },
+        ))
+    }
+
+    /// Middleware that records when it enters and leaves the agent and reasoning points.
+    struct OrderRecorder {
+        label: &'static str,
+        order: i32,
+        points: Vec<ExtensionPoint>,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl OrderRecorder {
+        fn new(
+            label: &'static str,
+            order: i32,
+            points: &[ExtensionPoint],
+            seen: Arc<Mutex<Vec<String>>>,
+        ) -> Self {
+            Self {
+                label,
+                order,
+                points: points.to_vec(),
+                seen,
+            }
+        }
+    }
+
+    impl Middleware for OrderRecorder {
+        fn order(&self) -> i32 {
+            self.order
+        }
+
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            self.points.clone()
+        }
+
+        fn on_agent(
+            &self,
+            _ctx: &RuntimeContext,
+            input: AgentInput,
+            next: Next<AgentInput>,
+        ) -> EventStream {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(format!("agent:{}:in", self.label));
+            record_leave(self.seen.clone(), self.label, "agent", next(input))
+        }
+
+        fn on_reasoning(
+            &self,
+            _ctx: &RuntimeContext,
+            input: ReasoningInput,
+            next: Next<ReasoningInput>,
+        ) -> EventStream {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(format!("reasoning:{}:in", self.label));
+            record_leave(self.seen.clone(), self.label, "reasoning", next(input))
+        }
+    }
+
+    /// Middleware recording the message `on_reasoning_result` is notified with (Java hook).
+    struct ReasoningResultRecorder {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Middleware for ReasoningResultRecorder {
+        async fn on_reasoning_result(&self, _ctx: &RuntimeContext, message: &Msg) {
+            self.seen.lock().unwrap().push(message.text_content());
+        }
+
+        fn active_points(&self) -> Vec<ExtensionPoint> {
+            vec![ExtensionPoint::OnReasoningResult]
+        }
+    }
+
+    // Java: `8cc6795b0` — `agentMiddlewares` (`onAgent`) wrap the whole call, `reasoningMiddlewares`
+    // (`onReasoning`) wrap the exchange with the remote agent, and the sorted hooks get the
+    // post-reasoning message.
+    #[test]
+    fn middlewares_wrap_the_whole_call_and_the_remote_exchange() {
+        let transport = StreamTransport::new(vec![
+            artifact_update("Hel"),
+            artifact_update("lo"),
+            completed_update(),
+        ]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let agent = A2aAgent::builder("remote", resolver())
+            .config(
+                A2aAgentConfig::builder()
+                    .transport(transport.clone())
+                    .build(),
+            )
+            .middlewares(vec![
+                Arc::new(OrderRecorder::new(
+                    "outer",
+                    10,
+                    &[ExtensionPoint::OnAgent, ExtensionPoint::OnReasoning],
+                    seen.clone(),
+                )),
+                Arc::new(OrderRecorder::new(
+                    "agent-only",
+                    7,
+                    &[ExtensionPoint::OnAgent],
+                    seen.clone(),
+                )),
+                Arc::new(OrderRecorder::new(
+                    "inner",
+                    5,
+                    &[ExtensionPoint::OnAgent, ExtensionPoint::OnReasoning],
+                    seen.clone(),
+                )),
+                Arc::new(ReasoningResultRecorder {
+                    seen: replies.clone(),
+                }),
+            ])
+            .build();
+
+        let events = rt().block_on(async {
+            let mut stream = agent.stream_events(vec![Msg::user("hi")]);
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                events.push(event.unwrap());
+            }
+            events
+        });
+        assert!(
+            matches!(events.last(), Some(AgentEvent::AgentEnd(_))),
+            "{events:?}"
+        );
+
+        // Highest `order()` enters first and leaves last; `agent-only` never reaches reasoning.
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "agent:outer:in",
+                "agent:agent-only:in",
+                "agent:inner:in",
+                "reasoning:outer:in",
+                "reasoning:inner:in",
+                "reasoning:inner:out",
+                "reasoning:outer:out",
+                "agent:inner:out",
+                "agent:agent-only:out",
+                "agent:outer:out",
+            ]
+        );
+        // The post-reasoning notification carries the reply of the remote agent.
+        assert_eq!(replies.lock().unwrap().clone(), vec!["Hello".to_string()]);
+        assert_eq!(
+            transport.methods.lock().unwrap().as_slice(),
+            [crate::model::methods::MESSAGE_STREAM]
+        );
     }
 }
