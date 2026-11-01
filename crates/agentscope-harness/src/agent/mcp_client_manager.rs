@@ -44,6 +44,38 @@ pub struct McpToolInfo {
     pub parameters: serde_json::Value,
     /// Server name this tool belongs to.
     pub server: String,
+    /// Human-readable display title (`Tool.title`) when the server advertises a
+    /// non-blank one. Mirrors Java `McpSchema.Tool.title`.
+    pub title: Option<String>,
+    /// JSON Schema of the tool's structured output (`Tool.outputSchema`).
+    ///
+    /// Mirrors Java `McpSchema.Tool.outputSchema`; `None` when the server does not
+    /// declare one.
+    pub output_schema: Option<serde_json::Value>,
+}
+
+impl McpToolInfo {
+    /// Creates tool info from the four fields the bridge has always carried.
+    ///
+    /// [`title`](Self::title) and [`output_schema`](Self::output_schema) default to
+    /// `None`. The fields stay public for the discovery path, so out-of-crate call
+    /// sites that only know the core four can use this constructor instead of a
+    /// struct literal.
+    pub fn new(
+        name: impl Into<String>,
+        description: Option<String>,
+        parameters: serde_json::Value,
+        server: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description,
+            parameters,
+            server: server.into(),
+            title: None,
+            output_schema: None,
+        }
+    }
 }
 
 /// Transport an MCP server connection must use.
@@ -78,9 +110,7 @@ impl McpTransport {
             "stdio" => Some(Self::Stdio),
             "sse" => Some(Self::Sse),
             "http" => Some(Self::StreamableHttp),
-            "streamable_http" | "streamable-http" | "streamablehttp" => {
-                Some(Self::StreamableHttp)
-            }
+            "streamable_http" | "streamable-http" | "streamablehttp" => Some(Self::StreamableHttp),
             _ => None,
         }
     }
@@ -355,13 +385,7 @@ impl McpClientManager {
             Ok(result) => result
                 .tools
                 .into_iter()
-                .map(|tool| McpToolInfo {
-                    name: tool.name,
-                    description: tool.description.clone(),
-                    parameters: serde_json::to_value(tool.input_schema)
-                        .unwrap_or_else(|_| serde_json::json!({ "type": "object" })),
-                    server: server_name.clone(),
-                })
+                .map(|tool| tool_info_from_schema(&server_name, tool))
                 .collect::<Vec<_>>(),
             Err(e) => {
                 tracing::warn!("Failed to list tools for MCP client '{}': {}", client_id, e);
@@ -491,6 +515,14 @@ impl McpClientManager {
         }
 
         if let Some(mcp_client) = &client.client {
+            // The connection-level switch is authoritative and read live on every call,
+            // so a caller cannot leak metadata to a server configured as untrusted: the
+            // meta is dropped here, before it reaches the SDK. `None` omits `_meta`.
+            let meta = if client.config.propagate_meta {
+                meta
+            } else {
+                None
+            };
             // Convert arguments to MCP tool call params
             let params = rust_mcp_sdk::schema::CallToolRequestParams {
                 name: tool_name.to_string(),
@@ -620,6 +652,34 @@ impl Default for McpClientManager {
     }
 }
 
+/// Projects a discovered MCP schema [`Tool`] into [`McpToolInfo`].
+///
+/// A blank `title` is dropped instead of being carried as `Some("")`, and the output
+/// schema is kept as raw JSON so the bridge can hand it to a provider verbatim.
+///
+/// [`Tool`]: rust_mcp_sdk::schema::Tool
+fn tool_info_from_schema(server: &str, tool: rust_mcp_sdk::schema::Tool) -> McpToolInfo {
+    let title = tool
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string);
+    let output_schema = tool
+        .output_schema
+        .as_ref()
+        .and_then(|schema| serde_json::to_value(schema).ok());
+    McpToolInfo {
+        name: tool.name,
+        description: tool.description.clone(),
+        parameters: serde_json::to_value(tool.input_schema)
+            .unwrap_or_else(|_| serde_json::json!({ "type": "object" })),
+        server: server.to_string(),
+        title,
+        output_schema,
+    }
+}
+
 /// Returns `true` when `url` should use the legacy SSE transport (path contains
 /// `/sse`), otherwise the URL is treated as a Streamable HTTP endpoint.
 fn is_sse_url(url: &str) -> bool {
@@ -633,8 +693,16 @@ fn is_sse_url(url: &str) -> bool {
 /// silent fallback. Without a pin the historical sniffing applies: `command` -> stdio,
 /// `/sse` URL -> legacy SSE, any other URL -> Streamable HTTP.
 pub fn plan_transport(config: &McpServerConfig) -> Result<PlannedTransport> {
-    let command = config.command.as_deref().map(str::trim).filter(|c| !c.is_empty());
-    let url = config.url.as_deref().map(str::trim).filter(|u| !u.is_empty());
+    let command = config
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    let url = config
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
 
     match config.transport {
         Some(McpTransport::Stdio) => match command {
@@ -739,7 +807,8 @@ mod tests {
         assert_eq!(sniffed.kind(), McpTransport::Sse);
         let sniffed = plan_transport(&McpServerConfig::new("srv").url("http://x/mcp")).unwrap();
         assert_eq!(sniffed.kind(), McpTransport::StreamableHttp);
-        let sniffed = plan_transport(&McpServerConfig::new("srv").command("npx -y server")).unwrap();
+        let sniffed =
+            plan_transport(&McpServerConfig::new("srv").command("npx -y server")).unwrap();
         assert_eq!(sniffed.kind(), McpTransport::Stdio);
     }
 
@@ -779,5 +848,361 @@ mod tests {
             Some(McpTransport::StreamableHttp)
         );
         assert_eq!(McpTransport::parse("carrier-pigeon"), None);
+    }
+
+    // ---- Title / output schema discovery (HIGRESS-05) ----
+
+    #[test]
+    fn discovered_tool_keeps_title_and_output_schema() {
+        // Round trip through the wire form, because discovery receives what the server
+        // serialized: a field the SDK drops on the way in would never reach the bridge.
+        let wire = serde_json::json!({
+            "name": "weather",
+            "title": "Weather lookup",
+            "description": "Looks up the weather",
+            "inputSchema": { "type": "object", "properties": {} },
+            "outputSchema": {
+                "type": "object",
+                "properties": { "temp": { "type": "number" } },
+                "required": ["temp"]
+            }
+        });
+        let tool: rust_mcp_sdk::schema::Tool =
+            serde_json::from_value(wire).expect("valid MCP tool");
+        let info = tool_info_from_schema("srv", tool);
+        assert_eq!(info.name, "weather");
+        assert_eq!(info.title.as_deref(), Some("Weather lookup"));
+        let schema = info
+            .output_schema
+            .expect("output schema survives discovery");
+        assert_eq!(schema["properties"]["temp"]["type"], "number");
+        assert_eq!(info.parameters["type"], "object");
+    }
+
+    #[test]
+    fn blank_title_and_missing_output_schema_are_none() {
+        let tool: rust_mcp_sdk::schema::Tool = serde_json::from_value(serde_json::json!({
+            "name": "bare",
+            "title": "   ",
+            "inputSchema": { "type": "object" }
+        }))
+        .expect("valid MCP tool");
+        let info = tool_info_from_schema("srv", tool);
+        assert!(info.title.is_none(), "a blank title must not be carried");
+        assert!(info.output_schema.is_none());
+    }
+
+    #[test]
+    fn constructor_defaults_the_new_fields() {
+        let info = McpToolInfo::new(
+            "legacy",
+            Some("desc".to_string()),
+            serde_json::json!({ "type": "object" }),
+            "srv",
+        );
+        assert!(info.title.is_none());
+        assert!(info.output_schema.is_none());
+        assert_eq!(info.server, "srv");
+    }
+
+    // ---- Connection-level meta gate ----
+
+    /// A stand-in MCP client that records every tool call it would have sent.
+    struct RecordingClient {
+        client_info: InitializeRequestParams,
+        calls: std::sync::Mutex<Vec<rust_mcp_sdk::schema::CallToolRequestParams>>,
+    }
+
+    impl RecordingClient {
+        fn new() -> Self {
+            Self {
+                client_info: InitializeRequestParams {
+                    capabilities: ClientCapabilities::default(),
+                    client_info: Implementation {
+                        name: "recording".into(),
+                        version: "0.1.0".into(),
+                        title: None,
+                        description: None,
+                        icons: vec![],
+                        website_url: None,
+                    },
+                    protocol_version: LATEST_PROTOCOL_VERSION.into(),
+                    meta: None,
+                },
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn last_meta(&self) -> Option<rust_mcp_sdk::schema::CallToolMeta> {
+            self.calls
+                .lock()
+                .unwrap()
+                .last()
+                .and_then(|p| p.meta.clone())
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpClient for RecordingClient {
+        async fn start(self: Arc<Self>) -> SdkResult<()> {
+            Ok(())
+        }
+
+        fn set_server_details(
+            &self,
+            _server_details: rust_mcp_sdk::schema::InitializeResult,
+        ) -> SdkResult<()> {
+            Ok(())
+        }
+
+        async fn terminate_session(&self) {}
+
+        fn task_store(&self) -> Option<Arc<rust_mcp_sdk::task_store::ClientTaskStore>> {
+            None
+        }
+
+        fn server_task_store(&self) -> Option<Arc<rust_mcp_sdk::task_store::ServerTaskStore>> {
+            None
+        }
+
+        async fn shut_down(&self) -> SdkResult<()> {
+            Ok(())
+        }
+
+        async fn is_shut_down(&self) -> bool {
+            true
+        }
+
+        fn client_info(&self) -> &InitializeRequestParams {
+            &self.client_info
+        }
+
+        fn server_info(&self) -> Option<rust_mcp_sdk::schema::InitializeResult> {
+            None
+        }
+
+        async fn session_id(&self) -> Option<rust_mcp_transport::SessionId> {
+            None
+        }
+
+        async fn send(
+            &self,
+            _message: rust_mcp_sdk::schema::MessageFromClient,
+            _request_id: Option<rust_mcp_sdk::schema::RequestId>,
+            _request_timeout: Option<std::time::Duration>,
+        ) -> SdkResult<Option<rust_mcp_sdk::schema::ServerMessage>> {
+            Ok(None)
+        }
+
+        async fn send_batch(
+            &self,
+            _messages: Vec<rust_mcp_sdk::schema::ClientMessage>,
+            _timeout: Option<std::time::Duration>,
+        ) -> SdkResult<Option<Vec<rust_mcp_sdk::schema::ServerMessage>>> {
+            Ok(None)
+        }
+
+        async fn request_tool_call(
+            &self,
+            params: rust_mcp_sdk::schema::CallToolRequestParams,
+        ) -> SdkResult<rust_mcp_sdk::schema::CallToolResult> {
+            self.calls.lock().unwrap().push(params);
+            Ok(rust_mcp_sdk::schema::CallToolResult {
+                content: Vec::new(),
+                is_error: None,
+                meta: None,
+                structured_content: None,
+            })
+        }
+    }
+
+    /// A manager holding one "connected" server backed by [`RecordingClient`].
+    async fn manager_with_recording_client(
+        propagate_meta: bool,
+    ) -> (McpClientManager, String, Arc<RecordingClient>) {
+        let manager = McpClientManager::new();
+        let client_id = manager
+            .create_client(
+                McpServerConfig::new("srv")
+                    .url("http://mcp.example.com/mcp")
+                    .propagate_meta(propagate_meta),
+            )
+            .await
+            .unwrap();
+        let recorder = Arc::new(RecordingClient::new());
+        {
+            let mut clients = manager.clients.lock().await;
+            let instance = clients.get_mut(&client_id).unwrap();
+            instance.connected = true;
+            instance.client = Some(recorder.clone());
+        }
+        (manager, client_id, recorder)
+    }
+
+    fn meta_map() -> serde_json::Map<String, serde_json::Value> {
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "io.agentscope/toolCallId".to_string(),
+            serde_json::json!("call-1"),
+        );
+        meta
+    }
+
+    #[tokio::test]
+    async fn disabled_connection_strips_meta_before_it_reaches_the_sdk() {
+        let (manager, client_id, recorder) = manager_with_recording_client(false).await;
+
+        manager
+            .call_tool_with_meta(
+                &client_id,
+                "remote",
+                serde_json::json!({ "a": 1 }),
+                Some(meta_map()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorder.call_count(), 1);
+        assert!(
+            recorder.last_meta().is_none(),
+            "a disabled connection must send no `_meta`, even when the caller passes one"
+        );
+
+        // The server-name entry point inherits the same fail-closed behaviour.
+        manager
+            .call_tool_by_server_with_meta("srv", "remote", serde_json::json!({}), Some(meta_map()))
+            .await
+            .unwrap();
+        assert_eq!(recorder.call_count(), 2);
+        assert!(recorder.last_meta().is_none());
+    }
+
+    #[tokio::test]
+    async fn enabled_connection_forwards_meta() {
+        let (manager, client_id, recorder) = manager_with_recording_client(true).await;
+
+        manager
+            .call_tool_with_meta(
+                &client_id,
+                "remote",
+                serde_json::json!({}),
+                Some(meta_map()),
+            )
+            .await
+            .unwrap();
+
+        let meta = recorder.last_meta().expect("meta must reach the SDK");
+        let extra = meta.extra.expect("caller-provided entries are kept");
+        assert_eq!(
+            extra["io.agentscope/toolCallId"],
+            serde_json::json!("call-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn per_tool_switch_ands_with_the_connection_switch() {
+        use agentscope_core::message::ToolUseBlock;
+        use agentscope_core::tool::{ToolExecutionContext, Toolkit};
+
+        let (manager, client_id, recorder) = manager_with_recording_client(true).await;
+        {
+            let mut clients = manager.clients.lock().await;
+            let instance = clients.get_mut(&client_id).unwrap();
+            // The bridge registers from the discovery cache, not from a live server.
+            instance.tools = vec![McpToolInfo::new(
+                "remote",
+                Some("desc".to_string()),
+                serde_json::json!({ "type": "object" }),
+                "srv",
+            )];
+        }
+        let manager = Arc::new(manager);
+        let toolkit = Toolkit::new();
+        let options = crate::agent::mcp::McpMetaPropagationOptions::new()
+            .propagate_meta_for("remote", false)
+            .expect("valid tool name");
+        let registered =
+            crate::agent::mcp::try_bridge_mcp_tools_to_toolkit(&manager, &toolkit, &options)
+                .await
+                .expect("bridge");
+        assert_eq!(registered, 1);
+
+        let tool = toolkit.get_tool("remote").expect("tool bridged");
+        let ctx = ToolExecutionContext {
+            tool_call: Some(ToolUseBlock::new("call-1", "remote", Default::default())),
+            ..Default::default()
+        };
+        tool.call(Default::default(), ctx).await.unwrap();
+
+        assert_eq!(recorder.call_count(), 1);
+        assert!(
+            recorder.last_meta().is_none(),
+            "per-tool off must silence meta even though the connection allows it"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridged_tool_exposes_title_and_output_schema() {
+        use agentscope_core::tool::Toolkit;
+
+        let (manager, client_id, _recorder) = manager_with_recording_client(true).await;
+        {
+            let mut clients = manager.clients.lock().await;
+            let instance = clients.get_mut(&client_id).unwrap();
+            let mut info = McpToolInfo::new(
+                "remote",
+                Some("desc".to_string()),
+                serde_json::json!({ "type": "object" }),
+                "srv",
+            );
+            info.title = Some("Remote title".to_string());
+            info.output_schema = Some(serde_json::json!({
+                "type": "object",
+                "properties": { "temp": { "type": "number" } }
+            }));
+            instance.tools = vec![info];
+        }
+        let manager = Arc::new(manager);
+        let toolkit = Toolkit::new();
+        let registered = crate::agent::mcp::bridge_mcp_tools_to_toolkit(&manager, &toolkit).await;
+        assert_eq!(registered, 1);
+
+        let tool = toolkit.get_tool("remote").expect("tool bridged");
+        assert_eq!(tool.title(), Some("Remote title"));
+        let schema = tool.output_schema().expect("output schema bridged");
+        assert_eq!(schema["properties"]["temp"]["type"], "number");
+    }
+
+    #[tokio::test]
+    async fn disabling_a_live_connection_takes_effect_on_the_next_call() {
+        let (manager, client_id, recorder) = manager_with_recording_client(true).await;
+        manager
+            .call_tool_with_meta(
+                &client_id,
+                "remote",
+                serde_json::json!({}),
+                Some(meta_map()),
+            )
+            .await
+            .unwrap();
+        assert!(recorder.last_meta().is_some());
+
+        assert!(manager.set_propagate_meta(&client_id, false).await);
+        manager
+            .call_tool_with_meta(
+                &client_id,
+                "remote",
+                serde_json::json!({}),
+                Some(meta_map()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            recorder.last_meta().is_none(),
+            "the switch is read live, not baked in at connect time"
+        );
     }
 }

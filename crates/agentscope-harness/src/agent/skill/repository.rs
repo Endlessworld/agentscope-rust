@@ -144,22 +144,40 @@ pub fn load_skills_from_dir(root: &Path, source: &str) -> Vec<AgentSkill> {
         if name.starts_with('.') || name == "_drafts" {
             continue;
         }
-        if !dir.join("SKILL.md").is_file() {
-            continue;
+        if let Some(skill) = load_skill_from_dir(&dir, source) {
+            skills.push(skill);
         }
-        let resources = collect_resources(&dir);
-        let description = skill_description(&resources).unwrap_or_else(|| format!("Skill: {name}"));
-        let mut builder = AgentSkill::builder()
-            .name(&name)
-            .source(source)
-            .description(description);
-        for (rel, content) in &resources {
-            builder = builder.add_resource(rel.clone(), content.clone());
-        }
-        skills.push(builder.build());
     }
     skills.sort_by(|a, b| a.name().cmp(&b.name()));
     skills
+}
+
+/// Loads a single skill directory (its `SKILL.md` + resources), without scanning
+/// siblings.
+///
+/// The skill name comes from the directory name, exactly as
+/// [`load_skills_from_dir`] derives it. Returns `None` when the directory holds no
+/// readable `SKILL.md`, which is the same skip semantics the directory scan applies —
+/// a repository that already resolved one skill directory can load just that skill
+/// instead of copying the resource scan or re-scanning the whole root.
+pub fn load_skill_from_dir(dir: &Path, source: &str) -> Option<AgentSkill> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let name = dir.file_name()?.to_string_lossy().to_string();
+    let resources = collect_resources(dir);
+    if !resources.keys().any(|rel| rel.ends_with("SKILL.md")) {
+        return None;
+    }
+    let description = skill_description(&resources).unwrap_or_else(|| format!("Skill: {name}"));
+    let mut builder = AgentSkill::builder()
+        .name(&name)
+        .source(source)
+        .description(description);
+    for (rel, content) in &resources {
+        builder = builder.add_resource(rel.clone(), content.clone());
+    }
+    Some(builder.build())
 }
 
 fn collect_resources(dir: &Path) -> BTreeMap<String, String> {
@@ -430,6 +448,37 @@ mod tests {
         assert!(skills
             .iter()
             .any(|s| s.name() == "alpha" && s.description().starts_with("Alpha")));
+    }
+
+    #[test]
+    fn load_skill_from_dir_reads_only_that_directory() {
+        let root = temp_dir("single");
+        write_skill(&root, "alpha", "# Alpha skill\n");
+        write_skill(&root, "beta", "# Beta skill\n");
+        std::fs::write(root.join("alpha").join("notes.md"), "alpha notes").unwrap();
+        std::fs::write(root.join("beta").join("notes.md"), "beta notes").unwrap();
+
+        let skill = load_skill_from_dir(&root.join("alpha"), "market").expect("alpha loads");
+        assert_eq!(skill.name(), "alpha");
+        assert_eq!(skill.source(), "market");
+        let resources: Vec<&String> = skill.resources().keys().collect();
+        assert!(resources.iter().any(|r| r.ends_with("SKILL.md")));
+        assert!(resources.iter().any(|r| r.as_str() == "notes.md"));
+        assert_eq!(
+            skill.resources().get("notes.md").map(String::as_str),
+            Some("alpha notes"),
+            "only the target directory's resources are read"
+        );
+
+        // A directory without a readable `SKILL.md` is skipped, like the scan does.
+        let empty = temp_dir("single_empty");
+        std::fs::create_dir_all(empty.join("gamma")).unwrap();
+        std::fs::write(empty.join("gamma").join("notes.md"), "no skill").unwrap();
+        assert!(load_skill_from_dir(&empty.join("gamma"), "market").is_none());
+        assert!(load_skill_from_dir(&empty.join("missing"), "market").is_none());
+
+        // The directory scan still returns both skills.
+        assert_eq!(load_skills_from_dir(&root, "market").len(), 2);
     }
 
     #[test]

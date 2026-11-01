@@ -10,6 +10,7 @@ pub mod harness_agent;
 pub mod isolation_scope;
 pub mod mcp;
 pub mod mcp_client_manager;
+pub mod mcp_content;
 pub mod memory;
 pub mod middleware;
 pub mod sandbox;
@@ -56,6 +57,7 @@ pub use mcp_client_manager::{
     plan_transport, McpClientInstance, McpClientManager, McpToolInfo, McpTransport,
     PlannedTransport,
 };
+pub use mcp_content::{convert_call_tool_result, convert_call_tool_result_value};
 pub use memory::{
     compaction::{
         build_summary_message, calculate_token, filter_summary_messages,
@@ -92,13 +94,13 @@ pub use shutdown::{
     StateStoreShutdownStateSaver, INTERRUPT_GRACE_PERIOD,
 };
 pub use skill::{
-    build_promoter, compose_skill_repositories, default_gate, AgentSkill, AgentSkillBuilder,
-    AllowListFilter, AllowListGate, AuditEntry, DenyListFilter, FileSystemSkillRepository,
-    FilesystemSkillUsageStore, HarnessSkillEntry, LoadSkillTool, PromotionDecision,
-    PromotionResult, ProposeSkillTool, RejectAllGate, ShellPathPolicy, SkillAuditLog, SkillCatalog,
-    SkillCurator, SkillCuratorConfig, SkillCuratorState, SkillFilter, SkillManageConfig,
-    SkillManageTool, SkillPromoter, SkillPromotionGate, SkillPromptBuilder, SkillRepository,
-    SkillRuntime, SkillState, SkillUsageStore, SkillVisibilityFilter, StageResult,
+    build_promoter, compose_skill_repositories, default_gate, load_skill_from_dir, AgentSkill,
+    AgentSkillBuilder, AllowListFilter, AllowListGate, AuditEntry, DenyListFilter,
+    FileSystemSkillRepository, FilesystemSkillUsageStore, HarnessSkillEntry, LoadSkillTool,
+    PromotionDecision, PromotionResult, ProposeSkillTool, RejectAllGate, ShellPathPolicy,
+    SkillAuditLog, SkillCatalog, SkillCurator, SkillCuratorConfig, SkillCuratorState, SkillFilter,
+    SkillManageConfig, SkillManageTool, SkillPromoter, SkillPromotionGate, SkillPromptBuilder,
+    SkillRepository, SkillRuntime, SkillState, SkillUsageStore, SkillVisibilityFilter, StageResult,
     WorkspaceSkillRepository,
 };
 pub use subagent::{

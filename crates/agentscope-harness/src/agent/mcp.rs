@@ -308,39 +308,24 @@ pub async fn try_bridge_mcp_tools_to_toolkit(
                 let server = h_server.clone();
                 let tool_name = h_tool_name.clone();
                 Box::pin(async move {
-                    // The connection-level switch is read live on every call
-                    // (Java `McpClientWrapper.isPropagateMeta`), so disabling a
-                    // connection takes effect immediately for already-bridged tools.
-                    let meta = match manager.find_client_id_by_server(&server).await {
-                        Some(client_id) => match manager.propagate_meta(&client_id).await {
-                            Some(true) => meta,
-                            _ => None,
-                        },
-                        None => None,
-                    };
+                    // The connection-level switch is applied inside the manager
+                    // (`call_tool_with_meta`), which reads it live on every call, so
+                    // disabling a connection takes effect immediately for
+                    // already-bridged tools. The per-tool decision is already ANDed in
+                    // by `McpTool::call` via `with_propagate_meta`.
                     let raw = serde_json::Value::Object(args);
                     match manager
                         .call_tool_by_server_with_meta(&server, &tool_name, raw, meta)
                         .await
                     {
-                        Ok(value) => {
-                            let text = match value {
-                                serde_json::Value::String(s) => s,
-                                other => serde_json::to_string_pretty(&other).unwrap_or_default(),
-                            };
-                            Ok(agentscope_core::message::ToolResultBlock::new(
-                                "",
-                                &tool_name,
-                                vec![agentscope_core::message::ContentBlock::Text(
-                                    agentscope_core::message::TextBlock::new(text),
-                                )],
-                            ))
-                        }
+                        Ok(value) => Ok(crate::agent::mcp_content::convert_call_tool_result_value(
+                            &tool_name, &value,
+                        )),
                         Err(e) => Err(e),
                     }
                 })
             });
-            let tool = agentscope_core::tool::McpTool::new(
+            let mut tool = agentscope_core::tool::McpTool::new(
                 server.clone(),
                 tool_name.clone(),
                 description,
@@ -354,7 +339,15 @@ pub async fn try_bridge_mcp_tools_to_toolkit(
                 }),
             )
             .with_async_handler(async_handler)
+            // Per-tool decision, fixed at registration time and ANDed with the
+            // connection-level switch on every call.
             .with_propagate_meta(propagate_meta);
+            if let Some(title) = info.title {
+                tool = tool.with_title(title);
+            }
+            if let Some(output_schema) = info.output_schema {
+                tool = tool.with_output_schema(output_schema);
+            }
             toolkit.register_tool(std::sync::Arc::new(tool));
             registered += 1;
         }
@@ -474,10 +467,13 @@ impl McpClientSource {
 fn mcp_tool_info_to_schema_tool(info: &McpToolInfo) -> rust_mcp_sdk::schema::Tool {
     rust_mcp_sdk::schema::Tool {
         name: info.name.clone(),
-        title: None,
+        title: info.title.clone(),
         description: info.description.clone(),
         input_schema: build_tool_input_schema(&info.parameters),
-        output_schema: None,
+        output_schema: info
+            .output_schema
+            .as_ref()
+            .and_then(|schema| serde_json::from_value(schema.clone()).ok()),
         annotations: None,
         meta: None,
         execution: None,

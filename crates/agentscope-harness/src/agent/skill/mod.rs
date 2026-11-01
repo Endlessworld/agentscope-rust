@@ -46,7 +46,7 @@ pub use promoter::{
 };
 pub use prompt::{SkillPromptBuilder, DEFAULT_CODE_EXECUTION_INSTRUCTION, DEFAULT_HEADER};
 pub use repository::{
-    compose_skill_repositories, FileSystemSkillRepository, SkillRepository,
+    compose_skill_repositories, load_skill_from_dir, FileSystemSkillRepository, SkillRepository,
     WorkspaceSkillRepository,
 };
 pub use runtime::{SkillRuntime, SKILL_CATALOG_METADATA_KEY};

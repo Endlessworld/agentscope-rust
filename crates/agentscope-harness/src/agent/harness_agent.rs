@@ -160,6 +160,9 @@ pub type AgentBuiltCallback = Arc<dyn Fn(&HarnessAgentHandle) + Send + Sync>;
 pub struct HarnessAgentHandle {
     name: String,
     agent_id: String,
+    description: String,
+    sys_prompt: String,
+    max_iters: usize,
     model: Option<Arc<dyn Model>>,
     toolkit: Toolkit,
     state: Option<Arc<Mutex<AgentState>>>,
@@ -174,6 +177,29 @@ impl HarnessAgentHandle {
     /// The stable agent id (defaults to the name).
     pub fn agent_id(&self) -> &str {
         &self.agent_id
+    }
+
+    /// The embedded agent's description, sourced from the same `ReActAgent` field the
+    /// owning [`HarnessAgent`] reads.
+    ///
+    /// Empty in assembly-only mode (no model, so no embedded agent was built).
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// The embedded agent's resolved system prompt (core `ReActAgent::sys_prompt`).
+    ///
+    /// Empty in assembly-only mode.
+    pub fn sys_prompt(&self) -> &str {
+        &self.sys_prompt
+    }
+
+    /// The embedded agent's effective reasoning/acting iteration cap.
+    ///
+    /// This is the value the agent actually runs with (the builder default applies when
+    /// none was configured); `0` in assembly-only mode.
+    pub fn max_iters(&self) -> usize {
+        self.max_iters
     }
 
     /// The model the agent was built with (`None` in assembly-only mode).
@@ -208,6 +234,23 @@ impl HarnessAgent {
         HarnessAgentHandle {
             name: self.name.clone(),
             agent_id: self.agent_id.clone(),
+            // Read back from the embedded agent: these are the values it really runs with
+            // (builder defaults applied), not the raw builder configuration.
+            description: self
+                .agent
+                .as_ref()
+                .map(|agent| agent.description().to_string())
+                .unwrap_or_default(),
+            sys_prompt: self
+                .agent
+                .as_ref()
+                .map(|agent| agent.sys_prompt().to_string())
+                .unwrap_or_default(),
+            max_iters: self
+                .agent
+                .as_ref()
+                .map(|agent| agent.max_iters().max(0) as usize)
+                .unwrap_or(0),
             model: self.model.clone(),
             toolkit: self.toolkit.clone(),
             state: self.agent.as_ref().map(|agent| agent.state_handle()),
@@ -2531,5 +2574,89 @@ impl MemoryFlushManager {
     /// Returns the default flush prompt (re-exposed for the builder).
     pub fn default_flush_prompt() -> String {
         super::memory::flush::DEFAULT_FLUSH_PROMPT.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
+    use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
+
+    /// A model that never gets called; these tests only inspect the built agent.
+    struct NoopModel;
+
+    #[async_trait::async_trait]
+    impl Model for NoopModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<ToolSchema>,
+            _options: GenerateOptions,
+        ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+            Box::pin(futures::stream::once(async {
+                Ok(ChatResponse::builder()
+                    .content(vec![CoreBlock::Text(TextBlock::new("done"))])
+                    .build())
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "noop"
+        }
+    }
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agentscope_harness_handle_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn handle_reports_the_embedded_agents_blueprint() {
+        let root = temp_root("blueprint");
+        let agent = HarnessAgent::builder()
+            .name("handle-agent")
+            .model(Arc::new(NoopModel))
+            .description("shadow blueprint")
+            .sys_prompt("you are a shadow")
+            .max_iters(3)
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .disable_web_tools()
+            .build();
+
+        let handle = agent.handle();
+        assert_eq!(handle.description(), "shadow blueprint");
+        assert_eq!(handle.sys_prompt(), "you are a shadow");
+        assert_eq!(handle.max_iters(), 3);
+        // Same source as the owning agent, so a hook and the host never disagree.
+        assert_eq!(handle.description(), agent.description());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn assembly_only_handle_has_no_prompt_and_zero_iterations() {
+        let root = temp_root("assembly_only");
+        let agent = HarnessAgent::builder()
+            .name("assembly-agent")
+            .description("configured but unbuilt")
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .disable_web_tools()
+            .build();
+
+        let handle = agent.handle();
+        assert!(handle.model().is_none(), "assembly-only mode has no model");
+        assert_eq!(handle.description(), "");
+        assert_eq!(handle.sys_prompt(), "");
+        assert_eq!(handle.max_iters(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
