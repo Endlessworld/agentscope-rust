@@ -45,10 +45,11 @@ pub use stub::MysqlAsyncBackend;
 
 /// Table names the driver-backed backend reads and writes.
 ///
-/// The adapter has no way to observe the names configured on
-/// [`crate::MysqlAgentStateStore`], [`crate::MysqlStore`] or
-/// [`crate::MysqlSnapshotSpec`] (their traits do not carry them), so the same names must be
-/// configured in both places. The defaults match each component's default.
+/// The components ([`crate::MysqlAgentStateStore`], [`crate::MysqlStore`],
+/// [`crate::MysqlSnapshotSpec`]) only learn their table name at construction, so both sides
+/// must agree. [`crate::MysqlDistributedStore::connect_with_config`] is the supported way to
+/// keep them in sync: it builds every component from this config, so the names below are the
+/// ones the statements actually use. The defaults match each component's default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MysqlAsyncConfig {
     /// Database holding the session-state table (also created by schema bootstrap).

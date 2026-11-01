@@ -126,6 +126,11 @@ impl MysqlStore {
         MysqlStore::builder(backend).build()
     }
 
+    /// The table this store reads and writes.
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
     fn select_sql(&self) -> String {
         self.dialect
             .render(self.dialect.select_sql(), &self.table_name)
@@ -487,7 +492,6 @@ mod tests {
         for bad in [
             "agentscope_store; DROP TABLE x",
             "`agentscope_store`",
-            "agentscope_store--",
             "agent.scope",
             "agentscope store",
             "agentscope_store)",

@@ -223,9 +223,34 @@ pub trait StateBackend: Send + Sync {
         from_index: usize,
     ) -> MysqlResult<()>;
 
-    /// Reads all list values ordered by `item_index`.
-    fn get_list(
+    /// Writes `values_json` (see [`StateBackend::save_list`]) **and** the `{key}:hash`
+    /// companion row in one atomic unit.
+    ///
+    /// Mirrors Java `MysqlAgentStateStore#executeInWriteTransaction`, which wraps
+    /// `save(list)` in a transaction: the three statements (row upsert, tail trim, hash
+    /// write) must all land or none. A half-applied write leaves the rows and the hash
+    /// disagreeing, so the next save either skips a needed rewrite or rewrites everything —
+    /// and a reader in between sees a truncated list.
+    ///
+    /// The default keeps the historical two-call behaviour so an out-of-tree backend still
+    /// compiles; implementations backed by a transaction-capable driver **should** override
+    /// it (the `mysql_async` adapter and the in-memory test double do).
+    fn save_list_and_hash(
         &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+        values_json: &[String],
+        from_index: usize,
+        hash_key: &str,
+        hash: &str,
+    ) -> MysqlResult<()> {
+        self.save_list(user_id, session_id, state_key, values_json, from_index)?;
+        self.save_single(user_id, session_id, hash_key, hash)
+    }
+
+    /// Reads all list values ordered by `item_index`.
+    fn get_list(        &self,
         user_id: Option<&str>,
         session_id: &str,
         state_key: &str,
@@ -257,6 +282,30 @@ pub trait StateBackend: Send + Sync {
         session_id: &str,
         state_key: &str,
     ) -> MysqlResult<i64>;
+
+    /// Reads the single value **and** its version together, `None` when the row is absent.
+    ///
+    /// Mirrors Java `MysqlAgentStateStore#getVersioned`, which issues one
+    /// `SELECT state_data, version`. Reading them with two statements can interleave with a
+    /// concurrent write and return a value from one version beside the number of another —
+    /// exactly what an optimistic caller then CAS-updates on.
+    ///
+    /// The default is the two-statement fallback; driver-backed implementations should
+    /// override it with a single query.
+    fn get_single_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+    ) -> MysqlResult<Option<(String, i64)>> {
+        match self.get_single(user_id, session_id, state_key)? {
+            Some(value) => Ok(Some((
+                value,
+                self.read_version(user_id, session_id, state_key)?,
+            ))),
+            None => Ok(None),
+        }
+    }
 }
 
 /// MySQL database-backed [`AgentStateStore`].
@@ -501,16 +550,26 @@ impl MysqlAgentStateStore {
 
         if list_hash::needs_full_rewrite(values, stored_hash.as_deref(), existing_count) {
             let encoded = Self::encode_values(values)?;
-            self.backend
-                .save_list(user_id, session_id, key, &encoded, 0)?;
-            self.backend
-                .save_single(user_id, session_id, &hash_key, &current_hash)?;
+            self.backend.save_list_and_hash(
+                user_id,
+                session_id,
+                key,
+                &encoded,
+                0,
+                &hash_key,
+                &current_hash,
+            )?;
         } else if values.len() > existing_count {
             let encoded = Self::encode_values(values)?;
-            self.backend
-                .save_list(user_id, session_id, key, &encoded, existing_count)?;
-            self.backend
-                .save_single(user_id, session_id, &hash_key, &current_hash)?;
+            self.backend.save_list_and_hash(
+                user_id,
+                session_id,
+                key,
+                &encoded,
+                existing_count,
+                &hash_key,
+                &current_hash,
+            )?;
         }
         Ok(())
     }
@@ -645,13 +704,24 @@ impl AgentStateStore for MysqlAgentStateStore {
                 version: agentscope_core::state::UNVERSIONED,
             };
         }
-        let version = self
+        // One statement: Java `getVersioned` selects `state_data` and `version` together, so
+        // the pair can never come from two different row versions.
+        match self
             .backend
-            .read_version(user_id, session_id, key)
-            .unwrap_or(agentscope_core::state::UNVERSIONED);
-        agentscope_core::state::VersionedState {
-            value: self.get(user_id, session_id, key).await,
-            version,
+            .get_single_versioned(user_id, session_id, key)
+        {
+            Ok(Some((json, version))) => agentscope_core::state::VersionedState {
+                value: serde_json::from_str(&json).ok(),
+                version,
+            },
+            Ok(None) => agentscope_core::state::VersionedState {
+                value: None,
+                version: 0,
+            },
+            Err(_) => agentscope_core::state::VersionedState {
+                value: None,
+                version: agentscope_core::state::UNVERSIONED,
+            },
         }
     }
 
@@ -994,6 +1064,62 @@ mod tests {
         );
     }
 
+    /// MYSQL-07: Java `getListCount` is `MAX(item_index) + 1`, not `COUNT(*)`. With a hole
+    /// in the index range the next append must go *after* the last row: a `COUNT(*)`-based
+    /// index lands inside the existing range and overwrites a different logical item.
+    #[tokio::test]
+    async fn list_len_counts_the_index_range_not_the_rows() {
+        let (s, backend) = store_with_backend();
+        backend.seed_list_item(Some("u"), "sess", "msgs", 0, "\"a\"");
+        backend.seed_list_item(Some("u"), "sess", "msgs", 2, "\"c\"");
+        assert_eq!(
+            backend.list_len(Some("u"), "sess", "msgs").unwrap(),
+            3,
+            "2 rows spanning indices 0..=2 must report 3, like Java getListCount"
+        );
+
+        // A hash describing the 3-item list makes the write an append of `d` at index 3.
+        let expected_prefix_hash =
+            list_hash::compute_hash(&[json!("a"), json!("b"), json!("c")]);
+        backend
+            .save_single(Some("u"), "sess", "msgs:_hash", &expected_prefix_hash)
+            .unwrap();
+        s.save_list(
+            Some("u"),
+            "sess",
+            "msgs",
+            &[json!("a"), json!("b"), json!("c"), json!("d")],
+        )
+        .await;
+
+        assert_eq!(
+            backend.list_indices(Some("u"), "sess", "msgs"),
+            vec![0, 2, 3],
+            "the append must not fill/overwrite the hole at index 1"
+        );
+    }
+
+    /// MYSQL-02: the row writes and the `{key}:_hash` write are one unit (Java
+    /// `executeInWriteTransaction`). A failure in the hash write must roll the rows back —
+    /// otherwise the half-written list is what the next read *and* the next hash check see.
+    #[tokio::test]
+    async fn list_hash_write_failure_rolls_back_the_rows() {
+        let (s, backend) = store_with_backend();
+        s.save_list(Some("u"), "sess", "msgs", &[json!(1), json!(2)])
+            .await;
+
+        backend.fail_hash_write(true);
+        s.save_list(Some("u"), "sess", "msgs", &[json!(9), json!(9), json!(9)])
+            .await;
+        backend.fail_hash_write(false);
+
+        assert_eq!(
+            s.get_list(Some("u"), "sess", "msgs").await,
+            vec![json!(1), json!(2)],
+            "a failed hash write must not leave the new rows behind"
+        );
+    }
+
     // ---- version column / atomic CAS ---------------------------------------------
 
     /// Java `save` upserts with `version = version + 1`; the version lives in the row, not in
@@ -1016,6 +1142,37 @@ mod tests {
         let versioned = s.get_versioned(Some("u"), "sess", "k").await;
         assert_eq!(versioned.version, 1);
         assert_eq!(versioned.value, Some(json!(5)));
+    }
+
+    /// MYSQL-12: `get_versioned` must be **one** read (Java `getVersioned` selects
+    /// `state_data, version` together). The previous `read_version` + `get` pair could
+    /// interleave with a write and return a value from one version beside another's number.
+    #[tokio::test]
+    async fn get_versioned_reads_value_and_version_together() {
+        let (s, backend) = store_with_backend();
+        s.save_if_version(Some("u"), "sess", "k", json!(7), None)
+            .await
+            .unwrap();
+        let reads_before = (backend.read_version_calls(), backend.get_single_calls());
+
+        let versioned = s.get_versioned(Some("u"), "sess", "k").await;
+        assert_eq!(versioned.value, Some(json!(7)));
+        assert_eq!(versioned.version, 1);
+        assert_eq!(
+            backend.read_version_calls(),
+            reads_before.0,
+            "get_versioned must not issue a separate read_version"
+        );
+        assert_eq!(
+            backend.get_single_calls(),
+            reads_before.1,
+            "get_versioned must not issue a separate get_single"
+        );
+
+        // An absent row keeps reporting version 0 (what `read_version` returned before).
+        let missing = s.get_versioned(Some("u"), "sess", "absent").await;
+        assert_eq!(missing.value, None);
+        assert_eq!(missing.version, 0);
     }
 
     /// `expected_version == 0` is a real create-if-absent: the row must not be overwritten.

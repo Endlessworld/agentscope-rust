@@ -16,7 +16,7 @@ use agentscope_harness::agent::sandbox::snapshot::{
 use async_trait::async_trait;
 
 use crate::error::MysqlResult;
-use crate::identifier::validate_identifier;
+use crate::identifier::{quote_identifier, validate_identifier};
 
 /// Default snapshot table name, mirroring `DEFAULT_TABLE`.
 pub const DEFAULT_SNAPSHOT_TABLE: &str = "agentscope_snapshots";
@@ -30,11 +30,31 @@ pub const DEFAULT_SNAPSHOT_TABLE: &str = "agentscope_snapshots";
 /// Java statement verbatim; `utf8mb4_bin` is also what this crate's `store` key columns use.
 pub fn snapshot_table_ddl(table_name: &str) -> String {
     format!(
-        "CREATE TABLE IF NOT EXISTS {table_name} (\
+        "CREATE TABLE IF NOT EXISTS {} (\
          snapshot_id VARCHAR(512) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY, \
          data LONGBLOB NOT NULL, \
          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\
-         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC",
+        quote_identifier(table_name)
+    )
+}
+
+/// Upload statement used by the driver backend, mirroring Java
+/// `JdbcRemoteSnapshotClient#upload`:
+///
+/// ```text
+/// INSERT INTO t (snapshot_id, data) VALUES (?, ?)
+///   ON DUPLICATE KEY UPDATE data = VALUES(data), created_at = CURRENT_TIMESTAMP
+/// ```
+///
+/// Re-uploading the same id must refresh `created_at` (Java does), otherwise the timestamp
+/// keeps reporting the first upload and any retention sweep that ages snapshots by it never
+/// sees the refreshed archive. Bind order: `(snapshot_id, data)`.
+pub fn snapshot_upload_sql(table_name: &str) -> String {
+    format!(
+        "INSERT INTO {} (snapshot_id, data) VALUES (?, ?) \
+         ON DUPLICATE KEY UPDATE data = VALUES(data), created_at = CURRENT_TIMESTAMP",
+        quote_identifier(table_name)
     )
 }
 
@@ -238,7 +258,8 @@ pub mod testing;
 mod tests {
     use super::testing::InMemorySnapshotBackend;
     use super::{
-        snapshot_table_ddl, MysqlRemoteSnapshotClient, MysqlSnapshotSpec, DEFAULT_SNAPSHOT_TABLE,
+        snapshot_table_ddl, snapshot_upload_sql, MysqlRemoteSnapshotClient, MysqlSnapshotSpec,
+        DEFAULT_SNAPSHOT_TABLE,
     };
     use agentscope_harness::agent::sandbox::snapshot::SandboxSnapshotSpec;
     use std::sync::Arc;
@@ -293,7 +314,6 @@ mod tests {
         for bad in [
             "agentscope_snapshots; DROP TABLE x",
             "`agentscope_snapshots`",
-            "snaps--",
             "agent.snaps",
             "snaps table",
         ] {
@@ -319,11 +339,27 @@ mod tests {
     #[test]
     fn snapshot_ddl_matches_the_java_statement() {
         let ddl = snapshot_table_ddl("agentscope_snapshots");
-        assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS agentscope_snapshots ("));
+        assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS `agentscope_snapshots` ("));
         assert!(ddl.contains("snapshot_id VARCHAR(512) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY"));
         assert!(ddl.contains("data LONGBLOB NOT NULL"));
         assert!(ddl.contains("created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"));
         assert!(ddl.contains("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC"));
+    }
+
+    /// Java `JdbcRemoteSnapshotClient#upload`: a duplicate id replaces the payload **and**
+    /// refreshes `created_at`, so re-uploading an archive does not keep reporting the first
+    /// upload time to any retention sweep.
+    #[test]
+    fn upload_sql_refreshes_created_at() {
+        let sql = snapshot_upload_sql("agentscope-prod-snaps");
+        assert!(
+            sql.contains("ON DUPLICATE KEY UPDATE data = VALUES(data), created_at = CURRENT_TIMESTAMP"),
+            "unexpected upload statement: {sql}"
+        );
+        assert!(
+            sql.starts_with("INSERT INTO `agentscope-prod-snaps` (snapshot_id, data) VALUES (?, ?)"),
+            "the table name must be backtick-quoted (it contains '-'): {sql}"
+        );
     }
 
     /// `JdbcSnapshotSpec` always passes `initializeSchema = true`.

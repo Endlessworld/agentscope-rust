@@ -71,10 +71,19 @@ pub trait StoreDialect: Send + Sync + fmt::Debug {
         '!'
     }
 
+    /// Quotes `table` for this vendor.
+    ///
+    /// MySQL only accepts a table name containing `-` when it is backtick-quoted (and Java
+    /// allows such names), so the MySQL dialect quotes **every** table name. The other
+    /// dialects keep the bare name: their quoting rules are not exercised by this crate.
+    fn quote_table(&self, table: &str) -> String {
+        table.to_string()
+    }
+
     /// Renders a dialect SQL template, substituting `{table}` with the table name and
     /// wrapping the placeholder-style bind markers for the target driver (kept as `?`).
     fn render(&self, template: &str, table: &str) -> String {
-        template.replace("{table}", table)
+        template.replace("{table}", &self.quote_table(table))
     }
 }
 
@@ -85,6 +94,10 @@ pub struct MysqlStoreDialect;
 impl StoreDialect for MysqlStoreDialect {
     fn name(&self) -> &str {
         "mysql"
+    }
+
+    fn quote_table(&self, table: &str) -> String {
+        crate::identifier::quote_identifier(table)
     }
 
     fn create_table_sql(&self) -> &'static str {

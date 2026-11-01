@@ -52,6 +52,14 @@ pub struct InMemoryStateBackend {
     /// When set, the CAS primitives fail (simulates a driver/statement error so tests can
     /// prove the store propagates it instead of swallowing it).
     fail_cas: AtomicBool,
+    /// When set, the hash row write inside [`StateBackend::save_list_and_hash`] fails, so a
+    /// test can prove the row writes are rolled back with it (Java wraps `save(list)` in a
+    /// transaction).
+    fail_hash_write: AtomicBool,
+    /// `read_version` / `get_single` call counts, so a test can prove
+    /// [`StateBackend::get_single_versioned`] does not degrade to that two-statement pair.
+    read_version_calls: AtomicUsize,
+    get_single_calls: AtomicUsize,
 }
 
 impl InMemoryStateBackend {
@@ -73,6 +81,22 @@ impl InMemoryStateBackend {
     /// Makes every subsequent version-guarded write fail.
     pub fn fail_cas(&self, fail: bool) {
         self.fail_cas.store(fail, Ordering::SeqCst);
+    }
+
+    /// Makes the hash-row write of [`StateBackend::save_list_and_hash`] fail (the row writes
+    /// of the same call still go through the in-memory transaction and must be rolled back).
+    pub fn fail_hash_write(&self, fail: bool) {
+        self.fail_hash_write.store(fail, Ordering::SeqCst);
+    }
+
+    /// How often `read_version` was called.
+    pub fn read_version_calls(&self) -> usize {
+        self.read_version_calls.load(Ordering::SeqCst)
+    }
+
+    /// How often `get_single` was called.
+    pub fn get_single_calls(&self) -> usize {
+        self.get_single_calls.load(Ordering::SeqCst)
     }
 
     /// Error surfaced by the CAS primitives when [`Self::fail_cas`] is on.
@@ -143,6 +167,37 @@ impl InMemoryStateBackend {
             .entry(key)
             .or_default()
             .insert(state_key.to_string(), version);
+    }
+
+    /// Seeds one list row at `item_index` so a test can model a table whose index range has
+    /// a hole (Java `getListCount` looks at `MAX(item_index)`, not `COUNT(*)`).
+    pub fn seed_list_item(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+        index: i64,
+        value_json: &str,
+    ) {
+        self.rows
+            .lock()
+            .unwrap()
+            .entry(Self::key(user_id, session_id))
+            .or_default()
+            .entry(state_key.to_string())
+            .or_default()
+            .insert(index, value_json.to_string());
+    }
+
+    /// Stored `item_index` values of a list key, ascending.
+    pub fn list_indices(&self, user_id: Option<&str>, session_id: &str, state_key: &str) -> Vec<i64> {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&Self::key(user_id, session_id))
+            .and_then(|s| s.get(state_key))
+            .map(|items| items.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Whether the modelled database exists.
@@ -423,12 +478,41 @@ impl StateBackend for InMemoryStateBackend {
         session_id: &str,
         state_key: &str,
     ) -> MysqlResult<Option<String>> {
+        self.get_single_calls.fetch_add(1, Ordering::SeqCst);
         let rows = self.rows.lock().unwrap();
         Ok(rows
             .get(&Self::key(user_id, session_id))
             .and_then(|s| s.get(state_key))
             .and_then(|m| m.get(&super::SINGLE_STATE_INDEX))
             .cloned())
+    }
+
+    /// Single critical section, so value and version always come from the same state.
+    fn get_single_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+    ) -> MysqlResult<Option<(String, i64)>> {
+        let key = Self::key(user_id, session_id);
+        let rows = self.rows.lock().unwrap();
+        let Some(value) = rows
+            .get(&key)
+            .and_then(|s| s.get(state_key))
+            .and_then(|m| m.get(&super::SINGLE_STATE_INDEX))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let version = self
+            .versions
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(|v| v.get(state_key))
+            .copied()
+            .unwrap_or(0);
+        Ok(Some((value, version)))
     }
 
     fn save_list(
@@ -443,13 +527,11 @@ impl StateBackend for InMemoryStateBackend {
         let mut rows = self.rows.lock().unwrap();
         let session = rows.entry(Self::key(user_id, session_id)).or_default();
         let items = session.entry(state_key.to_string()).or_default();
-        // Overwrite any positions the caller asked for (from_index == 0 rewrites everything,
-        // a higher value overwrites the tail), then trim stale trailing rows.
-        let overwrite_upto = from_index.min(values_json.len());
-        for (offset, json) in values_json.iter().enumerate() {
-            if offset < overwrite_upto || offset >= from_index {
-                items.insert(offset as i64, json.clone());
-            }
+        // Only the tail is written: `from_index` is where the unchanged prefix ends, so this
+        // models the real backend's `INSERT ... skip(from_index)` faithfully. Rewriting the
+        // prefix as well would hide append bugs (an append must never touch earlier slots).
+        for (offset, json) in values_json.iter().enumerate().skip(from_index) {
+            items.insert(offset as i64, json.clone());
         }
         // Trim stale trailing rows so shrinking removes them.
         let total = values_json.len() as i64;
@@ -458,6 +540,32 @@ impl StateBackend for InMemoryStateBackend {
             items.remove(&idx);
         }
         Ok(())
+    }
+
+    /// Atomic stand-in for the driver's transaction: the row writes and the hash write
+    /// either both land, or the rows are restored to what they were before the call.
+    fn save_list_and_hash(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+        values_json: &[String],
+        from_index: usize,
+        hash_key: &str,
+        hash: &str,
+    ) -> MysqlResult<()> {
+        let key = Self::key(user_id, session_id);
+        let snapshot = self.rows.lock().unwrap().get(&key).cloned();
+        self.save_list(user_id, session_id, state_key, values_json, from_index)?;
+        if self.fail_hash_write.load(Ordering::SeqCst) {
+            let mut rows = self.rows.lock().unwrap();
+            match snapshot {
+                Some(session) => rows.insert(key, session),
+                None => rows.remove(&key),
+            };
+            return Err(MysqlError::Sql("hash row write failed".to_string()));
+        }
+        self.save_single(user_id, session_id, hash_key, hash)
     }
 
     fn get_list(
@@ -480,7 +588,14 @@ impl StateBackend for InMemoryStateBackend {
         session_id: &str,
         state_key: &str,
     ) -> MysqlResult<usize> {
-        Ok(self.get_list(user_id, session_id, state_key)?.len())
+        // Java `getListCount`: `MAX(item_index) + 1` (the next free slot), not the row count.
+        let rows = self.rows.lock().unwrap();
+        let next = rows
+            .get(&Self::key(user_id, session_id))
+            .and_then(|s| s.get(state_key))
+            .and_then(|items| items.keys().next_back().map(|i| i + 1))
+            .unwrap_or(0);
+        Ok(next.max(0) as usize)
     }
 
     fn exists(&self, user_id: Option<&str>, session_id: &str) -> MysqlResult<bool> {
@@ -516,6 +631,7 @@ impl StateBackend for InMemoryStateBackend {
         session_id: &str,
         state_key: &str,
     ) -> MysqlResult<i64> {
+        self.read_version_calls.fetch_add(1, Ordering::SeqCst);
         let versions = self.versions.lock().unwrap();
         Ok(versions
             .get(&Self::key(user_id, session_id))
@@ -668,6 +784,40 @@ impl StateBackend for StaleVersionBackend {
         _state_key: &str,
     ) -> MysqlResult<i64> {
         Ok(0)
+    }
+
+    /// Delegated, not the trait default: the wrapper's stale `read_version` must not leak
+    /// into the atomic read (which is precisely the read-then-write pair it stands in for).
+    fn get_single_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+    ) -> MysqlResult<Option<(String, i64)>> {
+        self.inner
+            .get_single_versioned(user_id, session_id, state_key)
+    }
+
+    /// Delegated so the in-memory rollback semantics survive the wrapper.
+    fn save_list_and_hash(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+        values_json: &[String],
+        from_index: usize,
+        hash_key: &str,
+        hash: &str,
+    ) -> MysqlResult<()> {
+        self.inner.save_list_and_hash(
+            user_id,
+            session_id,
+            state_key,
+            values_json,
+            from_index,
+            hash_key,
+            hash,
+        )
     }
 }
 

@@ -90,12 +90,32 @@ impl MysqlDistributedStore {
     /// unreachable server) instead of handing back a half-configured bundle.
     #[cfg(feature = "mysql_async")]
     pub fn connect(url: &str) -> MysqlResult<Self> {
-        let backend = crate::MysqlAsyncBackend::connect(url)?;
+        Self::connect_with_config(url, crate::MysqlAsyncConfig::default())
+    }
+
+    /// Connects the whole bundle to `url` with explicit table names.
+    ///
+    /// This is what makes [`crate::MysqlAsyncConfig`] authoritative: `state_table`,
+    /// `store_table` and `snapshot_table` are handed to the components that actually emit
+    /// the statements (and `database` to the session-state store), so the table a write
+    /// lands in is the table that was configured — previously the config only reached the
+    /// driver adapter's own bookkeeping while the components kept their defaults.
+    #[cfg(feature = "mysql_async")]
+    pub fn connect_with_config(
+        url: &str,
+        config: crate::MysqlAsyncConfig,
+    ) -> MysqlResult<Self> {
+        let backend = crate::MysqlAsyncBackend::connect_with_config(url, config.clone())?;
         let state: Arc<dyn StateBackend> = backend.clone();
         let sql: Arc<dyn SqlBackend> = backend.clone();
         let snapshot: Arc<dyn SnapshotBackend> = backend.clone();
         let lock: Arc<dyn LockBackend> = backend;
-        Self::builder(state, sql, snapshot, lock).try_build()
+        Self::builder(state, sql, snapshot, lock)
+            .state_database_name(config.database)
+            .state_table_name(config.state_table)
+            .store_table_name(config.store_table)
+            .snapshot_table_name(config.snapshot_table)
+            .try_build()
     }
 
     /// Without the `mysql_async` feature there is no driver to build the bundle over, so this
@@ -160,6 +180,8 @@ pub struct MysqlDistributedStoreBuilder {
     sql_backend: Arc<dyn SqlBackend>,
     snapshot_backend: Arc<dyn SnapshotBackend>,
     lock_backend: Arc<dyn LockBackend>,
+    state_database_name: String,
+    state_table_name: String,
     store_table_name: String,
     snapshot_table_name: String,
     lock_key_prefix: String,
@@ -179,6 +201,8 @@ impl MysqlDistributedStoreBuilder {
             sql_backend,
             snapshot_backend,
             lock_backend,
+            state_database_name: crate::state::DEFAULT_DATABASE_NAME.to_string(),
+            state_table_name: crate::state::DEFAULT_TABLE_NAME.to_string(),
             store_table_name: crate::store::DEFAULT_STORE_TABLE.to_string(),
             snapshot_table_name: crate::snapshot::DEFAULT_SNAPSHOT_TABLE.to_string(),
             lock_key_prefix: crate::guard::DEFAULT_KEY_PREFIX.to_string(),
@@ -190,6 +214,19 @@ impl MysqlDistributedStoreBuilder {
     /// Overrides the workspace KV table name.
     pub fn store_table_name(mut self, name: impl Into<String>) -> Self {
         self.store_table_name = name.into();
+        self
+    }
+
+    /// Overrides the session-state database (default:
+    /// [`crate::DEFAULT_DATABASE_NAME`]).
+    pub fn state_database_name(mut self, name: impl Into<String>) -> Self {
+        self.state_database_name = name.into();
+        self
+    }
+
+    /// Overrides the session-state table (default: [`crate::DEFAULT_TABLE_NAME`]).
+    pub fn state_table_name(mut self, name: impl Into<String>) -> Self {
+        self.state_table_name = name.into();
         self
     }
 
@@ -235,8 +272,15 @@ impl MysqlDistributedStoreBuilder {
     /// state store is rebuilt without auto-creation — but the downgrade is now logged and
     /// the second attempt's error is returned (never swallowed).
     pub fn try_build(self) -> MysqlResult<MysqlDistributedStore> {
+        let database = Some(self.state_database_name.as_str());
+        let table = Some(self.state_table_name.as_str());
         let agent_state_store = if self.initialize_schema {
-            match MysqlAgentStateStore::with_config(self.state_backend.clone(), None, None, true) {
+            match MysqlAgentStateStore::with_config(
+                self.state_backend.clone(),
+                database,
+                table,
+                true,
+            ) {
                 Ok(store) => store,
                 Err(bootstrap_error) => {
                     tracing::warn!(
@@ -245,14 +289,14 @@ impl MysqlDistributedStoreBuilder {
                     );
                     MysqlAgentStateStore::with_config(
                         self.state_backend.clone(),
-                        None,
-                        None,
+                        database,
+                        table,
                         false,
                     )?
                 }
             }
         } else {
-            MysqlAgentStateStore::with_config(self.state_backend.clone(), None, None, false)?
+            MysqlAgentStateStore::with_config(self.state_backend.clone(), database, table, false)?
         };
 
         let base_store = MysqlStore::builder(self.sql_backend.clone())
@@ -382,6 +426,40 @@ mod tests {
         let guard = b.sandbox_execution_guard();
         let key = agentscope_harness::agent::sandbox::SandboxIsolationKey::new("User", "u");
         assert_eq!(guard.compose_lock_name(&key), "app:lock:user:u");
+    }
+
+    /// MYSQL-11: the configured table names must be the ones the components actually use.
+    /// `MysqlAsyncConfig::store_table` / `snapshot_table` used to be validated and then
+    /// ignored, while the components kept their own defaults (and live integration tests
+    /// dropped the configured tables, so a mismatch looked like a passing test).
+    #[test]
+    fn configured_table_names_reach_the_components() {
+        let snapshot_backend = Arc::new(InMemorySnapshotBackend::default());
+        let b = MysqlDistributedStore::builder(
+            Arc::new(InMemoryStateBackend::default()),
+            Arc::new(InMemorySqlBackend::default()),
+            snapshot_backend.clone(),
+            Arc::new(InMemoryLockBackend::default()),
+        )
+        .state_database_name("agentscope-prod")
+        .state_table_name("sessions-prod")
+        .store_table_name("store-prod")
+        .snapshot_table_name("snaps-prod")
+        .build();
+
+        assert_eq!(b.agent_state_store().database_name(), "agentscope-prod");
+        assert_eq!(b.agent_state_store().table_name(), "sessions-prod");
+        assert_eq!(b.base_store().table_name(), "store-prod");
+        // The snapshot DDL is issued for that table and quotes it (it contains `-`).
+        let ddl = snapshot_backend
+            .ddl_log()
+            .first()
+            .cloned()
+            .expect("the spec bootstraps its table");
+        assert!(
+            ddl.contains("`snaps-prod`"),
+            "snapshot DDL must target the configured table: {ddl}"
+        );
     }
 
     #[allow(dead_code)]

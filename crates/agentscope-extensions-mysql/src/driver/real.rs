@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use agentscope_core::error::{Error as CoreError, Result as CoreResult};
 use mysql_async::prelude::Queryable;
-use mysql_async::{Opts, Params, Pool, Value};
+use mysql_async::{Opts, Params, Pool, TxOpts, Value};
 use tokio::runtime::Runtime;
 
 use super::MysqlAsyncConfig;
@@ -123,12 +123,113 @@ impl MysqlAsyncBackend {
     fn state_table(&self) -> String {
         format!("`{}`.`{}`", self.config.database, self.config.state_table)
     }
+
+    /// Writes the list slice, trims rows past the new end and (optionally) the
+    /// `{key}:hash` companion row in **one transaction**.
+    ///
+    /// Java `MysqlAgentStateStore#executeInWriteTransaction` wraps `save(list)` the same
+    /// way. Without it a failure between the row upsert and the hash write left the rows and
+    /// the hash disagreeing: the next write then either skipped a needed rewrite (hash says
+    /// "unchanged") or rewrote every row, and readers saw a half-applied list in between.
+    ///
+    /// `hash == None` is the plain [`StateBackend::save_list`] path (still one transaction
+    /// for the row upsert + trim pair).
+    fn write_list(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+        values_json: &[String],
+        from_index: usize,
+        hash: Option<(&str, &str)>,
+    ) -> MysqlResult<()> {
+        let table = self.state_table();
+        let sid = self.session_key(user_id, session_id);
+        let start = from_index.min(values_json.len());
+        let mut conn = self.conn()?;
+
+        self.block_on(async {
+            let mut tx = conn.start_transaction(TxOpts::default()).await?;
+            let result: mysql_async::Result<()> = async {
+                if start < values_json.len() {
+                    // One multi-row upsert for the written slice: `from_index == 0` rewrites
+                    // the whole list, a higher value only touches the appended tail.
+                    let mut tuples: Vec<&str> = Vec::with_capacity(values_json.len() - start);
+                    let mut params: Vec<Value> =
+                        Vec::with_capacity((values_json.len() - start) * 4);
+                    for (index, json) in values_json.iter().enumerate().skip(start) {
+                        tuples.push("(?, ?, ?, ?, 1)");
+                        params.push(Value::from(sid.clone()));
+                        params.push(Value::from(state_key.to_string()));
+                        params.push(Value::from(index as i64));
+                        params.push(Value::from(json.clone()));
+                    }
+                    let sql = format!(
+                        "INSERT INTO {table} (session_id, state_key, item_index, state_data, version) \
+                         VALUES {} ON DUPLICATE KEY UPDATE state_data = VALUES(state_data)",
+                        tuples.join(", ")
+                    );
+                    tx.exec_drop(&sql, Params::Positional(params)).await?;
+                }
+
+                // Drop rows past the new end so shrinking a list removes stale items.
+                let trim = format!(
+                    "DELETE FROM {table} WHERE session_id = ? AND state_key = ? \
+                     AND item_index >= ?"
+                );
+                tx.exec_drop(
+                    &trim,
+                    (
+                        sid.clone(),
+                        state_key.to_string(),
+                        values_json.len() as i64,
+                    ),
+                )
+                .await?;
+
+                if let Some((hash_key, hash)) = hash {
+                    // `save_single`'s statement, inline because it must run on this
+                    // transaction's connection.
+                    let hash_sql = format!(
+                        "INSERT INTO {table} (session_id, state_key, item_index, state_data) \
+                         VALUES (?, ?, 0, ?) \
+                         ON DUPLICATE KEY UPDATE state_data = VALUES(state_data)"
+                    );
+                    tx.exec_drop(
+                        &hash_sql,
+                        (sid.clone(), hash_key.to_string(), hash.to_string()),
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => tx.commit().await,
+                Err(e) => {
+                    // Explicit rollback: dropping the transaction only defers it to the
+                    // next use of the connection, and this one goes back to the pool.
+                    let _ = tx.rollback().await;
+                    Err(e)
+                }
+            }
+        })
+        .map_err(driver_error)
+    }
 }
 
-/// Maps a driver error, preserving the server message so
-/// [`MysqlError::is_duplicate_key`] can recognise error 1062.
+/// Maps a driver error, keeping the server's error code and SQLSTATE so
+/// [`MysqlError::is_duplicate_key`] classifies on structure instead of message text.
 fn driver_error(e: mysql_async::Error) -> MysqlError {
-    MysqlError::Sql(e.to_string())
+    match e {
+        mysql_async::Error::Server(server) => MysqlError::Server {
+            code: server.code,
+            sql_state: (!server.state.is_empty()).then_some(server.state),
+            message: server.message,
+        },
+        other => MysqlError::Sql(other.to_string()),
+    }
 }
 
 /// Maps a driver error onto the core error type used by [`SnapshotBackend`].
@@ -333,6 +434,29 @@ impl StateBackend for MysqlAsyncBackend {
         .map_err(driver_error)
     }
 
+    fn get_single_versioned(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+    ) -> MysqlResult<Option<(String, i64)>> {
+        // Java `getVersioned`: one `SELECT state_data, version`, so the pair always comes
+        // from the same row version (two statements could interleave with a concurrent
+        // write and return a value from one version next to the number of another).
+        let sql = format!(
+            "SELECT state_data, version FROM {} \
+             WHERE session_id = ? AND state_key = ? AND item_index = 0",
+            self.state_table()
+        );
+        let sid = self.session_key(user_id, session_id);
+        let mut conn = self.conn()?;
+        self.block_on(async {
+            conn.exec_first::<(String, i64), _, _>(&sql, (sid, state_key.to_string()))
+                .await
+        })
+        .map_err(driver_error)
+    }
+
     fn save_list(
         &self,
         user_id: Option<&str>,
@@ -341,44 +465,34 @@ impl StateBackend for MysqlAsyncBackend {
         values_json: &[String],
         from_index: usize,
     ) -> MysqlResult<()> {
-        let table = self.state_table();
-        let sid = self.session_key(user_id, session_id);
-        let start = from_index.min(values_json.len());
-        let mut conn = self.conn()?;
+        self.write_list(
+            user_id,
+            session_id,
+            state_key,
+            values_json,
+            from_index,
+            None,
+        )
+    }
 
-        if start < values_json.len() {
-            // One multi-row upsert for the written slice: `from_index == 0` rewrites the
-            // whole list, a higher value only touches the appended tail.
-            let mut tuples: Vec<&str> = Vec::with_capacity(values_json.len() - start);
-            let mut params: Vec<Value> = Vec::with_capacity((values_json.len() - start) * 4);
-            for (index, json) in values_json.iter().enumerate().skip(start) {
-                tuples.push("(?, ?, ?, ?, 1)");
-                params.push(Value::from(sid.clone()));
-                params.push(Value::from(state_key.to_string()));
-                params.push(Value::from(index as i64));
-                params.push(Value::from(json.clone()));
-            }
-            let sql = format!(
-                "INSERT INTO {table} (session_id, state_key, item_index, state_data, version) \
-                 VALUES {} ON DUPLICATE KEY UPDATE state_data = VALUES(state_data)",
-                tuples.join(", ")
-            );
-            self.block_on(async {
-                conn.exec_drop(&sql, Params::Positional(params)).await
-            })
-            .map_err(driver_error)?;
-        }
-
-        // Drop rows past the new end so shrinking a list removes stale items.
-        let trim = format!(
-            "DELETE FROM {table} WHERE session_id = ? AND state_key = ? AND item_index >= ?"
-        );
-        let total = values_json.len() as i64;
-        self.block_on(async {
-            conn.exec_drop(&trim, (sid, state_key.to_string(), total))
-                .await
-        })
-        .map_err(driver_error)
+    fn save_list_and_hash(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+        values_json: &[String],
+        from_index: usize,
+        hash_key: &str,
+        hash: &str,
+    ) -> MysqlResult<()> {
+        self.write_list(
+            user_id,
+            session_id,
+            state_key,
+            values_json,
+            from_index,
+            Some((hash_key, hash)),
+        )
     }
 
     fn get_list(
@@ -407,20 +521,25 @@ impl StateBackend for MysqlAsyncBackend {
         session_id: &str,
         state_key: &str,
     ) -> MysqlResult<usize> {
+        // Java `getListCount`: `SELECT MAX(item_index)` (`wasNull` → 0) + 1, i.e. the next
+        // free slot — **not** `COUNT(*)`. The two differ once the index range has a hole,
+        // and a `COUNT(*)`-derived append index lands inside the existing range, where it
+        // overwrites a different logical item.
         let sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE session_id = ? AND state_key = ?",
+            "SELECT COALESCE(MAX(item_index) + 1, 0) FROM {} \
+             WHERE session_id = ? AND state_key = ?",
             self.state_table()
         );
         let sid = self.session_key(user_id, session_id);
         let mut conn = self.conn()?;
-        let count = self
+        let next = self
             .block_on(async {
                 conn.exec_first::<i64, _, _>(&sql, (sid, state_key.to_string()))
                     .await
             })
             .map_err(driver_error)?
             .unwrap_or(0);
-        Ok(count.max(0) as usize)
+        Ok(next.max(0) as usize)
     }
 
     fn exists(&self, user_id: Option<&str>, session_id: &str) -> MysqlResult<bool> {
@@ -610,11 +729,7 @@ impl SnapshotBackend for MysqlAsyncBackend {
     }
 
     fn upload(&self, table: &str, snapshot_id: &str, data: &[u8]) -> CoreResult<()> {
-        let sql = format!(
-            "INSERT INTO {} (snapshot_id, data) VALUES (?, ?) \
-             ON DUPLICATE KEY UPDATE data = VALUES(data)",
-            table
-        );
+        let sql = crate::snapshot::snapshot_upload_sql(table);
         let mut conn = self.conn().map_err(|e| CoreError::Tool(e.to_string()))?;
         self.block_on(async {
             conn.exec_drop(&sql, (snapshot_id.to_string(), data.to_vec()))
@@ -624,7 +739,10 @@ impl SnapshotBackend for MysqlAsyncBackend {
     }
 
     fn download(&self, table: &str, snapshot_id: &str) -> CoreResult<Vec<u8>> {
-        let sql = format!("SELECT data FROM {table} WHERE snapshot_id = ?");
+        let sql = format!(
+            "SELECT data FROM {} WHERE snapshot_id = ?",
+            crate::identifier::quote_identifier(table)
+        );
         let mut conn = self.conn().map_err(|e| CoreError::Tool(e.to_string()))?;
         self.block_on(async {
             conn.exec_first::<Vec<u8>, _, _>(&sql, (snapshot_id.to_string(),))
@@ -635,7 +753,10 @@ impl SnapshotBackend for MysqlAsyncBackend {
     }
 
     fn exists(&self, table: &str, snapshot_id: &str) -> CoreResult<bool> {
-        let sql = format!("SELECT COUNT(*) FROM {table} WHERE snapshot_id = ?");
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE snapshot_id = ?",
+            crate::identifier::quote_identifier(table)
+        );
         let mut conn = self.conn().map_err(|e| CoreError::Tool(e.to_string()))?;
         let count = self
             .block_on(async {
