@@ -25,6 +25,8 @@
 | 迁移波次 | core-adjacent（非 extensions 波次）；ACP 独立为 `crates/agentscope-extensions-acp` |
 | 当前状态 | **主体已迁移、生产可用**；复核发现的 2 处「文件已落盘但未接线」（HARNESS-04/05）与 HARNESS-01/09 装配缺口已于 2026-10-31 完成接线并补真实 `build()` 回归；原 1 处 **P0 待裁定**（HARNESS-15）已去重退役，执行归 acp crate 的 `ACP-01`，本 crate P0 归零 |
 
+> **2026-11-02 Java 提交批次（`0714868cc..HEAD`，10 个提交）**：逐条见 §3.5.3。实际改码：`HARNESS-31`（索引前缀字面量匹配）、`HARNESS-32`（`MEMORY.md` 保留最新条目）、`HARNESS-34`（结构化输出准备端到端回归）；`HARNESS-D07/D08` 为「已具备等价实现」并补回归/引用；`HARNESS-33`（子智能体事件 `source` 实例段）**阻塞**——Rust 尚无子智能体事件回灌父流。实测 `cargo test --workspace -j 2 --no-fail-fast` → **179 targets / 6195 passed / 0 failed / 7 ignored / EXITCODE=0**；分项：harness lib **613**、harness `--tests` 43 targets / 873、core lib 464、sandbox lib 257、model lib 468。反向验证 2 项（索引前缀转义、结构化输出派发）。
+
 > 2026-10-31 全量对齐复核：按 Java 包逐包复核完毕（§2），新增缺口/待裁定 17 条（§3.5），差异 8 + 9 条（§4.3）。全量测试数字沿用 `EXTENSIONS_GAP_TRACKER.md` §4.1 实测（workspace 156 targets / 5395 passed / 0 failed / 5 ignored；`agentscope-harness --lib` 519），**本轮未跑 cargo**。
 
 > **2026-11-01 Round 4**：关闭 6 项（HARNESS-07/08/10/11/13/14，逐行见 §3.5.1；新增不迁移条目 D09/D10 与差异 X10）。`cargo build -p agentscope-harness -j 2` EXITCODE=0（无新增 warning），`cargo test -p agentscope-harness --lib -j 2 --no-fail-fast` = **573 passed / 0 failed**（含本批 15 个新用例）+ `--test harness_mcp_bridge_test` 3 passed（含本批 1 个新用例）；反向验证：回退 `PinnedSandboxFilesystem::release()` 的 latch → `pinned_keeps_the_acquired_filesystem_and_rejects_after_release` FAILED → 恢复后绿。同轮修了 core 新增 `ActionObservation.execution_details` 导致的 harness 测试编译错（`agent/verification/mod.rs:239`，非本批功能）。改动仅限 `crates/agentscope-harness/**` + 本 tracker。
@@ -132,6 +134,25 @@
 | HARNESS-28 | 中断恢复（pending tool recovery + 逐迭代 checkpoint） | `ReActAgent.java`（pending recovery）、`middleware/StateCheckpoint*.java` | `middleware/state_checkpoint.rs`、`harness_agent.rs:1301`；`tests/resume_dangling_tool_call_test.rs`、`state_checkpoint_per_iteration_test.rs`、`state_checkpoint_conflict_policy_test.rs` | 已完成 |
 | HARNESS-29 | builder 构建回调：外部 crate 在 `build()` 收尾时拿到代理句柄（Java 用 `bindAgent`，无等价回调） | Java 无对应 | `harness_agent.rs:152` `AgentBuiltCallback`、`:160` `HarnessAgentHandle`、`:1500` `on_agent_built`，回调在 build 尾部调用一次；`tests/harness_agent_built_test.rs::builder_hands_the_finished_agent_to_the_host_callback` | 已完成 |
 | HARNESS-30 | 渠道回执：`Channel`/`ChannelSink` 默认 `deliver_with_receipt` + `DeliveryReceipt`（默认 `Unsupported`，自定义 sink 可返回 provider message id / 原始 JSON） | Java `gateway/Channel.java`（发送返回回执） | `agent/gateway/channel/channel.rs`、`agent/gateway/harness_gateway.rs`、`agent/gateway/{channel/mod,mod}.rs`、`agent/mod.rs`、`lib.rs` re-export；`tests/harness_channel_receipt_test.rs` | 已完成 |
+
+## 4. 项目状态与下一步
+
+### 3.5.3 2026-11-02 Java 提交批次（`0714868cc` 及其后 10 个提交，`0714868cc..HEAD`）
+
+> 来源：用户指定「Java `0714868cc1b15293d9a431fb3d04f6fddeeb151a` 及以后」的迁移批次。core / model / rag 侧见各自 tracker。
+
+| 编号 | Java 提交 | 变更 | Rust 落点 | 状态 / 验证 |
+|---|---|---|---|---|
+| `HARNESS-31` | `4399f75fc` | `WorkspaceIndex` 前缀查询把 `%`/`_` 当 LIKE 元字符，`bot_1` 会误匹配 `bot21`；`has_prefix` 误报还会让 `RemoteFilesystem` 跳过权威扫描 | `agent/workspace/index.rs`：新增 `like_prefix()`（转义 `\`/`%`/`_`，末尾追加 `%`），`list_by_prefix` / `has_prefix` 两条 SQL 加 `ESCAPE '\\'` | 已完成；`cargo test -p agentscope-harness --lib agent::workspace::index` → **7 passed / 0 failed**（含新增 `like_prefix_escapes_like_metacharacters`、`prefix_match_is_literal_not_like_pattern`） |
+| `HARNESS-32` | `6aa84d9d9` | `MEMORY.md` 超预算时保留的是**最旧**的头部，丢掉最新追加的尾部；Java 改为「掐中间、留两端」（尾部 3/4、头部 1/4，退化场景留尾部） | `agent/middleware/workspace_context.rs::truncate_to_token_budget`：新增 `MEMORY_HEAD_SHARE = 4`，按 `chars()` 计算 `kept/head` 并返回「头 + notice + 尾」，`max_chars <= notice` 时返回尾部 | 已完成；`cargo test -p agentscope-harness --lib agent::middleware::workspace_context` → **23 passed / 0 failed**（新增 `truncate_keeps_head_and_tail`、`truncate_budget_below_notice_keeps_tail`、`truncate_is_char_safe_for_multibyte_text`） |
+| `HARNESS-33` | `abf3c35a3` | 子智能体事件 `source` 由 `parentSessionId/agentId` 改为 `parentSessionId/agentId/subagentSessionId`（远程为 `.../taskId`），以便区分同类型多实例；AG-UI 原样透传完整 `source` | **未实现**：Rust 侧 `agent_spawn` / `agent_send` 是后台提交模型，尚无「子智能体事件回灌父事件流」的接线——`rg 'with_source' crates/agentscope-harness/src/agent/subagent` 仅命中 `protocol/codec.rs` 的测试；`core::event::AgentEventEmitter` / `FORWARDING_CONTEXT_KEY` 无任何使用点；远程 SSE 消费 `protocol_client::stream_events` 也无生产调用点（仅自身测试）。因此没有可加实例判别段的位置。AG-UI 侧本就原样透传 `source`（`extensions-agui/src/adapter/strategy/converters.rs`），无需改动 | 待办（P1）：需先实现 subagent 事件回灌（本地子代理同步流 + 远程 SSE 消费→父流），再补 `parentSessionId/agentId/{subagentSessionId\|taskId}` 末段 |
+| `HARNESS-34` | `51a74e2ef` | core 侧结构化输出 fallback 请求改走请求准备（CORE-32），harness 的 `ContextMiddleware`（Java `ModelRequestPreparer` 等价物）因此会首次看到该请求 | `tests/harness_structured_output_preparation_test.rs`：走真实 `HarnessAgent::build()` + `call_with_schema`，验证提醒与 `generate_response` schema 均到达 provider、且注册的 context 材料仍被编译进请求 | 已完成；`cargo test -p agentscope-harness --test harness_structured_output_preparation_test` → **1 passed / 0 failed** |
+| `HARNESS-D07` | `e190a8d1b` | 沙箱 `write()` 用 `"$(dirname ...)"` 组命令，Windows 宿主 docker CLI 会吞掉该参数 | 无代码改动：Rust 侧父目录在 Rust 计算后 `shell_quote` 传入，命令里没有 `$(...)` 也没有双引号（`extensions-sandbox/src/fs_spec.rs::write/move_path`、`agent/sandbox/docker.rs:205-228`、`extensions-sandbox/src/workspace.rs::build_workspace_setup_script`） | 设计决定（不迁移）+ 已补回归：`extensions-sandbox/src/fs_spec.rs` 新增 `adapter_write_creates_parent_without_command_substitution`、`adapter_move_creates_parent_without_command_substitution`（断言父目录为单引号字面量、命令无 `$(` 与双引号）；`cargo test -p agentscope-extensions-sandbox --lib command_substitution` → **2 passed / 0 failed** |
+| `HARNESS-D08` | `ac59f61e7` | `timeoutManaged` 工具开关 + force-sync 覆盖不再被 600s 截断 | 无 | 设计决定（不迁移）：等价开关 `Tool::is_long_running()` 已存在（见 CORE-D16），且 Rust `agent_spawn`/`agent_send` 不阻塞父回合，不存在该缺陷；该开关语义已由 core `tool/executor.rs` 的 `long_running_tool_skips_the_execution_timeout` / `regular_tool_is_still_cut_by_the_execution_timeout` 覆盖，阻塞型等待工具（`task_output`、`wait_async_results`）均已声明 `is_long_running() -> true` |
+
+**本轮附带修复（非 Java 迁移项，必须记录）**：
+1. `agent/workspace/index.rs` 的 `#[cfg(all(test, feature = "rusqlite"))] mod tests` 原本嵌在 `walk_files` 内部 `rec` 函数体里，**测试从未被执行**（`cargo test -- --list` 零命中，且编译报 dead-code）。已移到文件末尾，模块路径变为 `agent::workspace::index::tests::*`。
+2. 移出后暴露出 `rebuild_from_disk` 的 Windows 真实缺陷：`workspace_root.canonicalize()` 返回 `\\?\C:\...` 而 `walk_files` 用的是未规范化的 `dir`，`strip_prefix` 永不命中 → 相对路径退化为绝对路径 → 全部被判为非索引路径。已改为「规范化一次 + 用规范化根拼目录」。
 
 ## 4. 项目状态与下一步
 

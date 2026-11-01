@@ -24,6 +24,8 @@
 | 迁移波次 | 基础底座（无波次编号，早于 extensions 波次 A/B/C） |
 | 当前状态 | 主干可用：agent 循环 / 消息 / 事件 / 工具 / 状态 / 会话日志 / 权限 / 中断 / 关停均已落地；§3.5.1 的 P0/P1/P2 缺口已于 2026-11-01 清零（CORE-10 / CORE-12 已由 harness Round 5 落地，见 §4.2） |
 
+> **2026-11-02 Java 提交批次（`0714868cc..HEAD`，10 个提交）**：逐条见 §3.5.4。实际改码：`CORE-31`（`DocumentBlock` + `FileIdSource`）、`CORE-32`（结构化输出 fallback 请求改走中间件链准备，修正此前误记为「已满足、无代码改动」）。实测 `cargo test --workspace -j 2 --no-fail-fast` → **179 targets / 6195 passed / 0 failed / 7 ignored / EXITCODE=0**（无 `failures:` 段）；分项：core lib **464**、harness lib 613、harness `--tests` 43 targets / 873、sandbox lib 257、model lib 468。反向验证 2 项：`like_prefix` 去 `_` 转义 → 2 条 FAILED；fallback 派发改回直连 `model_call_impl` → 3 条 FAILED；均恢复后绿。
+
 > **2026-10-31 全量对齐复核**：按 Java 22 个包逐包核对，新增 §3.5（缺口 CORE-01..14，已对齐抽样 CORE-15..26）与 §4.3（`CORE-D01..D14` / `CORE-X01..X08`）。历史上曾被记录为缺口的两项已确认关闭：`Middleware::on_acting` 零调用（现 `wrap_acting` 已接线，CORE-16）、`GracefulShutdownManager` 无 `bind_state_saver`（现已存在并接线，CORE-17）。
 > **2026-11-01 Round 6（CORE+HARNESS 路）**：**真闭合 CORE-09**——此前 `RequirementProposeTool` 虽已落盘（Round 5）但全仓无开关、无注册点（工具永远装不上），本轮按 Java `ReActAgent.Builder.enableTaskRequirements` 加 `task_requirements_enabled`（默认 `false`）+ `build()` 条件注册，并由 harness `HarnessAgentBuilder::task_requirements(bool)` 透传；新增 3 条 core 单测 + 1 条 harness 用例。实测 `cargo build -p agentscope-core -j 2` / `-p agentscope-harness -j 2` → EXITCODE=0（warning 条数未变：core 2、harness 5）；`cargo test -p agentscope-core -j 2 --no-fail-fast` → 14 targets / **546 passed / 0 failed / 3 ignored / EXITCODE=0**；`cargo test -p agentscope-harness --lib -j 2 --no-fail-fast` → **603 passed / 0 failed / EXITCODE=0**。
 > **2026-11-01 Round 5（CORE-2 路）**：关闭 CORE-08（v1 legacy 迁移入口）、CORE-09（`task_requirement_propose`），新增 CORE-29（流式 `ReasoningContext` 保留 thinking metadata，修 MODEL §4.2-15 报的真实缺陷）与 CORE-30（工具可读会话历史的 runtime seam，解锁 RAG-03 保真度），新增 17 条单测。实测 `cargo build -p agentscope-core -j 2` → EXITCODE=0（仅 2 条既有死代码 warning）；`cargo test -p agentscope-core -j 2 --no-fail-fast` → 14 targets / **543 passed / 0 failed / 3 ignored / EXITCODE=0**；`cargo build -p agentscope-harness -j 2` → EXITCODE=0（`ToolExecutionContext` 未加字段，12 处字面量构造不受影响）。**§3.5.1 内 P0/P1/P2 全清零**，剩余仅 CORE-10 / CORE-12（归 harness，§4.2）。
@@ -145,6 +147,17 @@
 | `CORE-13` | `Memory` trait `#[deprecated]` 兼容层 | 保留全部实现/测试，仅标弃用 | `memory/mod.rs:18` | `memory_save_load_round_trip`（未改，仅加 `#[allow(deprecated)]`） |
 
 - 下游接入点：`JDBC`/`COS`/`REDIS`/`MYSQL`/`PG`/`MONGO` 将 `save`/`get` 路径改走 `try_*`；`MODEL` 把两个既有 inherent `tool_search_mode()` 改为 trait 覆写；`STUDIO` 在 `on_format` 内包 `call_format`；`ACP` 改用 `SessionLogStore::delete` 并删 sidecar。
+
+### 3.5.4 2026-11-02 Java 提交批次（`0714868cc` 及其后 10 个提交，`0714868cc..HEAD`）
+
+> 来源：用户指定「Java `0714868cc1b15293d9a431fb3d04f6fddeeb151a` 及以后」的迁移批次。本节只登记落在 core 的项；harness / model / rag / protocol 侧见各自 tracker。
+
+| 项 | Java 提交 | 变更 | Rust 落点 | 状态 / 验证 |
+|---|---|---|---|---|
+| `CORE-31` | `6ee804457` | `DocumentBlock`（`"document"`）+ `FileIdSource`（`"file_id"`）进入 `ContentBlock` / `Source` 子类型表；`USER` 允许 document，`SYSTEM` 仍只允许 text | `message/source.rs`（`Source::FileId` + `FileIdSource`/builder）、`message/block.rs`（`ContentBlock::Document` + `DocumentBlock`/builder，`mime_type`/`size_bytes` 走 Java 属性名）、`message/msg.rs`（角色校验 + `ContentBlockKind::Document`）、`lib.rs` 根导出 | 已完成；测试 `document_block_serializes_file_id_source`、`document_block_roundtrips_and_generates_id_when_absent`、`user_message_accepts_document_block_but_system_does_not` |
+| `CORE-D15` | `6ee804457` | `DataBlockStartEvent` 新增 `mediaType` 字段 | 无 | 设计决定（不迁移）：Rust `AgentEvent::DataBlockStart` 携带通用 `EventData.fields`，且全仓**无该事件的发射点**（`rg 'DataBlockStart'` 仅命中枚举/构造函数），无需新增具名字段 |
+| `CORE-32` | `51a74e2ef` | 结构化输出提醒 + `generate_response` schema 必须在**最终请求准备之前**组装，否则预算检查看到的是不完整请求；提醒 request-local 且带 `SYNTHETIC`/`reminderKind` 标记 | `agent/react_agent.rs`：新增 `model_call_through_chain()`；`call_fallback_structured` 不再直连 `model_call_impl`，而是把「已追加提醒 + 已注册 `generate_response` 工具」的 `ModelCallInput` 交给 `MiddlewareChain::wrap_model_call`（harness `ContextMiddleware` 即 Java `ModelRequestPreparer` 的等价物），并使用准备后返回的 messages/tools/options；`structured_output_reminder` 增补 `REMINDER_KIND = "structured_output"` 元数据 | 已完成（**修正此前误记为「已满足、无代码改动」**：旧实现整条 fallback 路径绕过中间件链，请求从未进入准备环节）。core 单测 `structured_output_request_is_prepared_with_reminder_and_schema`、`structured_output_uses_the_prepared_request`、`structured_output_propagates_preparation_rejection`；harness 端到端见 HARNESS-34。反向验证：把派发改回直连 `model_call_impl` → 3 条用例 FAILED → 恢复后绿 |
+| `CORE-D16` | `ac59f61e7` | 新增 `@Tool(timeoutManaged)` / `AgentTool.isTimeoutManaged()`，让 `agent_spawn` / `agent_send` 绕过普通工具超时 | 等价机制已存在：`Tool::is_long_running()`（`tool/tool.rs:122`）在 `tool/executor.rs:186` 跳过执行超时；Rust `agent_spawn`/`agent_send` 为**后台非阻塞**（提交即返回 task_id，无 force-sync 等待），不存在 Java 那个「普通超时截断同步委派」缺陷 | 设计决定（不迁移）：语义已由 `is_long_running` 覆盖，新增 `timeout_managed` 会与既有开关重复 |
 
 ## 4. 项目状态与下一步
 

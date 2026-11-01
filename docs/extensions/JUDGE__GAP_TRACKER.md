@@ -173,6 +173,12 @@
 | JUDGE-11 | 上下文与评测：`CompactionTranscript`、`JevContextCompactor`、`FileJevContextArchive`、`StoreJevContextArchive`；trace/metrics/runner/evaluator/text backend/capture | `jev/context/{CompactionTranscript,JevContextCompactor,FileJevContextArchive,StoreJevContextArchive}.java`；`jev/evaluation/{JevTraceMetrics,JevTraceRunner,JevTraceEvaluator,JevTextBackend}.java` | `src/jev/context/transcript.rs:55`、`compactor.rs:174`、`file_archive.rs:23`、`src/jev/runtime/archive.rs:49`、`src/jev/evaluation/{trace.rs:149,metrics.rs:648 agent_metrics,evaluator.rs:129,runner.rs:187,evaluation_runner.rs:195,text_backend.rs:57,capture.rs:180}`；测试 `save_then_restore_round_trips_and_is_content_addressed`、`a_store_without_create_if_absent_support_is_rejected` | 已完成 |
 | JUDGE-12 | `application` 10 类 + `evidence`/`integration` + 宿主装配（三工具、四中间件、归档、集成测试） | `jev/application/{JevBrowserPlanner,JevCandidateSelector,JevContextPlanner,JevCustomerSupport,JevDraftPipeline,JevMemoryGate,JevRag,JevSupervisor,JevTeamPlanner}.java`；`evidence/{JevEvidenceProcessor,JevEvidenceTool}.java`；`integration/{JevKnowledge,JevKnowledgeTool,JevResponseMiddleware}.java` | `src/jev/application/planners.rs:98/243/322/407/575/677/778`、`selector.rs:38`、`draft_pipeline.rs:68`、`evidence/processor.rs:270`、`integration/knowledge.rs:59`、`runtime/tools.rs:496 register_jev_tools`、`runtime/middleware.rs:205 TraceEvaluationMiddleware`/`:319 ResponseMiddleware`/`:564 SupervisionMiddleware`/`:759 PhaseRoutingMiddleware`；测试 `register_jev_tools_wires_every_configured_tool`、`the_screening_request_matches_the_java_shape`、`response_middleware_off_passes_through_and_enforce_withholds` | 已完成 |
 
+### 3.5.3 2026-11-02 Java 提交批次（`0714868cc` 及其后 10 个提交，`0714868cc..HEAD`）
+
+| 编号 | Java 提交 | 变更 | Rust 落点 | 状态 / 验证 |
+|---|---|---|---|---|
+| `JUDGE-D13` | `f911c0c7e` | 依赖升级 `com.openai:openai-java` 4.88.0 → 4.94.0；`OpenAIDecisionsClient` 跟随新 SDK 改为 `inputOfDecisionInputItems(List.of(DecisionInputItem.ofDecisionInputMessage(DecisionInputMessage.ofUser(...))))`（**wire 形态不变**，仅 SDK 构建器层级变了） | 无代码改动：`src/openai_decisions/protocol.rs` 手写 wire DTO，`input` 已是 `[{"role":"user","content":[{"type":"input_text",...}]}]`，与 Java 新 SDK 的生成体一致 | 设计决定（不迁移）：Rust 不依赖 openai-java；同批次的依赖影响另见 `MODEL__GAP_TRACKER.md` §3.6 的 `MODEL-D10` |
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

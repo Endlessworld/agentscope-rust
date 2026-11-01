@@ -307,6 +307,14 @@ cargo test  -p agentscope-extensions-rag -j 2 --no-fail-fast --features pdf,docx
 | RAG-20 | 分块算法与默认值：`CHARACTER`/`PARAGRAPH`/`TOKEN`（4 字符≈1 token）/`SEMANTIC`（回退段落），默认 512 / PARAGRAPH / 50，空串返回 `[""]` | `TextChunker.java#chunkText`、`TextReader.java`（L57-60 默认值） | `src/reader.rs:137 chunk_text`、`165 chunk_by_character`、`187 chunk_by_paragraph`、`32 CHARS_PER_TOKEN = 4`；测试 `empty_text_yields_single_empty_chunk`、`character_chunking_applies_overlap`、`token_chunking_uses_four_chars_per_token`、`validation_rejects_bad_parameters` | 已完成 |
 | RAG-21 | `SimpleKnowledge` 用量回调（`5bfb36b44`）：每次 embed 后回调，add 每文档一次、retrieve 查询一次 | `SimpleKnowledge.java#notifyUsage` | `src/simple.rs:46 with_usage_listener`、`67 notify_usage`、`87`（add 循环内回调）、`104`（retrieve 回调）；测试 `simple::tests::usage_listener_receives_add_and_retrieve_usage`、`no_usage_listener_is_a_no_op` | 已完成 |
 
+### 3.5.3 2026-11-02 Java 提交批次（`0714868cc` 及其后 10 个提交，`0714868cc..HEAD`）
+
+| 编号 | Java 提交 | 变更 | Rust 落点 | 状态 / 验证 |
+|---|---|---|---|---|
+| `RAG-D06` | `0714868cc` | `PgVectorStore` 构造时在 `CREATE EXTENSION IF NOT EXISTS vector` **之前**注册 pgvector 类型，导致无扩展库上首个实例的 `add` 全部失败（连接终生不可绑定 vector） | 无 | 设计决定（不迁移）：Rust 侧 `store/pgvector.rs` 先执行 `CREATE_EXTENSION_SQL` 再建表/索引，且**不注册任何客户端类型**（读写走 `embedding::text` 投影 + 文本字面量绑定），Java 的时序缺陷在 Rust 结构上不存在 |
+
+> 同批次其余提交（core 结构化输出 / 子智能体超时 / 文档块 / harness 索引与记忆截断 / SDK 依赖升级）与 RAG 无关，见 `CORE__GAP_TRACKER.md` §3.5.4、`HARNESS__GAP_TRACKER.md` §3.5.3、`MODEL__GAP_TRACKER.md` §3.6。
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

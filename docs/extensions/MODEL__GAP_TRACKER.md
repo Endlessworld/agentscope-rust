@@ -425,6 +425,17 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 
 **2026-10-31 第二轮状态**：**P0 已清零**（MODEL-01、MODEL-02 = 已完成）；MODEL-11 = 已完成；MODEL-09 = 已完成（anthropic / openai / gemini 三侧均剥离，Round 2 收尾）；MODEL-12 阻塞于 core `Model::tool_search_mode()`；MODEL-13 = 设计决定（本轮跳过）。**Round 2 / Wave B 追加关闭 MODEL-03、MODEL-04**。未关闭的 P1 剩 MODEL-05、MODEL-06、MODEL-07、MODEL-08、MODEL-10。
 
+### 3.6 2026-11-02 Java 提交批次（`0714868cc` 及其后 10 个提交，`0714868cc..HEAD`）
+
+> 来源：用户指定「Java `0714868cc1b15293d9a431fb3d04f6fddeeb151a` 及以后」的迁移批次。core 侧见 `CORE__GAP_TRACKER.md` §3.5.4。
+
+| 编号 | Java 提交 | 变更 | Rust 落点 | 状态 / 验证 |
+|---|---|---|---|---|
+| `MODEL-19` | `6ee804457` | DashScope `qwen-long` 文档输入：文档块先发 `{"role":"system","content":"fileid://<id>"}`，且该注入消息不参与自动 `cache_control` 放置；URL/Base64 文档显式报错而非丢弃；非 USER 轮的文档块忽略 | `src/dashscope/converter.rs`：`document_messages()`（仅接受 `Source::FileId` 且 provider 必须为 `dashscope`，错误文案对齐 Java）、`to_dashscope_messages_flagged()`、`apply_automatic_cache_control_excluding()`；`to_dashscope_messages` / `to_dashscope_messages_with_options` / `to_multi_agent_messages` 改为返回 `Result`（`src/dashscope/model.rs` 用 `?` 透传）；多智能体路径在合并前按组发 `fileid://` 系统消息 | 已完成；新增 6 条用例：`document_block_emits_file_id_system_message_before_the_turn`、`document_block_keeps_cache_directives_aligned`、`document_block_on_non_user_turn_is_left_alone`、`document_block_rejects_non_file_id_source`、`document_block_rejects_foreign_provider`、`multi_agent_document_block_emits_file_id_system_message`；`cargo test -p agentscope-extensions-model --lib` → **468 passed / 0 failed** |
+| `MODEL-20` | `6ee804457` | OpenAI / Anthropic 不再静默丢文档块（全文档消息会塌成空内容，Anthropic 直接丢整条消息）：改为告警 + 文本占位 `[Document - not supported by <Provider>: <name\|id>]` | `src/openai/mod.rs::user_message_content`、`src/anthropic/converter.rs::message_content_blocks`；Anthropic `image_source()` 对 file-id 源返回错误 | 已完成（行为对齐 Java；占位文案逐字一致） |
+| `MODEL-D09` | `6ee804457` | 其余 provider 的 `Source` 新增 `file_id` 变体 | `src/gemini`、`src/ollama`、`src/openai_official`、`src/responses`、`src/common/media`、`src/common/multi_agent` 各加显式分支：无内联字节 → `Err`（media resolver / image url）或 `fileid://<id>` 文本引用（纯文本降级路径） | 设计决定：Java 对这些 provider 未做文档支持，Rust 采用「显式降级/报错」而非静默丢弃，属 hardening，不新增能力 |
+| `MODEL-D10` | `f911c0c7e` / `0860005c9` / `f6c9fafe3` | 依赖升级：`com.openai:openai-java` 4.88→4.94、`google-genai` 1.78→1.79、`dashscope-sdk-java` 2.23.3→2.23.4；`OpenAIDecisionsClient` 跟随新 SDK 改用 `inputOfDecisionInputItems` | 无 | 设计决定（不迁移）：Rust 用 async-openai 0.41 / 自建 wire DTO，无 SDK 版本对应；judge crate 的 decisions 请求本就按 `"input": [{"role":"user","content":[{"type":"input_text"...}]}]` 构造（`extensions-judge/src/openai_decisions/protocol.rs:88-113`），与 Java 新形态一致，无需改动 |
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
