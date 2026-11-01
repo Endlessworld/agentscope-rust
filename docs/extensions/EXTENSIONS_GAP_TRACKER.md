@@ -323,6 +323,7 @@
 | RAG | `RAG-01/02/05` | `is_retryable_status` / `execute_with_retry` / `RetryingTransport`（**预算耗尽返回最后一次响应**而非 `Err`，保住 RAGFlow/HayStack 语义）；Dify `topK>=1`、scoreThreshold/weights ∈[0,1]；`limit==0` → `Limit must be positive` | lib 492（`--features pdf,docx` 494） |
 | SANDBOX | `SANDBOX-05/06/07` | exec 默认 cwd=`workspace_root`（k8s 仅在有 cwd 时 `cd <root> && ( cmd )`）；`OUTPUT_TRUNCATE_BYTES=512KiB` + `truncate_utf8_bytes` 码点边界安全；E2B `append_capped` 超限仍消费保 exitCode | 244（227→+9） |
 | CHANNEL | `CHANNEL-N05/N04` | **结构发现**：harness 对 `T: PlatformChannel` 有 `ChannelSink` blanket impl → 平台适配器无法覆写默认方法；新增 `common/receipt.rs` 的 `ReceiptChannel`/`ReceiptSink<C>`、`ChannelRegistry::with_manager_and_receipts`、`build_gateway_registry_with_receipts`，飞书 `delivery_id`→返回 `message_id`；`common::http::ensure_success` 非 2xx → `ChannelError::Remote{status, body≤200}` | 440（426→+14） |
+| ↳ 后续 | Round 3 已删除该适配层 | harness 提供 `PlatformChannel::deliver_with_receipt` 后，`ReceiptSink`/`with_manager_and_receipts`/`build_gateway_registry_with_receipts` 全部移除，改由适配器直接覆写 trait 方法（见 §3.3.7） | 444 |
 | CONTROLPLANE | `CP-05/06/07` | `dispatch_downstream(AsdpEvent)` 接事件泵（`sessionCmd`/`executionAttempt`（cancel 终止）/`conversationTurn`）；`context` adapter 权威、`subagents`/`workspaces` 委托、无 adapter → `Unsupported`；压缩后锁内写回 `state_handle()` + `agent_state_store.save` | lib 183 + 4 e2e |
 | STUDIO | `STUDIO-06/12/13` | export 失败指数退避（`EXPORT_MAX_ATTEMPTS=3`，100ms 起翻倍封顶 5s）；`TelemetryTracing::on_format` + `active_points()` 纳入 `OnFormat`（`format=None` 不出 span）；provider 名优先 core `Model::provider_name()` | 102 lib + 1 集成（96→+7） |
 | SKILLS | `SKILLS-04/05/07` | `sync_lock: Mutex<()>` git 同步单飞 + `clone_count()`；`split_frontmatter` 允许 `---` 尾随空白；MySQL 单次 `execute_batch` + `inserted != len` 报错；顺修 `SKILLS-01` 残留 bug：`SyncBridge` 在 async 上下文 drop 多线程 runtime panic → `Option<Runtime>` + `Drop::shutdown_background` | 128 / 138(pg) / 133(mysql) |
@@ -345,7 +346,7 @@
 2. harness `McpClientManager::call_tool_with_meta` 读 `config.propagate_meta`；`McpToolInfo` 补 `title` / `output_schema`（HIGRESS）。
 3. core `convert_call_tool_result`（`HIGRESS-03/05`）。
 4. `AsdpTransport` 补上行回报方法（CONTROLPLANE `executionAttempt`(ack/start/heartbeat/cancelled) 与 `conversationTurn`；与 `CP-13`「不主动推送」同源）。
-5. harness `PlatformChannel::deliver_with_receipt` 默认方法（CHANNEL `XM1`；落地后可删 `ReceiptSink` 适配层）。
+5. ~~harness `PlatformChannel::deliver_with_receipt` 默认方法（CHANNEL `XM1`；落地后可删 `ReceiptSink` 适配层）~~ **已完成（Round 3，`4676a29` + `ReceiptSink` 已删）**。
 6. `PreparedResponse` 扩响应头（CHANNEL `N04` 限流诊断）。
 7. core `AgentStateStore` 补 `try_save`/`try_save_list`/`try_delete`（JDBC `save`/`save_list`/`delete` 仍只能 warn 降级）。
 8. core 补 `try_get`/`try_list`/`try_exists`/`try_list_session_ids`（REDIS）+ `try_get_list`/`try_save_list`（COS）。
