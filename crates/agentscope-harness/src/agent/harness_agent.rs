@@ -765,6 +765,9 @@ pub struct HarnessAgentBuilder {
     /// Whether a tool rejected by the permission engine ends the turn instead of being fed
     /// back to the model (Java `Builder.stopOnReject`).
     stop_on_reject: Option<bool>,
+    /// Whether the built-in `task_requirement_propose` tool is registered (Java
+    /// `Builder.enableTaskRequirements`).
+    task_requirements_enabled: Option<bool>,
     filesystem: Option<Arc<dyn Filesystem>>,
     /// Filesystem assembled from a spec during `build()`, when the resolved workspace root is
     /// known (Java `Builder.filesystem(LocalFilesystemSpec)` / `(RemoteFilesystemSpec)`).
@@ -914,6 +917,7 @@ impl Default for HarnessAgentBuilder {
             failover_listener: None,
             max_retries: None,
             stop_on_reject: None,
+            task_requirements_enabled: None,
             filesystem: None,
             local_filesystem_spec: None,
             remote_filesystem_spec: None,
@@ -1067,6 +1071,19 @@ impl HarnessAgentBuilder {
     /// (mirrors Java `Builder.stopOnReject`; core default is `false`).
     pub fn stop_on_reject(mut self, stop_on_reject: bool) -> Self {
         self.stop_on_reject = Some(stop_on_reject);
+        self
+    }
+
+    /// Registers the built-in `task_requirement_propose` tool on the embedded agent (mirrors
+    /// Java `Builder.enableTaskRequirements`; core default is `false`).
+    ///
+    /// Java's harness passes `contextSources.taskContext().requirementProposals()`; Rust derives
+    /// the same default from [`Self::task_context`]'s [`TaskContextOptions`], so this knob only
+    /// exists to force the tool on/off independently of that projection.
+    ///
+    /// [`TaskContextOptions`]: crate::agent::context::TaskContextOptions
+    pub fn task_requirements(mut self, enabled: bool) -> Self {
+        self.task_requirements_enabled = Some(enabled);
         self
     }
 
@@ -2692,6 +2709,12 @@ impl HarnessAgentBuilder {
             if let Some(stop) = self.stop_on_reject {
                 agent_builder = agent_builder.stop_on_reject(stop);
             }
+            // Java `inner.enableTaskRequirements(contextSources.taskContext().requirementProposals())`:
+            // the task-context projection decides by default, an explicit knob overrides it.
+            let task_requirements = self.task_requirements_enabled.unwrap_or_else(|| {
+                self.context_sources.task_context().requirement_proposals
+            });
+            agent_builder = agent_builder.task_requirements_enabled(task_requirements);
             // ACP renders file diffs from the tool-result event and never reads them back
             // from history: archiving them would keep a copy of every edited file's old+new
             // text in the context (95% of the measured state) and in every checkpoint.
@@ -3124,6 +3147,55 @@ mod tests {
             .agent()
             .expect("an embedded agent")
             .stop_on_reject());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn task_requirements_reaches_the_embedded_agent() {
+        let root = temp_root("task_requirements");
+        let agent = HarnessAgent::builder()
+            .name("task-requirements-agent")
+            .model(Arc::new(NoopModel))
+            .task_requirements(true)
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .disable_web_tools()
+            .build();
+        assert!(agent
+            .agent()
+            .expect("an embedded agent")
+            .task_requirements_enabled());
+
+        // Unset keeps core's default: no propose tool on the model-callable surface.
+        let default_agent = HarnessAgent::builder()
+            .name("default-agent")
+            .model(Arc::new(NoopModel))
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .disable_web_tools()
+            .build();
+        assert!(!default_agent
+            .agent()
+            .expect("an embedded agent")
+            .task_requirements_enabled());
+
+        // Java parity: the task-context projection decides when the knob is unset.
+        let projected_agent = HarnessAgent::builder()
+            .name("projected-agent")
+            .model(Arc::new(NoopModel))
+            .task_context(
+                crate::agent::context::TaskContextOptions::disabled()
+                    .allow_requirement_proposals(),
+            )
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .disable_web_tools()
+            .build();
+        assert!(projected_agent
+            .agent()
+            .expect("an embedded agent")
+            .task_requirements_enabled());
 
         let _ = std::fs::remove_dir_all(&root);
     }
