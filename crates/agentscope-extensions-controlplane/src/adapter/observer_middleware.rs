@@ -53,6 +53,29 @@ struct TurnState {
     tool_outputs: Mutex<HashMap<String, String>>,
 }
 
+/// Releases a session's `busy` flag when the observed stream ends for any reason.
+///
+/// Java's `doFinally(signal -> markBusy(false))` runs on completion, error, cancel and
+/// dispose; an `AgentEnd`-only reset leaves `busy` true forever when the turn errors out or
+/// the consumer drops the stream. Dropping the guard is what covers the last two.
+struct BusyGuard {
+    reporter: BridgeReporter,
+    session_id: String,
+}
+
+impl BusyGuard {
+    /// The reporter, borrowed so a closure can both use it and keep this guard alive.
+    fn reporter(&self) -> &BridgeReporter {
+        &self.reporter
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.reporter.set_busy(&self.session_id, false);
+    }
+}
+
 /// Middleware that copies conversation activity out to controlplane without touching it.
 #[derive(Clone)]
 pub struct ControlPlaneObserverMiddleware {
@@ -120,10 +143,18 @@ impl Middleware for ControlPlaneObserverMiddleware {
         reporter.set_busy(&session_id, true);
         let turn = Arc::new(TurnState::default());
         let sid = session_id.clone();
+        let guard = BusyGuard {
+            reporter: reporter.clone(),
+            session_id: session_id.clone(),
+        };
         let stream = next(input);
         Box::pin(stream.inspect(move |res| {
-            if let Ok(event) = res {
-                observe(&reporter, &sid, &turn, event);
+            let reporter = guard.reporter();
+            match res {
+                Ok(event) => observe(reporter, &sid, &turn, event),
+                // An errored stream never reaches `AgentEnd`; release the turn now (the
+                // guard would do it on drop, but the consumer may hold the stream).
+                Err(_) => reporter.set_busy(&sid, false),
             }
         }))
     }
@@ -323,6 +354,32 @@ mod tests {
         let items: Vec<_> = stream.collect().await;
         assert_eq!(items.len(), 1);
         assert!(matches!(items[0], Ok(AgentEvent::AgentEnd(_))));
+    }
+
+    /// CP-11: an errored or dropped stream must not leave the session marked busy (Java
+    /// `doFinally(signal -> markBusy(false))`).
+    #[tokio::test]
+    async fn busy_is_released_when_the_stream_ends_without_agent_end() {
+        let (shared, bridge) = shared_with_reporter().await;
+        let mw = ControlPlaneObserverMiddleware::new(shared);
+
+        let failed: Next<AgentInput> = Box::new(|_i| {
+            Box::pin(futures::stream::iter(vec![Err(
+                agentscope_core::error::Error::Other("model exploded".into()),
+            )]))
+        });
+        let mut stream = mw.on_agent(&ctx("s8"), AgentInput::new(vec![Msg::user("hi")]), failed);
+        assert!(bridge.is_busy("s8"));
+        assert!(matches!(stream.next().await, Some(Err(_))));
+        assert!(!bridge.is_busy("s8"), "an errored turn stayed busy");
+
+        // A consumer that drops the stream mid-turn releases it through the guard.
+        let pending: Next<AgentInput> =
+            Box::new(|_i| Box::pin(futures::stream::pending::<agentscope_core::error::Result<AgentEvent>>()));
+        let stream = mw.on_agent(&ctx("s9"), AgentInput::new(vec![Msg::user("hi")]), pending);
+        assert!(bridge.is_busy("s9"));
+        drop(stream);
+        assert!(!bridge.is_busy("s9"), "a dropped turn stayed busy");
     }
 
     #[tokio::test]

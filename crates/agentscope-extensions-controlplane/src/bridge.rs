@@ -31,6 +31,7 @@ use crate::model::{
     AgentTaskAssignment, ContextSnapshot, ContextTracker, Inventory, MessagePage, SessionEvent,
     ToolInfo,
 };
+use crate::model::session_event::{TYPE_SESSION_END, TYPE_SESSION_START};
 use crate::transport::{
     AsdpEvent, AsdpTransport, ContractHttpServer, ContractProvider, ConversationTurnPhase,
     ConversationTurnReport, EventReport, EventReportAck, ExecutionAttemptCommand,
@@ -46,6 +47,45 @@ pub const EVENT_BATCH_SIZE: usize = 20;
 pub const EVENT_ACK_TIMEOUT: Duration = Duration::from_millis(15_000);
 /// Registration heartbeat period (`SessionBridge.java:213` passes `15_000L`).
 pub const REGISTRATION_HEARTBEAT: Duration = Duration::from_millis(15_000);
+
+/// Reporting capability this bridge always claims (`SessionBridge.capabilities`).
+pub const CAP_SESSION_REPORTING: &str = "session-reporting";
+/// Reporting capability this bridge always claims (`SessionBridge.capabilities`).
+pub const CAP_CONTEXT_REPORTING: &str = "context-reporting";
+/// Reporting capability claimed only when the Level-2 journal is open
+/// (`SessionBridge.capabilities`: `eventJournal != null`).
+pub const CAP_EVENT_REPORTING: &str = "event-reporting";
+
+/// Session phase while a turn is running (`SessionBridge.PHASE_ACTIVE`).
+pub const PHASE_ACTIVE: &str = "active";
+/// Session phase between turns (`SessionBridge.PHASE_IDLE`).
+pub const PHASE_IDLE: &str = "idle";
+/// Session phase while `compress` runs (`SessionBridge.PHASE_COMPRESSING`).
+pub const PHASE_COMPRESSING: &str = "compressing";
+/// Session phase for a session the runtime archived (`SessionBridge.PHASE_ARCHIVED`).
+pub const PHASE_ARCHIVED: &str = "archived";
+/// Session phase after `terminate` (`SessionBridge.PHASE_TERMINATED`).
+pub const PHASE_TERMINATED: &str = "terminated";
+
+/// The capability set this bridge reports, mirroring `SessionBridge.capabilities`: the two
+/// reporting families it always serves, `event-reporting` only with an open journal, plus
+/// every adapter capability — sorted, because Java returns a `TreeSet`.
+fn bridge_capabilities(
+    state: &Arc<Mutex<BridgeState>>,
+    adapter: Option<&Arc<dyn FrameworkAdapter>>,
+) -> Vec<String> {
+    let mut caps: std::collections::BTreeSet<String> = [CAP_SESSION_REPORTING, CAP_CONTEXT_REPORTING]
+        .iter()
+        .map(|cap| cap.to_string())
+        .collect();
+    if state.lock().unwrap_or_else(|p| p.into_inner()).journal.is_some() {
+        caps.insert(CAP_EVENT_REPORTING.to_string());
+    }
+    if let Some(adapter) = adapter {
+        caps.extend(adapter.capabilities());
+    }
+    caps.into_iter().collect()
+}
 
 /// Test-visible clock so the in-flight ack timeout never needs a real wait.
 pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
@@ -85,6 +125,12 @@ struct BridgeState {
     trackers: HashMap<String, ContextTracker>,
     descriptions: HashMap<String, SessionDescription>,
     busy: HashSet<String>,
+    /// Operational phase per session (`SessionBridge.phases`); absent means `idle`.
+    phases: HashMap<String, String>,
+    /// Epoch millis of the first and last activity per session, reported as
+    /// `startedAt` / `lastActiveAt`.
+    started_at: HashMap<String, i64>,
+    last_active_at: HashMap<String, i64>,
     effective_prompts: HashMap<String, String>,
     context_used: HashMap<String, i64>,
     /// The report currently on the wire, awaiting its `EventReportAck`.
@@ -105,7 +151,76 @@ impl BridgeState {
             .entry(session_id.clone())
             .or_insert_with(|| ContextTracker::new(&session_id, agent_key))
             .apply(&event);
+        self.touch(&session_id);
+        // `session_start` opens a conversation, `session_end` closes it. A finished
+        // conversation stays resumable, so it is `idle`; `terminated` is reserved for a
+        // session the runtime actually dropped.
+        match event.event_type.as_str() {
+            TYPE_SESSION_START => self.set_busy(&session_id, true),
+            TYPE_SESSION_END => self.set_busy(&session_id, false),
+            _ => {}
+        }
         next
+    }
+
+    /// Records activity for `session_id` (`SessionBridge.touch`).
+    fn touch(&mut self, session_id: &str) {
+        let now = chrono::Utc::now().timestamp_millis();
+        self.started_at.entry(session_id.to_string()).or_insert(now);
+        self.last_active_at.insert(session_id.to_string(), now);
+    }
+
+    /// The session's phase, `idle` when never driven.
+    fn phase(&self, session_id: &str) -> String {
+        self.phases
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| PHASE_IDLE.to_string())
+    }
+
+    /// Drives the phase from a turn hook: `active` while busy, `idle` when it ends.
+    ///
+    /// In-flight `compressing` and the terminal phases are never clobbered by a turn hook
+    /// (mirrors `SessionBridge.setBusy`).
+    fn set_busy(&mut self, session_id: &str, busy: bool) {
+        if busy {
+            self.busy.insert(session_id.to_string());
+        } else {
+            self.busy.remove(session_id);
+        }
+        let current = self.phase(session_id);
+        if current == PHASE_COMPRESSING
+            || current == PHASE_ARCHIVED
+            || current == PHASE_TERMINATED
+        {
+            self.touch(session_id);
+            return;
+        }
+        self.phases.insert(
+            session_id.to_string(),
+            if busy { PHASE_ACTIVE } else { PHASE_IDLE }.to_string(),
+        );
+        self.touch(session_id);
+    }
+
+    /// Sets the operational phase explicitly (`SessionBridge.setPhase`); an empty phase is
+    /// ignored.
+    fn set_phase(&mut self, session_id: &str, phase: &str) {
+        if phase.is_empty() {
+            return;
+        }
+        self.phases.insert(session_id.to_string(), phase.to_string());
+        if phase == PHASE_ACTIVE {
+            self.busy.insert(session_id.to_string());
+        } else {
+            self.busy.remove(session_id);
+        }
+        self.touch(session_id);
+    }
+
+    /// Whether a turn is running: the busy flag, or an `active` phase a host set directly.
+    fn is_busy(&self, session_id: &str) -> bool {
+        self.busy.contains(session_id) || self.phase(session_id) == PHASE_ACTIVE
     }
 
     /// Ingests one native committed fact, deduplicating by its per-source watermark.
@@ -242,12 +357,7 @@ impl BridgeReporter {
 
     /// Marks whether a turn is in progress (mirrors `SessionBridge.setBusy`).
     pub fn set_busy(&self, session_id: &str, busy: bool) {
-        let mut state = self.lock_state();
-        if busy {
-            state.busy.insert(session_id.to_string());
-        } else {
-            state.busy.remove(session_id);
-        }
+        self.lock_state().set_busy(session_id, busy);
     }
 
     /// Stores the middleware-composed system prompt (mirrors
@@ -409,6 +519,20 @@ impl ControlPlaneBridge {
                 &self.config.internal_token,
                 self.registration_options()?,
             )?);
+            // Every issued identity (generation changes included) has to reach the ASDP
+            // frames, mirroring `SessionBridge.start`'s `setIdentityListener` ->
+            // `grpc.updateIdentity`.
+            if let Some(transport) = self.asdp() {
+                registration.set_identity_listener(Some(Arc::new(move |identity| {
+                    transport.update_identity(
+                        &identity.registration_credential,
+                        &identity.agent_id,
+                        &identity.binding_id,
+                        &identity.instance_key,
+                        identity.generation,
+                    );
+                })));
+            }
             // Registers once, then heartbeats every 15s; failures are retried in the loop.
             registration.start().await;
             *self.registration.lock().unwrap_or_else(|p| p.into_inner()) = Some(registration);
@@ -447,14 +571,17 @@ impl ControlPlaneBridge {
             .and_then(|registration| registration.identity())
     }
 
+    /// The capability set reported on `info` and in self-registration (mirrors
+    /// `SessionBridge.capabilities`): the two reporting families, `event-reporting` while a
+    /// journal is open, plus every adapter capability, sorted.
+    pub fn capabilities(&self) -> Vec<String> {
+        bridge_capabilities(&self.state, self.adapter.as_ref())
+    }
+
     /// The registration request this bridge would send (also the body asserted against the
     /// control plane's `POST /api/v1/agent-registrations`).
     pub fn registration_options(&self) -> ControlPlaneResult<RegistrationOptions> {
-        let capabilities = self
-            .adapter
-            .as_ref()
-            .map(|adapter| adapter.capabilities())
-            .unwrap_or_default();
+        let capabilities = self.capabilities();
         RegistrationOptions::new(
             self.config.agent_key.clone(),
             self.config.instance_key.clone(),
@@ -703,16 +830,12 @@ impl ControlPlaneBridge {
 
     /// Marks whether a turn is in progress for `session_id`.
     pub fn set_busy(&self, session_id: &str, busy: bool) {
-        if busy {
-            self.lock_state().busy.insert(session_id.to_string());
-        } else {
-            self.lock_state().busy.remove(session_id);
-        }
+        self.lock_state().set_busy(session_id, busy);
     }
 
     /// Whether a turn is currently in progress for `session_id`.
     pub fn is_busy(&self, session_id: &str) -> bool {
-        self.lock_state().busy.contains(session_id)
+        self.lock_state().is_busy(session_id)
     }
 
     /// Stores the middleware-composed system prompt for `session_id`.
@@ -850,8 +973,77 @@ impl BridgeContractView {
     }
 
     fn is_busy(&self, session_id: &str) -> bool {
-        self.lock_state().busy.contains(session_id)
+        self.lock_state().is_busy(session_id)
     }
+
+    /// Adapter task counts for a session summary (`SessionBridge.resolveTaskSummary`); an
+    /// adapter that cannot answer contributes nothing.
+    async fn task_summary(&self, session_id: &str) -> Option<serde_json::Value> {
+        let adapter = self.adapter.clone()?;
+        summarize_tasks(&adapter.list_tasks(session_id).await.ok()?)
+    }
+}
+
+/// One row of the `sessions` listing: the tracker plus the bridge-side phase/timestamps.
+struct SessionSummary {
+    id: String,
+    tracker: ContextTracker,
+    phase: String,
+    busy: bool,
+    started_at: Option<i64>,
+    last_active_at: Option<i64>,
+}
+
+/// `startedAt` / `lastActiveAt` as `DateTimeFormatter.ISO_INSTANT` writes them.
+fn iso_instant(epoch_millis: Option<i64>) -> Option<String> {
+    let millis = epoch_millis?;
+    chrono::DateTime::from_timestamp_millis(millis)
+        .map(|instant| instant.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+}
+
+/// `tokenUsage` block shared by `sessions` and `session_state`.
+fn token_usage(tracker: &ContextTracker) -> serde_json::Value {
+    let mut usage = serde_json::Map::new();
+    usage.insert("promptTokens".into(), tracker.tokens_in().into());
+    usage.insert("completionTokens".into(), tracker.tokens_out().into());
+    usage.insert(
+        "totalTokens".into(),
+        (tracker.tokens_in() + tracker.tokens_out()).into(),
+    );
+    if tracker.max_tokens() > 0 {
+        usage.insert("maxTokens".into(), tracker.max_tokens().into());
+    }
+    serde_json::Value::Object(usage)
+}
+
+/// Context-window occupancy: `used / max`, zero when either side is unknown.
+fn context_pressure(used_tokens: i64, max_tokens: i64) -> f64 {
+    if max_tokens > 0 && used_tokens > 0 {
+        used_tokens as f64 / max_tokens as f64
+    } else {
+        0.0
+    }
+}
+
+/// Buckets the adapter's tasks into the `taskSummary` counters (`SessionBridge.summarizeTasks`).
+fn summarize_tasks(tasks: &[serde_json::Value]) -> Option<serde_json::Value> {
+    if tasks.is_empty() {
+        return None;
+    }
+    let (mut pending, mut in_progress, mut completed) = (0, 0, 0);
+    for task in tasks {
+        match task.get("state").and_then(|state| state.as_str()).unwrap_or("") {
+            "in_progress" => in_progress += 1,
+            "completed" => completed += 1,
+            _ => pending += 1,
+        }
+    }
+    Some(serde_json::json!({
+        "total": tasks.len(),
+        "pending": pending,
+        "inProgress": in_progress,
+        "completed": completed,
+    }))
 }
 
 #[async_trait]
@@ -922,6 +1114,141 @@ impl ContractProvider for BridgeContractView {
         Ok(from_events)
     }
 
+    /// `GET /agentscope/sessions`: one Java-shaped summary per tracked session.
+    async fn sessions(&self) -> ControlPlaneResult<Vec<serde_json::Value>> {
+        let framework = self
+            .adapter
+            .as_ref()
+            .map(|adapter| adapter.framework_name().to_string())
+            .unwrap_or_default();
+        let version = self
+            .adapter
+            .as_ref()
+            .map(|adapter| adapter.framework_version().to_string())
+            .unwrap_or_default();
+        let rows: Vec<SessionSummary> = {
+            let state = self.lock_state();
+            state
+                .trackers
+                .iter()
+                .map(|(id, tracker)| SessionSummary {
+                    id: id.clone(),
+                    tracker: tracker.clone(),
+                    phase: state.phase(id),
+                    busy: state.is_busy(id),
+                    started_at: state.started_at.get(id).copied(),
+                    last_active_at: state.last_active_at.get(id).copied(),
+                })
+                .collect()
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tracker = &row.tracker;
+            let mut session = serde_json::Map::new();
+            session.insert("id".into(), row.id.clone().into());
+            session.insert("phase".into(), row.phase.clone().into());
+            session.insert("busy".into(), row.busy.into());
+            if !tracker.model().is_empty() {
+                session.insert("model".into(), tracker.model().to_string().into());
+            }
+            if let Some(started) = iso_instant(row.started_at) {
+                session.insert("startedAt".into(), started.into());
+            }
+            if let Some(active) = iso_instant(row.last_active_at) {
+                session.insert("lastActiveAt".into(), active.into());
+            }
+            session.insert("messageCount".into(), tracker.message_count().into());
+            session.insert("tokenUsage".into(), token_usage(tracker));
+            session.insert(
+                "contextPressure".into(),
+                context_pressure(tracker.context_used_tokens(), tracker.max_tokens()).into(),
+            );
+            if let Some(summary) = self.task_summary(&row.id).await {
+                session.insert("taskSummary".into(), summary);
+            }
+            session.insert("framework".into(), framework.clone().into());
+            if !version.is_empty() {
+                session.insert("frameworkVersion".into(), version.clone().into());
+            }
+            session.insert("contextHash".into(), tracker.context_hash().to_string().into());
+            if tracker.is_compacted() {
+                session.insert("isCompacted".into(), true.into());
+            }
+            session.insert(
+                "effectiveMessageCount".into(),
+                tracker.effective_message_count().into(),
+            );
+            out.push(serde_json::Value::Object(session));
+        }
+        Ok(out)
+    }
+
+    /// `GET /agentscope/sessions/{id}/state`: the session's live view (Java
+    /// `SessionBridge.sessionState`). An unknown session is a 404, never an empty shell.
+    async fn session_state(&self, session_id: &str) -> ControlPlaneResult<serde_json::Value> {
+        let (tracker, phase, busy, started_at, last_active_at) = {
+            let state = self.lock_state();
+            let tracker = state.trackers.get(session_id).cloned().ok_or_else(|| {
+                ControlPlaneError::NotFound(format!("session not found: {session_id}"))
+            })?;
+            (
+                tracker,
+                state.phase(session_id),
+                state.is_busy(session_id),
+                state.started_at.get(session_id).copied(),
+                state.last_active_at.get(session_id).copied(),
+            )
+        };
+        let max_tokens = tracker.max_tokens();
+        let used_tokens = tracker.context_used_tokens();
+        let mut out = serde_json::Map::new();
+        out.insert("sessionId".into(), session_id.to_string().into());
+        out.insert("id".into(), session_id.to_string().into());
+        out.insert("phase".into(), phase.into());
+        out.insert("busy".into(), busy.into());
+        if !tracker.model().is_empty() {
+            out.insert("model".into(), tracker.model().to_string().into());
+        }
+        if let Some(started) = iso_instant(started_at) {
+            out.insert("startedAt".into(), started.into());
+        }
+        if let Some(active) = iso_instant(last_active_at) {
+            out.insert("lastActiveAt".into(), active.into());
+        }
+        out.insert("messageCount".into(), tracker.message_count().into());
+        out.insert("tokenUsage".into(), token_usage(&tracker));
+        out.insert(
+            "contextPressure".into(),
+            serde_json::json!({
+                "usedTokens": used_tokens,
+                "maxTokens": max_tokens,
+                // Window occupancy only — never lifetime spend.
+                "ratio": context_pressure(used_tokens, max_tokens),
+            }),
+        );
+        if tracker.is_compacted() {
+            out.insert("isCompacted".into(), true.into());
+        }
+        if let Some(summary) = self.task_summary(session_id).await {
+            out.insert("taskSummary".into(), summary);
+        }
+        out.insert(
+            "framework".into(),
+            self.adapter
+                .as_ref()
+                .map(|adapter| adapter.framework_name().to_string())
+                .unwrap_or_default()
+                .into(),
+        );
+        Ok(serde_json::Value::Object(out))
+    }
+
+    /// Current phase, also carried by every command-success response
+    /// (Java `SessionBridge.sessionPhase`).
+    fn session_phase(&self, session_id: &str) -> String {
+        self.lock_state().phase(session_id)
+    }
+
     async fn info(&self) -> ControlPlaneResult<serde_json::Value> {
         let adapter = self.adapter.clone();
         let mut cfg = adapter
@@ -937,7 +1264,7 @@ impl ContractProvider for BridgeContractView {
             "instanceKey": self.config.instance_key,
             "framework": adapter.as_ref().map(|a| a.framework_name()).unwrap_or(""),
             "frameworkVersion": adapter.as_ref().map(|a| a.framework_version()).unwrap_or(""),
-            "capabilities": adapter.as_ref().map(|a| a.capabilities()).unwrap_or_default(),
+            "capabilities": bridge_capabilities(&self.state, self.adapter.as_ref()),
             "agentConfig": cfg,
         }))
     }
@@ -974,26 +1301,31 @@ impl ContractProvider for BridgeContractView {
     }
 
     /// `POST .../compress`: a busy session is a 409, otherwise the adapter compacts it.
+    ///
+    /// The phase goes `compressing` for the duration and back to `idle` on both paths, so a
+    /// failed compaction cannot leave the session stuck (mirrors `SessionBridge.compress`).
     async fn compress(&self, session_id: &str) -> ControlPlaneResult<()> {
         if self.is_busy(session_id) {
             return Err(ControlPlaneError::Busy("session is busy".into()));
         }
-        self.dispatch_command(session_id, COMMAND_COMPRESS)
-            .await
-            .map(|_| ())
+        self.lock_state().set_phase(session_id, PHASE_COMPRESSING);
+        let outcome = self.dispatch_command(session_id, COMMAND_COMPRESS).await;
+        self.lock_state().set_phase(session_id, PHASE_IDLE);
+        outcome.map(|_| ())
     }
 
-    /// `POST .../terminate`: interrupts the session through the adapter.
+    /// `POST .../terminate`: interrupts the session through the adapter, then marks it
+    /// `terminated` — the terminal phase a turn hook may not overwrite.
     async fn terminate(&self, session_id: &str) -> ControlPlaneResult<()> {
-        self.dispatch_command(session_id, COMMAND_TERMINATE)
-            .await
-            .map(|_| ())
+        self.dispatch_command(session_id, COMMAND_TERMINATE).await?;
+        self.lock_state().set_phase(session_id, PHASE_TERMINATED);
+        Ok(())
     }
 
     /// `POST .../abort`: aborts the current turn without ending the session.
     async fn abort(&self, session_id: &str) -> ControlPlaneResult<()> {
         self.dispatch_command(session_id, COMMAND_ABORT).await?;
-        self.lock_state().busy.remove(session_id);
+        self.lock_state().set_busy(session_id, false);
         Ok(())
     }
 
@@ -1430,6 +1762,18 @@ impl ContractProvider for ControlPlaneBridge {
         self.contract_view().session_ids().await
     }
 
+    async fn sessions(&self) -> ControlPlaneResult<Vec<serde_json::Value>> {
+        self.contract_view().sessions().await
+    }
+
+    async fn session_state(&self, session_id: &str) -> ControlPlaneResult<serde_json::Value> {
+        self.contract_view().session_state(session_id).await
+    }
+
+    fn session_phase(&self, session_id: &str) -> String {
+        self.contract_view().session_phase(session_id)
+    }
+
     async fn info(&self) -> ControlPlaneResult<serde_json::Value> {
         self.contract_view().info().await
     }
@@ -1698,6 +2042,39 @@ mod tests {
         assert_eq!(options.base_url, "https://agent.example");
     }
 
+    /// CP-12: the identity issued by registration reaches the ASDP envelope, so a later
+    /// generation bump propagates to the following frames (Java `setIdentityListener` →
+    /// `grpc.updateIdentity`).
+    #[tokio::test]
+    async fn registration_identity_reaches_the_asdp_envelope() {
+        let (recorded, registration_port) = registration_stub().await;
+        let mut cfg = ControlPlaneConfig::builder("friday")
+            .instance_key("rep-1")
+            .internal_token("tok")
+            .control_plane_http(format!("http://127.0.0.1:{registration_port}"))
+            .build()
+            .unwrap();
+        cfg.start_http_register = true;
+
+        let link = Arc::new(RecordingLink::default());
+        let link_handle: Arc<dyn AsdpLink> = link.clone();
+        let transport = asdp_transport(link_handle);
+        let mut bridge = ControlPlaneBridge::new(cfg);
+        bridge.attach_asdp(Arc::clone(&transport));
+        let mut bridge = bridge.start().await.unwrap();
+        assert_eq!(recorded.lock().unwrap().len(), 1);
+
+        transport.connect().await.unwrap();
+        let sent = link.sent.lock().unwrap().clone();
+        let connect: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(connect["meta"]["agentId"], "agent-1");
+        assert_eq!(connect["meta"]["bindingId"], "binding-1");
+        assert_eq!(connect["meta"]["instanceKey"], "rep-1");
+        assert_eq!(connect["meta"]["generation"], 3);
+        assert_eq!(transport.credential(), "cred-1");
+        bridge.close().unwrap();
+    }
+
     // ─── CP-02: contract command routing ───
 
     /// Adapter double that records what the bridge forwards to it.
@@ -1712,6 +2089,14 @@ mod tests {
         turns: Mutex<Vec<String>>,
         fail_context: std::sync::atomic::AtomicBool,
         fail_task: std::sync::atomic::AtomicBool,
+        /// Lets a test hold `compress` in flight and read the bridge meanwhile.
+        compress_gate: Mutex<Option<Arc<CompressGate>>>,
+    }
+
+    /// Holds a `compress` command inside the adapter until the test releases it.
+    struct CompressGate {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -1771,6 +2156,13 @@ mod tests {
         ) -> ControlPlaneResult<CommandOutcome> {
             self.commands.lock().unwrap().push(command.to_string());
             self.payloads.lock().unwrap().push(payload);
+            if command == COMMAND_COMPRESS {
+                let gate = self.compress_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    let _ = gate.entered.send(());
+                    gate.release.notified().await;
+                }
+            }
             Ok(CommandOutcome {
                 ok: true,
                 message: String::new(),
@@ -2041,6 +2433,153 @@ mod tests {
             *adapter.injected.lock().unwrap(),
             vec!["from-message".to_string()]
         );
+    }
+
+    // ─── CP-09 / CP-10: capabilities and session views ───
+
+    /// CP-09: `info` and the registration body claim the reporting families, `event-reporting`
+    /// only while the journal is open (mirrors `SessionBridge.capabilities`).
+    #[tokio::test]
+    async fn info_and_registration_claim_the_reporting_capabilities() {
+        let (bridge, _adapter) = adapter_bridge();
+        let expected = vec![
+            "context-query".to_string(),
+            CAP_CONTEXT_REPORTING.to_string(),
+            CAP_EVENT_REPORTING.to_string(),
+            CAP_SESSION_REPORTING.to_string(),
+        ];
+        assert_eq!(bridge.capabilities(), expected);
+        assert_eq!(
+            bridge.registration_options().unwrap().capabilities,
+            expected
+        );
+        assert_eq!(
+            bridge.info().await.unwrap()["capabilities"],
+            serde_json::json!(expected)
+        );
+    }
+
+    /// CP-09: without a journal nothing durable carries events, so `event-reporting` is not
+    /// claimed (Java: `eventJournal != null`).
+    #[tokio::test]
+    async fn event_reporting_is_only_claimed_with_a_journal() {
+        let cfg = ControlPlaneConfig::builder("friday")
+            .instance_key("rep-1")
+            .enable_events(false)
+            .build()
+            .unwrap();
+        let bridge = ControlPlaneBridge::new(cfg);
+        let expected = vec![
+            CAP_CONTEXT_REPORTING.to_string(),
+            CAP_SESSION_REPORTING.to_string(),
+        ];
+        assert_eq!(bridge.capabilities(), expected);
+        assert_eq!(
+            bridge.info().await.unwrap()["capabilities"],
+            serde_json::json!(expected)
+        );
+    }
+
+    /// CP-10: the phase follows the turn, `terminate` makes it terminal and a turn hook may
+    /// not overwrite a terminal phase.
+    #[tokio::test]
+    async fn phase_follows_the_turn_and_terminate_is_terminal() {
+        let (bridge, _adapter) = adapter_bridge();
+        bridge.record_event(SessionEvent::builder("s1", TYPE_MESSAGE).content("hi").build());
+        assert_eq!(bridge.session_phase("s1"), PHASE_IDLE);
+
+        bridge.set_busy("s1", true);
+        let state = bridge.session_state("s1").await.unwrap();
+        assert_eq!(state["phase"], PHASE_ACTIVE);
+        assert_eq!(state["busy"], true);
+        assert_eq!(state["sessionId"], "s1");
+
+        bridge.terminate("s1").await.unwrap();
+        assert_eq!(bridge.session_phase("s1"), PHASE_TERMINATED);
+        let state = bridge.session_state("s1").await.unwrap();
+        assert_eq!(state["phase"], PHASE_TERMINATED);
+        assert_eq!(state["busy"], false);
+
+        // A late turn hook must not revive a terminated session.
+        bridge.set_busy("s1", false);
+        assert_eq!(bridge.session_phase("s1"), PHASE_TERMINATED);
+    }
+
+    /// CP-10: `compress` publishes `compressing` for its duration and returns to `idle`.
+    #[tokio::test]
+    async fn compress_reports_the_compressing_phase_while_it_runs() {
+        let (bridge, adapter) = adapter_bridge();
+        bridge.record_event(SessionEvent::builder("s1", TYPE_MESSAGE).content("hi").build());
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(CompressGate {
+            entered: entered_tx,
+            release: tokio::sync::Notify::new(),
+        });
+        *adapter.compress_gate.lock().unwrap() = Some(Arc::clone(&gate));
+
+        let probe = async {
+            entered_rx.recv().await.expect("compress never reached the adapter");
+            let state = bridge.session_state("s1").await.unwrap();
+            assert_eq!(state["phase"], PHASE_COMPRESSING);
+            assert_eq!(state["busy"], false);
+            gate.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(bridge.compress("s1"), probe);
+        outcome.unwrap();
+        assert_eq!(bridge.session_phase("s1"), PHASE_IDLE);
+    }
+
+    /// CP-10: the `sessions` listing carries the Java field set, not just id + phase.
+    #[tokio::test]
+    async fn sessions_report_the_java_field_set() {
+        let (bridge, _adapter) = adapter_bridge();
+        bridge.describe_session("s1", "you are helpful", vec![], 1000, "gpt-4o");
+        bridge.record_event(
+            SessionEvent::builder("s1", TYPE_MESSAGE)
+                .role("user")
+                .content("hi")
+                .tokens_in(10)
+                .build(),
+        );
+        bridge.set_context_used_tokens("s1", 250);
+        bridge.set_busy("s1", true);
+
+        let sessions = bridge.sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session["id"], "s1");
+        assert_eq!(session["phase"], PHASE_ACTIVE);
+        assert_eq!(session["busy"], true);
+        assert_eq!(session["model"], "gpt-4o");
+        assert_eq!(session["messageCount"], 1);
+        assert_eq!(session["effectiveMessageCount"], 1);
+        assert_eq!(session["tokenUsage"]["promptTokens"], 10);
+        assert_eq!(session["tokenUsage"]["totalTokens"], 10);
+        assert_eq!(session["tokenUsage"]["maxTokens"], 1000);
+        assert_eq!(session["contextPressure"], 0.25);
+        assert_eq!(session["framework"], "recording");
+        assert!(session["startedAt"].is_string());
+        assert!(session["lastActiveAt"].is_string());
+        // `RecordingAdapter::list_tasks` returns one pending task.
+        assert_eq!(session["taskSummary"]["total"], 1);
+        assert_eq!(session["taskSummary"]["pending"], 1);
+        assert!(session.get("isCompacted").is_none());
+
+        // The state view reports window occupancy as an object, not a bare ratio.
+        let state = bridge.session_state("s1").await.unwrap();
+        assert_eq!(state["contextPressure"]["usedTokens"], 250);
+        assert_eq!(state["contextPressure"]["maxTokens"], 1000);
+        assert_eq!(state["contextPressure"]["ratio"], 0.25);
+    }
+
+    /// CP-10: an unknown session is a 404, never an empty shell (Java `requireTracker`).
+    #[tokio::test]
+    async fn session_state_for_an_unknown_session_is_not_found() {
+        let (bridge, _adapter) = adapter_bridge();
+        assert!(matches!(
+            bridge.session_state("ghost").await,
+            Err(ControlPlaneError::NotFound(_))
+        ));
     }
 
     // ─── CP-04: Level-2 outbound loop ───

@@ -97,6 +97,21 @@ impl ContextTracker {
         self.context_used_tokens
     }
 
+    /// Context-window maximum (0 when the framework never reported one).
+    pub fn max_tokens(&self) -> i64 {
+        self.max_tokens
+    }
+
+    /// Model identifier in effect (empty when never described).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Whether the view was reset by a compaction event.
+    pub fn is_compacted(&self) -> bool {
+        self.compacted
+    }
+
     /// Sets tokens in the live effective context.
     pub fn set_context_used_tokens(&mut self, v: i64) {
         self.context_used_tokens = v.max(0);

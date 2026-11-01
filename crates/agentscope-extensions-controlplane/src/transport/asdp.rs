@@ -496,12 +496,18 @@ struct AsdpState {
     /// Reports that have been sent (or attempted) but not acknowledged, keyed by
     /// `report_id` so a reconnect can resend them in order.
     pending: BTreeMap<String, EventReport>,
+    /// The credential last applied by [`AsdpTransport::update_identity`]. The stream
+    /// metadata is owned by the host link, which reads it back through
+    /// [`AsdpTransport::credential`].
+    credential: String,
 }
 
 /// ASDP channel: handshake, heartbeats, ack-gated outbox and downstream dispatch.
 pub struct AsdpTransport {
     link: Arc<dyn AsdpLink>,
-    meta: UpstreamMeta,
+    /// Routing identity of every upstream frame; replaced by
+    /// [`AsdpTransport::update_identity`] when registration issues a new one.
+    meta: Mutex<UpstreamMeta>,
     connect: ConnectRequest,
     state: Mutex<AsdpState>,
 }
@@ -511,10 +517,47 @@ impl AsdpTransport {
     pub fn new(link: Arc<dyn AsdpLink>, meta: UpstreamMeta, connect: ConnectRequest) -> Self {
         Self {
             link,
-            meta,
+            meta: Mutex::new(meta),
             connect,
             state: Mutex::new(AsdpState::default()),
         }
+    }
+
+    /// Replaces the identity carried by subsequent upstream frames, mirroring
+    /// `GrpcTransport.updateIdentity`.
+    ///
+    /// A blank `agent_id` / `binding_id` / `instance_key` and a non-positive `generation`
+    /// are ignored, exactly like Java (an unreachable registration must not blank a working
+    /// identity). The credential is kept for the host link, which owns the stream metadata
+    /// (`GrpcTransport` sends it as `Authorization: Bearer`).
+    pub fn update_identity(
+        &self,
+        credential: &str,
+        agent_id: &str,
+        binding_id: &str,
+        instance_key: &str,
+        generation: i64,
+    ) {
+        if agent_id.trim().is_empty()
+            || binding_id.trim().is_empty()
+            || instance_key.trim().is_empty()
+            || generation <= 0
+        {
+            return;
+        }
+        {
+            let mut meta = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+            meta.agent_id = agent_id.to_string();
+            meta.binding_id = binding_id.to_string();
+            meta.instance_key = instance_key.to_string();
+            meta.generation = generation;
+        }
+        self.lock().credential = credential.to_string();
+    }
+
+    /// The credential most recently applied by [`Self::update_identity`].
+    pub fn credential(&self) -> String {
+        self.lock().credential.clone()
     }
 
     /// The reconnect delay for `attempt` (1-based), mirroring
@@ -668,7 +711,7 @@ impl AsdpTransport {
     }
 
     fn frame(&self, payload: UpstreamPayload) -> ControlPlaneResult<String> {
-        let mut meta = self.meta.clone();
+        let mut meta = self.meta.lock().unwrap_or_else(|p| p.into_inner()).clone();
         meta.timestamp = now_millis();
         let value = Upstream { meta, payload }.to_json()?;
         serde_json::to_string(&value)
@@ -770,6 +813,34 @@ mod tests {
         assert_eq!(sent[0]["meta"]["generation"], 3);
         assert_eq!(sent[0]["connect"]["runtime"], "agentscope-rust");
         assert_eq!(sent[0]["connect"]["capabilities"][0], "session-inventory");
+    }
+
+    /// CP-12: an identity refresh reaches the meta of every later frame and is ignored
+    /// while incomplete (Java `GrpcTransport.updateIdentity`).
+    #[tokio::test]
+    async fn update_identity_reaches_subsequent_frames() {
+        let link = Arc::new(RecordingLink::default());
+        let transport = transport(link.clone());
+        transport.connect().await.unwrap();
+
+        transport.update_identity("cred-9", "agent-9", "b-9", "rep-9", 7);
+        assert!(transport.heartbeat().await.unwrap());
+
+        let sent = link.sent();
+        assert_eq!(sent[0]["meta"]["agentId"], "agent-1");
+        assert_eq!(sent[1]["meta"]["agentId"], "agent-9");
+        assert_eq!(sent[1]["meta"]["bindingId"], "b-9");
+        assert_eq!(sent[1]["meta"]["instanceKey"], "rep-9");
+        assert_eq!(sent[1]["meta"]["generation"], 7);
+        assert_eq!(transport.credential(), "cred-9");
+
+        // A half-filled identity (no binding, zero generation) changes nothing.
+        transport.update_identity("cred-x", "agent-x", "", "rep-x", 0);
+        assert!(transport.heartbeat().await.unwrap());
+        let sent = link.sent();
+        assert_eq!(sent[2]["meta"]["agentId"], "agent-9");
+        assert_eq!(sent[2]["meta"]["generation"], 7);
+        assert_eq!(transport.credential(), "cred-9");
     }
 
     #[test]
