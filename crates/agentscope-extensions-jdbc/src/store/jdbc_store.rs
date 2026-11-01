@@ -189,7 +189,17 @@ impl BaseStore for JdbcStore {
             self.dialect
                 .store_cas_update(&json, timestamp, &path, key, expected_version as i64);
         match self.executor.execute(&bound) {
-            Ok(affected) => affected == 1,
+            Ok(affected) => {
+                if affected != 1 {
+                    tracing::debug!(
+                        namespace = %path,
+                        key,
+                        expected_version,
+                        "[jdbc-store] CAS conflict: the row moved or is gone"
+                    );
+                }
+                affected == 1
+            }
             Err(e) => {
                 tracing::debug!("[jdbc-store] CAS update failed: {e}");
                 false

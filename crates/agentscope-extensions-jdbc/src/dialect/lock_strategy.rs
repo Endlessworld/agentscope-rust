@@ -9,11 +9,22 @@
 
 use std::time::{Duration, Instant};
 
-/// Interval between two acquisition attempts of [`SandboxLockStrategy::try_enter_async`].
+/// Initial interval between two acquisition attempts of [`SandboxLockStrategy::try_enter_async`].
 ///
-/// Mirrors the Java PostgreSQL `TimeUnit.MILLISECONDS.sleep(100)` loop. Sleeping happens on
-/// the async task (`tokio::time::sleep`), never on the calling worker thread.
-pub const DEFAULT_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Mirrors Java `AbstractJdbcDialect.INITIAL_BACKOFF_MS`. The interval doubles after every
+/// failed attempt up to [`MAX_LOCK_POLL_INTERVAL`], so a contended lock is probed with
+/// 50/100/200/400/800/1000ms waits instead of a fixed interval. Sleeping happens on the async
+/// task (`tokio::time::sleep`), never on the calling worker thread.
+pub const DEFAULT_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Upper bound for the retry interval, mirroring Java `MAX_BACKOFF_MS`.
+pub const MAX_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Next retry interval: `min(current * 2, MAX_LOCK_POLL_INTERVAL)` (Java
+/// `backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)`).
+pub fn next_lock_poll_interval(current: Duration) -> Duration {
+    (current * 2).min(MAX_LOCK_POLL_INTERVAL)
+}
 
 /// Outcome of a lock acquisition attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +130,7 @@ pub trait SandboxLockStrategy: Send + Sync {
         timeout_seconds: u64,
     ) -> Result<LockLease, LockOutcome> {
         let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+        let mut interval = DEFAULT_LOCK_POLL_INTERVAL;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.try_enter_once(lock_name, remaining) {
@@ -133,7 +145,8 @@ pub trait SandboxLockStrategy: Send + Sync {
             if remaining.is_zero() {
                 return Err(LockOutcome::TimedOut);
             }
-            tokio::time::sleep(DEFAULT_LOCK_POLL_INTERVAL.min(remaining)).await;
+            tokio::time::sleep(interval.min(remaining)).await;
+            interval = next_lock_poll_interval(interval);
         }
     }
 
@@ -165,5 +178,31 @@ pub trait SandboxLockStrategy: Send + Sync {
     fn is_held(&self, lock_name: &str) -> bool {
         let _ = lock_name;
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_from_50ms_and_caps_at_one_second() {
+        // Java: AbstractJdbcDialect table lock (`backoff = min(backoff * 2, MAX)`).
+        let mut interval = DEFAULT_LOCK_POLL_INTERVAL;
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            seen.push(interval.as_millis());
+            interval = next_lock_poll_interval(interval);
+        }
+        assert_eq!(seen, vec![50, 100, 200, 400, 800, 1000, 1000]);
+        // At or past the cap it stays capped.
+        assert_eq!(
+            next_lock_poll_interval(MAX_LOCK_POLL_INTERVAL),
+            MAX_LOCK_POLL_INTERVAL
+        );
+        assert_eq!(
+            next_lock_poll_interval(Duration::from_millis(900)),
+            MAX_LOCK_POLL_INTERVAL
+        );
     }
 }

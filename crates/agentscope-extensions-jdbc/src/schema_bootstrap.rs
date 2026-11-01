@@ -30,6 +30,12 @@ pub(crate) fn run_ddl(
     ddls: &[String],
 ) -> JdbcResult<()> {
     let serialized = dialect.kind() == DialectKind::Postgres;
+    tracing::debug!(
+        dialect = ?dialect.kind(),
+        statements = ddls.len(),
+        serialized,
+        "[jdbc-schema] running bootstrap DDL"
+    );
     if serialized {
         // `execute`, not `query`: `pg_advisory_lock` returns `void`, and a `void` result row
         // has no decodable value.
@@ -41,6 +47,12 @@ pub(crate) fn run_ddl(
     let mut outcome = Ok(());
     for ddl in ddls {
         if let Err(error) = executor.execute(&BoundSql::no_params(ddl.clone())) {
+            tracing::warn!(
+                dialect = ?dialect.kind(),
+                statements = ddls.len(),
+                error = %error,
+                "[jdbc-schema] bootstrap DDL failed"
+            );
             outcome = Err(error);
             break;
         }

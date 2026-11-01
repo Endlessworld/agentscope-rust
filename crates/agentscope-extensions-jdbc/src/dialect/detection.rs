@@ -25,7 +25,7 @@ use super::vendor::{AnsiDialect, MysqlDialect, PostgresDialect, SqliteDialect};
 /// [`crate::JdbcDistributedStore`].
 pub fn detect_dialect(product_name: &str) -> Arc<dyn AbstractJdbcDialect> {
     let lower = product_name.to_ascii_lowercase();
-    if lower.contains("mysql") || lower.contains("mariadb") {
+    let dialect: Arc<dyn AbstractJdbcDialect> = if lower.contains("mysql") || lower.contains("mariadb") {
         Arc::new(MysqlDialect::new())
     } else if lower.contains("postgres") {
         Arc::new(PostgresDialect::new())
@@ -33,7 +33,15 @@ pub fn detect_dialect(product_name: &str) -> Arc<dyn AbstractJdbcDialect> {
         Arc::new(SqliteDialect::new())
     } else {
         Arc::new(AnsiDialect::new())
-    }
+    };
+    // Java logs the SPI candidate it picked; here the same decision is worth a `debug`
+    // because an unexpected fallback to `AnsiDialect` is otherwise invisible.
+    tracing::debug!(
+        product_name,
+        dialect = ?dialect.kind(),
+        "[jdbc-dialect] detected"
+    );
+    dialect
 }
 
 /// Chainable builder for selecting/configuring a dialect, mirroring

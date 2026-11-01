@@ -376,7 +376,10 @@ impl JdbcAgentStateStore {
         );
         match self.executor.execute(&bound) {
             Ok(1) => Ok(expected_version + 1),
-            Ok(_) => Ok(UNVERSIONED),
+            Ok(_) => {
+                self.trace_cas_conflict(&slot, key, expected_version);
+                Ok(UNVERSIONED)
+            }
             Err(e) => Err(e),
         }
     }
@@ -397,9 +400,28 @@ impl JdbcAgentStateStore {
         );
         match self.executor.execute(&bound) {
             Ok(1) => Ok(1),
-            Ok(_) => Ok(UNVERSIONED),
+            Ok(_) => {
+                self.trace_cas_conflict(slot_id, key, 0);
+                Ok(UNVERSIONED)
+            }
             Err(e) => Err(e),
         }
+    }
+
+    /// Emits the CAS-conflict trace of the versioned write paths.
+    ///
+    /// A conflict is not a failure (another writer won), so it is `debug`: the structured
+    /// fields (dialect / table / slot / key / expected version) are what make a retry storm
+    /// readable in the logs.
+    fn trace_cas_conflict(&self, slot_id: &str, key: &str, expected_version: i64) {
+        tracing::debug!(
+            dialect = ?self.dialect.kind(),
+            table = %self.dialect.resolved_session_state_table_name(),
+            slot = %slot_id,
+            key = %key,
+            expected_version,
+            "[jdbc-state] CAS conflict: the stored version no longer matches"
+        );
     }
 
     fn save_single(&self, slot_id: &str, key: &str, json: &str) -> JdbcResult<()> {
@@ -485,6 +507,7 @@ impl JdbcAgentStateStore {
         let current_hash = core_compute_hash(values);
         // Serialize before opening the transaction so a bad value cannot leave one behind.
         let payloads = values.iter().map(Self::json_of).collect::<JdbcResult<Vec<_>>>()?;
+        let mut full_rewrite = false;
 
         self.executor
             .in_transaction(&mut |session: &mut dyn JdbcSession| -> JdbcResult<()> {
@@ -499,6 +522,7 @@ impl JdbcAgentStateStore {
                     core_needs_full_rewrite(values, stored.as_deref(), existing);
 
                 if needs_full_rewrite {
+                    full_rewrite = true;
                     session.execute(&self.dialect.session_state_delete_by_key(slot_id, key))?;
                     for (index, payload) in payloads.iter().enumerate() {
                         session.execute(&self.dialect.session_state_insert(
@@ -533,7 +557,17 @@ impl JdbcAgentStateStore {
                     &current_hash,
                 ))?;
                 Ok(())
-            })
+            })?;
+        tracing::debug!(
+            dialect = ?self.dialect.kind(),
+            table = %self.dialect.resolved_session_state_table_name(),
+            slot = %slot_id,
+            key = %key,
+            rows = values.len(),
+            full_rewrite,
+            "[jdbc-state] list batch written"
+        );
+        Ok(())
     }
 
     // --- Fallible primitives shared by the infallible and `try_*` surfaces ---------------

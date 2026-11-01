@@ -31,9 +31,10 @@ use super::jdbc_guard::{
 };
 use crate::backend::SharedExecutor;
 use crate::dialect::{
-    ExecutorNativeLockProvider, LockLease, LockOutcome, MysqlNativeLockStrategy, NativeLockError,
-    NativeLockSession, NativeLockSessionProvider, PostgresNativeLockStrategy, SandboxLockStrategy,
-    SessionScopedLockSession, DEFAULT_LOCK_POLL_INTERVAL,
+    next_lock_poll_interval, ExecutorNativeLockProvider, LockLease, LockOutcome,
+    MysqlNativeLockStrategy, NativeLockError, NativeLockSession, NativeLockSessionProvider,
+    PostgresNativeLockStrategy, SandboxLockStrategy, SessionScopedLockSession,
+    DEFAULT_LOCK_POLL_INTERVAL,
 };
 
 /// Which native lock identity [`NativeLockGuard`] uses (Java `MysqlDialect` vs
@@ -369,6 +370,7 @@ impl SandboxLockStrategy for NativeProviderStrategy {
             as Box<dyn NativeLockSession>);
         let strategy = self.flavor.strategy(scoped.clone());
         let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+        let mut interval = DEFAULT_LOCK_POLL_INTERVAL;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match strategy.try_enter_once(lock_name, remaining) {
@@ -393,7 +395,8 @@ impl SandboxLockStrategy for NativeProviderStrategy {
                 // Dropping `scoped` closes the session and releases whatever it holds.
                 return Err(LockOutcome::TimedOut);
             }
-            tokio::time::sleep(DEFAULT_LOCK_POLL_INTERVAL.min(remaining)).await;
+            tokio::time::sleep(interval.min(remaining)).await;
+            interval = next_lock_poll_interval(interval);
         }
     }
 }

@@ -357,6 +357,15 @@ fn mysql_snapshot_ddl_uses_longblob() {
 }
 
 #[test]
+fn mysql_snapshot_ddl_declares_the_table_engine_and_charset() {
+    // Java: MysqlDialect.snapshotCreateTableDdls ends with `ENGINE=InnoDB DEFAULT
+    // CHARSET=utf8mb4`; without it the table inherits the server/database default.
+    let ddl = MysqlDialect::new().snapshot_create_table_ddls().remove(0);
+    assert!(ddl.contains("ENGINE=InnoDB"), "{ddl}");
+    assert!(ddl.contains("DEFAULT CHARSET=utf8mb4"), "{ddl}");
+}
+
+#[test]
 fn h2_snapshot_upsert_updates_created_at() {
     // Java: DialectSqlTests.h2SnapshotUpsertUpdatesCreatedAt (H2 -> AnsiDialect)
     let bs = AnsiDialect::new().snapshot_upsert("snap", &[1, 2]);

@@ -13,7 +13,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agentscope_extensions_jdbc::dialect::vendor::SqliteDialect;
 use agentscope_extensions_jdbc::dialect::AbstractJdbcDialect;
@@ -157,6 +157,40 @@ fn lock_provides_mutual_exclusion_across_threads() {
         1,
         "max concurrent holders must be 1"
     );
+}
+
+#[test]
+fn try_enter_keeps_polling_until_the_deadline_but_never_overshoots_it() {
+    // JDBC-08: the retry waits 50/100/200/... ms (capped at 1s) instead of a fixed 50ms, so
+    // the deadline still bounds the whole acquisition (no wait past it beyond the cap).
+    let executor = Arc::new(RusqliteExecutor::in_memory().unwrap());
+    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
+    let holder = JdbcSandboxExecutionGuard::table_lock(executor.clone(), dialect.clone())
+        .unwrap()
+        .with_timeout_seconds(0);
+    let contender = JdbcSandboxExecutionGuard::table_lock(executor, dialect)
+        .unwrap()
+        .with_timeout_seconds(1);
+
+    let isolation_key = key(IsolationScope::Agent, "backoff-agent");
+    let held = holder.try_enter(isolation_key.clone());
+    assert!(held.is_acquired());
+
+    let started = Instant::now();
+    let mut timed_out = contender.try_enter(isolation_key);
+    let elapsed = started.elapsed();
+
+    assert!(!timed_out.is_acquired(), "a held lock must time out");
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "the contender kept retrying until the deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2) + Duration::from_millis(500),
+        "the backoff must be clamped to the remaining budget: {elapsed:?}"
+    );
+    timed_out.release();
+    drop(held);
 }
 
 #[test]

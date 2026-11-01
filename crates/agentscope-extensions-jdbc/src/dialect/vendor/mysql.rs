@@ -138,13 +138,15 @@ impl SnapshotDialect for MysqlDialect {
         // `snapshot_id` is the primary key, so it needs the same binary collation as the
         // other key columns: under a case-insensitive collation two snapshot ids differing
         // only in letter case collide, and the UPSERT silently overwrites the first archive
-        // with the second. The table declares no default charset/collation today, so the
-        // column is fully explicit (`CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`).
+        // with the second. The table-level default stays `utf8mb4` (Java `MysqlDialect`
+        // declares `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4` too), while the key column is
+        // fully explicit (`CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`).
         vec![format!(
             "CREATE TABLE IF NOT EXISTS {} (\
              snapshot_id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY, \
              data LONGBLOB NOT NULL, \
-             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) \
+             ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
             self.resolved_snapshot_table_name()
         )]
     }

@@ -15,7 +15,8 @@ use agentscope_harness::agent::sandbox::{SandboxGuard, SandboxIsolationKey, Sand
 
 use crate::backend::{JdbcResult, SharedExecutor};
 use crate::dialect::{
-    AbstractJdbcDialect, BoundSql, LockLease, LockOutcome, SandboxLockStrategy, SqlParam,
+    next_lock_poll_interval, AbstractJdbcDialect, BoundSql, LockLease, LockOutcome,
+    SandboxLockStrategy, SqlParam, DEFAULT_LOCK_POLL_INTERVAL,
 };
 
 /// Default prefix applied to composed lock names.
@@ -119,7 +120,15 @@ impl TableLockStrategy {
             ),
             vec![SqlParam::Text(lock_name.to_string())],
         );
-        self.executor.execute(&bound).map(|_| ())
+        let released = self.executor.execute(&bound);
+        tracing::debug!(
+            dialect = ?self.dialect.kind(),
+            table = %self.dialect.resolved_lock_table_name(),
+            lock = %lock_name,
+            released = released.is_ok(),
+            "[jdbc-lock] table lock released"
+        );
+        released.map(|_| ())
     }
 }
 
@@ -149,6 +158,12 @@ impl SandboxLockStrategy for TableLockStrategy {
     ) -> Result<LockLease, LockOutcome> {
         match self.insert_lock(lock_name) {
             Ok(1) => {
+                tracing::debug!(
+                    dialect = ?self.dialect.kind(),
+                    table = %self.dialect.resolved_lock_table_name(),
+                    lock = %lock_name,
+                    "[jdbc-lock] table lock acquired"
+                );
                 let name = lock_name.to_string();
                 // Clone the executor+dialect handles into the release closure so the
                 // lease releases the lock when dropped.
@@ -162,7 +177,13 @@ impl SandboxLockStrategy for TableLockStrategy {
                         ),
                         vec![SqlParam::Text(name.clone())],
                     );
-                    let _ = executor.execute(&bound);
+                    let released = executor.execute(&bound);
+                    tracing::debug!(
+                        dialect = ?dialect.kind(),
+                        lock = %name,
+                        released = released.is_ok(),
+                        "[jdbc-lock] table lock lease released"
+                    );
                 }))
             }
             // Row already present (unique violation rendered as 0 affected rows).
@@ -178,6 +199,7 @@ impl SandboxLockStrategy for TableLockStrategy {
     /// [`SandboxLockStrategy::try_enter_async`], which sleeps on the task instead).
     fn try_enter(&self, lock_name: &str, timeout_seconds: u64) -> Result<LockLease, LockOutcome> {
         let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+        let mut interval = DEFAULT_LOCK_POLL_INTERVAL;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.try_enter_once(lock_name, remaining) {
@@ -187,10 +209,13 @@ impl SandboxLockStrategy for TableLockStrategy {
                     return Err(LockOutcome::Failed(message));
                 }
             }
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(LockOutcome::TimedOut);
             }
-            std::thread::sleep(Duration::from_millis(50));
+            // Java: `INITIAL_BACKOFF_MS` doubling up to `MAX_BACKOFF_MS`.
+            std::thread::sleep(interval.min(remaining));
+            interval = next_lock_poll_interval(interval);
         }
     }
 }
