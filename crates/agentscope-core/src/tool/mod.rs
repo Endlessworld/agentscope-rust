@@ -13,9 +13,11 @@ pub mod interceptor;
 pub mod mcp;
 pub mod meta;
 pub mod registration;
+pub mod requirement;
 pub mod result;
 pub mod schema;
 pub mod schema_only_tool;
+pub mod search;
 pub mod suspend;
 pub mod todo;
 pub mod tool;
@@ -37,11 +39,19 @@ pub use mcp::{McpAsyncHandler, McpTool};
 pub use meta::ToolCallParamBuilder;
 pub use meta::{ExtendedModel, MetaToolFactory, SimpleExtendedModel, ToolCallParam};
 pub use registration::ToolRegistration;
+pub use requirement::RequirementProposeTool;
 pub use result::{DefaultToolResultConverter, ToolResultConverter, ToolResultMessageBuilder};
 pub use schema_only_tool::SchemaOnlyTool;
+pub use search::{
+    KeywordToolSearchStrategy, ToolSearchMiddleware, ToolSearchRequest, ToolSearchResult,
+    ToolSearchStrategy, ToolSearchTool,
+};
 pub use suspend::ToolSuspendException;
 pub use todo::TodoWriteTool;
-pub use tool::{FunctionTool, Tool, ToolExecutionContext};
+pub use tool::{
+    FunctionTool, Tool, ToolExecutionContext, CONVERSATION_HISTORY_KEY,
+    MAX_CONVERSATION_HISTORY,
+};
 pub use tool_request_config::{ToolMergeMode, ToolRequestConfig, TOOL_REQUEST_CONFIG_CONTEXT_KEY};
 pub use toolkit::Toolkit;
 pub use validator::ToolValidator;

@@ -555,6 +555,12 @@ pub struct ToolContextState {
     pub activated_groups: Vec<String>,
     #[serde(rename = "spawn_registry", default)]
     pub spawn_registry: std::collections::HashMap<String, SpawnEntry>,
+    /// Tools the model discovered through `tool_search`.
+    ///
+    /// Persisted so a discovery survives history compaction and a protocol change.
+    /// Mirrors Java `ToolContextState.discoveredTools`.
+    #[serde(rename = "discovered_tools", default)]
+    pub discovered_tools: Vec<String>,
 }
 
 impl Default for ToolContextState {
@@ -564,6 +570,7 @@ impl Default for ToolContextState {
             max_cache_bytes: 25_000.0,
             activated_groups: Vec::new(),
             spawn_registry: std::collections::HashMap::new(),
+            discovered_tools: Vec::new(),
         }
     }
 }
@@ -580,6 +587,21 @@ impl ToolContextState {
     }
     pub fn set_activated_groups(&mut self, groups: Vec<String>) {
         self.activated_groups = groups;
+    }
+
+    /// Returns the tools discovered through `tool_search` (Java `getDiscoveredTools`).
+    pub fn discovered_tools(&self) -> &[String] {
+        &self.discovered_tools
+    }
+
+    /// Appends tools discovered through `tool_search`, dropping blanks and duplicates
+    /// (Java `addDiscoveredTools`).
+    pub fn add_discovered_tools(&mut self, tools: impl IntoIterator<Item = String>) {
+        for tool in tools {
+            if !tool.is_empty() && !self.discovered_tools.contains(&tool) {
+                self.discovered_tools.push(tool);
+            }
+        }
     }
 }
 
@@ -628,6 +650,7 @@ impl ToolContextBuilder {
             max_cache_bytes: self.max_cache_bytes.max(10_001.0),
             activated_groups: self.activated_groups,
             spawn_registry: self.spawn_registry,
+            discovered_tools: Vec::new(),
         }
     }
 }

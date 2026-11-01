@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod chat_response;
 pub mod context_windows;
 pub mod execution_config;
+pub mod finish_reasons;
 pub mod generate_options;
 pub mod model;
 pub mod provider;
@@ -25,6 +26,7 @@ pub use catalog::{
 pub use chat_response::{ChatResponse, ChatResponseBuilder};
 pub use context_windows::{resolve_context_window, DEFAULT_CONTEXT_WINDOW};
 pub use execution_config::{ExecutionConfig, ExecutionConfigBuilder};
+pub use finish_reasons::indicates_output_limit;
 pub use generate_options::{GenerateOptions, GenerateOptionsBuilder};
 pub use model::{Model, ModelCapabilities};
 pub use provider::{

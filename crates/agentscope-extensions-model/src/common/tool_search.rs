@@ -3,9 +3,10 @@
 //! Mirrors `io.agentscope.core.tool.search.{ToolSearchMode, ToolSearchTool}` and
 //! `io.agentscope.extensions.model.openaiofficial.tool.ResponsesToolHelper`.
 //!
-//! Search itself lives in core (`ToolSearchMiddleware`); this module only carries
-//! the **model-layer** contract so a provider can encode the discovery loop into
-//! its own protocol:
+//! Search itself lives in core (`agentscope_core::tool::search::ToolSearchMiddleware`,
+//! which also owns `ToolSearchMode` and the result metadata keys re-exported below); this
+//! module only carries the **model-layer** contract so a provider can encode the discovery
+//! loop into its own protocol:
 //!
 //! * `Anthropic` sends the eligible catalog as **deferred** tool definitions and
 //!   returns `tool_reference` blocks for the matches (`ToolSearchMode::Deferred`).
@@ -17,50 +18,22 @@
 //!   function calling (`ToolSearchMode::Function`, the default).
 //!
 //! Core's `Model` trait exposes `tool_search_mode()`, so the two native
-//! providers override it in their `Model` impl; the crate-local enum here is the
-//! metadata spelling used by `mode_of` ([`METADATA_MODE`]).
+//! providers override it in their `Model` impl; the mode enum and the metadata keys are
+//! core's, so a search result is spelled the same on both sides of the seam.
 
 use agentscope_core::message::JsonMap;
 use agentscope_core::ToolSchema;
 use serde_json::{json, Map, Value};
 
-/// Name of the read-only discovery tool (Java `ToolSearchTool.NAME`).
-pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
-/// Metadata key carrying the loading protocol of a search result
-/// (Java `ToolSearchTool.METADATA_MODE`).
-pub const METADATA_MODE: &str = "agentscope.tool_search.mode";
-/// Metadata key carrying the discovered tool schemas
-/// (Java `ToolSearchTool.METADATA_TOOLS`).
-pub const METADATA_TOOLS: &str = "agentscope.tool_search.tools";
+// Single source of truth: core defines the discovery contract.
+pub use agentscope_core::model::ToolSearchMode;
+pub use agentscope_core::tool::search::{
+    DEFAULT_LIMIT, METADATA_MODE, METADATA_TOOLS, TOOL_SEARCH_TOOL_NAME,
+};
+
 /// Metadata key marking a decoded **client-executed** OpenAI `tool_search_call`
 /// (Java `ResponsesToolHelper.CLIENT_TOOL_SEARCH_CALL_METADATA`).
 pub const METADATA_CLIENT_TOOL_SEARCH_CALL: &str = "openai.clientToolSearchCall";
-/// Default result limit of `tool_search` (Java `ToolSearchTool.DEFAULT_LIMIT`).
-pub const DEFAULT_LIMIT: u32 = 5;
-
-/// How a model receives the tools found by a client-side search strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ToolSearchMode {
-    /// Discovered schemas are exposed through ordinary function calling.
-    #[default]
-    Function,
-    /// Discovered definitions are loaded through native client-search items.
-    Client,
-    /// The eligible catalog is sent as deferred definitions; matches are returned
-    /// as references.
-    Deferred,
-}
-
-impl ToolSearchMode {
-    /// The wire/metadata spelling (Java `ToolSearchMode.name()`).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ToolSearchMode::Function => "FUNCTION",
-            ToolSearchMode::Client => "CLIENT",
-            ToolSearchMode::Deferred => "DEFERRED",
-        }
-    }
-}
 
 /// Builds the `tool_search` declaration the middleware registers.
 ///
@@ -102,12 +75,10 @@ pub fn is_tool_search_schema(schema: &ToolSchema) -> bool {
 
 /// The loading protocol recorded on a search result, if any.
 pub fn mode_of(metadata: &JsonMap) -> Option<ToolSearchMode> {
-    match metadata.get(METADATA_MODE).and_then(Value::as_str) {
-        Some("FUNCTION") => Some(ToolSearchMode::Function),
-        Some("CLIENT") => Some(ToolSearchMode::Client),
-        Some("DEFERRED") => Some(ToolSearchMode::Deferred),
-        _ => None,
-    }
+    metadata
+        .get(METADATA_MODE)
+        .and_then(Value::as_str)
+        .and_then(ToolSearchMode::from_wire)
 }
 
 /// The tool schemas discovered by a successful `tool_search` call.

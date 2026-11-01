@@ -2,11 +2,22 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::message::{JsonMap, ToolResultBlock, ToolUseBlock};
+use crate::message::{JsonMap, Msg, ToolResultBlock, ToolUseBlock};
 use crate::model::ToolSchema;
 use std::sync::Arc;
 
 use super::emitter::ToolEmitter;
+
+/// Runtime key carrying the conversation history of the current call, as a JSON array of
+/// [`Msg`]. The wire name matches the Java `conversationHistory` field the built-in tools
+/// read from the agent state.
+pub const CONVERSATION_HISTORY_KEY: &str = "conversationHistory";
+
+/// Maximum number of most-recent messages exposed to a single tool call.
+///
+/// Java hands the whole history to every tool call; the runtime channel caps it here to bound
+/// the per-call serialization cost, so tools see the recent tail only.
+pub const MAX_CONVERSATION_HISTORY: usize = 32;
 
 /// Execution context passed to a tool invocation.
 #[derive(Clone, Default)]
@@ -27,6 +38,18 @@ pub struct ToolExecutionContext {
 }
 
 impl ToolExecutionContext {
+    /// The conversation messages the agent had accumulated when this call was dispatched.
+    ///
+    /// Read from the runtime entry named by [`CONVERSATION_HISTORY_KEY`]. Returns an empty vec
+    /// when the agent exposes no history (no messages yet, or a hand-built context) and when the
+    /// entry is not a readable message list, so a tool never panics on a malformed runtime.
+    pub fn conversation_history(&self) -> Vec<Msg> {
+        self.runtime
+            .get(CONVERSATION_HISTORY_KEY)
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    }
+
     /// Attaches a per-call tool view.
     pub fn with_tool_request_config(
         mut self,
@@ -333,6 +356,47 @@ mod tests {
             serde_json::json!({"type": "object"}),
             Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
         )
+    }
+
+    #[test]
+    fn conversation_history_is_read_from_the_runtime_in_order() {
+        let messages = vec![Msg::user("first"), Msg::user("second")];
+        let mut runtime = JsonMap::new();
+        runtime.insert(
+            CONVERSATION_HISTORY_KEY.to_string(),
+            serde_json::to_value(&messages).unwrap(),
+        );
+        let ctx = ToolExecutionContext {
+            runtime,
+            ..Default::default()
+        };
+        let seen: Vec<String> = ctx
+            .conversation_history()
+            .iter()
+            .map(Msg::text_content)
+            .collect();
+        assert_eq!(seen, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn a_context_without_the_history_key_has_no_history() {
+        assert!(ToolExecutionContext::default()
+            .conversation_history()
+            .is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_conversation_history_is_treated_as_absent() {
+        let mut runtime = JsonMap::new();
+        runtime.insert(
+            CONVERSATION_HISTORY_KEY.to_string(),
+            serde_json::json!({"not": "a message list"}),
+        );
+        let ctx = ToolExecutionContext {
+            runtime,
+            ..Default::default()
+        };
+        assert!(ctx.conversation_history().is_empty());
     }
 
     #[test]

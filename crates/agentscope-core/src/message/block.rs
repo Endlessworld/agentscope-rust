@@ -158,6 +158,24 @@ pub struct ImageBlock {
     /// Maximum pixel threshold for the input image.
     #[serde(rename = "max_pixels", skip_serializing_if = "Option::is_none")]
     pub max_pixels: Option<u32>,
+    /// How much detail the model should spend on the image.
+    ///
+    /// `None` leaves the provider default in place. Mirrors the `detail` field of the
+    /// OpenAI vision content part; other providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ImageDetail>,
+}
+
+/// Level of detail a model should use for an image input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    /// Fewer tokens, coarser understanding of the image.
+    Low,
+    /// More tokens, finer understanding of the image.
+    High,
+    /// Let the provider decide based on the image size.
+    Auto,
 }
 
 impl ImageBlock {
@@ -166,6 +184,7 @@ impl ImageBlock {
             source,
             min_pixels: None,
             max_pixels: None,
+            detail: None,
         }
     }
 
@@ -179,6 +198,7 @@ pub struct ImageBlockBuilder {
     source: Option<Source>,
     min_pixels: Option<u32>,
     max_pixels: Option<u32>,
+    detail: Option<ImageDetail>,
 }
 
 impl ImageBlockBuilder {
@@ -197,11 +217,17 @@ impl ImageBlockBuilder {
         self
     }
 
+    pub fn detail(mut self, detail: ImageDetail) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+
     pub fn build(self) -> ImageBlock {
         ImageBlock {
             source: self.source.expect("ImageBlock requires a source"),
             min_pixels: self.min_pixels,
             max_pixels: self.max_pixels,
+            detail: self.detail,
         }
     }
 }
@@ -961,5 +987,41 @@ mod tests {
     fn final_state_reports_suspended_first() {
         let rb = ToolResultBlock::suspended("awaiting user", "c1", "external");
         assert_eq!(rb.final_state(), ToolResultState::Suspended);
+    }
+
+    #[test]
+    fn image_detail_serializes_as_snake_case() {
+        use crate::message::URLSource;
+
+        let image = ImageBlock::builder()
+            .source(Source::Url(URLSource::new("https://example.com/a.png")))
+            .detail(ImageDetail::High)
+            .build();
+        let value = serde_json::to_value(ContentBlock::Image(image)).unwrap();
+        assert_eq!(value["detail"], serde_json::json!("high"));
+        assert_eq!(
+            serde_json::to_value(ImageDetail::Low).unwrap(),
+            serde_json::json!("low")
+        );
+        assert_eq!(
+            serde_json::to_value(ImageDetail::Auto).unwrap(),
+            serde_json::json!("auto")
+        );
+    }
+
+    #[test]
+    fn an_image_block_without_detail_deserializes_to_none() {
+        let legacy = serde_json::json!({
+            "type": "image",
+            "source": {"type": "url", "url": "https://example.com/a.png"}
+        });
+        let block: ContentBlock = serde_json::from_value(legacy).unwrap();
+        let ContentBlock::Image(image) = block else {
+            panic!("expected an image block");
+        };
+        assert_eq!(image.detail, None);
+        // Unset detail is omitted from the wire form.
+        let value = serde_json::to_value(ContentBlock::Image(image)).unwrap();
+        assert!(value.get("detail").is_none(), "{value}");
     }
 }

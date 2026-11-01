@@ -90,6 +90,9 @@ struct AgentCore {
     toolkit: Toolkit,
     sys_prompt: String,
     max_iters: i32,
+    /// Whether a permission rejection of any tool call ends the turn instead of being fed
+    /// back to the model. Mirrors Java `ReactConfig.stopOnReject` (default `false`).
+    stop_on_reject: bool,
     state: Arc<Mutex<AgentState>>,
     #[allow(dead_code)]
     enable_pending_tool_recovery: bool,
@@ -208,7 +211,10 @@ impl Drop for RunGuard {
 struct ReasoningContext {
     id: String,
     text: String,
-    thinking: String,
+    /// The accumulated thinking block: its text plus the provider metadata
+    /// (`encryptedContent` / `thinkingSignature` / `reasoningDetails`). Streaming must not
+    /// drop the metadata, or replaying a thinking block after a streamed turn loses it.
+    thinking: Option<ThinkingBlock>,
     tool_calls: Vec<ToolUseBlock>,
     tool_results: Vec<ToolResultBlock>,
     usage: Option<ChatUsage>,
@@ -230,7 +236,7 @@ impl ReasoningContext {
         for block in chunk.content {
             match block {
                 ContentBlock::Text(t) => self.text.push_str(&t.text),
-                ContentBlock::Thinking(t) => self.thinking.push_str(&t.thinking),
+                ContentBlock::Thinking(t) => self.accumulate_thinking(t),
                 ContentBlock::ToolUse(t) => self.tool_calls.push(t),
                 ContentBlock::ToolResult(t) => self.tool_results.push(t),
                 _ => {}
@@ -238,6 +244,25 @@ impl ReasoningContext {
         }
         if chunk.usage.total_tokens() > 0 {
             self.usage = Some(chunk.usage);
+        }
+    }
+
+    /// Merges one thinking chunk: text is concatenated, metadata is merged key by key.
+    ///
+    /// A later chunk wins on a conflicting key, and a chunk without metadata (empty map)
+    /// never clears a key an earlier chunk supplied — providers send the payload
+    /// (`encryptedContent`, `thinkingSignature`, `reasoningDetails`) on the last chunk only.
+    fn accumulate_thinking(&mut self, chunk: ThinkingBlock) {
+        if let Some(accumulated) = self.thinking.as_mut() {
+            accumulated.thinking.push_str(&chunk.thinking);
+            if let Some(metadata) = chunk.metadata.filter(|metadata| !metadata.is_empty()) {
+                accumulated
+                    .metadata
+                    .get_or_insert_with(JsonMap::new)
+                    .extend(metadata);
+            }
+        } else {
+            self.thinking = Some(chunk);
         }
     }
 
@@ -255,8 +280,14 @@ impl ReasoningContext {
     fn build_final_message(self) -> Msg {
         let output_limit_reached = self.output_limit_reached();
         let mut blocks = Vec::new();
-        if !self.thinking.is_empty() {
-            blocks.push(ContentBlock::Thinking(ThinkingBlock::new(self.thinking)));
+        if let Some(thinking) = self.thinking.filter(|block| {
+            !block.thinking.is_empty()
+                || block
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| !metadata.is_empty())
+        }) {
+            blocks.push(ContentBlock::Thinking(thinking));
         }
         if !self.text.is_empty() {
             blocks.push(ContentBlock::Text(TextBlock::new(self.text)));
@@ -378,6 +409,12 @@ impl ReActAgent {
     /// Returns the maximum number of reasoning→acting iterations per call.
     pub fn max_iters(&self) -> i32 {
         self.core.max_iters
+    }
+
+    /// Whether a permission rejection of any tool call ends the turn (mirrors Java
+    /// `ReActAgent`'s `ReactConfig.stopOnReject`).
+    pub fn stop_on_reject(&self) -> bool {
+        self.core.stop_on_reject
     }
 
     /// Whether orphaned pending tool calls are auto-patched with synthetic error
@@ -1256,6 +1293,7 @@ pub struct ReActAgentBuilder {
     toolkit: Option<Toolkit>,
     sys_prompt: String,
     max_iters: i32,
+    stop_on_reject: bool,
     middleware_chain: Option<MiddlewareChain>,
     state: Option<AgentState>,
     enable_pending_tool_recovery: bool,
@@ -1283,6 +1321,7 @@ impl Default for ReActAgentBuilder {
             toolkit: None,
             sys_prompt: String::new(),
             max_iters: 0,
+            stop_on_reject: false,
             middleware_chain: None,
             state: None,
             enable_pending_tool_recovery: false,
@@ -1375,6 +1414,13 @@ impl ReActAgentBuilder {
     /// Sets the maximum reasoning→acting iterations (default 10).
     pub fn max_iters(mut self, max_iters: i32) -> Self {
         self.max_iters = max_iters;
+        self
+    }
+    /// Ends the turn when a tool call is rejected by the permission engine, instead of
+    /// feeding the rejection back to the model for another iteration (default `false`).
+    /// Mirrors Java `ReActAgent.Builder.stopOnReject` / `ReactConfig.stopOnReject`.
+    pub fn stop_on_reject(mut self, stop_on_reject: bool) -> Self {
+        self.stop_on_reject = stop_on_reject;
         self
     }
     /// Sets the middleware chain.
@@ -1502,6 +1548,7 @@ impl ReActAgentBuilder {
             toolkit,
             sys_prompt: self.sys_prompt,
             max_iters,
+            stop_on_reject: self.stop_on_reject,
             state: Arc::new(Mutex::new(initial_state)),
             enable_pending_tool_recovery: self.enable_pending_tool_recovery,
             permission_engine: Mutex::new(PermissionEngine::new(
@@ -1780,6 +1827,14 @@ async fn execute_iteration(
         // existed. Mirrors Java `emitAllToolsDeniedThroughMiddleware`.
         if all_tool_calls_denied(state, &round_calls) {
             if let Some(reason) = emit_all_tools_denied(core, ctx, &round_calls).await {
+                return Ok(last_assistant_message_with_reason(state, reason));
+            }
+        }
+        // `stop_on_reject`: a rejection ends the turn instead of feeding it back to the
+        // model for another iteration. Mirrors Java `ReactConfig.stopOnReject`; the default
+        // (`false`) keeps the pre-existing loop, which retries after the denial.
+        if core.stop_on_reject {
+            if let Some(reason) = rejected_turn_reason(state, &round_calls) {
                 return Ok(last_assistant_message_with_reason(state, reason));
             }
         }
@@ -3029,8 +3084,9 @@ fn tool_request_config(
 }
 
 /// Builds the JSON runtime exposed to a tool call, carrying the call-scoped
-/// identity (session / user / agent) plus any metadata the agent recorded.
-fn tool_runtime(ctx: &crate::agent::RuntimeContext) -> JsonMap {
+/// identity (session / user / agent), the recent conversation history plus any
+/// metadata the agent recorded.
+fn tool_runtime(ctx: &crate::agent::RuntimeContext, history: &[Msg]) -> JsonMap {
     let mut rt = ctx.metadata.clone();
     if let Some(sid) = ctx.session_id() {
         rt.insert(
@@ -3049,6 +3105,18 @@ fn tool_runtime(ctx: &crate::agent::RuntimeContext) -> JsonMap {
             "agentId".to_string(),
             serde_json::Value::String(aid.to_string()),
         );
+    }
+    // Tools that need "what was said so far" read the history from this entry instead of a
+    // structural field on `ToolExecutionContext`. Only the tail is passed: Java hands the
+    // whole history to every tool call, the runtime channel caps it to bound the per-call
+    // serialization cost. No messages means no key at all.
+    if !history.is_empty() {
+        let start = history
+            .len()
+            .saturating_sub(crate::tool::MAX_CONVERSATION_HISTORY);
+        if let Ok(value) = serde_json::to_value(&history[start..]) {
+            rt.insert(crate::tool::CONVERSATION_HISTORY_KEY.to_string(), value);
+        }
     }
     rt
 }
@@ -3075,7 +3143,7 @@ async fn acting_phase(
     }
 
     let reply_id = current_reply_id(state);
-    let runtime = tool_runtime(ctx);
+    let runtime = tool_runtime(ctx, state.context());
     let output_limit_reached = last_assistant_reached_output_limit(state);
     // Plan-mode enforcement (mirrors Java `PlanModeMiddleware.onActing`) is the only
     // acting decision that reads `AgentState`; resolve it up front so the execution
@@ -4242,6 +4310,31 @@ fn all_tool_calls_denied(state: &AgentState, calls: &[ToolUseBlock]) -> bool {
         }
     }
     states.len() == ids.len() && states.values().all(|s| *s == ToolResultState::Denied)
+}
+
+/// The reason a round's permission rejections end the turn under `stopOnReject`, or `None`
+/// when no call of the round was denied.
+///
+/// A round whose every call was denied reports `AllToolsDenied`; a partial rejection reports
+/// `ActingStopRequested`, because the acting phase was cut short instead of running every call.
+fn rejected_turn_reason(state: &AgentState, calls: &[ToolUseBlock]) -> Option<GenerateReason> {
+    if !calls.iter().any(|call| call_denied(state, &call.id)) {
+        return None;
+    }
+    Some(if all_tool_calls_denied(state, calls) {
+        GenerateReason::AllToolsDenied
+    } else {
+        GenerateReason::ActingStopRequested
+    })
+}
+
+/// Whether the tool result recorded for `id` in `state` is `Denied`.
+fn call_denied(state: &AgentState, id: &str) -> bool {
+    state.context().iter().any(|message| {
+        message.tool_result_blocks().any(|result| {
+            result.id.as_deref() == Some(id) && result.final_state() == ToolResultState::Denied
+        })
+    })
 }
 
 /// Emits `AllToolsDenied` through the acting middleware chain, giving middlewares the
@@ -5732,6 +5825,116 @@ mod tests {
         assert!(message
             .metadata()
             .get(crate::message::metadata_keys::OUTPUT_LIMIT_REACHED)
+            .is_none());
+    }
+
+    #[test]
+    fn streamed_thinking_chunks_keep_their_metadata() {
+        let mut first = ThinkingBlock::new("let me think");
+        first.metadata = Some(JsonMap::from_iter([(
+            "encryptedContent".to_string(),
+            serde_json::json!("cipher-1"),
+        )]));
+        let mut second = ThinkingBlock::new(" harder");
+        second.metadata = Some(JsonMap::from_iter([(
+            "thinkingSignature".to_string(),
+            serde_json::json!("sig-1"),
+        )]));
+
+        let mut context = ReasoningContext::default();
+        for chunk in [first, second] {
+            context.accumulate(
+                ChatResponse::builder()
+                    .content(vec![ContentBlock::Thinking(chunk)])
+                    .build(),
+            );
+        }
+
+        let message = context.build_final_message();
+        let thinking = message
+            .content()
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Thinking(block) => Some(block),
+                _ => None,
+            })
+            .expect("the merged thinking block must survive");
+        assert_eq!(thinking.thinking, "let me think harder");
+        let metadata = thinking.metadata.as_ref().expect("metadata must survive");
+        assert_eq!(
+            metadata.get("encryptedContent"),
+            Some(&serde_json::json!("cipher-1"))
+        );
+        assert_eq!(
+            metadata.get("thinkingSignature"),
+            Some(&serde_json::json!("sig-1"))
+        );
+    }
+
+    #[test]
+    fn a_thinking_chunk_without_metadata_does_not_clear_earlier_keys() {
+        let mut with_metadata = ThinkingBlock::new("step one");
+        with_metadata.metadata = Some(JsonMap::from_iter([(
+            "encryptedContent".to_string(),
+            serde_json::json!("cipher-1"),
+        )]));
+        let mut empty_metadata = ThinkingBlock::new(" step two");
+        empty_metadata.metadata = Some(JsonMap::new());
+        let mut replacement = ThinkingBlock::new(" step three");
+        replacement.metadata = Some(JsonMap::from_iter([(
+            "encryptedContent".to_string(),
+            serde_json::json!("cipher-2"),
+        )]));
+
+        let mut context = ReasoningContext::default();
+        for chunk in [with_metadata, empty_metadata, replacement] {
+            context.accumulate(
+                ChatResponse::builder()
+                    .content(vec![ContentBlock::Thinking(chunk)])
+                    .build(),
+            );
+        }
+
+        let message = context.build_final_message();
+        let thinking = message
+            .content()
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Thinking(block) => Some(block),
+                _ => None,
+            })
+            .expect("the merged thinking block must survive");
+        assert_eq!(thinking.thinking, "step one step two step three");
+        assert_eq!(
+            thinking.metadata.as_ref().and_then(|m| m.get("encryptedContent")),
+            Some(&serde_json::json!("cipher-2")),
+            "the empty map must not clear a key, a later value must win"
+        );
+    }
+
+    #[test]
+    fn tool_runtime_exposes_only_the_most_recent_messages() {
+        let history: Vec<Msg> = (0..40).map(|i| Msg::user(format!("m{i}"))).collect();
+        let runtime = tool_runtime(&crate::agent::RuntimeContext::new(), &history);
+        let ctx = ToolExecutionContext {
+            runtime,
+            ..Default::default()
+        };
+        let seen: Vec<String> = ctx
+            .conversation_history()
+            .iter()
+            .map(Msg::text_content)
+            .collect();
+        assert_eq!(seen.len(), crate::tool::MAX_CONVERSATION_HISTORY);
+        assert_eq!(seen.first().map(String::as_str), Some("m8"));
+        assert_eq!(seen.last().map(String::as_str), Some("m39"));
+    }
+
+    #[test]
+    fn tool_runtime_omits_the_history_entry_when_there_is_nothing_to_share() {
+        let runtime = tool_runtime(&crate::agent::RuntimeContext::new(), &[]);
+        assert!(runtime
+            .get(crate::tool::CONVERSATION_HISTORY_KEY)
             .is_none());
     }
 
@@ -7434,6 +7637,112 @@ mod tests {
         assert_eq!(reply.text_content(), "done");
         assert_eq!(*seen.lock().unwrap(), 0, "one allowed call disqualifies the round");
         assert_eq!(*counter.lock().unwrap(), 0, "the denied call never runs");
+    }
+
+    #[tokio::test]
+    async fn stop_on_reject_is_off_by_default_so_a_denial_is_fed_back() {
+        // The default must keep the pre-existing loop: the rejection is reported to the model
+        // as a tool result and the turn continues.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", JsonMap::new()),
+                text_response("done"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-stop-on-reject-off")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(deny_add())
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        assert!(!agent.stop_on_reject());
+        assert_eq!(reply.text_content(), "done");
+        assert_eq!(reply.generate_reason(), GenerateReason::ModelStop);
+        assert_eq!(*counter.lock().unwrap(), 0, "the denied call never runs");
+    }
+
+    #[tokio::test]
+    async fn stop_on_reject_ends_an_all_denied_turn_without_another_reasoning_round() {
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        // Only one response: a second reasoning round would return `done` instead.
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response("c1", "add", JsonMap::new())],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-stop-on-reject-on")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(deny_add())
+            .stop_on_reject(true)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        assert!(agent.stop_on_reject());
+        assert_ne!(reply.text_content(), "done");
+        assert_eq!(reply.generate_reason(), GenerateReason::AllToolsDenied);
+        assert_eq!(*counter.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_on_reject_also_ends_a_partially_denied_turn() {
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "echo",
+            "echoes its input",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_args: JsonMap, _ctx: ToolExecutionContext| {
+                Ok(ToolResultBlock::text("echoed"))
+            }),
+        )));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![ChatResponse::builder()
+                .content(vec![
+                    ContentBlock::ToolUse(ToolUseBlock::new("c1", "add", JsonMap::new())),
+                    ContentBlock::ToolUse(ToolUseBlock::new("c2", "echo", JsonMap::new())),
+                ])
+                .build()],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-stop-on-reject-partial")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(
+                PermissionContextState::builder()
+                    .add_deny_rule(
+                        "add",
+                        PermissionRule::new("add", None, PermissionBehavior::Deny, "test"),
+                    )
+                    .add_allow_rule(
+                        "echo",
+                        PermissionRule::new("echo", None, PermissionBehavior::Allow, "test"),
+                    )
+                    .build(),
+            )
+            .stop_on_reject(true)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+
+        // The allowed call still ran; the rejection is what ended the turn.
+        assert_eq!(reply.generate_reason(), GenerateReason::ActingStopRequested);
+        assert_eq!(*counter.lock().unwrap(), 0);
     }
 
     #[test]

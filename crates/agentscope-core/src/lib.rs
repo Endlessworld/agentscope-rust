@@ -52,9 +52,9 @@ pub use interruption::{InterruptContext, InterruptControl, InterruptSource};
 pub use memory::{InMemoryMemory, Memory, StateBackedMemory};
 pub use message::{
     metadata_keys, AudioBlock, Base64Source, ChatUsage, ContentBlock, DataBlock, GenerateReason,
-    HintBlock, ImageBlock, JsonMap, Msg, MsgBuilder, MsgRole, Source, TextBlock, ThinkingBlock,
-    ToolCallState, ToolExecutionDetails, ToolExecutionOutcome, ToolResultBlock, ToolResultState,
-    ToolUseBlock, URLSource, VideoBlock,
+    HintBlock, ImageBlock, ImageDetail, JsonMap, Msg, MsgBuilder, MsgRole, Source, TextBlock,
+    ThinkingBlock, ToolCallState, ToolExecutionDetails, ToolExecutionOutcome, ToolResultBlock,
+    ToolResultState, ToolUseBlock, URLSource, VideoBlock,
 };
 pub use middleware::{
     ActingInput, ActingResultsHandle, ActingResultsSnapshot, AgentInput, ExtensionPoint,
@@ -62,10 +62,11 @@ pub use middleware::{
     TaskReminderMiddleware,
 };
 pub use model::{
-    resolve_context_window, CachePolicy, ChatResponse, ChatResponseBuilder, ExecutionConfig,
-    ExecutionConfigBuilder, GenerateOptions, GenerateOptionsBuilder, Model, ModelCapabilities,
-    ModelCreationContext, ModelProvider, ModelProviderSupport, ModelRegistry, ModelUtils,
-    StructuredOutputReminder, ToolChoice, ToolSchema, ToolSearchMode, DEFAULT_PROVIDER_ID,
+    indicates_output_limit, resolve_context_window, CachePolicy, ChatResponse, ChatResponseBuilder,
+    ExecutionConfig, ExecutionConfigBuilder, GenerateOptions, GenerateOptionsBuilder, Model,
+    ModelCapabilities, ModelCreationContext, ModelProvider, ModelProviderSupport, ModelRegistry,
+    ModelUtils, StructuredOutputReminder, ToolChoice, ToolSchema, ToolSearchMode,
+    DEFAULT_PROVIDER_ID,
 };
 pub use observation::{
     observe_action, status_of, ActionObservation, ActionObserver, ActionStatus, ObserverHandle,
@@ -81,17 +82,18 @@ pub use shutdown::{
 };
 pub use state::{
     compute_hash, has_changed, needs_full_rewrite, AgentState, AgentStateStore, ConflictPolicy,
-    EvidenceBinding, InMemoryAgentStateStore, JsonFileAgentStateStore, PlanModeContextState,
-    ReadCacheEntry, SessionInfo, Task, TaskContextState, TaskState, TaskVerification,
-    ToolContextState, VerificationOutcome,
+    EvidenceBinding, InMemoryAgentStateStore, JsonFileAgentStateStore, LegacyLoadResult,
+    PlanModeContextState, ReadCacheEntry, SessionInfo, Task, TaskContextState, TaskState,
+    TaskVerification, ToolkitState, ToolContextState, VerificationOutcome,
 };
 pub use tool::{
     is_dangerous_command, is_dangerous_path, DefaultToolResultConverter, ExtendedModel,
-    FunctionTool, MetaToolFactory, SchemaOnlyTool, SimpleExtendedModel, TodoWriteTool, Tool,
-    ToolCallParam, ToolCallInterceptor, ToolExecutionContext, ToolExecutor, ToolGroup,
-    ToolGroupBuilder, ToolGroupManager, ToolGroupScope, ToolInvocation, ToolRegistration,
-    ToolResultConverter,
-    ToolResultMessageBuilder, ToolSuspendException, ToolValidator, Toolkit, ToolkitConfig,
-    ToolkitConfigBuilder,
+    FunctionTool, KeywordToolSearchStrategy, MetaToolFactory, RequirementProposeTool,
+    SchemaOnlyTool, SimpleExtendedModel,
+    TodoWriteTool, Tool, ToolCallParam, ToolCallInterceptor, ToolExecutionContext, ToolExecutor,
+    ToolGroup, ToolGroupBuilder, ToolGroupManager, ToolGroupScope, ToolInvocation,
+    ToolRegistration, ToolResultConverter, ToolResultMessageBuilder, ToolSearchMiddleware,
+    ToolSearchRequest, ToolSearchResult, ToolSearchStrategy, ToolSearchTool, ToolSuspendException,
+    ToolValidator, Toolkit, ToolkitConfig, ToolkitConfigBuilder,
 };
 pub use tracing::{init_tracing, init_tracing_with_filter};
