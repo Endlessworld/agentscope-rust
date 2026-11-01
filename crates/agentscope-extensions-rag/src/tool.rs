@@ -6,10 +6,11 @@
 //! an **error result** rather than a failed call (Java `onErrorResume`).
 //!
 //! Java read the conversation history from the agent state
-//! (`RuntimeContext.resolveAgentState(ctx, agent).getContext()`). A Rust tool call only receives
-//! the call-scoped JSON runtime (`sessionId` / `userId` / `agentId` plus metadata), so the history
-//! is supplied through the [`ConversationHistorySource`] seam; without a source the config keeps
-//! Java's `null` history. See tracker §4.2.
+//! (`RuntimeContext.resolveAgentState(ctx, agent).getContext()`). Rust exposes the same data over
+//! the call's runtime channel ([`ToolExecutionContext::conversation_history`], key
+//! `conversationHistory`), so a default assembly needs no extra wiring; an installed
+//! [`ConversationHistorySource`] is an explicit override that takes precedence. No history keeps
+//! Java's `null`.
 
 use std::sync::Arc;
 
@@ -29,10 +30,10 @@ pub const RETRIEVE_KNOWLEDGE_TOOL_NAME: &str = "retrieve_knowledge";
 /// Java `KnowledgeRetrievalTools.retrieveKnowledge` default for the optional `limit`.
 pub const DEFAULT_RETRIEVE_LIMIT: usize = 5;
 
-/// Supplies the conversation history Java read from the agent state.
+/// Supplies an explicit conversation history, overriding the call's runtime channel.
 ///
-/// The call context carries only the JSON runtime map, so a host that needs context-aware
-/// backends (e.g. Bailian's `queryHistory`) installs this source at construction time.
+/// The runtime channel already carries the agent's recent messages, so this is only needed when a
+/// host wants a different view (e.g. a longer history for Bailian's `queryHistory`).
 pub type ConversationHistorySource = dyn Fn(&ToolExecutionContext) -> Vec<Msg> + Send + Sync;
 
 /// Agentic RAG: `retrieve_knowledge`, implemented on the core [`Tool`] trait.
@@ -66,7 +67,8 @@ impl KnowledgeRetrievalTool {
         }
     }
 
-    /// Installs the source that fills `RetrieveConfig::conversation_history` per call.
+    /// Installs an explicit source for `RetrieveConfig::conversation_history`, overriding the
+    /// runtime channel [`ToolExecutionContext::conversation_history`].
     pub fn with_history_source(mut self, source: Arc<ConversationHistorySource>) -> Self {
         self.history_source = Some(source);
         self
@@ -80,6 +82,16 @@ impl KnowledgeRetrievalTool {
     /// The default retrieval configuration (Java `getDefaultConfig`).
     pub fn default_config(&self) -> &RetrieveConfig {
         &self.default_config
+    }
+
+    /// The history Java took from the agent state: an installed source wins, otherwise the
+    /// call's runtime channel (an empty history keeps Java's `null`).
+    fn conversation_history(&self, ctx: &ToolExecutionContext) -> Option<Vec<Msg>> {
+        if let Some(source) = &self.history_source {
+            return Some(source(ctx));
+        }
+        let history = ctx.conversation_history();
+        (!history.is_empty()).then_some(history)
     }
 }
 
@@ -140,9 +152,7 @@ impl Tool for KnowledgeRetrievalTool {
 
         let mut config = self.default_config.clone();
         config.limit = limit_arg(&args)?;
-        if let Some(source) = &self.history_source {
-            config.conversation_history = Some(source(&ctx));
-        }
+        config.conversation_history = self.conversation_history(&ctx);
 
         match self.knowledge.retrieve(query, &config).await {
             Ok(documents) => Ok(ToolResultBlock::success(format_documents_for_tool(
@@ -161,7 +171,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use agentscope_core::message::ToolResultState;
+    use agentscope_core::message::{MsgRole, ToolResultState};
 
     use crate::error::{RagError, Result};
     use crate::model::{Document, DocumentMetadata};
@@ -292,6 +302,66 @@ mod tests {
 
         let config = knowledge.last_config();
         assert_eq!(config.conversation_history.unwrap().len(), 1);
+    }
+
+    /// A call context whose runtime carries the agent's conversation history.
+    fn context_with_history(history: &[Msg]) -> ToolExecutionContext {
+        let mut context = ToolExecutionContext::default();
+        context.runtime.insert(
+            agentscope_core::tool::CONVERSATION_HISTORY_KEY.to_string(),
+            serde_json::to_value(history).unwrap(),
+        );
+        context
+    }
+
+    #[tokio::test]
+    async fn the_runtime_conversation_history_fills_the_retrieve_config() {
+        let knowledge = Arc::new(RecordingKnowledge::new(vec![]));
+        let history = vec![
+            Msg::text(MsgRole::User, "earlier"),
+            Msg::text(MsgRole::Assistant, "answer"),
+        ];
+
+        tool(knowledge.clone())
+            .call(args(json!({ "query": "hello" })), context_with_history(&history))
+            .await
+            .unwrap();
+
+        let filled = knowledge.last_config().conversation_history.unwrap();
+        assert_eq!(filled.len(), 2);
+        assert_eq!(filled[0].text_content(), "earlier");
+        assert_eq!(filled[1].text_content(), "answer");
+    }
+
+    #[tokio::test]
+    async fn a_call_without_runtime_history_keeps_the_config_none() {
+        let knowledge = Arc::new(RecordingKnowledge::new(vec![]));
+        tool(knowledge.clone())
+            .call(args(json!({ "query": "hello" })), ToolExecutionContext::default())
+            .await
+            .unwrap();
+
+        assert_eq!(knowledge.last_config().conversation_history, None);
+    }
+
+    #[tokio::test]
+    async fn the_history_source_overrides_the_runtime_conversation_history() {
+        let knowledge = Arc::new(RecordingKnowledge::new(vec![]));
+        let runtime_history = vec![Msg::text(MsgRole::User, "from runtime")];
+        let injected = vec![Msg::text(MsgRole::User, "from source")];
+        let tool =
+            tool(knowledge.clone()).with_history_source(Arc::new(move |_ctx| injected.clone()));
+
+        tool.call(
+            args(json!({ "query": "hello" })),
+            context_with_history(&runtime_history),
+        )
+        .await
+        .unwrap();
+
+        let filled = knowledge.last_config().conversation_history.unwrap();
+        assert_eq!(filled.len(), 1);
+        assert_eq!(filled[0].text_content(), "from source");
     }
 
     #[tokio::test]
