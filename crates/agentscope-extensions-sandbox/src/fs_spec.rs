@@ -1615,6 +1615,57 @@ mod tests {
         assert_eq!(rest.content, "l2\nl3\n");
     }
 
+    #[tokio::test]
+    async fn adapter_write_creates_parent_without_command_substitution() {
+        // Java e190a8d1b: the docker CLI on Windows hosts mangles arguments carrying a
+        // double-quoted `"$(dirname ...)"` before the container shell sees them. The parent
+        // must be computed here and passed as a single-quoted literal.
+        let sandbox = Arc::new(FakeSandbox::default());
+        let fs = SandboxFilesystemAdapter::new(sandbox.clone(), "/workspace", ".");
+        let ctx = RuntimeContext::new();
+        Filesystem::write(&fs, &ctx, "my docs/new file.txt", "hello")
+            .await
+            .unwrap();
+        let commands = sandbox.commands.lock().unwrap().clone();
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("mkdir -p '/workspace/my docs'")),
+            "parent with spaces must be a single-quoted literal: {commands:?}"
+        );
+        for command in &commands {
+            assert!(
+                !command.contains("$("),
+                "no command substitution: {command}"
+            );
+            assert!(!command.contains('"'), "no double quotes: {command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_move_creates_parent_without_command_substitution() {
+        let sandbox = Arc::new(FakeSandbox::default());
+        let fs = SandboxFilesystemAdapter::new(sandbox.clone(), "/workspace", ".");
+        let ctx = RuntimeContext::new();
+        Filesystem::move_path(&fs, &ctx, "a.txt", "my docs/new file.txt")
+            .await
+            .unwrap();
+        let commands = sandbox.commands.lock().unwrap().clone();
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("mkdir -p '/workspace/my docs'")),
+            "parent with spaces must be a single-quoted literal: {commands:?}"
+        );
+        for command in &commands {
+            assert!(
+                !command.contains("$("),
+                "no command substitution: {command}"
+            );
+            assert!(!command.contains('"'), "no double quotes: {command}");
+        }
+    }
+
     #[test]
     fn apply_line_window_matches_sed_windows() {
         let text = "a\nb\nc\nd\n";
