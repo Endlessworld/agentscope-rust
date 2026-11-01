@@ -198,6 +198,12 @@ pub trait HigressMcpTransport: Send + Sync {
     async fn connect_server(&self, request: McpConnectRequest) -> Result<()>;
     /// Returns the connected client id for `server`, if any.
     async fn find_client_id_by_server(&self, server: &str) -> Option<String>;
+    /// Returns the endpoint of the connection currently registered for `server`.
+    ///
+    /// `None` when nothing is connected (or the connection has no URL), so a
+    /// caller never compares against a phantom endpoint. Used before reusing an
+    /// existing connection (HIGRESS-04).
+    async fn connected_server_url(&self, server: &str) -> Option<String>;
     /// Lists the tools discovered for `client_id`.
     async fn list_tools(&self, client_id: &str) -> Result<Vec<McpToolInfo>>;
     /// Calls a tool on the connected client for `server`.
@@ -252,6 +258,13 @@ impl HigressMcpTransport for McpClientManager {
 
     async fn find_client_id_by_server(&self, server: &str) -> Option<String> {
         McpClientManager::find_client_id_by_server(self, server).await
+    }
+
+    async fn connected_server_url(&self, server: &str) -> Option<String> {
+        let client_id = McpClientManager::find_client_id_by_server(self, server).await?;
+        McpClientManager::get_client(self, &client_id)
+            .await
+            .and_then(|client| client.config.url)
     }
 
     async fn list_tools(&self, client_id: &str) -> Result<Vec<McpToolInfo>> {
@@ -672,13 +685,14 @@ impl HigressMcpClientWrapper {
 
         // A connection for this server may already exist on the shared manager
         // (another wrapper, or a previous initialize). Reuse it rather than
-        // opening a second one.
+        // opening a second one — but only if it points at the same endpoint.
         if self
             .connection
             .find_client_id_by_server(&self.name)
             .await
             .is_some()
         {
+            self.ensure_reusable_endpoint().await?;
             tracing::debug!(
                 "Higress MCP client '{}' reusing existing connection",
                 self.name
@@ -723,6 +737,31 @@ impl HigressMcpClientWrapper {
         }
     }
 
+    /// Rejects reusing a connection whose endpoint is not this wrapper's own.
+    ///
+    /// Before this check a second wrapper carrying the same client name but a
+    /// different endpoint bound to the first one's connection, silently dropping
+    /// the new endpoint (HIGRESS-04). Java never reaches this state because every
+    /// wrapper owns its own delegate; failing loudly keeps the reuse optimisation
+    /// (HIGRESS-X03) without losing a configuration change. A wrapper built with
+    /// [`with_options`](Self::with_options) has no endpoint of its own, so the
+    /// pre-existing connection is reused as documented there.
+    async fn ensure_reusable_endpoint(&self) -> Result<()> {
+        let (Some(existing), Some(own)) = (
+            self.connection.connected_server_url(&self.name).await,
+            self.server_config.url.clone(),
+        ) else {
+            return Ok(());
+        };
+        if existing != own {
+            return Err(Error::Other(format!(
+                "Higress MCP client '{}' is already connected to '{}'; refusing to reuse that connection for '{}'",
+                self.name, existing, own
+            )));
+        }
+        Ok(())
+    }
+
     /// Applies the configured per-request `timeout` to one MCP operation.
     async fn with_request_timeout<F, T>(&self, operation: &str, future: F) -> Result<T>
     where
@@ -743,6 +782,23 @@ impl HigressMcpClientWrapper {
     /// configured query and returns only the semantically relevant tools;
     /// otherwise delegates to the underlying MCP server's full tool list.
     pub async fn list_tools(&self) -> Result<Vec<Tool>> {
+        Ok(self
+            .list_tool_specs()
+            .await?
+            .into_iter()
+            .map(|(tool, _)| tool)
+            .collect())
+    }
+
+    /// Lists the gateway's tools together with each tool's **raw** input schema.
+    ///
+    /// The typed [`Tool`] is exactly what [`list_tools`](Self::list_tools)
+    /// returns; the raw schema is the gateway's own JSON value, which the shared
+    /// `McpToolSource` port cannot carry because `rust_mcp_sdk`'s
+    /// `ToolInputSchema` is a closed struct (HIGRESS-01). Registration uses it so
+    /// root keywords (`$defs`, `additionalProperties`, boolean sub-schemas) still
+    /// reach the model, as they do in Java (raw schema map, `putAll`).
+    pub async fn list_tool_specs(&self) -> Result<Vec<(Tool, Value)>> {
         if self.enable_tool_search {
             let query = self.tool_search_query.clone().unwrap_or_default();
             tracing::info!(
@@ -761,14 +817,23 @@ impl HigressMcpClientWrapper {
                 tracing::error!("Tool search failed: {}", msg);
                 return Err(Error::Other(format!("Tool search failed: {}", msg)));
             }
-            let tools: Vec<Tool> = result.tools().iter().map(convert_to_mcp_tool).collect();
+            let specs: Vec<(Tool, Value)> = result
+                .tools()
+                .iter()
+                .map(|info| {
+                    (
+                        convert_to_mcp_tool(info),
+                        info.input_schema.clone().unwrap_or(Value::Null),
+                    )
+                })
+                .collect();
             tracing::info!(
                 "Tool search returned {} tools: {:?}",
-                tools.len(),
+                specs.len(),
                 result.tool_names()
             );
-            self.cache_tools(&tools);
-            Ok(tools)
+            self.cache_tools(specs.iter().map(|(tool, _)| tool));
+            Ok(specs)
         } else {
             let client_id = self
                 .with_request_timeout("find_client", async {
@@ -786,14 +851,17 @@ impl HigressMcpClientWrapper {
             let infos = self
                 .with_request_timeout("list_tools", self.connection.list_tools(&client_id))
                 .await?;
-            let tools: Vec<Tool> = infos.iter().map(mcp_tool_info_to_tool).collect();
-            self.cache_tools(&tools);
+            let specs: Vec<(Tool, Value)> = infos
+                .iter()
+                .map(|info| (mcp_tool_info_to_tool(info), info.parameters.clone()))
+                .collect();
+            self.cache_tools(specs.iter().map(|(tool, _)| tool));
             tracing::debug!(
                 "Higress MCP client '{}' discovered {} tools",
                 self.name,
-                tools.len()
+                specs.len()
             );
-            Ok(tools)
+            Ok(specs)
         }
     }
 
@@ -914,7 +982,7 @@ impl HigressMcpClientWrapper {
         self.cached_tools.lock().unwrap().clear();
     }
 
-    fn cache_tools(&self, tools: &[Tool]) {
+    fn cache_tools<'a>(&self, tools: impl IntoIterator<Item = &'a Tool>) {
         let mut cache = self.cached_tools.lock().unwrap();
         for tool in tools {
             cache.insert(tool.name.clone(), tool.clone());
@@ -1118,6 +1186,8 @@ mod tests {
     struct RecordingConnection {
         requests: Mutex<Vec<McpConnectRequest>>,
         connected: Mutex<HashMap<String, Vec<McpToolInfo>>>,
+        /// Endpoint registered per server name, for the reuse guard (HIGRESS-04).
+        server_urls: Mutex<HashMap<String, String>>,
         tools: Vec<McpToolInfo>,
         connect_error: Mutex<Option<String>>,
         connect_delay: Mutex<Option<Duration>>,
@@ -1164,6 +1234,12 @@ mod tests {
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
+            if let Some(url) = request.server.url.clone() {
+                self.server_urls
+                    .lock()
+                    .unwrap()
+                    .insert(request.server.name.clone(), url);
+            }
             self.connected
                 .lock()
                 .unwrap()
@@ -1177,6 +1253,10 @@ mod tests {
                 .unwrap()
                 .contains_key(server)
                 .then(|| server.to_string())
+        }
+
+        async fn connected_server_url(&self, server: &str) -> Option<String> {
+            self.server_urls.lock().unwrap().get(server).cloned()
         }
 
         async fn list_tools(&self, client_id: &str) -> Result<Vec<McpToolInfo>> {
@@ -1212,6 +1292,7 @@ mod tests {
 
         async fn disconnect_by_server(&self, server: &str) -> Result<()> {
             self.connected.lock().unwrap().remove(server);
+            self.server_urls.lock().unwrap().remove(server);
             Ok(())
         }
     }
@@ -1283,6 +1364,50 @@ mod tests {
         wrapper.initialize().await.unwrap();
         wrapper.initialize().await.unwrap();
 
+        assert_eq!(recording.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn initialize_refuses_to_reuse_a_connection_with_another_endpoint() {
+        // HIGRESS-04: a second wrapper with the same client name used to bind to
+        // the first one's connection, silently keeping the old endpoint.
+        let recording = Arc::new(RecordingConnection::default());
+        let first = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
+        first.initialize().await.unwrap();
+
+        let other_config = HigressMcpClientBuilder::create("higress")
+            .unwrap()
+            .streamable_http_endpoint("https://other.example.com/mcp")
+            .build_config()
+            .unwrap();
+        let second = HigressMcpClientWrapper::with_transport(other_config, recording.clone());
+
+        let error = second.initialize().await.unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to reuse"),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("https://other.example.com/mcp"));
+        assert!(!second.is_initialized());
+        // Only the first endpoint reached the connection layer.
+        assert_eq!(recording.requests().len(), 1);
+        assert_eq!(
+            recording.connected_server_url("higress").await.as_deref(),
+            Some("https://gw.example.com/mcp?x=1")
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_reuses_a_connection_with_the_same_endpoint() {
+        // The reuse optimisation (HIGRESS-X03) is kept for the same gateway.
+        let recording = Arc::new(RecordingConnection::default());
+        let first = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
+        first.initialize().await.unwrap();
+        let second = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
+
+        second.initialize().await.unwrap();
+
+        assert!(second.is_initialized());
         assert_eq!(recording.requests().len(), 1);
     }
 

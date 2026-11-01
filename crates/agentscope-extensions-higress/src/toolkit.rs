@@ -224,8 +224,13 @@ impl<'a> McpClientRegistration<'a> {
     }
 
     /// Sets the MCP client to register.
+    ///
+    /// Overrides any Higress handle set by [`higress_client`](Self::higress_client),
+    /// so the raw input schemas used during registration always come from the
+    /// client that is actually registered.
     pub fn mcp_client(mut self, client: Arc<dyn McpToolSource>) -> Self {
         self.client = Some(client);
+        self.higress_client = None;
         self
     }
 
@@ -337,10 +342,22 @@ impl<'a> McpClientRegistration<'a> {
         })?;
 
         client.initialize().await?;
-        let tools = client.list_tools().await?;
-        let selected: Vec<McpSchemaTool> = tools
+        // HIGRESS-01: the shared port returns rust-mcp-sdk's closed
+        // `ToolInputSchema`, which cannot carry root JSON-Schema keywords or
+        // boolean sub-schemas. A Higress client also hands back the gateway's raw
+        // schema, so those reach the model (Java copies the raw map verbatim).
+        let specs: Vec<(McpSchemaTool, Value)> = match &higress_client {
+            Some(higress) => higress.list_tool_specs().await?,
+            None => client
+                .list_tools()
+                .await?
+                .into_iter()
+                .map(|tool| (tool, Value::Null))
+                .collect(),
+        };
+        let selected: Vec<(McpSchemaTool, Value)> = specs
             .into_iter()
-            .filter(|tool| {
+            .filter(|(tool, _)| {
                 should_register_tool(
                     &tool.name,
                     enable_tools.as_deref(),
@@ -356,7 +373,7 @@ impl<'a> McpClientRegistration<'a> {
                     .tool_overrides
                     .iter()
                     .map(|(name, _)| name.as_str())
-                    .filter(|name| !selected.iter().any(|tool| tool.name == *name))
+                    .filter(|name| !selected.iter().any(|(tool, _)| tool.name == *name))
                     .collect();
                 names.sort_unstable();
                 names.dedup();
@@ -372,7 +389,7 @@ impl<'a> McpClientRegistration<'a> {
         }
 
         let mut registered = 0usize;
-        for tool in selected {
+        for (tool, raw_schema) in selected {
             let remote_name = tool.name.clone();
             let registered_name = format!("{}{}", tool_name_prefix, remote_name);
             let presets = preset_parameters
@@ -381,7 +398,7 @@ impl<'a> McpClientRegistration<'a> {
                 .unwrap_or_default();
             let propagate_meta = resolve_propagate_meta(&meta, &remote_name);
 
-            let parameters = tool_parameters(&tool, &presets);
+            let parameters = tool_parameters(&tool, &raw_schema, &presets);
             let handler_client = Arc::clone(&client);
             let handler_tool = remote_name.clone();
             let async_handler: McpAsyncHandler = Box::new(move |_tool, args, meta| {
@@ -481,36 +498,48 @@ fn should_register_tool(
     result
 }
 
-/// Projects an MCP tool's input schema into a JSON parameter schema, hiding the
-/// keys supplied through `presets`.
+/// Projects a tool's input schema into the JSON parameter schema the model sees,
+/// hiding the keys supplied through `presets`.
 ///
-/// Java hides preset parameters from the model by removing their keys from the
-/// schema (`McpTool.convertMcpSchemaToParameters(schema, presetKeys)`); core's
-/// `ToolRegistration` only merges the presets at call time.
-fn tool_parameters(tool: &McpSchemaTool, presets: &JsonMap) -> Value {
-    let mut properties = serde_json::Map::new();
-    if let Some(props) = &tool.input_schema.properties {
-        for (key, value) in props {
-            if presets.contains_key(key) {
-                continue;
-            }
-            properties.insert(key.clone(), Value::Object(value.clone()));
-        }
-    }
-    let required: Vec<Value> = tool
-        .input_schema
-        .required
-        .iter()
-        .filter(|name| !presets.contains_key(*name))
-        .map(|name| Value::String(name.clone()))
-        .collect();
+/// Mirrors Java `McpTool.convertMcpSchemaToParameters`: the raw schema is copied
+/// wholesale, only the preset keys are removed, and the object keywords are then
+/// normalized. Copying is what keeps root keywords (`$defs`,
+/// `additionalProperties`, `$schema`) and boolean sub-schemas alive (HIGRESS-01);
+/// core's `ToolRegistration` merges presets at call time only.
+fn tool_parameters(tool: &McpSchemaTool, raw_schema: &Value, presets: &JsonMap) -> Value {
+    let mut schema = raw_schema.as_object().cloned().unwrap_or_default();
+    // A source that cannot hand back a raw schema (the shared port's closed
+    // `ToolInputSchema`) still carries `properties`/`required` (HIGRESS-X08).
+    let mut properties = match schema.get("properties").and_then(Value::as_object) {
+        Some(props) => props.clone(),
+        None => tool
+            .input_schema
+            .properties
+            .iter()
+            .flatten()
+            .map(|(key, value)| (key.clone(), Value::Object(value.clone())))
+            .collect(),
+    };
+    let mut required = match schema.get("required").and_then(Value::as_array) {
+        Some(list) => list
+            .iter()
+            .filter_map(|value| value.as_str().map(String::from))
+            .collect::<Vec<_>>(),
+        None => tool.input_schema.required.clone(),
+    };
+    properties.retain(|key, _| !presets.contains_key(key));
+    required.retain(|name| !presets.contains_key(name));
 
-    let mut schema = serde_json::Map::new();
-    schema.insert("type".to_string(), Value::String("object".to_string()));
+    let type_name = match schema.get("type").and_then(Value::as_str) {
+        Some(name) if !name.trim().is_empty() => name.to_string(),
+        _ => "object".to_string(),
+    };
+    schema.insert("type".to_string(), Value::String(type_name));
     schema.insert("properties".to_string(), Value::Object(properties));
-    if !required.is_empty() {
-        schema.insert("required".to_string(), Value::Array(required));
-    }
+    schema.insert(
+        "required".to_string(),
+        Value::Array(required.into_iter().map(Value::String).collect()),
+    );
     Value::Object(schema)
 }
 
@@ -989,6 +1018,11 @@ mod tests {
             async fn find_client_id_by_server(&self, server: &str) -> Option<String> {
                 Some(server.to_string())
             }
+            async fn connected_server_url(&self, _server: &str) -> Option<String> {
+                // The double models no endpoint, so the reuse guard (HIGRESS-04)
+                // has nothing to compare against.
+                None
+            }
             async fn list_tools(
                 &self,
                 _client_id: &str,
@@ -1067,5 +1101,125 @@ mod tests {
         // …and it plugs into the fluent registration unchanged.
         let toolkit = HigressToolkit::new();
         let _registration = toolkit.registration().mcp_client(source);
+    }
+
+    /// A Higress transport double that advertises one tool carrying `parameters`
+    /// as the gateway's raw input schema.
+    struct RawSchemaTransport {
+        parameters: Value,
+    }
+
+    #[async_trait]
+    impl crate::client::HigressMcpTransport for RawSchemaTransport {
+        async fn connect_server(&self, _request: crate::client::McpConnectRequest) -> Result<()> {
+            Ok(())
+        }
+        async fn find_client_id_by_server(&self, server: &str) -> Option<String> {
+            Some(server.to_string())
+        }
+        async fn connected_server_url(&self, _server: &str) -> Option<String> {
+            None
+        }
+        async fn list_tools(
+            &self,
+            _client_id: &str,
+        ) -> Result<Vec<agentscope_harness::agent::McpToolInfo>> {
+            Ok(vec![agentscope_harness::agent::McpToolInfo {
+                name: "weather".to_string(),
+                description: Some("Weather".to_string()),
+                parameters: self.parameters.clone(),
+                server: "higress".to_string(),
+                title: None,
+                output_schema: None,
+            }])
+        }
+        async fn call_tool_by_server(
+            &self,
+            _server: &str,
+            _tool_name: &str,
+            _arguments: Value,
+            _meta: Option<JsonMap>,
+        ) -> Result<Value> {
+            Ok(serde_json::json!({ "content": [], "isError": false }))
+        }
+        async fn disconnect_by_server(&self, _server: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn higress_client_with(parameters: Value) -> Arc<HigressMcpClientWrapper> {
+        let config = crate::client::HigressMcpClientBuilder::create("higress")
+            .unwrap()
+            .streamable_http_endpoint("https://gw.example.com/mcp")
+            .build_config()
+            .unwrap();
+        Arc::new(HigressMcpClientWrapper::with_transport(
+            config,
+            Arc::new(RawSchemaTransport { parameters }),
+        ))
+    }
+
+    /// HIGRESS-01: the model-facing parameters must keep the gateway's root
+    /// JSON-Schema keywords, which the shared port's closed `ToolInputSchema`
+    /// cannot carry.
+    #[tokio::test]
+    async fn registration_keeps_root_schema_keywords_from_the_gateway() {
+        let client = higress_client_with(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": { "type": "string" },
+                "token": { "type": "string" }
+            },
+            "required": ["city", "token"],
+            "additionalProperties": false,
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": { "location": { "type": "object", "properties": { "lat": { "type": "number" } } } }
+        }));
+        let toolkit = HigressToolkit::new();
+        let mut presets = JsonMap::new();
+        presets.insert("token".to_string(), Value::String("secret".to_string()));
+
+        toolkit
+            .registration()
+            .higress_client(client)
+            .preset_parameters_for("weather", presets)
+            .apply()
+            .await
+            .unwrap();
+
+        let schema = toolkit.get_tool("weather").unwrap().parameters_schema();
+        // Java copies the raw schema (`parameters.putAll(inputSchema)`).
+        assert_eq!(schema["additionalProperties"], Value::Bool(false));
+        assert_eq!(
+            schema["$schema"],
+            Value::String("https://json-schema.org/draft/2020-12/schema".to_string())
+        );
+        assert_eq!(
+            schema["$defs"]["location"]["properties"]["lat"]["type"],
+            "number"
+        );
+        assert_eq!(schema["properties"]["city"]["type"], "string");
+        // Preset keys stay hidden from the model.
+        assert!(schema["properties"].get("token").is_none());
+        assert_eq!(schema["required"], serde_json::json!(["city"]));
+        assert_eq!(schema["type"], "object");
+    }
+
+    /// HIGRESS-01: boolean sub-schemas (`{"p": true}`) survive registration.
+    #[tokio::test]
+    async fn registration_keeps_boolean_sub_schemas_from_the_gateway() {
+        let client = higress_client_with(serde_json::json!({
+            "type": "object",
+            "properties": { "anything": true, "city": { "type": "string" } }
+        }));
+        let toolkit = HigressToolkit::new();
+
+        toolkit.register_higress_client(client).await.unwrap();
+
+        let schema = toolkit.get_tool("weather").unwrap().parameters_schema();
+        assert_eq!(schema["properties"]["anything"], Value::Bool(true));
+        assert_eq!(schema["properties"]["city"]["type"], "string");
+        // Java always writes `required`, even when the schema has none.
+        assert_eq!(schema["required"], serde_json::json!([]));
     }
 }
