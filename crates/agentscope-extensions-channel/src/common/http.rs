@@ -127,6 +127,14 @@ impl PreparedResponse {
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
     }
+
+    /// Case-insensitive header lookup, mirroring [`PreparedRequest::header_value`].
+    pub fn header_value(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// Characters of a provider error body echoed in an error message (the same bound the WeCom
@@ -251,6 +259,19 @@ impl HttpTransport for ReqwestTransport {
             .await
             .map_err(|e| ChannelError::Http(e.to_string()))?;
         let status = response.status().as_u16();
+        // Provider diagnostics (`Retry-After`, `x-ratelimit-remaining`, ...) must reach the caller
+        // (CHANNEL-N04). A header value that is not valid UTF-8 is dropped instead of panicking:
+        // diagnostics are never worth failing a delivery over.
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect();
         let body = response
             .text()
             .await
@@ -258,7 +279,7 @@ impl HttpTransport for ReqwestTransport {
         Ok(PreparedResponse {
             status,
             body,
-            headers: Vec::new(),
+            headers,
         })
     }
 
@@ -424,5 +445,61 @@ mod tests {
     fn with_response_timeout_rejects_zero() {
         let transport = ReqwestTransport::new().unwrap();
         assert!(transport.with_response_timeout(Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn response_header_lookup_is_case_insensitive() {
+        let response = PreparedResponse::new(429, "")
+            .with_header("Retry-After", "1")
+            .with_header("x-ratelimit-remaining", "0");
+        assert_eq!(response.header_value("retry-after"), Some("1"));
+        assert_eq!(response.header_value("X-RATELIMIT-REMAINING"), Some("0"));
+        assert!(response.header_value("x-request-id").is_none());
+    }
+
+    /// CHANNEL-N04's last mile: the real transport must surface provider response headers, so
+    /// `x-ratelimit-remaining` / `Retry-After` are usable for diagnostics. A value that is not
+    /// valid UTF-8 is dropped rather than panicking.
+    #[tokio::test]
+    async fn reqwest_transport_carries_the_provider_response_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("one probe request");
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.expect("read the request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\n\
+                      content-length: 0\r\n\
+                      retry-after: 1\r\n\
+                      x-ratelimit-remaining: 0\r\n\
+                      x-binary: \x80\x81\r\n\
+                      \r\n",
+                )
+                .await
+                .expect("write the response");
+            socket.flush().await.expect("flush the response");
+        });
+
+        let transport = ReqwestTransport::new().unwrap();
+        let response = transport
+            .execute(PreparedRequest::get(format!("http://{address}/probe")))
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.status, 429);
+        assert_eq!(response.header_value("x-ratelimit-remaining"), Some("0"));
+        assert_eq!(response.header_value("Retry-After"), Some("1"));
+        assert!(
+            response.header_value("x-binary").is_none(),
+            "a non-UTF-8 header value is dropped, not a panic: {:?}",
+            response.headers
+        );
     }
 }

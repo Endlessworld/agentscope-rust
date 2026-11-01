@@ -61,7 +61,7 @@ use super::properties::WeixinChannelProperties;
 use super::state_store::{WeixinInboxClaim, WeixinInboxMessage, WeixinLease, WeixinStateStore};
 use crate::common::{
     to_core_error as channel_to_core_error, BotLoopGuard, ChannelCore, ChannelRegistry,
-    ChannelSeams, HttpTransport, ReceiptChannel, Result,
+    ChannelSeams, HttpTransport, Result,
 };
 
 /// Channel type name, mirroring `WeixinChannel.TYPE`.
@@ -884,10 +884,9 @@ impl PlatformChannel for WeixinChannel {
             .await
             .map_err(to_core_error)
     }
-}
 
-#[async_trait]
-impl ReceiptChannel for WeixinChannel {
+    /// CHANNEL-N05: iLink reports the provider message id, so the adapter overrides the
+    /// fail-closed default. iLink has no caller-supplied idempotency key, hence `_delivery_id`.
     async fn deliver_with_receipt(
         &self,
         address: &OutboundAddress,
@@ -1114,7 +1113,7 @@ mod tests {
         let session = channel.begin_consuming().unwrap().unwrap();
         assert!(store.save_context_token(ACCOUNT, session.lease(), "peer-a", "ctx-9"));
 
-        let receipt = ReceiptChannel::deliver_with_receipt(
+        let receipt = PlatformChannel::deliver_with_receipt(
             &*channel,
             &address(),
             &assistant("hello"),
@@ -1132,7 +1131,7 @@ mod tests {
         let transport = Arc::new(RecordingTransport::new());
         let (channel, _store) = channel(transport.clone());
         let error =
-            ReceiptChannel::deliver_with_receipt(&*channel, &address(), &assistant("hello"), None)
+            PlatformChannel::deliver_with_receipt(&*channel, &address(), &assistant("hello"), None)
                 .await
                 .unwrap_err();
         assert!(error.to_string().contains("not active"));

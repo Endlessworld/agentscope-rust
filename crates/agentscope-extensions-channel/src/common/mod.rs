@@ -13,7 +13,6 @@ pub mod idempotency_store;
 pub mod media;
 pub mod outbound_address;
 pub mod props;
-pub mod receipt;
 pub mod text;
 pub mod token;
 pub mod xml;
@@ -34,7 +33,6 @@ pub use idempotency_store::{IdempotencyStore, InboundEventDeduplicator};
 pub use media::{marker_text, put_if_present};
 pub use outbound_address::{parse_peer_target, PeerTarget};
 pub use props::{get_int, get_str, get_str_or, object_from_btree};
-pub use receipt::{ReceiptChannel, ReceiptSink};
 pub use text::{constant_time_eq, looks_like_markdown, to_hex};
 pub use token::{
     now_ms, refresh_at_ms, AccessTokenProvider, AccessTokenStore, CachedAccessToken,

@@ -33,7 +33,7 @@ use super::properties::FeishuChannelProperties;
 use super::token::FeishuAccessTokenProvider;
 use crate::common::{
     constant_time_eq, to_core_error, AccessTokenProvider, BotLoopGuard, ChannelCore,
-    ChannelRegistry, ChannelSeams, HttpTransport, InboundEventDeduplicator, ReceiptChannel, Result,
+    ChannelRegistry, ChannelSeams, HttpTransport, InboundEventDeduplicator, Result,
 };
 
 /// Channel type name, mirroring `FeishuChannel.TYPE` (the `agentscope.json#channels[*].type` key).
@@ -298,10 +298,9 @@ impl PlatformChannel for FeishuChannel {
             .await
             .map_err(to_core_error)
     }
-}
 
-#[async_trait]
-impl ReceiptChannel for FeishuChannel {
+    /// CHANNEL-N05: Feishu's transport returns the provider `message_id`, so the adapter overrides
+    /// the fail-closed default and forwards the caller's delivery id as the Feishu `uuid`.
     async fn deliver_with_receipt(
         &self,
         address: &OutboundAddress,
@@ -432,7 +431,7 @@ mod tests {
             BotLoopGuard::with_defaults(),
         );
 
-        let receipt = ReceiptChannel::deliver_with_receipt(
+        let receipt = PlatformChannel::deliver_with_receipt(
             &c,
             &OutboundAddress::direct("feishu", "feishu:DIRECT:oc_1"),
             &Msg::user("hi"),
