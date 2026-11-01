@@ -15,6 +15,7 @@ use agentscope_core::middleware::{
 use agentscope_core::model::Model;
 use agentscope_core::tool::Toolkit;
 use agentscope_core::{Agent, AgentEvent, CallableAgent, ReActAgent, RuntimeContext};
+use agentscope_harness::agent::{AgentBuiltCallback, HarnessAgentBuilder, HarnessAgentHandle};
 use futures::StreamExt;
 
 use crate::backend::dto::{CommitRequest, FeedbackRequest};
@@ -698,6 +699,27 @@ impl ShadowAgentBlueprint {
         }
     }
 
+    /// Snapshots the same fields off a built harness agent.
+    ///
+    /// [`HarnessAgentHandle`] is the only borrow a `HarnessAgentBuilder::on_agent_built`
+    /// callback receives; its `description`/`sys_prompt`/`max_iters` getters read back the
+    /// values the embedded `ReActAgent` really runs with (builder defaults applied), so a
+    /// blueprint built here matches the production agent exactly.
+    ///
+    /// `agent_id` is intentionally not carried: the blueprint only holds what a shadow
+    /// clone consumes, and nothing in the clone path reads an agent id — the clone is named
+    /// `{name}-shadow` and the router accounts for runs by that name.
+    pub fn from_handle(handle: &HarnessAgentHandle) -> Self {
+        Self {
+            name: handle.name().to_string(),
+            description: handle.description().to_string(),
+            sys_prompt: handle.sys_prompt().to_string(),
+            // The handle reports the effective cap as `usize`; core takes `i32`.
+            max_iters: handle.max_iters().min(i32::MAX as usize) as i32,
+            toolkit: handle.toolkit().clone(),
+        }
+    }
+
     /// The production agent name (shadow clones get a `-shadow` suffix).
     pub fn name(&self) -> &str {
         &self.name
@@ -1152,6 +1174,10 @@ pub type AnnotationProvider = Arc<dyn Fn() -> Option<TrainingAnnotation> + Send 
 /// runner.start();                                // lifecycle only, no hook registration
 /// ```
 ///
+/// A host that builds a `HarnessAgent` skips the manual pairing: `HarnessAgent::builder()`
+/// plus [`TrainingRunner::attach_to`] installs the hook and binds it automatically from the
+/// build callback's [`HarnessAgentHandle`].
+///
 /// The post-call step (selection -> shadow runs -> feedback) runs when the agent event
 /// stream is drained, which is where Java `PostCallEvent` fires. Differences from
 /// Java, both intentional:
@@ -1258,6 +1284,14 @@ impl TrainingHook {
     /// Whether a production agent has been bound (without it the hook is a passthrough).
     pub fn has_agent(&self) -> bool {
         self.agent.lock().unwrap().is_some()
+    }
+
+    /// The blueprint bound to this hook, if any.
+    ///
+    /// This is the wiring an [`TrainingRunner::attach_to`] host can assert on before
+    /// relying on collected data (TRAIN-03): an unbound hook is a silent passthrough.
+    pub fn blueprint(&self) -> Option<ShadowAgentBlueprint> {
+        self.agent.lock().unwrap().clone()
     }
 
     /// Number of completed production calls this hook has handled.
@@ -1438,6 +1472,64 @@ impl TrainingRunner {
         hook.install(chain);
         self.hooks.lock().unwrap().push(Arc::downgrade(&hook));
         hook
+    }
+
+    /// Wires this runner into a [`HarnessAgentBuilder`]: installs a [`TrainingHook`] in the
+    /// builder's middleware chain and binds it to the finished agent at build time.
+    ///
+    /// This is the one-call replacement for the manual assembly described on
+    /// [`TrainingHook`] ("build the chain, build the agent, remember to bind" — the step
+    /// TRAIN-03 shows is easy to forget): the hook enters the chain **before** `build()`, and
+    /// the `on_agent_built` callback builds the [`ShadowAgentBlueprint`] from the
+    /// [`HarnessAgentHandle`] and binds it. When `build()` returns, training is armed.
+    ///
+    /// Returns the builder together with the hook, so the caller can drive/inspect it
+    /// ([`TrainingHook::has_agent`], [`TrainingHook::disable`], [`TrainingHook::blueprint`]);
+    /// the runner itself only keeps a weak reference.
+    ///
+    /// **The builder's middleware chain is replaced** — `HarnessAgentBuilder::middleware`
+    /// swaps the whole chain and the builder exposes no way to read it back, so a host that
+    /// already owns a chain must keep using [`Self::attach`] (`attach(&mut chain)` then
+    /// `builder.middleware(chain)`). Likewise `on_agent_built` holds a single callback: use
+    /// [`Self::attach_to_with`] to keep your own.
+    pub fn attach_to(
+        &self,
+        builder: HarnessAgentBuilder,
+    ) -> (HarnessAgentBuilder, Arc<TrainingHook>) {
+        self.attach_to_inner(builder, None)
+    }
+
+    /// [`Self::attach_to`] that preserves an existing `on_agent_built` callback.
+    ///
+    /// `HarnessAgentBuilder::on_agent_built` stores one callback, so registering a second one
+    /// silently drops the first. `existing` runs first (the host keeps its observer), then the
+    /// hook is bound.
+    pub fn attach_to_with(
+        &self,
+        builder: HarnessAgentBuilder,
+        existing: AgentBuiltCallback,
+    ) -> (HarnessAgentBuilder, Arc<TrainingHook>) {
+        self.attach_to_inner(builder, Some(existing))
+    }
+
+    fn attach_to_inner(
+        &self,
+        builder: HarnessAgentBuilder,
+        existing: Option<AgentBuiltCallback>,
+    ) -> (HarnessAgentBuilder, Arc<TrainingHook>) {
+        let mut chain = MiddlewareChain::new();
+        let hook = self.attach(&mut chain);
+        let bind = Arc::clone(&hook);
+        let builder =
+            builder
+                .middleware(chain)
+                .on_agent_built(move |handle: &HarnessAgentHandle| {
+                    if let Some(existing) = existing.as_ref() {
+                        existing(handle);
+                    }
+                    bind.bind_blueprint(ShadowAgentBlueprint::from_handle(handle));
+                });
+        (builder, hook)
     }
 
     /// Disables every hook installed through [`Self::attach`].
@@ -2425,6 +2517,137 @@ mod tests {
         assert_eq!(hook.completed_calls(), 0);
     }
 
+    /// Temp root for the harness builders (the harness writes a workspace/journal under it).
+    fn harness_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agentscope_training_attach_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("workspace")).unwrap();
+        root
+    }
+
+    /// Router that never selects a call, for wiring tests that must stay offline.
+    fn wiring_runner() -> TrainingRunner {
+        TrainingRunner::builder()
+            .trinity_endpoint("http://127.0.0.1:1")
+            .selection_strategy(Arc::new(SamplingRateStrategy::of(0.0)))
+            .reward_calculator(Arc::new(ZeroRewardCalculator))
+            .commit_interval_seconds(0)
+            .build()
+            .unwrap()
+    }
+
+    /// TRAIN-10: one call wires the hook into the chain *before* `build()` and binds it from
+    /// the build callback. Goes through the real `HarnessAgent::builder()` assembly, because
+    /// poking the hook directly is what previously hid a missing wiring step.
+    #[tokio::test]
+    async fn runner_attach_to_wires_a_harness_agent_end_to_end() {
+        use agentscope_harness::agent::HarnessAgent;
+
+        let root = harness_root("attach_to");
+        let runner = wiring_runner();
+        let (builder, hook) = runner.attach_to(
+            HarnessAgent::builder()
+                .name("train-me")
+                .agent_id("train-me-1")
+                .description("production description")
+                .sys_prompt("production prompt")
+                .max_iters(7)
+                .model(Arc::new(model_support::ReplyModel))
+                .cwd(root.clone())
+                .workspace(root.join("workspace"))
+                .disable_web_tools(),
+        );
+        // Binding is the build callback's job: nothing is bound before `build()`.
+        assert!(!hook.has_agent());
+
+        let agent = builder.build();
+
+        assert_eq!(runner.attached_hook_count(), 1);
+        assert_eq!(runner.unbound_hook_count(), 0);
+        assert!(hook.has_agent(), "the build callback must bind the hook");
+
+        // The blueprint mirrors the values the agent really runs with.
+        let blueprint = hook.blueprint().expect("blueprint after build");
+        assert_eq!(blueprint.name(), "train-me");
+        assert_eq!(blueprint.description(), "production description");
+        assert_eq!(blueprint.sys_prompt(), "production prompt");
+        assert_eq!(blueprint.max_iters(), 7);
+        let mut blueprint_tools = blueprint.toolkit().tool_names();
+        let mut agent_tools = agent.handle().toolkit().tool_names();
+        blueprint_tools.sort();
+        agent_tools.sort();
+        assert_eq!(
+            blueprint_tools, agent_tools,
+            "the shadow blueprint must share the built toolkit"
+        );
+
+        // The hook is inside the built chain, not just returned to the caller.
+        let installed: Arc<dyn Middleware> = hook.clone();
+        let participants = agent.middleware().participants(ExtensionPoint::OnAgent);
+        assert!(
+            participants.iter().any(|mw| Arc::ptr_eq(*mw, &installed)),
+            "the training hook must participate in the built chain"
+        );
+
+        // ...and it is live on a real call: the post-call step runs (0% sampling => no
+        // shadow run, no network).
+        let mut events = agent.stream_events(vec![Msg::user("hi")], StreamOptions::default());
+        while let Some(event) = events.next().await {
+            event.expect("the harness agent run must not fail");
+        }
+        wait_until("the hook's post-call step", || hook.completed_calls() == 1).await;
+        assert_eq!(hook.shadow_rounds(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `on_agent_built` holds a single callback, so `attach_to` must not silently drop a
+    /// host's own observer — `attach_to_with` chains them.
+    #[tokio::test]
+    async fn runner_attach_to_with_keeps_the_host_build_callback() {
+        use agentscope_harness::agent::HarnessAgent;
+
+        let root = harness_root("attach_to_with");
+        let runner = wiring_runner();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_hook = Arc::clone(&seen);
+        let existing: AgentBuiltCallback = Arc::new(move |handle: &HarnessAgentHandle| {
+            seen_hook
+                .lock()
+                .unwrap()
+                .push(handle.agent_id().to_string());
+        });
+        let (builder, hook) = runner.attach_to_with(
+            HarnessAgent::builder()
+                .name("host-agent")
+                .agent_id("host-1")
+                .model(Arc::new(model_support::ReplyModel))
+                .cwd(root.clone())
+                .workspace(root.join("workspace"))
+                .disable_web_tools(),
+            existing,
+        );
+        let agent = builder.build();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["host-1".to_string()],
+            "the host callback must still fire"
+        );
+        assert!(hook.has_agent(), "chaining must still bind the hook");
+        let blueprint = hook.blueprint().unwrap();
+        assert_eq!(blueprint.name(), "host-agent");
+        // Unconfigured fields fall back to what the agent actually runs with (the builder
+        // default iteration cap), not to an empty snapshot.
+        assert!(blueprint.max_iters() > 0);
+        drop(agent);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn runner_reports_unbound_hooks() {
         let runner = TrainingRunner::builder()
@@ -2597,7 +2820,11 @@ mod tests {
         /// block on an `accept` that never comes).
         pub fn spawn(
             expected_requests: usize,
-        ) -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<Vec<String>>) {
+        ) -> (
+            String,
+            Arc<AtomicUsize>,
+            std::thread::JoinHandle<Vec<String>>,
+        ) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let served = Arc::new(AtomicUsize::new(0));
@@ -2794,10 +3021,11 @@ mod tests {
         let agent = reply_agent(chain);
         hook.bind_agent(&agent);
 
-        let reply = tokio::time::timeout(Duration::from_secs(10), agent.call(vec![Msg::user("hi")]))
-            .await
-            .expect("a marked call must not stall on the fake Trinity endpoint")
-            .unwrap();
+        let reply =
+            tokio::time::timeout(Duration::from_secs(10), agent.call(vec![Msg::user("hi")]))
+                .await
+                .expect("a marked call must not stall on the fake Trinity endpoint")
+                .unwrap();
         assert_eq!(reply.text_content(), "ok");
         wait_until("the background shadow round", || {
             hook.completed_calls() == 1 && hook.shadow_rounds() == 1

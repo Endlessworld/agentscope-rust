@@ -599,6 +599,7 @@ version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-extensions-model",
+ "agentscope-harness",
  "futures",
  "reqwest 0.13.4",
  "serde",
