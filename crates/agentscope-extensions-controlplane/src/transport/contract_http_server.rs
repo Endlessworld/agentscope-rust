@@ -586,6 +586,7 @@ mod tests {
         body: Option<Value>,
     ) -> (u16, Value) {
         let url = format!("http://127.0.0.1:{}{}", server.port(), path);
+        agentscope_core::tls::ensure_crypto_provider();
         let client = reqwest::Client::new();
         let mut req = client.request(method, &url);
         if let Some(t) = token {

@@ -485,6 +485,7 @@ impl CosHttpObjectStoreBuilder {
         }
         let max_retries = self.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
 
+        agentscope_core::tls::ensure_crypto_provider();
         let client = match self.client {
             Some(client) => client,
             None => reqwest::Client::builder()

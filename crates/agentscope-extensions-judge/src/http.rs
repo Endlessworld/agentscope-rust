@@ -160,6 +160,7 @@ impl ReqwestJudgeTransport {
 
     /// Builds a transport with an explicit connect timeout.
     pub fn with_connect_timeout(timeout: Duration) -> Result<Self, JudgeTransportError> {
+        agentscope_core::tls::ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .connect_timeout(timeout)
             .build()

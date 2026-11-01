@@ -54,6 +54,7 @@ impl ControlPlaneHttpClient {
         base_url: impl Into<String>,
         internal_token: impl Into<String>,
     ) -> ControlPlaneResult<Self> {
+        agentscope_core::tls::ensure_crypto_provider();
         let http = Client::builder()
             .connect_timeout(HTTP_TIMEOUT)
             .timeout(HTTP_TIMEOUT)

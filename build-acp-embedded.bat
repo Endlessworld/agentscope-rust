@@ -16,6 +16,8 @@ if not "%EXITCODE%"=="0" (
 )
 
 echo [build-acp-embedded] done:
-echo   target\embedded\acp_harness_agent.exe
-echo   target\embedded\acp_agent_cli.exe
+for %%F in (target\embedded\acp_harness_agent.exe target\embedded\acp_agent_cli.exe) do (
+  echo   %%F  %%~zF bytes
+)
+echo [build-acp-embedded] optional: pack-acp-upx.bat shrinks further (see docs\EMBEDDED_SIZE.md)
 exit /b 0

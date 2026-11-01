@@ -29,6 +29,7 @@ impl Default for ReqwestNacosTransport {
 impl ReqwestNacosTransport {
     /// Builds a transport with a default `reqwest::Client` and [`DEFAULT_REQUEST_TIMEOUT`].
     pub fn new() -> Self {
+        agentscope_core::tls::ensure_crypto_provider();
         Self {
             client: reqwest::Client::new(),
             timeout: Some(DEFAULT_REQUEST_TIMEOUT),

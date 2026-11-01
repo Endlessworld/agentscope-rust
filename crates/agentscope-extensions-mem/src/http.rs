@@ -47,6 +47,7 @@ impl ReqwestTransport {
     /// The per-request timeout is Java's `readTimeout(timeout)` (default 60s);
     /// [`DEFAULT_CONNECT_TIMEOUT`] is Java's `connectTimeout(30s)`.
     pub fn new(timeout: Duration) -> Result<Self> {
+        agentscope_core::tls::ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
             .timeout(timeout)

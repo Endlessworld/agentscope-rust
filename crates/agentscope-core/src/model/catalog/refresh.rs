@@ -48,6 +48,7 @@ pub struct HttpFetcher {
 
 impl HttpFetcher {
     pub fn new(timeout: Duration) -> Self {
+        crate::tls::ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .user_agent(concat!("agentscope-rust/", env!("CARGO_PKG_VERSION")))

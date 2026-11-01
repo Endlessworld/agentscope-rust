@@ -379,6 +379,7 @@ impl std::fmt::Debug for OtlpHttpExporter {
 impl OtlpHttpExporter {
     /// Creates an exporter posting to `endpoint` with the given resource attributes.
     pub fn new(endpoint: impl Into<String>, resource: Attributes) -> Self {
+        agentscope_core::tls::ensure_crypto_provider();
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))

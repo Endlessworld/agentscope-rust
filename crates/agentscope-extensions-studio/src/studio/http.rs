@@ -139,6 +139,7 @@ impl ReqwestStudioTransport {
     /// Falls back to a default client if the builder rejects the configuration, matching the
     /// previous `unwrap_or_else(|_| reqwest::Client::new())` behaviour.
     pub fn with_timeouts(connect_timeout: Duration, request_timeout: Duration) -> Self {
+        agentscope_core::tls::ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .timeout(request_timeout)

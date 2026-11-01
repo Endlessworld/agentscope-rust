@@ -256,6 +256,7 @@ impl TrinityClientBuilder {
             .endpoint
             .filter(|e| !e.is_empty())
             .ok_or_else(|| Error::Agent("endpoint is required".to_string()))?;
+        agentscope_core::tls::ensure_crypto_provider();
         Ok(TrinityClient {
             base_url: endpoint,
             http: reqwest::Client::new(),

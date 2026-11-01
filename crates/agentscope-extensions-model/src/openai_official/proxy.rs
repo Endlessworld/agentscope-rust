@@ -269,6 +269,7 @@ impl ProxyConfig {
 pub fn build_client(config: &ProxyConfig, base_url: &str) -> Result<reqwest::Client> {
     config.validate()?;
     let host = host_of(base_url);
+    agentscope_core::tls::ensure_crypto_provider();
     let mut builder = reqwest::Client::builder();
     if !config.should_bypass(&host) {
         let mut proxy = reqwest::Proxy::all(config.proxy_url())

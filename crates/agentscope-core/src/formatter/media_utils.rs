@@ -228,6 +228,7 @@ pub fn url_to_protocol_url(url: &str) -> Result<String> {
 /// Downloads a remote URL and returns its base64-encoded content.
 pub async fn download_url_to_base64(url: &str) -> Result<String> {
     tracing::debug!("Downloading remote URL for base64 encoding: {url}");
+    crate::tls::ensure_crypto_provider();
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))

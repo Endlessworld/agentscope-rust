@@ -19,6 +19,7 @@ pub mod permission;
 pub mod session;
 pub mod shutdown;
 pub mod state;
+pub mod tls;
 pub mod tool;
 pub mod tracing;
 

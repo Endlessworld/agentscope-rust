@@ -75,6 +75,7 @@ const TCP_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(30);
 /// pending indefinitely, which freezes the agent and its ACP UI. The connect /
 /// read timeouts turn such a stall into a retryable transport error.
 fn build_http_client() -> reqwest::Client {
+    agentscope_core::tls::ensure_crypto_provider();
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(STREAM_READ_TIMEOUT)

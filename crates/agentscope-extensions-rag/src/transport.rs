@@ -181,6 +181,7 @@ impl ReqwestTransport {
         options: &TransportOptions,
         extra_headers: HashMap<String, String>,
     ) -> Result<Self> {
+        agentscope_core::tls::ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .connect_timeout(options.connect_timeout)
             .timeout(options.read_timeout)

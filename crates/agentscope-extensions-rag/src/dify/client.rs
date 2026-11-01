@@ -60,6 +60,7 @@ pub struct HttpDifyTransport {
 impl HttpDifyTransport {
     /// Builds a transport from the Dify configuration's timeouts and retry budget.
     pub fn from_config(config: &DifyRAGConfig) -> Result<Self> {
+        agentscope_core::tls::ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout)
             .timeout(config.read_timeout)

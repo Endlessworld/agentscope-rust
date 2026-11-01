@@ -23,6 +23,7 @@ schemars.workspace = true
 serde_yaml.workspace = true
 base64.workspace = true
 jsonschema.workspace = true
+rustls.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]

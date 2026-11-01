@@ -34,6 +34,7 @@ impl Default for HttpOptions {
 
 /// Returns a client builder carrying the given timeouts and the ambient proxy configuration.
 pub fn client_builder(opts: &HttpOptions) -> ClientBuilder {
+    agentscope_core::tls::ensure_crypto_provider();
     Client::builder()
         .connect_timeout(Duration::from_secs(opts.connect_timeout_seconds))
         .timeout(Duration::from_secs(opts.read_timeout_seconds))
@@ -96,6 +97,7 @@ pub fn is_loopback_target(value: &str) -> bool {
 ///
 /// Non-loopback traffic keeps the ambient proxy configuration.
 pub fn bypass_proxy_for_loopback(builder: ClientBuilder, targets: &[&str]) -> ClientBuilder {
+    agentscope_core::tls::ensure_crypto_provider();
     if targets.iter().any(|target| is_loopback_target(target)) {
         builder.no_proxy()
     } else {

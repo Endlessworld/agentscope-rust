@@ -212,6 +212,7 @@ impl ReqwestTransport {
     /// `"responseTimeout must be positive"` constructor guard.
     pub fn with_timeout(timeout: Duration) -> Result<Self> {
         ensure_positive_timeout(timeout)?;
+        agentscope_core::tls::ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .build()
             .map_err(|e| ChannelError::Http(e.to_string()))?;
@@ -425,6 +426,7 @@ mod tests {
 
     #[test]
     fn with_client_defers_to_the_wrapped_client_timeout() {
+        agentscope_core::tls::ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .build()
