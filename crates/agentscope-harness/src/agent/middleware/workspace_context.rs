@@ -81,6 +81,10 @@ const TRUNCATION_NOTICE_WITH_SEARCH: &str =
 
 const TRUNCATION_NOTICE_PLAIN: &str = "\n\n... (memory truncated) ...\n";
 
+/// 截断时头部所占份额（1/N），其余留给最新（尾部）内容，mirroring Java
+/// `MEMORY_HEAD_SHARE`。
+const MEMORY_HEAD_SHARE: usize = 4;
+
 const DEFAULT_MAX_CONTEXT_TOKENS: usize = 8000;
 
 /// Upper bound for the AGENTS.md body injected into the system prompt, mirroring the
@@ -728,18 +732,34 @@ fn estimate_tokens(text: &str) -> usize {
     }
 }
 
+/// 超出 token 预算时「掐掉中间、保留两端」，mirroring Java `truncateToTokenBudget`。
+///
+/// MEMORY.md 是追加式文件，最新内容在尾部，所以尾部保留 post-notice 预算的
+/// 3/4、头部只保留 1/4；预算小于 notice 长度时退化为只保留尾部。全部按字符
+/// 计数与截取，避免在 UTF-8 多字节字符中间切开。
 fn truncate_to_token_budget(text: &str, max_tokens: usize, disable_memory_tools: bool) -> String {
     let max_chars = max_tokens * 4;
-    if text.len() <= max_chars {
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
         return text.to_string();
     }
-    let prefix: String = text.chars().take(max_chars).collect();
     let notice = if disable_memory_tools {
         TRUNCATION_NOTICE_PLAIN
     } else {
         TRUNCATION_NOTICE_WITH_SEARCH
     };
-    format!("{prefix}{notice}")
+    let notice_chars = notice.chars().count();
+    if max_chars <= notice_chars {
+        // 退化：预算装不下 notice，只能保留最新的尾部内容（Java: text.substring(len - maxChars)）。
+        return text.chars().skip(total_chars - max_chars).collect();
+    }
+    let kept = max_chars - notice_chars;
+    let head = kept / MEMORY_HEAD_SHARE;
+    let tail = kept - head;
+    let mut out: String = text.chars().take(head).collect();
+    out.push_str(notice);
+    out.extend(text.chars().skip(total_chars - tail));
+    out
 }
 
 async fn build_knowledge_block(
@@ -796,18 +816,49 @@ mod tests {
 
     #[test]
     fn truncate_long_text_appends_search_aware_notice() {
-        let text = "a".repeat(200);
-        let out = truncate_to_token_budget(&text, 10, false);
-        assert!(out.ends_with(TRUNCATION_NOTICE_WITH_SEARCH));
+        // Java 6aa84d9d9：notice 插在中间，尾部（最新条目）必须保留。
+        let text = format!("{}{}", "a".repeat(200), "TAILMARK");
+        let out = truncate_to_token_budget(&text, 40, false);
+        assert!(out.contains(TRUNCATION_NOTICE_WITH_SEARCH));
+        assert!(out.ends_with("TAILMARK"));
         assert!(out.len() < text.len());
     }
 
     #[test]
     fn truncate_long_text_uses_plain_notice_when_memory_tools_disabled() {
-        let text = "a".repeat(200);
-        let out = truncate_to_token_budget(&text, 10, true);
-        assert!(out.ends_with(TRUNCATION_NOTICE_PLAIN));
+        let text = format!("{}{}", "a".repeat(200), "TAILMARK");
+        let out = truncate_to_token_budget(&text, 40, true);
+        assert!(out.contains(TRUNCATION_NOTICE_PLAIN));
+        assert!(out.ends_with("TAILMARK"));
         assert!(out.len() < text.len());
+    }
+
+    #[test]
+    fn truncate_budget_below_notice_keeps_tail() {
+        // 预算（1 * 4 = 4 字符）小于 notice 长度：退化为只保留尾部。
+        let text = format!("HEAD{}{}", "a".repeat(200), "TAIL");
+        let out = truncate_to_token_budget(&text, 1, false);
+        assert_eq!(out, "TAIL");
+        assert!(!out.contains("HEAD"));
+    }
+
+    #[test]
+    fn truncate_keeps_head_and_tail() {
+        // 头尾比例：头部保留开头若干字符，尾部保留最新内容。
+        let text = format!("HEADMARK{}{}", "a".repeat(200), "TAILMARK");
+        let out = truncate_to_token_budget(&text, 40, false);
+        assert!(out.contains("HEADMARK"));
+        assert!(out.ends_with("TAILMARK"));
+        assert!(out.contains(TRUNCATION_NOTICE_WITH_SEARCH));
+    }
+
+    #[test]
+    fn truncate_is_char_safe_for_multibyte_text() {
+        // 中文等多字节字符不得被按字节切开（否则会 panic）。
+        let text = format!("{}{}", "记".repeat(200), "尾部");
+        let out = truncate_to_token_budget(&text, 40, false);
+        assert!(out.ends_with("尾部"));
+        assert!(out.contains(TRUNCATION_NOTICE_WITH_SEARCH));
     }
 
     #[test]
