@@ -92,9 +92,16 @@
 // mimalloc made the same workload *worse* -- one heap per thread, purged on a 1 s timer: measured
 // 54 MB peak RSS across 32 threads versus 4.6 MB with the system allocator. So it stays a unix
 // choice. Installing it here -- the binary's crate root -- leaves every library consumer untouched.
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "alloc-stats")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Diagnostic build (`--features alloc-stats`): replaces the platform allocator so `[mem]` lines can
+// report live heap bytes -- the number that separates real data from pages the allocator kept.
+#[cfg(feature = "alloc-stats")]
+#[global_allocator]
+static COUNTING_ALLOCATOR: agentscope_extensions_acp::mem::counting::CountingAlloc =
+    agentscope_extensions_acp::mem::counting::CountingAlloc;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -104,11 +111,12 @@ use std::time::Duration;
 use agentscope_core::model::catalog::CatalogAwareModel;
 use agentscope_core::model::provider::{ApiProtocol, ModelCreationContext};
 use agentscope_core::model::{GenerateOptions, Model};
-use agentscope_extensions_acp::config::ModelChoice;
 use agentscope_extensions_acp::compaction_window_tokens;
-use agentscope_extensions_acp::{config::default_modes, AcpAgentSession, AcpCodingAgent};
+use agentscope_extensions_acp::config::ModelChoice;
+use agentscope_extensions_acp::{
+    config::default_modes, AcpAgentSession, AcpCodingAgent, ImageSupport,
+};
 use agentscope_extensions_acp::{AskUserTool, SessionBuild};
-use agentscope_extensions_model::{AnthropicMessagesModel, OpenAiChatModel, OpenAiResponsesModel};
 use agentscope_harness::agent::context::TaskContextOptions;
 use agentscope_harness::agent::{
     trigger_for_window, CompactionConfig, FileSystemSkillRepository, HarnessAgent,
@@ -1080,7 +1088,11 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         builder = builder.toolkit(toolkit);
     }
 
-    builder.build()
+    let agent = builder.build();
+    // One line per session build: the footprint the agent settles at before any turn runs. This is
+    // the baseline the idle trim works on, not a per-turn number.
+    agentscope_extensions_acp::mem::log_footprint("init");
+    agent
 }
 
 /// Initializes tracing to a log file under `<cwd>/.agentscope/log/`.
@@ -1155,6 +1167,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 模型列表从配置文件动态加载：汇总所有 provider 下的模型 ID（去重后）。
     let model_config = ModelConfig::load_or_create();
     let models = model_config.all_models();
+    // 供转发器在目录常驻时重算 `prompt.image` 能力（见 `ImageSupport`）。
+    let image_models = models.clone();
 
     let agent = AcpCodingAgent::builder()
         .name("agentscope-coding-agent")
@@ -1180,6 +1194,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .max_sessions(3)
         .build()?;
 
+    // The footprint the process serves at, before any session exists: this is the baseline the
+    // idle trim works on (measured ~26 MB RSS / 29 MB commit on Windows).
+    agentscope_extensions_acp::mem::log_footprint("serving");
+
     // Shutdown handling: on Ctrl-C / SIGTERM, interrupt every live session so its
     // in-flight turn unwinds through the normal path — interrupt reconciliation
     // plus the state checkpoint — before the process exits, instead of being
@@ -1189,7 +1207,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // on the per-iteration checkpoint (`StateCheckpointMiddleware::on_reasoning`)
     // to cap the loss at the in-flight iteration.
     spawn_shutdown_handler(agent.session_registry());
-    spawn_catalog_forwarder(agent.session_registry());
+    spawn_catalog_forwarder(
+        agent.session_registry(),
+        image_models,
+        agent.image_support(),
+    );
 
     tracing::info!("ACP CodingAgent starting over stdio...");
     let sessions = agent.session_registry();
@@ -1204,28 +1226,46 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Forwards catalog content changes to live sessions as
-/// `ConfigOptionUpdate` + `UsageUpdate`.
-fn spawn_catalog_forwarder(sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>) {
+/// `ConfigOptionUpdate` + `UsageUpdate`, then hands the table back.
+///
+/// Every refresh (the startup one and the TTL one) installs a freshly parsed table; sessions that
+/// already bound their model do not need it, so the memory goes back to the OS right here instead of
+/// waiting for the next `session/new`. Without this a refresh that finished after `session/new`
+/// would keep ~15 MB resident for a whole TTL.
+///
+/// The same table answers the `prompt.image` capability, so the cached answer is refreshed here —
+/// while the table is resident — before it is released. That keeps `initialize` from parsing it.
+fn spawn_catalog_forwarder(
+    sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>,
+    models: Vec<ModelChoice>,
+    image_support: ImageSupport,
+) {
     let catalog = agentscope_core::model::catalog::ModelCatalog::global();
     let mut receiver = catalog.subscribe();
     tokio::spawn(async move {
+        // The startup refresh may already have finished before we subscribed, in which case no
+        // event is coming: refresh and release once here so an idle agent does not sit on the table.
+        image_support.refresh(&models);
+        agentscope_extensions_acp::release_catalog_if_unused(&sessions);
         while receiver.changed().await.is_ok() {
             let event = receiver.borrow_and_update().clone();
-            if event.changed_keys.is_empty() {
-                continue;
-            }
-            let guard = sessions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for session in guard.values() {
-                let relevant = session
-                    .selected_catalog_key()
-                    .map(|key| event.changed_keys.contains(&key))
-                    .unwrap_or(true);
-                if relevant {
-                    session.push_config_update();
+            if !event.changed_keys.is_empty() {
+                let guard = sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for session in guard.values() {
+                    let relevant = session
+                        .selected_catalog_key()
+                        .map(|key| event.changed_keys.contains(&key))
+                        .unwrap_or(true);
+                    if relevant {
+                        session.push_config_update();
+                    }
                 }
+                drop(guard);
             }
+            image_support.refresh(&models);
+            agentscope_extensions_acp::release_catalog_if_unused(&sessions);
         }
     });
 }

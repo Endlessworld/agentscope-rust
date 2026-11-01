@@ -24,9 +24,14 @@ Windows MSVC / nightly，`acp_harness_agent.exe` 实测（同一台机器）：
 | 单一 rustls 后端 | 9,765,376 | **-814,080** | 见下节 |
 | 去 brotli / zstd | 9,500,672 | **-264,704** | `reqwest` 只保留 gzip/deflate |
 | `-Zlocation-detail=none` | 9,240,576 | **-260,096** | panic 消息不再带文件/行号 |
-| **合计** | **9,240,576** | **-1,338,880（-12.7%）** | |
+| 目录快照按需释放（ACP 内存） | 9,246,720 | +6,144 | 见 `docs/ACP_MEMORY.md`，为内存换来的小代价 |
+| **当前合计** | **9,246,720** | **-1,332,736（-12.6%）** | |
 
 `acp_agent_cli.exe`：4,128,256 → 3,424,768（-17.0%）。
+
+> 已回退的尝试：去掉 `async-anthropic`（`a625bf2`）实测 **harness +12,288 / cli −3,584**，没有体积收益
+> （`Messages` 换成能力更全的 wire 适配器，两者体积相当），已 `git revert`；改动只剩「去重一份实现与
+> 一个 reqwest 0.12 钉版」这一个价值，不值得用体积换。
 
 各开关位置：
 
@@ -133,3 +138,5 @@ pack-acp-upx.bat
   已无 `.debug*` 段（`strip` + `/DEBUG:NONE` 生效）。
 - 改 rustflags 会触发全量重建（本机约 2~2.5 分钟）；改特性只重建受影响子图。
 - 定位大头：`cargo tree -e features -i <crate>` 看特性来源；临时移除依赖测差值比估。
+- 运行时内存（不是文件体积）：见 `docs/ACP_MEMORY.md` —— 26 MB 基线里 15.6 MB 是模型目录，空闲裁剪
+  `AGENTSCOPE_ACP_MEM_TRIM_IDLE`（默认 3 秒）可把常驻工作集降到 ~0。

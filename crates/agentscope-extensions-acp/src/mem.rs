@@ -2,25 +2,39 @@
 //!
 //! One prompt turn allocates several megabyte-sized buffers -- the compiled model request, the
 //! journal `state/checkpoint` payload, the base64 wrapper a backend adds around it -- and frees
-//! them as soon as the turn is committed. On Windows the CRT hands those blocks straight back to
-//! the OS (`VirtualFree` above 512 KiB), which is why mimalloc was **removed** there: it kept a
-//! heap per thread and purged on a 1 s timer, so the same workload measured 54 MB peak RSS across
-//! 32 threads instead of 4.6 MB. Linux/glibc keeps freed pages in the arena instead, so mimalloc
-//! still pays for itself and stays installed on unix.
+//! them as soon as the turn is committed. Large blocks go back to the OS on `free` everywhere
+//! (`VirtualFree` above 512 KiB on Windows), which is why mimalloc was **removed** on Windows: it
+//! kept a heap per thread and purged on a 1 s timer, so the same workload measured 54 MB peak RSS
+//! across 32 threads instead of 4.6 MB. Linux/glibc keeps freed pages in the arena instead, so
+//! mimalloc still pays for itself and stays installed on unix.
 //!
-//! Both the worker cap and the per-turn collect are on by default; the environment tunes them
-//! per host. On Windows `collect()` is a no-op because the system allocator already returns the
-//! pages, and the footprint is read from `GetProcessMemoryInfo`.
+//! What does *not* come back on its own is what the heap kept from the many small allocations made
+//! while the agent is built: measured on Windows, the process settles at ~26 MB RSS / 29 MB commit
+//! within 70 ms of `main` and stays there whether or not a turn ever runs. Two knobs hand that
+//! back -- [`collect`] (`HeapCompact` after every turn) and the idle trim, which drops the working
+//! set once the conversation has been quiet for `AGENTSCOPE_ACP_MEM_TRIM_IDLE` seconds.
 //!
 //! | variable | default | effect |
 //! |---|---|---|
 //! | `AGENTSCOPE_ACP_WORKER_THREADS` | `min(ncpu, 8)` | worker threads of the agent runtime |
 //! | `AGENTSCOPE_ACP_MEM_REPORT` | off | also log the serialized `AgentState` size per turn |
-//! | `AGENTSCOPE_ACP_MEM_COLLECT` | on | `mi_collect(true)` after every turn; `=0` disables |
+//! | `AGENTSCOPE_ACP_MEM_COLLECT` | on | `HeapCompact` / `mi_collect(true)` after every turn; `=0` disables |
+//! | `AGENTSCOPE_ACP_MEM_TRIM_IDLE` | `3` | seconds of quiet before the working set is dropped; `=0` disables |
+//!
+//! Build with `--features alloc-stats` to install a counting allocator: the `[mem]` lines then also
+//! report live heap bytes, which is what tells real data apart from pages the allocator kept after
+//! freeing them.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const WORKER_THREADS_ENV: &str = "AGENTSCOPE_ACP_WORKER_THREADS";
 const MEM_REPORT_ENV: &str = "AGENTSCOPE_ACP_MEM_REPORT";
 const MEM_COLLECT_ENV: &str = "AGENTSCOPE_ACP_MEM_COLLECT";
+const MEM_TRIM_IDLE_ENV: &str = "AGENTSCOPE_ACP_MEM_TRIM_IDLE";
+
+/// Seconds of quiet before the working set is dropped. Short enough to trim between turns of an
+/// interactive session, long enough that a burst of tool calls does not pay the page faults.
+const DEFAULT_TRIM_IDLE_SECONDS: usize = 3;
 
 /// A turn is I/O bound (one model stream plus tool calls), so the default worker count is
 /// capped: every extra worker costs a thread stack and, under mimalloc, another heap that keeps
@@ -146,9 +160,197 @@ pub fn collect() {
     unsafe { libmimalloc_sys::mi_collect(true) }
 }
 
-/// Nothing to do: the system allocator frees large blocks back to the OS on `free`.
+/// Decommits the free pages the heap kept.
+///
+/// The system allocator already `VirtualFree`s large blocks on `free`, but the hundreds of small
+/// allocations made while the agent is built leave their pages committed. `HeapCompact` walks the
+/// heap and decommits the free runs, which is the only way to shrink that baseline.
 #[cfg(windows)]
-pub fn collect() {}
+pub fn collect() {
+    use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapCompact};
+
+    // SAFETY: `GetProcessHeap` returns the process-heap pseudo handle (no ownership), and
+    // `HeapCompact` only releases free memory inside that heap.
+    unsafe {
+        HeapCompact(GetProcessHeap(), 0);
+    }
+}
+
+/// Drops the resident pages of the whole process until they are touched again.
+///
+/// This is the idle trim: nothing is freed, the OS is simply allowed to take the working set away,
+/// so the next turn pays soft faults to bring the image and the heap back.
+pub fn trim_working_set() {
+    let before = usage();
+    // Freed blocks stay committed until the heap coalesces and decommits them, which is what makes
+    // a released model catalog (~15 MB) show up as committed memory even though nothing uses it.
+    collect();
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        // SAFETY: `GetCurrentProcess` returns a pseudo handle the caller does not own, and the call
+        // only affects the working set of this process.
+        unsafe {
+            K32EmptyWorkingSet(GetCurrentProcess());
+        }
+    }
+    let after = usage();
+    tracing::info!(
+        "[mem] idle trim | rss {:.1}->{:.1}MB commit {:.1}->{:.1}MB",
+        mb(before.rss),
+        mb(after.rss),
+        mb(before.commit),
+        mb(after.commit)
+    );
+}
+
+/// Bumped by every turn so a pending idle trim knows the conversation is no longer quiet.
+static ACTIVITY: AtomicU64 = AtomicU64::new(0);
+
+/// Marks a turn as started, cancelling any idle trim that is already armed.
+pub fn note_activity() {
+    ACTIVITY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Seconds of quiet before the working set is dropped.
+pub fn trim_idle_seconds() -> usize {
+    let value = std::env::var(MEM_TRIM_IDLE_ENV).ok();
+    parse_trim_idle(value.as_deref())
+}
+
+/// `AGENTSCOPE_ACP_MEM_TRIM_IDLE` parsing: unset or unparseable falls back to the default, `0`
+/// disables the trim.
+fn parse_trim_idle(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_TRIM_IDLE_SECONDS)
+}
+
+/// Arms the idle trim: after `AGENTSCOPE_ACP_MEM_TRIM_IDLE` seconds without a new turn, drop the
+/// working set. A turn that starts in the meantime bumps [`ACTIVITY`] and cancels this one.
+///
+/// Must be called from inside a tokio runtime: it spawns the timer task.
+pub fn schedule_idle_trim() {
+    let seconds = trim_idle_seconds();
+    if seconds == 0 {
+        return;
+    }
+    let armed = ACTIVITY.load(Ordering::Relaxed);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(seconds as u64)).await;
+        if ACTIVITY.load(Ordering::Relaxed) == armed {
+            trim_working_set();
+        }
+    });
+}
+
+/// Emits the `[mem] <stage>` footprint line at `INFO`.
+///
+/// With `--features alloc-stats` the line also carries the live heap: that is what tells a real
+/// baseline apart from pages the allocator kept after freeing them.
+pub fn log_footprint(stage: &str) {
+    let usage = usage();
+    match live_heap() {
+        Some((live, peak_live, blocks)) => tracing::info!(
+            "[mem] {stage} | rss {:.1}MB commit {:.1}MB peak_rss {:.1}MB | live {:.1}MB \
+             peak_live {:.1}MB blocks {blocks}",
+            mb(usage.rss),
+            mb(usage.commit),
+            mb(usage.peak_rss),
+            mb(live),
+            mb(peak_live)
+        ),
+        None => tracing::info!(
+            "[mem] {stage} | rss {:.1}MB commit {:.1}MB peak_rss {:.1}MB",
+            mb(usage.rss),
+            mb(usage.commit),
+            mb(usage.peak_rss)
+        ),
+    }
+}
+
+/// Live heap bytes, peak live bytes and live block count when the counting allocator is installed.
+#[cfg(feature = "alloc-stats")]
+pub fn live_heap() -> Option<(usize, usize, usize)> {
+    Some(counting::snapshot())
+}
+
+/// No live-heap numbers without `--features alloc-stats`.
+#[cfg(not(feature = "alloc-stats"))]
+pub fn live_heap() -> Option<(usize, usize, usize)> {
+    None
+}
+
+/// Diagnostic allocator: wraps [`std::alloc::System`] and tracks live bytes.
+///
+/// Installed by the two binaries instead of mimalloc under `--features alloc-stats`. It is a
+/// measurement tool, not a default: the atomics on the hot path cost throughput.
+#[cfg(feature = "alloc-stats")]
+pub mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+    static BLOCKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn add(bytes: usize) {
+        let live = LIVE.fetch_add(bytes, Relaxed) + bytes;
+        BLOCKS.fetch_add(1, Relaxed);
+        if live > PEAK.load(Relaxed) {
+            PEAK.store(live, Relaxed);
+        }
+    }
+
+    fn sub(bytes: usize) {
+        LIVE.fetch_sub(bytes, Relaxed);
+        BLOCKS.fetch_sub(1, Relaxed);
+    }
+
+    /// `(live bytes, peak live bytes, live blocks)`.
+    pub fn snapshot() -> (usize, usize, usize) {
+        (LIVE.load(Relaxed), PEAK.load(Relaxed), BLOCKS.load(Relaxed))
+    }
+
+    /// The counting global allocator.
+    pub struct CountingAlloc;
+
+    // SAFETY: every method forwards to `System` unchanged; the counters only observe the layout
+    // that was passed in, so they cannot disagree with the allocation they describe.
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = System.alloc(layout);
+            if !ptr.is_null() {
+                add(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let ptr = System.alloc_zeroed(layout);
+            if !ptr.is_null() {
+                add(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            sub(layout.size());
+            System.dealloc(ptr, layout)
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let out = System.realloc(ptr, layout, new_size);
+            if !out.is_null() {
+                sub(layout.size());
+                add(new_size);
+            }
+            out
+        }
+    }
+}
 
 pub fn report_enabled() -> bool {
     env_flag(MEM_REPORT_ENV)
@@ -343,5 +545,63 @@ mod tests {
             out.contains("[mem] turn stop=StopReason::EndTurn messages=7 state=1.0MB"),
             "captured: {out}"
         );
+    }
+
+    /// The idle trim defaults to 3 s; `0` is the documented off switch and a garbage value must not
+    /// turn the trim off silently.
+    #[test]
+    fn the_idle_trim_defaults_to_three_seconds() {
+        assert_eq!(parse_trim_idle(None), 3);
+        assert_eq!(parse_trim_idle(Some("0")), 0);
+        assert_eq!(parse_trim_idle(Some("30")), 30);
+        assert_eq!(parse_trim_idle(Some("  12 ")), 12);
+        assert_eq!(parse_trim_idle(Some("off")), 3);
+    }
+
+    /// Dropping the working set must be safe to call on any thread and must not free anything.
+    #[test]
+    fn trimming_the_working_set_is_safe() {
+        let buffer = vec![9u8; 8 * 1024 * 1024];
+        std::hint::black_box(&buffer);
+        trim_working_set();
+        assert_eq!(buffer.len(), 8 * 1024 * 1024);
+        assert_eq!(buffer[0], 9);
+    }
+
+    /// `collect()` is the per-turn hook: it must be callable repeatedly and must not disturb the
+    /// process (a failure here would only show up as a crash under the heap lock).
+    #[test]
+    fn collect_survives_repeated_calls() {
+        drop(vec![0u8; 4 * 1024 * 1024]);
+        collect();
+        collect();
+        assert!(usage().peak_rss > 0);
+    }
+
+    /// A turn cancels a pending trim by bumping the activity generation.
+    #[test]
+    fn a_new_turn_cancels_the_armed_trim() {
+        note_activity();
+        let armed = ACTIVITY.load(Ordering::Relaxed);
+        note_activity();
+        assert_ne!(armed, ACTIVITY.load(Ordering::Relaxed));
+    }
+
+    /// The counting allocator is only installed under `--features alloc-stats`; without it the
+    /// footprint line must simply omit the live-heap fields instead of reporting zeros.
+    #[cfg(not(feature = "alloc-stats"))]
+    #[test]
+    fn live_heap_is_absent_without_the_feature() {
+        assert_eq!(live_heap(), None);
+    }
+
+    #[cfg(feature = "alloc-stats")]
+    #[test]
+    fn live_heap_is_reported_when_the_feature_is_on() {
+        // The counting allocator is installed by the two binaries -- a library cannot own the
+        // process-wide `#[global_allocator]` -- so this binary only checks that the accessor
+        // reports numbers instead of `None`.
+        let (live, peak, _) = live_heap().expect("feature on");
+        assert!(peak >= live, "peak {peak} < live {live}");
     }
 }

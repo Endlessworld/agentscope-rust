@@ -155,6 +155,59 @@ impl ModelCatalog {
         self.inner.snapshot.read().unwrap().clone()
     }
 
+    /// Whether the parsed table is currently resident.
+    pub fn is_loaded(&self) -> bool {
+        !self.snapshot().entries.is_empty()
+    }
+
+    /// Drops the parsed table, keeping only the metadata that keeps the refresh schedule honest
+    /// (schema version, generation, sources, `fetched_at`).
+    ///
+    /// The table costs ~15 MB for ~9k models and is only needed to answer 「which models are
+    /// there」 -- `session/new`, `initialize`, a model switch. A host whose sessions have all bound
+    /// their model can hand the memory back; [`ensure_loaded`](Self::ensure_loaded) parses the file
+    /// again on the next listing. Returns whether anything was released.
+    pub fn release_snapshot(&self) -> bool {
+        let current = self.snapshot();
+        if current.entries.is_empty() {
+            return false;
+        }
+        let released = CatalogSnapshot {
+            schema_version: current.schema_version,
+            generation: current.generation,
+            sources: current.sources.clone(),
+            entries: HashMap::new(),
+            by_bare: HashMap::new(),
+            by_provider: HashMap::new(),
+            by_canonical: HashMap::new(),
+            provider_api: current.provider_api.clone(),
+            fetched_at: current.fetched_at,
+        };
+        *self.inner.snapshot.write().unwrap() = Arc::new(released);
+        // The cache holds `Resolution`s (and therefore descriptors) of the released table.
+        self.inner.resolve_cache.write().unwrap().clear();
+        true
+    }
+
+    /// Loads the on-disk table when it is not resident. Returns whether a table is available.
+    ///
+    /// A released table is **not** silently substituted by the caller's static fallback: that
+    /// would change capability values (context window, modalities) behind the host's back.
+    pub fn ensure_loaded(&self) -> bool {
+        if self.is_loaded() {
+            return true;
+        }
+        if !self.inner.config.enabled {
+            return false;
+        }
+        let Some(snapshot) = self.inner.storage.read_snapshot() else {
+            return false;
+        };
+        *self.inner.snapshot.write().unwrap() = Arc::new(snapshot);
+        self.inner.resolve_cache.write().unwrap().clear();
+        true
+    }
+
     /// Current generation. `0` means no snapshot has ever been loaded.
     pub fn generation(&self) -> u64 {
         self.snapshot().generation
@@ -177,10 +230,14 @@ impl ModelCatalog {
     }
 
     /// Whether the snapshot is older than the configured TTL.
+    ///
+    /// A released table (see [`release_snapshot`](Self::release_snapshot)) is **not** stale: the
+    /// next listing re-parses the file, so a network refresh would be pure cost. Only a table that
+    /// was never loaded reports stale.
     pub fn is_stale(&self) -> bool {
         let snapshot = self.snapshot();
         if snapshot.entries.is_empty() {
-            return true;
+            return snapshot.generation == 0;
         }
         let ttl = self.inner.config.ttl;
         let age = Utc::now()
@@ -193,6 +250,9 @@ impl ModelCatalog {
     /// Resolves a model id against the current snapshot, using a small generation-scoped
     /// result cache.
     pub fn resolve(&self, request: &ResolveRequest<'_>) -> Resolution {
+        // A released table is parsed again here instead of falling back to the caller's static
+        // table, which would silently change capability values.
+        self.ensure_loaded();
         let snapshot = self.snapshot();
         let key = ResolveCacheKey {
             generation: snapshot.generation,
@@ -406,5 +466,52 @@ mod tests {
         let outcome = catalog.refresh().await.unwrap();
         assert!(matches!(outcome, RefreshOutcome::Skipped));
         drop(guard);
+    }
+
+    #[test]
+    fn never_loaded_is_stale_and_nothing_to_release() {
+        let catalog = ModelCatalog::with_fetcher(
+            config(),
+            Arc::new(FixtureFetcher {
+                calls: Mutex::new(Vec::new()),
+            }),
+        );
+        // Never loaded: stale, so the refresh path fetches; there is nothing to release.
+        assert!(catalog.is_stale());
+        assert!(!catalog.release_snapshot());
+        assert!(!catalog.is_loaded());
+    }
+
+    #[tokio::test]
+    async fn release_drops_the_table_and_reloads_on_demand() {
+        let catalog = ModelCatalog::with_fetcher(
+            config(),
+            Arc::new(FixtureFetcher {
+                calls: Mutex::new(Vec::new()),
+            }),
+        );
+        catalog.refresh().await.unwrap();
+        assert!(catalog.is_loaded());
+        let before = catalog.resolve(&ResolveRequest::new("m"));
+
+        assert!(catalog.release_snapshot());
+        assert!(!catalog.is_loaded());
+        // Released on purpose is not stale: re-parsing the file is enough, while a network
+        // refresh would be pure cost.
+        assert!(!catalog.is_stale());
+        // Metadata that keeps the refresh schedule honest survives.
+        assert_eq!(catalog.generation(), 1);
+        // Releasing an already released table is a no-op.
+        assert!(!catalog.release_snapshot());
+
+        // A released table is re-parsed instead of silently falling back to the static table,
+        // which would change capability values.
+        let after = catalog.resolve(&ResolveRequest::new("m"));
+        assert!(catalog.is_loaded());
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(
+            serde_json::to_value(after.descriptor.as_deref()).unwrap(),
+            serde_json::to_value(before.descriptor.as_deref()).unwrap()
+        );
     }
 }

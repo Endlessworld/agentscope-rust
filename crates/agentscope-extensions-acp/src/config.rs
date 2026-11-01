@@ -348,6 +348,18 @@ pub(crate) fn resolve_choice(choice: &ModelChoice) -> Option<std::sync::Arc<Mode
     result.descriptor
 }
 
+/// Whether any selectable model accepts image input, per the catalog.
+///
+/// `initialize` only needs this boolean, and answering it with [`resolve_choice`] forces the whole
+/// ~15 MB model table to be parsed. Hosts therefore compute it while the table is already resident
+/// (startup, each refresh) and cache it — see `AcpCodingAgent::image_support`.
+pub(crate) fn image_support(models: &[ModelChoice]) -> bool {
+    models
+        .iter()
+        .filter_map(resolve_choice)
+        .any(|descriptor| descriptor.input_modalities.contains("image"))
+}
+
 fn model_description(descriptor: &ModelDescriptor) -> String {
     let mut parts = vec![
         format!("{} ctx", human_tokens(descriptor.context_window)),

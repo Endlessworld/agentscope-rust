@@ -23,9 +23,16 @@
 
 // Same allocator rationale as `acp_harness_agent`: a prompt allocator that returns peak memory to
 // the OS is worth it on Linux/glibc, while the Windows CRT already does it (see that file).
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "alloc-stats")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Diagnostic build (`--features alloc-stats`): replaces the platform allocator so `[mem]` lines can
+// report live heap bytes -- the number that separates real data from pages the allocator kept.
+#[cfg(feature = "alloc-stats")]
+#[global_allocator]
+static COUNTING_ALLOCATOR: agentscope_extensions_acp::mem::counting::CountingAlloc =
+    agentscope_extensions_acp::mem::counting::CountingAlloc;
 
 use agent_client_protocol::schema::v1::{
     ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities, ContentBlock,

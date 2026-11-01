@@ -59,6 +59,9 @@ rusqlite = ["agentscope-harness/rusqlite"]
 # Embedded minimal build: mirrors `agentscope-harness`'s `lite` feature,
 # dropping the bundled SQLite index.
 lite = []
+# Diagnostic only: install a counting global allocator so `[mem]` lines report live heap bytes
+# (`src/mem.rs`). Not a default -- the atomics are on the allocation hot path.
+alloc-stats = []
 
 # The allocator is platform-specific. Session journaling builds megabyte-sized JSON payloads per
 # turn; on Linux/glibc the default allocator keeps that burst in its arena (RSS never returns), so
@@ -75,6 +78,7 @@ libmimalloc-sys = { version = "0.1", features = ["extended"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }

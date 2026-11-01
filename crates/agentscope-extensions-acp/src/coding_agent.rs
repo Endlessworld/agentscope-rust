@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
@@ -172,6 +173,50 @@ pub struct AcpCodingAgent {
     /// Agents built only to read the durable session index per `cwd`, so
     /// `session/list` does not rebuild one on every call.
     catalog_agents: Mutex<HashMap<PathBuf, Arc<HarnessAgent>>>,
+    /// Advertised `prompt.image` support. See [`ImageSupport`].
+    image_support: ImageSupport,
+}
+
+const IMAGE_SUPPORT_NO: u8 = 1;
+const IMAGE_SUPPORT_YES: u8 = 2;
+
+/// Cached answer to 「does any selectable model accept image input」.
+///
+/// The catalog table that answers it costs ~15 MB, and `initialize` only needs the boolean. The
+/// host refreshes the value while the table is resident (startup and after every catalog refresh);
+/// `initialize` then reads it without parsing anything.
+#[derive(Clone, Default)]
+pub struct ImageSupport(Arc<AtomicU8>);
+
+impl ImageSupport {
+    /// Stores the answer.
+    pub fn set(&self, supported: bool) {
+        let value = if supported {
+            IMAGE_SUPPORT_YES
+        } else {
+            IMAGE_SUPPORT_NO
+        };
+        self.0.store(value, Ordering::Relaxed);
+    }
+
+    /// The cached answer, or `None` when it was never computed.
+    pub fn get(&self) -> Option<bool> {
+        match self.0.load(Ordering::Relaxed) {
+            IMAGE_SUPPORT_YES => Some(true),
+            IMAGE_SUPPORT_NO => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Recomputes the answer from the catalog for `models` and caches it.
+    ///
+    /// Cheap while the table is already resident (the normal call sites); when it is not, this
+    /// parses it exactly like `initialize` used to.
+    pub fn refresh(&self, models: &[ModelChoice]) -> bool {
+        let supported = super::config::image_support(models);
+        self.set(supported);
+        supported
+    }
 }
 
 /// Picks which cached catalog agent to drop when the map is full: any entry other than the one
@@ -181,6 +226,31 @@ fn catalog_eviction<'a>(
     cwd: &std::path::Path,
 ) -> Option<&'a PathBuf> {
     keys.into_iter().find(|key| key.as_path() != cwd)
+}
+
+/// Hands the parsed model catalog back to the OS once no live session still needs it.
+///
+/// The catalog table is ~15 MB for ~9k models and is only needed to answer *which* models exist:
+/// `initialize`, `session/new`, `session/load`/`resume` and a model switch. Once every registered
+/// session holds the descriptor of its selected model, the per-turn path never touches the table
+/// again, so this drops it (the JSON file stays on disk) and `ModelCatalog::ensure_loaded` re-parses
+/// it on the next listing. Skipped while any session has no descriptor yet, because releasing then
+/// would force a re-parse before that session can serve its first prompt.
+pub fn release_catalog_if_unused(sessions: &Mutex<HashMap<String, AcpAgentSession>>) {
+    let bound = {
+        let guard = sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.values().all(AcpAgentSession::has_cached_descriptor)
+    };
+    if !bound {
+        return;
+    }
+    if agentscope_core::model::catalog::ModelCatalog::global().release_snapshot() {
+        tracing::debug!("model catalog released: every session has bound its model");
+        // Freed blocks are still committed heap pages until the idle trim compacts them.
+        crate::mem::schedule_idle_trim();
+    }
 }
 
 impl AcpCodingAgent {
@@ -202,6 +272,7 @@ impl AcpCodingAgent {
             client_support: ClientSupport::new(),
             providers: ProviderRegistry::default(),
             catalog_agents: Mutex::new(HashMap::new()),
+            image_support: ImageSupport::default(),
         }
     }
 
@@ -229,17 +300,35 @@ impl AcpCodingAgent {
         Arc::clone(&self.sessions)
     }
 
+    /// Handle to the cached `prompt.image` answer advertised by [`capabilities`](Self::capabilities).
+    ///
+    /// Hosts refresh it while the catalog table is resident (startup, every refresh) so
+    /// `initialize` never parses the table for one boolean.
+    pub fn image_support(&self) -> ImageSupport {
+        self.image_support.clone()
+    }
+
+    /// Recomputes the advertised `prompt.image` answer from the catalog.
+    ///
+    /// Cheap while the table is resident; when it is not, this parses it once (the behaviour
+    /// `initialize` had before the value was cached).
+    pub fn refresh_image_support(&self) -> bool {
+        self.image_support.refresh(&self.models)
+    }
+
     pub fn builder() -> AcpCodingAgentBuilder {
         AcpCodingAgentBuilder::default()
     }
 
     /// Builds the ACP agent capabilities advertised during initialization.
     pub fn capabilities(&self) -> AgentCapabilities {
+        // Read the cached answer: parsing the model table here costs ~15 MB, and this runs on
+        // every `initialize` while only a boolean is needed. A host that never refreshed the
+        // cache pays the parse once, exactly like before.
         let image = self
-            .models
-            .iter()
-            .filter_map(super::config::resolve_choice)
-            .any(|descriptor| descriptor.input_modalities.contains("image"));
+            .image_support
+            .get()
+            .unwrap_or_else(|| self.refresh_image_support());
         AgentCapabilities::new()
             .load_session(true)
             .prompt_capabilities(
@@ -584,6 +673,8 @@ impl AcpCodingAgent {
                     let response = NewSessionResponse::new(session_id)
                         .modes(modes)
                         .config_options(config_options);
+                    // The model list is out; drop the catalog table unless a session still needs it.
+                    release_catalog_if_unused(&a_new.sessions);
                     responder.respond(response)
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -724,6 +815,8 @@ impl AcpCodingAgent {
                     );
                     let _ = cx.send_notification(update);
                     a_cfg.register_session(session);
+                    // A model switch re-parsed the catalog; hand it back right away.
+                    release_catalog_if_unused(&a_cfg.sessions);
                     responder.respond(SetSessionConfigOptionResponse::new(config_options))
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -826,6 +919,7 @@ impl AcpCodingAgent {
                     let response = LoadSessionResponse::new()
                         .modes(modes)
                         .config_options(config_options);
+                    release_catalog_if_unused(&a_load.sessions);
                     responder.respond(response)
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -858,6 +952,7 @@ impl AcpCodingAgent {
                     let response = ResumeSessionResponse::new()
                         .modes(modes)
                         .config_options(config_options);
+                    release_catalog_if_unused(&a_resume.sessions);
                     responder.respond(response)
                 },
                 agent_client_protocol::on_receive_request!(),

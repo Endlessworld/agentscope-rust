@@ -16,6 +16,7 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Client, ConnectionTo};
 use agentscope_core::event::{AgentEvent, ConfirmResult};
 use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
+use agentscope_core::model::catalog::ModelDescriptor;
 use agentscope_core::model::{GenerateOptions, DEFAULT_CONTEXT_WINDOW};
 use agentscope_core::permission::{PermissionBehavior, PermissionRule};
 use agentscope_core::ConfirmHandler;
@@ -375,6 +376,30 @@ enum TurnInput {
     Wakeup,
 }
 
+/// Descriptor of the selected model, resolved once when the session binds its model.
+///
+/// `resolved` is not the same as `descriptor.is_some()`: a model the catalog does not know has no
+/// descriptor, and remembering that answer is what keeps the released catalog from being parsed
+/// again on every turn.
+#[derive(Clone, Default)]
+struct SelectedDescriptor {
+    resolved: bool,
+    descriptor: Option<Arc<ModelDescriptor>>,
+}
+
+impl SelectedDescriptor {
+    /// Resolves `model` against the model list, so the answer needs no catalog lookup afterwards.
+    fn resolve(models: &[ModelChoice], model: &str) -> Self {
+        Self {
+            resolved: true,
+            descriptor: models
+                .iter()
+                .find(|choice| choice.id == model)
+                .and_then(super::config::resolve_choice),
+        }
+    }
+}
+
 /// A single ACP session backed by a [`HarnessAgent`].
 #[derive(Clone)]
 pub struct AcpAgentSession {
@@ -386,6 +411,14 @@ pub struct AcpAgentSession {
     /// mode) must not be lost on `register_session` write-back.
     config: Arc<Mutex<SessionConfig>>,
     models: Vec<ModelChoice>,
+    /// Catalog descriptor of the selected model, resolved once at bind time.
+    ///
+    /// The full catalog (~15 MB for ~9k models) is only needed to *list* models and to resolve a
+    /// switch. Caching the descriptor here keeps the per-turn path (prompt block validation, the
+    /// catalog key) independent of that table, so the host can hand the memory back while a
+    /// session runs. Shared across clones: a clone taken from the registry mutates the same
+    /// session.
+    descriptor: Arc<Mutex<SelectedDescriptor>>,
     modes: Vec<ModeChoice>,
     /// Optional resolver building a model from a model id (dynamic model
     /// switching). When set, `setModel` swaps the live agent's model on the next
@@ -605,12 +638,16 @@ impl AcpAgentSession {
                     .any(|id| id == level)
             })
             .unwrap_or_else(|| super::config::DEFAULT_THOUGHT_LEVEL.to_string());
+        // Resolve the descriptor of the initial model now: the caller is building the model list,
+        // so the catalog is resident -- and the host releases it as soon as every session is bound.
+        let descriptor = SelectedDescriptor::resolve(&models, &initial_model);
         let mut session = Self {
             session_id,
             cwd,
             agent: Arc::new(agent),
             config: Arc::new(Mutex::new(SessionConfig::default())),
             models,
+            descriptor: Arc::new(Mutex::new(descriptor)),
             modes,
             model_builder: None,
             applied_model: actual_model,
@@ -792,10 +829,18 @@ impl AcpAgentSession {
 
     /// Sets the current model.
     pub fn set_model(&mut self, model: impl Into<String>) {
+        let model = model.into();
+        // Resolve the new descriptor right away: the caller has just listed the models, so the
+        // catalog is resident, and the host releases it as soon as every session is bound.
+        let descriptor = SelectedDescriptor::resolve(&self.models, &model);
+        *self
+            .descriptor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = descriptor;
         self.config
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .model = model.into();
+            .model = model;
         self.persist_config();
     }
 
@@ -1280,19 +1325,37 @@ impl AcpAgentSession {
     }
 
     /// Catalog descriptor for the currently selected model, when available.
-    pub fn selected_descriptor(
-        &self,
-    ) -> Option<std::sync::Arc<agentscope_core::model::catalog::ModelDescriptor>> {
-        let model = self
-            .config
+    ///
+    /// Cached: the per-turn path (prompt block validation, the catalog key) must not depend on the
+    /// process-wide catalog table, which the host releases once every session has bound its model.
+    /// A session that was built without the eager resolve resolves here once and remembers the
+    /// answer, including "the catalog has nothing for this model".
+    pub fn selected_descriptor(&self) -> Option<Arc<ModelDescriptor>> {
+        let mut slot = self
+            .descriptor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !slot.resolved {
+            let model = self
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .model
+                .clone();
+            *slot = SelectedDescriptor::resolve(&self.models, &model);
+        }
+        slot.descriptor.clone()
+    }
+
+    /// Whether the descriptor question for the selected model has been answered.
+    ///
+    /// Cheap and side-effect free: the host uses it to decide whether the catalog table can be
+    /// released without a later turn having to parse it again.
+    pub fn has_cached_descriptor(&self) -> bool {
+        self.descriptor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .model
-            .clone();
-        self.models
-            .iter()
-            .find(|choice| choice.id == model)
-            .and_then(super::config::resolve_choice)
+            .resolved
     }
 
     /// Catalog key for the currently selected model, when available.
@@ -1616,6 +1679,9 @@ impl AcpAgentSession {
         };
         drop(guard);
         crate::mem::note_turn(&format!("StopReason::{stop:?}"), messages, state_bytes);
+        // Arm the idle trim: if the conversation stays quiet for `AGENTSCOPE_ACP_MEM_TRIM_IDLE`
+        // seconds, the working set is dropped (a new turn cancels it via `note_activity`).
+        crate::mem::schedule_idle_trim();
     }
 
     /// Converts ACP content blocks into a core user message, rejecting unsupported media
@@ -1780,6 +1846,7 @@ impl AcpAgentSession {
         // stop, not to start running once the lock is free. Capturing the generation after the
         // wait made such a cancel indistinguishable from "this turn started after the cancel"
         // and silently ignored it, so the prompt ran (and billed) anyway.
+        crate::mem::note_activity();
         let cancel_epoch = Arc::clone(&self.cancel_epoch);
         let my_epoch = cancel_epoch.load(Ordering::SeqCst);
         let closed = Arc::clone(&self.closed);
@@ -2551,6 +2618,7 @@ impl AcpAgentSession {
 mod tests {
     use super::{
         prompt_idempotency_key, save_session_config, thought_level_params, turn_usage_to_response,
+        SelectedDescriptor,
     };
     use agentscope_core::message::{ChatUsage, Msg};
 
@@ -2590,6 +2658,20 @@ mod tests {
             "the temporary file must be renamed away"
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_model_outside_the_catalog_still_counts_as_resolved() {
+        // Regression risk: `descriptor.is_some()` was used as "resolved", so a model the catalog
+        // does not know would be looked up on every turn -- re-parsing the whole 15 MB table once
+        // the host had released it.
+        let unresolved = SelectedDescriptor::default();
+        assert!(!unresolved.resolved);
+        assert!(unresolved.descriptor.is_none());
+
+        let resolved = SelectedDescriptor::resolve(&[], "not-in-any-catalog");
+        assert!(resolved.resolved);
+        assert!(resolved.descriptor.is_none());
     }
 
     #[test]
