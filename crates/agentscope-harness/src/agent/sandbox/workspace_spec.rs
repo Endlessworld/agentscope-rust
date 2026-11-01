@@ -4,10 +4,12 @@
 //! These types describe the desired layout of a sandbox workspace and provide
 //! the mechanism to apply that layout when the sandbox is started.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use agentscope_core::error::Result;
+
+use super::layout::{BindMountEntry, WorkspaceProjectionEntry};
 
 /// Describes the desired layout of a sandbox workspace.
 ///
@@ -35,6 +37,16 @@ pub struct WorkspaceSpec {
 
     /// Paths to export from the workspace after execution.
     pub copy_out: Vec<String>,
+
+    /// Host directories bind-mounted into the workspace, keyed by their mount path under
+    /// `root` (Java `WorkspaceSpec.entries` with `BindMountEntry` values).
+    #[serde(default)]
+    pub bind_mounts: BTreeMap<String, BindMountEntry>,
+
+    /// Host workspace projected into the sandbox at start (Java
+    /// `WorkspaceSpec.__workspace_projection__`).
+    #[serde(default)]
+    pub workspace_projection: Option<WorkspaceProjectionEntry>,
 }
 
 impl WorkspaceSpec {
@@ -79,6 +91,17 @@ impl WorkspaceSpec {
     /// Adds a path to copy out after execution.
     pub fn with_copy_out(mut self, path: impl Into<String>) -> Self {
         self.copy_out.push(path.into());
+        self
+    }
+
+    /// Bind-mounts `host_path` at `path` (workspace-relative).
+    pub fn with_bind_mount(
+        mut self,
+        path: impl Into<String>,
+        host_path: impl Into<String>,
+    ) -> Self {
+        self.bind_mounts
+            .insert(path.into(), BindMountEntry::new(host_path));
         self
     }
 

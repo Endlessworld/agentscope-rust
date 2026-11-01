@@ -23,7 +23,7 @@ pub mod wait_async;
 pub mod web_tools;
 
 pub use agent_generate::AgentGenerateTool;
-pub use agent_spawn::{AgentListTool, AgentSendTool, AgentSpawnTool};
+pub use agent_spawn::{AgentListTool, AgentSendTool, AgentSpawnTool, SubagentExposure, SubagentExposureSink};
 pub use artifact_delivery::ArtifactDeliveryTool;
 pub use filesystem_tools::FilesystemTool;
 pub use fuzzy_text_matcher::{search, Level, MatchRange, SearchResult};

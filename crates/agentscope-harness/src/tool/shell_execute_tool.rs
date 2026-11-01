@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
-use agentscope_core::message::{JsonMap, ToolResultBlock};
+use agentscope_core::message::{
+    JsonMap, ToolExecutionDetails, ToolExecutionOutcome, ToolResultBlock,
+};
 use agentscope_core::tool::{is_dangerous_command, Tool, ToolExecutionContext, Toolkit};
 use async_trait::async_trait;
 
@@ -74,8 +76,21 @@ pub(crate) fn format_execute_output(
     if truncated {
         text.push_str("\n(output was truncated)");
     }
-    let mut block = ToolResultBlock::text(text);
-    block.metadata = metadata;
+    // Producer-supplied execution facts (mirrors Java `ShellExecuteTool`): a successful
+    // process is not a verified task, and an exit code is the only process-level evidence.
+    let outcome = if exit_code == 0 {
+        ToolExecutionOutcome::Succeeded
+    } else {
+        ToolExecutionOutcome::Failed
+    };
+    let mut block = ToolResultBlock::text(text).with_execution_details(
+        ToolExecutionDetails::new("shell", outcome)
+            .with_exit_code(exit_code)
+            .with_output_truncated(truncated),
+    );
+    // Merge, not replace: the compaction counters and the execution details share the
+    // attribute map.
+    block.metadata.extend(metadata);
     block
 }
 
@@ -264,7 +279,11 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(text, format!("Exit code: 0\n\n{raw}"));
-        assert!(block.metadata.is_empty());
+        // No compaction counters; the producer execution details are the only attribute.
+        assert_eq!(block.metadata.len(), 1);
+        assert!(block
+            .metadata
+            .contains_key(agentscope_core::message::ToolResultBlock::METADATA_EXECUTION_DETAILS));
     }
 
     #[test]
@@ -279,7 +298,43 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(text, "Exit code: 0\n\nhello\nworld");
-        assert!(block.metadata.is_empty());
+        // No compaction counters; the producer execution details are the only attribute.
+        assert_eq!(block.metadata.len(), 1);
+        assert!(block
+            .metadata
+            .contains_key(agentscope_core::message::ToolResultBlock::METADATA_EXECUTION_DETAILS));
+    }
+
+    #[test]
+    fn a_successful_run_carries_shell_execution_details() {
+        use agentscope_core::message::{ToolExecutionDetails, ToolExecutionOutcome};
+
+        let block = format_execute_output(0, "hello", false, &CompactConfig::disabled());
+        let details = block.execution_details().expect("shell execution details");
+        assert_eq!(details.kind, "shell");
+        assert_eq!(details.outcome, ToolExecutionOutcome::Succeeded);
+        assert_eq!(details.exit_code, Some(0));
+        assert!(!details.output_truncated);
+
+        // The attribute round-trips, so the observation side reads the same facts.
+        let raw = block
+            .metadata
+            .get(agentscope_core::message::ToolResultBlock::METADATA_EXECUTION_DETAILS)
+            .expect("the wire attribute");
+        let decoded: ToolExecutionDetails = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(decoded, details);
+    }
+
+    #[test]
+    fn a_nonzero_exit_code_is_a_failed_execution() {
+        use agentscope_core::message::ToolExecutionOutcome;
+
+        let block = format_execute_output(2, "boom", true, &CompactConfig::disabled());
+        let details = block.execution_details().expect("shell execution details");
+        assert_eq!(details.kind, "shell");
+        assert_eq!(details.outcome, ToolExecutionOutcome::Failed);
+        assert_eq!(details.exit_code, Some(2));
+        assert!(details.output_truncated);
     }
 
     #[test]

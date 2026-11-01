@@ -35,10 +35,71 @@ pub struct SpawnedAgent {
     pub repair: Option<Arc<dyn SubagentSessionRepair>>,
 }
 
+/// One subagent exposed as a user-addressable entry point, mirroring Java
+/// `SubagentExposedEvent`.
+///
+/// `subagent_id` is the addressable handle (`agent_key`), which is exactly what a caller passes
+/// to a follow-up `agent_send`; `session_id` is the child's own session, not the parent's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentExposure {
+    pub subagent_id: String,
+    pub agent_id: String,
+    pub session_id: String,
+    pub label: Option<String>,
+}
+
+impl SubagentExposure {
+    /// The in-band `SubagentExposed` event carrying these fields (Java property names).
+    pub fn into_event(self) -> agentscope_core::event::AgentEvent {
+        let mut fields = JsonMap::new();
+        fields.insert(
+            "subagentId".to_string(),
+            serde_json::json!(self.subagent_id),
+        );
+        fields.insert("agentId".to_string(), serde_json::json!(self.agent_id));
+        fields.insert("sessionId".to_string(), serde_json::json!(self.session_id));
+        if let Some(label) = self.label {
+            fields.insert("label".to_string(), serde_json::json!(label));
+        }
+        agentscope_core::event::AgentEvent::with_fields(
+            agentscope_core::event::AgentEventType::SubagentExposed,
+            fields,
+        )
+    }
+}
+
+/// Collects the exposures recorded by [`AgentSpawnTool`].
+///
+/// The tool runs inside a tool call and has no handle on the agent's event stream, so it records
+/// the exposure here and the subagent middleware announces it at the next reasoning step — the
+/// same point where a background result becomes a `<system-reminder>`.
+#[derive(Clone, Default)]
+pub struct SubagentExposureSink {
+    pending: Arc<Mutex<Vec<SubagentExposure>>>,
+}
+
+impl SubagentExposureSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one exposure for the next step.
+    pub fn record(&self, exposure: SubagentExposure) {
+        self.pending.lock().unwrap().push(exposure);
+    }
+
+    /// Takes everything recorded since the last drain, in spawn order.
+    pub fn drain(&self) -> Vec<SubagentExposure> {
+        std::mem::take(&mut *self.pending.lock().unwrap())
+    }
+}
+
 /// Spawns registered subagents as tool invocations.
 pub struct AgentSpawnTool {
     manager: Arc<DefaultAgentManager>,
     tasks: Option<Arc<dyn TaskRepository>>,
+    /// Where freshly exposed subagents are recorded for the in-band `SubagentExposed` event.
+    exposure_sink: Option<SubagentExposureSink>,
     /// Empty set = every non-PRIMARY agent may be spawned.
     allowed_agents: HashSet<String>,
     propagate_plan_mode: bool,
@@ -56,6 +117,7 @@ impl AgentSpawnTool {
         Self {
             manager,
             tasks: None,
+            exposure_sink: None,
             allowed_agents: HashSet::new(),
             propagate_plan_mode: true,
             counter: AtomicU64::new(0),
@@ -77,6 +139,13 @@ impl AgentSpawnTool {
     /// The attached task repository, when one was configured.
     pub fn task_repository(&self) -> Option<Arc<dyn TaskRepository>> {
         self.tasks.clone()
+    }
+
+    /// Records every spawned subagent into `sink`, so the subagent middleware can emit the
+    /// in-band `SubagentExposed` event.
+    pub fn with_exposure_sink(mut self, sink: SubagentExposureSink) -> Self {
+        self.exposure_sink = Some(sink);
+        self
     }
 
     /// Restricts spawnable agent ids (permission scoping). Empty = allow all.
@@ -339,6 +408,16 @@ impl Tool for AgentSpawnTool {
                 Arc::clone(&exec_agent),
                 repair.clone(),
             );
+            // The subagent is now user-addressable, so announce it in-band (Java
+            // `AgentSpawnTool#withSubagentExposedEvent`).
+            if let Some(sink) = &self.exposure_sink {
+                sink.record(SubagentExposure {
+                    subagent_id: key.clone(),
+                    agent_id: agent_id.clone(),
+                    session_id: child_session.clone(),
+                    label: label.clone(),
+                });
+            }
             header = format!("{}\n", spawn_header(&key, &agent_id, &child_session));
             TaskRunSpec::Adopted {
                 future: tokio::spawn(run_child_turn(exec_agent, repair, effective_prompt)),
@@ -759,8 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_spec_defaults_streaming_and_detail() {
-        let mut decl = SubagentDeclaration::new("coder", "desc", "prompt");
+    fn remote_spec_defaults_streaming_and_detail() {        let mut decl = SubagentDeclaration::new("coder", "desc", "prompt");
         decl.url = Some("http://remote:8080".into());
         let spec = remote_spec(&decl, "coder", "do it");
         match spec {
@@ -771,5 +849,129 @@ mod tests {
             }
             _ => panic!("expected remote spec"),
         }
+    }
+
+    /// Child stub for the exposure test: the spawn handshake only needs a callable agent.
+    struct EchoChild(Toolkit);
+
+    #[async_trait]
+    impl Agent for EchoChild {
+        fn agent_id(&self) -> &str {
+            "researcher"
+        }
+        fn name(&self) -> &str {
+            "researcher"
+        }
+        fn description(&self) -> &str {
+            "researcher"
+        }
+        fn interrupt(&self) {}
+        fn agent_state(&self) -> AgentState {
+            AgentState::default()
+        }
+        fn toolkit(&self) -> &Toolkit {
+            &self.0
+        }
+    }
+
+    #[async_trait]
+    impl CallableAgent for EchoChild {
+        async fn call(&self, _messages: Vec<Msg>) -> Result<Msg> {
+            Ok(Msg::assistant("child reply"))
+        }
+        async fn call_with_schema(&self, messages: Vec<Msg>, _schema: JsonSchema) -> Result<Msg> {
+            self.call(messages).await
+        }
+    }
+
+    struct EchoFactory;
+
+    impl crate::agent::subagent::SubagentFactory for EchoFactory {
+        fn create(
+            &self,
+            _rc: &agentscope_core::agent::RuntimeContext,
+        ) -> Arc<dyn CallableAgent> {
+            Arc::new(EchoChild(Toolkit::new()))
+        }
+    }
+
+    fn echo_entry() -> crate::agent::subagent::SubagentEntry {
+        use crate::agent::subagent::{SubagentEntry, SubagentMode};
+        let mut entry = SubagentEntry::new("researcher", "sub", Arc::new(EchoFactory));
+        entry = entry.with_declaration(SubagentDeclaration {
+            name: "researcher".to_string(),
+            mode: SubagentMode::Subagent,
+            ..SubagentDeclaration::new("researcher", "sub", "")
+        });
+        entry
+    }
+
+    #[tokio::test]
+    async fn a_spawned_subagent_is_announced_as_a_subagent_exposed_event() {
+        // Regression: Java announces a newly exposed subagent in-band
+        // (`AgentSpawnTool#withSubagentExposedEvent`); without it a UI never learns the
+        // `agent_key` needed for follow-up `agent_send` turns.
+        let dir = std::env::temp_dir().join(format!("as_exposed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fs: Arc<dyn crate::filesystem::Filesystem> =
+            Arc::new(crate::filesystem::LocalFilesystem::sandboxed(&dir));
+        let repo: Arc<dyn TaskRepository> = Arc::new(
+            crate::agent::subagent::task::WorkspaceTaskRepository::new(fs, "parent"),
+        );
+
+        let sink = SubagentExposureSink::new();
+        let tool = AgentSpawnTool::new(Arc::new(DefaultAgentManager::new(&[echo_entry()])))
+            .with_task_repository(repo)
+            .with_exposure_sink(sink.clone());
+
+        let mut args = JsonMap::new();
+        args.insert("agent".to_string(), serde_json::json!("researcher"));
+        args.insert("prompt".to_string(), serde_json::json!("hi"));
+        args.insert("label".to_string(), serde_json::json!("alpha"));
+        let out = tool
+            .call(args, ToolExecutionContext::default())
+            .await
+            .expect("call ok")
+            .text_content();
+        assert!(out.contains("task_id: "), "spawn failed: {out}");
+
+        // The middleware drains the sink at the next reasoning step.
+        let events = crate::agent::middleware::subagents::take_subagent_exposed_events(&Some(
+            sink.clone(),
+        ));
+        assert_eq!(events.len(), 1, "one spawn must announce exactly one exposure");
+        let event = events
+            .into_iter()
+            .next()
+            .expect("event")
+            .expect("ok event");
+        assert_eq!(
+            event.event_type(),
+            agentscope_core::event::AgentEventType::SubagentExposed
+        );
+        let fields = &event.data().fields;
+        assert_eq!(
+            fields.get("agentId").and_then(|v| v.as_str()),
+            Some("researcher")
+        );
+        assert_eq!(
+            fields.get("label").and_then(|v| v.as_str()),
+            Some("alpha")
+        );
+        let subagent_id = fields
+            .get("subagentId")
+            .and_then(|v| v.as_str())
+            .expect("subagentId");
+        assert!(subagent_id.starts_with("agent:researcher:"), "{subagent_id}");
+        assert_eq!(
+            fields.get("sessionId").and_then(|v| v.as_str()).map(str::is_empty),
+            Some(false)
+        );
+
+        // One-shot: the same announcement must not be replayed on the next step.
+        assert!(crate::agent::middleware::subagents::take_subagent_exposed_events(&Some(sink))
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

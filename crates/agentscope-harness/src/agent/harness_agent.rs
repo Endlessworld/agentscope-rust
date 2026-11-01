@@ -24,7 +24,10 @@ use agentscope_core::state::AgentStateStore;
 use agentscope_core::state::ConflictPolicy;
 use agentscope_core::tool::{Tool, Toolkit};
 
-use crate::filesystem::{Filesystem, LocalFilesystem};
+use crate::filesystem::{
+    CompositeFilesystem, Filesystem, LocalFilesystem, LocalFilesystemSpec, RemoteFilesystemSpec,
+    SandboxFilesystemSpec,
+};
 use crate::tool::CompactConfig;
 
 use super::artifact::ArtifactDeliveryTarget;
@@ -68,7 +71,7 @@ use super::workspace::{
 use crate::tool::{
     AgentListTool, AgentSendTool, AgentSpawnTool, ArtifactDeliveryTool, FilesystemTool,
     MemoryGetTool, MemorySaveTool, MemorySearchTool, PlanModeHandle, SessionSearchTool,
-    ShellExecuteTool, TeamTool, WebFetchTool, WebSearchTool,
+    ShellExecuteTool, SubagentExposureSink, TeamTool, WebFetchTool, WebSearchTool,
 };
 
 /// A harness agent that operates on a filesystem with a configured toolkit and middleware chain.
@@ -749,7 +752,28 @@ pub struct HarnessAgentBuilder {
     model: Option<Arc<dyn Model>>,
     /// Turns a subagent declaration's `model` id into a model (Java `Builder.modelResolver`).
     model_resolver: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn Model>> + Send + Sync>>,
+    /// Model that takes over once the primary exhausts its retry budget (Java
+    /// `Builder.fallbackModel`).
+    fallback_model: Option<Arc<dyn Model>>,
+    /// Fallback model id resolved through [`Self::model_resolver`] at build time (Java
+    /// `Builder.fallbackModel(String)`).
+    fallback_model_id: Option<String>,
+    /// Observer notified when the fallback takes over (Java `Builder.failoverListener`).
+    failover_listener: Option<Arc<dyn agentscope_core::agent::FailoverListener>>,
+    /// Number of model retries after the first attempt (Java `Builder.maxRetries`).
+    max_retries: Option<u32>,
+    /// Whether a tool rejected by the permission engine ends the turn instead of being fed
+    /// back to the model (Java `Builder.stopOnReject`).
+    stop_on_reject: Option<bool>,
     filesystem: Option<Arc<dyn Filesystem>>,
+    /// Filesystem assembled from a spec during `build()`, when the resolved workspace root is
+    /// known (Java `Builder.filesystem(LocalFilesystemSpec)` / `(RemoteFilesystemSpec)`).
+    local_filesystem_spec: Option<LocalFilesystemSpec>,
+    remote_filesystem_spec: Option<RemoteFilesystemSpec>,
+    /// Sandbox configuration assembled by `build()` unless `sandbox_context` is set.
+    sandbox_filesystem_spec: Option<SandboxFilesystemSpec>,
+    /// Extra path-prefix routes layered over the resolved filesystem (Java `filesystemRoute`).
+    filesystem_routes: Vec<(String, Arc<dyn Filesystem>)>,
     cwd: Option<PathBuf>,
     distributed_store: Option<DistributedStore>,
     /// Optional persistent state store wired into a checkpoint middleware.
@@ -885,7 +909,16 @@ impl Default for HarnessAgentBuilder {
             name: None,
             model: None,
             model_resolver: None,
+            fallback_model: None,
+            fallback_model_id: None,
+            failover_listener: None,
+            max_retries: None,
+            stop_on_reject: None,
             filesystem: None,
+            local_filesystem_spec: None,
+            remote_filesystem_spec: None,
+            sandbox_filesystem_spec: None,
+            filesystem_routes: Vec::new(),
             cwd: None,
             distributed_store: None,
             state_store: None,
@@ -997,8 +1030,83 @@ impl HarnessAgentBuilder {
         self.model_resolver = Some(Arc::new(resolver));
         self
     }
+
+    /// Sets the model that takes over after the primary exhausts its own retry budget
+    /// (mirrors Java `Builder.fallbackModel(Model)`).
+    pub fn fallback_model(mut self, model: Arc<dyn Model>) -> Self {
+        self.fallback_model = Some(model);
+        self
+    }
+
+    /// Sets the fallback model by id, resolved through [`Self::model_resolver`] at build time
+    /// (mirrors Java `Builder.fallbackModel(String modelId)`).
+    pub fn fallback_model_by_name(mut self, model_id: impl Into<String>) -> Self {
+        self.fallback_model_id = Some(model_id.into());
+        self
+    }
+
+    /// Sets the observer notified when the fallback model takes over (mirrors Java
+    /// `Builder.failoverListener`).
+    pub fn failover_listener(
+        mut self,
+        listener: Arc<dyn agentscope_core::agent::FailoverListener>,
+    ) -> Self {
+        self.failover_listener = Some(listener);
+        self
+    }
+
+    /// Sets the model retry budget (mirrors Java `Builder.maxRetries`): the number of retries
+    /// after the first attempt, so core receives `max_retries + 1` attempts.
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        assert!(max_retries > 0, "max_retries must be > 0");
+        self.max_retries = Some(max_retries);
+        self
+    }
+
+    /// Whether a permission rejection ends the turn instead of being fed back to the model
+    /// (mirrors Java `Builder.stopOnReject`; core default is `false`).
+    pub fn stop_on_reject(mut self, stop_on_reject: bool) -> Self {
+        self.stop_on_reject = Some(stop_on_reject);
+        self
+    }
+
     pub fn filesystem(mut self, fs: Arc<dyn Filesystem>) -> Self {
         self.filesystem = Some(fs);
+        self
+    }
+
+    /// Builds the filesystem from a local spec at build time, anchored at the resolved
+    /// workspace root (Java `Builder.filesystem(LocalFilesystemSpec)`). Takes precedence over
+    /// [`Self::remote_filesystem`], and is ignored when an explicit filesystem is configured.
+    pub fn local_filesystem(mut self, spec: LocalFilesystemSpec) -> Self {
+        self.local_filesystem_spec = Some(spec);
+        self
+    }
+
+    /// Builds a composite filesystem from a remote spec at build time: shared workspace paths
+    /// route to the spec's store, everything else stays local (Java
+    /// `Builder.filesystem(RemoteFilesystemSpec)`).
+    pub fn remote_filesystem(mut self, spec: RemoteFilesystemSpec) -> Self {
+        self.remote_filesystem_spec = Some(spec);
+        self
+    }
+
+    /// Sandbox configuration used to build the `SandboxContext` during `build()` (Java
+    /// `Builder.filesystem(SandboxFilesystemSpec)`). An explicit
+    /// [`Self::sandbox_context`] wins.
+    pub fn sandbox_filesystem(mut self, spec: SandboxFilesystemSpec) -> Self {
+        self.sandbox_filesystem_spec = Some(spec);
+        self
+    }
+
+    /// Routes `prefix` (workspace-relative, longest prefix wins) to `filesystem`, leaving the
+    /// default backend for everything else (Java `Builder.filesystemRoute`).
+    pub fn filesystem_route(
+        mut self,
+        prefix: impl Into<String>,
+        filesystem: Arc<dyn Filesystem>,
+    ) -> Self {
+        self.filesystem_routes.push((prefix.into(), filesystem));
         self
     }
 
@@ -1473,19 +1581,27 @@ impl HarnessAgentBuilder {
         self
     }
 
-    /// Generation defaults after overlaying [`HarnessAgentBuilder::model_execution_config`].
+    /// Generation defaults after overlaying [`HarnessAgentBuilder::model_execution_config`]
+    /// and [`HarnessAgentBuilder::max_retries`].
     fn effective_generate_options(&self) -> Option<agentscope_core::model::GenerateOptions> {
-        match (&self.generate_options_defaults, &self.model_execution_config) {
+        let mut model_config = self.model_execution_config.clone();
+        if let Some(retries) = self.max_retries {
+            // Java counts retries after the first attempt; core counts attempts.
+            model_config
+                .get_or_insert_with(agentscope_core::model::ExecutionConfig::default)
+                .max_attempts = Some(retries.saturating_add(1));
+        }
+        match (&self.generate_options_defaults, model_config) {
             (None, None) => None,
             (Some(options), None) => Some(options.clone()),
             (None, Some(config)) => Some(
                 agentscope_core::model::GenerateOptions::builder()
-                    .execution_config(config.clone())
+                    .execution_config(config)
                     .build(),
             ),
             (Some(options), Some(config)) => {
                 let mut options = options.clone();
-                options.execution_config = Some(config.clone());
+                options.execution_config = Some(config);
                 Some(options)
             }
         }
@@ -1738,16 +1854,37 @@ impl HarnessAgentBuilder {
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let filesystem = self
-            .filesystem
-            .clone()
-            .unwrap_or_else(|| Arc::new(LocalFilesystem::new(cwd.clone())));
         let resolved_workspace = self
             .workspace
             .clone()
             .unwrap_or_else(|| self.resolve_default_workspace(&cwd));
         let name = self.name.clone().unwrap_or_else(|| "agent".to_string());
         let agent_id = self.agent_id.clone().unwrap_or_else(|| name.clone());
+        // Spec-built filesystems need the resolved workspace root, so they are assembled here
+        // rather than by the caller (Java `Builder.filesystem(Local/RemoteFilesystemSpec)`).
+        let filesystem = self
+            .filesystem
+            .clone()
+            .or_else(|| {
+                self.local_filesystem_spec
+                    .as_ref()
+                    .map(|spec| spec.build(&resolved_workspace))
+            })
+            .or_else(|| {
+                self.remote_filesystem_spec
+                    .as_ref()
+                    .map(|spec| spec.build(&resolved_workspace, &agent_id))
+            })
+            .unwrap_or_else(|| Arc::new(LocalFilesystem::new(cwd.clone())));
+        // Extra routes layer over whichever backend was resolved above; longest prefix wins.
+        let filesystem: Arc<dyn Filesystem> = if self.filesystem_routes.is_empty() {
+            filesystem
+        } else {
+            Arc::new(CompositeFilesystem::new(
+                filesystem,
+                self.filesystem_routes.clone(),
+            ))
+        };
         let description = self.description.clone();
         let environment = self
             .environment
@@ -1824,6 +1961,11 @@ impl HarnessAgentBuilder {
             let sandbox_context = self
                 .sandbox_context
                 .clone()
+                .or_else(|| {
+                    self.sandbox_filesystem_spec
+                        .take()
+                        .map(|spec| spec.into_sandbox_context(Some(&resolved_workspace)))
+                })
                 .unwrap_or_else(|| SandboxContext::builder().build());
             middleware.add(Box::new(SandboxLifecycleMiddleware::new(
                 manager,
@@ -2381,9 +2523,13 @@ impl HarnessAgentBuilder {
             entries.extend(self.subagent_entries.clone());
             let manager = Arc::new(DefaultAgentManager::new(&entries));
             // --- agent tools ---
+            // A tool call cannot reach the agent's event stream, so `agent_spawn` records the
+            // exposure here and the subagent middleware announces it at the next step.
+            let exposure_sink = SubagentExposureSink::new();
             let spawn_tool = Arc::new(
                 AgentSpawnTool::new(Arc::clone(&manager))
-                    .with_task_repository(Arc::clone(&task_repo)),
+                    .with_task_repository(Arc::clone(&task_repo))
+                    .with_exposure_sink(exposure_sink.clone()),
             );
             let agent_tools: Vec<Arc<dyn Tool>> = vec![
                 Arc::clone(&spawn_tool) as Arc<dyn Tool>,
@@ -2393,7 +2539,8 @@ impl HarnessAgentBuilder {
 
             if self.disable_dynamic_subagents {
                 let mw = SubagentsMiddleware::new(entries, Arc::clone(&task_repo))
-                    .with_extra_tools(agent_tools.clone());
+                    .with_extra_tools(agent_tools.clone())
+                    .with_exposure_sink(exposure_sink.clone());
                 for t in mw.get_tools() {
                     toolkit.register_tool(t);
                 }
@@ -2409,7 +2556,8 @@ impl HarnessAgentBuilder {
                     .with_factory_builder(move |decl: &SubagentDeclaration| {
                         factory_blueprint.declared_factory(decl)
                     })
-                    .with_extra_tools(agent_tools.clone());
+                    .with_extra_tools(agent_tools.clone())
+                    .with_exposure_sink(exposure_sink.clone());
                 for t in mw.get_tools() {
                     toolkit.register_tool(t);
                 }
@@ -2521,6 +2669,28 @@ impl HarnessAgentBuilder {
             }
             if let Some(task_list) = self.enable_task_list {
                 agent_builder = agent_builder.todo_tool(task_list);
+            }
+            // Model resilience (Java `Builder.fallbackModel|failoverListener`). The fallback
+            // gets its own identical retry budget inside core; `maxRetries` already reaches
+            // the call through the generation defaults built above.
+            let fallback_model = match (&self.fallback_model, &self.fallback_model_id) {
+                (Some(configured), _) => Some(Arc::clone(configured)),
+                (None, Some(model_id)) => Some(
+                    self.model_resolver
+                        .as_ref()
+                        .and_then(|resolve| resolve(model_id))
+                        .unwrap_or_else(|| panic!("unknown fallback model id: {model_id}")),
+                ),
+                (None, None) => None,
+            };
+            if let Some(fallback) = fallback_model {
+                agent_builder = agent_builder.fallback_model(fallback);
+            }
+            if let Some(listener) = &self.failover_listener {
+                agent_builder = agent_builder.failover_listener(Arc::clone(listener));
+            }
+            if let Some(stop) = self.stop_on_reject {
+                agent_builder = agent_builder.stop_on_reject(stop);
             }
             // ACP renders file diffs from the tool-result event and never reads them back
             // from history: archiving them would keep a copy of every edited file's old+new
@@ -2751,6 +2921,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_filesystem_route_serves_its_prefix_from_the_routed_backend() {
+        let root = temp_root("fs_route");
+        let routed_dir = root.join("routed");
+        std::fs::create_dir_all(&routed_dir).unwrap();
+        std::fs::write(routed_dir.join("note.md"), "routed content").unwrap();
+
+        let agent = HarnessAgent::builder()
+            .name("route-agent")
+            .model(Arc::new(NoopModel))
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .filesystem_route(
+                "knowledge/",
+                Arc::new(crate::filesystem::LocalFilesystem::sandboxed(&routed_dir)),
+            )
+            .disable_web_tools()
+            .build();
+
+        assert_eq!(
+            agent.filesystem().kind(),
+            crate::filesystem::FilesystemKind::Composite
+        );
+        let data = agent
+            .filesystem()
+            .read(
+                &agentscope_core::agent::RuntimeContext::default(),
+                "knowledge/note.md",
+                0,
+                100,
+            )
+            .await
+            .expect("the route serves the file");
+        assert_eq!(data.content, "routed content");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_local_filesystem_spec_is_assembled_at_the_resolved_workspace() {
+        let root = temp_root("fs_local_spec");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "project rules").unwrap();
+
+        let agent = HarnessAgent::builder()
+            .name("fs-spec-agent")
+            .model(Arc::new(NoopModel))
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .local_filesystem(crate::filesystem::LocalFilesystemSpec::new().project(&project))
+            .disable_web_tools()
+            .build();
+
+        // The overlay's lower layer is the project tree, so a project-authored file is
+        // readable through the agent's filesystem.
+        assert_eq!(
+            agent.filesystem().kind(),
+            crate::filesystem::FilesystemKind::Overlay
+        );
+        let data = agent
+            .filesystem()
+            .read(
+                &agentscope_core::agent::RuntimeContext::default(),
+                "AGENTS.md",
+                0,
+                100,
+            )
+            .await
+            .expect("the project layer answers reads");
+        assert_eq!(data.content, "project rules");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn assembly_only_handle_has_no_prompt_and_zero_iterations() {
         let root = temp_root("assembly_only");
         let agent = HarnessAgent::builder()
@@ -2766,6 +3009,121 @@ mod tests {
         assert_eq!(handle.description(), "");
         assert_eq!(handle.sys_prompt(), "");
         assert_eq!(handle.max_iters(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fails every call, so the configured fallback must take over.
+    struct FailingModel;
+
+    #[async_trait::async_trait]
+    impl Model for FailingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<ToolSchema>,
+            _options: GenerateOptions,
+        ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+            Box::pin(futures::stream::once(async {
+                Err(agentscope_core::error::Error::Http("primary is down".into()))
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "primary"
+        }
+    }
+
+    /// Records the primary model name reported at every failover.
+    struct RecordingFailover {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl agentscope_core::agent::FailoverListener for RecordingFailover {
+        fn on_failover(&self, primary_model: &str, _error: &agentscope_core::error::Error) {
+            self.seen.lock().unwrap().push(primary_model.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_model_and_listener_reach_the_embedded_agent() {
+        use futures::StreamExt;
+
+        let root = temp_root("failover");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let agent = HarnessAgent::builder()
+            .name("failover-agent")
+            .model(Arc::new(FailingModel))
+            .fallback_model(Arc::new(NoopModel))
+            .failover_listener(Arc::new(RecordingFailover {
+                seen: Arc::clone(&seen),
+            }))
+            // A single attempt, so the primary fails over instead of backing off.
+            .max_retries(1)
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .disable_web_tools()
+            .build();
+
+        let events: Vec<_> = agent
+            .stream_events(vec![Msg::user("hi")], StreamOptions::default())
+            .collect()
+            .await;
+        assert!(events.iter().all(|event| event.is_ok()), "{events:?}");
+        assert_eq!(*seen.lock().unwrap(), vec!["primary".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn max_retries_counts_retries_after_the_first_attempt() {
+        let options = HarnessAgent::builder()
+            .max_retries(2)
+            .effective_generate_options()
+            .expect("max_retries alone still yields options");
+        assert_eq!(
+            options.execution_config.expect("an execution policy").max_attempts,
+            Some(3)
+        );
+
+        // An explicit model policy keeps its other fields; only the attempt budget moves.
+        let config = agentscope_core::model::ExecutionConfig::builder()
+            .timeout(Duration::from_secs(5))
+            .build();
+        let options = HarnessAgent::builder()
+            .model_execution_config(config)
+            .max_retries(1)
+            .effective_generate_options()
+            .expect("the overlay produces options");
+        let config = options.execution_config.expect("an execution policy");
+        assert_eq!(config.max_attempts, Some(2));
+        assert_eq!(config.timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[tokio::test]
+    async fn stop_on_reject_reaches_the_embedded_agent() {
+        let root = temp_root("stop_on_reject");
+        let agent = HarnessAgent::builder()
+            .name("stop-on-reject-agent")
+            .model(Arc::new(NoopModel))
+            .stop_on_reject(true)
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .disable_web_tools()
+            .build();
+        assert!(agent.agent().expect("an embedded agent").stop_on_reject());
+
+        // Unset keeps core's default (a rejection is fed back to the model).
+        let default_agent = HarnessAgent::builder()
+            .name("default-agent")
+            .model(Arc::new(NoopModel))
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .disable_web_tools()
+            .build();
+        assert!(!default_agent
+            .agent()
+            .expect("an embedded agent")
+            .stop_on_reject());
 
         let _ = std::fs::remove_dir_all(&root);
     }

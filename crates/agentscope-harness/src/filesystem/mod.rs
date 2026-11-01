@@ -9,6 +9,7 @@ pub mod overlay;
 pub mod remote;
 pub mod result;
 pub mod sandbox;
+pub mod spec;
 pub mod util;
 
 use std::any::Any;
@@ -33,6 +34,7 @@ pub use result::{
 pub use sandbox::{
     PinnedSandboxFilesystem, RoutedSandboxFilesystem, SandboxBackedFilesystem, SandboxFilesystem,
 };
+pub use spec::{LocalFilesystemSpec, RemoteFilesystemSpec, SandboxFilesystemSpec};
 
 /// Directory/listing entry.
 #[derive(Debug, Clone, PartialEq, Eq)]

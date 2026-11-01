@@ -16,8 +16,9 @@ use agentscope_core::tool::Tool;
 use futures::StreamExt;
 
 use crate::agent::middleware::{
-    build_delivery_reminder, build_task_summary, prepend_to_system_message,
+    build_delivery_reminder, build_task_summary, prepend_events, prepend_to_system_message,
     render_subagent_section, subagents::deliver_after_completion,
+    subagents::take_subagent_exposed_events,
 };
 use crate::agent::subagent::task::{task_session_key, TaskRepository};
 use crate::agent::subagent::{
@@ -25,6 +26,7 @@ use crate::agent::subagent::{
     SubagentEntry, SubagentFactory, SUBAGENTS_DIR,
 };
 use crate::filesystem::Filesystem;
+use crate::tool::agent_spawn::SubagentExposureSink;
 use crate::tool::TaskTool;
 
 /// Re-materializes factories from a declaration; returns `None` to skip.
@@ -41,6 +43,8 @@ pub struct DynamicSubagentsMiddleware {
     task_repository: Arc<dyn TaskRepository>,
     task_tool: Arc<TaskTool>,
     extra_tools: Vec<Arc<dyn Tool>>,
+    /// Exposures recorded by `agent_spawn`, announced as in-band `SubagentExposed` events.
+    exposure_sink: Option<SubagentExposureSink>,
 }
 
 impl DynamicSubagentsMiddleware {
@@ -59,7 +63,14 @@ impl DynamicSubagentsMiddleware {
             task_repository: Arc::clone(&task_repository),
             task_tool: TaskTool::new(task_repository),
             extra_tools: Vec::new(),
+            exposure_sink: None,
         }
+    }
+
+    /// Announces subagents spawned by the attached `agent_spawn` tool.
+    pub fn with_exposure_sink(mut self, sink: SubagentExposureSink) -> Self {
+        self.exposure_sink = Some(sink);
+        self
     }
 
     /// Enables the namespace-aware filesystem layer (Layer 1 override source).
@@ -130,6 +141,7 @@ impl Middleware for DynamicSubagentsMiddleware {
         let mgr = self.agent_manager.clone();
         let repo = Arc::clone(&self.task_repository);
         let static_entries = self.static_entries.clone();
+        let exposed = take_subagent_exposed_events(&self.exposure_sink);
 
         let fut = async move {
             let merged = reload_entries(
@@ -164,7 +176,7 @@ impl Middleware for DynamicSubagentsMiddleware {
                 addition.push_str(&summary);
             }
             if addition.is_empty() && delivery_msg.is_none() {
-                return next(input);
+                return prepend_events(exposed, next(input));
             }
             let mut rebuilt = if addition.is_empty() {
                 input.messages
@@ -175,7 +187,10 @@ impl Middleware for DynamicSubagentsMiddleware {
                 rebuilt.push(dm);
             }
             let downstream = next(ReasoningInput::new(rebuilt, input.tools, input.options));
-            deliver_after_completion(downstream, repo, rc, session, pending)
+            prepend_events(
+                exposed,
+                deliver_after_completion(downstream, repo, rc, session, pending),
+            )
         };
         Box::pin(futures::stream::once(fut).flatten())
     }

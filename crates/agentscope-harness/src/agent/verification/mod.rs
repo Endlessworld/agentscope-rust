@@ -35,11 +35,19 @@
 //!   the evidence is passed in instead of re-read. See [`SettledAction::evidence_binding`].
 //! - **`CustomEvent("task_verification")` emission.** Not wired: no in-band observer consumes it
 //!   yet, and the durable `verification/result` fact is the source of truth for projections.
-//! - **`VerificationService::load`.** Loading a stored report requires the state-store key space
-//!   above; `SessionProjection::verifications` already replays committed facts.
+//! - **`VerificationService::load(userId, sessionId, id)`.** Loading a *stored report* requires
+//!   the state-store key space above; `SessionProjection::verifications` already replays
+//!   committed facts. The name-keyed verifier registry is ported as [`load`].
 //! - **`recorder.captureState(...)` / `flushNow()`.** A checkpoint after recording needs the
 //!   whole `AgentState`; this module only receives the task context, so the owning agent loop
 //!   remains responsible for checkpointing after a verification.
+
+mod verifiers;
+
+pub use verifiers::{
+    load, JsonResultSchemaVerifier, ShellExitCodeVerifier, JSON_RESULT_SCHEMA_VERIFIER,
+    SHELL_EXIT_CODE_VERIFIER,
+};
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 

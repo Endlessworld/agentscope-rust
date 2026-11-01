@@ -347,7 +347,18 @@ impl LayoutSpec {
         let mut spec = WorkspaceSpec::new(self.root.clone());
         spec.environment = self.environment.clone().into_iter().collect();
         for (key, entry) in &self.entries {
-            flatten_entry(key, entry, &mut spec);
+            match entry {
+                // Bind mounts and the projection are not materialized: they are carried on the
+                // workspace spec so the sandbox backend can apply them at start time.
+                WorkspaceEntry::BindMount(mount) => {
+                    spec.bind_mounts
+                        .insert(key.trim_matches('/').to_string(), mount.clone());
+                }
+                WorkspaceEntry::WorkspaceProjection(projection) => {
+                    spec.workspace_projection = Some(projection.clone());
+                }
+                _ => flatten_entry(key, entry, &mut spec),
+            }
         }
         spec
     }

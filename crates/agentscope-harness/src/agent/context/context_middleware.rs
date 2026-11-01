@@ -14,11 +14,57 @@ use futures::StreamExt;
 
 use super::builder::{BudgetExceeded, ContextPipeline, PrepareOutcome};
 use super::item::ContextPurpose;
+use super::policy::ContextManifest;
 use super::source::ContextRequest;
 use crate::agent::memory::compaction::{
     CompactionConfig, CompactionMetrics, ConversationCompactor,
 };
 use crate::agent::middleware::conversation_compaction::compaction_event;
+
+/// In-band build-outcome event name, mirroring Java
+/// `ModelRequestPreparer.BUILD_EVENT_NAME`.
+///
+/// One event is emitted per prepared request, including the rejected ones: a rejection happens
+/// before any provider call, so the event is the only way an observer can see *that* the
+/// request was refused and why.
+pub const BUILD_EVENT_NAME: &str = "context_build";
+
+/// Builds the `context_build` `Custom` event.
+///
+/// The manifest is included whenever compilation produced one (the rejected over-budget case
+/// carries the manifest that overflowed), so a consumer can attribute the outcome to the exact
+/// material set. Mirrors Java `ModelRequestPreparer#emitBuild`.
+fn build_event(
+    agent_id: &str,
+    call_id: &str,
+    purpose: ContextPurpose,
+    status: &str,
+    manifest: Option<&ContextManifest>,
+    error_type: Option<&str>,
+) -> agentscope_core::event::AgentEvent {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "kind".to_string(),
+        serde_json::json!(BUILD_EVENT_NAME),
+    );
+    fields.insert("agent_id".to_string(), serde_json::json!(agent_id));
+    fields.insert("model_call_id".to_string(), serde_json::json!(call_id));
+    fields.insert("purpose".to_string(), serde_json::json!(purpose.as_str()));
+    fields.insert("status".to_string(), serde_json::json!(status));
+    if let Some(manifest) = manifest {
+        if let Ok(value) = serde_json::to_value(manifest) {
+            fields.insert("context_manifest".to_string(), value);
+        }
+    }
+    // Exception text can contain source content, so only the failure class is recorded.
+    if let Some(error_type) = error_type {
+        fields.insert("error_type".to_string(), serde_json::json!(error_type));
+    }
+    agentscope_core::event::AgentEvent::with_fields(
+        agentscope_core::event::AgentEventType::Custom,
+        fields,
+    )
+}
 
 /// Configuration of the budget-overflow fallback.
 ///
@@ -129,6 +175,13 @@ impl Middleware for ContextMiddleware {
         } = input;
 
         let fut = async move {
+            // Every terminal build outcome is announced in-band, including a rejection that
+            // happens before any provider call (Java `ModelRequestPreparer.prepareObserved`).
+            let emit = |event: agentscope_core::event::AgentEvent| {
+                if let Some(tx) = &delta_tx {
+                    let _ = tx.unbounded_send(Ok(event));
+                }
+            };
             let first = pipeline
                 .prepare_with_task_outcome(
                     Arc::clone(&model),
@@ -142,6 +195,14 @@ impl Middleware for ContextMiddleware {
             let overflow_info: BudgetExceeded = match first {
                 // The continuation receives the compiled request, never the original one.
                 Ok(PrepareOutcome::Prepared(prepared)) => {
+                    emit(build_event(
+                        &agent_id,
+                        &request.call_id,
+                        request.purpose,
+                        "passed",
+                        Some(&prepared.manifest),
+                        None,
+                    ));
                     return next(ModelCallInput::new(
                         prepared.messages,
                         prepared.tools,
@@ -151,6 +212,14 @@ impl Middleware for ContextMiddleware {
                 }
                 Ok(PrepareOutcome::BudgetExceeded(info)) => info,
                 Err(error) => {
+                    emit(build_event(
+                        &agent_id,
+                        &request.call_id,
+                        request.purpose,
+                        "failed",
+                        None,
+                        Some("ContextError"),
+                    ));
                     return Box::pin(futures::stream::once(async move { Err(error) }))
                         as EventStream
                 }
@@ -171,6 +240,14 @@ impl Middleware for ContextMiddleware {
                     session = %session_id,
                     "no compaction fallback is configured; surfacing the local budget failure"
                 );
+                emit(build_event(
+                    &agent_id,
+                    &request.call_id,
+                    request.purpose,
+                    "failed",
+                    Some(&overflow_info.manifest),
+                    Some("BudgetExceeded"),
+                ));
                 let error = overflow_info.into_error();
                 return Box::pin(futures::stream::once(async move { Err(error) })) as EventStream;
             };
@@ -206,6 +283,7 @@ impl Middleware for ContextMiddleware {
                     call_id: uuid::Uuid::new_v4().to_string(),
                     ..request.clone()
                 };
+                let retry_call_id = retry_request.call_id.clone();
                 match pipeline
                     .prepare_with_task_outcome(
                         Arc::clone(&model),
@@ -218,6 +296,14 @@ impl Middleware for ContextMiddleware {
                     .await
                 {
                     Ok(PrepareOutcome::Prepared(prepared)) => {
+                        emit(build_event(
+                            &agent_id,
+                            &retry_call_id,
+                            request.purpose,
+                            "passed",
+                            Some(&prepared.manifest),
+                            None,
+                        ));
                         return next(ModelCallInput::new(
                             prepared.messages,
                             prepared.tools,
@@ -236,6 +322,14 @@ impl Middleware for ContextMiddleware {
                         last_info = info;
                     }
                     Err(error) => {
+                        emit(build_event(
+                            &agent_id,
+                            &request.call_id,
+                            request.purpose,
+                            "failed",
+                            None,
+                            Some("ContextError"),
+                        ));
                         return Box::pin(futures::stream::once(async move { Err(error) }))
                             as EventStream
                     }
@@ -247,6 +341,14 @@ impl Middleware for ContextMiddleware {
                 session = %session_id,
                 "conversation compaction could not free enough context; surfacing the budget failure"
             );
+            emit(build_event(
+                &agent_id,
+                &request.call_id,
+                request.purpose,
+                "failed",
+                Some(&last_info.manifest),
+                Some("BudgetExceeded"),
+            ));
             let error = last_info.into_error();
             Box::pin(futures::stream::once(async move { Err(error) })) as EventStream
         };
@@ -528,6 +630,103 @@ mod tests {
         // The instruction cannot be evicted, so preparation fails and no model call happens.
         assert!(events.iter().any(|event| event.is_err()));
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_prepared_request_announces_one_context_build() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let model: Arc<dyn Model> = Arc::new(StubModel {
+            window: 128_000,
+            seen: Arc::clone(&seen),
+        });
+        let (delta_tx, mut delta_rx) = futures::channel::mpsc::unbounded();
+        let ctx = RuntimeContext::new()
+            .with_user_id("alice")
+            .with_session_id("s1")
+            .with_agent_id("agent");
+        let ctx = RuntimeContext {
+            delta_tx: Some(delta_tx),
+            ..ctx
+        };
+
+        let events = run_with_ctx(
+            ContextMiddleware::new(pipeline(true)),
+            model,
+            vec![Msg::user("investigate")],
+            ctx,
+        )
+        .await;
+        assert!(events.iter().all(|event| event.is_ok()), "{events:?}");
+
+        let build = delta_rx
+            .try_next()
+            .expect("the channel stays open")
+            .expect("one build event")
+            .expect("ok event");
+        let fields = &build.data().fields;
+        assert_eq!(fields["kind"], serde_json::json!("context_build"));
+        assert_eq!(fields["status"], serde_json::json!("passed"));
+        assert_eq!(fields["purpose"], serde_json::json!("REASONING"));
+        assert_eq!(fields["agent_id"], serde_json::json!("agent"));
+        assert!(
+            fields["model_call_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "{fields:?}"
+        );
+        assert!(
+            fields["context_manifest"].is_object(),
+            "the manifest travels with the build: {fields:?}"
+        );
+        assert!(fields.get("error_type").is_none());
+        // Exactly one outcome per prepared request.
+        assert!(matches!(delta_rx.try_next(), Ok(None)));
+        // The compiled request still reached the provider.
+        assert!(!seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_request_announces_a_failed_build_and_never_calls_the_model() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let model: Arc<dyn Model> = Arc::new(StubModel {
+            window: 10,
+            seen: Arc::clone(&seen),
+        });
+        let (delta_tx, mut delta_rx) = futures::channel::mpsc::unbounded();
+        let ctx = RuntimeContext::new()
+            .with_user_id("alice")
+            .with_session_id("s1")
+            .with_agent_id("agent");
+        let ctx = RuntimeContext {
+            delta_tx: Some(delta_tx),
+            ..ctx
+        };
+
+        let events = run_with_ctx(
+            ContextMiddleware::new(pipeline(true)),
+            model,
+            vec![Msg::user("investigate")],
+            ctx,
+        )
+        .await;
+        assert!(events.iter().any(|event| event.is_err()));
+        // The rejection happens before any provider call, so the event is the only trace.
+        assert!(seen.lock().unwrap().is_empty());
+
+        let build = delta_rx
+            .try_next()
+            .expect("the channel stays open")
+            .expect("one build event")
+            .expect("ok event");
+        let fields = &build.data().fields;
+        assert_eq!(fields["kind"], serde_json::json!("context_build"));
+        assert_eq!(fields["status"], serde_json::json!("failed"));
+        assert_eq!(fields["error_type"], serde_json::json!("BudgetExceeded"));
+        assert!(
+            fields["context_manifest"].is_object(),
+            "the overflowing manifest is reported: {fields:?}"
+        );
+        assert!(matches!(delta_rx.try_next(), Ok(None)));
     }
 
     #[tokio::test]

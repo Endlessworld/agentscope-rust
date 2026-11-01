@@ -15,7 +15,35 @@ use futures::StreamExt;
 
 use crate::agent::subagent::task::{task_session_key, TaskDelivery, TaskRepository, TaskStatus};
 use crate::agent::subagent::SubagentEntry;
+use crate::tool::agent_spawn::SubagentExposureSink;
 use crate::tool::TaskTool;
+
+/// Drains the exposures recorded since the last step into in-band `SubagentExposed` events.
+///
+/// `agent_spawn` runs inside a tool call and cannot reach the event stream, so the announcement
+/// happens at the next reasoning step (the same point a background result is delivered).
+pub(crate) fn take_subagent_exposed_events(
+    sink: &Option<SubagentExposureSink>,
+) -> Vec<agentscope_core::error::Result<AgentEvent>> {
+    let Some(sink) = sink else {
+        return Vec::new();
+    };
+    sink.drain()
+        .into_iter()
+        .map(|exposure| Ok(exposure.into_event()))
+        .collect()
+}
+
+/// Prepends `events` to `stream`; identity when there is nothing to announce.
+pub(crate) fn prepend_events(
+    events: Vec<agentscope_core::error::Result<AgentEvent>>,
+    stream: agentscope_core::middleware::EventStream,
+) -> agentscope_core::middleware::EventStream {
+    if events.is_empty() {
+        return stream;
+    }
+    futures::stream::iter(events).chain(stream).boxed()
+}
 
 /// Cap on individual task results aggregated into one delivery message.
 const MAX_DELIVERIES_PER_REMINDER: usize = 10;
@@ -93,6 +121,8 @@ pub struct SubagentsMiddleware {
     task_repository: Arc<dyn TaskRepository>,
     /// Additional agent tools (e.g. `agent_spawn`/`agent_send`/`agent_list`) to register.
     extra_tools: Vec<Arc<dyn Tool>>,
+    /// Exposures recorded by `agent_spawn`, announced as in-band `SubagentExposed` events.
+    exposure_sink: Option<SubagentExposureSink>,
 }
 
 impl SubagentsMiddleware {
@@ -102,7 +132,14 @@ impl SubagentsMiddleware {
             task_tool: TaskTool::new(Arc::clone(&task_repository)),
             task_repository,
             extra_tools: Vec::new(),
+            exposure_sink: None,
         }
+    }
+
+    /// Announces subagents spawned by the attached `agent_spawn` tool.
+    pub fn with_exposure_sink(mut self, sink: SubagentExposureSink) -> Self {
+        self.exposure_sink = Some(sink);
+        self
     }
 
     /// Adds extra agent tools (spawn/send/list) contributed by this middleware.
@@ -141,9 +178,10 @@ impl Middleware for SubagentsMiddleware {
         input: ReasoningInput,
         next: Next<ReasoningInput>,
     ) -> agentscope_core::middleware::EventStream {
+        let exposed = take_subagent_exposed_events(&self.exposure_sink);
         let entries = self.entries.lock().unwrap().clone();
         if entries.is_empty() {
-            return next(input);
+            return prepend_events(exposed, next(input));
         }
         let session = task_session_key(ctx);
         let repo = Arc::clone(&self.task_repository);
@@ -170,11 +208,14 @@ impl Middleware for SubagentsMiddleware {
 
             let downstream = next(ReasoningInput::new(rebuilt, input.tools, input.options));
             if pending.is_empty() {
-                return downstream;
+                return prepend_events(exposed, downstream);
             }
 
             // Mark delivered ONLY after the inner reasoning completes successfully.
-            deliver_after_completion(downstream, repo, rc, sid, pending)
+            prepend_events(
+                exposed,
+                deliver_after_completion(downstream, repo, rc, sid, pending),
+            )
         };
         Box::pin(futures::stream::once(fut).flatten())
     }
