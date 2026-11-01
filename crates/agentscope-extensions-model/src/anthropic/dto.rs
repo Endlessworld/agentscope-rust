@@ -392,6 +392,11 @@ pub struct AnthropicStreamDelta {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// `signature_delta`: an incremental fragment of the thinking block's
+    /// signature. Anthropic streams the signature in pieces, so the parser
+    /// concatenates them instead of overwriting (MODEL-18).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
     /// `input_json_delta`: the partial JSON of a tool call's arguments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partial_json: Option<String>,

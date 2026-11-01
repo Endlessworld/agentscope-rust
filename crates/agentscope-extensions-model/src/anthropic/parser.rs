@@ -190,6 +190,8 @@ pub fn parse_message(response: &AnthropicMessageResponse) -> ChatResponse {
 ///
 /// * `content_block_delta` / `text_delta` and `thinking_delta` are yielded
 ///   immediately as incremental [`ChatResponse`]s.
+/// * `signature_delta` fragments are concatenated per block index and yielded as
+///   an empty-text thinking chunk carrying the signature metadata (MODEL-18).
 /// * `content_block_start` registers an in-flight tool call (by stream index).
 /// * `input_json_delta` appends to that tool call's raw argument buffer.
 /// * `message_start` / `message_delta` update the accumulated usage; the tool
@@ -200,6 +202,8 @@ pub struct AnthropicStreamIncrementer {
     /// In-flight tool calls, keyed by their `content_block` stream index.
     tool_calls: BTreeMap<usize, ToolUseBlock>,
     position: BTreeMap<usize, usize>,
+    /// Accumulated `signature_delta` fragments, keyed by `content_block` index.
+    thinking_signatures: BTreeMap<usize, String>,
     usage: Option<ChatUsage>,
     stop_reason: Option<String>,
 }
@@ -261,6 +265,24 @@ impl AnthropicStreamIncrementer {
                     }
                     if let Some(thinking) = delta.thinking.as_ref().filter(|s| !s.is_empty()) {
                         blocks.push(ContentBlock::Thinking(ThinkingBlock::new(thinking.clone())));
+                    }
+                    // The signature arrives in fragments after the thinking text; keep the
+                    // cumulative value so the consumer's last-wins metadata merge yields the
+                    // full signature instead of the final fragment alone.
+                    if let Some(fragment) = delta.signature.as_ref().filter(|s| !s.is_empty()) {
+                        let signature = self
+                            .thinking_signatures
+                            .entry(event.index.unwrap_or(0))
+                            .or_default();
+                        signature.push_str(fragment);
+                        let mut thinking = ThinkingBlock::new("");
+                        let mut metadata = JsonMap::new();
+                        metadata.insert(
+                            METADATA_THINKING_SIGNATURE.to_string(),
+                            serde_json::json!(signature),
+                        );
+                        thinking.metadata = Some(metadata);
+                        blocks.push(ContentBlock::Thinking(thinking));
                     }
                     if let Some(partial) = delta.partial_json.as_ref().filter(|s| !s.is_empty()) {
                         let index = event.index.unwrap_or(0);
@@ -540,6 +562,100 @@ mod tests {
         }));
         let out = inc.accumulate(&delta).unwrap();
         assert!(matches!(&out.content[0], ContentBlock::Thinking(t) if t.thinking == "hmm"));
+    }
+
+    fn thinking_delta(index: usize, thinking: &str) -> AnthropicStreamEvent {
+        event(serde_json::json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": { "type": "thinking_delta", "thinking": thinking }
+        }))
+    }
+
+    fn signature_delta(index: usize, signature: &str) -> AnthropicStreamEvent {
+        event(serde_json::json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": { "type": "signature_delta", "signature": signature }
+        }))
+    }
+
+    /// Returns the emitted thinking text and its signature metadata, if any.
+    fn thinking_of(chunk: ChatResponse) -> (String, Option<String>) {
+        let block = chunk
+            .content
+            .into_iter()
+            .find_map(|block| match block {
+                ContentBlock::Thinking(t) => Some(t),
+                _ => None,
+            })
+            .expect("expected an incremental thinking block");
+        let signature = block
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(METADATA_THINKING_SIGNATURE))
+            .and_then(|value| value.as_str().map(str::to_string));
+        (block.thinking, signature)
+    }
+
+    #[test]
+    fn stream_signature_delta_fragments_are_concatenated() {
+        let mut inc = AnthropicStreamIncrementer::new();
+        assert_eq!(
+            thinking_of(inc.accumulate(&thinking_delta(0, "hmm")).unwrap()),
+            ("hmm".to_string(), None)
+        );
+        // The signature streams in fragments after the thinking text; each chunk carries
+        // the cumulative value so the consumer's last-wins merge keeps all of it.
+        assert_eq!(
+            thinking_of(inc.accumulate(&signature_delta(0, "sig-")).unwrap()),
+            (String::new(), Some("sig-".to_string()))
+        );
+        assert_eq!(
+            thinking_of(inc.accumulate(&signature_delta(0, "abc")).unwrap()),
+            (String::new(), Some("sig-abc".to_string()))
+        );
+    }
+
+    #[test]
+    fn stream_signature_lands_on_the_thinking_block_only() {
+        let mut inc = AnthropicStreamIncrementer::new();
+        assert_eq!(
+            thinking_of(inc.accumulate(&thinking_delta(0, "hmm")).unwrap()),
+            ("hmm".to_string(), None)
+        );
+        assert_eq!(
+            thinking_of(inc.accumulate(&signature_delta(0, "sig")).unwrap()),
+            (String::new(), Some("sig".to_string()))
+        );
+        let text = event(serde_json::json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": { "type": "text_delta", "text": "hi" }
+        }));
+        let chunk = inc.accumulate(&text).unwrap();
+        assert_eq!(chunk.content.len(), 1);
+        assert!(matches!(&chunk.content[0], ContentBlock::Text(t) if t.text == "hi"));
+    }
+
+    #[test]
+    fn stream_signature_fragments_are_scoped_per_content_block() {
+        let mut inc = AnthropicStreamIncrementer::new();
+        inc.accumulate(&signature_delta(0, "aa"));
+        inc.accumulate(&signature_delta(1, "bb"));
+        assert_eq!(
+            thinking_of(inc.accumulate(&signature_delta(0, "cc")).unwrap()),
+            (String::new(), Some("aacc".to_string()))
+        );
+    }
+
+    #[test]
+    fn stream_thinking_without_signature_delta_keeps_metadata_empty() {
+        let mut inc = AnthropicStreamIncrementer::new();
+        let (text, signature) = thinking_of(inc.accumulate(&thinking_delta(0, "hmm")).unwrap());
+        assert_eq!(text, "hmm");
+        assert_eq!(signature, None);
+        assert!(inc.into_final().is_none());
     }
 
     #[test]
