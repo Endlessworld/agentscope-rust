@@ -17,7 +17,9 @@ use agentscope_core::error::{Error, Result};
 use agentscope_core::message::Msg;
 
 use crate::common::config::{RuntimeAgentConfig, ScheduleConfig};
-use crate::common::scheduler::task::{AgentFactory, BaseScheduleAgentTask, ScheduleAgentTask};
+use crate::common::scheduler::task::{
+    AgentFactory, BaseScheduleAgentTask, ScheduleAgentTask, TaskControl,
+};
 use crate::quartz::job::CronPlan;
 
 /// Status of a scheduled task.
@@ -406,6 +408,29 @@ impl ScheduleAgentTask for QuartzScheduleAgentTask {
 
     fn cancel(&self) {
         self.shutdown();
+    }
+}
+
+/// The pause/resume/interrupt control surface, callable through
+/// `Arc<dyn TaskControl>` (see `QuartzAgentScheduler::task_control`).
+#[async_trait]
+impl TaskControl for QuartzScheduleAgentTask {
+    async fn pause(&self) -> Result<()> {
+        QuartzScheduleAgentTask::pause(self);
+        Ok(())
+    }
+
+    async fn resume(&self) -> Result<()> {
+        QuartzScheduleAgentTask::resume(self);
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> Result<()> {
+        // Whether an execution was actually in flight is reported by
+        // `QuartzAgentScheduler::interrupt`; Java's `Scheduler#interrupt` also
+        // ignores that information.
+        QuartzScheduleAgentTask::interrupt(self);
+        Ok(())
     }
 }
 

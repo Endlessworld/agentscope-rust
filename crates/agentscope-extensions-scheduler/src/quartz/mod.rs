@@ -34,7 +34,7 @@ use agentscope_core::message::Msg;
 use crate::common::config::{AgentConfig, RuntimeAgentConfig, ScheduleConfig, ScheduleMode};
 use crate::common::scheduler::lock::{NoopSchedulerLock, SchedulerLock};
 use crate::common::scheduler::scheduler::{AgentScheduler, SchedulerError};
-use crate::common::scheduler::task::{AgentFactory, ScheduleAgentTask};
+use crate::common::scheduler::task::{AgentFactory, ScheduleAgentTask, TaskControl};
 
 use self::job::{spawn_job, CronPlan};
 
@@ -139,15 +139,17 @@ impl QuartzAgentScheduler {
         input: Option<Msg>,
     ) -> Result<Arc<dyn ScheduleAgentTask>, SchedulerError> {
         if self.shutdown.load(Ordering::SeqCst) {
-            return Err(SchedulerError::new("Scheduler has been shut down"));
+            return Err(SchedulerError::Shutdown);
         }
         schedule_config
             .validate()
-            .map_err(|e| SchedulerError::new(e.to_string()))?;
+            .map_err(|e| SchedulerError::invalid_argument(e.to_string()))?;
 
         let name = runtime.name().to_string();
         if name.trim().is_empty() {
-            return Err(SchedulerError::new("Agent name must not be null or empty"));
+            return Err(SchedulerError::invalid_argument(
+                "Agent name must not be null or empty",
+            ));
         }
         // Already scheduled -> return existing task (mirrors Java warning path).
         if let Some(existing) = self.get_scheduled_agent(&name) {
@@ -254,6 +256,19 @@ impl QuartzAgentScheduler {
         }
     }
 
+    /// The pause/resume/interrupt control surface of a scheduled task.
+    ///
+    /// Java hands callers the concrete `QuartzScheduleAgentTask` and they call
+    /// `pause()`/`resume()`/`interrupt()` directly; exposing a
+    /// [`TaskControl`] handle keeps callers independent of the backend task type.
+    pub fn task_control(&self, name: &str) -> Option<Arc<dyn TaskControl>> {
+        self.jobs
+            .read()
+            .unwrap()
+            .get(name)
+            .map(|t| t.clone() as Arc<dyn TaskControl>)
+    }
+
     /// Returns the current status of a task, if present.
     pub fn get_status(&self, name: &str) -> Option<TaskStatus> {
         self.get_scheduled_agent(name).and_then(|t| {
@@ -284,14 +299,14 @@ impl QuartzAgentScheduler {
     pub async fn trigger(&self, name: &str) -> Result<Msg, SchedulerError> {
         let task = self
             .get_scheduled_agent(name)
-            .ok_or_else(|| SchedulerError::new(format!("No such task: {name}")))?;
+            .ok_or_else(|| SchedulerError::backend(format!("No such task: {name}")))?;
         let q = task
             .as_any()
             .downcast_ref::<QuartzScheduleAgentTask>()
-            .ok_or_else(|| SchedulerError::new("Unexpected task type"))?;
+            .ok_or_else(|| SchedulerError::backend("Unexpected task type"))?;
         q.execute()
             .await
-            .map_err(|e| SchedulerError::new(e.to_string()))
+            .map_err(|e| SchedulerError::backend(e.to_string()))
     }
 }
 
@@ -372,10 +387,12 @@ fn resolve_cron(schedule_config: &ScheduleConfig) -> Result<Option<Arc<CronPlan>
     }
     let expression = schedule_config.cron_expression().unwrap_or_default();
     let parsed = CronExpression::parse(expression).map_err(|e| {
-        SchedulerError::new(format!("CronExpression '{expression}' is invalid: {e}"))
+        SchedulerError::invalid_argument(format!(
+            "CronExpression '{expression}' is invalid: {e}"
+        ))
     })?;
     let offset = schedule_config.zone_offset().map_err(|e| {
-        SchedulerError::new(format!(
+        SchedulerError::invalid_argument(format!(
             "CronExpression '{expression}' has an invalid time zone: {e}"
         ))
     })?;
@@ -640,6 +657,74 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected {what} to fail"),
         }
+    }
+
+    #[tokio::test]
+    async fn error_kinds_mirror_the_java_exception_types() {
+        // Java: `IllegalArgumentException` for bad arguments, `RuntimeException`
+        // for backend failures; a shut-down scheduler has its own variant.
+        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+
+        let bad_cron = ScheduleConfig::builder()
+            .cron("0 0 9 * * MON-FRI")
+            .build()
+            .unwrap();
+        let err = expect_err(
+            sched.schedule_runtime(runtime("A"), bad_cron, None).await,
+            "invalid cron",
+        );
+        assert!(
+            matches!(err, SchedulerError::InvalidArgument(_)),
+            "err was {err}"
+        );
+
+        let unchecked = ScheduleConfig::builder()
+            .schedule_mode(ScheduleMode::FIXED_RATE)
+            .build_unchecked();
+        let err = expect_err(
+            sched.schedule_runtime(runtime("B"), unchecked, None).await,
+            "invalid fixed rate",
+        );
+        assert!(
+            matches!(err, SchedulerError::InvalidArgument(_)),
+            "err was {err}"
+        );
+
+        let err = expect_err(sched.trigger("missing").await, "unknown task");
+        assert!(
+            matches!(err, SchedulerError::Backend(_)),
+            "err was {err}"
+        );
+
+        sched.shutdown().await;
+        let err = expect_err(
+            sched
+                .schedule_runtime(runtime("C"), ScheduleConfig::none(), None)
+                .await,
+            "schedule after shutdown",
+        );
+        assert_eq!(err, SchedulerError::Shutdown);
+        assert_eq!(err.to_string(), "Scheduler has been shut down");
+    }
+
+    #[tokio::test]
+    async fn task_control_handle_pauses_and_resumes() {
+        // `TaskControl` is the backend-agnostic control surface of a task; here
+        // it is the only way to reach the `pub(crate)` pause/resume methods.
+        let sched = QuartzAgentScheduler::new(Arc::new(EchoFactory));
+        sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none(), None)
+            .await
+            .unwrap();
+
+        let control = sched.task_control("A").expect("control handle");
+        control.pause().await.unwrap();
+        assert_eq!(sched.get_status("A"), Some(TaskStatus::Paused));
+        control.resume().await.unwrap();
+        assert_eq!(sched.get_status("A"), Some(TaskStatus::Normal));
+        // No execution in flight: interrupt is a no-op rather than an error.
+        control.interrupt().await.unwrap();
+        assert!(sched.task_control("missing").is_none());
     }
 
     #[tokio::test]

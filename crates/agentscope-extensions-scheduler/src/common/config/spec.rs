@@ -57,14 +57,58 @@ impl ModelConfig for StaticModelConfig {
 ///
 /// Mirrors Java `AgentConfig`: only serializable fields (`name`, `sys_prompt`,
 /// and the model *name*). Runtime objects live in [`RuntimeAgentConfig`].
+///
+/// The JSON shape matches Java's Jackson output — `name` / `sysPrompt` /
+/// `modelConfig` — so a config exported from the Java side deserializes here
+/// (and vice versa); see [`model_name_wire`] for the model part.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentConfig {
     /// The agent name; used as the task identifier and (in xxl-job) the handler name.
     pub name: String,
     /// Optional system prompt.
+    #[serde(alias = "sys_prompt")]
     pub sys_prompt: Option<String>,
     /// The model name / identifier (serializable form of the model config).
+    ///
+    /// Java serializes the whole `ModelConfig` object (`{"modelName": …}`), so
+    /// the name is stored inside that object; the bare-string and the older
+    /// `model_name` forms are also accepted when reading.
+    #[serde(rename = "modelConfig", alias = "model_name", with = "model_name_wire")]
     pub model_name: String,
+}
+
+/// Serde adapter for [`AgentConfig::model_name`].
+///
+/// Writes `{"modelName": <name>}` (Java `ModelConfig` bean shape; provider
+/// fields such as `apiKey`/`stream` are not carried by this crate and are
+/// ignored when reading) and also accepts a bare string.
+mod model_name_wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        Object {
+            #[serde(rename = "modelName")]
+            model_name: String,
+        },
+        Name(String),
+    }
+
+    pub fn serialize<S: Serializer>(name: &String, serializer: S) -> Result<S::Ok, S::Error> {
+        Wire::Object {
+            model_name: name.clone(),
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Object { model_name } => model_name,
+            Wire::Name(name) => name,
+        })
+    }
 }
 
 impl AgentConfig {
@@ -345,6 +389,25 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn reads_the_java_agent_config_json() {
+        // Jackson bean output of Java `AgentConfig` + `DashScopeModelConfig`
+        // (provider-specific fields are not carried by this crate and ignored).
+        let json = r#"{"name":"ScheduledAssistant","modelConfig":{"apiKey":"sk","modelName":"qwen-max","stream":true},"sysPrompt":"be nice"}"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.name(), "ScheduledAssistant");
+        assert_eq!(cfg.model_name(), "qwen-max");
+        assert_eq!(cfg.sys_prompt(), Some("be nice"));
+
+        // Writing back produces the same Java shape.
+        let out = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            out.contains("\"modelConfig\":{\"modelName\":\"qwen-max\"}"),
+            "json was {out}"
+        );
+        assert!(out.contains("\"sysPrompt\":\"be nice\""), "json was {out}");
     }
 
     #[test]

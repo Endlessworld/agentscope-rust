@@ -72,17 +72,19 @@ impl XxlJobAgentScheduler {
         schedule_config: ScheduleConfig,
     ) -> Result<Arc<dyn ScheduleAgentTask>, SchedulerError> {
         if self.shutdown.load(Ordering::SeqCst) {
-            return Err(SchedulerError::new("Scheduler has been shut down"));
+            return Err(SchedulerError::Shutdown);
         }
         if schedule_config.schedule_mode() != ScheduleMode::NONE {
-            return Err(SchedulerError::new(
+            return Err(SchedulerError::unsupported(
                 "XXL-Job scheduler implementation currently only supports scheduleType 'none'. \
                  Other types are not supported yet.",
             ));
         }
         let name = runtime.name().to_string();
         if name.trim().is_empty() {
-            return Err(SchedulerError::new("Agent name must not be null or empty"));
+            return Err(SchedulerError::invalid_argument(
+                "Agent name must not be null or empty",
+            ));
         }
         if let Some(existing) = self.get_scheduled_agent(&name) {
             return Ok(existing);
@@ -143,7 +145,7 @@ impl XxlJobAgentScheduler {
     ) -> Result<Msg, SchedulerError> {
         let task = self
             .get_scheduled_agent(name)
-            .ok_or_else(|| SchedulerError::new(format!("No such handler: {name}")))?;
+            .ok_or_else(|| SchedulerError::backend(format!("No such handler: {name}")))?;
         let task_name = name.to_string();
         let input = Msg::user(context.job_param().to_string());
         let context_for_run = context.clone();
@@ -170,7 +172,7 @@ impl XxlJobAgentScheduler {
                 Err(err) => {
                     let message = format!("Task execution failed: {task_name}: {err}");
                     XxlJobHelper::handle_fail(message.clone());
-                    Err(SchedulerError::new(message))
+                    Err(SchedulerError::backend(message))
                 }
             }
         })
@@ -183,7 +185,7 @@ impl XxlJobAgentScheduler {
     /// faithful Rust counterpart used by callers that need to distinguish
     /// "unsupported" from "not found".
     pub fn try_cancel(&self, _name: &str) -> Result<(), SchedulerError> {
-        Err(SchedulerError::new(CANCEL_UNSUPPORTED))
+        Err(SchedulerError::unsupported(CANCEL_UNSUPPORTED))
     }
 
     /// Lists registered handler names.
@@ -382,6 +384,46 @@ mod tests {
     async fn trigger_unknown_handler_errors() {
         let sched = XxlJobAgentScheduler::new(Arc::new(EchoFactory));
         assert!(sched.trigger("missing", "").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn error_kinds_mirror_the_java_exception_types() {
+        let sched = XxlJobAgentScheduler::new(Arc::new(EchoFactory));
+
+        // Java throws `UnsupportedOperationException` from `cancel`.
+        let err = sched.try_cancel("never-registered").unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::Unsupported(_)),
+            "err was {err}"
+        );
+
+        // … and for any schedule type other than `NONE`.
+        let cron = ScheduleConfig::builder()
+            .cron("0 0 8 * * ?")
+            .build()
+            .unwrap();
+        let err = sched
+            .schedule_runtime(runtime("A"), cron)
+            .err()
+            .expect("non-NONE mode must be rejected");
+        assert!(
+            matches!(err, SchedulerError::Unsupported(_)),
+            "err was {err}"
+        );
+
+        // Unknown handler / failed execution are backend failures (`RuntimeException`).
+        let err = sched.trigger("missing", "").await.unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::Backend(_)),
+            "err was {err}"
+        );
+
+        sched.shutdown().await;
+        let err = sched
+            .schedule_runtime(runtime("A"), ScheduleConfig::none())
+            .err()
+            .expect("schedule after shutdown must fail");
+        assert_eq!(err, SchedulerError::Shutdown);
     }
 
     #[tokio::test]

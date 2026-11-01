@@ -12,14 +12,47 @@ use crate::common::config::{AgentConfig, ScheduleConfig};
 use crate::common::scheduler::task::ScheduleAgentTask;
 
 /// Errors surfaced by scheduler backends.
+///
+/// Java distinguishes three failure kinds — `IllegalArgumentException` for bad
+/// arguments, `UnsupportedOperationException` for operations a backend does not
+/// implement and plain `RuntimeException` for backend failures. The variants
+/// keep that distinction so callers can branch on it, while the `Display` text
+/// stays byte-identical to the Java messages.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{0}")]
-pub struct SchedulerError(pub String);
+pub enum SchedulerError {
+    /// The caller passed an invalid argument (Java `IllegalArgumentException`).
+    #[error("{0}")]
+    InvalidArgument(String),
+    /// The backend does not support the operation (Java
+    /// `UnsupportedOperationException`).
+    #[error("{0}")]
+    Unsupported(String),
+    /// The backend failed while executing (Java `RuntimeException`).
+    #[error("{0}")]
+    Backend(String),
+    /// The scheduler was already shut down.
+    ///
+    /// Java has no dedicated type for this (it surfaces as a
+    /// `RuntimeException`), but a caller that ignores it would schedule onto a
+    /// dead scheduler, so it gets its own variant.
+    #[error("Scheduler has been shut down")]
+    Shutdown,
+}
 
 impl SchedulerError {
-    /// Creates a new error with the given message.
-    pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+    /// Creates an [`SchedulerError::InvalidArgument`].
+    pub fn invalid_argument(message: impl Into<String>) -> Self {
+        Self::InvalidArgument(message.into())
+    }
+
+    /// Creates an [`SchedulerError::Unsupported`].
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::Unsupported(message.into())
+    }
+
+    /// Creates an [`SchedulerError::Backend`].
+    pub fn backend(message: impl Into<String>) -> Self {
+        Self::Backend(message.into())
     }
 }
 
@@ -46,7 +79,7 @@ pub trait AgentScheduler: Send + Sync {
     ) -> Result<Arc<dyn ScheduleAgentTask>, SchedulerError> {
         let _ = input;
         let _ = (agent_config, schedule_config);
-        Err(SchedulerError::new(
+        Err(SchedulerError::unsupported(
             "This scheduler implementation does not support initial input.",
         ))
     }

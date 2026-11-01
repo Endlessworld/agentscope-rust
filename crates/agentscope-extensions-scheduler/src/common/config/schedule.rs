@@ -57,19 +57,29 @@ pub enum ScheduleConfigError {
 /// Scheduling parameters for a scheduled agent task.
 ///
 /// Durations are expressed in **milliseconds**, matching the Java `Long` fields.
+/// Fields are serialized with Java's Jackson names (`scheduleMode`,
+/// `cronExpression`, `fixedRate`, `fixedDelay`, `initialDelay`, `zoneId`); the
+/// snake_case aliases keep payloads written by earlier Rust builds readable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScheduleConfig {
     /// The schedule mode.
+    #[serde(alias = "schedule_mode")]
     pub schedule_mode: ScheduleMode,
     /// Cron expression (only meaningful for `CRON`).
+    #[serde(alias = "cron_expression")]
     pub cron_expression: Option<String>,
     /// Fixed rate in milliseconds (only meaningful for `FIXED_RATE`).
+    #[serde(alias = "fixed_rate")]
     pub fixed_rate: Option<u64>,
     /// Fixed delay in milliseconds (only meaningful for `FIXED_DELAY`).
+    #[serde(alias = "fixed_delay")]
     pub fixed_delay: Option<u64>,
     /// Initial delay in milliseconds before the first execution.
+    #[serde(alias = "initial_delay")]
     pub initial_delay: Option<u64>,
     /// Time zone id used to evaluate the cron expression (e.g. `"Asia/Shanghai"`).
+    #[serde(alias = "zone_id")]
     pub zone_id: Option<String>,
 }
 
@@ -307,5 +317,23 @@ mod tests {
         assert!(json.contains("\"CRON\""), "json was {json}");
         let back: ScheduleConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn reads_the_java_schedule_config_json() {
+        // Jackson output of Java `ScheduleConfig` (all fields present, nulls for
+        // the unused ones).
+        let json = r#"{"scheduleMode":"CRON","cronExpression":"0 0 8 * * ?","fixedRate":null,"fixedDelay":null,"initialDelay":1000,"zoneId":"Asia/Shanghai"}"#;
+        let cfg: ScheduleConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.schedule_mode(), ScheduleMode::CRON);
+        assert_eq!(cfg.cron_expression(), Some("0 0 8 * * ?"));
+        assert_eq!(cfg.initial_delay(), Some(1000));
+        assert_eq!(cfg.zone_id(), Some("Asia/Shanghai"));
+
+        // Payloads written by earlier Rust builds (snake_case keys) still parse.
+        let legacy = r#"{"schedule_mode":"FIXED_RATE","fixed_rate":500}"#;
+        let cfg: ScheduleConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg.schedule_mode(), ScheduleMode::FIXED_RATE);
+        assert_eq!(cfg.fixed_rate(), Some(500));
     }
 }
