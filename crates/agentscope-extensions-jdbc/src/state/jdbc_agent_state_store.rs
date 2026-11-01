@@ -104,12 +104,12 @@ impl JdbcAgentStateStore {
         let table = self.dialect.resolved_session_state_table_name();
         let bound = self.dialect.session_state_check_table_exists(&table);
         let rows = self.executor.query(&bound).map_err(|e| {
-            JdbcError::Database(format!(
+            JdbcError::database(format!(
                 "table does not exist: {table}. use create_if_not_exist=true to auto-create. ({e})"
             ))
         })?;
         if rows.is_empty() {
-            return Err(JdbcError::Database(format!(
+            return Err(JdbcError::database(format!(
                 "table does not exist: {table}. use create_if_not_exist=true to auto-create."
             )));
         }
@@ -127,17 +127,17 @@ impl JdbcAgentStateStore {
 
     fn validate_session(session_id: &str) -> JdbcResult<()> {
         if session_id.trim().is_empty() {
-            return Err(JdbcError::Database("sessionId must not be blank".into()));
+            return Err(JdbcError::database("sessionId must not be blank"));
         }
         Ok(())
     }
 
     fn validate_key(key: &str) -> JdbcResult<()> {
         if key.trim().is_empty() {
-            return Err(JdbcError::Database("key must not be blank".into()));
+            return Err(JdbcError::database("key must not be blank"));
         }
         if utf16_len(key) > MAX_STATE_COLUMN_LENGTH {
-            return Err(JdbcError::Database(format!(
+            return Err(JdbcError::database(format!(
                 "state key is too long: {} UTF-16 code units, the column allows \
                  {MAX_STATE_COLUMN_LENGTH}",
                 utf16_len(key)
@@ -164,7 +164,7 @@ impl JdbcAgentStateStore {
         }
         let slot = Self::slot_id(user_id, session_id);
         if utf16_len(&slot) > MAX_STATE_COLUMN_LENGTH {
-            return Err(JdbcError::Database(format!(
+            return Err(JdbcError::database(format!(
                 "sessionId is too long: the encoded slot '{}' is {} UTF-16 code units, the \
                  column allows {MAX_STATE_COLUMN_LENGTH}",
                 slot,
@@ -179,7 +179,7 @@ impl JdbcAgentStateStore {
     /// expectedVersion < 0` → `IllegalArgumentException`).
     fn validate_expected_version(expected_version: i64) -> JdbcResult<()> {
         if expected_version != UNVERSIONED && expected_version < 0 {
-            return Err(JdbcError::Database(format!(
+            return Err(JdbcError::database(format!(
                 "expectedVersion must be >= 0 or UNVERSIONED: {expected_version}"
             )));
         }
@@ -188,7 +188,7 @@ impl JdbcAgentStateStore {
 
     fn json_of(value: &Value) -> JdbcResult<String> {
         serde_json::to_string(value)
-            .map_err(|e| JdbcError::Database(format!("serialize state: {e}")))
+            .map_err(|e| JdbcError::database(format!("serialize state: {e}")))
     }
 
     /// Reads the stored hash for a list key, if any.
@@ -304,11 +304,11 @@ impl JdbcAgentStateStore {
             .next()
             .and_then(|c| c.as_text().map(str::to_string))
             .ok_or_else(|| {
-                JdbcError::Database(format!("state row for key '{key}' has no readable payload"))
+                JdbcError::database(format!("state row for key '{key}' has no readable payload"))
             })?;
         let version = columns.next().and_then(|c| c.as_int()).unwrap_or(0);
         let value = serde_json::from_str(&json)
-            .map_err(|e| JdbcError::Database(format!("deserialize state: {e}")))?;
+            .map_err(|e| JdbcError::database(format!("deserialize state: {e}")))?;
         Ok(VersionedState {
             value: Some(value),
             version,
@@ -583,10 +583,10 @@ impl JdbcAgentStateStore {
             .next()
             .and_then(|c| c.as_text().map(str::to_string))
             .ok_or_else(|| {
-                JdbcError::Database(format!("state row for key '{key}' has no readable payload"))
+                JdbcError::database(format!("state row for key '{key}' has no readable payload"))
             })?;
         let value = serde_json::from_str(&json)
-            .map_err(|e| JdbcError::Database(format!("deserialize state: {e}")))?;
+            .map_err(|e| JdbcError::database(format!("deserialize state: {e}")))?;
         Ok(Some(value))
     }
 
@@ -601,13 +601,13 @@ impl JdbcAgentStateStore {
                 .next()
                 .and_then(|c| c.as_text().map(str::to_string))
                 .ok_or_else(|| {
-                    JdbcError::Database(format!(
+                    JdbcError::database(format!(
                         "list row {index} for key '{key}' has no readable payload"
                     ))
                 })?;
             out.push(
                 serde_json::from_str(&json).map_err(|e| {
-                    JdbcError::Database(format!("deserialize list item {index}: {e}"))
+                    JdbcError::database(format!("deserialize list item {index}: {e}"))
                 })?,
             );
         }

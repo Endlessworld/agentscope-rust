@@ -13,7 +13,7 @@ use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 use tokio_postgres::{Client, Config, NoTls, Row};
 
 use super::{to_dollar_placeholders, DriverExecutor, SqlClient};
-use crate::backend::{ColumnValue, JdbcError, JdbcResult};
+use crate::backend::{ColumnValue, DbError, JdbcError, JdbcResult};
 use crate::dialect::SqlParam;
 use crate::sandbox::NativeLockFlavor;
 
@@ -59,7 +59,7 @@ impl SqlClient for PostgresSqlClient {
             JdbcError::Configuration(format!("invalid PostgreSQL configuration: {error}"))
         })?;
         let (client, connection) = parsed.connect(NoTls).await.map_err(|error| {
-            JdbcError::Database(format!("PostgreSQL connection failed: {error}"))
+            JdbcError::database(format!("PostgreSQL connection failed: {error}"))
         })?;
         // The connection future drives the socket; the driver thread polls it whenever a
         // statement is in flight (it is spawned on that thread's runtime).
@@ -170,7 +170,7 @@ fn decode_row(row: &Row) -> JdbcResult<Vec<ColumnValue>> {
 
 fn decode_column(row: &Row, index: usize, column_type: &Type) -> JdbcResult<ColumnValue> {
     let context = |error: tokio_postgres::Error| {
-        JdbcError::Database(format!(
+        JdbcError::database(format!(
             "failed to decode column {index} ({}): {error}",
             column_type.name()
         ))
@@ -218,21 +218,25 @@ fn decode_column(row: &Row, index: usize, column_type: &Type) -> JdbcResult<Colu
     Ok(value.map(ColumnValue::Text).unwrap_or(ColumnValue::Null))
 }
 
-/// Maps a driver error, keeping the SQLSTATE code in the message.
+/// Maps a driver error, keeping the SQLSTATE code.
 ///
-/// The code is what [`crate::backend::is_unique_violation`] keys on (`23505` = unique
-/// violation); `tokio-postgres`'s `Display` alone is not guaranteed to carry it.
+/// [`crate::backend::is_unique_violation`] keys on it (`23505` = unique violation; `23502`
+/// NOT NULL, `23503` foreign key and `23514` CHECK are integrity violations but not
+/// duplicates); `tokio-postgres`'s `Display` alone is not guaranteed to carry it.
 fn map_error(error: tokio_postgres::Error) -> JdbcError {
     if let Some(details) = error.as_db_error() {
         let detail = details
             .detail()
             .map(|detail| format!(" ({detail})"))
             .unwrap_or_default();
-        return JdbcError::Database(format!(
-            "{}: {}{detail}",
-            details.code().code(),
-            details.message()
-        ));
+        return JdbcError::Database(
+            DbError::new(format!(
+                "{}: {}{detail}",
+                details.code().code(),
+                details.message()
+            ))
+            .with_sql_state(details.code().code()),
+        );
     }
-    JdbcError::Database(error.to_string())
+    JdbcError::database(error.to_string())
 }

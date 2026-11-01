@@ -139,7 +139,8 @@ fn custom_table_names_are_validated_under_their_configured_name() {
         JdbcDialectBuilder::new(Arc::new(SqliteDialect::new()))
             .store_table_name("custom_store")
             .expect("valid identifier")
-            .build();
+            .build()
+            .expect("dialect");
     // Auto-creation under the custom name must pass its own validation.
     JdbcStore::new(executor, dialect, true).expect("custom table must be created and validated");
 }

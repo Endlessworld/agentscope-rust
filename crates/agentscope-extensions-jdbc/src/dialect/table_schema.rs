@@ -178,7 +178,7 @@ pub fn validate_table_schema(
 
     let rows = executor.query(&dialect.table_columns_query(table_name))?;
     if rows.is_empty() {
-        return Err(JdbcError::Database(format!(
+        return Err(JdbcError::database(format!(
             "table '{table_name}' is missing although its DDL was executed; reference DDL: {}. \
              The framework never alters existing tables — check that the configured table name \
              matches the deployed schema.",
@@ -210,7 +210,7 @@ pub fn validate_table_schema(
         return Ok(());
     }
 
-    Err(JdbcError::Database(format!(
+    Err(JdbcError::database(format!(
         "table '{table_name}' is missing column(s) [{}]; actual columns: [{}]; reference DDL: {}. \
          The framework never alters existing tables — apply your own migration.",
         missing.join(", "),

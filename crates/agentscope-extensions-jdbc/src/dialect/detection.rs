@@ -52,6 +52,8 @@ pub struct JdbcDialectBuilder {
     snapshot_table_name: Option<String>,
     skill_table_name: Option<String>,
     skill_resources_table_name: Option<String>,
+    enable_base_tables: bool,
+    enable_skill_tables: bool,
     auto_create_table: bool,
 }
 
@@ -68,6 +70,8 @@ impl std::fmt::Debug for JdbcDialectBuilder {
                 "skill_resources_table_name",
                 &self.skill_resources_table_name,
             )
+            .field("enable_base_tables", &self.enable_base_tables)
+            .field("enable_skill_tables", &self.enable_skill_tables)
             .field("auto_create_table", &self.auto_create_table)
             .finish()
     }
@@ -84,6 +88,8 @@ impl JdbcDialectBuilder {
             snapshot_table_name: None,
             skill_table_name: None,
             skill_resources_table_name: None,
+            enable_base_tables: true,
+            enable_skill_tables: false,
             auto_create_table: true,
         }
     }
@@ -135,10 +141,40 @@ impl JdbcDialectBuilder {
         Ok(self)
     }
 
+    /// Whether the base table group (store, sessions, snapshots) joins this build's schema
+    /// work (default true). Orthogonal to create-vs-validate; the last call wins.
+    ///
+    /// The group flags scope schema work only. The lock table
+    /// (`{prefix}distributed_locks`) belongs to no group: the table lock creates it lazily on
+    /// first use, so a skill-only deployment (`enable_base_tables(false)` +
+    /// `enable_skill_tables(true)`) that takes sandbox locks still creates and uses it.
+    pub fn enable_base_tables(mut self, enabled: bool) -> Self {
+        self.enable_base_tables = enabled;
+        self
+    }
+
+    /// Whether the skill table group (skills, skill_resources) joins this build's schema
+    /// work (default **false**, so opting in is explicit). Semantics as
+    /// [`Self::enable_base_tables`].
+    pub fn enable_skill_tables(mut self, enabled: bool) -> Self {
+        self.enable_skill_tables = enabled;
+        self
+    }
+
     /// Whether to auto-create tables during component construction (default true).
     pub fn auto_create_table(mut self, value: bool) -> Self {
         self.auto_create_table = value;
         self
+    }
+
+    /// Whether the base table group is enabled on this builder.
+    pub fn base_tables_enabled(&self) -> bool {
+        self.enable_base_tables
+    }
+
+    /// Whether the skill table group is enabled on this builder.
+    pub fn skill_tables_enabled(&self) -> bool {
+        self.enable_skill_tables
     }
 
     /// The table prefix configured on this builder.
@@ -178,14 +214,19 @@ impl JdbcDialectBuilder {
 
     /// Returns the selected dialect.
     ///
-    /// Chainable configuration (prefix + per-table overrides) is applied to the dialect
-    /// instance before it is returned, mirroring the Java `AbstractJdbcDialectBuilder.build()`
-    /// which sets the dialect's table-name fields. `auto_create_table` is record-only here:
-    /// schema creation is owned by the component constructors (which receive this builder's
-    /// value through [`Self::should_auto_create_table`]).
-    pub fn build(self) -> Arc<dyn AbstractJdbcDialect> {
+    /// Chainable configuration (prefix, per-table overrides, group switches) is applied to the
+    /// dialect instance before it is returned, mirroring the Java
+    /// `AbstractJdbcDialectBuilder.build()` which sets the dialect's fields. `auto_create_table`
+    /// is record-only here: schema creation is owned by the component constructors (which
+    /// receive this builder's value through [`Self::should_auto_create_table`]).
+    ///
+    /// Fails on the two misconfigurations Java's `build()` rejects: both table groups disabled,
+    /// and a table name claimed by two domains (see
+    /// [`AbstractJdbcDialect::validate_table_groups`]).
+    pub fn build(self) -> Result<Arc<dyn AbstractJdbcDialect>, String> {
         self.apply_table_name_config();
-        self.dialect
+        self.dialect.validate_table_groups()?;
+        Ok(self.dialect)
     }
 
     /// Returns the configured [`TableNameConfig`] without mutating the dialect.
@@ -197,6 +238,8 @@ impl JdbcDialectBuilder {
             snapshot_table_name: self.snapshot_table_name.clone(),
             skill_table_name: self.skill_table_name.clone(),
             skill_resources_table_name: self.skill_resources_table_name.clone(),
+            enable_base_tables: self.enable_base_tables,
+            enable_skill_tables: self.enable_skill_tables,
         }
     }
 

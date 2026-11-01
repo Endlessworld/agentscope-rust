@@ -99,12 +99,12 @@ impl JdbcStore {
 
     fn serialize_value(value: &StoreValue) -> JdbcResult<String> {
         serde_json::to_string(value)
-            .map_err(|e| crate::backend::JdbcError::Database(format!("serialize value: {e}")))
+            .map_err(|e| crate::backend::JdbcError::database(format!("serialize value: {e}")))
     }
 
     fn validate_key(key: &str) -> JdbcResult<()> {
         if key.trim().is_empty() {
-            return Err(crate::backend::JdbcError::Database(
+            return Err(crate::backend::JdbcError::database(
                 "key must not be blank".to_string(),
             ));
         }

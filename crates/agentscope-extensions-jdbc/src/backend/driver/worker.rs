@@ -42,14 +42,14 @@ impl<C: Send + 'static> DriverWorker<C> {
             .name("agentscope-jdbc-driver".to_string())
             .spawn(move || Self::run(connect, started, incoming))
             .map_err(|e| {
-                JdbcError::Database(format!("failed to spawn the driver thread: {e}"))
+                JdbcError::database(format!("failed to spawn the driver thread: {e}"))
             })?;
         match start_report.recv() {
             Ok(Ok(())) => Ok(Self {
                 jobs: Mutex::new(jobs),
             }),
             Ok(Err(error)) => Err(error),
-            Err(_) => Err(JdbcError::Database(
+            Err(_) => Err(JdbcError::database(
                 "the driver thread exited during start-up".to_string(),
             )),
         }
@@ -65,7 +65,7 @@ impl<C: Send + 'static> DriverWorker<C> {
         {
             Ok(runtime) => runtime,
             Err(error) => {
-                let _ = started.send(Err(JdbcError::Database(format!(
+                let _ = started.send(Err(JdbcError::database(format!(
                     "failed to build the driver runtime: {error}"
                 ))));
                 return;
@@ -104,10 +104,10 @@ impl<C: Send + 'static> DriverWorker<C> {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             jobs.send(job)
-                .map_err(|_| JdbcError::Database("the driver thread is gone".to_string()))?;
+                .map_err(|_| JdbcError::database("the driver thread is gone".to_string()))?;
         }
         response.recv().map_err(|_| {
-            JdbcError::Database("the driver thread dropped the reply".to_string())
+            JdbcError::database("the driver thread dropped the reply".to_string())
         })?
     }
 }

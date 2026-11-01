@@ -18,6 +18,14 @@ use super::store_dialect::StoreDialect;
 /// Default table prefix applied to every table name.
 pub const DEFAULT_TABLE_PREFIX: &str = "agentscope_";
 
+/// Reported when both table groups are switched off, mirroring the Java builder's
+/// `IllegalStateException` ("No table groups enabled: enableBaseTables(false) combined with
+/// enableSkillTables(false) leaves build() nothing to create or validate.").
+pub const NO_ENABLED_TABLE_GROUPS: &str =
+    "No table groups enabled: enable_base_tables(false) combined with \
+     enable_skill_tables(false) leaves build() nothing to create or validate. Enable at least \
+     one group.";
+
 /// Which database a dialect targets. Used for dialect auto-detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DialectKind {
@@ -31,8 +39,9 @@ pub enum DialectKind {
     Sqlite,
 }
 
-/// Host-side table-name configuration, mirroring the mutable fields `AbstractJdbcDialect`
-/// exposes to `AbstractJdbcDialectBuilder` (`tablePrefix` + the three per-table overrides).
+/// Host-side table configuration, mirroring the mutable fields `AbstractJdbcDialect` exposes
+/// to `AbstractJdbcDialectBuilder` (`tablePrefix`, the per-table overrides and the two table
+/// group switches).
 ///
 /// Table-name resolution priority is **per-table override > prefix + base name**, matching
 /// the Java `final storeTableName()` / `sessionStateTableName()` / `snapshotTableName()`.
@@ -50,6 +59,12 @@ pub struct TableNameConfig {
     pub skill_table_name: Option<String>,
     /// Full override for the skill-resources table name.
     pub skill_resources_table_name: Option<String>,
+    /// Whether the base table group (store, sessions, snapshots) takes part in this
+    /// dialect's schema work (Java `enableBaseTables`, default on).
+    pub enable_base_tables: bool,
+    /// Whether the skill table group (skills, skill_resources) takes part in this dialect's
+    /// schema work (Java `enableSkillTables`, default **off**: opting in is explicit).
+    pub enable_skill_tables: bool,
 }
 
 impl Default for TableNameConfig {
@@ -61,6 +76,8 @@ impl Default for TableNameConfig {
             snapshot_table_name: None,
             skill_table_name: None,
             skill_resources_table_name: None,
+            enable_base_tables: true,
+            enable_skill_tables: false,
         }
     }
 }
@@ -182,16 +199,25 @@ pub trait AbstractJdbcDialect:
         self.table_config().prefix
     }
 
-    /// All create-schema DDL, in store → sessions → snapshots order.
+    /// All create-schema DDL for the **enabled** table groups, in creation order
+    /// (store → sessions → snapshots → skills → skill_resources).
     ///
     /// Mirrors the Java `AbstractJdbcDialect.createTableDdls()` (executed by the builder in a
-    /// single pass). Each table may contribute more than one statement (CREATE TABLE plus a
-    /// secondary CREATE INDEX), so the returned vector is flattened.
+    /// single pass), including its group filter: the skill group only contributes when
+    /// `enableSkillTables` is on. Each table may contribute more than one statement (CREATE
+    /// TABLE plus a secondary CREATE INDEX), so the returned vector is flattened. The
+    /// resources table follows the skill table it references.
     fn create_table_ddls(&self) -> Vec<String> {
         let mut ddls = Vec::new();
-        ddls.extend(self.store_create_table_ddls());
-        ddls.extend(self.session_state_create_table_ddls());
-        ddls.extend(self.snapshot_create_table_ddls());
+        if self.base_tables_enabled() {
+            ddls.extend(self.store_create_table_ddls());
+            ddls.extend(self.session_state_create_table_ddls());
+            ddls.extend(self.snapshot_create_table_ddls());
+        }
+        if self.skill_tables_enabled() {
+            ddls.extend(self.skill_create_table_ddls());
+            ddls.extend(self.skill_resources_create_table_ddls());
+        }
         ddls
     }
 
@@ -210,12 +236,63 @@ pub trait AbstractJdbcDialect:
         format!("{}distributed_locks", self.table_prefix())
     }
 
-    /// The explicit table-name configuration applied by the builder (if any).
+    /// The explicit table configuration applied by the builder (if any).
     ///
     /// Provided for introspection/tests; resolution itself happens in the table-domain
     /// `resolved_*_table_name()` helpers.
     fn configured_table_names(&self) -> TableNameConfig {
         self.table_config()
+    }
+
+    /// Whether the base table group joins this dialect's schema work (Java
+    /// `isBaseTablesEnabled`).
+    fn base_tables_enabled(&self) -> bool {
+        self.table_config().enable_base_tables
+    }
+
+    /// Whether the skill table group joins this dialect's schema work (Java
+    /// `isSkillTablesEnabled`).
+    fn skill_tables_enabled(&self) -> bool {
+        self.table_config().enable_skill_tables
+    }
+
+    /// Resolved table names of the enabled groups, in creation order
+    /// (store → sessions → snapshots → skills → skill_resources).
+    fn enabled_table_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        if self.base_tables_enabled() {
+            names.push(self.resolved_store_table_name());
+            names.push(self.resolved_session_state_table_name());
+            names.push(self.resolved_snapshot_table_name());
+        }
+        if self.skill_tables_enabled() {
+            names.push(self.resolved_skill_table_name());
+            names.push(self.resolved_skill_resources_table_name());
+        }
+        names
+    }
+
+    /// Rejects the two configuration mistakes the Java builder reports at build time:
+    ///
+    /// * both groups disabled — `build()` would have nothing to create or validate;
+    /// * one table name claimed by two domains (Java `putDdls`) — a collision silently drops
+    ///   one domain's creation *and* its validation, so the table would look fine while the
+    ///   component writes into another domain's table.
+    fn validate_table_groups(&self) -> Result<(), String> {
+        if !self.base_tables_enabled() && !self.skill_tables_enabled() {
+            return Err(NO_ENABLED_TABLE_GROUPS.to_string());
+        }
+        let mut seen: Vec<String> = Vec::with_capacity(5);
+        for name in self.enabled_table_names() {
+            if seen.contains(&name) {
+                return Err(format!(
+                    "Duplicate JDBC table name '{name}': each table domain needs a distinct \
+                     table name"
+                ));
+            }
+            seen.push(name);
+        }
+        Ok(())
     }
 
     /// Whether this dialect supports native advisory locks (MySQL `GET_LOCK`,

@@ -7,11 +7,33 @@
 use std::sync::{Arc, Mutex};
 
 use rusqlite::types::Value;
-use rusqlite::Connection;
-use rusqlite::Transaction;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
-use super::{ColumnValue, JdbcError, JdbcExecutor, JdbcResult, JdbcSession};
+use super::{ColumnValue, DbError, JdbcError, JdbcExecutor, JdbcResult, JdbcSession};
 use crate::dialect::{BoundSql, NativeLockSession, SqlParam};
+
+/// How long a statement waits for another connection's write lock before giving up.
+///
+/// `rusqlite` defaults to no wait at all, so a second writer on the same database file gets
+/// `SQLITE_BUSY` the instant the first one is mid-transaction. The JDBC components do
+/// read-modify-write work inside [`JdbcExecutor::in_transaction`] (list appends, versioned
+/// upserts), which only stays correct — and only succeeds at all — when the waiter blocks
+/// until the writer commits.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Maps a `rusqlite` failure, keeping SQLite's **extended** result code.
+///
+/// SQLite reports no SQLSTATE and words every constraint failure as "constraint failed", so
+/// the code is the only structured signal: `2067` (`SQLITE_CONSTRAINT_UNIQUE`) and `1555`
+/// (`SQLITE_CONSTRAINT_PRIMARYKEY`) are duplicates, while `1299` (NOT NULL), `275` (CHECK)
+/// and `787` (FOREIGN KEY) are not (see [`crate::backend::is_unique_violation`]).
+fn sqlite_error(context: impl std::fmt::Display, error: rusqlite::Error) -> JdbcError {
+    let mut db = DbError::new(format!("{context}: {error}"));
+    if let rusqlite::Error::SqliteFailure(inner, _) = &error {
+        db = db.with_vendor_code(i64::from(inner.extended_code));
+    }
+    JdbcError::Database(db)
+}
 
 /// A [`JdbcExecutor`] backed by a single `rusqlite` connection guarded by a mutex.
 ///
@@ -32,16 +54,20 @@ impl RusqliteExecutor {
     /// Opens an in-memory SQLite database.
     pub fn in_memory() -> JdbcResult<Self> {
         let conn = Connection::open_in_memory()
-            .map_err(|e| JdbcError::Database(format!("open in-memory sqlite: {e}")))?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+            .map_err(|e| sqlite_error("open in-memory sqlite", e))?;
+        Self::with_busy_timeout(conn)
     }
 
     /// Opens a file-backed SQLite database.
     pub fn open(path: &str) -> JdbcResult<Self> {
-        let conn = Connection::open(path)
-            .map_err(|e| JdbcError::Database(format!("open sqlite '{path}': {e}")))?;
+        let conn =
+            Connection::open(path).map_err(|e| sqlite_error(format!("open sqlite '{path}'"), e))?;
+        Self::with_busy_timeout(conn)
+    }
+
+    fn with_busy_timeout(conn: Connection) -> JdbcResult<Self> {
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .map_err(|e| sqlite_error("set busy timeout", e))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -52,7 +78,7 @@ impl RusqliteExecutor {
         let conn = self.lock();
         for ddl in statements {
             conn.execute_batch(ddl)
-                .map_err(|e| JdbcError::Database(format!("DDL failed: {ddl}: {e}")))?;
+                .map_err(|e| sqlite_error(format!("DDL failed: {ddl}"), e))?;
         }
         Ok(())
     }
@@ -76,28 +102,28 @@ fn to_rusqlite_value(param: &SqlParam) -> Value {
 fn execute_bound(conn: &Connection, bound: &BoundSql) -> JdbcResult<usize> {
     let params: Vec<Value> = bound.params.iter().map(to_rusqlite_value).collect();
     conn.execute(&bound.sql, rusqlite::params_from_iter(params))
-        .map_err(|e| JdbcError::Database(format!("{}: {e}", bound.sql)))
+        .map_err(|e| sqlite_error(&bound.sql, e))
 }
 
 fn query_bound(conn: &Connection, bound: &BoundSql) -> JdbcResult<Vec<Vec<ColumnValue>>> {
     let params: Vec<Value> = bound.params.iter().map(to_rusqlite_value).collect();
     let mut stmt = conn
         .prepare(&bound.sql)
-        .map_err(|e| JdbcError::Database(format!("prepare {}: {e}", bound.sql)))?;
+        .map_err(|e| sqlite_error(format!("prepare {}", bound.sql), e))?;
     let column_count = stmt.column_count();
     let mut rows = stmt
         .query(rusqlite::params_from_iter(params))
-        .map_err(|e| JdbcError::Database(format!("query {}: {e}", bound.sql)))?;
+        .map_err(|e| sqlite_error(format!("query {}", bound.sql), e))?;
     let mut result = Vec::new();
     while let Some(row) = rows
         .next()
-        .map_err(|e| JdbcError::Database(format!("row {}: {e}", bound.sql)))?
+        .map_err(|e| sqlite_error(format!("row {}", bound.sql), e))?
     {
         let mut record = Vec::with_capacity(column_count);
         for i in 0..column_count {
             let value = row
                 .get_ref(i)
-                .map_err(|e| JdbcError::Database(format!("column {i}: {e}")))?;
+                .map_err(|e| sqlite_error(format!("column {i}"), e))?;
             record.push(rusqlite_value_to_column(value));
         }
         result.push(record);
@@ -146,14 +172,13 @@ impl JdbcExecutor for RusqliteExecutor {
         let mut conn = self.lock();
         let tx = conn
             .transaction()
-            .map_err(|e| JdbcError::Database(format!("begin transaction: {e}")))?;
+            .map_err(|e| sqlite_error("begin transaction", e))?;
         for bound in bounds {
             let params: Vec<Value> = bound.params.iter().map(to_rusqlite_value).collect();
             tx.execute(&bound.sql, rusqlite::params_from_iter(params))
-                .map_err(|e| JdbcError::Database(format!("{}: {e}", bound.sql)))?;
+                .map_err(|e| sqlite_error(&bound.sql, e))?;
         }
-        tx.commit()
-            .map_err(|e| JdbcError::Database(format!("commit: {e}")))?;
+        tx.commit().map_err(|e| sqlite_error("commit", e))?;
         Ok(())
     }
 
@@ -161,21 +186,20 @@ impl JdbcExecutor for RusqliteExecutor {
         let mut conn = self.lock();
         let tx = conn
             .transaction()
-            .map_err(|e| JdbcError::Database(format!("begin transaction: {e}")))?;
+            .map_err(|e| sqlite_error("begin transaction", e))?;
         let mut total = 0usize;
         {
             let mut stmt = tx
                 .prepare_cached(bounds[0].sql.as_str())
-                .map_err(|e| JdbcError::Database(format!("prepare batch: {e}")))?;
+                .map_err(|e| sqlite_error("prepare batch", e))?;
             for bound in bounds {
                 let params: Vec<Value> = bound.params.iter().map(to_rusqlite_value).collect();
                 total += stmt
                     .execute(rusqlite::params_from_iter(params))
-                    .map_err(|e| JdbcError::Database(format!("batch {}: {e}", bound.sql)))?;
+                    .map_err(|e| sqlite_error(format!("batch {}", bound.sql), e))?;
             }
         }
-        tx.commit()
-            .map_err(|e| JdbcError::Database(format!("commit batch: {e}")))?;
+        tx.commit().map_err(|e| sqlite_error("commit batch", e))?;
         Ok(total)
     }
 
@@ -193,22 +217,29 @@ impl JdbcExecutor for RusqliteExecutor {
     /// Opens a real SQLite transaction; the callback's statements commit together or all
     /// roll back. Dropping an uncommitted `rusqlite::Transaction` rolls back, so an error
     /// from `work` needs no explicit rollback call.
+    ///
+    /// The transaction is `IMMEDIATE`, not SQLite's default `DEFERRED`: every caller uses
+    /// this envelope for a **read-modify-write** (list appends read the stored hash and the
+    /// item count first, versioned upserts read the version back), and a `DEFERRED`
+    /// transaction only takes its write lock when the first write runs. Under two writers the
+    /// upgrade then fails immediately with `SQLITE_BUSY` — the read lock cannot be promoted
+    /// while the other connection holds the write lock — so the append would be lost even with
+    /// a busy timeout. `IMMEDIATE` takes the write lock at `BEGIN`, where [`BUSY_TIMEOUT`]
+    /// applies, and the writers queue instead of failing.
     fn in_transaction(
         &self,
         work: &mut dyn FnMut(&mut dyn JdbcSession) -> JdbcResult<()>,
     ) -> JdbcResult<()> {
         let mut conn = self.lock();
         let tx = conn
-            .transaction()
-            .map_err(|e| JdbcError::Database(format!("begin transaction: {e}")))?;
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| sqlite_error("begin transaction", e))?;
         let result = {
             let mut session = TxSession { tx: &tx };
             work(&mut session)
         };
         match result {
-            Ok(()) => tx
-                .commit()
-                .map_err(|e| JdbcError::Database(format!("commit: {e}"))),
+            Ok(()) => tx.commit().map_err(|e| sqlite_error("commit", e)),
             Err(e) => {
                 // Dropping `tx` rolls back; keep the original error as the returned one.
                 drop(tx);

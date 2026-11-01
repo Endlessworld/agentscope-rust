@@ -19,9 +19,20 @@ use serde_json::json;
 
 type Repo = JdbcAgentSkillRepository;
 
+/// A SQLite dialect whose skill table group is enabled.
+///
+/// The repository refuses a dialect built without it (Java `enableSkillTables(true)` is the
+/// documented prerequisite), so every repository test opts in here.
+fn skill_dialect() -> Arc<dyn AbstractJdbcDialect> {
+    JdbcDialectBuilder::new(Arc::new(SqliteDialect::new()))
+        .enable_skill_tables(true)
+        .build()
+        .expect("dialect")
+}
+
 fn setup() -> (SharedExecutor, Arc<dyn AbstractJdbcDialect>, Repo) {
     let executor: SharedExecutor = in_memory_executor().expect("in-memory executor");
-    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
+    let dialect: Arc<dyn AbstractJdbcDialect> = skill_dialect();
     let repo = Repo::with_schema(executor.clone(), dialect.clone()).expect("schema");
     (executor, dialect, repo)
 }
@@ -545,7 +556,7 @@ fn create_if_not_exist_false_rejects_a_missing_schema() {
     // Not in Java's repository test (schema is owned by the builder there): proves the
     // Rust `create_if_not_exist=false` contract fails fast instead of silently creating.
     let executor = in_memory_executor().unwrap();
-    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
+    let dialect: Arc<dyn AbstractJdbcDialect> = skill_dialect();
 
     let err = Repo::new(executor.clone(), dialect.clone(), "default", true, false).unwrap_err();
     assert!(
@@ -574,7 +585,7 @@ fn legacy_table_without_metadata_json_fails_schema_validation() {
              UNIQUE (namespace, name))",
         ))
         .unwrap();
-    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
+    let dialect: Arc<dyn AbstractJdbcDialect> = skill_dialect();
 
     let err = Repo::with_schema(executor, dialect).unwrap_err();
     assert!(err.to_string().contains("metadata_json"), "{err}");
@@ -869,7 +880,9 @@ fn builder_prefix_and_per_table_overrides_apply_to_skill_tables() {
     let dialect = JdbcDialectBuilder::from_product_name("SQLite")
         .table_prefix("app_")
         .unwrap()
-        .build();
+        .enable_skill_tables(true)
+        .build()
+        .expect("dialect");
     assert_eq!("app_skills", dialect.resolved_skill_table_name());
     assert_eq!(
         "app_skill_resources",
@@ -885,10 +898,31 @@ fn builder_prefix_and_per_table_overrides_apply_to_skill_tables() {
         .unwrap()
         .skill_resources_table_name("my_skill_resources")
         .unwrap()
-        .build();
+        .enable_skill_tables(true)
+        .build()
+        .expect("dialect");
     assert_eq!("my_skills", override_dialect.resolved_skill_table_name());
     assert_eq!(
         "my_skill_resources",
         override_dialect.resolved_skill_resources_table_name()
     );
+}
+
+#[test]
+fn repository_rejects_a_dialect_without_the_skill_table_group() {
+    // Java: DialectBuilderTableGroupsTest.repositoryConsistencyCheck
+    let executor: SharedExecutor = in_memory_executor().unwrap();
+    let base_only = JdbcDialectBuilder::from_product_name("SQLite")
+        .build()
+        .expect("dialect");
+
+    let err = Repo::new(executor.clone(), base_only, "default", true, true).unwrap_err();
+    let message = err.to_string();
+    // The message must point at the group by its tables and by its enabling switch.
+    assert!(message.contains("agentscope_skills"), "{message}");
+    assert!(message.contains("enable_skill_tables(true)"), "{message}");
+
+    // A dialect built with the group enabled satisfies the guard.
+    Repo::new(executor, skill_dialect(), "default", true, true)
+        .expect("a skill-enabled dialect must be accepted");
 }

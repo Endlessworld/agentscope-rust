@@ -75,7 +75,8 @@ pub mod state;
 pub mod store;
 
 pub use backend::{
-    ColumnValue, JdbcError, JdbcExecutor, JdbcResult, JdbcSession, RusqliteExecutor, SharedExecutor,
+    ColumnValue, DbError, JdbcError, JdbcExecutor, JdbcResult, JdbcSession, RusqliteExecutor,
+    SharedExecutor,
 };
 pub use backend::driver::{DriverExecutor, SqlClient};
 #[cfg(feature = "postgres-executor")]

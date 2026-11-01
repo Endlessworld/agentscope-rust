@@ -47,7 +47,8 @@ fn custom_prefix_table_names() {
         .table_prefix("custom_")
         .unwrap()
         .auto_create_table(false)
-        .build();
+        .build()
+        .expect("dialect");
     assert_eq!(d.resolved_store_table_name(), "custom_store");
     assert_eq!(d.resolved_session_state_table_name(), "custom_sessions");
 }
@@ -61,7 +62,8 @@ fn per_table_override_wins_over_prefix() {
         .store_table_name("my_kv_table")
         .unwrap()
         .auto_create_table(false)
-        .build();
+        .build()
+        .expect("dialect");
     assert_eq!(d.resolved_store_table_name(), "my_kv_table");
     assert_eq!(d.resolved_session_state_table_name(), "custom_sessions");
 }
@@ -73,7 +75,8 @@ fn snapshot_table_override_is_honoured() {
         .snapshot_table_name("my_snaps")
         .unwrap()
         .auto_create_table(false)
-        .build();
+        .build()
+        .expect("dialect");
     assert_eq!(d.resolved_snapshot_table_name(), "my_snaps");
     assert_eq!(d.resolved_store_table_name(), "agentscope_store");
 }
@@ -515,9 +518,156 @@ fn builder_accepts_valid_names() {
         .store_table_name("my_store")
         .unwrap()
         .auto_create_table(false)
-        .build();
+        .build()
+        .expect("dialect");
     assert_eq!(d.resolved_store_table_name(), "my_store");
     assert_eq!(d.resolved_session_state_table_name(), "my_app_sessions");
+}
+
+// ---------------------------------------------------------------------------
+//  Table-group switches — Java: DialectBuilderTableGroupsTest
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_table_groups_cover_the_base_tables_only() {
+    // Java: DialectBuilderTableGroupsTest.defaultGroups
+    let d = JdbcDialectBuilder::from_product_name("H2")
+        .build()
+        .expect("dialect");
+    assert!(d.base_tables_enabled());
+    assert!(!d.skill_tables_enabled());
+    assert_eq!(
+        vec!["agentscope_store", "agentscope_sessions", "agentscope_snapshots"],
+        d.enabled_table_names()
+    );
+    let joined = d.create_table_ddls().join("\n").to_lowercase();
+    assert!(joined.contains("agentscope_store"));
+    assert!(joined.contains("agentscope_sessions"));
+    assert!(joined.contains("agentscope_snapshots"));
+    assert!(!joined.contains("skill"));
+}
+
+#[test]
+fn skill_only_group_never_creates_the_base_tables() {
+    // Java: DialectBuilderTableGroupsTest.skillOnly
+    let d = JdbcDialectBuilder::from_product_name("H2")
+        .enable_base_tables(false)
+        .enable_skill_tables(true)
+        .build()
+        .expect("dialect");
+    assert!(!d.base_tables_enabled());
+    assert!(d.skill_tables_enabled());
+    assert_eq!(
+        vec!["agentscope_skills", "agentscope_skill_resources"],
+        d.enabled_table_names()
+    );
+    let joined = d.create_table_ddls().join("\n").to_lowercase();
+    assert!(joined.contains("agentscope_skills"));
+    assert!(joined.contains("agentscope_skill_resources"));
+    assert!(!joined.contains("agentscope_store"));
+    assert!(!joined.contains("agentscope_sessions"));
+    assert!(!joined.contains("agentscope_snapshots"));
+}
+
+#[test]
+fn both_groups_create_all_five_tables() {
+    // Java: DialectBuilderTableGroupsTest.bothGroups
+    let d = JdbcDialectBuilder::from_product_name("H2")
+        .enable_skill_tables(true)
+        .build()
+        .expect("dialect");
+    assert_eq!(
+        vec![
+            "agentscope_store",
+            "agentscope_sessions",
+            "agentscope_snapshots",
+            "agentscope_skills",
+            "agentscope_skill_resources"
+        ],
+        d.enabled_table_names()
+    );
+    let joined = d.create_table_ddls().join("\n").to_lowercase();
+    for table in [
+        "agentscope_store",
+        "agentscope_sessions",
+        "agentscope_snapshots",
+        "agentscope_skills",
+        "agentscope_skill_resources",
+    ] {
+        assert!(joined.contains(table), "{table} must be created");
+    }
+}
+
+#[test]
+fn disabling_both_table_groups_is_rejected_at_build() {
+    // Java: DialectBuilderTableGroupsTest.noGroupsEnabled
+    let error = JdbcDialectBuilder::from_product_name("H2")
+        .enable_base_tables(false)
+        .enable_skill_tables(false)
+        .build()
+        .err()
+        .expect("nothing left to create or validate");
+    assert!(error.contains("enable_skill_tables(false)"), "{error}");
+    assert!(error.contains("enable_base_tables(false)"), "{error}");
+
+    // The switches are "last call wins": enabling the skill group and disabling it again is a
+    // rejectable build, exactly like never enabling it.
+    let error = JdbcDialectBuilder::from_product_name("H2")
+        .enable_skill_tables(true)
+        .enable_skill_tables(false)
+        .enable_skill_tables(false)
+        .enable_base_tables(false)
+        .build()
+        .err()
+        .expect("last call wins");
+    assert!(error.contains("No table groups enabled"), "{error}");
+}
+
+#[test]
+fn auto_create_table_is_orthogonal_to_the_table_groups() {
+    // Java: DialectBuilderTableGroupsTest.autoCreateFalseValidatesSkillGroupOnly /
+    //       reopenWithAutoCreateFalse. Rust's builder records create-vs-validate only (the
+    //       component constructors own the schema work), so the check is that the plan and the
+    //       flag stay independent.
+    let builder = JdbcDialectBuilder::from_product_name("H2")
+        .enable_base_tables(false)
+        .enable_skill_tables(true)
+        .auto_create_table(false);
+    assert!(!builder.should_auto_create_table());
+    let d = builder.build().expect("dialect");
+    assert!(d.skill_tables_enabled());
+    assert_eq!(2, d.enabled_table_names().len());
+}
+
+#[test]
+fn a_table_name_claimed_by_two_domains_is_rejected() {
+    // Java: AbstractJdbcDialect.putDdls — a collision would silently drop one domain's
+    // creation *and* its validation.
+    let error = JdbcDialectBuilder::from_product_name("H2")
+        .table_prefix("app_")
+        .unwrap()
+        .store_table_name("app_sessions")
+        .unwrap()
+        .build()
+        .err()
+        .expect("the store table took the sessions table name");
+    assert!(
+        error.contains("Duplicate JDBC table name 'app_sessions'"),
+        "{error}"
+    );
+
+    // Same across groups: a skill table named like the store table.
+    let error = JdbcDialectBuilder::from_product_name("H2")
+        .enable_skill_tables(true)
+        .skill_table_name("agentscope_store")
+        .unwrap()
+        .build()
+        .err()
+        .expect("the skill table took the store table name");
+    assert!(
+        error.contains("Duplicate JDBC table name 'agentscope_store'"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -645,9 +795,9 @@ fn postgres_upsert_can_return_the_new_version_atomically() {
 
 #[test]
 fn create_table_ddls_covers_the_three_store_owned_tables_only() {
-    // Java: `AbstractJdbcDialect.createTableDdls()` — store → sessions → snapshots. The skill
-    // tables are created by `JdbcSkillRepository::initialize_with_schema`, so a store-only
-    // deployment never needs them and a skill-only one never creates the store tables.
+    // Java: `AbstractJdbcDialect.createTableDdls()` — the default configuration enables the base
+    // group (store → sessions → snapshots) and leaves the skill group off, so a store-only
+    // deployment never creates the skill tables (see the group-switch tests below).
     let ddls = PostgresDialect::new().create_table_ddls();
     let joined = ddls.join("\n");
     for table in [

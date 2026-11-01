@@ -64,12 +64,118 @@ impl ColumnValue {
 /// Result type for backend operations.
 pub type JdbcResult<T> = Result<T, JdbcError>;
 
+/// A failure reported by the database, together with the driver's structured codes when it
+/// exposes them.
+///
+/// Java's components classify failures on the thrown exception type and its `getSQLState()`
+/// (`JdbcAgentStateStore.isDuplicateKey`). Rust drivers hand back an error value, so the
+/// classification lives here instead of on the message text: SQLite's message reads
+/// "constraint failed" for **every** constraint class, which made a NOT NULL / CHECK /
+/// FOREIGN KEY violation indistinguishable from a duplicate key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbError {
+    message: String,
+    /// The five-character ANSI `SQLSTATE` (e.g. `23505`), when the driver reports one.
+    sql_state: Option<String>,
+    /// The driver's own error code: MySQL `ER_DUP_ENTRY = 1062`, SQLite's **extended**
+    /// result code (`2067` unique, `1555` primary key), and so on.
+    vendor_code: Option<i64>,
+}
+
+/// `SQLSTATE` of a unique/primary-key violation (`unique_violation`). Other `23xxx`
+/// integrity violations — `23502` NOT NULL, `23503` foreign key, `23514` CHECK — are not
+/// duplicates.
+const UNIQUE_VIOLATION_SQL_STATE: &str = "23505";
+
+impl DbError {
+    /// Wraps a message from a driver that reported no structured code.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            sql_state: None,
+            vendor_code: None,
+        }
+    }
+
+    /// Attaches the driver's `SQLSTATE`.
+    pub fn with_sql_state(mut self, sql_state: impl Into<String>) -> Self {
+        self.sql_state = Some(sql_state.into());
+        self
+    }
+
+    /// Attaches the driver's own error code.
+    pub fn with_vendor_code(mut self, code: i64) -> Self {
+        self.vendor_code = Some(code);
+        self
+    }
+
+    /// The human-readable message (no driver code prefix).
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The `SQLSTATE`, when the driver reported one.
+    pub fn sql_state(&self) -> Option<&str> {
+        self.sql_state.as_deref()
+    }
+
+    /// The driver's own error code, when it reported one.
+    pub fn vendor_code(&self) -> Option<i64> {
+        self.vendor_code
+    }
+
+    /// Whether this is a unique/primary-key violation, mirroring the Java `isDuplicateKey`.
+    ///
+    /// Structured codes decide when present; only an error that carries none falls back to
+    /// the message, and then only on unambiguous wording (`unique` / `duplicate` /
+    /// `primary key`) — the SQLite messages for the other constraint classes say
+    /// "constraint failed" and must not match.
+    pub fn is_unique_violation(&self) -> bool {
+        // Driver codes are the strongest signal: MySQL reports `SQLSTATE 23000` (generic
+        // integrity violation) for a duplicate key, so its state alone cannot decide.
+        if let Some(code) = self.vendor_code {
+            if matches!(
+                code,
+                MYSQL_DUPLICATE_ENTRY | SQLITE_CONSTRAINT_UNIQUE | SQLITE_CONSTRAINT_PRIMARYKEY
+            ) {
+                return true;
+            }
+        }
+        match self.sql_state.as_deref() {
+            Some(UNIQUE_VIOLATION_SQL_STATE) => true,
+            // Any other integrity violation: the driver named the class, so the text must not
+            // be re-interpreted (this is the NOT NULL / CHECK / FK false positive).
+            Some(state) if state.starts_with("23") => false,
+            _ => {
+                let lower = self.message.to_ascii_lowercase();
+                lower.contains("unique")
+                    || lower.contains("duplicate")
+                    || lower.contains("primary key")
+                    || lower.contains("23505")
+            }
+        }
+    }
+}
+
+/// MySQL `ER_DUP_ENTRY`.
+const MYSQL_DUPLICATE_ENTRY: i64 = 1062;
+/// SQLite `SQLITE_CONSTRAINT_UNIQUE` (extended; base code is 19).
+const SQLITE_CONSTRAINT_UNIQUE: i64 = 2067;
+/// SQLite `SQLITE_CONSTRAINT_PRIMARYKEY` (extended; base code is 19).
+const SQLITE_CONSTRAINT_PRIMARYKEY: i64 = 1555;
+
+impl std::fmt::Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Error type for the execution backend.
 #[derive(Debug, thiserror::Error)]
 pub enum JdbcError {
     /// An error originating from the underlying database driver.
     #[error("database error: {0}")]
-    Database(String),
+    Database(DbError),
     /// A feature is not supported by this backend.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
@@ -80,6 +186,17 @@ pub enum JdbcError {
     /// silently dialling `localhost`.
     #[error("invalid configuration: {0}")]
     Configuration(String),
+}
+
+impl JdbcError {
+    /// Wraps a database failure for which the driver reported no structured code.
+    ///
+    /// Use [`DbError::new`] + [`DbError::with_sql_state`] / [`DbError::with_vendor_code`]
+    /// directly when the driver does report one (see `backend::driver::*::map_error` and
+    /// `backend::sqlite`).
+    pub fn database(message: impl Into<String>) -> Self {
+        JdbcError::Database(DbError::new(message))
+    }
 }
 
 /// Minimal statement-execution surface used inside a transaction.
@@ -201,20 +318,101 @@ pub trait JdbcExecutor: Send + Sync + std::fmt::Debug {
 /// A shared, thread-safe executor handle.
 pub type SharedExecutor = Arc<dyn JdbcExecutor>;
 
-/// Returns whether the database error looks like a unique/primary-key violation.
+/// Returns whether the database error is a unique/primary-key violation.
 ///
-/// Mirrors Java `JdbcAgentStateStore.isDuplicateKey`: a `SQLIntegrityConstraintViolationException`
-/// or SQLState starting with `23`. Backends render these strings differently, so match on
-/// common substrings.
+/// Mirrors Java `JdbcAgentStateStore.isDuplicateKey`, but on the driver's structured code
+/// ([`DbError::is_unique_violation`]) rather than a SQLState prefix: a `23xxx` prefix also
+/// covers NOT NULL (`23502`), foreign-key (`23503`) and CHECK (`23514`) violations, which
+/// must not be mistaken for "the row already exists" (a lock-table insert would then poll as
+/// if the lock were held, and `save_if_version(0)` would take the self-heal branch).
 pub fn is_unique_violation(error: &JdbcError) -> bool {
-    let JdbcError::Database(msg) = error else {
-        return false;
-    };
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("unique")
-        || lower.contains("primary key")
-        || lower.contains("constraint failed")
-        || lower.contains("duplicate")
-        || lower.contains("23505")
-        || msg.starts_with("23")
+    match error {
+        JdbcError::Database(db) => db.is_unique_violation(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn database(db: DbError) -> JdbcError {
+        JdbcError::Database(db)
+    }
+
+    #[test]
+    fn unique_sqlstate_is_a_duplicate() {
+        // PostgreSQL / H2 unique violation.
+        let error = database(DbError::new("duplicate").with_sql_state("23505"));
+        assert!(is_unique_violation(&error));
+    }
+
+    #[test]
+    fn other_integrity_sqlstates_are_not_duplicates() {
+        // PostgreSQL words a NOT NULL violation as "23502", a FK violation as "23503" and a
+        // CHECK violation as "23514"; all of them are `23xxx` class yet none is a duplicate.
+        for state in ["23502", "23503", "23514", "23000"] {
+            let error = database(DbError::new("constraint violated").with_sql_state(state));
+            assert!(!is_unique_violation(&error), "{state} is not a duplicate");
+        }
+        // The message text must not override a structured "not a duplicate" verdict, even
+        // when it happens to contain the word SQLite uses for every constraint class.
+        let error = database(
+            DbError::new("duplicate key value violates ... constraint failed")
+                .with_sql_state("23502"),
+        );
+        assert!(!is_unique_violation(&error));
+    }
+
+    #[test]
+    fn vendor_codes_decide_ahead_of_a_generic_sqlstate() {
+        // MySQL reports a duplicate key as SQLSTATE 23000 (generic integrity violation) plus
+        // its own ER_DUP_ENTRY = 1062.
+        let error = database(
+            DbError::new("Duplicate entry 'k' for key 'PRIMARY'").with_sql_state("23000"),
+        );
+        assert!(!is_unique_violation(&error), "23000 alone is ambiguous");
+        let error = database(
+            DbError::new("Duplicate entry 'k' for key 'PRIMARY'")
+                .with_sql_state("23000")
+                .with_vendor_code(1062),
+        );
+        assert!(is_unique_violation(&error));
+        // SQLite extended result codes.
+        for code in [2067, 1555] {
+            let error = database(DbError::new("constraint failed").with_vendor_code(code));
+            assert!(is_unique_violation(&error), "sqlite {code} is a duplicate");
+        }
+        // SQLite NOT NULL (1299) / CHECK (275) / FOREIGN KEY (787) are not.
+        for code in [1299, 275, 787] {
+            let error = database(DbError::new("constraint failed").with_vendor_code(code));
+            assert!(!is_unique_violation(&error), "sqlite {code} is not a duplicate");
+        }
+    }
+
+    #[test]
+    fn text_only_errors_use_unambiguous_wording() {
+        // Drivers/backends that only surface text (or hosts constructing their own errors).
+        assert!(is_unique_violation(&JdbcError::database(
+            "UNIQUE constraint failed: agentscope_store.item_key"
+        )));
+        assert!(is_unique_violation(&JdbcError::database(
+            "duplicate key value violates unique constraint"
+        )));
+        assert!(is_unique_violation(&JdbcError::database(
+            "PRIMARY KEY must be unique"
+        )));
+        // "constraint failed" alone used to match every constraint class.
+        assert!(!is_unique_violation(&JdbcError::database(
+            "NOT NULL constraint failed: agentscope_store.value_json"
+        )));
+        assert!(!is_unique_violation(&JdbcError::database(
+            "CHECK constraint failed: version > 0"
+        )));
+        assert!(!is_unique_violation(&JdbcError::database(
+            "FOREIGN KEY constraint failed"
+        )));
+        // Non-database failures are never duplicates.
+        assert!(!is_unique_violation(&JdbcError::Unsupported("nope".into())));
+    }
 }

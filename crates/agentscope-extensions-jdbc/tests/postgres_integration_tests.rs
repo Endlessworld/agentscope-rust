@@ -158,7 +158,7 @@ async fn a_failed_transaction_rolls_back() {
             "INSERT INTO agentscope_jdbc_tx_probe (id) VALUES (?)",
             vec![SqlParam::Int(1)],
         ))?;
-        Err(JdbcError::Database("rollback please".to_string()))
+        Err(JdbcError::database("rollback please".to_string()))
     });
     assert!(result.is_err(), "the closure error must be propagated");
 

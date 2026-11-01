@@ -1391,14 +1391,14 @@ impl FailingExecutor {
 impl JdbcExecutor for FailingExecutor {
     fn execute(&self, bound: &BoundSql) -> JdbcResult<usize> {
         if self.fail_writes.load(Ordering::SeqCst) {
-            return Err(JdbcError::Database("injected write failure".into()));
+            return Err(JdbcError::database("injected write failure"));
         }
         self.inner.execute(bound)
     }
 
     fn query(&self, bound: &BoundSql) -> JdbcResult<Vec<Vec<ColumnValue>>> {
         if self.fail_reads.load(Ordering::SeqCst) {
-            return Err(JdbcError::Database("injected read failure".into()));
+            return Err(JdbcError::database("injected read failure"));
         }
         self.inner.query(bound)
     }
@@ -1408,7 +1408,7 @@ impl JdbcExecutor for FailingExecutor {
         work: &mut dyn FnMut(&mut dyn JdbcSession) -> JdbcResult<()>,
     ) -> JdbcResult<()> {
         if self.fail_writes.load(Ordering::SeqCst) {
-            return Err(JdbcError::Database("injected transaction failure".into()));
+            return Err(JdbcError::database("injected transaction failure"));
         }
         self.inner.in_transaction(work)
     }
@@ -1633,4 +1633,229 @@ async fn try_delete_reports_a_backend_failure() {
             .is_some(),
         "the failed delete must have left the row in place"
     );
+}
+
+// ---------------------------------------------------------------------------
+//  Constraint classification — JDBC-05
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sqlite_constraint_classes_are_told_apart_by_their_codes() {
+    // SQLite words *every* constraint failure as "constraint failed", so the message alone
+    // cannot tell a duplicate key from a NOT NULL / CHECK / foreign-key violation. The
+    // extended result code can, and that is what `is_unique_violation` keys on.
+    let executor = RusqliteExecutor::in_memory().unwrap();
+    executor
+        .execute(&BoundSql::no_params(
+            "CREATE TABLE probe (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        ))
+        .unwrap();
+    executor
+        .execute(&BoundSql::no_params(
+            "INSERT INTO probe (id, name) VALUES (1, 'a')",
+        ))
+        .unwrap();
+
+    let duplicate = executor
+        .execute(&BoundSql::no_params(
+            "INSERT INTO probe (id, name) VALUES (1, 'b')",
+        ))
+        .unwrap_err();
+    assert!(is_unique_violation(&duplicate), "{duplicate}");
+
+    let not_null = executor
+        .execute(&BoundSql::no_params("INSERT INTO probe (id, name) VALUES (2, NULL)"))
+        .unwrap_err();
+    assert!(
+        !is_unique_violation(&not_null),
+        "a NOT NULL violation must not be mistaken for a duplicate key: {not_null}"
+    );
+
+    // The verdict comes from the structured code, not from the text.
+    match not_null {
+        JdbcError::Database(db) => {
+            assert_eq!(Some(1299), db.vendor_code(), "SQLITE_CONSTRAINT_NOTNULL");
+            assert_eq!(None, db.sql_state(), "SQLite has no SQLSTATE");
+        }
+        other => panic!("expected a database error, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Multiple stores over one database file — Java: JdbcUnconditionalVersionTest
+// ---------------------------------------------------------------------------
+
+/// A unique path for a file-backed database, so each test owns its own file.
+///
+/// File-backed rather than `:memory:` because these cases need several *connections*:
+/// the store's own connection serializes nothing across instances.
+fn temp_db_path(label: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir()
+        .join(format!(
+            "agentscope-jdbc-{label}-{}-{seq}-{nanos}.sqlite3",
+            std::process::id()
+        ))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Opens another store over the same database file — a second connection, i.e. the
+/// multi-instance shape of the Java concurrency tests (one pool connection per writer).
+fn open_store(path: &str, dialect: &Arc<dyn AbstractJdbcDialect>) -> Arc<JdbcAgentStateStore> {
+    let executor = Arc::new(RusqliteExecutor::open(path).expect("open the database file"));
+    Arc::new(
+        JdbcAgentStateStore::new(executor, dialect.clone(), false).expect("schema already exists"),
+    )
+}
+
+#[test]
+fn concurrent_writers_get_unique_contiguous_versions() {
+    // Java: JdbcUnconditionalVersionTest.concurrentStoreInstancesReturnUniqueContiguousVersions
+    // (4 writers × 25 rounds). Every write is unconditional, so the store — not the caller —
+    // hands out the version and no two writers may ever see the same one.
+    const WRITERS: usize = 4;
+    const ROUNDS: usize = 25;
+    let path = temp_db_path("versions");
+    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
+    {
+        let executor = Arc::new(RusqliteExecutor::open(&path).expect("open the database file"));
+        JdbcAgentStateStore::with_schema(executor, dialect.clone()).expect("schema");
+    }
+
+    let mut handles = Vec::with_capacity(WRITERS);
+    for writer in 0..WRITERS {
+        let path = path.clone();
+        let dialect = dialect.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = open_store(&path, &dialect);
+            (0..ROUNDS)
+                .map(|round| {
+                    store
+                        .save_if_version(
+                            None,
+                            "s",
+                            "counter",
+                            serde_json::json!({ "writer": writer, "round": round }),
+                            UNVERSIONED,
+                        )
+                        .expect("an unconditional write must succeed")
+                })
+                .collect::<Vec<i64>>()
+        }));
+    }
+    let mut versions: Vec<i64> = handles
+        .into_iter()
+        .flat_map(|handle| handle.join().expect("writer thread"))
+        .collect();
+    versions.sort_unstable();
+    assert_eq!(
+        (1..=(WRITERS * ROUNDS) as i64).collect::<Vec<_>>(),
+        versions,
+        "every version must be handed out exactly once, without gaps"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn concurrent_writes_to_distinct_keys_all_land() {
+    // The companion to the version test: four connections writing side by side must neither
+    // fail with `SQLITE_BUSY` nor lose a row (the busy timeout is what makes the loser wait
+    // for the winner's commit instead of erroring out).
+    const WRITERS: usize = 4;
+    const ROUNDS: usize = 25;
+    let path = temp_db_path("distinct");
+    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
+    {
+        let executor = Arc::new(RusqliteExecutor::open(&path).expect("open the database file"));
+        JdbcAgentStateStore::with_schema(executor, dialect.clone()).expect("schema");
+    }
+
+    let mut handles = Vec::with_capacity(WRITERS);
+    for writer in 0..WRITERS {
+        let path = path.clone();
+        let dialect = dialect.clone();
+        handles.push(std::thread::spawn(move || {
+            let store = open_store(&path, &dialect);
+            for round in 0..ROUNDS {
+                let key = format!("k-{writer}-{round}");
+                let version = store
+                    .save_if_version(
+                        None,
+                        "s",
+                        &key,
+                        serde_json::json!({ "writer": writer, "round": round }),
+                        UNVERSIONED,
+                    )
+                    .expect("a write to a private key must succeed");
+                assert_eq!(1, version, "a fresh key starts at version 1");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("writer thread");
+    }
+
+    let store = open_store(&path, &dialect);
+    for writer in 0..WRITERS {
+        for round in 0..ROUNDS {
+            let key = format!("k-{writer}-{round}");
+            let state = store.get_versioned(None, "s", &key).expect("read back");
+            assert_eq!(1, state.version, "{key}");
+            assert_eq!(
+                Some(&serde_json::json!({ "writer": writer, "round": round })),
+                state.value.as_ref(),
+                "{key} must hold exactly what its writer stored"
+            );
+        }
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_appends_never_collide_on_the_item_index() {
+    // JDBC-01 follow-up under real concurrency: the list read-modify-write runs in one
+    // IMMEDIATE transaction per store, so two stores cannot compute the same tail index. Each
+    // writer submits `[seed, own]`: whoever loses the race sees the winner's committed items,
+    // so the append neither errors (an index collision would roll the whole batch back) nor
+    // leaves a half-written list.
+    const WRITERS: usize = 4;
+    let path = temp_db_path("appends");
+    let dialect: Arc<dyn AbstractJdbcDialect> = Arc::new(SqliteDialect::new());
+    {
+        let executor = Arc::new(RusqliteExecutor::open(&path).expect("open the database file"));
+        JdbcAgentStateStore::with_schema(executor, dialect.clone()).expect("schema");
+    }
+
+    let mut tasks = Vec::with_capacity(WRITERS);
+    for writer in 0..WRITERS {
+        let path = path.clone();
+        let dialect = dialect.clone();
+        tasks.push(tokio::spawn(async move {
+            let store = open_store(&path, &dialect);
+            let values = vec![text("seed"), text(&format!("writer-{writer}"))];
+            store.try_save_list(None, "s", "log", &values).await
+        }));
+    }
+    for task in tasks {
+        task.await
+            .expect("append task")
+            .expect("a concurrent append must not fail");
+    }
+
+    let store = open_store(&path, &dialect);
+    let items = store.get_list(None, "s", "log").await;
+    assert_eq!(
+        2,
+        items.len(),
+        "exactly the seed plus one winner: {:?}",
+        items.iter().map(text_of).collect::<Vec<_>>()
+    );
+    assert_eq!("seed", text_of(&items[0]));
+    std::fs::remove_file(&path).ok();
 }

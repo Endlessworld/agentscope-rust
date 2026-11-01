@@ -32,7 +32,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Column, Conn, Opts, Params, Value};
 
 use super::{DriverExecutor, SqlClient};
-use crate::backend::{ColumnValue, JdbcError, JdbcResult};
+use crate::backend::{ColumnValue, DbError, JdbcError, JdbcResult};
 use crate::dialect::SqlParam;
 use crate::sandbox::NativeLockFlavor;
 
@@ -86,7 +86,7 @@ impl SqlClient for MysqlSqlClient {
         })?;
         let conn = Conn::new(opts)
             .await
-            .map_err(|error| JdbcError::Database(format!("MySQL connection failed: {error}")))?;
+            .map_err(|error| JdbcError::database(format!("MySQL connection failed: {error}")))?;
         Ok(Self { conn })
     }
 
@@ -206,18 +206,22 @@ fn decode_row(row: &mysql_async::Row, columns: &[Column]) -> Vec<ColumnValue> {
         .collect()
 }
 
-/// Maps a driver error, keeping the MySQL error code and SQLSTATE in the message.
+/// Maps a driver error, keeping the MySQL error code and SQLSTATE.
 ///
-/// [`crate::backend::is_unique_violation`] keys on the text (`duplicate`, `23000`);
-/// `mysql_async`'s `Display` for a server error does not guarantee the SQLSTATE, so it is
-/// appended explicitly.
+/// [`crate::backend::is_unique_violation`] needs both: MySQL reports a duplicate key as the
+/// generic `SQLSTATE 23000`, so only the driver code (`ER_DUP_ENTRY = 1062`, here surfaced
+/// as `DbError::with_vendor_code`) tells it apart from a NOT NULL / foreign-key violation.
 fn map_error(error: mysql_async::Error) -> JdbcError {
     match &error {
-        mysql_async::Error::Server(server) => JdbcError::Database(format!(
-            "{}: {} (SQLSTATE {})",
-            server.code, server.message, server.state
-        )),
-        _ => JdbcError::Database(error.to_string()),
+        mysql_async::Error::Server(server) => JdbcError::Database(
+            DbError::new(format!(
+                "{}: {} (SQLSTATE {})",
+                server.code, server.message, server.state
+            ))
+            .with_sql_state(server.state.clone())
+            .with_vendor_code(i64::from(server.code)),
+        ),
+        _ => JdbcError::database(error.to_string()),
     }
 }
 

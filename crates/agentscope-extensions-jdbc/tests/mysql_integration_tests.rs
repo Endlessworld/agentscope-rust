@@ -25,7 +25,7 @@ use std::sync::Arc;
 use agentscope_extensions_jdbc::backend::{ColumnValue, JdbcError, JdbcExecutor};
 use agentscope_extensions_jdbc::dialect::vendor::MysqlDialect;
 use agentscope_extensions_jdbc::dialect::{
-    detect_dialect, AbstractJdbcDialect, BoundSql, DialectKind, TableNameConfig,
+    detect_dialect, AbstractJdbcDialect, BoundSql, DialectKind, JdbcDialectBuilder, TableNameConfig,
     TableNameConfigurable,
 };
 use agentscope_extensions_jdbc::sandbox::NativeLockFlavor;
@@ -61,6 +61,15 @@ fn unique(prefix: &str) -> String {
 
 fn mysql_dialect() -> Arc<dyn AbstractJdbcDialect> {
     Arc::new(MysqlDialect::new())
+}
+
+/// A MySQL dialect whose skill table group is enabled — the repository refuses one without it
+/// (Java `enableSkillTables(true)` prerequisite).
+fn mysql_skill_dialect() -> Arc<dyn AbstractJdbcDialect> {
+    JdbcDialectBuilder::new(Arc::new(MysqlDialect::new()))
+        .enable_skill_tables(true)
+        .build()
+        .expect("dialect")
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +241,7 @@ async fn skill_repository_round_trip() {
     let Some(executor) = executor() else {
         return;
     };
-    let repo = JdbcAgentSkillRepository::with_schema(executor, mysql_dialect())
+    let repo = JdbcAgentSkillRepository::with_schema(executor, mysql_skill_dialect())
         .expect("skill schema");
     let name = unique("mysql-skill");
     let skill = AgentSkill::builder()
@@ -263,7 +272,7 @@ async fn namespaced_skill_isolation() {
     let Some(executor) = executor() else {
         return;
     };
-    let repo = JdbcAgentSkillRepository::with_schema(executor, mysql_dialect())
+    let repo = JdbcAgentSkillRepository::with_schema(executor, mysql_skill_dialect())
         .expect("skill schema");
     let name = unique("mysql-ns-skill");
     let team_a = AgentSkill::builder()

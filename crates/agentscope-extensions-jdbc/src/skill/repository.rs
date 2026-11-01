@@ -86,7 +86,7 @@ fn column_text(row: &[ColumnValue], index: usize, name: &str) -> JdbcResult<Opti
     match row.get(index) {
         Some(ColumnValue::Text(text)) => Ok(Some(text.clone())),
         Some(ColumnValue::Null) | None => Ok(None),
-        Some(other) => Err(JdbcError::Database(format!(
+        Some(other) => Err(JdbcError::database(format!(
             "column '{name}' has unexpected non-text value: {other:?}"
         ))),
     }
@@ -96,12 +96,12 @@ fn column_int(row: &[ColumnValue], index: usize, name: &str) -> JdbcResult<i64> 
     match row.get(index) {
         Some(ColumnValue::Int(value)) => Ok(*value),
         Some(ColumnValue::Text(text)) => text.parse::<i64>().map_err(|e| {
-            JdbcError::Database(format!("column '{name}' is not an integer: {text}: {e}"))
+            JdbcError::database(format!("column '{name}' is not an integer: {text}: {e}"))
         }),
-        Some(other) => Err(JdbcError::Database(format!(
+        Some(other) => Err(JdbcError::database(format!(
             "column '{name}' has unexpected non-integer value: {other:?}"
         ))),
-        None => Err(JdbcError::Database(format!("column '{name}' is missing"))),
+        None => Err(JdbcError::database(format!("column '{name}' is missing"))),
     }
 }
 
@@ -118,6 +118,7 @@ impl JdbcAgentSkillRepository {
         create_if_not_exist: bool,
     ) -> Result<Self, SkillRepositoryError> {
         validate_namespace(namespace)?;
+        require_skill_tables_enabled(dialect.as_ref())?;
         let repository = Self {
             executor,
             dialect,
@@ -385,7 +386,7 @@ impl JdbcAgentSkillRepository {
                 let Some(skill_id) =
                     select_skill_id(session, &self.dialect, namespace, skill.name())?
                 else {
-                    return Err(JdbcError::Database(format!(
+                    return Err(JdbcError::database(format!(
                         "failed to read generated id for skill: {}",
                         skill.name()
                     )));
@@ -642,15 +643,31 @@ fn deserialize_metadata(metadata_json: Option<&str>, name: &str) -> Metadata {
     }
 }
 
-/// Classifies duplicate-key failures narrowly: only positive duplicate signals match, so
-/// a NOT NULL / CHECK / FK failure surfaces as a database error instead of the misleading
-/// "use force=true" conflict (mirrors Java `isUniqueViolation`).
+/// Classifies duplicate-key failures on the driver's structured code, so a NOT NULL / CHECK
+/// / FK failure surfaces as a database error instead of the misleading "use force=true"
+/// conflict (mirrors Java `isUniqueViolation`).
 fn is_skill_unique_violation(error: &JdbcError) -> bool {
-    let JdbcError::Database(message) = error else {
-        return false;
-    };
-    let lower = message.to_ascii_lowercase();
-    lower.contains("unique") || lower.contains("duplicate") || lower.contains("23505")
+    crate::backend::is_unique_violation(error)
+}
+
+/// Fails fast on the base-without-skill misconfiguration: a dialect whose skill group is
+/// disabled did no skill schema work, so the skill channel would fail at first use. Mirrors
+/// the Java `JdbcAgentSkillRepository.requireSkillTablesEnabled`.
+fn require_skill_tables_enabled(
+    dialect: &dyn AbstractJdbcDialect,
+) -> Result<(), SkillRepositoryError> {
+    if dialect.skill_tables_enabled() {
+        return Ok(());
+    }
+    Err(SkillRepositoryError::invalid(
+        "skill tables group",
+        format!(
+            "The skill tables group ({} / {}) is not enabled on this dialect. Enable it with \
+             enable_skill_tables(true) on the dialect builder before building the dialect.",
+            dialect.resolved_skill_table_name(),
+            dialect.resolved_skill_resources_table_name()
+        ),
+    ))
 }
 
 fn db_error(error: JdbcError) -> SkillRepositoryError {

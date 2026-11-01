@@ -124,7 +124,7 @@ impl SqlClient for RecordingClient {
     async fn execute(&mut self, sql: &str, params: &[SqlParam]) -> JdbcResult<usize> {
         self.recorder.record(sql, params);
         if sql.contains("boom") {
-            return Err(JdbcError::Database(format!("fake failure for {sql}")));
+            return Err(JdbcError::database(format!("fake failure for {sql}")));
         }
         Ok(1)
     }
@@ -220,7 +220,7 @@ fn query_returns_the_driver_rows() {
 fn driver_errors_are_surfaced_with_their_message() {
     let (executor, _recorder) = connect(None);
     match executor.execute(&BoundSql::no_params("INSERT boom")) {
-        Err(JdbcError::Database(message)) => assert!(message.contains("boom"), "{message}"),
+        Err(JdbcError::Database(db)) => assert!(db.message().contains("boom"), "{db}"),
         other => panic!("expected a database error, got {other:?}"),
     }
 }
@@ -256,11 +256,11 @@ fn in_transaction_rolls_back_when_the_work_fails() {
     let (executor, recorder) = connect(None);
     let result = executor.in_transaction(&mut |session: &mut dyn JdbcSession| {
         session.execute(&BoundSql::no_params("INSERT skill"))?;
-        Err(JdbcError::Database("resource insert failed".to_string()))
+        Err(JdbcError::database("resource insert failed".to_string()))
     });
 
     match result {
-        Err(JdbcError::Database(message)) => assert!(message.contains("resource insert failed")),
+        Err(JdbcError::Database(db)) => assert!(db.message().contains("resource insert failed")),
         other => panic!("expected the closure error, got {other:?}"),
     }
     assert_eq!(

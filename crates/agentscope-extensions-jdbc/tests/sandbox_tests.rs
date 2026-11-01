@@ -205,8 +205,9 @@ fn sqlite_acquire_and_release_lock() {
 #[test]
 fn sqlite_duplicate_lock_is_contention_not_an_error() {
     // Java: JdbcSandboxExecutionGuardSqliteTest.duplicateLockTimesOut
-    // SQLite reports the PK violation as errorCode=19 with SQLSTATE=null; `is_unique_violation`
-    // must recognise it so the second attempt polls instead of aborting.
+    // SQLite has no SQLSTATE and words the PK violation like every other constraint failure;
+    // its extended result code (`SQLITE_CONSTRAINT_PRIMARYKEY` = 1555) is what
+    // `is_unique_violation` keys on, so the second attempt polls instead of aborting.
     let guard = new_guard_with_timeout(0);
     let isolation_key = key(IsolationScope::Agent, "sqlite-mutex");
 
