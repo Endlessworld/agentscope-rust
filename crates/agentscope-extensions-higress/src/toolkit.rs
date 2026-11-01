@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use agentscope_core::error::{Error, Result};
-use agentscope_core::message::{ContentBlock, JsonMap, TextBlock, ToolResultBlock};
+use agentscope_core::message::{JsonMap, ToolResultBlock};
 use agentscope_core::tool::{McpAsyncHandler, McpTool, Tool, Toolkit, ToolkitConfig};
-use agentscope_harness::agent::McpMetaPropagationOptions;
+use agentscope_harness::agent::{convert_call_tool_result, McpMetaPropagationOptions};
 use async_trait::async_trait;
 use rust_mcp_sdk::schema::{CallToolResult, Tool as McpSchemaTool};
 use serde_json::Value;
@@ -515,35 +515,16 @@ fn tool_parameters(tool: &McpSchemaTool, presets: &JsonMap) -> Value {
 }
 
 /// Renders an MCP [`CallToolResult`] as a [`ToolResultBlock`].
+///
+/// Delegates to the harness converter (HIGRESS-03), which keeps non-text content
+/// in its richest core form instead of `Debug`-formatting it: images and audio
+/// become base64 content blocks, embedded resources are unwrapped (text bodies
+/// kept, binary bodies rendered as `image`/`audio` or a short description),
+/// resource links render as `name` + `uri` text, and an empty `content` falls
+/// back to `structuredContent`. `isError` semantics are unchanged — the text
+/// still reaches the model, the block is just marked as an error.
 fn render_call_result(tool_name: &str, result: &CallToolResult) -> ToolResultBlock {
-    use rust_mcp_sdk::schema::ContentBlock as McpContentBlock;
-    let mut parts = Vec::new();
-    for block in &result.content {
-        match block {
-            McpContentBlock::TextContent(text) => parts.push(text.text.clone()),
-            other => parts.push(format!("{:?}", other)),
-        }
-    }
-    let text = if parts.is_empty() {
-        match &result.structured_content {
-            Some(structured) => {
-                serde_json::to_string_pretty(&Value::Object(structured.clone())).unwrap_or_default()
-            }
-            None => String::new(),
-        }
-    } else {
-        parts.join("\n")
-    };
-
-    if result.is_error == Some(true) {
-        ToolResultBlock::error(text)
-    } else {
-        ToolResultBlock::new(
-            "",
-            tool_name,
-            vec![ContentBlock::Text(TextBlock::new(text))],
-        )
-    }
+    convert_call_tool_result(tool_name, result)
 }
 
 #[cfg(test)]
@@ -693,6 +674,57 @@ mod tests {
             Some("regular-client")
         );
         assert!(toolkit.get_tool("tool_b").is_some());
+    }
+
+    /// HIGRESS-03: non-text MCP content must survive as structured blocks.
+    ///
+    /// The old renderer `Debug`-formatted everything that was not text, so an
+    /// image reached the model as a Rust enum dump.
+    #[test]
+    fn render_call_result_keeps_image_blocks() {
+        use agentscope_core::message::{ContentBlock, Source, ToolResultState};
+
+        let result: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [
+                { "type": "text", "text": "chart follows" },
+                { "type": "image", "data": "aGk=", "mimeType": "image/png" }
+            ],
+            "isError": false
+        }))
+        .unwrap();
+
+        let block = render_call_result("chart", &result);
+
+        assert_eq!(block.name.as_deref(), Some("chart"));
+        assert_eq!(block.output.len(), 2);
+        assert_eq!(
+            block.output[0],
+            ContentBlock::Text(agentscope_core::message::TextBlock::new("chart follows"))
+        );
+        match &block.output[1] {
+            ContentBlock::Image(image) => match &image.source {
+                Source::Base64(base64) => {
+                    assert_eq!(base64.media_type, "image/png");
+                    assert_eq!(base64.data, "aGk=");
+                }
+                other => panic!("expected a base64 source, got {other:?}"),
+            },
+            other => panic!("expected an image block, got {other:?}"),
+        }
+
+        // `isError` keeps its old semantics: the text still reaches the model,
+        // only the state changes.
+        let error_result: CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [{ "type": "text", "text": "boom" }],
+            "isError": true
+        }))
+        .unwrap();
+        let error = render_call_result("chart", &error_result);
+        assert_eq!(error.state, ToolResultState::Error);
+        match &error.output[..] {
+            [ContentBlock::Text(text)] => assert!(text.text.contains("boom")),
+            other => panic!("expected one error text block, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -983,6 +1015,11 @@ mod tests {
                 description: Some("Weather".to_string()),
                 parameters: serde_json::json!({ "type": "object", "properties": {} }),
                 server: "higress".to_string(),
+                title: Some("Weather Lookup".to_string()),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "temp": { "type": "number" } }
+                })),
             }],
         });
         let config = HigressMcpClientBuilder::create("higress")
@@ -998,6 +1035,12 @@ mod tests {
         assert_eq!(registered, 1);
         let cached = toolkit.get_higress_mcp_client().unwrap();
         assert_eq!(cached.name(), "higress");
+        // HIGRESS-05: the gateway's display title reaches the registered tool
+        // through the client's plain list path.
+        assert_eq!(
+            toolkit.get_tool("weather").unwrap().title(),
+            Some("Weather Lookup")
+        );
     }
 
     #[tokio::test]

@@ -1082,16 +1082,20 @@ fn build_output_schema(schema: &Value) -> Option<rust_mcp_sdk::schema::ToolOutpu
 
 /// Converts a harness-discovered [`McpToolInfo`] into an MCP [`Tool`].
 ///
+/// The gateway's human-readable `title` and its `outputSchema` are both carried
+/// through (HIGRESS-05); dropping them here made the non-tool-search path lose
+/// metadata the tool-search path (`convert_to_mcp_tool`) already kept.
+///
 /// [`McpToolInfo`]: agentscope_harness::agent::McpToolInfo
 fn mcp_tool_info_to_tool(info: &agentscope_harness::agent::McpToolInfo) -> Tool {
     let input_schema = build_input_schema(&info.parameters)
         .unwrap_or_else(|| ToolInputSchema::new(Vec::new(), None, None));
     Tool {
         name: info.name.clone(),
-        title: None,
+        title: info.title.clone(),
         description: info.description.clone(),
         input_schema,
-        output_schema: None,
+        output_schema: info.output_schema.as_ref().and_then(build_output_schema),
         annotations: None,
         meta: None,
         execution: None,
@@ -1222,6 +1226,8 @@ mod tests {
                 "required": ["q"]
             }),
             server: "higress".to_string(),
+            title: None,
+            output_schema: None,
         }
     }
 
@@ -1889,6 +1895,45 @@ mod tests {
             .calls()
             .iter()
             .all(|call| call.tool_name != TOOL_SEARCH_NAME));
+    }
+
+    #[tokio::test]
+    async fn list_tools_without_tool_search_keeps_title_and_output_schema() {
+        // HIGRESS-05: the plain path used to drop the gateway's `title` and
+        // `outputSchema` even though the tool-search path kept them.
+        let recording = Arc::new(RecordingConnection::with_tools(vec![McpToolInfo {
+            name: "weather".to_string(),
+            description: Some("Weather".to_string()),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            server: "higress".to_string(),
+            title: Some("Weather Lookup".to_string()),
+            output_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "temp": { "type": "number" } },
+                "required": ["temp"]
+            })),
+        }]));
+        let wrapper = HigressMcpClientWrapper::with_transport(test_config(), recording.clone());
+        wrapper.initialize().await.unwrap();
+
+        let tools = wrapper.list_tools().await.unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].title.as_deref(), Some("Weather Lookup"));
+        let output_schema = tools[0]
+            .output_schema
+            .as_ref()
+            .expect("outputSchema must survive the plain list path");
+        assert_eq!(output_schema.required, vec!["temp".to_string()]);
+        assert!(output_schema
+            .properties
+            .as_ref()
+            .unwrap()
+            .contains_key("temp"));
+        // The cache stores the same metadata, not a stripped copy.
+        let cached = wrapper.get_cached_tool("weather").unwrap();
+        assert_eq!(cached.title.as_deref(), Some("Weather Lookup"));
+        assert!(cached.output_schema.is_some());
     }
 
     #[tokio::test]
