@@ -56,6 +56,11 @@ pub const CONNECT_FLAG_END_STREAM: u8 = 0x02;
 pub const CONNECT_FLAG_RESERVED: u8 = 0xfc;
 /// Upper bound for a single Connect frame payload (mirrors the Java 64 MiB guard).
 pub const MAX_CONNECT_FRAME_LEN: usize = 64 * 1024 * 1024;
+/// State `extra` key carrying the E2B snapshot ids of a session, as a JSON array.
+///
+/// Mirrors the Java `E2bSandboxState#snapshotIds` field: it is serialized with the state so a
+/// later process can still prune the snapshots an earlier one created.
+pub const KNOWN_SNAPSHOTS_EXTRA_KEY: &str = "known_snapshots";
 
 /// How workspace bytes are persisted for E2B sandboxes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1096,6 +1101,26 @@ impl E2bBackend {
         self.known_snapshots_guard().clone()
     }
 
+    /// Snapshot ids this session owns: the ids persisted with the state (written by an earlier
+    /// process) followed by the ones this process created, de-duplicated oldest-first.
+    ///
+    /// Mirrors the Java `E2bSandboxState#getSnapshotIds()` record: the state list is what a
+    /// resumed session inherits, so pruning must count both halves rather than only this
+    /// process's own creations.
+    pub fn snapshot_ids_for(&self, handle: &RemoteSandboxHandle) -> Vec<String> {
+        let mut ids: Vec<String> = handle
+            .extra
+            .get(KNOWN_SNAPSHOTS_EXTRA_KEY)
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+            .unwrap_or_default();
+        for id in self.known_snapshot_ids() {
+            if !ids.iter().any(|seen| *seen == id) {
+                ids.push(id);
+            }
+        }
+        dedupe_snapshot_ids(&ids)
+    }
+
     /// Records a snapshot id this process created (most recent last).
     ///
     /// Blank ids are ignored and duplicates keep their original (oldest) position, mirroring the
@@ -1966,6 +1991,39 @@ impl RemoteBackend for E2bBackend {
     ) -> Option<Arc<dyn SandboxFileTransfer>> {
         Some(Arc::new(E2bFileTransfer::new(self.clone(), handle.clone())))
     }
+
+    fn state_extra(&self, handle: &RemoteSandboxHandle) -> BTreeMap<String, String> {
+        // SANDBOX-11: `known_snapshots` is the only record of the snapshots this session created
+        // (E2B has no listing endpoint), so it has to travel with the state.
+        let ids = self.snapshot_ids_for(handle);
+        if ids.is_empty() {
+            return BTreeMap::new();
+        }
+        let mut extra = BTreeMap::new();
+        match serde_json::to_string(&ids) {
+            Ok(json) => {
+                extra.insert(KNOWN_SNAPSHOTS_EXTRA_KEY.to_string(), json);
+                extra
+            }
+            Err(e) => {
+                tracing::warn!("e2b: failed to serialize known snapshot ids: {e}");
+                BTreeMap::new()
+            }
+        }
+    }
+
+    async fn on_shutdown(&self, handle: &RemoteSandboxHandle) -> SandboxResult<()> {
+        // Mirrors Java `E2bSandbox#shutdown`: kill first (which unlocks the templates), then run
+        // the retention pass. The ids restored from the state are adopted here so a resumed
+        // process prunes the whole window, not only its own creations.
+        for id in self.snapshot_ids_for(handle) {
+            self.note_snapshot(&id);
+        }
+        if let Err(err) = self.prune_known_snapshots().await {
+            tracing::warn!("e2b: snapshot retention pass on shutdown failed: {err}");
+        }
+        Ok(())
+    }
 }
 
 /// De-duplicates snapshot ids, dropping blanks and keeping the first (oldest) occurrence.
@@ -2079,6 +2137,7 @@ pub fn marker_hash(snapshot_id: &str) -> u64 {
 mod tests {
     use super::*;
     use crate::remote::RemoteSandboxStateData;
+    use agentscope_harness::agent::sandbox::{Sandbox, SandboxClient};
 
     #[test]
     fn create_body_matches_java() {
@@ -3203,6 +3262,112 @@ mod tests {
             "the newest snapshot must survive"
         );
         assert_eq!(backend.known_snapshot_ids(), vec!["snap-1".to_string()]);
+    }
+
+    // ------------------------------------------- snapshot ids carried by the state (SANDBOX-11)
+
+    fn snapshot_state(ids: &[&str], snapshot_id: &str) -> crate::remote::RemoteSandboxStateData {
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "persistence_mode".to_string(),
+            E2bPersistenceMode::NativeSnapshot.as_str().to_string(),
+        );
+        if !ids.is_empty() {
+            extra.insert(
+                KNOWN_SNAPSHOTS_EXTRA_KEY.to_string(),
+                serde_json::to_string(ids).unwrap(),
+            );
+        }
+        crate::remote::RemoteSandboxStateData {
+            session_id: "sess-e2b".to_string(),
+            backend: "e2b".to_string(),
+            sandbox_id: Some(snapshot_id.to_string()),
+            endpoint: String::new(),
+            token: None,
+            workspace_root: "/home/user".to_string(),
+            sandbox_owned: true,
+            workspace_root_ready: false,
+            workspace_projection_hash: None,
+            extra,
+            workspace_spec: None,
+            snapshot: None,
+        }
+    }
+
+    /// `stop()` must write the snapshot ids into the serialized state, keeping the ones the
+    /// resumed state carried: E2B has no listing endpoint, so a later process can only converge
+    /// its retention window from this record.
+    #[tokio::test]
+    async fn stop_persists_known_snapshot_ids_into_the_state() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/sandboxes/sbx-1/snapshots");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body("{\"snapshotID\":\"snap-new\"}");
+            })
+            .await;
+        let backend = Arc::new(retention_backend(&server, None));
+        let client = crate::remote::RemoteSandboxClient::new(backend);
+        let state = snapshot_state(&["snap-old"], "sbx-1").to_harness_state();
+
+        let mut sandbox = client.resume(&state).await.unwrap();
+        sandbox.stop().await.unwrap();
+
+        let persisted = crate::remote::RemoteSandboxStateData::from_harness_state(sandbox.state())
+            .expect("remote state");
+        let raw = persisted
+            .extra
+            .get(KNOWN_SNAPSHOTS_EXTRA_KEY)
+            .expect("known snapshot ids travel with the state");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(raw).unwrap(),
+            vec!["snap-old".to_string(), "snap-new".to_string()],
+            "the inherited id keeps its (oldest) position"
+        );
+    }
+
+    /// A resumed process prunes the snapshots the state recorded, after the sandbox is killed
+    /// (Java `E2bSandbox#shutdown`: kill first, then `cleanupSnapshots`).
+    #[tokio::test]
+    async fn shutdown_prunes_snapshots_carried_by_the_resumed_state() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let kill = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/sandboxes/sbx-1");
+                then.status(204).body("");
+            })
+            .await;
+        let prune = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/templates/snap-old");
+                then.status(200).body("");
+            })
+            .await;
+        let keep = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/templates/snap-new");
+                then.status(200).body("");
+            })
+            .await;
+        let backend = Arc::new(retention_backend(&server, Some(1)));
+        let client = crate::remote::RemoteSandboxClient::new(backend.clone());
+        let state = snapshot_state(&["snap-old", "snap-new"], "sbx-1").to_harness_state();
+
+        let mut sandbox = client.resume(&state).await.unwrap();
+        sandbox.shutdown().await.unwrap();
+
+        kill.assert_async().await;
+        prune.assert_async().await;
+        assert_eq!(keep.hits_async().await, 0, "the newest snapshot survives");
+        assert_eq!(
+            backend.known_snapshot_ids(),
+            vec!["snap-new".to_string()],
+            "pruning updates the in-process record to the surviving window"
+        );
     }
 
     // ------------------------------------------------------ volume mounts (E2B `volumeMounts`)

@@ -375,6 +375,12 @@ pub trait RemoteBackend: Send + Sync + std::fmt::Debug {
         root: &str,
         archive: &[u8],
     ) -> SandboxResult<Option<RemoteSandboxHandle>> {
+        // An empty archive is the "persistence is handled elsewhere" no-op marker written by
+        // volume/NAS-backed persists (Java `AgentRunSandbox`/`E2bSandbox#doHydrateWorkspace`
+        // return early on an empty stream). Extracting nothing must not touch the remote tree.
+        if archive.is_empty() {
+            return Ok(None);
+        }
         hydrate_tar(self, handle, root, archive).await?;
         Ok(None)
     }
@@ -390,6 +396,24 @@ pub trait RemoteBackend: Send + Sync + std::fmt::Debug {
         _handle: &RemoteSandboxHandle,
     ) -> Option<Arc<dyn SandboxFileTransfer>> {
         None
+    }
+
+    /// Extra fields the backend wants carried into the persisted sandbox state.
+    ///
+    /// Mirrors the `*SandboxState` fields a backend updates while stopping (E2B `snapshotIds`):
+    /// they have to survive serialization so a later process can still act on them. The default
+    /// is empty — most backends keep no stop-time bookkeeping.
+    fn state_extra(&self, _handle: &RemoteSandboxHandle) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
+
+    /// Hook run by [`RemoteSandbox::shutdown`] **after** the remote sandbox was destroyed.
+    ///
+    /// Mirrors the Java `E2bSandbox#shutdown` ordering: the sandbox is killed first and only then
+    /// are snapshot templates cleaned up, because E2B keeps templates locked while a sandbox
+    /// restored from them is alive. The default does nothing.
+    async fn on_shutdown(&self, _handle: &RemoteSandboxHandle) -> SandboxResult<()> {
+        Ok(())
     }
 }
 
@@ -683,6 +707,11 @@ impl Sandbox for RemoteSandbox {
         if let Some(snapshot) = self.snapshot.clone() {
             snapshot.persist(&archive).await?;
         }
+        // Backend bookkeeping produced by the persist (E2B snapshot ids) must reach the serialized
+        // state, otherwise the next process cannot converge its retention window (SANDBOX-11).
+        for (key, value) in self.backend.state_extra(&handle) {
+            self.core.data.extra.insert(key, value);
+        }
         self.core.data.workspace_root_ready = true;
         self.core.running = false;
         self.core.sync();
@@ -697,8 +726,17 @@ impl Sandbox for RemoteSandbox {
             transfer.close();
         }
         if self.core.data.sandbox_owned {
-            if let Some(id) = self.handle.as_ref().map(|h| h.id.clone()) {
-                self.backend.kill_sandbox(&id).await?;
+            if let Some(handle) = self.handle.clone() {
+                self.backend.kill_sandbox(&handle.id).await?;
+                // Java E2bSandbox#shutdown: the kill unlocks the snapshot templates this sandbox
+                // was restored from, so the retention pass runs *after* it. Best effort: a failed
+                // cleanup never blocks teardown.
+                if let Err(e) = self.backend.on_shutdown(&handle).await {
+                    tracing::warn!(
+                        "sandbox[{}] shutdown hook failed: {e}",
+                        self.backend.backend_name()
+                    );
+                }
             }
         }
         self.handle = None;
@@ -793,6 +831,39 @@ impl RemoteSandboxClient {
     pub fn backend_name(&self) -> &'static str {
         self.backend.backend_name()
     }
+
+    /// Rebuilds the runtime snapshot handle for a resumed session.
+    ///
+    /// Mirrors the Java `KubernetesSandboxClient#deserializeState(String,
+    /// SandboxSnapshotSpec)`: the persisted state only carries the snapshot *identity*
+    /// (Rust `SandboxSnapshotRef` is a pure identity, Java's `RemoteSandboxSnapshot` even
+    /// carries a live client), so the client's snapshot spec turns that identity back into a
+    /// snapshot bound to this process while keeping the persisted archive id. Without a spec the
+    /// identity cannot be rebound, and `start()` falls back to re-projecting the workspace —
+    /// exactly what "no snapshot" means.
+    fn rebind_snapshot(
+        &self,
+        data: &RemoteSandboxStateData,
+    ) -> Result<Option<Arc<dyn SandboxSnapshot>>> {
+        let Some(reference) = data.snapshot.as_ref() else {
+            return Ok(None);
+        };
+        let id = match reference {
+            SandboxSnapshotRef::Noop => return Ok(None),
+            SandboxSnapshotRef::Local { id } | SandboxSnapshotRef::Remote { id } => id.clone(),
+        };
+        match self.snapshot_spec.as_deref() {
+            Some(spec) => Ok(Some(spec.build(&id)?)),
+            None => {
+                tracing::warn!(
+                    "sandbox: persisted snapshot {} cannot be rebound without a snapshot spec; \
+                     the workspace will be re-projected",
+                    id
+                );
+                Ok(None)
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -836,10 +907,14 @@ impl SandboxClient for RemoteSandboxClient {
 
     async fn resume(&self, state: &SandboxState) -> Result<Box<dyn Sandbox>> {
         let data = RemoteSandboxStateData::from_harness_state(state)?;
+        // SANDBOX-04: the persisted state only carries the snapshot identity, so the spec has to
+        // re-bind it here — otherwise a resumed session silently loses snapshot restore (the
+        // Java `deserializeState(json, snapshotSpec)` override exists for the same reason).
+        let snapshot = self.rebind_snapshot(&data)?;
         Ok(Box::new(RemoteSandbox::new(
             self.backend.clone(),
             data,
-            None,
+            snapshot,
         )))
     }
 
@@ -860,6 +935,7 @@ impl SandboxClient for RemoteSandboxClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentscope_harness::agent::sandbox::RemoteSnapshotSpec;
     use std::sync::Mutex;
 
     fn sample_data() -> RemoteSandboxStateData {
@@ -1035,6 +1111,9 @@ mod tests {
     }
 
     // A minimal in-memory backend used to exercise the generic `Sandbox` lifecycle offline.
+    /// Archive bytes the fake backend hands out for `tar | base64`, and hydrates back.
+    const FAKE_ARCHIVE: &[u8] = b"fake-tar-archive";
+
     #[derive(Debug)]
     struct FakeBackend {
         commands: Mutex<Vec<String>>,
@@ -1109,12 +1188,15 @@ mod tests {
                 .unwrap()
                 .push(cwd.map(str::to_string));
             self.commands.lock().unwrap().push(command.to_string());
-            // Emulate `tar | base64` for an empty archive so `stop` can round-trip.
+            // Emulate `tar | base64` with a real archive so `stop` -> snapshot.persist and a later
+            // `start` -> snapshot.restore carry bytes instead of an empty stream.
             if command.contains("base64 -w0") {
-                Ok(RemoteExecOutput::new(0, String::new(), String::new()))
-            } else {
-                Ok(RemoteExecOutput::new(0, String::new(), String::new()))
+                use base64::Engine as _;
+                let encoded =
+                    base64::engine::general_purpose::STANDARD.encode(FAKE_ARCHIVE);
+                return Ok(RemoteExecOutput::new(0, encoded, String::new()));
             }
+            Ok(RemoteExecOutput::new(0, String::new(), String::new()))
         }
     }
 
@@ -1425,5 +1507,156 @@ mod tests {
         assert!(sandbox.persist_workspace().await.is_err());
         assert!(sandbox.hydrate_workspace(b"archive").await.is_err());
         assert!(sandbox.stop().await.is_err());
+    }
+
+    /// In-memory `RemoteSnapshotClient` so a snapshot can round-trip across a `resume`.
+    #[derive(Debug, Default)]
+    struct MemorySnapshotClient {
+        objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl agentscope_harness::agent::sandbox::RemoteSnapshotClient for MemorySnapshotClient {
+        async fn upload(&self, snapshot_id: &str, data: &[u8]) -> Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(snapshot_id.to_string(), data.to_vec());
+            Ok(())
+        }
+
+        async fn download(&self, snapshot_id: &str) -> Result<Vec<u8>> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(snapshot_id)
+                .cloned()
+                .ok_or_else(|| Error::Tool(format!("snapshot {snapshot_id} is missing")))
+        }
+
+        async fn exists(&self, snapshot_id: &str) -> Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(snapshot_id))
+        }
+    }
+
+    fn snapshotted_client(
+        backend: Arc<FakeBackend>,
+        snapshots: Arc<MemorySnapshotClient>,
+    ) -> RemoteSandboxClient {
+        RemoteSandboxClient::new(backend).with_snapshot_spec(Arc::new(RemoteSnapshotSpec::new(
+            snapshots,
+        )))
+    }
+
+    #[tokio::test]
+    async fn resume_rebinds_the_snapshot_so_start_restores_the_workspace() {
+        // SANDBOX-04: Java `KubernetesSandboxClient#deserializeState(json, snapshotSpec)` re-binds
+        // the runtime snapshot client while keeping the persisted archive id. A resumed session
+        // must therefore hit the snapshot branch of `start()` instead of re-projecting the
+        // workspace.
+        let backend = Arc::new(FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(false),
+            native_transfer: false,
+            creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
+        });
+        let snapshots = Arc::new(MemorySnapshotClient::default());
+        let client = snapshotted_client(backend.clone(), snapshots.clone());
+
+        let mut sandbox = client
+            .create(&WorkspaceSpec::new("/workspace"), None, None)
+            .await
+            .unwrap();
+        sandbox.start().await.unwrap();
+        sandbox.stop().await.unwrap();
+
+        // The archive reached the snapshot store under the session id (persist path).
+        let session_id = sandbox.state().session_id().to_string();
+        assert_eq!(
+            snapshots
+                .objects
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .map(Vec::as_slice),
+            Some(FAKE_ARCHIVE),
+            "stop() persists the workspace archive into the snapshot"
+        );
+        let json = client.serialize_state(sandbox.state()).unwrap();
+
+        // A new session resumes the persisted state through the same client.
+        backend.commands.lock().unwrap().clear();
+        let mut resumed = client.resume(&client.deserialize_state(&json).unwrap()).await.unwrap();
+        resumed.start().await.unwrap();
+
+        let commands = backend.commands.lock().unwrap().clone();
+        assert!(
+            commands.iter().any(|c| c.contains("standard_b64decode")),
+            "start() must hydrate the rebound snapshot; got {commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.contains("mkdir -p /workspace")),
+            "a restored workspace must not be re-projected; got {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_without_a_snapshot_spec_reprojects_the_workspace() {
+        // The other half of SANDBOX-04: the identity alone cannot be rebound, so `start()` falls
+        // back to the workspace projection instead of failing or hydrating nothing silently.
+        let backend = Arc::new(FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(false),
+            native_transfer: false,
+            creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
+        });
+        let with_spec = snapshotted_client(backend.clone(), Arc::new(MemorySnapshotClient::default()));
+        let mut sandbox = with_spec
+            .create(&WorkspaceSpec::new("/workspace"), None, None)
+            .await
+            .unwrap();
+        sandbox.start().await.unwrap();
+        sandbox.stop().await.unwrap();
+        let json = with_spec.serialize_state(sandbox.state()).unwrap();
+
+        let plain = RemoteSandboxClient::new(backend.clone());
+        backend.commands.lock().unwrap().clear();
+        let mut resumed = plain.resume(&plain.deserialize_state(&json).unwrap()).await.unwrap();
+        resumed.start().await.unwrap();
+
+        let commands = backend.commands.lock().unwrap().clone();
+        assert!(
+            commands.iter().any(|c| c.contains("mkdir -p /workspace")),
+            "without a spec the workspace is re-projected; got {commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.contains("standard_b64decode")),
+            "no snapshot bytes may be hydrated; got {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_archives_are_a_hydration_no_op() {
+        // NAS/volume-backed persists write an empty "nothing to archive" marker; restoring it must
+        // not run any remote command (Java `doHydrateWorkspace` returns early on an empty stream).
+        let backend = FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(true),
+            native_transfer: false,
+            creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
+        };
+        let handle = RemoteSandboxHandle::new("fake-1", BTreeMap::new());
+        assert!(backend
+            .hydrate_workspace_bytes(&handle, "/workspace", &[])
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            backend.commands.lock().unwrap().is_empty(),
+            "an empty archive must not trigger base64 chunk uploads"
+        );
     }
 }

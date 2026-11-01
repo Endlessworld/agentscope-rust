@@ -340,6 +340,17 @@ impl KubernetesSandboxClientOptions {
     }
 }
 
+/// Builds the deterministic `SandboxClaim` name for a session.
+///
+/// Mirrors the Java `KubernetesSandboxClient#create`: `"as-sbx-"` + the session id with its
+/// hyphens removed, truncated to 20 characters (or the whole remainder when shorter). Keeping the
+/// formula identical means operators can reconcile/prune claims by name across the Java and Rust
+/// clients; the previous `agentscope-<uuid>` shape was valid but cross-language divergent.
+pub fn claim_name_for(session_id: &str) -> String {
+    let cleaned: String = session_id.chars().filter(|c| *c != '-').take(20).collect();
+    format!("as-sbx-{cleaned}")
+}
+
 /// Builds the `SandboxClaim` CRD body for a deterministic claim name.
 pub fn build_claim_body(namespace: &str, claim_name: &str, warm_pool_name: &str) -> Value {
     build_claim_body_with_options(
@@ -1573,7 +1584,7 @@ impl RemoteBackend for KubernetesBackend {
                         .to_string(),
                 )
             })?;
-        let claim_name = format!("agentscope-{session_id}");
+        let claim_name = claim_name_for(session_id);
         let collection = self.claims_collection_path();
         let lifecycle = claim_lifecycle(self.options.shutdown_after_seconds, chrono::Utc::now())?;
         let body = build_claim_body_with_options(
@@ -1612,6 +1623,14 @@ impl RemoteBackend for KubernetesBackend {
         cwd: Option<&str>,
         timeout_seconds: u64,
     ) -> SandboxResult<RemoteExecOutput> {
+        // Java `KubernetesSandbox#doExec`: a blank command is rejected before any request is
+        // issued (`ExecException(2, "", "empty command rejected by KubernetesSandbox")`).
+        if command.trim().is_empty() {
+            return Err(SandboxExtensionError::Runtime(
+                SandboxErrorCode::CommandExecutionError,
+                "empty command rejected by KubernetesSandbox".to_string(),
+            ));
+        }
         let base = self.connector_base_url(handle).await?;
         let url = join_url(&base, "execute");
         // A caller-supplied cwd is the workspace root: run the command inside it like Java does.
@@ -1852,13 +1871,13 @@ mod tests {
                     "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/default/sandboxclaims",
                 );
                 then.status(201)
-                    .json_body(json!({"metadata": {"name": "agentscope-sess-1"}}));
+                    .json_body(json!({"metadata": {"name": "as-sbx-sess1"}}));
             })
             .await;
         let claim = server
             .mock_async(|when, then| {
                 when.method(GET).path(
-                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/default/sandboxclaims/agentscope-sess-1",
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/default/sandboxclaims/as-sbx-sess1",
                 );
                 then.status(200).json_body(json!({"status": {"conditions": [
                     {"type": "Ready", "status": "False", "reason": "TemplateNotFound",
@@ -1914,13 +1933,13 @@ mod tests {
                         .to_string(),
                     );
                 then.status(201)
-                    .json_body(json!({"metadata": {"name": "agentscope-sess-9"}}));
+                    .json_body(json!({"metadata": {"name": "as-sbx-sess9"}}));
             })
             .await;
         let claim = server
             .mock_async(|when, then| {
                 when.method(GET).path(
-                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/agentscope-sess-9",
+                    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims/as-sbx-sess9",
                 );
                 then.status(200).json_body(json!({"status": {
                     "sandbox": {"name": "sandbox-9", "podIPs": ["10.0.0.9"]},
@@ -1949,9 +1968,59 @@ mod tests {
         .unwrap();
 
         let handle = backend.create_sandbox("sess-9").await.unwrap();
-        assert_eq!(handle.id, "agentscope-sess-9");
+        assert_eq!(handle.id, "as-sbx-sess9");
         created.assert_async().await;
         assert!(claim.hits_async().await >= 1);
+    }
+
+    #[test]
+    fn claim_name_matches_the_java_formula() {
+        // SANDBOX-10 / Java `KubernetesSandboxClient#create`: "as-sbx-" + hyphens removed, cut to
+        // 20 characters.
+        assert_eq!(claim_name_for("sess-1"), "as-sbx-sess1");
+        assert_eq!(
+            claim_name_for("1234abcd-0000-4000-8000-000012345678"),
+            "as-sbx-1234abcd000040008000"
+        );
+        // Shorter ids are not padded.
+        assert_eq!(claim_name_for("abc"), "as-sbx-abc");
+    }
+
+    #[tokio::test]
+    async fn blank_commands_are_rejected_without_any_request() {
+        // SANDBOX-14 / Java `KubernetesSandbox#doExec`: blank commands never reach the sandbox.
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let any = server
+            .mock_async(|when, then| {
+                when.any_request();
+                then.status(200).body("{}");
+            })
+            .await;
+        let backend = KubernetesBackend::new(KubernetesSandboxClientOptions {
+            api_url: Some(server.base_url()),
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let handle = RemoteSandboxHandle::new("as-sbx-s1", BTreeMap::new());
+
+        for command in ["", "   ", "\t\n"] {
+            let err = backend
+                .exec_in(&handle, command, Some("/workspace"), 30)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("empty command rejected by KubernetesSandbox"),
+                "got {err}"
+            );
+        }
+        assert_eq!(
+            any.hits_async().await,
+            0,
+            "a rejected command must not issue any request"
+        );
     }
 
     #[test]

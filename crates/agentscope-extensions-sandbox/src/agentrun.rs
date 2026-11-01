@@ -21,7 +21,9 @@ use tokio::sync::Mutex;
 
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
 use crate::http::{bypass_proxy_for_loopback, join_url};
-use crate::remote::{RemoteBackend, RemoteExecOutput, RemoteSandboxClient, RemoteSandboxHandle};
+use crate::remote::{
+    persist_tar, RemoteBackend, RemoteExecOutput, RemoteSandboxClient, RemoteSandboxHandle,
+};
 use crate::retry::{with_retries, RetryPolicy};
 
 /// Default workspace root inside an AgentRun sandbox container.
@@ -49,6 +51,12 @@ pub const MCP_INITIALIZE_REQUEST_ID: u64 = 0;
 pub const SANDBOX_ID_LENGTH: usize = 26;
 /// Crockford Base32 alphabet used for AgentRun sandbox ids.
 pub const SANDBOX_ID_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+/// Handle `extra` key recording whether the workspace lives on a persistent mount.
+///
+/// Mirrors the Java `AgentRunSandboxState#workspaceOnNas`: it is derived once at create/connect and
+/// persisted with the state so a resumed session keeps the NAS semantics even if the client
+/// options are rebuilt without the mount configuration.
+pub const WORKSPACE_ON_NAS_EXTRA_KEY: &str = "workspace_on_nas";
 
 /// NAS mount configuration (mirrors `AgentRunNasMountConfig`).
 #[derive(Debug, Clone, Default)]
@@ -140,6 +148,48 @@ pub fn is_allowed_mount_dir(value: &str) -> bool {
     ALLOWED_MOUNT_PREFIXES
         .iter()
         .any(|prefix| value.starts_with(prefix))
+}
+
+impl AgentRunSandboxClientOptions {
+    /// Whether this configuration puts the workspace on a persistent NAS/OSS mount.
+    ///
+    /// Mirrors the Java `AgentRunSandboxClient#isWorkspaceUnderMounts` call inside `create`.
+    pub fn workspace_on_nas(&self) -> bool {
+        workspace_on_nas(
+            &self.workspace_root,
+            self.nas_config.as_ref(),
+            &self.oss_mount_configs,
+        )
+    }
+}
+
+/// Returns whether `workspace_root` lives under a persistent NAS/OSS mount.
+///
+/// Mirrors the Java `AgentRunSandboxClient#isWorkspaceUnderMounts`: a NAS mount covers the root by
+/// prefix, an OSS mount only when it is writable (a read-only bucket cannot back a workspace).
+/// When true the workspace survives sandbox deletion, so the adapter skips tar persistence and
+/// "resume" is just a recreate with the same deterministic id and mount configuration.
+pub fn workspace_on_nas(
+    workspace_root: &str,
+    nas: Option<&AgentRunNasMountConfig>,
+    oss: &[AgentRunOssMountConfig],
+) -> bool {
+    let root = workspace_root.trim();
+    if root.is_empty() {
+        return false;
+    }
+    if let Some(mount_dir) = nas.and_then(|c| c.mount_dir.as_deref()) {
+        if root.starts_with(mount_dir) {
+            return true;
+        }
+    }
+    oss.iter().any(|mount| {
+        !mount.read_only
+            && mount
+                .mount_dir
+                .as_deref()
+                .is_some_and(|dir| root.starts_with(dir))
+    })
 }
 
 /// Validates option invariants that do not require a live sandbox.
@@ -730,6 +780,10 @@ impl AgentRunBackend {
         if let Some(mcp) = &self.options.mcp_server_url {
             extra.insert("mcp_server_url".to_string(), mcp.clone());
         }
+        extra.insert(
+            WORKSPACE_ON_NAS_EXTRA_KEY.to_string(),
+            self.options.workspace_on_nas().to_string(),
+        );
         RemoteSandboxHandle::new(sandbox_id, extra)
     }
 }
@@ -836,6 +890,26 @@ impl RemoteBackend for AgentRunBackend {
         output.truncate_stdout();
         Ok(output)
     }
+
+    async fn persist_workspace_bytes(
+        &self,
+        handle: &RemoteSandboxHandle,
+        root: &str,
+    ) -> SandboxResult<Vec<u8>> {
+        // SANDBOX-08: a workspace under a persistent mount is durable on its own, so archiving it
+        // into the snapshot would duplicate (and on restore overwrite) the mount contents. Java
+        // `AgentRunSandbox#doPersistWorkspace` returns an empty stream, which the hydration side
+        // treats as the "nothing to restore" marker.
+        let on_nas = handle
+            .extra
+            .get(WORKSPACE_ON_NAS_EXTRA_KEY)
+            .map(|v| v == "true")
+            .unwrap_or_else(|| self.options.workspace_on_nas());
+        if on_nas {
+            return Ok(Vec::new());
+        }
+        persist_tar(self, handle, root).await
+    }
 }
 
 /// AgentRun sandbox client (harness [`agentscope_harness::agent::sandbox::SandboxClient`]).
@@ -918,6 +992,100 @@ mod tests {
             })
             .collect();
         assert!(validate_options(&options).is_err());
+    }
+
+    #[test]
+    fn workspace_on_nas_covers_persistent_mounts() {
+        // SANDBOX-08 / Java `AgentRunSandboxClient#isWorkspaceUnderMounts`.
+        let nas = AgentRunNasMountConfig {
+            mount_dir: Some("/home/nas".to_string()),
+            ..Default::default()
+        };
+        assert!(workspace_on_nas("/home/nas", Some(&nas), &[]));
+        assert!(workspace_on_nas("/home/nas/work", Some(&nas), &[]));
+        // Java uses a plain `startsWith` (no path-boundary check), so a sibling sharing the textual
+        // prefix counts as covered too — kept byte-identical to avoid a silent semantic drift.
+        assert!(workspace_on_nas("/home/nas-other", Some(&nas), &[]));
+        // A blank root has no mount semantics, and no mounts means sandbox-local.
+        assert!(!workspace_on_nas("   ", Some(&nas), &[]));
+        assert!(!workspace_on_nas("/home/agentscope/workspace", None, &[]));
+
+        // A writable OSS mount covers the root; a read-only one cannot back a workspace.
+        let writable = AgentRunOssMountConfig {
+            mount_dir: Some("/data/oss".to_string()),
+            ..Default::default()
+        };
+        assert!(workspace_on_nas(
+            "/data/oss/ws",
+            None,
+            std::slice::from_ref(&writable)
+        ));
+        let read_only = AgentRunOssMountConfig {
+            read_only: true,
+            ..writable
+        };
+        assert!(!workspace_on_nas("/data/oss/ws", None, &[read_only]));
+    }
+
+    #[test]
+    fn options_workspace_on_nas_mirrors_the_mount_configuration() {
+        let mut options = base_options();
+        assert!(!options.workspace_on_nas());
+        options.workspace_root = "/home/nas/ws".to_string();
+        options.nas_config = Some(AgentRunNasMountConfig {
+            mount_dir: Some("/home/nas".to_string()),
+            ..Default::default()
+        });
+        assert!(options.workspace_on_nas());
+    }
+
+    #[tokio::test]
+    async fn nas_workspace_persists_and_hydrates_without_any_traffic() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let any = server
+            .mock_async(|when, then| {
+                when.any_request();
+                then.status(200).body("{}");
+            })
+            .await;
+        let backend = AgentRunBackend::new(AgentRunSandboxClientOptions {
+            workspace_root: "/home/nas/ws".to_string(),
+            data_plane_base_url: Some(server.base_url()),
+            nas_config: Some(AgentRunNasMountConfig {
+                mount_dir: Some("/home/nas".to_string()),
+                ..Default::default()
+            }),
+            ..base_options()
+        })
+        .unwrap();
+        let handle = backend.handle_for(&derive_sandbox_id("sess-nas"));
+        assert_eq!(
+            handle
+                .extra
+                .get(WORKSPACE_ON_NAS_EXTRA_KEY)
+                .map(String::as_str),
+            Some("true"),
+            "the NAS flag is persisted with the handle"
+        );
+
+        // No tar command, no HTTP: the mount itself is the persistence.
+        let archive = backend
+            .persist_workspace_bytes(&handle, "/home/nas/ws")
+            .await
+            .unwrap();
+        assert!(archive.is_empty());
+        // The empty marker hydrates to a no-op instead of extracting an empty tar.
+        assert!(backend
+            .hydrate_workspace_bytes(&handle, "/home/nas/ws", &[])
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            any.hits_async().await,
+            0,
+            "a NAS-backed workspace must not hit the data plane"
+        );
     }
 
     #[test]

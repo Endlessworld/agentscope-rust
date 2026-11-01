@@ -100,7 +100,18 @@ impl SandboxExtensionError {
 
 impl From<SandboxExtensionError> for Error {
     fn from(err: SandboxExtensionError) -> Self {
-        Error::Other(err.to_string())
+        match err {
+            // Keep the status code instead of flattening it into text: callers (and the core
+            // retry policy) branch on `HttpStatus`, so a 429/5xx stays recognisable as retryable.
+            // Java keeps the same information in the typed `SandboxException` subclasses.
+            SandboxExtensionError::Http { status, body } => Error::HttpStatus {
+                status,
+                message: body,
+            },
+            // The remaining variants have no core counterpart; their `Display` already carries the
+            // stable `[CODE]` / `sandbox configuration error:` prefixes (see `SandboxErrorCode`).
+            other => Error::Other(other.to_string()),
+        }
     }
 }
 
@@ -138,5 +149,30 @@ mod tests {
     fn converts_to_core_error() {
         let err: Error = SandboxExtensionError::Configuration("no key".into()).into();
         assert!(err.to_string().contains("no key"));
+        // The configuration prefix is explicit, so callers can tell option errors from runtime ones.
+        assert!(err.to_string().contains("sandbox configuration error"));
+    }
+
+    #[test]
+    fn http_errors_keep_their_status() {
+        // SANDBOX-13: the status must survive the conversion, otherwise a retryable 429/5xx
+        // degrades into an opaque `Error::Other`.
+        let err: Error = SandboxExtensionError::http(429, "slow down").into();
+        match err {
+            Error::HttpStatus { status, message } => {
+                assert_eq!(status, 429);
+                assert_eq!(message, "slow down");
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+
+        // Runtime errors keep the stable code prefix instead of gaining a status.
+        let err: Error = SandboxExtensionError::Runtime(
+            SandboxErrorCode::CommandExecutionError,
+            "boom".to_string(),
+        )
+        .into();
+        assert!(matches!(err, Error::Other(_)));
+        assert!(err.to_string().contains("COMMAND_EXECUTION_ERROR"));
     }
 }
