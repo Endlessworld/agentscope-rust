@@ -371,6 +371,60 @@
 - REDIS-01（`ManagerRedisCommands` 注入 `ClusterRouter`）/07~10/12/14；MONGO-05/07/08/09/10；MYSQL-02（写事务）/06~09/11/12；NACOS-08/09/10/12/13/14。
 - PROTO-A2A-03、PROTO-AP-02；RAG-03/04/06/07/22；SKILLS-03（TLS 需根 workspace 加 rustls feature）/06/08/09/11；COS-05/06/07；OSS-08（列表/snapshot 组合 + 真机 412 验证）；MEM-05；TRAIN-04~09①。
 
+### 3.3.7 Round 3 执行结果（2026-11-01，Wave C：harness/core 独占 5 路 + 下游接线 8 路）
+
+目标：关闭 §3.3.6 列出的 **10 条跨模块需求**（均须 harness/core 独占串行），再由下游模块接线。分两阶段：Phase 1 五路（缝本身）→ Phase 2 八路（下游接线 + 存储侧 `try_*` 补齐）。
+
+#### 缝设计裁定（与任务示例的偏差，均已按仓库现状收敛）
+
+| 需求 | 裁定 |
+|---|---|
+| core `AgentStateStore::try_*`（8 个） | 全部提供**加性默认实现**，否则 8 个存储 crate 同时编译失败 |
+| `convert_call_tool_result` | 放 **harness**（`agent/mcp_content.rs`）而非 core：core 不依赖 `rust-mcp-sdk`，harness 本就是 MCP 宿主层，HIGRESS 直接复用 |
+| `SandboxGuard::is_held` | **不改 async 签名**（会强制 8 个 crate 同步改）；新增异步 `try_is_held`，同步 `is_held` 退化为本地视图 |
+| `PlatformChannel::deliver_with_receipt` | 沿用既有 `Channel::deliver_with_receipt` 的 fail-closed 签名（`&Msg` + `Option<&str>`）；默认 `Err(unsupported_delivery_receipt(..))`，blanket `Channel`/`ChannelSink` 转发 |
+| 「kill_sandbox」 | harness 侧无该方法：后端 kill 走 `Sandbox::close()` → `shutdown()`；manager 级用例钉住这条链 |
+| 控制面上行 | `dispatch_downstream(adapter, transport: Option<&AsdpTransport>, event)`；`None` 零上报；发送失败仅 `tracing::warn!`，命令结果原样返回 |
+| CHANNEL `ReceiptSink` | Round 2 的镜像层**整体删除**（harness 已提供默认方法），飞书/微信改为在 `impl PlatformChannel` 直接覆写 |
+
+#### Phase 1（5 路，缝本身）
+
+| 提交 | 模块 | 交付 |
+|---|---|---|
+| `88dedfa` | core | `AgentStateStore` 8 个 `try_*` 默认方法（`try_save`/`try_save_list`/`try_get`/`try_get_list`/`try_exists`/`try_delete`/`try_delete_key`/`try_list_session_ids`）；`Tool::output_schema()`；`McpTool` output schema |
+| `1f17724` | harness | `HarnessAgentHandle` 补 `description`/`sys_prompt`/`max_iters`；`McpToolInfo` 补 `title`/`output_schema`；`call_tool_with_meta` 读连接级 `propagate_meta`（fail-closed）；新建 `agent/mcp_content.rs::convert_call_tool_result`；`load_skill_from_dir` |
+| `4676a29` | harness | `PlatformChannel::deliver_with_receipt` 默认方法 + blanket 转发；`SandboxGuard::try_is_held` 异步缝；manager `release→close/shutdown` 用例 |
+| `91aeb29` | controlplane | `ExecutionAttemptPhase`(Ack/Start/Heartbeat/Cancelled)、`ExecutionAttemptReport`；`ConversationTurnPhase`(Accepted/Started/Completed/Failed)、`ConversationTurnReport`；`AsdpTransport::report_execution_attempt/report_conversation_turn` |
+| `22b5994` | channel | `PreparedResponse` 增 `headers: Vec<(String, String)>` + `with_header(s)` |
+
+#### Phase 2（8 路，下游接线）
+
+| 提交 | 模块 | 交付 | 测试 |
+|---|---|---|---|
+| `d153cf5` | TRAINING | `TRAIN-10` 收尾：`TrainingRunner::attach_to(builder)` / `attach_to_with`、`ShadowAgentBlueprint::from_handle`、`TrainingHook::blueprint`；`Cargo.toml` 加 path 依赖 harness | 93 |
+| `7037b1c` | HIGRESS | `HIGRESS-03/05`：`render_call_result` 委托 harness `convert_call_tool_result`；`mcp_tool_info_to_tool` 透传 `title`/`output_schema` | 65 |
+| `bbe82cc` | CONTROLPLANE | `CP-05` 上行回报接线；`dispatch_downstream` 加 `Option<&AsdpTransport>`；attempt/turn 回报点；补 `ExecutionAttemptPhase::Completed/Failed`（wire `complete`/`fail`） | lib 195 + e2e 4 |
+| `d0d1b04` | CHANNEL | `CHANNEL-XM1`：删 `common/receipt.rs`、`ReceiptChannel`/`ReceiptSink`、`with_manager_and_receipts`、`build_gateway_registry_with_receipts`；飞书/微信覆写 `deliver_with_receipt`；`ReqwestTransport::execute` 填充响应头 + 大小写不敏感取值 | 444 |
+| `8ccf350` | SKILLS | `SKILLS-06`：`get_skill` 只加载目标目录；`skill_names_in_dir` 只读 `SKILL.md` frontmatter；复用 harness `load_skill_from_dir` | 132 / pg 142 / my 137 |
+| `93b0342` | JDBC | `JDBC-12` 扩展：覆写 7 个 `try_*`（本 crate 无 `delete_key`）；错误如实上抛 | 274 |
+| `d400a8c` | REDIS | `REDIS-07`：`try_is_held` + `probe_is_held`；`is_held` 改纯本地视图（零网络往返）；补齐 9 个 `try_*` | 203 |
+| `89fe151` | COS | 7 个 `try_*` 覆写；坏 payload/连接失败 `Err`（不再冒充「不存在」） | 132 |
+
+收口文档：`e525db2 docs(extensions): Wave C 收口 —— 10 条跨模块需求清零`（9 files，+73/−38）。
+
+#### 收口结果
+
+- **10 条跨模块需求全部清零**（§3.3.6 列表逐条对应：1→`1f17724`+`d153cf5`；2→`1f17724`+`7037b1c`；3→`1f17724`+`7037b1c`；4→`91aeb29`+`bbe82cc`；5→`4676a29`+`d0d1b04`；6→`22b5994`；7/8→`88dedfa`+`93b0342`/`d400a8c`/`89fe151`；9→`1f17724`+`8ccf350`；10→`4676a29`+`d400a8c`）。
+- **全量（Round 3 收口实测，2026-11-01）**：**173 targets / 5890 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 2 基线 **+76 passed**，targets 与 ignored 未增（Wave C 未新增测试二进制，只在既有 target 内加用例）。
+- 反向验证：各路至少 1 处（回退实现 → 对应用例 `FAILED` → 恢复全绿）；`rg "REVERSE-VERIFICATION" crates -g '*.rs'` 零命中。
+- 无新增 `#[ignore]` / `todo!()` / `unimplemented!()`。
+- `git log --merges --oneline` 在 `dev` 上无输出（14 条 Wave C 提交全部线性）。
+- `Cargo.lock` 仅随 `d153cf5`（TRAINING 新增 harness path 依赖）变动，归属正确。
+
+#### 剩余待办（Round 4 候选）
+
+Round 2 §3.3.6「剩余 P1/P2」清单整体顺延（MODEL-05~08/10、SANDBOX-04/08、CP-08/CP-13、STUDIO-03/05/07~11、SCHED-07/08/10、HIGRESS-01/04、JDBC-05/06~09/11、REDIS-01/07~10/12/14、MONGO-05/07/08/09/10、MYSQL-02/06~09/11/12、NACOS-08~14、PROTO-A2A-03/AP-02、RAG-03/04/06/07/22、SKILLS-03/06/08/09/11、COS-05/06/07、OSS-08、MEM-05、TRAIN-04~09①），另加 **SANDBOX-09**（harness manager 级 kill 链用例已在 `4676a29` 落地，剩余为后端侧断言）。
+
 ## 4. 状态与下一步
 
 ### 4.1 验证命令与实测（2026-10-31，stable **1.97.1**）
@@ -380,6 +434,7 @@ cargo test -p <crate> -j 2 --no-fail-fast                 # 逐 crate（本表�
 cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 ```
 
+- **全量（Round 3 收口实测，2026-11-01）**：**173 targets / 5890 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 2 基线 **+76 passed**，targets 与 ignored 未增（Wave C 只在既有 target 内加用例）。
 - **全量（Round 2 收口实测，2026-11-01）**：**173 targets / 5814 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 1 基线 **+15 targets / +162 passed**，ignored 未增。
 - **全量（Round 1 收口实测，2026-10-31）**：**158 targets / 5652 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）。工具链 `rustc 1.97.1 (8bab26f4f 2026-07-14)`。
 - **6 个 ignored**：`agentscope-core` lib 3 个（既有）+ 3 个 ```ignore 文档示例（CHANNEL `platform_channel.rs`、RAG `hook.rs`、HARNESS 新增示例），**无 `#[ignore]` 新增**。
@@ -399,7 +454,7 @@ cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 
 ### 4.3 后续事项
 
-1. **~~P0 清零（30 条）~~ 已完成（2026-10-31 Round 1，见 §3.3.5）**；**~~P1 解锁项 + P2 长尾一轮~~ 已完成（2026-11-01 Round 2，见 §3.3.6）**：Wave A（`SandboxGuard::try_enter -> Result` fail-closed）解锁 5 个存储模块，Wave B 20 路并行关闭 63 条 P1/P2，全量 173 targets / 5814 passed / 0 failed。下一步：① 按 §3.3.6「跨模块需求」10 条做 **Wave C**（harness/core 独占串行，每条独立提交）；② 剩余 P1/P2 见 §3.3.6 结尾与各模块 tracker。
+1. **~~P0 清零（30 条）~~ 已完成（2026-10-31 Round 1，见 §3.3.5）**；**~~P1 解锁项 + P2 长尾一轮~~ 已完成（2026-11-01 Round 2，见 §3.3.6）**：Wave A（`SandboxGuard::try_enter -> Result` fail-closed）解锁 5 个存储模块，Wave B 20 路并行关闭 63 条 P1/P2，全量 173 targets / 5814 passed / 0 failed。**~~Wave C（§3.3.6 列出的 10 条跨模块需求）~~ 已完成（2026-11-01 Round 3，见 §3.3.7）**：Phase 1 五路落地缝、Phase 2 八路下游接线，全量 173 targets / 5890 passed / 0 failed。下一步：按 §3.3.7 结尾「Round 4 候选」清单（即 §3.3.6 剩余 P1/P2 顺延）逐模块推进。
 2. **~~待裁定 41 条~~ 已完成（2026-10-31 全部裁定，见 §3.3）**：36 项转 `待办`（按 §3.1 的 P0 分组顺序执行）、5 项转 `设计决定（不迁移）`（`COS-08` / `MODEL-13` / `CORE-14` / `CP-13` / `OSS-10`）；`HARNESS-16` 关闭为 `已完成`、`HARNESS-15` 去重退役。执行批次见 §3.3.4。
 3. **真实后端联调**：MySQL / PostgreSQL / Redis（单机 + 集群）/ MongoDB / Docker 沙箱**已实测通过**（§3.2 + `history/EXTENSIONS_MIGRATION_HISTORY.md`）；仍缺环境：E2B、Kubernetes、MEM 三厂商、CHANNEL 真实租户、Trinity-RFT。
 4. **可选增强（P2，136 条）**：测试密度对齐 Java（如 SKILLS 108 vs 192 `@Test`、POSTGRESQL 53 个 Java 用例未覆盖）；各 tracker §3.5 的 P2 行即候选清单。
