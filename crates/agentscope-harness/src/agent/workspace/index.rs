@@ -32,6 +32,27 @@ fn indexed_prefixes() -> Vec<String> {
     vec![format!("{AGENTS_DIR}/"), format!("{MEMORY_DIR}/")]
 }
 
+/// Builds a literal prefix `LIKE` pattern, mirroring Java `likePrefix`.
+///
+/// `_` and `%` are `LIKE` metacharacters: without escaping, prefix
+/// `agents/bot_1/sessions/s_1/` would also match `agents/bot21/sessions/s21/...`
+/// and make `has_prefix` wrongly skip the authoritative remote scan. Backslash is
+/// the escape character (see `ESCAPE '\'` in the queries), so it is escaped first.
+#[cfg(feature = "rusqlite")]
+fn like_prefix(prefix: &str) -> String {
+    let mut pattern = String::with_capacity(prefix.len() + 1);
+    for ch in prefix.chars() {
+        match ch {
+            '\\' => pattern.push_str("\\\\"),
+            '%' => pattern.push_str("\\%"),
+            '_' => pattern.push_str("\\_"),
+            other => pattern.push(other),
+        }
+    }
+    pattern.push('%');
+    pattern
+}
+
 /// Best-effort SQLite index over locally materialized workspace files.
 ///
 /// All methods are best-effort and never propagate errors to callers: a failed
@@ -232,15 +253,16 @@ impl WorkspaceIndex {
         }
         let guard = self.conn.lock().unwrap();
         let conn = guard.as_ref().unwrap();
-        let mut stmt =
-            match conn.prepare("SELECT path FROM files WHERE path LIKE ?1 AND present_local=1") {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::debug!("Index listByPrefix prepare failed (non-fatal): {e}");
-                    return Vec::new();
-                }
-            };
-        let pattern = format!("{prefix}%");
+        let mut stmt = match conn.prepare(
+            "SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\' AND present_local=1",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("Index listByPrefix prepare failed (non-fatal): {e}");
+                return Vec::new();
+            }
+        };
+        let pattern = like_prefix(prefix);
         let mut out = Vec::new();
         match stmt.query_map(rusqlite::params![pattern], |row| row.get::<_, String>(0)) {
             Ok(rows) => {
@@ -268,8 +290,8 @@ impl WorkspaceIndex {
             .as_ref()
             .unwrap()
             .query_row(
-                "SELECT 1 FROM files WHERE path LIKE ?1 AND present_local=1 LIMIT 1",
-                rusqlite::params![format!("{prefix}%")],
+                "SELECT 1 FROM files WHERE path LIKE ?1 ESCAPE '\\' AND present_local=1 LIMIT 1",
+                rusqlite::params![like_prefix(prefix)],
                 |_| Ok(true),
             )
             .optional()
@@ -291,16 +313,19 @@ impl WorkspaceIndex {
             .as_ref()
             .unwrap()
             .execute("DELETE FROM files", []);
+        // Canonicalize once: on Windows `canonicalize` yields a `\\?\` verbatim path,
+        // so the walk must start from that same form or `strip_prefix` never matches
+        // and every relative path stays absolute (and thus non-indexable).
+        let abs = workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.to_path_buf());
         for prefix in indexed_prefixes() {
-            let dir = workspace_root.join(&prefix);
+            let dir = abs.join(&prefix);
             if !dir.is_dir() {
                 continue;
             }
             if let Ok(walk) = walk_files(&dir) {
                 for file in walk {
-                    let abs = workspace_root
-                        .canonicalize()
-                        .unwrap_or_else(|_| workspace_root.to_path_buf());
                     let rel = file.strip_prefix(&abs).unwrap_or(&file);
                     let rel_str = rel.to_string_lossy().replace('\\', "/");
                     self.upsert_from_local_file(&rel_str, &file);
@@ -381,90 +406,6 @@ fn walk_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         for entry in std::fs::read_dir(dir)? {
             let p = entry?.path();
             if p.is_dir() {
-                #[cfg(all(test, feature = "rusqlite"))]
-                mod tests {
-                    use super::*;
-
-                    fn temp_dir(name: &str) -> std::path::PathBuf {
-                        let dir = std::env::temp_dir()
-                            .join(format!("as_ws_idx_{name}_{}", uuid::Uuid::new_v4()));
-                        std::fs::create_dir_all(&dir).unwrap();
-                        dir
-                    }
-
-                    #[test]
-                    fn open_creates_db_and_schema() {
-                        let root = temp_dir("open");
-                        let idx = WorkspaceIndex::open(&root).expect("index opens");
-                        // 惰性语义：open 只记录路径，首次读写才建立 db 文件。
-                        assert!(root.join(".index").exists());
-                        idx.upsert("memory/2024-01-01.md", 10, None);
-                        assert!(root.join(".index/workspace.db").exists());
-                        assert!(idx.exists("memory/2024-01-01.md"));
-                        let _ = std::fs::remove_dir_all(&root);
-                    }
-
-                    #[test]
-                    fn non_indexable_paths_are_ignored() {
-                        let root = temp_dir("nonindex");
-                        let idx = WorkspaceIndex::open(&root).unwrap();
-                        idx.upsert("skills/foo.md", 5, None);
-                        assert!(!idx.exists("skills/foo.md"));
-                        assert!(!WorkspaceIndex::is_indexable("skills/foo.md"));
-                        assert!(WorkspaceIndex::is_indexable("agents/a1/sessions/s.jsonl"));
-                        let _ = std::fs::remove_dir_all(&root);
-                    }
-
-                    #[test]
-                    fn upsert_exists_remove_roundtrip() {
-                        let root = temp_dir("roundtrip");
-                        let idx = WorkspaceIndex::open(&root).unwrap();
-                        let path = "agents/a1/sessions/s1.log.jsonl";
-                        idx.upsert(path, 42, Some("2024-01-01T00:00:00Z"));
-                        assert!(idx.exists(path));
-                        assert!(idx.has_prefix("agents/a1/"));
-                        assert_eq!(
-                            idx.list_by_prefix("agents/a1/sessions/"),
-                            vec![path.to_string()]
-                        );
-                        idx.remove(path);
-                        assert!(!idx.exists(path));
-                        assert!(!idx.has_prefix("agents/a1/"));
-                        let _ = std::fs::remove_dir_all(&root);
-                    }
-
-                    #[test]
-                    fn rename_moves_entry() {
-                        let root = temp_dir("rename");
-                        let idx = WorkspaceIndex::open(&root).unwrap();
-                        let from = "agents/a1/sessions/s1.jsonl";
-                        let to = "agents/a1/sessions/s2.jsonl";
-                        idx.upsert(from, 7, None);
-                        idx.rename(from, to);
-                        assert!(!idx.exists(from));
-                        assert!(idx.exists(to));
-                        let _ = std::fs::remove_dir_all(&root);
-                    }
-
-                    #[test]
-                    fn rebuild_from_disk_walks_indexed_dirs() {
-                        let root = temp_dir("rebuild");
-                        std::fs::create_dir_all(root.join("memory")).unwrap();
-                        std::fs::write(root.join("memory/2024-01-01.md"), "hello").unwrap();
-                        std::fs::create_dir_all(root.join("agents/a1/sessions")).unwrap();
-                        std::fs::write(root.join("agents/a1/sessions/s1.log.jsonl"), "{}").unwrap();
-                        // Non-indexed file should be skipped.
-                        std::fs::create_dir_all(root.join("skills")).unwrap();
-                        std::fs::write(root.join("skills/foo.md"), "x").unwrap();
-
-                        let idx = WorkspaceIndex::open(&root).unwrap();
-                        idx.rebuild_from_disk(&root);
-                        assert!(idx.exists("memory/2024-01-01.md"));
-                        assert!(idx.exists("agents/a1/sessions/s1.log.jsonl"));
-                        assert!(!idx.exists("skills/foo.md"));
-                        let _ = std::fs::remove_dir_all(&root);
-                    }
-                }
                 rec(&p, out)?;
             } else if p.is_file() {
                 out.push(p);
@@ -474,4 +415,119 @@ fn walk_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     rec(dir, &mut out)?;
     Ok(out)
+}
+
+#[cfg(all(test, feature = "rusqlite"))]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("as_ws_idx_{name}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn open_creates_db_and_schema() {
+        let root = temp_dir("open");
+        let idx = WorkspaceIndex::open(&root).expect("index opens");
+        // 惰性语义：open 只记录路径，首次读写才建立 db 文件。
+        assert!(root.join(".index").exists());
+        idx.upsert("memory/2024-01-01.md", 10, None);
+        assert!(root.join(".index/workspace.db").exists());
+        assert!(idx.exists("memory/2024-01-01.md"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_indexable_paths_are_ignored() {
+        let root = temp_dir("nonindex");
+        let idx = WorkspaceIndex::open(&root).unwrap();
+        idx.upsert("skills/foo.md", 5, None);
+        assert!(!idx.exists("skills/foo.md"));
+        assert!(!WorkspaceIndex::is_indexable("skills/foo.md"));
+        assert!(WorkspaceIndex::is_indexable("agents/a1/sessions/s.jsonl"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upsert_exists_remove_roundtrip() {
+        let root = temp_dir("roundtrip");
+        let idx = WorkspaceIndex::open(&root).unwrap();
+        let path = "agents/a1/sessions/s1.log.jsonl";
+        idx.upsert(path, 42, Some("2024-01-01T00:00:00Z"));
+        assert!(idx.exists(path));
+        assert!(idx.has_prefix("agents/a1/"));
+        assert_eq!(
+            idx.list_by_prefix("agents/a1/sessions/"),
+            vec![path.to_string()]
+        );
+        idx.remove(path);
+        assert!(!idx.exists(path));
+        assert!(!idx.has_prefix("agents/a1/"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn like_prefix_escapes_like_metacharacters() {
+        // 普通前缀只追加通配符。
+        assert_eq!(like_prefix("abc"), "abc%");
+        // `_` 是 LIKE 单字符通配，必须转义。
+        assert_eq!(like_prefix("a_b"), "a\\_b%");
+        // `%` 是 LIKE 多字符通配，必须转义。
+        assert_eq!(like_prefix("a%b"), "a\\%b%");
+        // 转义字符本身也要转义（先转义，避免二次解释）。
+        assert_eq!(like_prefix("a\\b"), "a\\\\b%");
+    }
+
+    #[test]
+    fn prefix_match_is_literal_not_like_pattern() {
+        // Java 4399f75fc：前缀按字面量匹配，`_` 不得当通配符。
+        let root = temp_dir("literal_prefix");
+        let idx = WorkspaceIndex::open(&root).unwrap();
+        idx.upsert("agents/bot_1/sessions/s_1/report.md", 1, None);
+        idx.upsert("agents/bot21/sessions/s21/report.md", 1, None);
+        assert_eq!(
+            idx.list_by_prefix("agents/bot_1/sessions/s_1/"),
+            vec!["agents/bot_1/sessions/s_1/report.md".to_string()]
+        );
+        assert!(idx.has_prefix("agents/bot_1/sessions/s_1/"));
+        // 原本会因 `_` 通配而误报 true。
+        assert!(!idx.has_prefix("agents/bot_1/sessions/s_9/"));
+        assert!(idx.list_by_prefix("agents/bot_1/sessions/s_9/").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_moves_entry() {
+        let root = temp_dir("rename");
+        let idx = WorkspaceIndex::open(&root).unwrap();
+        let from = "agents/a1/sessions/s1.jsonl";
+        let to = "agents/a1/sessions/s2.jsonl";
+        idx.upsert(from, 7, None);
+        idx.rename(from, to);
+        assert!(!idx.exists(from));
+        assert!(idx.exists(to));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuild_from_disk_walks_indexed_dirs() {
+        let root = temp_dir("rebuild");
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(root.join("memory/2024-01-01.md"), "hello").unwrap();
+        std::fs::create_dir_all(root.join("agents/a1/sessions")).unwrap();
+        std::fs::write(root.join("agents/a1/sessions/s1.log.jsonl"), "{}").unwrap();
+        // Non-indexed file should be skipped.
+        std::fs::create_dir_all(root.join("skills")).unwrap();
+        std::fs::write(root.join("skills/foo.md"), "x").unwrap();
+
+        let idx = WorkspaceIndex::open(&root).unwrap();
+        idx.rebuild_from_disk(&root);
+        assert!(idx.exists("memory/2024-01-01.md"));
+        assert!(idx.exists("agents/a1/sessions/s1.log.jsonl"));
+        assert!(!idx.exists("skills/foo.md"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
