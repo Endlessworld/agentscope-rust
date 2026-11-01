@@ -542,6 +542,47 @@ Round 2 §3.3.6「剩余 P1/P2」清单整体顺延（MODEL-05~08/10、SANDBOX-0
 - 各路均附「回退了什么 → 哪条用例 FAILED → 已恢复」，抽样复核有效。
 - 范围体检：改动的 `Cargo.toml` 仅 `crates/agentscope-extensions-skills/Cargo.toml`（crate 内具体版本 + opt-in feature）；`Cargo.lock` 仅 +7 行依赖列表、零新 package、零版本漂移；根 `Cargo.toml` 未动。
 
+### 3.3.10 Round 6 执行结果（2026-11-01，2 路并行：CORE+HARNESS 合路 + MODEL）
+
+**范围**：经 2026-11-01 裁决确认执行的两项（CORE-09 真闭合、MODEL-18 流式收尾）；其余四项按裁定归档（见下）。
+
+| 路 | 关闭缺口 | 实测 |
+|---|---|---|
+| core+harness | CORE-09（真闭合）：`task_requirements_enabled` 默认 `false` + 构建期条件注册 `RequirementProposeTool`；harness 默认按 `ContextSources::task_context().requirement_proposals` 推导，`task_requirements(bool)` 为显式覆盖 | core 14 targets / **546**（+3）/ 3 ignored；harness lib **603**（+1） |
+| model | MODEL-18（流式）：`signature_delta` 按 `content_block` index 累积拼接（不覆盖），落 `METADATA_THINKING_SIGNATURE`；每片以「空文本 + 累计签名」thinking 增量 + core last-wins 合并得完整签名 | **471**（+4） |
+
+#### 全量闸门（Round 6）
+
+**177 targets / 6157 passed / 0 failed / 7 ignored / EXITCODE=0**，无 `^failures:` 段；较 Round 5 **+8 passed**（targets / ignored 不变）。
+
+#### 关键修复与纠偏
+
+- **CORE-09 端到端用例抓到真实缺陷**：Round 5 把 `Arc<Mutex<AgentState>>` 注入工具，但 agent 每迭代用主干 `tasks_context` 快照回写 `AgentState` → 工具写入的提案在下一迭代被覆盖丢失。改为注入共享 task bag `Arc<Mutex<TaskContextState>>`（`tool/requirement.rs`），即 agent 循环真正读写并持久化的对象；用例 `a_proposal_made_during_a_call_survives_into_the_agents_state` 锁定。
+- **brief 纠偏**：`ContextSources::task_context()`（`context/source.rs:182`）+ `TaskContextOptions::allow_requirement_proposals()`（`policy.rs:177`）即 Java `contextSources.taskContext().requirementProposals()` 的等价物 → 默认路径按 Java 自动推导，`task_requirements(bool)` 降级为显式覆盖，不引入 Rust-only 语义。
+
+#### 归档裁定（2026-11-01）
+
+| 项 | 结论 | 依据 |
+|---|---|---|
+| `ToolSearchMiddleware` 宿主装配 | **不接线**（维持 Round 5 决定；宿主可 `builder.middleware(...)` 自注册） | Java harness 模块无对应装配点（全仓只见 `agentscope-examples/.../ToolSearchExample.java` 与 core 测试），`HarnessAgent.Builder` 无旋钮 |
+| JDK SPI 方言自动注册 | **已完成（设计决定，不迁移）**，与 JDBC tracker §3.4 口径统一 | Rust 无运行时类路径扫描；第三方方言经 `detect_dialect` / `JdbcDialectBuilder` / 构造参数 `Arc<dyn AbstractJdbcDialect>` 显式注入已覆盖需求，残余仅「零配置自动发现」 |
+| SKILLS P1-09 测试覆盖 | **关为基线记录**（93，不与 Java 192 追数） | Rust 以表驱动 + 集成用例为主，粒度不同，数字不可比 |
+| HIGRESS 原始 schema | **不改 harness** | `rust-mcp-sdk` 的 `ToolInputSchema` 为封闭类型，未建模根级关键字在反序列化即丢，harness 侧无原始 JSON 可取（非取舍问题）；需要者各自旁路 |
+| AP wire 双键（snake_case + camelCase） | **保留，不设淘汰期** | 成本 0，同时兼容 Java 端与 Rust 端消费者 |
+| CORE-30（历史 32 条上限）/ MODEL-10（缺 encrypted 软跳过） | **保留（有意偏离）** | 均已文档化，差异理由明确 |
+
+#### 记账修正
+
+- CORE-10 / CORE-12 由「待办」改「已完成（跨 crate 落地）」：harness `agent/context/context_middleware.rs:30/32` 发 `context_build`（含拒绝分支 `status:"failed"` + `error_type` + manifest），`tool/agent_spawn.rs:65/951` 发 `SubagentExposed`。
+- 全 tracker 现已无 `待办` / `进行中` / `待裁定` 行，扩展模块迁移的编号缺口清零。
+
+#### 反作弊审计（Round 6）
+
+- 源代码零新增 `#[ignore]` / `todo!()` / `unimplemented!()`。
+- 断言净增 **+46 / −4**；新增 `#[test]` **8**。
+- 根 `Cargo.toml` / `Cargo.lock` 未动；源码改动 5 文件 + 6 tracker。
+- 三处反向验证（core 条件注册 / harness 透传 / model 签名拼接）均先 FAILED 后恢复全绿。
+
 ## 4. 状态与下一步
 
 ### 4.1 验证命令与实测（2026-10-31，stable **1.97.1**）
@@ -551,6 +592,7 @@ cargo test -p <crate> -j 2 --no-fail-fast                 # 逐 crate（本表�
 cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 ```
 
+- **全量（Round 6 收口实测，2026-11-01）**：**177 targets / 6157 passed / 0 failed / 7 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 5 **+8 passed**（targets / ignored 不变）。
 - **全量（Round 5 收口实测，2026-11-01）**：**177 targets / 6149 passed / 0 failed / 7 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 4 **+83 passed**（targets / ignored 不变）。
 - **全量（Round 4 收口实测，2026-11-01）**：**177 targets / 6066 passed / 0 failed / 7 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 3 基线 **+4 targets / +176 passed**，ignored +1（harness 新增 `context/conventions.rs` 的 ```ignore 文档示例，非 `#[ignore]`）。
 - **全量（Round 3 收口实测，2026-11-01）**：**173 targets / 5890 passed / 0 failed / 6 ignored / EXITCODE=0**（无 `^failures:` 段）——较 Round 2 基线 **+76 passed**，targets 与 ignored 未增（Wave C 只在既有 target 内加用例）。

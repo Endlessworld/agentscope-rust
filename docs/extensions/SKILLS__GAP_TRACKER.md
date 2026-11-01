@@ -81,7 +81,7 @@
 | `MysqlSkillRepository` | `MysqlSkillRepository` | 已完成 | `src/mysql.rs`，两表 + metadata_json 兼容 |
 | `PostgresSkillRepository` | `PostgresSkillRepository` | 已完成 | `src/postgresql.rs`，schema + 两表 |
 | `RepoBackedSkillRepository`（harness 适配器） | — | 已完成 | `src/repository.rs`；已覆写 `skill_dir`（git 透出真实目录 / SQL 资源落盘缓存），见 history/SKILLS__MIGRATION_HISTORY.md P1-08 |
-| 测试 | 3 个 `*Test` | 进行中 | 现 **93 个 `#[test]`**（git 35 / mysql 26 / pg 18 / repository 4 / sql 5 / util 5），git 侧 20 个为 `file://` 真实仓用例；Java 192（见 history/SKILLS__MIGRATION_HISTORY.md） |
+| 测试 | 3 个 `*Test` | 已完成（基线记录） | 现 **93 个 `#[test]`**（git 35 / mysql 26 / pg 18 / repository 4 / sql 5 / util 5），git 侧 20 个为 `file://` 真实仓用例；Java 192。【2026-11-01 裁定】Rust 以表驱动 + 集成用例为主，测试粒度与 Java 不同，**不与 192 追数**，93 记为当前基线 |
 
 ### 3.2 静态复核发现的语义缺口（2026-10-22，未编译、仅静态核对）
 > 状态取值沿用 §0：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
@@ -163,7 +163,7 @@
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 
-**状态：§3.2 的 P1/P2 已全部收敛（2026-10-28）。** 波次 C，crate `crates/agentscope-extensions-skills` 实现 3 个后端仓库 + harness 适配器。§3.2 逐项终态：P1-01~P1-11 全部已完成；P2-02/03/04/05/06/07/08/10 已完成；P2-01 / P2-09 为已裁定「设计决定（不迁移）」（见 history/SKILLS__MIGRATION_HISTORY.md）；P0-01 归 jdbc crate 且已落地。**P1-09（测试覆盖）仍为进行中**——93 vs Java 192，见 history/SKILLS__MIGRATION_HISTORY.md。
+**状态：§3.2 的 P1/P2 已全部收敛（2026-10-28）。** 波次 C，crate `crates/agentscope-extensions-skills` 实现 3 个后端仓库 + harness 适配器。§3.2 逐项终态：P1-01~P1-11 全部已完成；P2-02/03/04/05/06/07/08/10 已完成；P2-01 / P2-09 为已裁定「设计决定（不迁移）」（见 history/SKILLS__MIGRATION_HISTORY.md）；P0-01 归 jdbc crate 且已落地。**P1-09（测试覆盖）已按 2026-11-01 裁定关闭为基线记录**（93 为当前基线；Rust 测试粒度与 Java 不同，不与 192 对齐），见 history/SKILLS__MIGRATION_HISTORY.md。
 
 **最近一次实测（2026-11-01 Round 5，SKILLS-03）**：`cargo build -p agentscope-extensions-skills -j 2` → EXITCODE 0（本 crate 0 warning；同轮 `agentscope-core` / `agentscope-extensions-model` / `agentscope-harness` 曾被并行路改到不可编译，等 60~120s 重试后恢复正常）；`cargo build ... --features postgres-driver,postgres-tls` 与 `--features mysql-driver,mysql-tls` 均 EXITCODE 0。测试（`--no-fail-fast`）：**138**（默认）/ **150**（`postgres-driver`）/ **154**（`postgres-driver,postgres-tls`）/ **146**（`mysql-driver`）/ **146**（`mysql-driver,mysql-tls`）passed，0 failed，均无 `^failures:` 段。依赖面：默认 `cargo tree --depth 1` 仅 `agentscope-harness` + `base64/serde_json/thiserror/tracing`，**无 TLS crate**；开 TLS 后为 `rustls 0.23.43` / `tokio-rustls 0.26.4` / `rustls-native-certs 0.8.4` / `webpki-roots 0.26.11`（全部已在 lock 与本地 cache，零新下载）。**需告知主智能体**：新增 TLS 依赖后 `Cargo.lock` 被 cargo 自动更新（仅本 crate 依赖列表新增这些条目，无新 package、无版本漂移）——本路未手工编辑 lock。反向验证：删除 `pg_tls::root_store_from` 的 `webpki-roots` 回退 → `driver::pg_tls::tests::{missing_native_certs_fall_back_to_the_bundled_roots, unusable_native_certs_fall_back_without_panicking}` FAILED → 已恢复（`cargo test ... --lib driver::` 16 passed）。
 

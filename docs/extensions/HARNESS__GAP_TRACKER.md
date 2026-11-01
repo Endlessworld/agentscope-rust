@@ -29,6 +29,7 @@
 
 > **2026-11-01 Round 4**：关闭 6 项（HARNESS-07/08/10/11/13/14，逐行见 §3.5.1；新增不迁移条目 D09/D10 与差异 X10）。`cargo build -p agentscope-harness -j 2` EXITCODE=0（无新增 warning），`cargo test -p agentscope-harness --lib -j 2 --no-fail-fast` = **573 passed / 0 failed**（含本批 15 个新用例）+ `--test harness_mcp_bridge_test` 3 passed（含本批 1 个新用例）；反向验证：回退 `PinnedSandboxFilesystem::release()` 的 latch → `pinned_keeps_the_acquired_filesystem_and_rejects_after_release` FAILED → 恢复后绿。同轮修了 core 新增 `ActionObservation.execution_details` 导致的 harness 测试编译错（`agent/verification/mod.rs:239`，非本批功能）。改动仅限 `crates/agentscope-harness/**` + 本 tracker。
 
+> **2026-11-01 Round 6（CORE+HARNESS 路）**：无新缺口编号；配合 core 真闭合 CORE-09（`task_requirement_propose` 此前只落盘、无开关无注册点），`build()` 把 `context_sources.task_context().requirement_proposals`（Java `contextSources.taskContext().requirementProposals()` 的等价物）传给 `ReActAgent::builder().task_requirements_enabled(v)`，并新增 `HarnessAgentBuilder::task_requirements(bool)`（`harness_agent.rs:1085`）作为**显式覆盖**（不设置时按 task-context 投影推导，默认 `false`）。`cargo build -p agentscope-harness -j 2` EXITCODE=0（既有 5 条 warning 未变）；`cargo test -p agentscope-harness --lib -j 2 --no-fail-fast` = **603 passed / 0 failed / 0 ignored**（基线 602，+1）。反向验证：把透传写成恒 `false` → `task_requirements_reaches_the_embedded_agent` FAILED → 恢复后绿。改动仅限 `crates/agentscope-harness/src/agent/harness_agent.rs` + 本 tracker。
 > **2026-11-01 Round 5**：关闭最后 4 项（HARNESS-02/03/06/12，逐行见 §3.5.1），另在 harness 内落地 3 个 core 侧条目（CORE-07/10/12，见 §4.2）。`cargo build -p agentscope-harness -j 2` EXITCODE=0（无新增 warning：既有 5 条与 Round 4 相同），`cargo test -p agentscope-harness --lib -j 2 --no-fail-fast` = **602 passed / 0 failed / 0 ignored**（基线 573，本批 29 个新用例）。反向验证 2 处：① `LocalFilesystemSpec::build` 忽略 `project` 层 → `local_spec_builds_a_copy_on_write_overlay_over_the_project` FAILED；② `agent_spawn` 不写 exposure sink → `a_spawned_subagent_is_announced_as_a_subagent_exposed_event` FAILED；均恢复后绿。改动仅限 `crates/agentscope-harness/**` + 本 tracker。
 
 ## 2. Java 包与 Rust 映射（逐包）
@@ -37,7 +38,7 @@
 
 | Java 包 | 文件/行 | Rust 对应 | 结论 | 装配是否真接线（源码核验） |
 |---|---|---|---|---|
-| `agent`（根） | 4 / 4348 | `agent/harness_agent.rs`、`distributed_store.rs`、`isolation_scope.rs`、`mod.rs`、`shutdown.rs` | 已迁移（builder 面已齐：HARNESS-02/03/12 于 2026-11-01 Round 5 关闭） | `HarnessAgent::builder().build()` 为唯一装配入口；会话工具/子代理/中间件均在 `build()` 内注册，`harness_agent.rs:1500-2260` |
+| `agent`（根） | 4 / 4348 | `agent/harness_agent.rs`、`distributed_store.rs`、`isolation_scope.rs`、`mod.rs`、`shutdown.rs` | 已迁移（builder 面已齐：HARNESS-02/03/12 于 2026-11-01 Round 5 关闭，`task_requirements` 于 Round 6 补上） | `HarnessAgent::builder().build()` 为唯一装配入口；会话工具/子代理/中间件均在 `build()` 内注册，`harness_agent.rs:1500-2260` |
 | `agent.context` | 17 / 1526 | `agent/context/{builder,context_middleware,conventions,item,mod,model_calls,policy,render,source,usage}.rs`（10 / 4022+） | 已迁移（Rust 更宽） | `ContextMiddleware` 最后注册、位于 `call_gate` 内；`harness_agent.rs:1559-1580`、`2125-2132` |
 | `agent.session` | 6 / 1018 | `agent/session/{session,storage,store,sqlite,answer,mod}.rs`（6 / 3741） | 已迁移 | `session_log_store` 在 `build()` 解析一次，ReAct 与会话工具共用；`harness_agent.rs:1500-1520`、`2094-2125` |
 | `agent.observation` | 2 / 126 | 无独立模块；`core::observation::ActionObservation` + `verification::SettledAction` | 部分迁移（存储回放不迁，D01） | 观察者由 core `SessionRecorder` 承担；`verification/mod.rs:22-33` 明确记录不回放 |
@@ -137,7 +138,12 @@
 ### 4.1 当前状态
 
 - **已核实**：Java 295 个类按 24 个包/子包完成映射归类（§2）；11 条抽样能力确认已接线且有走真实装配入口的测试（§3.5.2）。
-- **测试基线**（2026-11-01 Round 5 本轮实测）：
+- **测试基线**（2026-11-01 Round 6 本轮实测）：
+  - `cargo build -p agentscope-harness -j 2` → **EXITCODE=0**，warning 条数未变（既有 5 条：`mcp_client_manager.rs` 的 `SdkResult`、`sandbox/manager.rs` 的三个未使用导入、`gateway/harness_gateway.rs::ExposedSession` 字段未读）。
+  - `cargo test -p agentscope-harness --lib -j 2 --no-fail-fast` → **603 passed / 0 failed / 0 ignored**（无 `^failures:` 段；基线 602，本轮 +1）。
+  - 反向验证 1 处：把 `task_requirements_enabled` 透传临时写成恒 `false` → `task_requirements_reaches_the_embedded_agent` FAILED；恢复后重跑全绿。
+  - 本轮未跑集成 target（`tests/*.rs`），改动不涉及 `tests/`。
+- **测试基线**（2026-11-01 Round 5 实测，历史）：
   - `cargo build -p agentscope-harness -j 2` → **EXITCODE=0**，无新增 warning（既有 5 条：`mcp_client_manager.rs` 的 `SdkResult`、`sandbox/manager.rs` 的三个未使用导入、`gateway/harness_gateway.rs::ExposedSession` 字段未读）。
   - `cargo test -p agentscope-harness --lib -j 2 --no-fail-fast` → **602 passed / 0 failed / 0 ignored**（无 `^failures:` 段；基线 573，本批 +29）。
   - 反向验证 2 处：回退 `LocalFilesystemSpec::build` 的 project 下层 → `local_spec_builds_a_copy_on_write_overlay_over_the_project` FAILED；回退 `agent_spawn` 的 sink 写入 → `a_spawned_subagent_is_announced_as_a_subagent_exposed_event` FAILED；恢复后重跑全绿。
@@ -156,9 +162,10 @@
    - **CORE-07**：`tool/shell_execute_tool.rs::format_execute_output` 给结果挂 `ToolExecutionDetails`（`kind="shell"`、`outcome` Succeeded/Failed、`exit_code`、`output_truncated`），并用 `metadata.extend(...)` 与压缩计数器合并（**曾因 `metadata =` 覆写导致 4 个用例失败**）。用例：`a_successful_run_carries_shell_execution_details`、`a_nonzero_exit_code_is_a_failed_execution`。
    - **CORE-10**：`agent/context/context_middleware.rs` 在模型调用前发 `Custom` 事件（`kind="context_build"`），带 manifest 摘要与 `accepted`；被拒时 `accepted=false` 且**不发任何 provider 请求**。用例：`a_prepared_request_announces_one_context_build`、`a_rejected_request_announces_a_failed_build_and_never_calls_the_model`。
    - **CORE-12**：`tool/agent_spawn.rs` 经 `SubagentExposureSink` 记录新暴露子代理，`middleware/{subagents,dynamic_subagents}.rs` 在下一步 reasoning 前置 `SubagentExposed` 事件（`subagentId`/`agentId`/`sessionId`/`label`），`build()` 把同一个 sink 分给 spawn 工具与两个子代理中间件。用例：`agent_spawn.rs::a_spawned_subagent_is_announced_as_a_subagent_exposed_event`（含一次性语义）。
-8. **2026-11-01 Round 5 交接（core-1 新增能力，harness 侧有意不接线）**：
+8. **2026-11-01 Round 5 交接（core-1 新增能力，harness 侧有意不接线）** —— **2026-11-01 用户确认：维持本决定，不评估 builder 开关**：
    - **`ToolSearchMiddleware`（`agentscope_core::tool::search`，含 `ToolSearchTool`）**：core 不自动注册，须宿主在构造 `ReActAgent` **之前**显式注册。**Java harness 模块无对应装配点**（全仓 `ToolSearchMiddleware` 只出现在 `agentscope-examples/.../ToolSearchExample.java` 与 core 自身测试），`HarnessAgent.java#Builder` 也无相关旋钮；按「与 Java 对齐、不扩大范围」不加入 builder，由宿主自行 `builder.middleware(...)` 注册（builder 已支持任意 `Middleware`）。若后续 Java 侧在 harness 加开关，再按同一模式补齐并登记本 tracker。
    - **`ToolExecutionContext::conversation_history()`**（读 `runtime` 的 `conversationHistory` 键，最近 32 条）：仅通知，harness 无需动作——`tool_runtime` 若已写入该键则工具自动可见；本轮不为此改 `harness_agent.rs` 的 runtime 注入。
+9. **2026-11-01 Round 6 新增接线（CORE-09 的 harness 侧）**：`build()` 处 `task_requirements_enabled = self.task_requirements_enabled.unwrap_or_else(|| self.context_sources.task_context().requirement_proposals)` → `ReActAgent::builder().task_requirements_enabled(v)`，开启后 core 在 `build()` 注册 `task_requirement_propose`（注入本 agent 的共享 task bag）。**与 Java 对齐**：Java 为 `inner.enableTaskRequirements(contextSources.taskContext().requirementProposals())`，本 crate 已有等价物 `ContextSources::task_context()`（`agent/context/source.rs:182`）+ `TaskContextOptions::allow_requirement_proposals()`（`agent/context/policy.rs:177`），默认路径完全对齐（`.task_context(allow_requirement_proposals())` → 工具自动装上）。**唯一新增的 Java 外 API**：`HarnessAgentBuilder::task_requirements(bool)`（`harness_agent.rs:1085`），仅作显式覆盖（Java 无此旋钮），使宿主能在不开任务投影时单独启用/关闭该工具。用例：`harness_agent.rs::task_requirements_reaches_the_embedded_agent`（旋钮 `true` → getter `true`；不设置 → `false`；`task_context(allow_requirement_proposals())` → `true`）。另注：Java 的 `TaskReminderMiddleware(taskListEnabled, taskRequirementsEnabled)` 带 requirements 提示，Rust `TaskReminderMiddleware` 只渲染 todo 段落（未迁移的提示层差异，未扩大范围）。
 
 ### 4.3 与 Java 的已知差异（有意为之，非缺口）
 
