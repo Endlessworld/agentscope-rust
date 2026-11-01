@@ -63,6 +63,23 @@ const HASH_SUFFIX: &str = ":_hash";
 /// multi-key command could cross slots on Redis Cluster).
 pub(crate) const DISCARD_TRACKED_KEY_SCRIPT: &str = "return redis.call('SREM', KEYS[1], ARGV[1])";
 
+/// Lua script: the whole `save_list` write burst in one round-trip (REDIS-09).
+///
+/// `KEYS = [list, list-hash, session-keys]`, `ARGV = [trackMember, digest, rewrite]
+/// ++ items`, where `rewrite == '1'` deletes the list before pushing. Without it a process
+/// or connection that died between the `DEL` / `RPUSH`s / `SET :_hash` / `SADD :_keys`
+/// left a half-written (or untracked) list behind.
+///
+/// Like [`SAVE_SCRIPT`] it names three keys, which the V1 key layout pins to one slot
+/// through the `{user/session}` hash tag.
+pub(crate) const SAVE_LIST_SCRIPT: &str = "local member = ARGV[1] \
+     local digest = ARGV[2] \
+     if ARGV[3] == '1' then redis.call('del', KEYS[1]) end \
+     for i = 4, #ARGV do redis.call('rpush', KEYS[1], ARGV[i]) end \
+     redis.call('set', KEYS[2], digest) \
+     redis.call('sadd', KEYS[3], member) \
+     return #ARGV - 3";
+
 /// A versioned state value (payload + version), mirroring Java `VersionedState`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionedState {
@@ -241,8 +258,12 @@ impl RedisAgentStateStore {
         }
     }
 
-    /// Clears all sessions stored in Redis (testing / cleanup), mirroring
-    /// Java `clearAllSessions`. Returns the number of deleted keys.
+    /// Clears all sessions stored in Redis (testing / ops cleanup). Returns the number of
+    /// deleted keys.
+    ///
+    /// Rust-side extension: the unified Java store has no such method (only the two
+    /// `@Deprecated` client-specific stores do), and **nothing in this crate calls it** — it
+    /// stays for operator cleanup and tests instead of being deleted (REDIS-10).
     pub async fn clear_all_sessions(&self) -> Result<usize> {
         let pattern = format!("{}*", self.key_prefix);
         let keys = self.client.find_keys_by_pattern(&pattern).await?;
@@ -292,8 +313,11 @@ impl AgentStateStore for RedisAgentStateStore {
         }
     }
 
-    /// Fallible list write (same contract as [`AgentStateStore::try_save`]); a partially
-    /// written list stays partially written, but the caller can now see it (REDIS-07).
+    /// Fallible list write (same contract as the infallible `save_list`).
+    ///
+    /// The write burst itself runs as one Lua script (REDIS-09), so a caller never sees a
+    /// half-written list; the change-detection read before it can still be stale under a
+    /// competing writer, which the stored hash heals on the next write.
     async fn try_save_list(
         &self,
         user_id: Option<&str>,
@@ -654,22 +678,26 @@ impl RedisAgentStateStore {
         let stored_hash = self.client.get(&hash_key).await?;
         let existing_count = self.client.get_list_length(&list_key).await?.max(0) as usize;
 
-        if needs_full_rewrite(values, stored_hash.as_deref(), existing_count) {
-            self.client.delete_keys(&[list_key.clone()]).await?;
-            for item in values {
-                let json = serde_json::to_string(item)?;
-                self.client.right_push_list(&list_key, &json).await?;
-            }
-        } else if values.len() > existing_count {
-            for item in &values[existing_count..] {
-                let json = serde_json::to_string(item)?;
-                self.client.right_push_list(&list_key, &json).await?;
-            }
+        // Which items the script has to push, and whether the stored list must go first.
+        let (rewrite, items) =
+            if needs_full_rewrite(values, stored_hash.as_deref(), existing_count) {
+                (true, values)
+            } else {
+                (false, &values[values.len().min(existing_count)..])
+            };
+
+        let mut args: Vec<String> = Vec::with_capacity(3 + items.len());
+        args.push(layout.list_track_key(key));
+        args.push(current_hash);
+        args.push(if rewrite { "1" } else { "0" }.to_string());
+        for item in items {
+            args.push(serde_json::to_string(item)?);
         }
 
-        self.client.set(&hash_key, &current_hash).await?;
+        // One script writes the payload, the change marker and the session index together
+        // (REDIS-09); all three keys share the V1 hash-tag slot.
         self.client
-            .add_to_set(&keys_key, &layout.list_track_key(key))
+            .eval_script(SAVE_LIST_SCRIPT, &[list_key, hash_key, keys_key], &args)
             .await?;
         Ok(())
     }

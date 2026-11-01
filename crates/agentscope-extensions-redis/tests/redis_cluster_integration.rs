@@ -14,11 +14,16 @@
 //! `#[ignore]`d, so an environment that has a cluster always exercises them.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agentscope_core::state::AgentStateStore as _;
+use agentscope_extensions_redis::sandbox::RedisSandboxExecutionGuard;
+use agentscope_extensions_redis::snapshot::RedisRemoteSnapshotClient;
 use agentscope_extensions_redis::state::adapter::RedisClientAdapter;
 use agentscope_extensions_redis::state::connection::RedisConnection;
 use agentscope_extensions_redis::state::{KeyLayoutVersion, RedisAgentStateStore};
+use agentscope_harness::agent::sandbox::snapshot::RemoteSnapshotClient;
+use agentscope_harness::agent::sandbox::SandboxIsolationKey;
 use serde_json::json;
 
 fn cluster_url() -> Option<String> {
@@ -114,4 +119,72 @@ async fn lists_and_key_index_stay_in_one_slot() {
         );
         store.delete(Some("cluster-it"), &session).await;
     }
+}
+
+/// REDIS-01: snapshot storage and the sandbox lease do not go through the state store's
+/// adapter but through the `RedisCommands` seam, which used to be built straight from the
+/// **seed** connection. Both now carry the connection's `ClusterRouter`, so a key whose slot
+/// is owned by another primary is routed (and redirected) instead of failing with `MOVED`.
+#[tokio::test]
+async fn snapshots_and_leases_reach_non_seed_slots() {
+    if skip() {
+        return;
+    }
+    let connection = RedisConnection::connect_cluster(&cluster_url().unwrap())
+        .await
+        .expect("connect to the Redis Cluster seed");
+    let prefix = format!("{}route:", key_prefix());
+
+    // Snapshot payloads across many ids: most land on a primary other than the seed.
+    let snapshots =
+        RedisRemoteSnapshotClient::new(&connection, &format!("{prefix}snap:"), Some(600));
+    for i in 0..32u32 {
+        let id = format!("snap-{i}");
+        let payload = vec![i as u8; 32];
+        snapshots
+            .upload(&id, &payload)
+            .await
+            .expect("upload must follow the slot owner");
+        assert_eq!(
+            snapshots.download(&id).await.expect("download routed"),
+            payload,
+            "round-trip for {id}"
+        );
+        assert!(snapshots.exists(&id).await.expect("exists routed"));
+    }
+
+    // The distributed lease is `SET NX PX` plus a Lua CAS release on the lock key.
+    let guard = RedisSandboxExecutionGuard::builder(&connection)
+        .key_prefix(format!("{prefix}lock:"))
+        .lease_ttl(Duration::from_secs(60))
+        .retry_interval(Duration::from_millis(50))
+        .build();
+    for i in 0..16u32 {
+        let key = SandboxIsolationKey::new("session", format!("s{i}"));
+        let lease = tokio::time::timeout(Duration::from_secs(10), guard.try_enter(&key))
+            .await
+            .expect("SET NX PX must not spin on a MOVED slot")
+            .expect("acquire the routed lease");
+        assert!(guard.probe_is_held(&key).await.expect("EXISTS probe"));
+        assert!(lease.release().await, "the token CAS release is routed too");
+        assert!(!guard.probe_is_held(&key).await.expect("EXISTS probe"));
+    }
+
+    // Cleanup: `SCAN` fans out over every primary.
+    let keys = RedisClientAdapter::find_keys_by_pattern(&connection, &format!("{prefix}*"))
+        .await
+        .expect("scan every primary");
+    assert!(!keys.is_empty(), "the routed keys are enumerable");
+    for key in keys {
+        RedisClientAdapter::delete_keys(&connection, &[key])
+            .await
+            .expect("delete one routed key");
+    }
+    assert!(
+        RedisClientAdapter::find_keys_by_pattern(&connection, &format!("{prefix}*"))
+            .await
+            .expect("scan every primary")
+            .is_empty(),
+        "cleanup removes every routed key"
+    );
 }

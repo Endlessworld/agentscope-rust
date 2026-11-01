@@ -408,8 +408,14 @@ impl RedisConnection {
     /// Hands out the crate-internal low-level command seam backed by the same
     /// connection, for the components that do not use [`RedisClientAdapter`]
     /// (`RedisRemoteSnapshotClient` / `RedisSandboxExecutionGuard`).
+    ///
+    /// A cluster connection also hands over its [`ClusterRouter`], so those two components
+    /// follow slot ownership exactly like the state store does.
     pub(crate) fn raw_client(&self) -> Arc<dyn RedisCommands> {
-        Arc::new(ManagerRedisCommands::new(self.manager.clone()))
+        Arc::new(ManagerRedisCommands::with_router(
+            self.manager.clone(),
+            self.router.clone(),
+        ))
     }
 
     /// Runs a key-scoped command, following `MOVED` / `ASK` redirects when this connection

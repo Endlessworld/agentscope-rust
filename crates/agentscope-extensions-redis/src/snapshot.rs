@@ -103,17 +103,13 @@ impl RedisRemoteSnapshotClient {
 impl RemoteSnapshotClient for RedisRemoteSnapshotClient {
     async fn upload(&self, snapshot_id: &str, data: &[u8]) -> Result<()> {
         let key = self.compose_key(snapshot_id)?;
-        self.commands
-            .set_bytes(&key, data)
-            .await
-            .map_err(|e| Error::Other(format!("Redis snapshot upload failed: {e}")))?;
-        if let Some(ttl) = self.ttl_seconds {
-            self.commands
-                .expire(&key, ttl)
-                .await
-                .map_err(|e| Error::Other(format!("Redis snapshot EXPIRE failed: {e}")))?;
-        }
-        Ok(())
+        // One command writes the payload and its TTL together (REDIS-08): `SET` followed by
+        // `EXPIRE` could leave an archive without an expiry when only the second call failed.
+        let written = match self.ttl_seconds {
+            Some(ttl) => self.commands.set_bytes_with_ttl(&key, data, ttl).await,
+            None => self.commands.set_bytes(&key, data).await,
+        };
+        written.map_err(|e| Error::Other(format!("Redis snapshot upload failed: {e}")))
     }
 
     async fn download(&self, snapshot_id: &str) -> Result<Vec<u8>> {
@@ -240,7 +236,16 @@ mod tests {
         let (client, commands) = client(Some(120), "snap:");
         client.upload("s2", b"x").await.unwrap();
         assert_eq!(commands.expiration_of("snap:s2.tar"), Some(120));
-        assert_eq!(commands.inspect(|d| d.expire_calls), 1);
+        assert_eq!(
+            commands.inspect(|d| d.set_bytes_with_ttl_calls),
+            1,
+            "one SET ... EX carries the TTL"
+        );
+        assert_eq!(
+            commands.inspect(|d| d.set_bytes_calls),
+            0,
+            "no separate untimed SET"
+        );
     }
 
     #[tokio::test]
@@ -268,24 +273,26 @@ mod tests {
 
     #[tokio::test]
     async fn backend_failures_are_wrapped_with_context() {
-        let (c1, commands) = client(Some(5), "snap:");
+        // Untimed path.
+        let (c1, commands) = client(None, "snap:");
         commands.configure(|d| d.fail_set_bytes = true);
         let err = c1.upload("s", b"x").await.unwrap_err();
         assert!(
             format!("{err}").contains("Redis snapshot upload failed"),
             "{err}"
         );
+        assert_eq!(commands.inspect(|d| d.set_bytes_calls), 1);
 
+        // TTL path: the expiry rides on the same command, so its failure is the upload
+        // failure (REDIS-08 removed the separate EXPIRE round-trip).
         let (c2, commands) = client(Some(5), "snap:");
-        commands.configure(|d| {
-            d.strings.insert("snap:s.tar".into(), b"x".to_vec());
-            d.fail_expire = true;
-        });
+        commands.configure(|d| d.fail_set_bytes = true);
         let err = c2.upload("s", b"x").await.unwrap_err();
         assert!(
-            format!("{err}").contains("Redis snapshot EXPIRE failed"),
+            format!("{err}").contains("Redis snapshot upload failed"),
             "{err}"
         );
+        assert_eq!(commands.inspect(|d| d.set_bytes_with_ttl_calls), 1);
     }
 
     #[tokio::test]

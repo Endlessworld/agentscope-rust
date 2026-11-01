@@ -62,7 +62,6 @@ pub(crate) struct MemoryRedisData {
     pub fail_all: bool,
     pub fail_set_nx: bool,
     pub fail_set_bytes: bool,
-    pub fail_expire: bool,
     pub fail_release_script: bool,
     /// `exists` on the raw command surface returns a transport error.
     pub fail_exists: bool,
@@ -91,7 +90,8 @@ pub(crate) struct MemoryRedisData {
     pub store_eval_calls: usize,
     pub set_nx_calls: usize,
     pub set_bytes_calls: usize,
-    pub expire_calls: usize,
+    /// `SET ... EX` writes (the snapshot TTL path).
+    pub set_bytes_with_ttl_calls: usize,
     pub exists_calls: usize,
     pub ping_calls: usize,
 }
@@ -509,6 +509,44 @@ impl RedisClientAdapter for MemoryRedisAdapter {
             }
             return Ok(Some(if removed { 1 } else { 0 }));
         }
+        if script == crate::state::SAVE_LIST_SCRIPT {
+            if keys.len() != 3 || args.len() < 3 {
+                return Err(Error::Other(
+                    "bad SAVE_LIST_SCRIPT arity (memory double)".to_string(),
+                ));
+            }
+            let rewrite = args[2] == "1";
+            let pushed = &args[3..];
+            {
+                let mut data = self.data_guard();
+                data.adapter_eval_calls += 1;
+                data.adapter_push_calls += pushed.len();
+                if rewrite {
+                    data.adapter_delete_calls += 1;
+                    data.adapter_deleted_key_total += 1;
+                    data.adapter_max_delete_batch = data.adapter_max_delete_batch.max(1);
+                }
+            }
+            let mut lists = self.lists_guard();
+            if rewrite {
+                lists.remove(&keys[0]);
+            }
+            if !pushed.is_empty() {
+                lists
+                    .entry(keys[0].clone())
+                    .or_default()
+                    .extend(pushed.iter().cloned());
+            }
+            drop(lists);
+            self.data_guard()
+                .strings
+                .insert(keys[1].clone(), args[1].as_bytes().to_vec());
+            self.sets_guard()
+                .entry(keys[2].clone())
+                .or_default()
+                .insert(args[0].clone());
+            return Ok(Some(pushed.len() as i64));
+        }
         if script != crate::state::version_support::SAVE_SCRIPT {
             return Err(Error::Other(
                 "unsupported Lua script (memory double)".to_string(),
@@ -603,12 +641,13 @@ impl RedisCommands for MemoryRedisCommands {
         Ok(data.strings.contains_key(key))
     }
 
-    async fn expire(&self, key: &str, seconds: i64) -> Result<()> {
+    async fn set_bytes_with_ttl(&self, key: &str, value: &[u8], seconds: i64) -> Result<()> {
         let mut data = self.guard();
-        data.expire_calls += 1;
-        if data.fail_expire {
-            return Err(Error::Other("injected EXPIRE failure".to_string()));
+        data.set_bytes_with_ttl_calls += 1;
+        if data.fail_set_bytes {
+            return Err(Error::Other("injected SET EX failure".to_string()));
         }
+        data.strings.insert(key.to_string(), value.to_vec());
         data.expirations.insert(key.to_string(), seconds);
         Ok(())
     }

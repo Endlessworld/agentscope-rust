@@ -40,8 +40,17 @@
 //! [`RedisSandboxLease::release`] is idempotent: the `released` flag is the single source
 //! of truth, so an explicit release followed by a drop cannot run the script twice.
 //!
-//! Release failures are logged and swallowed — never propagated — so the harness
+//! Release failures are logged and swallowed, never propagated, so the harness
 //! post-call path always completes (matching the Java contract).
+//!
+//! ## Release explicitly; `Drop` is only a backstop
+//!
+//! [`RedisSandboxLease::release`] runs the token-CAS delete on the caller's task. `Drop`
+//! runs the same script as a spawned task (or, with no runtime at all, through a blocking
+//! bridge), so a runtime shutdown can discard the task before it is polled and the slot
+//! then stays taken until the lease TTL expires ([`DEFAULT_LEASE_TTL`], 30 min). Hosts that
+//! need the slot back deterministically, or that are about to shut the runtime down, must
+//! await `release()` instead of relying on `Drop` (REDIS-14).
 //!
 //! All Redis access goes through the crate-internal [`RedisCommands`] seam, so the whole
 //! acquire / compete / release lifecycle is covered by offline tests.
@@ -317,7 +326,9 @@ impl SandboxGuard for RedisSandboxExecutionGuard {
 
 /// Lease returned by [`RedisSandboxExecutionGuard::try_enter`].
 ///
-/// Releasing is idempotent and performed on drop; failures are logged, not thrown.
+/// Releasing is idempotent and attempted on drop; failures are logged, not thrown. `Drop` is
+/// a best-effort backstop (see the module docs), so a caller that needs the slot back before
+/// the runtime shuts down must await [`RedisSandboxLease::release`] explicitly.
 #[derive(Debug)]
 pub struct RedisSandboxLease {
     commands: Arc<dyn RedisCommands>,
@@ -338,6 +349,9 @@ impl RedisSandboxLease {
     }
 
     /// Whether this lease has already been released (explicitly or on drop).
+    ///
+    /// Diagnostic getter: the release paths read the flag directly, so the only callers are
+    /// idempotence tests and operators (REDIS-10).
     pub fn is_released(&self) -> bool {
         self.released.load(Ordering::SeqCst)
     }
@@ -404,6 +418,8 @@ impl Drop for RedisSandboxLease {
         };
         // Prefer the ambient runtime so a worker thread is never blocked; fall back to
         // blocking only when there is no runtime (the crate's sync→async bridging shape).
+        // Backstop only: a shutting-down runtime can discard the task, which is why a caller
+        // that needs a deterministic release must call `release().await` (REDIS-14).
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(release);
@@ -425,19 +441,36 @@ pub struct RedisSandboxExecutionGuardBuilder {
 
 impl RedisSandboxExecutionGuardBuilder {
     /// Sets the Redis key prefix (default [`DEFAULT_KEY_PREFIX`]).
+    ///
+    /// # Panics
+    /// A blank prefix is rejected, mirroring Java's `IllegalArgumentException`: falling back
+    /// to the default would let two differently-configured guards share one lock keyspace,
+    /// i.e. silently serialise unrelated tenants (REDIS-12).
     pub fn key_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.key_prefix = normalize_prefix(&prefix.into());
+        let prefix = prefix.into();
+        assert!(!prefix.trim().is_empty(), "keyPrefix must not be blank");
+        self.key_prefix = normalize_prefix(&prefix);
         self
     }
 
-    /// Sets the lease TTL (must be positive).
+    /// Sets the lease TTL.
+    ///
+    /// # Panics
+    /// A zero TTL is rejected rather than rounded up to 1ms (Java throws
+    /// `IllegalArgumentException`), so a mis-configured lease can never look acquired but
+    /// already be expired (REDIS-12).
     pub fn lease_ttl(mut self, ttl: Duration) -> Self {
+        assert!(!ttl.is_zero(), "leaseTtl must be positive");
         self.lease_ttl_ms = ttl.as_millis().max(1) as u64;
         self
     }
 
-    /// Sets the retry interval between acquisition attempts (must be positive).
+    /// Sets the retry interval between acquisition attempts.
+    ///
+    /// # Panics
+    /// A zero interval is rejected, matching the TTL check above (REDIS-12).
     pub fn retry_interval(mut self, interval: Duration) -> Self {
+        assert!(!interval.is_zero(), "retryInterval must be positive");
         self.retry_interval_ms = interval.as_millis().max(1) as u64;
         self
     }
@@ -505,6 +538,33 @@ mod tests {
         assert_eq!(guard.compose_key(&key), "lock:agent:code-agent");
     }
 
+    #[test]
+    #[should_panic(expected = "keyPrefix must not be blank")]
+    fn a_blank_key_prefix_is_rejected() {
+        // Java's `Builder.keyPrefix` throws IllegalArgumentException. Falling back to the
+        // default would silently share one lock keyspace across differently-configured
+        // guards, i.e. serialise unrelated tenants (REDIS-12).
+        let commands = Arc::new(MemoryRedisCommands::new());
+        let _ = RedisSandboxExecutionGuard::builder_from_commands(commands).key_prefix("   ");
+    }
+
+    #[test]
+    #[should_panic(expected = "leaseTtl must be positive")]
+    fn a_zero_lease_ttl_is_rejected() {
+        // It used to be rounded up to 1ms, which hands out a lease that is expired before
+        // the caller can use it (REDIS-12).
+        let commands = Arc::new(MemoryRedisCommands::new());
+        let _ = RedisSandboxExecutionGuard::builder_from_commands(commands)
+            .lease_ttl(Duration::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "retryInterval must be positive")]
+    fn a_zero_retry_interval_is_rejected() {
+        let commands = Arc::new(MemoryRedisCommands::new());
+        let _ = RedisSandboxExecutionGuard::builder_from_commands(commands)
+            .retry_interval(Duration::ZERO);
+    }
     #[tokio::test]
     async fn try_enter_writes_nx_lease_with_ttl_and_unique_token() {
         let (guard, commands) = guard("lock:", Duration::from_millis(1));

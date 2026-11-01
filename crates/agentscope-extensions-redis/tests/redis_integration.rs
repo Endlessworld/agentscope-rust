@@ -728,6 +728,28 @@ async fn distributed_lease_uses_set_nx_and_a_token_cas_release() {
         .expect("and acquire it");
     assert!(regained.release().await);
 
+    // REDIS-14: `Drop` runs the same CAS release as a spawned task, so a lease that is
+    // dropped (not explicitly released) frees the slot as long as the runtime is alive. Only
+    // a shutting-down runtime can discard that task, and that case is bounded by the TTL.
+    let dropped = guard
+        .try_enter(&isolation_key)
+        .await
+        .expect("the slot is free again");
+    drop(dropped);
+    let freed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if raw_pttl(&connection, &redis_key).await == -2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        freed.is_ok(),
+        "Drop must release the lease while the runtime is alive"
+    );
+
     cleanup(&connection, &prefix).await;
     assert!(
         scan_keys(&connection, &format!("{prefix}*"))
