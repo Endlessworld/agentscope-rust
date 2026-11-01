@@ -18,7 +18,7 @@ use crate::dashscope::converter::{
     MULTIMODAL_GENERATION_ENDPOINT, TEXT_GENERATION_ENDPOINT,
 };
 use crate::dashscope::credential::EndpointType;
-use crate::dashscope::dto::DashScopeResponse;
+use crate::dashscope::dto::{DashScopeResponse, DashScopeSearchOptions};
 use crate::dashscope::encryption::{
     self, DashScopeCryptoProvider, EncryptionConfig, EncryptionContext,
 };
@@ -54,6 +54,19 @@ pub struct DashScopeChatModel {
     resolved_encryption: tokio::sync::OnceCell<EncryptionConfig>,
     /// Crypto primitives used when `encryption` is set.
     crypto: Arc<dyn DashScopeCryptoProvider>,
+    /// Web search (`enable_search` + `search_options`), mirroring Java's
+    /// `enableSearch` model/provider option.
+    enable_search: bool,
+    search_options: Option<DashScopeSearchOptions>,
+    /// Built-in code interpreter (`enable_code_interpreter`).
+    enable_code_interpreter: bool,
+    /// User-supplied patterns forcing the multimodal endpoint
+    /// (Java `multimodalModelPatterns`), on top of the built-in table.
+    multimodal_patterns: Vec<String>,
+    /// Native structured output capability bits (Java `nativeStructuredOutput` /
+    /// `nativeStructuredOutputWithTools`), on by default.
+    native_structured_output: bool,
+    native_structured_output_with_tools: bool,
 }
 
 impl DashScopeChatModel {
@@ -96,6 +109,12 @@ impl DashScopeChatModel {
             public_keys_endpoint: PUBLIC_KEYS_ENDPOINT.to_string(),
             resolved_encryption: tokio::sync::OnceCell::new(),
             crypto: Arc::new(super::crypto::AesRsaCryptoProvider),
+            enable_search: false,
+            search_options: None,
+            enable_code_interpreter: false,
+            multimodal_patterns: Vec::new(),
+            native_structured_output: true,
+            native_structured_output_with_tools: true,
         }
     }
 
@@ -135,6 +154,48 @@ impl DashScopeChatModel {
         self
     }
 
+    /// Enables web search (`parameters.enable_search`), mirroring Java's
+    /// `DashScopeChatModel.Builder#enableSearch(true)`.
+    pub fn with_enable_search(mut self, enable: bool) -> Self {
+        self.enable_search = enable;
+        self
+    }
+
+    /// Sets the web-search strategy (`parameters.search_options`).
+    pub fn with_search_options(mut self, options: DashScopeSearchOptions) -> Self {
+        self.search_options = Some(options);
+        self
+    }
+
+    /// Enables the built-in code interpreter (`parameters.enable_code_interpreter`).
+    pub fn with_enable_code_interpreter(mut self, enable: bool) -> Self {
+        self.enable_code_interpreter = enable;
+        self
+    }
+
+    /// Forces the multimodal endpoint for model ids matching any of `patterns`
+    /// (Java `DashScopeHttpClient.Builder#multimodalModelPatterns`).
+    ///
+    /// Matching is a case-insensitive substring test, so an unanchored Java
+    /// pattern such as `qwen-vl` behaves identically.
+    pub fn with_multimodal_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.multimodal_patterns = patterns;
+        self
+    }
+
+    /// Sets the native structured-output capability bits (Java
+    /// `nativeStructuredOutput` / `nativeStructuredOutputWithTools`).
+    pub fn with_native_structured_output(mut self, enabled: bool) -> Self {
+        self.native_structured_output = enabled;
+        self
+    }
+
+    /// Sets whether native structured output is honoured alongside tools.
+    pub fn with_native_structured_output_with_tools(mut self, enabled: bool) -> Self {
+        self.native_structured_output_with_tools = enabled;
+        self
+    }
+
     /// Sets the reported context window size in tokens.
     pub fn with_context_window_size(mut self, size: usize) -> Self {
         if size > 0 {
@@ -153,8 +214,19 @@ impl DashScopeChatModel {
         match self.endpoint_type {
             EndpointType::Multimodal => true,
             EndpointType::Text => false,
-            EndpointType::Auto => is_multimodal_model(&self.model_name),
+            EndpointType::Auto => {
+                is_multimodal_model(&self.model_name) || self.matches_multimodal_pattern()
+            }
         }
+    }
+
+    /// Whether the model id matches a user-supplied multimodal pattern.
+    fn matches_multimodal_pattern(&self) -> bool {
+        let model = self.model_name.to_lowercase();
+        self.multimodal_patterns.iter().any(|pattern| {
+            let pattern = pattern.trim().to_lowercase();
+            !pattern.is_empty() && model.contains(&pattern)
+        })
     }
 
     /// The endpoint path selected for this model.
@@ -245,7 +317,7 @@ impl DashScopeChatModel {
             ),
             None => to_dashscope_messages_with_options(messages, force_multimodal, options),
         };
-        let request = build_request(
+        let mut request = build_request(
             &self.model_name,
             ds_messages,
             stream,
@@ -255,6 +327,20 @@ impl DashScopeChatModel {
             options.tool_choice.as_ref(),
             self.enable_thinking,
         );
+        // Provider knobs that live on the model (Java `DashScopeChatModel` builder
+        // fields) are written into `parameters` here, so they are never confused
+        // with per-call `additional_body_params`.
+        if let Some(params) = request.parameters.as_mut() {
+            if self.enable_search {
+                params.enable_search = Some(true);
+            }
+            if let Some(search_options) = self.search_options.clone() {
+                params.search_options = Some(search_options);
+            }
+            if self.enable_code_interpreter {
+                params.enable_code_interpreter = Some(true);
+            }
+        }
         let mut body = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
 
         // Encrypt the `input` member when configured (mirrors
@@ -496,7 +582,11 @@ impl Model for DashScopeChatModel {
     }
 
     fn supports_native_structured_output(&self) -> bool {
-        true
+        self.native_structured_output
+    }
+
+    fn supports_native_structured_output_with_tools(&self) -> bool {
+        self.native_structured_output_with_tools
     }
 
     fn supports_tool_choice_specific(&self) -> bool {
@@ -675,6 +765,83 @@ mod tests {
         )
         .with_endpoint_type(EndpointType::Multimodal);
         assert!(forced.requires_multimodal_api());
+    }
+
+    #[test]
+    fn search_and_code_interpreter_knobs_reach_parameters() {
+        let model = DashScopeChatModel::new(
+            "qwen-plus",
+            "sk",
+            None,
+            Arc::new(MemoryTransport::default()),
+        )
+        .with_enable_search(true)
+        .with_search_options(DashScopeSearchOptions {
+            forced_search: Some(true),
+            ..Default::default()
+        })
+        .with_enable_code_interpreter(true);
+        let spec = model
+            .build_http_request(
+                vec![Msg::user("hi")],
+                Vec::new(),
+                &GenerateOptions::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(spec.body["parameters"]["enable_search"], serde_json::json!(true));
+        assert_eq!(
+            spec.body["parameters"]["search_options"]["forced_search"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            spec.body["parameters"]["enable_code_interpreter"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn user_multimodal_patterns_force_the_multimodal_endpoint() {
+        let model = DashScopeChatModel::new(
+            "acme-vision-7b",
+            "sk",
+            None,
+            Arc::new(MemoryTransport::default()),
+        );
+        assert!(!model.requires_multimodal_api());
+
+        let model = model.with_multimodal_patterns(vec!["Vision".to_string()]);
+        assert!(model.requires_multimodal_api());
+        assert_eq!(model.endpoint_path(), MULTIMODAL_GENERATION_ENDPOINT);
+
+        // An explicit text endpoint still wins over the user pattern.
+        let text = DashScopeChatModel::new(
+            "acme-vision-7b",
+            "sk",
+            None,
+            Arc::new(MemoryTransport::default()),
+        )
+        .with_endpoint_type(EndpointType::Text)
+        .with_multimodal_patterns(vec!["vision".to_string()]);
+        assert!(!text.requires_multimodal_api());
+    }
+
+    #[test]
+    fn native_structured_output_capabilities_follow_the_options() {
+        let model = DashScopeChatModel::new(
+            "qwen-plus",
+            "sk",
+            None,
+            Arc::new(MemoryTransport::default()),
+        );
+        assert!(model.supports_native_structured_output());
+        assert!(model.supports_native_structured_output_with_tools());
+
+        let model = model
+            .with_native_structured_output(false)
+            .with_native_structured_output_with_tools(false);
+        assert!(!model.supports_native_structured_output());
+        assert!(!model.supports_native_structured_output_with_tools());
     }
 
     #[test]

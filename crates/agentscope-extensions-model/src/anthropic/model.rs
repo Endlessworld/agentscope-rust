@@ -17,7 +17,7 @@ use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, 
 
 use crate::anthropic::converter::{
     apply_cache_control, apply_extra_body_params, build_request_with_server_tools, extra_headers,
-    ChatFormatOptions,
+    to_multi_agent_messages, ChatFormatOptions,
 };
 use crate::anthropic::credential::{AnthropicAuthMode, DEFAULT_BASE_URL, MESSAGES_ENDPOINT};
 use crate::anthropic::dto::{AnthropicMessageResponse, AnthropicStreamEvent};
@@ -42,6 +42,10 @@ pub struct AnthropicChatModel {
     descriptor: Option<Arc<ModelDescriptor>>,
     /// Built-in Anthropic server tools declared alongside the client tools.
     server_tools: Vec<AnthropicServerTool>,
+    /// `Some(prompt)` switches to the multi-agent formatter
+    /// (`AnthropicMultiAgentFormatter`): agent turns collapse into one
+    /// `<history>` user message while tool sequences stay intact.
+    multi_agent_prompt: Option<String>,
 }
 
 impl AnthropicChatModel {
@@ -78,6 +82,7 @@ impl AnthropicChatModel {
             context_window_size,
             descriptor,
             server_tools: Vec::new(),
+            multi_agent_prompt: None,
         }
     }
 
@@ -142,19 +147,23 @@ impl AnthropicChatModel {
         self
     }
 
+    /// Switches the adapter to the multi-agent formatter, mirroring Java's
+    /// `AnthropicChatModel.Builder#formatter(new AnthropicMultiAgentFormatter(...))`.
+    ///
+    /// `prompt == None` keeps the plain chat formatter.
+    pub fn with_multi_agent_formatter(mut self, prompt: Option<String>) -> Self {
+        self.multi_agent_prompt = prompt;
+        self
+    }
+
+    /// Whether the multi-agent formatter is active.
+    pub fn is_multi_agent(&self) -> bool {
+        self.multi_agent_prompt.is_some()
+    }
+
     /// The declared server tools.
     pub fn server_tools(&self) -> &[AnthropicServerTool] {
         &self.server_tools
-    }
-
-    /// The native tool-loading protocol of this provider.
-    ///
-    /// Anthropic loads deferred definitions through `tool_search` and returns
-    /// matches as `tool_reference` blocks, i.e. `ToolSearchMode::Deferred`
-    /// (Java: `AnthropicChatModel#getToolSearchMode`). Core's `Model` trait has
-    /// no such method yet, so it is exposed here as an inherent accessor.
-    pub fn tool_search_mode(&self) -> crate::common::tool_search::ToolSearchMode {
-        crate::common::tool_search::ToolSearchMode::Deferred
     }
 
     /// The resolved messages endpoint URL.
@@ -185,6 +194,17 @@ impl AnthropicChatModel {
             &fmt,
             stream,
         )?;
+        // Multi-agent formatter: runs of plain agent turns collapse into one
+        // `<history>` user message while tool sequences keep their normal
+        // conversion (Java `AnthropicMultiAgentFormatter`). The leading system
+        // prompt stays in the top-level `system` field, so it is excluded here.
+        if let Some(prompt) = &self.multi_agent_prompt {
+            let conversation = match messages.first() {
+                Some(first) if first.role == agentscope_core::MsgRole::System => &messages[1..],
+                _ => &messages[..],
+            };
+            request.messages = to_multi_agent_messages(conversation, prompt, &fmt);
+        }
         apply_cache_control(&mut request.messages, &fmt);
 
         let mut body = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
@@ -291,6 +311,13 @@ impl Model for AnthropicChatModel {
 
     fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    /// Anthropic loads deferred definitions through `tool_search` and returns
+    /// matches as `tool_reference` blocks, i.e. `ToolSearchMode::Deferred`
+    /// (Java: `AnthropicChatModel#getToolSearchMode`).
+    fn tool_search_mode(&self) -> agentscope_core::ToolSearchMode {
+        agentscope_core::ToolSearchMode::Deferred
     }
 
     fn supports_native_structured_output(&self) -> bool {
@@ -507,6 +534,37 @@ mod tests {
             serde_json::json!("object")
         );
         let _ = JsonMap::new();
+    }
+
+    #[test]
+    fn multi_agent_formatter_merges_agent_turns_into_history() {
+        let model = AnthropicChatModel::from_api_key(
+            "claude",
+            "sk",
+            None,
+            Arc::new(MemoryTransport::default()),
+        )
+        .with_multi_agent_formatter(Some("HISTORY PROMPT".to_string()));
+        assert!(model.is_multi_agent());
+        let messages = vec![
+            Msg::system("be brief"),
+            Msg::builder().name("alice").text_content("hello").build(),
+            Msg::builder().name("bob").text_content("hi there").build(),
+        ];
+        let spec = model
+            .build_http_request(messages, Vec::new(), &GenerateOptions::default(), false)
+            .unwrap();
+
+        // The system prompt still goes through the top-level field (plain string
+        // form without cache markers), never a wire message.
+        assert_eq!(spec.body["system"], serde_json::json!("be brief"));
+        let messages = spec.body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "agent turns must collapse: {messages:?}");
+        let text = messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("HISTORY PROMPT<history>"), "{text}");
+        assert!(text.contains("alice: hello"), "{text}");
+        assert!(text.contains("bob: hi there"), "{text}");
+        assert!(text.ends_with("</history>"), "{text}");
     }
 
     #[test]

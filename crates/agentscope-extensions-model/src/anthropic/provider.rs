@@ -137,6 +137,10 @@ impl AnthropicModelProvider {
         for key in [OPTION_AUTH_TOKEN, OPTION_CACHE_TTL, OPTION_CONTEXT_WINDOW_SIZE] {
             default_options.additional_body_params.remove(key);
         }
+        // Formatter selector (mirrors Java's `AnthropicModelProvider` picking an
+        // `AnthropicBaseFormatter` component). Consumed here so it never reaches
+        // the request body.
+        let multi_agent_prompt = crate::common::take_multi_agent_prompt(&mut default_options);
 
         let base_url = crate::common::resolve_base_url(
             ctx.base_url.clone(),
@@ -146,7 +150,8 @@ impl AnthropicModelProvider {
         let mut model = AnthropicChatModel::new(model_name, auth_mode, secret, Some(base_url), transport)
             .with_default_options(default_options)
             .with_stream(ctx.stream.unwrap_or(true))
-            .with_context_window_size(context_window_size);
+            .with_context_window_size(context_window_size)
+            .with_multi_agent_formatter(multi_agent_prompt);
         if let Some(ttl) = cache_ttl {
             model = model.with_cache_ttl(ttl);
         }
@@ -237,6 +242,32 @@ mod tests {
             .options(options);
         let model = provider.create(ctx).unwrap();
         assert_eq!(model.context_window_size(), 200_000);
+    }
+
+    #[test]
+    fn multi_agent_formatter_option_is_consumed_by_the_provider() {
+        let provider = AnthropicModelProvider::new();
+        let mut options = agentscope_core::GenerateOptions::default();
+        options
+            .additional_body_params
+            .insert("multiAgentFormatter".to_string(), serde_json::json!(true));
+        let ctx = ModelCreationContext::new("anthropic", "anthropic:claude-3-5-haiku-latest")
+            .api_key("k")
+            .options(options);
+        let model = provider
+            .create_with_transport(ctx, Arc::new(crate::common::MemoryTransport::default()))
+            .unwrap();
+        assert!(model.is_multi_agent());
+        // The selector is a provider knob and must never reach the wire.
+        let spec = model
+            .build_http_request(
+                vec![agentscope_core::Msg::user("hi")],
+                Vec::new(),
+                &agentscope_core::GenerateOptions::default(),
+                false,
+            )
+            .unwrap();
+        assert!(spec.body.get("multiAgentFormatter").is_none());
     }
 
     #[test]

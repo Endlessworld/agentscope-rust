@@ -103,21 +103,65 @@ impl ModelProvider for DashScopeModelProvider {
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
 
+        // Model-level knobs (`enableSearch` / `searchOptions` /
+        // `enableCodeInterpreter` / `multimodalModelPatterns` /
+        // `nativeStructuredOutput` / `nativeStructuredOutputWithTools`). They are
+        // consumed here so they stay provider options, never body fields.
+        let enable_search = options
+            .additional_body_params
+            .remove("enableSearch")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let search_options = options
+            .additional_body_params
+            .remove("searchOptions")
+            .and_then(|value| {
+                serde_json::from_value::<crate::dashscope::dto::DashScopeSearchOptions>(value).ok()
+            });
+        let enable_code_interpreter = options
+            .additional_body_params
+            .remove("enableCodeInterpreter")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let multimodal_patterns = options
+            .additional_body_params
+            .remove("multimodalModelPatterns")
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+            .unwrap_or_default();
+        let native_structured_output = options
+            .additional_body_params
+            .remove("nativeStructuredOutput")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        let native_structured_output_with_tools = options
+            .additional_body_params
+            .remove("nativeStructuredOutputWithTools")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+
         let base_url = crate::common::resolve_base_url(
             ctx.base_url.clone(),
             BASE_URL_ENV,
             crate::dashscope::converter::DEFAULT_BASE_URL,
         );
 
-        let model =
-            DashScopeChatModel::new(model_name, api_key, Some(base_url), default_transport())
-                .with_default_options(options)
-                .with_stream(ctx.stream.unwrap_or(true))
-                .with_endpoint_type(endpoint_type)
-                .with_enable_thinking(ctx.enable_thinking)
-                .with_context_window_size(context_window_size)
-                .with_multi_agent_formatter(multi_agent_prompt)
-                .with_encryption_enabled(enable_encrypt);
+        let model = DashScopeChatModel::new(model_name, api_key, Some(base_url), default_transport())
+            .with_default_options(options)
+            .with_stream(ctx.stream.unwrap_or(true))
+            .with_endpoint_type(endpoint_type)
+            .with_enable_thinking(ctx.enable_thinking)
+            .with_context_window_size(context_window_size)
+            .with_multi_agent_formatter(multi_agent_prompt)
+            .with_enable_search(enable_search)
+            .with_enable_code_interpreter(enable_code_interpreter)
+            .with_multimodal_patterns(multimodal_patterns)
+            .with_native_structured_output(native_structured_output)
+            .with_native_structured_output_with_tools(native_structured_output_with_tools)
+            .with_encryption_enabled(enable_encrypt);
+        let model = match search_options {
+            Some(search_options) => model.with_search_options(search_options),
+            None => model,
+        };
         Ok(Arc::new(model))
     }
 }
@@ -154,6 +198,25 @@ mod tests {
         let provider = DashScopeModelProvider::new();
         let ctx = ModelCreationContext::new("dashscope", "gpt-4o").api_key("sk");
         assert!(provider.create(ctx).is_err());
+    }
+
+    #[test]
+    fn native_structured_output_option_is_consumed_from_the_provider() {
+        let provider = DashScopeModelProvider::new();
+        let mut options = agentscope_core::GenerateOptions::default();
+        options
+            .additional_body_params
+            .insert("nativeStructuredOutput".to_string(), serde_json::json!(false));
+        options.additional_body_params.insert(
+            "nativeStructuredOutputWithTools".to_string(),
+            serde_json::json!(false),
+        );
+        let ctx = ModelCreationContext::new("dashscope", "dashscope:qwen-plus")
+            .api_key("sk")
+            .options(options);
+        let model = provider.create(ctx).unwrap();
+        assert!(!model.supports_native_structured_output());
+        assert!(!model.supports_native_structured_output_with_tools());
     }
 
     #[test]

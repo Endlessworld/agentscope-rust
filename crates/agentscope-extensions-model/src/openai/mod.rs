@@ -17,8 +17,8 @@ use serde::Deserialize;
 use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice,
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+    ChatCompletionNamedToolChoice,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartAudio,
     ChatCompletionRequestMessageContentPartImage,
@@ -319,6 +319,14 @@ impl OpenAiChatModel {
         let thinking_budget = options.thinking_budget;
         // Automatic prompt-cache marking is opt-in per request(`cache_control`).
         let cache_control = options.cache_control;
+        // `async-openai` only models the known effort levels; a vendor value it
+        // cannot represent is passed through verbatim (Java
+        // `OpenAIChatFormatter#applyOptions` sets the string as-is) instead of
+        // being silently dropped.
+        let unknown_reasoning_effort = options
+            .reasoning_effort
+            .clone()
+            .filter(|value| to_reasoning_effort(value).is_none());
         // Capture the transport mode before `options` is moved into the builder.
         // `None` keeps the historical streaming default.
         let streaming = options.stream.unwrap_or(true);
@@ -343,6 +351,14 @@ impl OpenAiChatModel {
                 object.insert("thinking_budget".to_string(), serde_json::Value::from(budget));
             }
         }
+        if let Some(effort) = unknown_reasoning_effort {
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "reasoning_effort".to_string(),
+                    serde_json::Value::String(effort),
+                );
+            }
+        }
         if !extra_body.is_empty() {
             if let Some(object) = body.as_object_mut() {
                 for (key, value) in extra_body {
@@ -357,6 +373,10 @@ impl OpenAiChatModel {
         if self.reasoning_passback {
             inject_reasoning_content(&mut body, &extras.reasoning);
         }
+        // `reasoning_details` / `thought_signature` round-trip (MODEL-05): the typed
+        // `async-openai` messages cannot express either field.
+        inject_reasoning_details(&mut body, &extras.reasoning_details);
+        inject_tool_signatures(&mut body, &extras.tool_signatures);
         // Prompt caching: message-level metadata directives first, then the
         // automatic policy when the caller opted in.
         apply_cache_control(&mut body, &extras.cache_directives, cache_control);
@@ -648,7 +668,9 @@ fn build_request(
     let RequestMessages {
         messages: request_messages,
         reasoning,
+        reasoning_details,
         cache_directives,
+        tool_signatures,
     } = to_request_messages(messages, reasoning_passback);
     // `None` keeps the historical streaming default (TRAINING/agent loop relies
     // on it); `Some(false)` must reach the wire as a plain non-streaming
@@ -743,15 +765,24 @@ fn build_request(
     if let Some(rf) = &options.response_format {
         req.response_format = to_response_format(rf, strict_json_schema);
     }
-    (req, MessageExtras { reasoning, cache_directives })
+    (req, MessageExtras {
+        reasoning,
+        reasoning_details,
+        cache_directives,
+        tool_signatures,
+    })
 }
 
 /// Bookkeeping recorded while converting core `Msg`s, addressed by wire index.
 struct MessageExtras {
     /// The `reasoning_content` to replay for each wire message.
     reasoning: Vec<Option<String>>,
+    /// The `reasoning_details` list to replay for each wire message.
+    reasoning_details: Vec<Option<serde_json::Value>>,
     /// The `Msg`-level `cache_control` metadata directive of each wire message.
     cache_directives: Vec<Option<bool>>,
+    /// `(tool call id, thought_signature)` pairs to replay on the function call.
+    tool_signatures: Vec<(String, String)>,
 }
 
 /// The result of converting core [`Msg`]s into OpenAI wire messages.
@@ -761,10 +792,15 @@ struct RequestMessages {
     /// Parallel to `messages`: the `reasoning_content` to replay for each wire
     /// message (only populated for assistant turns when passback is enabled).
     reasoning: Vec<Option<String>>,
+    /// Parallel to `messages`: the provider `reasoning_details` list of each
+    /// assistant turn (OpenRouter / vLLM / Gemini-via-OpenAI).
+    reasoning_details: Vec<Option<serde_json::Value>>,
     /// Parallel to `messages`: the message-level cache directive of each wire
     /// message (`true` = the message asked for a marker, `None` = no explicit
     /// preference, so the automatic policy may still mark it).
     cache_directives: Vec<Option<bool>>,
+    /// `(tool call id, thought_signature)` pairs collected from tool-use blocks.
+    tool_signatures: Vec<(String, String)>,
 }
 
 fn has_image_block(msg: &Msg) -> bool {
@@ -914,7 +950,9 @@ fn user_message_content(msg: &Msg) -> ChatCompletionRequestUserMessageContent {
 fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestMessages {
     let mut out = Vec::new();
     let mut reasoning = Vec::new();
+    let mut reasoning_details = Vec::new();
     let mut cache_directives = Vec::new();
+    let mut tool_signatures = Vec::new();
     for msg in messages {
         let cache_directive = metadata_cache_directive(&msg);
         match msg.role {
@@ -928,6 +966,7 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                     },
                 ));
                 reasoning.push(None);
+                reasoning_details.push(None);
                 cache_directives.push(cache_directive);
             }
             MsgRole::User => {
@@ -942,6 +981,7 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                 // entry here shifts every later assistant turn and drops its
                 // `reasoning_content`.
                 reasoning.push(None);
+                reasoning_details.push(None);
                 cache_directives.push(cache_directive);
             }
             MsgRole::Assistant => {
@@ -949,6 +989,17 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                 let mut tool_calls = Vec::new();
                 for tu in msg.tool_use_blocks() {
                     let args = serde_json::to_string(&tu.input).unwrap_or_default();
+                    // A provider tool signature (OpenRouter / Gemini-via-OpenAI)
+                    // must be echoed back on the same function call, otherwise
+                    // the follow-up turn is rejected.
+                    if let Some(signature) = tu
+                        .metadata
+                        .get(ToolUseBlock::METADATA_THOUGHT_SIGNATURE)
+                        .and_then(|value| value.as_str())
+                        .filter(|signature| !signature.is_empty())
+                    {
+                        tool_signatures.push((tu.id.clone(), signature.to_string()));
+                    }
                     tool_calls.push(ChatCompletionMessageToolCalls::Function(
                         ChatCompletionMessageToolCall {
                             id: tu.id.clone(),
@@ -987,6 +1038,7 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                 } else {
                     None
                 });
+                reasoning_details.push(reasoning_details_of(&msg));
                 cache_directives.push(cache_directive);
             }
             MsgRole::Tool => {
@@ -1000,6 +1052,7 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                             },
                         ));
                         reasoning.push(None);
+                        reasoning_details.push(None);
                         cache_directives.push(cache_directive);
                     }
                 }
@@ -1009,7 +1062,9 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
     RequestMessages {
         messages: out,
         reasoning,
+        reasoning_details,
         cache_directives,
+        tool_signatures,
     }
 }
 
@@ -1032,6 +1087,19 @@ fn reasoning_text(msg: &Msg) -> Option<String> {
     }
 }
 
+/// The provider `reasoning_details` list recorded on a message's thinking
+/// block, or `None` when the message carries none.
+fn reasoning_details_of(msg: &Msg) -> Option<serde_json::Value> {
+    msg.content.iter().find_map(|block| match block {
+        ContentBlock::Thinking(thinking) => thinking
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(ThinkingBlock::METADATA_REASONING_DETAILS))
+            .cloned(),
+        _ => None,
+    })
+}
+
 /// Injects the per-message `reasoning_content` into the serialized request body
 /// (`body["messages"][i]["reasoning_content"] = ...`).
 ///
@@ -1052,6 +1120,59 @@ fn inject_reasoning_content(body: &mut serde_json::Value, reasoning: &[Option<St
                 "reasoning_content".to_string(),
                 serde_json::Value::String(text.to_string()),
             );
+        }
+    }
+}
+
+/// Injects the per-message `reasoning_details` list into the serialized request
+/// body (`body["messages"][i]["reasoning_details"] = [...]`).
+///
+/// Replayed regardless of `reasoning_passback`: only gateways that emit the list
+/// (OpenRouter / vLLM / Gemini-via-OpenAI) ever see it, and losing it breaks
+/// their thinking round-trip.
+fn inject_reasoning_details(body: &mut serde_json::Value, details: &[Option<serde_json::Value>]) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for (i, entry) in details.iter().enumerate() {
+        let Some(details) = entry else {
+            continue;
+        };
+        if let Some(object) = messages.get_mut(i).and_then(|m| m.as_object_mut()) {
+            object.insert("reasoning_details".to_string(), details.clone());
+        }
+    }
+}
+
+/// Replays provider tool signatures on the matching function calls
+/// (`body["messages"][i]["tool_calls"][j]["function"]["thought_signature"]`).
+///
+/// `async-openai`'s `FunctionCall` has no such field, and the typed conversion is
+/// not 1:1, so the pairs are matched by call id.
+fn inject_tool_signatures(body: &mut serde_json::Value, signatures: &[(String, String)]) {
+    if signatures.is_empty() {
+        return;
+    }
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for message in messages.iter_mut() {
+        let Some(tool_calls) = message.get_mut("tool_calls").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for call in tool_calls.iter_mut() {
+            let Some(id) = call.get("id").and_then(|id| id.as_str()) else {
+                continue;
+            };
+            let Some((_, signature)) = signatures.iter().find(|(call_id, _)| call_id == id) else {
+                continue;
+            };
+            if let Some(function) = call.get_mut("function").and_then(|f| f.as_object_mut()) {
+                function.insert(
+                    "thought_signature".to_string(),
+                    serde_json::Value::String(signature.clone()),
+                );
+            }
         }
     }
 }
@@ -1274,6 +1395,8 @@ struct ToolCallFragment {
     id: String,
     name: String,
     arguments: String,
+    /// OpenRouter / Gemini-via-OpenAI tool signature (`thought_signature`).
+    thought_signature: Option<String>,
 }
 
 /// A single SSE chunk from an OpenAI-compatible streaming response, decoded with
@@ -1305,10 +1428,38 @@ struct OpenAiStreamDelta {
     reasoning_content: Option<String>,
     #[serde(default)]
     reasoning: Option<String>,
+    /// OpenRouter / vLLM / Gemini-via-OpenAI reasoning detail objects.
+    #[serde(default)]
+    reasoning_details: Option<serde_json::Value>,
     #[serde(default)]
     refusal: Option<String>,
     #[serde(default)]
-    tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
+    tool_calls: Option<Vec<OpenAiToolCallChunk>>,
+}
+
+/// A streamed tool-call fragment.
+///
+/// `async-openai`'s chunk type drops `thought_signature`, which OpenRouter /
+/// Gemini-via-OpenAI send on the function object; it is captured here so it can
+/// be replayed (MODEL-05).
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiToolCallChunk {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<OpenAiFunctionChunk>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiFunctionChunk {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default, alias = "thoughtSignature")]
+    thought_signature: Option<String>,
 }
 
 impl OpenAiStreamDelta {
@@ -1362,13 +1513,55 @@ fn usage_from_completion(usage: &CompletionUsage) -> ChatUsage {
 /// arguments are not a JSON object (invalid JSON, or a bare string) the raw
 /// text is kept in `content` so it still reaches the event stream instead of
 /// being silently dropped.
-fn tool_use_block(id: String, name: String, arguments: &str) -> ToolUseBlock {
+///
+/// `thought_signature` (OpenRouter / Gemini-via-OpenAI) is persisted under
+/// [`ToolUseBlock::METADATA_THOUGHT_SIGNATURE`] so later turns can replay it.
+fn tool_use_block(
+    id: String,
+    name: String,
+    arguments: &str,
+    thought_signature: Option<String>,
+) -> ToolUseBlock {
     let input = parse_arguments(arguments);
     let mut tool_use = ToolUseBlock::new(id, name, input);
     if tool_use.input.is_empty() && !arguments.is_empty() {
         tool_use.content = Some(arguments.to_string());
     }
+    if let Some(signature) = thought_signature.filter(|signature| !signature.is_empty()) {
+        tool_use.metadata.insert(
+            ToolUseBlock::METADATA_THOUGHT_SIGNATURE.to_string(),
+            serde_json::Value::String(signature),
+        );
+    }
     tool_use
+}
+
+/// Builds a thinking block from a reasoning text and/or `reasoning_details`.
+///
+/// Mirrors Java's `OpenAIResponseParser` (thinking first: `reasoning_content` +
+/// `reasoning_details`): the text is the model's visible reasoning, while the
+/// details list is preserved verbatim under
+/// [`ThinkingBlock::METADATA_REASONING_DETAILS`] for replay.
+fn thinking_block(
+    text: Option<&str>,
+    details: Option<&serde_json::Value>,
+) -> Option<ThinkingBlock> {
+    let text = text.filter(|text| !text.is_empty());
+    let details = details.filter(|details| !details.is_null());
+    if text.is_none() && details.is_none() {
+        return None;
+    }
+    let mut block = ThinkingBlock::new(text.unwrap_or_default());
+    if let Some(details) = details {
+        block
+            .metadata
+            .get_or_insert_with(JsonMap::new)
+            .insert(
+                ThinkingBlock::METADATA_REASONING_DETAILS.to_string(),
+                details.clone(),
+            );
+    }
+    Some(block)
 }
 
 /// Incremental stream decoder: emits one [`ChatResponse`] per SSE chunk for
@@ -1403,10 +1596,11 @@ impl StreamIncrementer {
                     blocks.push(ContentBlock::Text(TextBlock::new(content.clone())));
                 }
             }
-            if let Some(reasoning) = delta.reasoning_text() {
-                blocks.push(ContentBlock::Thinking(ThinkingBlock::new(
-                    reasoning.to_string(),
-                )));
+            if let Some(thinking) = thinking_block(
+                delta.reasoning_text(),
+                delta.reasoning_details.as_ref(),
+            ) {
+                blocks.push(ContentBlock::Thinking(thinking));
             }
             if let Some(refusal) = &delta.refusal {
                 if !refusal.is_empty() {
@@ -1419,12 +1613,15 @@ impl StreamIncrementer {
                     if let Some(id) = &tc.id {
                         frag.id = id.clone();
                     }
-                    if let Some(f) = &tc.function {
-                        if let Some(name) = &f.name {
+                    if let Some(function) = &tc.function {
+                        if let Some(name) = &function.name {
                             frag.name = name.clone();
                         }
-                        if let Some(args) = &f.arguments {
+                        if let Some(args) = &function.arguments {
                             frag.arguments.push_str(args);
+                        }
+                        if let Some(signature) = &function.thought_signature {
+                            frag.thought_signature = Some(signature.clone());
                         }
                     }
                 }
@@ -1462,6 +1659,7 @@ impl StreamIncrementer {
                 frag.id.clone(),
                 frag.name.clone(),
                 &frag.arguments,
+                frag.thought_signature.clone(),
             )));
         }
         if blocks.is_empty() && self.usage.is_none() {
@@ -1526,9 +1724,30 @@ struct OpenAiCompletionMessage {
     #[serde(default)]
     reasoning: Option<String>,
     #[serde(default)]
+    reasoning_details: Option<serde_json::Value>,
+    #[serde(default)]
     refusal: Option<String>,
     #[serde(default)]
-    tool_calls: Option<Vec<ChatCompletionMessageToolCalls>>,
+    tool_calls: Option<Vec<OpenAiCompletionToolCall>>,
+}
+
+/// A non-streaming tool call decoded with the extra `thought_signature` field.
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiCompletionToolCall {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    function: OpenAiCompletionFunction,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiCompletionFunction {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    arguments: String,
+    #[serde(default, alias = "thoughtSignature")]
+    thought_signature: Option<String>,
 }
 
 /// Maps a non-streaming completion onto the core [`ChatResponse`].
@@ -1545,13 +1764,14 @@ fn completion_to_response(
     let mut finish_reason: Option<String> = None;
     for choice in &response.choices {
         let message = &choice.message;
-        if let Some(reasoning) = reasoning_text_from(
-            message.reasoning_content.as_deref(),
-            message.reasoning.as_deref(),
+        if let Some(thinking) = thinking_block(
+            reasoning_text_from(
+                message.reasoning_content.as_deref(),
+                message.reasoning.as_deref(),
+            ),
+            message.reasoning_details.as_ref(),
         ) {
-            blocks.push(ContentBlock::Thinking(ThinkingBlock::new(
-                reasoning.to_string(),
-            )));
+            blocks.push(ContentBlock::Thinking(thinking));
         }
         if let Some(content) = &message.content {
             if !content.is_empty() {
@@ -1564,13 +1784,12 @@ fn completion_to_response(
             }
         }
         for call in message.tool_calls.iter().flatten() {
-            if let ChatCompletionMessageToolCalls::Function(call) = call {
-                blocks.push(ContentBlock::ToolUse(tool_use_block(
-                    call.id.clone(),
-                    call.function.name.clone(),
-                    &call.function.arguments,
-                )));
-            }
+            blocks.push(ContentBlock::ToolUse(tool_use_block(
+                call.id.clone(),
+                call.function.name.clone(),
+                &call.function.arguments,
+                call.function.thought_signature.clone(),
+            )));
         }
         if let Some(fr) = &choice.finish_reason {
             finish_reason = Some(finish_reason_string(fr.clone()));
@@ -1591,7 +1810,6 @@ mod tests {
         Base64Source, ContentBlock, ImageBlock, Msg, MsgRole, TextBlock, ToolResultBlock,
         ToolUseBlock,
     };
-    use async_openai::types::chat::FunctionCallStream;
 
     fn sample_msg() -> Msg {
         Msg::builder()
@@ -1794,6 +2012,25 @@ mod tests {
             body.get(STRICT_JSON_SCHEMA_OPTION).is_none(),
             "provider knob leaked into the wire body: {body:?}"
         );
+    }
+
+    #[test]
+    fn unknown_reasoning_effort_is_passed_through_verbatim() {
+        // MODEL-17: `async-openai`'s enum only covers the documented levels. A
+        // vendor value it cannot model must still reach the wire (Java sets the
+        // configured string as-is) instead of being dropped.
+        let ctx = ModelCreationContext::new("openai", "gateway-chat").api_key("sk-test");
+        let model = OpenAiChatModel::from_context(&ctx).expect("model");
+        let per_call = GenerateOptions::builder()
+            .reasoning_effort("ultra")
+            .build();
+        let (body, _) = model.prepare_body(vec![sample_msg()], vec![], per_call);
+        assert_eq!(body["reasoning_effort"], serde_json::json!("ultra"));
+
+        // Known levels keep going through the typed field.
+        let per_call = GenerateOptions::builder().reasoning_effort("high").build();
+        let (body, _) = model.prepare_body(vec![sample_msg()], vec![], per_call);
+        assert_eq!(body["reasoning_effort"], serde_json::json!("high"));
     }
 
     #[test]
@@ -2089,6 +2326,7 @@ mod tests {
                     content: None,
                     reasoning_content: Some("let me think".into()),
                     reasoning: None,
+                    reasoning_details: None,
                     refusal: None,
                     tool_calls: None,
                 },
@@ -2110,6 +2348,7 @@ mod tests {
                     content: Some("hello".into()),
                     reasoning_content: None,
                     reasoning: None,
+                    reasoning_details: None,
                     refusal: None,
                     tool_calls: None,
                 },
@@ -2138,14 +2377,15 @@ mod tests {
                     content: None,
                     reasoning_content: None,
                     reasoning: None,
+                    reasoning_details: None,
                     refusal: None,
-                    tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                    tool_calls: Some(vec![OpenAiToolCallChunk {
                         index: 0,
                         id: Some("call_1".into()),
-                        r#type: None,
-                        function: Some(FunctionCallStream {
+                        function: Some(OpenAiFunctionChunk {
                             name: Some("get_weather".into()),
                             arguments: Some(r#"{"city":"Bei"#.into()),
+                            thought_signature: None,
                         }),
                     }]),
                 },
@@ -2161,14 +2401,15 @@ mod tests {
                     content: None,
                     reasoning_content: None,
                     reasoning: None,
+                    reasoning_details: None,
                     refusal: None,
-                    tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                    tool_calls: Some(vec![OpenAiToolCallChunk {
                         index: 0,
                         id: None,
-                        r#type: None,
-                        function: Some(FunctionCallStream {
+                        function: Some(OpenAiFunctionChunk {
                             name: None,
                             arguments: Some(r#"jing"}"#.into()),
+                            thought_signature: None,
                         }),
                     }]),
                 },
@@ -2190,6 +2431,75 @@ mod tests {
             Some("Beijing")
         );
         assert_eq!(final_resp.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn reasoning_details_and_thought_signature_round_trip() {
+        // MODEL-05: OpenRouter / vLLM / Gemini-via-OpenAI send `reasoning_details`
+        // and a per-call `thought_signature`; both must survive into the core
+        // blocks and be replayed on the next request.
+        let chunk: OpenAiStreamChunk = serde_json::from_value(serde_json::json!({
+            "id": "x",
+            "choices": [{
+                "delta": {
+                    "reasoning": "step",
+                    "reasoning_details": [{"type": "reasoning.text", "text": "step"}],
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"Beijing\"}",
+                            "thought_signature": "sig-1"
+                        }
+                    }]
+                }
+            }]
+        }))
+        .unwrap();
+        let mut inc = StreamIncrementer::default();
+        let delta = inc.accumulate(&chunk).expect("reasoning delta");
+        let thinking = match &delta.content[0] {
+            ContentBlock::Thinking(thinking) => thinking.clone(),
+            other => panic!("expected Thinking, got {other:?}"),
+        };
+        assert_eq!(thinking.thinking, "step");
+        assert_eq!(
+            thinking.metadata.as_ref().unwrap()[ThinkingBlock::METADATA_REASONING_DETAILS],
+            serde_json::json!([{"type": "reasoning.text", "text": "step"}])
+        );
+        let final_resp = inc.into_final().expect("tool call flushed");
+        let tool = match &final_resp.content[0] {
+            ContentBlock::ToolUse(tool) => tool.clone(),
+            other => panic!("expected ToolUse, got {other:?}"),
+        };
+        assert_eq!(
+            tool.metadata[ToolUseBlock::METADATA_THOUGHT_SIGNATURE],
+            serde_json::json!("sig-1")
+        );
+
+        let ctx = ModelCreationContext::new("openai", "gateway-chat").api_key("sk-test");
+        let model = OpenAiChatModel::from_context(&ctx).expect("model");
+        let assistant = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![
+                ContentBlock::Thinking(thinking),
+                ContentBlock::ToolUse(tool),
+            ])
+            .build();
+        let (body, _) = model.prepare_body(
+            vec![Msg::user("hi"), assistant],
+            vec![],
+            GenerateOptions::default(),
+        );
+        assert_eq!(
+            body["messages"][1]["reasoning_details"][0]["type"],
+            serde_json::json!("reasoning.text")
+        );
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["thought_signature"],
+            serde_json::json!("sig-1")
+        );
     }
 
     fn json_schema_response_format(strict: Option<bool>) -> ResponseFormat {

@@ -16,7 +16,9 @@ use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, 
 
 use crate::common::error::ModelError;
 use crate::common::{HttpRequestSpec, SharedTransport};
-use crate::gemini::converter::{build_request_with_server_tools, GeminiServerTool};
+use crate::gemini::converter::{
+    build_request_with_server_tools, to_multi_agent_contents, GeminiServerTool,
+};
 use crate::gemini::credential::{
     generate_content_path, stream_generate_content_path, API_KEY_HEADER, DEFAULT_BASE_URL,
 };
@@ -50,6 +52,10 @@ pub struct GeminiChatModel {
     context_window_size: usize,
     descriptor: Option<Arc<ModelDescriptor>>,
     server_tools: Vec<GeminiServerTool>,
+    /// `Some(prompt)` switches to the multi-agent formatter
+    /// (`GeminiMultiAgentFormatter`): agent turns collapse into one `<history>`
+    /// user content while tool sequences stay intact.
+    multi_agent_prompt: Option<String>,
 }
 
 impl GeminiChatModel {
@@ -82,6 +88,7 @@ impl GeminiChatModel {
             context_window_size,
             descriptor,
             server_tools: Vec::new(),
+            multi_agent_prompt: None,
         }
     }
 
@@ -89,6 +96,20 @@ impl GeminiChatModel {
     pub fn with_server_tools(mut self, tools: Vec<GeminiServerTool>) -> Self {
         self.server_tools = tools;
         self
+    }
+
+    /// Switches the adapter to the multi-agent formatter, mirroring Java's
+    /// `GeminiChatModel.Builder#formatter(new GeminiMultiAgentFormatter(...))`.
+    ///
+    /// `prompt == None` keeps the plain chat formatter.
+    pub fn with_multi_agent_formatter(mut self, prompt: Option<String>) -> Self {
+        self.multi_agent_prompt = prompt;
+        self
+    }
+
+    /// Whether the multi-agent formatter is active.
+    pub fn is_multi_agent(&self) -> bool {
+        self.multi_agent_prompt.is_some()
     }
 
     /// Sets the default options merged under every request.
@@ -133,13 +154,19 @@ impl GeminiChatModel {
         options: &GenerateOptions,
         stream: bool,
     ) -> HttpRequestSpec {
-        let request = build_request_with_server_tools(
+        let mut request = build_request_with_server_tools(
             &messages,
             &tools,
             options,
             &self.default_options,
             &self.server_tools,
         );
+        // Multi-agent formatter: runs of plain agent turns collapse into one
+        // `<history>` user content while tool sequences keep their normal
+        // conversion (Java `GeminiMultiAgentFormatter`).
+        if let Some(prompt) = &self.multi_agent_prompt {
+            request.contents = to_multi_agent_contents(&messages, prompt);
+        }
         let mut body = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
         // Extra body params merge last so callers can override any field, but
         // provider knobs are never wire fields (MODEL-09): Java keeps them in
@@ -434,6 +461,34 @@ mod tests {
             spec.body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             serde_json::json!(256)
         );
+    }
+
+    #[test]
+    fn multi_agent_formatter_merges_agent_turns_into_history() {
+        let model = GeminiChatModel::new(
+            "gemini-2.5-flash",
+            "gm",
+            None,
+            Arc::new(MemoryTransport::default()),
+        )
+        .with_multi_agent_formatter(Some("HISTORY PROMPT".to_string()));
+        assert!(model.is_multi_agent());
+        let messages = vec![
+            Msg::system("be brief"),
+            Msg::builder().name("alice").text_content("hello").build(),
+            Msg::builder().name("bob").text_content("hi there").build(),
+        ];
+        let spec = model.build_http_request(messages, Vec::new(), &GenerateOptions::default(), false);
+
+        let contents = spec.body["contents"].as_array().unwrap();
+        // System prompt becomes the leading `user` content, agent turns merge into one.
+        assert_eq!(contents.len(), 2, "unexpected contents: {contents:?}");
+        assert_eq!(contents[0]["parts"][0]["text"], serde_json::json!("be brief"));
+        let merged = contents[1]["parts"][0]["text"].as_str().unwrap();
+        assert!(merged.starts_with("HISTORY PROMPT<history>"), "{merged}");
+        assert!(merged.contains("alice: hello"), "{merged}");
+        assert!(merged.contains("bob: hi there"), "{merged}");
+        assert!(merged.ends_with("</history>"), "{merged}");
     }
 
     #[test]

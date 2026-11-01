@@ -20,18 +20,19 @@ use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
 use async_openai::types::responses::{
     CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
-    FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem, InputParam, Item,
-    MessageType, OutputItem, ResponseStreamEvent, Role, Status, Tool, ToolChoiceFunction,
-    ToolChoiceOptions, ToolChoiceParam,
+    FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, ImageDetail, InputContent,
+    InputImageContent, InputItem, InputParam, InputTextContent, Item, MessageType, OutputItem,
+    ResponseFormatJsonSchema, ResponseStreamEvent, ResponseTextParam, Role, Status,
+    TextResponseFormatConfiguration, Tool, ToolChoiceFunction, ToolChoiceOptions, ToolChoiceParam,
 };
 use async_openai::Client;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 
 use agentscope_core::error::{Error, Result};
-use agentscope_core::formatter::{convert_tool_result_to_string, extract_text_content};
+use agentscope_core::formatter::{convert_tool_result_to_string, extract_text_content, ResponseFormat};
 use agentscope_core::message::{
-    ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, TextBlock, ThinkingBlock, ToolUseBlock,
+    ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, Source, TextBlock, ThinkingBlock, ToolUseBlock,
 };
 use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
 use agentscope_core::model::context_windows::resolve_context_window;
@@ -299,7 +300,7 @@ fn build_request(
                     instructions.push(text);
                 }
             }
-            MsgRole::User => items.push(easy_message(Role::User, extract_text_content(&msg))),
+            MsgRole::User => items.push(user_input_item(&msg)),
             MsgRole::Assistant => {
                 let text = extract_text_content(&msg);
                 if !text.is_empty() {
@@ -378,7 +379,106 @@ fn build_request(
     if let Some(n) = options.max_completion_tokens.or(options.max_tokens) {
         req.max_output_tokens = Some(n);
     }
+    if let Some(rf) = &options.response_format {
+        if let Some(text) = to_response_text_param(rf) {
+            req.text = Some(text);
+        }
+    }
     req
+}
+
+/// Resolves a media source to the URL a Responses input expects (remote URLs are
+/// forwarded verbatim, base64 becomes a `data:` URL).
+fn source_url(source: &Source) -> String {
+    match source {
+        Source::Url(url) => url.url.clone(),
+        Source::Base64(data) => format!("data:{};base64,{}", data.media_type, data.data),
+    }
+}
+
+/// Converts a user message into a Responses input item, keeping images.
+///
+/// Mirrors Java `ResponsesRequestMapper#mapUserMessage`: image blocks become
+/// `input_image` parts. The Responses API has no audio / video input type, so
+/// those degrade to a text reference **with a diagnostic** instead of being
+/// dropped silently (MODEL-10).
+fn user_input_item(msg: &Msg) -> InputItem {
+    let mut parts: Vec<InputContent> = Vec::new();
+    for block in &msg.content {
+        match block {
+            ContentBlock::Text(text) if !text.text.is_empty() => {
+                parts.push(InputContent::InputText(InputTextContent {
+                    text: text.text.clone(),
+                }));
+            }
+            ContentBlock::Image(image) => {
+                parts.push(InputContent::InputImage(InputImageContent {
+                    detail: ImageDetail::Auto,
+                    file_id: None,
+                    image_url: Some(source_url(&image.source)),
+                }));
+            }
+            ContentBlock::Audio(audio) => {
+                diagnostics::warn(
+                    "unsupported_media_type",
+                    "input.audio",
+                    "the Responses API has no audio input type; the audio is sent as a text reference",
+                );
+                parts.push(InputContent::InputText(InputTextContent {
+                    text: format!("[Audio: {}]", source_url(&audio.source)),
+                }));
+            }
+            ContentBlock::Video(video) => {
+                diagnostics::warn(
+                    "unsupported_media_type",
+                    "input.video",
+                    "the Responses API has no video input type; the video is sent as a text reference",
+                );
+                parts.push(InputContent::InputText(InputTextContent {
+                    text: format!("[Video URL: {}]", source_url(&video.source)),
+                }));
+            }
+            ContentBlock::Data(_) => diagnostics::warn(
+                "unsupported_media_type",
+                "input.data",
+                "data blocks have no Responses input part; the block is omitted",
+            ),
+            _ => {}
+        }
+    }
+    if let [InputContent::InputText(text)] = &parts[..] {
+        return easy_message(Role::User, text.text.clone());
+    }
+    InputItem::EasyMessage(EasyInputMessage {
+        r#type: MessageType::Message,
+        role: Role::User,
+        content: EasyInputContent::ContentList(parts),
+        phase: None,
+    })
+}
+
+/// Maps the core `response_format` onto the Responses `text.format` object.
+fn to_response_text_param(rf: &ResponseFormat) -> Option<ResponseTextParam> {
+    let format = match rf.format_type.as_str() {
+        "json_object" => TextResponseFormatConfiguration::JsonObject,
+        "json_schema" => {
+            let schema = rf.json_schema.as_ref()?;
+            TextResponseFormatConfiguration::JsonSchema(ResponseFormatJsonSchema {
+                description: None,
+                name: schema
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "output_schema".to_string()),
+                schema: serde_json::Value::Object(schema.schema.clone()),
+                strict: schema.strict,
+            })
+        }
+        _ => return None,
+    };
+    Some(ResponseTextParam {
+        format,
+        verbosity: None,
+    })
 }
 
 fn easy_message(role: Role, text: String) -> InputItem {
@@ -635,6 +735,114 @@ mod tests {
                 _ => panic!("expected easy message"),
             },
             _ => panic!("expected items"),
+        }
+    }
+
+    #[test]
+    fn user_image_becomes_input_image_part() {
+        // MODEL-10: images must not be silently dropped by the Responses path.
+        let msg = Msg::builder()
+            .role(MsgRole::User)
+            .content(vec![
+                ContentBlock::Text(TextBlock::new("what is this?")),
+                ContentBlock::Image(agentscope_core::message::ImageBlock::new(Source::Url(
+                    agentscope_core::message::URLSource::new("https://example.test/cat.png"),
+                ))),
+            ])
+            .build();
+        let req = build_request(
+            "gpt-5".to_string(),
+            vec![msg],
+            vec![],
+            GenerateOptions::default(),
+            None,
+        );
+        match &req.input {
+            InputParam::Items(items) => match &items[0] {
+                InputItem::EasyMessage(m) => match &m.content {
+                    EasyInputContent::ContentList(parts) => {
+                        assert_eq!(parts.len(), 2);
+                        assert!(
+                            matches!(&parts[0], InputContent::InputText(t) if t.text == "what is this?")
+                        );
+                        match &parts[1] {
+                            InputContent::InputImage(image) => assert_eq!(
+                                image.image_url.as_deref(),
+                                Some("https://example.test/cat.png")
+                            ),
+                            other => panic!("expected input_image, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected content list, got {other:?}"),
+                },
+                _ => panic!("expected easy message"),
+            },
+            _ => panic!("expected items"),
+        }
+    }
+
+    #[test]
+    fn user_audio_degrades_to_a_text_reference() {
+        let msg = Msg::builder()
+            .role(MsgRole::User)
+            .content(vec![ContentBlock::Audio(agentscope_core::message::AudioBlock {
+                source: Source::Base64(agentscope_core::message::Base64Source {
+                    media_type: "audio/wav".to_string(),
+                    data: "AAAA".to_string(),
+                }),
+            })])
+            .build();
+        let req = build_request(
+            "gpt-5".to_string(),
+            vec![msg],
+            vec![],
+            GenerateOptions::default(),
+            None,
+        );
+        match &req.input {
+            InputParam::Items(items) => match &items[0] {
+                InputItem::EasyMessage(m) => match &m.content {
+                    EasyInputContent::Text(text) => {
+                        assert!(text.starts_with("[Audio: data:audio/wav;base64,"), "{text}");
+                    }
+                    other => panic!("expected text reference, got {other:?}"),
+                },
+                _ => panic!("expected easy message"),
+            },
+            _ => panic!("expected items"),
+        }
+    }
+
+    #[test]
+    fn response_format_maps_to_text_format() {
+        let mut schema = serde_json::Map::new();
+        schema.insert(
+            "type".to_string(),
+            serde_json::json!("object"),
+        );
+        let rf = ResponseFormat::json_schema(
+            agentscope_core::formatter::JsonSchema::builder()
+                .name("answer")
+                .schema(schema)
+                .strict(true)
+                .build(),
+        );
+        let options = GenerateOptions::builder().response_format(rf).build();
+        let req = build_request(
+            "gpt-5".to_string(),
+            vec![user_msg("hi")],
+            vec![],
+            options,
+            None,
+        );
+        let text = req.text.expect("text param");
+        match text.format {
+            TextResponseFormatConfiguration::JsonSchema(schema) => {
+                assert_eq!(schema.name, "answer");
+                assert_eq!(schema.strict, Some(true));
+                assert_eq!(schema.schema["type"], serde_json::json!("object"));
+            }
+            other => panic!("expected json_schema, got {other:?}"),
         }
     }
 

@@ -16,9 +16,9 @@
 //! * Every other provider exposes the discovered schemas through ordinary
 //!   function calling (`ToolSearchMode::Function`, the default).
 //!
-//! Core's `Model` trait has no `tool_search_mode()` yet, so the two native
-//! providers expose the mode through an inherent accessor; see
-//! `MODEL__GAP_TRACKER.md` §4.2 for the cross-module request.
+//! Core's `Model` trait exposes `tool_search_mode()`, so the two native
+//! providers override it in their `Model` impl; the crate-local enum here is the
+//! metadata spelling used by `mode_of` ([`METADATA_MODE`]).
 
 use agentscope_core::message::JsonMap;
 use agentscope_core::ToolSchema;

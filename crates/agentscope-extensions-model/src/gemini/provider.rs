@@ -109,10 +109,17 @@ impl ModelProvider for GeminiModelProvider {
             crate::gemini::credential::DEFAULT_BASE_URL,
         );
 
+        // Formatter selector (mirrors Java's `GeminiModelProvider` resolving an
+        // assignable `Formatter` component). Consumed here so it never reaches
+        // the request body.
+        let mut default_options = ctx.options.clone();
+        let multi_agent_prompt = crate::common::take_multi_agent_prompt(&mut default_options);
+
         let model = GeminiChatModel::new(model_name, api_key, Some(base_url), default_transport())
-            .with_default_options(ctx.options.clone())
+            .with_default_options(default_options)
             .with_stream(ctx.stream.unwrap_or(true))
-            .with_context_window_size(context_window_size);
+            .with_context_window_size(context_window_size)
+            .with_multi_agent_formatter(multi_agent_prompt);
         Ok(Arc::new(model))
     }
 }
