@@ -41,6 +41,13 @@ pub const MAX_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// COS rejects an upload with more than 10000 parts.
 pub const MAX_MULTIPART_PARTS: u64 = 10_000;
 
+/// Largest body COS accepts in a **single** `PUT` (5 GiB). Anything bigger must be
+/// uploaded in parts, which is what the SDK `TransferManager` exists for.
+pub const MAX_SINGLE_PUT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
+/// COS caps `max-parts` on `ListParts` at 1000.
+pub const MAX_LIST_PARTS: usize = 1000;
+
 /// Number of parts uploaded at the same time.
 ///
 /// Java: `TransferManagerUtils.createDefaultExecutorService()` builds a
@@ -48,6 +55,18 @@ pub const MAX_MULTIPART_PARTS: u64 = 10_000;
 /// unless the caller supplies its own executor. Raise it through
 /// `CosHttpObjectStoreBuilder::multipart_concurrency`.
 pub const DEFAULT_MULTIPART_CONCURRENCY: usize = 1;
+
+/// One part the service already holds for an in-flight multipart upload
+/// (COS `ListParts` → `<Part><PartNumber>..</PartNumber><ETag>..</ETag><Size>..</Size>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UploadedPart {
+    /// 1-based part number.
+    pub part_number: u32,
+    /// Quoted-stripped ETag the service assigned to the part.
+    pub etag: String,
+    /// Stored part size in bytes (used to detect a resume against different data).
+    pub size: u64,
+}
 
 /// How a body is split into parts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

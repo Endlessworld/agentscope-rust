@@ -57,6 +57,7 @@
 //! # Ok(()) }
 //! ```
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -67,7 +68,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::{Method, Response, StatusCode};
 
-use crate::multipart::{self, MultipartPlan};
+use crate::multipart::{self, MultipartPlan, UploadedPart};
 use crate::object_store::{
     ConditionalWrite, CosObjectStore, EtaggedObject, ObjectListPage, DEFAULT_LIST_PAGE_SIZE,
 };
@@ -335,7 +336,9 @@ impl CosHttpObjectStoreBuilder {
     ///
     /// Defaults to [`multipart::DEFAULT_MULTIPART_THRESHOLD`] (5 MiB, the Java SDK
     /// `TransferManagerConfiguration` value). `0` forces multipart for every body;
-    /// `u64::MAX` disables it.
+    /// values above [`multipart::MAX_SINGLE_PUT_SIZE`] (5 GiB) are rejected at build
+    /// time, because COS refuses a single `PUT` that large — raise
+    /// [`Self::multipart_part_size`] instead of disabling multipart.
     pub fn multipart_threshold(mut self, bytes: u64) -> Self {
         self.multipart_threshold = Some(bytes);
         self
@@ -447,6 +450,18 @@ impl CosHttpObjectStoreBuilder {
             )));
         }
 
+        let multipart_threshold = self
+            .multipart_threshold
+            .unwrap_or(multipart::DEFAULT_MULTIPART_THRESHOLD);
+        if multipart_threshold > multipart::MAX_SINGLE_PUT_SIZE {
+            return Err(CosError::Config(format!(
+                "multipart threshold must not exceed the {} byte single-PUT limit (COS caps a \
+                 single PUT at that size); raise the part size instead of disabling multipart, \
+                 got {multipart_threshold}",
+                multipart::MAX_SINGLE_PUT_SIZE
+            )));
+        }
+
         let multipart_concurrency = self
             .multipart_concurrency
             .unwrap_or(multipart::DEFAULT_MULTIPART_CONCURRENCY);
@@ -488,9 +503,7 @@ impl CosHttpObjectStoreBuilder {
                 endpoint,
                 credentials,
                 sign_expire_secs: self.sign_expire_secs.unwrap_or(DEFAULT_SIGN_EXPIRE_SECS),
-                multipart_threshold: self
-                    .multipart_threshold
-                    .unwrap_or(multipart::DEFAULT_MULTIPART_THRESHOLD),
+                multipart_threshold,
                 multipart_part_size,
                 multipart_concurrency,
                 connect_timeout,
@@ -610,7 +623,22 @@ impl CosHttpObjectStore {
     /// `expire_secs` overrides the client's `sign_expire_secs` (default 900 s); the
     /// value must be `1..=604800`. No request is issued.
     pub fn presign_get(&self, key: &str, expire_secs: Option<u64>) -> Result<String> {
-        self.presign("GET", key, expire_secs)
+        self.presign("GET", key, &[], expire_secs)
+    }
+
+    /// Signs a `GET` URL that also carries business parameters the receiver must
+    /// send verbatim, e.g. `response-content-disposition` or
+    /// `response-content-type` (COS then answers with the overridden headers).
+    ///
+    /// Every parameter is signed, so it shows up in `q-url-param-list`; names are
+    /// lowercased and must not start with `q-` (reserved by the signature itself).
+    pub fn presign_get_with_params(
+        &self,
+        key: &str,
+        params: &[(&str, &str)],
+        expire_secs: Option<u64>,
+    ) -> Result<String> {
+        self.presign("GET", key, params, expire_secs)
     }
 
     /// Signs a URL that lets an ordinary HTTP client `PUT` `key`.
@@ -618,10 +646,27 @@ impl CosHttpObjectStore {
     /// Only `host` is signed (plus the session token as a query parameter), so the
     /// uploader must not add headers the signature would not cover.
     pub fn presign_put(&self, key: &str, expire_secs: Option<u64>) -> Result<String> {
-        self.presign("PUT", key, expire_secs)
+        self.presign("PUT", key, &[], expire_secs)
     }
 
-    fn presign(&self, method: &str, key: &str, expire_secs: Option<u64>) -> Result<String> {
+    /// Signs a `PUT` URL with extra signed business parameters (see
+    /// [`Self::presign_get_with_params`]).
+    pub fn presign_put_with_params(
+        &self,
+        key: &str,
+        params: &[(&str, &str)],
+        expire_secs: Option<u64>,
+    ) -> Result<String> {
+        self.presign("PUT", key, params, expire_secs)
+    }
+
+    fn presign(
+        &self,
+        method: &str,
+        key: &str,
+        extra_params: &[(&str, &str)],
+        expire_secs: Option<u64>,
+    ) -> Result<String> {
         self.ensure_open()?;
         let expire = presign::resolve_expire_secs(expire_secs, self.config.sign_expire_secs)?;
 
@@ -630,6 +675,15 @@ impl CosHttpObjectStore {
         let mut params: Vec<(String, String)> = Vec::new();
         if let Some(token) = self.config.credentials.security_token() {
             params.push(("x-cos-security-token".to_string(), token.to_string()));
+        }
+        for (name, value) in extra_params {
+            let name = name.trim().to_ascii_lowercase();
+            if name.is_empty() || name.starts_with("q-") {
+                return Err(CosError::Config(format!(
+                    "presigned URL parameter {name:?} is empty or reserved by the signature (q-*)"
+                )));
+            }
+            params.push((name, value.to_string()));
         }
 
         let start = (self.config.clock)();
@@ -659,6 +713,17 @@ impl CosHttpObjectStore {
     /// Fails with [`CosError::Config`] when the body is empty, the configured part
     /// size is outside the COS range, or the object would need more than 10000 parts.
     pub async fn put_multipart(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.put_multipart_with(key, data, |_, _| {}).await
+    }
+
+    /// [`Self::put_multipart`] that reports progress.
+    ///
+    /// `on_progress(completed_parts, total_parts)` is called once before the first
+    /// upload and again after every part the service accepted.
+    pub async fn put_multipart_with<F>(&self, key: &str, data: &[u8], on_progress: F) -> Result<()>
+    where
+        F: FnMut(usize, usize),
+    {
         self.ensure_open()?;
         let plan = multipart::plan_parts(data.len(), self.config.multipart_part_size as usize)?;
         let upload_id = self.initiate_multipart(key).await?;
@@ -667,7 +732,7 @@ impl CosHttpObjectStore {
         // linger in the bucket and keep being billed (COS docs, Complete Multipart
         // Upload: "建议您及时完成分块上传或者舍弃分块上传").
         match self
-            .upload_parts_and_complete(key, &upload_id, data, plan)
+            .upload_parts_and_complete(key, &upload_id, data, plan, BTreeMap::new(), on_progress)
             .await
         {
             Ok(()) => Ok(()),
@@ -685,46 +750,137 @@ impl CosHttpObjectStore {
         }
     }
 
-    async fn upload_parts_and_complete(
+    /// Resumes the in-flight multipart upload `upload_id` of `key` with `data`.
+    ///
+    /// [`Self::list_parts`] reports which parts the service already stores; those
+    /// whose size matches the plan are kept (their ETag is reused on completion),
+    /// every other one is (re)uploaded. A failure leaves the upload **open** so the
+    /// caller can retry, or discard it with [`Self::abort_multipart`].
+    pub async fn resume_multipart(&self, key: &str, upload_id: &str, data: &[u8]) -> Result<()> {
+        self.resume_multipart_with(key, upload_id, data, |_, _| {})
+            .await
+    }
+
+    /// [`Self::resume_multipart`] with a progress callback (see
+    /// [`Self::put_multipart_with`]).
+    pub async fn resume_multipart_with<F>(
+        &self,
+        key: &str,
+        upload_id: &str,
+        data: &[u8],
+        on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, usize),
+    {
+        self.ensure_open()?;
+        let plan = multipart::plan_parts(data.len(), self.config.multipart_part_size as usize)?;
+        let mut completed: BTreeMap<u32, String> = BTreeMap::new();
+        for part in self.list_parts(key, upload_id).await? {
+            let Some((start, end)) = plan.range(part.part_number) else {
+                continue;
+            };
+            // A size mismatch means the caller's data changed under the same upload id,
+            // so that part has to travel again.
+            if !part.etag.is_empty() && part.size == (end - start) as u64 {
+                completed.insert(part.part_number, part.etag);
+            }
+        }
+        self.upload_parts_and_complete(key, upload_id, data, plan, completed, on_progress)
+            .await
+    }
+
+    /// `GET /{key}?uploadId=..` — the parts the service already holds.
+    ///
+    /// Follows `part-number-marker` pagination (`max-parts` is capped at 1000).
+    pub async fn list_parts(&self, key: &str, upload_id: &str) -> Result<Vec<UploadedPart>> {
+        self.ensure_open()?;
+        let mut parts = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut params = vec![
+                ("uploadId".to_string(), upload_id.to_string()),
+                ("max-parts".to_string(), multipart::MAX_LIST_PARTS.to_string()),
+            ];
+            if let Some(marker) = &marker {
+                params.push(("part-number-marker".to_string(), marker.clone()));
+            }
+            let response = self.send(Method::GET, Some(key), &params, None, &[]).await?;
+            let response = ensure_success(response).await?;
+            let body = response.text().await.map_err(|e| {
+                CosError::Backend(format!("failed to read COS ListParts response: {e}"))
+            })?;
+            parts.extend(parse_list_parts(&body));
+
+            let truncated = xml_text(&body, "istruncated")
+                .map(|value| value.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !truncated {
+                return Ok(parts);
+            }
+            match xml_text(&body, "nextpartnumbermarker") {
+                Some(next) if !next.trim().is_empty() => marker = Some(next.trim().to_string()),
+                // Without a marker there is nothing to continue from; stop instead of
+                // looping forever.
+                _ => return Ok(parts),
+            }
+        }
+    }
+
+    /// Uploads every part not already in `completed` (part number → ETag) and then
+    /// completes the upload.
+    ///
+    /// `completed` accumulates the ETags of this attempt on top of the parts the
+    /// service already stored, so a resumed upload completes with both.
+    async fn upload_parts_and_complete<F>(
         &self,
         key: &str,
         upload_id: &str,
         data: &[u8],
         plan: MultipartPlan,
-    ) -> Result<()> {
+        mut completed: BTreeMap<u32, String>,
+        mut on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, usize),
+    {
         // Owned once so concurrently spawned part uploads can borrow it.
         let body = Arc::new(data.to_vec());
         let concurrency = self.config.multipart_concurrency.max(1);
-        let mut etags: Vec<(u32, String)> = Vec::with_capacity(plan.part_count);
+        let pending: Vec<u32> = (1..=plan.part_count as u32)
+            .filter(|part_number| !completed.contains_key(part_number))
+            .collect();
 
-        for chunk_start in (1..=plan.part_count).step_by(concurrency) {
+        let mut done = completed.len();
+        on_progress(done, plan.part_count);
+
+        for chunk in pending.chunks(concurrency) {
             let mut tasks = tokio::task::JoinSet::new();
-            for part_number in chunk_start..=(chunk_start + concurrency - 1).min(plan.part_count) {
+            for &part_number in chunk {
                 let store = self.clone();
                 let key = key.to_string();
                 let upload_id = upload_id.to_string();
                 let body = Arc::clone(&body);
-                let Some((start, end)) = plan.range(part_number as u32) else {
+                let Some((start, end)) = plan.range(part_number) else {
                     return Err(CosError::Backend(format!(
                         "multipart plan has no range for part {part_number}"
                     )));
                 };
                 tasks.spawn(async move {
                     store
-                        .upload_part(
-                            &key,
-                            &upload_id,
-                            part_number as u32,
-                            body[start..end].to_vec(),
-                        )
+                        .upload_part(&key, &upload_id, part_number, body[start..end].to_vec())
                         .await
-                        .map(|etag| (part_number as u32, etag))
+                        .map(|etag| (part_number, etag))
                 });
             }
 
             while let Some(joined) = tasks.join_next().await {
                 match joined {
-                    Ok(Ok(etag)) => etags.push(etag),
+                    Ok(Ok((part_number, etag))) => {
+                        completed.insert(part_number, etag);
+                        done += 1;
+                        on_progress(done, plan.part_count);
+                    }
                     Ok(Err(err)) => return Err(err),
                     Err(join_err) => {
                         return Err(CosError::Backend(format!(
@@ -735,8 +891,9 @@ impl CosHttpObjectStore {
             }
         }
 
-        // COS answers `400 InvalidPartOrder` unless parts are listed by number.
-        etags.sort_by_key(|(part_number, _)| *part_number);
+        // COS answers `400 InvalidPartOrder` unless parts are listed by number, which
+        // walking a `BTreeMap` guarantees.
+        let etags: Vec<(u32, String)> = completed.into_iter().collect();
         self.complete_multipart(key, upload_id, &etags).await
     }
 
@@ -822,8 +979,9 @@ impl CosHttpObjectStore {
         Ok(())
     }
 
-    /// `DELETE /{key}?uploadId=..`; a 404 (`NoSuchUpload`) means already gone.
-    async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
+    /// `DELETE /{key}?uploadId=..` — discards an in-flight multipart upload and its
+    /// parts (a `404 NoSuchUpload` means it is already gone).
+    pub async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
         let response = self
             .send(
                 Method::DELETE,
@@ -1403,6 +1561,87 @@ fn parse_list_keys(xml: &str) -> Vec<String> {
         }
     }
     keys
+}
+
+/// Collects every `<Part>` of a COS `ListPartsResult`
+/// (`<PartNumber>`, `<ETag>`, `<Size>`).
+///
+/// Entries without a usable part number are dropped; a missing/unparsable `<Size>`
+/// becomes `0`, which makes [`crate::CosHttpObjectStore::resume_multipart`] treat the
+/// part as "not stored yet" and upload it again.
+fn parse_list_parts(xml: &str) -> Vec<UploadedPart> {
+    #[derive(Clone, Copy)]
+    enum Field {
+        PartNumber,
+        ETag,
+        Size,
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut in_part = false;
+    let mut field: Option<Field> = None;
+    let mut buf = String::new();
+    let mut part = UploadedPart::default();
+    let mut parts = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match local_name(&e).as_str() {
+                "part" => {
+                    in_part = true;
+                    part = UploadedPart::default();
+                }
+                "partnumber" if in_part => {
+                    field = Some(Field::PartNumber);
+                    buf.clear();
+                }
+                "etag" if in_part => {
+                    field = Some(Field::ETag);
+                    buf.clear();
+                }
+                "size" if in_part => {
+                    field = Some(Field::Size);
+                    buf.clear();
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) => match local_name_end(&e).as_str() {
+                "part" if in_part => {
+                    in_part = false;
+                    if part.part_number > 0 {
+                        parts.push(std::mem::take(&mut part));
+                    }
+                }
+                "partnumber" | "etag" | "size" if in_part => match field.take() {
+                    Some(Field::PartNumber) => part.part_number = buf.trim().parse().unwrap_or(0),
+                    Some(Field::ETag) => part.etag = multipart::normalize_etag(&buf),
+                    Some(Field::Size) => part.size = buf.trim().parse().unwrap_or(0),
+                    None => {}
+                },
+                _ => {}
+            },
+            Ok(Event::Text(e)) => {
+                if field.is_some() {
+                    if let Ok(decoded) = e.decode() {
+                        if let Ok(unescaped) = quick_xml::escape::unescape(&decoded) {
+                            buf.push_str(&unescaped);
+                        }
+                    }
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if field.is_some() {
+                    if let Ok(decoded) = e.decode() {
+                        buf.push_str(&decoded);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    parts
 }
 
 fn local_name(event: &quick_xml::events::BytesStart<'_>) -> String {
@@ -2591,6 +2830,312 @@ mod tests {
         any_request.assert_hits_async(0).await;
     }
 
+    /// `ListParts` is signed with `uploadId` + `max-parts` and a truncated answer is
+    /// followed with `part-number-marker`.
+    #[tokio::test]
+    async fn list_parts_follows_part_number_markers() {
+        let server = MockServer::start_async().await;
+        let store = multipart_store(&server, 0, MIB as u64, 1);
+        let key = "blob.bin";
+
+        let first_params = vec![
+            ("uploadId".to_string(), "u-list".to_string()),
+            (
+                "max-parts".to_string(),
+                multipart::MAX_LIST_PARTS.to_string(),
+            ),
+        ];
+        let first_auth = expected_authorization(&store, "GET", Some(key), &first_params, &[]);
+        let first_page = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/blob.bin")
+                    .query_param("uploadId", "u-list")
+                    .query_param("max-parts", multipart::MAX_LIST_PARTS.to_string())
+                    .header("authorization", first_auth.as_str());
+                then.status(200).body(
+                    "<ListPartsResult><Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
+                     <Size>1048576</Size></Part><IsTruncated>true</IsTruncated>\
+                     <NextPartNumberMarker>1</NextPartNumberMarker></ListPartsResult>",
+                );
+            })
+            .await;
+
+        let second_params = vec![
+            ("uploadId".to_string(), "u-list".to_string()),
+            (
+                "max-parts".to_string(),
+                multipart::MAX_LIST_PARTS.to_string(),
+            ),
+            ("part-number-marker".to_string(), "1".to_string()),
+        ];
+        let second_auth = expected_authorization(&store, "GET", Some(key), &second_params, &[]);
+        let second_page = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/blob.bin")
+                    .query_param("uploadId", "u-list")
+                    .query_param("part-number-marker", "1")
+                    .header("authorization", second_auth.as_str());
+                then.status(200).body(
+                    "<ListPartsResult><Part><PartNumber>2</PartNumber><ETag>\"e2\"</ETag>\
+                     <Size>524288</Size></Part><IsTruncated>false</IsTruncated></ListPartsResult>",
+                );
+            })
+            .await;
+
+        let parts = store.list_parts(key, "u-list").await.unwrap();
+        assert_eq!(
+            parts,
+            vec![
+                UploadedPart {
+                    part_number: 1,
+                    etag: "e1".to_string(),
+                    size: MIB as u64,
+                },
+                UploadedPart {
+                    part_number: 2,
+                    etag: "e2".to_string(),
+                    size: 524_288,
+                },
+            ]
+        );
+        first_page.assert_hits_async(1).await;
+        second_page.assert_hits_async(1).await;
+    }
+
+    /// `resume_multipart` keeps the parts `ListParts` reports with the expected size,
+    /// uploads only the missing ones and completes with both ETags in part order.
+    #[tokio::test]
+    async fn resume_multipart_skips_parts_the_service_already_holds() {
+        let server = MockServer::start_async().await;
+        let store = multipart_store(&server, 0, MIB as u64, 1);
+        let key = "blob.bin";
+        let data: Vec<u8> = vec![b'r'; 2 * MIB];
+
+        let list_params = vec![
+            ("uploadId".to_string(), "u-resume".to_string()),
+            (
+                "max-parts".to_string(),
+                multipart::MAX_LIST_PARTS.to_string(),
+            ),
+        ];
+        let list_auth = expected_authorization(&store, "GET", Some(key), &list_params, &[]);
+        server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/blob.bin")
+                    .query_param("uploadId", "u-resume")
+                    .header("authorization", list_auth.as_str());
+                then.status(200).body(
+                    "<ListPartsResult><Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
+                     <Size>1048576</Size></Part><IsTruncated>false</IsTruncated></ListPartsResult>",
+                );
+            })
+            .await;
+
+        let part1 = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/blob.bin")
+                    .query_param("partNumber", "1")
+                    .query_param("uploadId", "u-resume");
+                then.status(200).header("ETag", r#""fresh""#);
+            })
+            .await;
+        let part2 = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/blob.bin")
+                    .query_param("partNumber", "2")
+                    .query_param("uploadId", "u-resume");
+                then.status(200).header("ETag", r#""e2""#);
+            })
+            .await;
+        let complete = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/blob.bin")
+                    .query_param("uploadId", "u-resume")
+                    .body(
+                        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+                         <ETag>\"e1\"</ETag></Part><Part><PartNumber>2</PartNumber>\
+                         <ETag>\"e2\"</ETag></Part></CompleteMultipartUpload>",
+                    );
+                then.status(200);
+            })
+            .await;
+
+        let mut progress = Vec::new();
+        store
+            .resume_multipart_with(key, "u-resume", &data, |done, total| {
+                progress.push((done, total))
+            })
+            .await
+            .unwrap();
+
+        part1.assert_hits_async(0).await;
+        part2.assert_hits_async(1).await;
+        complete.assert_hits_async(1).await;
+        assert_eq!(progress, vec![(1, 2), (2, 2)]);
+    }
+
+    /// A stored part whose size does not match the plan is uploaded again: the data
+    /// changed under the same upload id.
+    #[tokio::test]
+    async fn resume_multipart_reuploads_a_part_with_a_stale_size() {
+        let server = MockServer::start_async().await;
+        let store = multipart_store(&server, 0, MIB as u64, 1);
+        let key = "blob.bin";
+        let data: Vec<u8> = vec![b's'; 2 * MIB];
+
+        server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/blob.bin")
+                    .query_param("uploadId", "u-stale");
+                then.status(200).body(
+                    "<ListPartsResult><Part><PartNumber>1</PartNumber><ETag>\"old\"</ETag>\
+                     <Size>7</Size></Part><IsTruncated>false</IsTruncated></ListPartsResult>",
+                );
+            })
+            .await;
+        let part1 = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/blob.bin")
+                    .query_param("partNumber", "1")
+                    .query_param("uploadId", "u-stale");
+                then.status(200).header("ETag", r#""new1""#);
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/blob.bin")
+                    .query_param("partNumber", "2")
+                    .query_param("uploadId", "u-stale");
+                then.status(200).header("ETag", r#""new2""#);
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/blob.bin")
+                    .query_param("uploadId", "u-stale");
+                then.status(200);
+            })
+            .await;
+
+        store.resume_multipart(key, "u-stale", &data).await.unwrap();
+        part1.assert_hits_async(1).await;
+    }
+
+    /// A failed resume must **not** discard the upload: the parts already stored stay
+    /// usable for the next attempt, so no `DELETE ?uploadId` is sent.
+    #[tokio::test]
+    async fn resume_leaves_the_upload_open_when_a_part_fails() {
+        let server = MockServer::start_async().await;
+        let store = multipart_store(&server, 0, MIB as u64, 1);
+        let key = "blob.bin";
+        let data: Vec<u8> = vec![b'f'; 2 * MIB];
+
+        server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/blob.bin")
+                    .query_param("uploadId", "u-open");
+                then.status(200)
+                    .body("<ListPartsResult><IsTruncated>false</IsTruncated></ListPartsResult>");
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/blob.bin")
+                    .query_param("partNumber", "1")
+                    .query_param("uploadId", "u-open");
+                then.status(200).header("ETag", r#""e1""#);
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/blob.bin")
+                    .query_param("partNumber", "2")
+                    .query_param("uploadId", "u-open");
+                then.status(403)
+                    .body("<Error><Code>SignatureDoesNotMatch</Code></Error>");
+            })
+            .await;
+        let abort = server
+            .mock_async(|when, then| {
+                when.method(DELETE)
+                    .path("/blob.bin")
+                    .query_param("uploadId", "u-open");
+                then.status(204);
+            })
+            .await;
+        let complete = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/blob.bin")
+                    .query_param("uploadId", "u-open");
+                then.status(200);
+            })
+            .await;
+
+        let err = store.resume_multipart(key, "u-open", &data).await.unwrap_err();
+        assert_eq!(err.status(), Some(403));
+        abort.assert_hits_async(0).await;
+        complete.assert_hits_async(0).await;
+    }
+
+    /// Progress is reported once before the first upload and after every accepted
+    /// part.
+    #[tokio::test]
+    async fn put_multipart_reports_progress() {
+        let server = MockServer::start_async().await;
+        let store = multipart_store(&server, 0, MIB as u64, 1);
+        let data: Vec<u8> = vec![b'p'; 2 * MIB];
+
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/k").query_param("uploads", "");
+                then.status(200).body(
+                    r#"<InitiateMultipartUploadResult><UploadId>u-progress</UploadId></InitiateMultipartUploadResult>"#,
+                );
+            })
+            .await;
+        for part_number in 1..=2 {
+            server
+                .mock_async(move |when, then| {
+                    when.method(PUT)
+                        .path("/k")
+                        .query_param("partNumber", part_number.to_string())
+                        .query_param("uploadId", "u-progress");
+                    then.status(200)
+                        .header("ETag", format!("\"e{part_number}\""));
+                })
+                .await;
+        }
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/k")
+                    .query_param("uploadId", "u-progress");
+                then.status(200);
+            })
+            .await;
+
+        let mut progress = Vec::new();
+        store
+            .put_multipart_with("k", &data, |done, total| progress.push((done, total)))
+            .await
+            .unwrap();
+        assert_eq!(progress, vec![(0, 2), (1, 2), (2, 2)]);
+    }
+
     /// Part size, concurrency and threshold are validated eagerly and exposed.
     #[test]
     fn multipart_settings_are_validated_and_exposed() {
@@ -2630,6 +3175,26 @@ mod tests {
 
         let err = builder().multipart_concurrency(0).build().unwrap_err();
         assert!(err.to_string().contains("concurrency must be at least 1"));
+
+        // A threshold above the 5 GiB single-PUT cap would make `put` send an
+        // oversized single PUT (COS refuses it), so it is rejected eagerly.
+        let err = builder().multipart_threshold(u64::MAX).build().unwrap_err();
+        assert!(err.to_string().contains("single-PUT limit"));
+        let err = builder()
+            .multipart_threshold(multipart::MAX_SINGLE_PUT_SIZE + 1)
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("single-PUT limit"));
+        // The cap itself stays accepted: multipart starts right at 5 GiB.
+        assert_eq!(
+            builder()
+                .multipart_threshold(multipart::MAX_SINGLE_PUT_SIZE)
+                .build()
+                .unwrap()
+                .config()
+                .multipart_threshold(),
+            multipart::MAX_SINGLE_PUT_SIZE
+        );
 
         // Settings survive into the config.
         let store = builder()
@@ -2823,6 +3388,74 @@ mod tests {
             KEY_TIME,
         );
         assert!(url.ends_with(&expected.signature));
+    }
+
+    /// Business parameters (`response-content-*`) are signed, so they appear in
+    /// `q-url-param-list` and the value can be passed through verbatim.
+    #[tokio::test]
+    async fn presign_get_with_params_signs_the_business_parameters() {
+        let server = MockServer::start_async().await;
+        let store = store_for(&server);
+        let params = [(
+            "Response-Content-Disposition",
+            "attachment; filename=\"a b.json\"",
+        )];
+
+        let url = store
+            .presign_get_with_params("a b.json", &params, Some(60))
+            .unwrap();
+
+        let signed = signature::sign_request(
+            &CosCredentials::new("AKIDexample", "secret-key"),
+            "GET",
+            "/a b.json",
+            // Names are lowercased before signing, matching `canonical_pairs`.
+            &[(
+                "response-content-disposition".to_string(),
+                params[0].1.to_string(),
+            )],
+            &[("host".to_string(), store.config().host())],
+            "1700000000;1700000060",
+        );
+        assert_eq!(
+            url,
+            format!(
+                "{}/a%20b.json?response-content-disposition=\
+                 attachment%3B%20filename%3D%22a%20b.json%22&{}",
+                server.base_url(),
+                signed.authorization
+            )
+        );
+        assert!(url.contains("&q-url-param-list=response-content-disposition&q-signature="));
+        // The plain variant is unaffected (no parameter list, no extra query keys).
+        assert!(store
+            .presign_get("a b.json", None)
+            .unwrap()
+            .contains("&q-url-param-list=&"));
+    }
+
+    /// Parameter names reserved by the signature itself are rejected instead of
+    /// producing a URL that cannot be verified.
+    #[test]
+    fn presign_rejects_reserved_parameter_names() {
+        let store = CosHttpObjectStore::new(BUCKET, "ap-beijing", "id", "key").unwrap();
+
+        let err = store
+            .presign_get_with_params("k", &[("q-sign-time", "0;1")], None)
+            .unwrap_err();
+        assert!(err.to_string().contains("reserved by the signature"));
+
+        let err = store
+            .presign_get_with_params("k", &[("  ", "x")], None)
+            .unwrap_err();
+        assert!(err.to_string().contains("reserved by the signature"));
+
+        // The `PUT` variant signs its parameters the same way.
+        let url = store
+            .presign_put_with_params("k", &[("response-content-type", "text/plain")], None)
+            .unwrap();
+        assert!(url.contains("response-content-type=text%2Fplain"));
+        assert!(url.contains("&q-url-param-list=response-content-type&q-signature="));
     }
 
     #[tokio::test]
