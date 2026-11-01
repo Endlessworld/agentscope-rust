@@ -916,6 +916,48 @@ mod tests {
         })
     }
 
+    /// A client whose `create` hands back the observable [`ClosingSandbox`].
+    #[derive(Debug, Clone)]
+    struct ClosingSandboxClient {
+        counters: Arc<CloseCounters>,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxClient for ClosingSandboxClient {
+        async fn create(
+            &self,
+            _workspace_spec: &WorkspaceSpec,
+            _snapshot_spec: Option<&dyn SandboxSnapshotSpec>,
+            _options: Option<&SandboxClientOptions>,
+        ) -> Result<Box<dyn Sandbox>> {
+            Ok(Box::new(ClosingSandbox {
+                state: closing_state(),
+                counters: Arc::clone(&self.counters),
+            }))
+        }
+
+        async fn resume(&self, _state: &SandboxState) -> Result<Box<dyn Sandbox>> {
+            Ok(Box::new(ClosingSandbox {
+                state: closing_state(),
+                counters: Arc::clone(&self.counters),
+            }))
+        }
+
+        async fn delete(&self, _sandbox: &dyn Sandbox) -> Result<()> {
+            Ok(())
+        }
+
+        fn serialize_state(&self, state: &SandboxState) -> Result<String> {
+            serde_json::to_string(state)
+                .map_err(|e| agentscope_core::error::Error::Other(e.to_string()))
+        }
+
+        fn deserialize_state(&self, json: &str) -> Result<SandboxState> {
+            serde_json::from_str(json)
+                .map_err(|e| agentscope_core::error::Error::Other(e.to_string()))
+        }
+    }
+
     #[tokio::test]
     async fn release_closes_a_self_managed_sandbox() {
         let counters = Arc::new(CloseCounters::default());
@@ -943,6 +985,54 @@ mod tests {
         );
     }
 
+    /// Teardown of the sandbox the **client** created, end to end.
+    ///
+    /// A backend's `kill_sandbox` rides on `Sandbox::close` (stop → snapshot, shutdown →
+    /// destroy), so this pins the manager-level path: acquire from the client, release, and
+    /// the client's sandbox is destroyed exactly once while the isolation key is freed.
+    #[tokio::test]
+    async fn release_kills_the_client_created_sandbox_and_frees_the_key() {
+        let guard = RecordingGuard::default();
+        let observed = guard.clone();
+        let counters = Arc::new(CloseCounters::default());
+        let manager = SandboxManager::with_guard(
+            Arc::new(ClosingSandboxClient {
+                counters: Arc::clone(&counters),
+            }),
+            Arc::new(InMemorySandboxStateStore::new()),
+            "test-agent",
+            guard,
+        );
+        let context = agent_scoped_context();
+        let key = SandboxIsolationKey::new("agent", "test-agent");
+
+        let result = manager.acquire(&context, None).await.unwrap();
+        assert_eq!(result.lease_key(), Some(&key));
+        manager.release(result).await;
+
+        assert_eq!(
+            counters.stops.load(Ordering::SeqCst),
+            1,
+            "release must close() the sandbox the client created"
+        );
+        assert_eq!(
+            counters.shutdowns.load(Ordering::SeqCst),
+            1,
+            "close() must destroy the backend resources (the provider-side kill)"
+        );
+        assert!(
+            !observed.is_held(&key),
+            "release must free the isolation key"
+        );
+
+        // The key is free: a second acquire/release cycle tears the sandbox down again.
+        let again = manager.acquire(&context, None).await.unwrap();
+        assert!(observed.is_held(&key));
+        manager.release(again).await;
+        assert_eq!(counters.shutdowns.load(Ordering::SeqCst), 2);
+        assert!(!observed.is_held(&key));
+    }
+
     #[tokio::test]
     async fn release_leaves_a_user_managed_sandbox_alive() {
         let counters = Arc::new(CloseCounters::default());
@@ -964,5 +1054,91 @@ mod tests {
             "the caller owns a user-managed sandbox and reuses it"
         );
         assert_eq!(counters.shutdowns.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingCloseCounters {
+        closes: AtomicUsize,
+        shutdowns: AtomicUsize,
+    }
+
+    /// A sandbox whose `close()` fails *before* it ever reached `shutdown()`, so only the
+    /// manager's fail-closed fallback can destroy the backend.
+    #[derive(Debug)]
+    struct FailingCloseSandbox {
+        state: SandboxState,
+        counters: Arc<FailingCloseCounters>,
+    }
+
+    #[async_trait::async_trait]
+    impl Sandbox for FailingCloseSandbox {
+        async fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> Result<()> {
+            self.counters.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            self.counters.closes.fetch_add(1, Ordering::SeqCst);
+            Err(agentscope_core::error::Error::Other(
+                "snapshot failed".to_string(),
+            ))
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn state(&self) -> &SandboxState {
+            &self.state
+        }
+
+        async fn exec(
+            &self,
+            _runtime_context: Option<&RuntimeContext>,
+            _command: &str,
+            _timeout_seconds: Option<u64>,
+        ) -> Result<ExecResult> {
+            unreachable!("the teardown tests never execute commands")
+        }
+
+        async fn persist_workspace(&self) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        async fn hydrate_workspace(&self, _archive: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Fail-closed teardown: a failed `close()` must not leave the backend alive.
+    #[tokio::test]
+    async fn release_still_shuts_down_when_close_fails() {
+        let counters = Arc::new(FailingCloseCounters::default());
+        let manager = SandboxManager::new(
+            Arc::new(MockSandboxClient),
+            Arc::new(InMemorySandboxStateStore::new()),
+            "test-agent",
+        );
+        let result = SandboxAcquireResult::self_managed_no_guard(Box::new(FailingCloseSandbox {
+            state: closing_state(),
+            counters: Arc::clone(&counters),
+        }));
+
+        manager.release(result).await;
+
+        assert_eq!(counters.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            counters.shutdowns.load(Ordering::SeqCst),
+            1,
+            "a failed close() must still be followed by shutdown()"
+        );
     }
 }

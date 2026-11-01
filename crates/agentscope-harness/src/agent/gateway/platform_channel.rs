@@ -38,7 +38,7 @@ use agentscope_core::error::{Error, Result};
 use agentscope_core::message::Msg;
 use async_trait::async_trait;
 
-use super::channel::channel::Channel;
+use super::channel::channel::{unsupported_delivery_receipt, Channel, DeliveryReceipt};
 use super::channel::config::ChannelConfig;
 use super::channel::inbound::InboundMessage;
 use super::channel::router::{ChannelRouter, RouteResult};
@@ -170,6 +170,25 @@ pub trait PlatformChannel: Send + Sync {
     /// best-effort, mirroring the Java controllers that log and still answer 2xx.
     async fn deliver_reply(&self, address: &OutboundAddress, messages: Vec<Msg>) -> Result<()>;
 
+    /// Delivers one message and returns the provider's delivery receipt.
+    ///
+    /// Same contract as [`Channel::deliver_with_receipt`]: a platform whose transport reports a
+    /// provider message id (Feishu's `message_id`, Weixin's `msgid`, ...) overrides it, and every
+    /// other platform keeps the fail-closed default so a durable-delivery worker never mistakes
+    /// "not implemented" for "delivered".
+    ///
+    /// The blanket [`Channel`] / [`ChannelSink`] impls below forward here, which is the only way
+    /// an adapter built on this trait can report a receipt — the blanket impls own both trait
+    /// methods, so an adapter cannot implement them itself.
+    async fn deliver_with_receipt(
+        &self,
+        _address: &OutboundAddress,
+        _message: &Msg,
+        _delivery_id: Option<&str>,
+    ) -> Result<DeliveryReceipt> {
+        Err(unsupported_delivery_receipt(self.ctx().channel_id()))
+    }
+
     /// Full inbound turn: route, run, and deliver the reply back out.
     async fn dispatch(&self, message: InboundMessage) -> Result<Msg> {
         let (reply, address) = self.ctx().run_turn(&message, None).await?;
@@ -201,6 +220,15 @@ impl<T: PlatformChannel + ?Sized> Channel for T {
     fn apply_routing_config(&self, new_config: ChannelConfig) -> bool {
         self.ctx().apply_routing_config(new_config)
     }
+
+    async fn deliver_with_receipt(
+        &self,
+        address: &OutboundAddress,
+        message: &Msg,
+        delivery_id: Option<&str>,
+    ) -> Result<DeliveryReceipt> {
+        PlatformChannel::deliver_with_receipt(self, address, message, delivery_id).await
+    }
 }
 
 /// ...and a harness [`ChannelSink`] too, so proactive outbound delivery (gateway-initiated pushes)
@@ -213,6 +241,30 @@ impl<T: PlatformChannel + ?Sized> ChannelSink for T {
 
     async fn deliver(&self, address: &OutboundAddress, messages: Vec<Msg>) -> Result<()> {
         self.deliver_reply(address, messages).await
+    }
+
+    async fn deliver_with_receipt(
+        &self,
+        address: &OutboundAddress,
+        messages: Vec<Msg>,
+        delivery_id: Option<&str>,
+    ) -> Result<DeliveryReceipt> {
+        // Java's receipt API is single-message: a batch is delivered in order and reports the
+        // last provider receipt, and only a single-message batch carries the caller's delivery
+        // id (a uuid shared by several messages would collapse them in the provider's dedupe
+        // index). Same convention as the `ChannelSink` receipt adapter in the channel crate.
+        let is_single = messages.len() == 1;
+        let mut receipt = DeliveryReceipt::default();
+        for message in &messages {
+            receipt = PlatformChannel::deliver_with_receipt(
+                self,
+                address,
+                message,
+                if is_single { delivery_id } else { None },
+            )
+            .await?;
+        }
+        Ok(receipt)
     }
 }
 
@@ -373,5 +425,118 @@ mod tests {
         let delivered = channel.delivered.lock().unwrap();
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0.to, "wecom:DIRECT:u9");
+    }
+
+    /// A platform adapter whose transport reports the provider's message id.
+    struct ReceiptReportingChannel {
+        core: PlatformCtx,
+        delivered: Mutex<Vec<(OutboundAddress, Vec<Msg>)>>,
+        receipt_calls: Mutex<Vec<Option<String>>>,
+    }
+
+    impl ReceiptReportingChannel {
+        fn new(channel_id: &str, config: ChannelConfig) -> Self {
+            Self {
+                core: PlatformCtx::new(channel_id, config),
+                delivered: Mutex::new(Vec::new()),
+                receipt_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PlatformChannel for ReceiptReportingChannel {
+        fn ctx(&self) -> &PlatformCtx {
+            &self.core
+        }
+
+        async fn deliver_reply(&self, address: &OutboundAddress, messages: Vec<Msg>) -> Result<()> {
+            self.delivered
+                .lock()
+                .unwrap()
+                .push((address.clone(), messages));
+            Ok(())
+        }
+
+        async fn deliver_with_receipt(
+            &self,
+            address: &OutboundAddress,
+            message: &Msg,
+            delivery_id: Option<&str>,
+        ) -> Result<DeliveryReceipt> {
+            self.receipt_calls
+                .lock()
+                .unwrap()
+                .push(delivery_id.map(str::to_string));
+            PlatformChannel::deliver_reply(self, address, vec![message.clone()]).await?;
+            Ok(DeliveryReceipt::with_message_id("mid-1"))
+        }
+    }
+
+    /// The default is fail-closed on both trait views, and a receipt-less platform must not
+    /// deliver either: no receipt means the caller cannot tell a retry from a first attempt.
+    #[tokio::test]
+    async fn default_deliver_with_receipt_is_fail_closed() {
+        let c = RecordingChannel::new("feishu", ChannelConfig::of("feishu"));
+        let address = OutboundAddress::direct("feishu", "feishu:DIRECT:u1");
+
+        let err = Channel::deliver_with_receipt(&c, &address, &Msg::user("hi"), Some("d-1"))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("unsupported"), "{err}");
+        assert!(format!("{err}").contains("feishu"), "{err}");
+
+        let err =
+            ChannelSink::deliver_with_receipt(&c, &address, vec![Msg::user("hi")], Some("d-1"))
+                .await
+                .unwrap_err();
+        assert!(format!("{err}").contains("unsupported"), "{err}");
+
+        assert!(
+            c.delivered.lock().unwrap().is_empty(),
+            "the fail-closed default must not deliver and then report no receipt"
+        );
+    }
+
+    /// An adapter that overrides `PlatformChannel::deliver_with_receipt` must be reachable
+    /// through both blanket impls — they are the only `Channel` / `ChannelSink` an adapter gets.
+    #[tokio::test]
+    async fn blanket_impls_forward_an_overridden_receipt() {
+        let c = ReceiptReportingChannel::new("feishu", ChannelConfig::of("feishu"));
+        let address = OutboundAddress::direct("feishu", "feishu:DIRECT:u1");
+
+        let receipt = Channel::deliver_with_receipt(&c, &address, &Msg::user("hi"), Some("d-1"))
+            .await
+            .unwrap();
+        assert_eq!(receipt.message_id.as_deref(), Some("mid-1"));
+        assert_eq!(c.delivered.lock().unwrap().len(), 1, "delivered once");
+        assert_eq!(
+            c.receipt_calls.lock().unwrap().clone(),
+            vec![Some("d-1".to_string())]
+        );
+
+        // A single-message batch keeps the caller's delivery id...
+        let receipt =
+            ChannelSink::deliver_with_receipt(&c, &address, vec![Msg::user("a")], Some("d-2"))
+                .await
+                .unwrap();
+        assert_eq!(receipt.message_id.as_deref(), Some("mid-1"));
+
+        // ...a multi-message batch drops it and reports the last receipt.
+        let receipt = ChannelSink::deliver_with_receipt(
+            &c,
+            &address,
+            vec![Msg::user("a"), Msg::user("b")],
+            Some("d-3"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.message_id.as_deref(), Some("mid-1"));
+
+        assert_eq!(
+            c.receipt_calls.lock().unwrap().clone(),
+            vec![Some("d-1".to_string()), Some("d-2".to_string()), None, None]
+        );
+        assert_eq!(c.delivered.lock().unwrap().len(), 4);
     }
 }

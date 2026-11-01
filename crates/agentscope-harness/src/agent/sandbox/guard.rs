@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex};
 /// and the release `async` lets every backend just `await tokio::time::sleep`.
 ///
 /// [`SandboxGuard::is_held`] stays synchronous: it is a diagnostics probe (single
-/// round-trip, no polling) and is never part of the acquire/release path.
+/// round-trip, no polling) and is never part of the acquire/release path. Callers that can
+/// `await` should use [`SandboxGuard::try_is_held`] instead — the async seam a distributed
+/// backend overrides when its probe needs a real round-trip.
 ///
 /// ## Fail-closed contract
 ///
@@ -52,6 +54,18 @@ pub trait SandboxGuard: Send + Sync + std::fmt::Debug {
 
     /// Returns true if the given key is currently held.
     fn is_held(&self, key: &SandboxIsolationKey) -> bool;
+
+    /// Async diagnostics probe: is `key` currently held?
+    ///
+    /// [`is_held`](Self::is_held) stays synchronous for the existing backends, but a
+    /// distributed guard can only answer by round-tripping to its lock store. Bridging that
+    /// with `futures::executor::block_on` blocks a Tokio worker and can deadlock on a
+    /// `current_thread` runtime, so backends whose probe needs an `await` override this
+    /// method and callers that can `await` should ask through here. The default delegates to
+    /// [`is_held`](Self::is_held).
+    async fn try_is_held(&self, key: &SandboxIsolationKey) -> agentscope_core::error::Result<bool> {
+        Ok(self.is_held(key))
+    }
 
     /// Number of active leases (diagnostics; distributed guards may return 0).
     fn active_count(&self) -> usize {
@@ -290,6 +304,92 @@ mod tests {
         // Release second lease
         guard.release(&key);
         assert!(!guard.is_held(&key)); // Now released
+    }
+
+    /// A guard that only implements the synchronous probe: the async seam must delegate to it.
+    #[derive(Debug)]
+    struct SyncOnlyProbeGuard {
+        held: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxGuard for SyncOnlyProbeGuard {
+        async fn try_enter(
+            &self,
+            key: SandboxIsolationKey,
+        ) -> agentscope_core::error::Result<SandboxLease> {
+            Ok(SandboxLease::new(key))
+        }
+
+        async fn release(&self, _key: &SandboxIsolationKey) {}
+
+        fn is_held(&self, key: &SandboxIsolationKey) -> bool {
+            let _ = key;
+            self.held
+        }
+    }
+
+    /// A distributed guard whose probe needs a round-trip: it overrides the async seam and
+    /// reports the backend failure instead of blocking a Tokio worker on `block_on`.
+    #[derive(Debug)]
+    struct FailingAsyncProbeGuard;
+
+    #[async_trait::async_trait]
+    impl SandboxGuard for FailingAsyncProbeGuard {
+        async fn try_enter(
+            &self,
+            key: SandboxIsolationKey,
+        ) -> agentscope_core::error::Result<SandboxLease> {
+            Ok(SandboxLease::new(key))
+        }
+
+        async fn release(&self, _key: &SandboxIsolationKey) {}
+
+        fn is_held(&self, _key: &SandboxIsolationKey) -> bool {
+            unreachable!("the async probe overrides the synchronous one")
+        }
+
+        async fn try_is_held(
+            &self,
+            _key: &SandboxIsolationKey,
+        ) -> agentscope_core::error::Result<bool> {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Err(agentscope_core::error::Error::Other(
+                "lock store unreachable".to_string(),
+            ))
+        }
+    }
+
+    /// The added seam is opt-in: a backend that only knows the local probe keeps working and
+    /// its answer reaches the caller through `try_is_held`.
+    #[tokio::test]
+    async fn try_is_held_defaults_to_the_sync_probe() {
+        let key = SandboxIsolationKey::new("user", "u1");
+        assert!(SyncOnlyProbeGuard { held: true }
+            .try_is_held(&key)
+            .await
+            .unwrap());
+        assert!(!SyncOnlyProbeGuard { held: false }
+            .try_is_held(&key)
+            .await
+            .unwrap());
+
+        // Object safe through `Arc<dyn SandboxGuard>`, like the manager's guard slot.
+        let object: Arc<dyn SandboxGuard> = Arc::new(SyncOnlyProbeGuard { held: true });
+        assert!(object.try_is_held(&key).await.unwrap());
+    }
+
+    /// The override must be reached through the trait object, and it must be able to `await`
+    /// inside a single-threaded runtime — a `block_on` probe deadlocks there.
+    #[tokio::test(flavor = "current_thread")]
+    async fn try_is_held_reaches_an_async_override_on_a_current_thread_runtime() {
+        let key = SandboxIsolationKey::new("user", "u1");
+        let guard: Arc<dyn SandboxGuard> = Arc::new(FailingAsyncProbeGuard);
+        let error = guard.try_is_held(&key).await.unwrap_err();
+        assert!(
+            format!("{error}").contains("lock store unreachable"),
+            "{error}"
+        );
     }
 
     #[test]
