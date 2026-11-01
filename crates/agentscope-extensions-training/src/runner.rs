@@ -217,10 +217,13 @@ impl RunRegistry {
         Self::default()
     }
 
-    /// The process-wide registry (Java parity: Java's `RunRegistry` is all-static).
+    /// The process-wide registry — **legacy compatibility entry point only**.
     ///
-    /// Only use this when several routers must share one run-id space on purpose;
-    /// the default [`TrainingRouter::new`] gives each router its own registry.
+    /// Kept because Java's `RunRegistry` is all-static, so a host that needs one run-id
+    /// space across routers can still opt in via
+    /// [`TrainingRouter::with_global_registries`]. It is process-wide mutable state:
+    /// nothing on the default path touches it, and tests must not reset it with
+    /// [`RunRegistry::clear_all`] to isolate themselves — use [`RunRegistry::new`].
     pub fn global() -> Arc<RunRegistry> {
         static GLOBAL: OnceLock<Arc<RunRegistry>> = OnceLock::new();
         Arc::clone(GLOBAL.get_or_init(|| Arc::new(RunRegistry::new())))
@@ -282,8 +285,9 @@ impl RunRegistry {
 /// Registry of run execution contexts grouped by task, mirroring
 /// `TaskExecutionRegistry`.
 ///
-/// Like [`RunRegistry`] this is an instance handle: a router owns one, and
-/// [`TaskExecutionRegistry::global`] provides the JVM-static behaviour on demand.
+/// Like [`RunRegistry`] this is an instance handle: a router owns one.
+/// [`TaskExecutionRegistry::global`] only remains as a legacy compatibility entry
+/// (the JVM-static behaviour of Java's all-static registry) on explicit request.
 #[derive(Debug, Default)]
 pub struct TaskExecutionRegistry {
     runs: Mutex<HashMap<String, Vec<Arc<RunExecutionContext>>>>,
@@ -295,7 +299,11 @@ impl TaskExecutionRegistry {
         Self::default()
     }
 
-    /// The process-wide registry (Java parity: Java's registry is all-static).
+    /// The process-wide registry — **legacy compatibility entry point only**.
+    ///
+    /// See [`RunRegistry::global`]: it exists for Java parity
+    /// ([`TrainingRouter::with_global_registries`]) and is never used by the default
+    /// path or to isolate one test from another (use [`TaskExecutionRegistry::new`]).
     pub fn global() -> Arc<TaskExecutionRegistry> {
         static GLOBAL: OnceLock<Arc<TaskExecutionRegistry>> = OnceLock::new();
         Arc::clone(GLOBAL.get_or_init(|| Arc::new(TaskExecutionRegistry::new())))
@@ -906,7 +914,12 @@ impl TrainingRouter {
         )
     }
 
-    /// Creates a router sharing the process-wide registries (Java parity).
+    /// Creates a router sharing the process-wide registries — **legacy compatibility
+    /// entry point** (Java parity), never used by the default path.
+    ///
+    /// Prefer [`TrainingRouter::new`] (one registry pair per router) or
+    /// [`TrainingRouter::with_registries`] (explicit injection): shared process-wide
+    /// counters make independent runners — and parallel tests — interfere.
     pub fn with_global_registries(config: TrainingConfig, trinity_client: TrinityClient) -> Self {
         Self::with_registries(
             config,
