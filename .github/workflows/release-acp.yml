@@ -1,0 +1,116 @@
+name: release-acp
+
+# 构建并发布 ACP 智能体的 Windows 可执行产物：
+#   acp_harness_agent.exe  —— ACP agent（stdio 服务端，给 IDE/CLI 客户端接入）
+#   acp_agent_cli.exe      —— 内置 REPL 客户端（会自动拉起上面的 agent）
+#
+# 触发：
+#   - push tag（v*）：构建后创建 GitHub Release，附 zip 下载
+#   - workflow_dispatch：只构建并上传 artifact，不动 Release
+#
+# 为什么只出 Windows x64：embedded profile 的 rustflags 用的是 MSVC 链接器参数
+# （/OPT:REF、/OPT:ICF、/DEBUG:NONE，见 .cargo/config.embedded.toml），
+# Linux/macOS 需要另一份 -Wl,--gc-sections,--icf=all 的配置，暂未纳入。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_AGENT: acp_harness_agent.exe
+  BIN_CLI: acp_agent_cli.exe
+
+jobs:
+  build:
+    name: build embedded binaries (windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # build-std 需要 nightly + rust-src。注意仓库根的 rust-toolchain.toml 把
+      # 默认工具链钉在 stable，所以下面的 cargo 调用一律显式 `+nightly`。
+      - name: install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: embedded
+          # build-std 的 std 产物在 target/<triple>/<profile> 下，一起缓存
+          workspaces: '. -> target'
+
+      - name: cargo build (embedded profile, lite features)
+        run: |
+          cargo +nightly build --locked `
+            --profile embedded `
+            --config .cargo/config.embedded.toml `
+            -p agentscope-extensions-acp `
+            --no-default-features --features lite --bins
+
+      - name: smoke test (ACP handshake)
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $req = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}'
+          $out = $req | & "./target/embedded/$env:BIN_AGENT" 2>$null | Out-String
+          Write-Host $out
+          if ($out -notmatch '"protocolVersion"') {
+            throw 'agent did not answer initialize; embedded build is not usable'
+          }
+
+      - name: stage dist
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/embedded/$env:BIN_AGENT" dist/
+          Copy-Item "target/embedded/$env:BIN_CLI" dist/
+          Copy-Item crates/agentscope-extensions-acp/README.md dist/README.md
+          Copy-Item LICENSE dist/LICENSE
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: zip
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          Compress-Archive -Path dist/* -DestinationPath "agentscope-acp-$tag-windows-x86_64.zip"
+          Get-Item "agentscope-acp-$tag-windows-x86_64.zip" | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentscope-acp-windows-x86_64
+          path: agentscope-acp-*-windows-x86_64.zip
+          if-no-files-found: error
+
+      - name: publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: agentscope-acp-*-windows-x86_64.zip
+          generate_release_notes: true
+          body: |
+            Prebuilt ACP binaries for Windows x64 (embedded profile, `lite` features).
+
+            下载后解压，包含：
+
+            | 文件 | 说明 |
+            | --- | --- |
+            | `acp_harness_agent.exe` | ACP agent（stdio 服务端）。在 ACP 客户端里把命令指向它即可 |
+            | `acp_agent_cli.exe` | 内置 REPL 客户端，在当前目录拉起 agent 并开始对话 |
+            | `README.md` | 安装、会话模式、权限、排障、各语言 SDK 接入 |
+
+            首次运行会在 `%USERPROFILE%\.agentscope\models.json` 生成模型配置模板，填入
+            provider 与 API key 后即可使用。内置 REPL 还需把 `acp_harness_agent.exe`
+            放在 `acp_agent_cli.exe` 同目录（非 Windows 或不同目录时用 `ACP_AGENT_EXE` 指定）。
+
+            校验连通性：
+
+            ```powershell
+            echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}' | .\acp_harness_agent.exe
+            ```

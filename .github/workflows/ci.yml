@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rustfmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 不显式传 toolchain：rustup 会自动读取仓库根的 rust-toolchain.toml，
+      # 保证 CI 与本地用的是同一个 rustfmt 版本。
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all -- --check

@@ -1,0 +1,8 @@
+# 让 git blame 跳过纯格式化提交。
+# GitHub 自动朗读本文件；本地启用一次即可：
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# 只记录「纯格式化/纯机械改写」的提交，不要把带逻辑改动的提交加进来。
+
+# style: apply cargo fmt across the workspace
+e12af061c1adf141b3693b4c41ad2042b907db04

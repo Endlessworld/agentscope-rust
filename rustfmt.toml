@@ -1,0 +1,14 @@
+# rustfmt 配置。
+#
+# 本文件存在的意义不是「开启格式化」（rustfmt 默认配置本来就是确定的），
+# 而是把格式化规则变成仓库契约：任何人、任何设备在仓库内跑 `cargo fmt`，
+# 读到的都是这一份规则。
+#
+# 当前全部使用 rustfmt 默认值：实测全仓 41.7 万行里只有 0.2% 超过默认的
+# max_width = 100，默认配置与历史代码契合度最高，无需自定义。
+#
+# 两条约定：
+# 1. 只写 stable 可用的选项。`imports_granularity`、`group_imports`、
+#    `format_code_in_doc_comments`、`wrap_comments` 等是 nightly-only，
+#    在 stable 下会被静默忽略，反而导致成员之间结果不一致。
+# 2. 修改本文件后必须全仓重跑一次 `cargo fmt --all`，并作为独立提交。

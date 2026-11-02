@@ -1,0 +1,11 @@
+# 仓库固定使用 stable 工具链，并声明格式化/静态检查必需的两个组件，
+# 缺失时 rustup 会自动装上（新环境首次跑 cargo 即可）。
+#
+# 为什么不是具体版本号：exact pin（如 channel = "1.97.1"）可复现性更强，
+# 但每台新机器都要多下一次完整工具链。rustfmt 只在个别版本会改变输出，
+# 且 CI 的 `cargo fmt --all -- --check` 会立刻暴露漂移。
+# 如需严格复现（例如排查格式化相关的问题），把 channel 改成具体版本号即可，
+# 改完必须全仓重跑一次 `cargo fmt --all`。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
