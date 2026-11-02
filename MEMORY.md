@@ -692,3 +692,11 @@
   - **校验**：`cargo metadata`（29 依赖 / 31 features）、`cargo tree --features full`（29 内部 crate 全解析）、`cargo check -p agentscope-rs`（默认）/`--features full`（真编译全部，15s，facade **零警告** → 29 个 re-export 名全对）、`cargo package --list`（exit 0）、`cargo fmt --all -- --check`（exit 0）、`cargo test -p agentscope-rs`（0 tests，doc 1 ignored）。
   - **`cargo publish --dry-run -p agentscope-rs` 仍报 `no matching package named agentscope-core found`** —— 与其它 28 包一致，属预期（前置未上架）。
   - 根 `Cargo.toml`：members 首行 + `[workspace.dependencies]` 首行（`agentscope-rs`）；`publish_crates.ps1` 的 `$order` 末尾追加（**必须最后发**）。README「规模」改为 30 个 crate，Crate 地图新增门面用法表。
+
+- 决策（2026-11-03）：论文《HarnessMM》(arXiv 2610.32813v1，EDG/GDR/CCS 跳过 reasoning 回调)**不实施**。理由：①对本项目默认形态（长程交互式 coding agent）token 边际收益仅 3~8%；②论文 29.5%/87.9% 头条数字中大部分来自伴生配置（compact/finalization），唯一干净的 MBPP 消融为 19~27% token 省额 + 0.4~1.6 点正确率损失；③`extensions-model` 已支持 `cache_control`/prompt cache，token 省额≠费用省额。仅当目标是「减少等待轮次/延迟」或「跑 benchmark token-efficiency」时才值得重开。
+- 阅读产物：论文纯文本落在 `.agentscope/workspace/tmp/harnessmm.txt`（由 Documents 下 HTML 转换）。
+- 若将来重开：落地接缝为 `on_model_call` 替换 `ModelCallInput.model`（零 core 改动）；**不可**用 `on_reasoning` 合成 assistant 消息（只能 `RequestStop`）。前置仍是 P0 episode 级 token 账本（调用数/平均上下文/缓存命中率三元组）。
+
+- ACP 智能体（crates/agentscope-extensions-acp/src/acp_harness_agent.rs）请求上送的 model id 必须等于 models.json `providers.<P>.models` 元素原值；models.dev（core model catalog）只提供参数（context window / max_output / capabilities / reasoning options）与下拉 `_meta` 卡片，从不改写 wire model。
+- 已修 bug（2026-11-03）：`ModelConfig::resolve_model` 原先用 `rsplit('/')` 的 `bare` 作为返回的 wire model，导致 Gateway 这类「模型 id 自带 vendor 前缀」的配置（如 `workbuddy/deepseek-v4.1-flash`）被截成 `deepseek-v4.1-flash`，网关报 `magpie knows no model ...`。现改为三级优先 `model_id`（原值）→ `configured`（剥掉合成 provider key 后的值）→ `bare`，且 `protocol_for` 用命中的写法查表（原先用 bare 查不到会退化成 ChatCompletions）；同时 `model_resolver`（子 agent front-matter）改用 `resolved.model_id`，与 `model_builder` 统一。新增 4 个 bin 单测（`cargo test -p agentscope-extensions-acp --bin acp_harness_agent`），已双向反向验证。
+- `ModelChoice.id` 默认就是 models.json 元素原值（可自带 `/`），仅当同一 id 出现在多个 provider 下才合成 `ProviderKey/id`；`name` 始终为 `ProviderKey/id`（仅显示）。
