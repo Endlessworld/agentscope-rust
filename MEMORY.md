@@ -679,3 +679,9 @@
   4. `c39165d chore(memory): 记录发布准备、格式化契约与 CI 基线`。
   - 压缩手法：`git branch backup/dev-pre-squash` → `git reset --soft origin/dev` → `git restore --staged .` → 按文件组 `git stage` + 分次提交；`git diff backup/dev-pre-squash` 仅剩 `.git-blame-ignore-revs` 的 SHA 行差异（预期）。
 - **squash 后注意**：任何记录旧 SHA 的地方都要改——`.git-blame-ignore-revs` 里的格式化提交 SHA 必须随之更新（否则指向不存在的 commit）；备份分支 `backup/dev-pre-squash` 未删，`git branch -D backup/dev-pre-squash` 可清理。
+
+- **crates.io 名字占用核查（2026-11-02，经代理 `http://127.0.0.1:10808` 查 `api/v1/crates/<name>`，脚本 `.agentscope/workspace/check_names.ps1`，结果 `name_check.json`）**：32 个名字中 **31 个 FREE（404）**，**`agentscope` 已被第三方占用（200）**——v0.1.0，owner `agentscope2`，repo `abdouloued/agentscopev2`，description "Scope firewall and audit layer for AI coding agents"，172 KB，2026-05-26 发布，仅 29 次下载。**更正旧记忆**：此前记的「agentscope / agentscope-core / agentscope-harness / agentscope-extensions-model 均 404 未占用」是错的（直连 crates.io API 超时导致误判为 404）；除 `agentscope` 外其余名字确实可用。
+- **影响**：仓库 29 个 crate 均不叫 `agentscope`（只有 `agentscope-core` / `-harness` / `agentscope-extensions-*`），**发布不受影响**；但未来若做 umbrella/facade crate 不能用 `agentscope`，宜用 `agentscope-rs`（与仓库改名讨论一致，且可避开那个同领域第三方包）。
+- **crates.io 上传网络（本机）**：直连 `cargo publish` 报 `[55] Failed sending data to the peer (Send failure: Connection was reset)`；加 `--config 'http.proxy="http://127.0.0.1:10808"'` 后请求可达服务器。**发布必须带这个代理配置**（10808 端口已监听；git 全局 `http.proxy` 现为空）。
+- **crates.io 账号阻塞（2026-11-02）**：token 有效但 `cargo publish` 返回 400 `A verified email address is required to publish crates to crates.io. Visit https://crates.io/settings/profile`。crates.io 的邮箱验证与 GitHub 邮箱验证相互独立，需用户自行在 profile 页完成。
+- **发布脚本已增强**（`.agentscope/workspace/publish_crates.ps1`）：新增 `-Proxy`（默认 `http://127.0.0.1:10808`）、`-From <crate>`（断点续发）、`-Retries`（默认 3、间隔 60s）、自动识别 `already uploaded` 跳过、日志落 `.agentscope/workspace/publish.log`。`cargo publish` 要求工作区干净 → 发布前任何 `memory_save` 改动都必须先提交。
