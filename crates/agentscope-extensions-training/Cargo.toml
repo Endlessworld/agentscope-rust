@@ -1,16 +1,22 @@
 [package]
 name = "agentscope-extensions-training"
+description = "AgentScope Rust - shadow-traffic training support (selection strategies, rewards, Trinity backend)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
-agentscope-extensions-model = { path = "../agentscope-extensions-model" }
+agentscope-core = { workspace = true }
+agentscope-extensions-model = { workspace = true }
 # Builder attach point (`TrainingRunner::attach_to`): the harness owns the
 # `MiddlewareChain` / `on_agent_built` pairing this crate composes.
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-harness = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

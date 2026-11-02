@@ -4,8 +4,8 @@
 //! speaks the Agent Client Protocol over stdio.
 //!
 //! Run:
-//!   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}' \
-//!     | cargo run -p agentscope-harness --bin acp_harness_agent
+//!   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}' \
+//!     | cargo run -p agentscope-extensions-acp --bin acp_harness_agent
 //!
 //! A full interactive ACP client (IDE/CLI) is the intended peer.
 //!

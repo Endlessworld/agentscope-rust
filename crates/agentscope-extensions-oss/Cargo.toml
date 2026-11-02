@@ -1,11 +1,17 @@
-﻿[package]
+[package]
 name = "agentscope-extensions-oss"
+description = "AgentScope Rust - S3-compatible object storage, sandbox snapshots and execution guard"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 # `rust-s3 0.38`（feature `s3`）要求 edition 2024 / Rust >= 1.85；workspace MSRV 自
 # 2026-10-31 起为 `1.85.0`（OSS-09 裁定），本地声明仅为就地记录该依赖约束。
-rust-version = "1.85"
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = []
@@ -16,8 +22,8 @@ default = []
 s3 = ["dep:rust-s3", "dep:tokio", "dep:md5"]
 
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-core = { workspace = true }
+agentscope-harness = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

@@ -1,17 +1,23 @@
 [package]
 name = "agentscope-extensions-judge"
+description = "AgentScope Rust - calibrated decision APIs (TypeSafe JEV and OpenAI Decisions)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # Ports `agentscope-extensions-judge/agentscope-extensions-jev` (TypeSafe System One).
 # `agentscope-core` / `agentscope-harness` are path dependencies of the `jev::runtime` seam
 # module only: `BaseStore`-backed context archiving, the `Tool` implementations and the
 # `Middleware` hooks. Every pure/DTO/orchestration module stays independent of them.
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-core = { workspace = true }
+agentscope-harness = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

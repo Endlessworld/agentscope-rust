@@ -1,12 +1,18 @@
-﻿[package]
+[package]
 name = "agentscope-extensions-mem"
+description = "AgentScope Rust - long-term memory backends (Mem0, Bailian, ReMe)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
+agentscope-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -29,5 +35,5 @@ futures = { workspace = true }
 # `HarnessAgent` assembly entry (`builder().middleware(chain)`), not by poking the
 # adapter. Only a dev-dependency: the crate itself stays harness-agnostic, and the
 # dependency is acyclic (harness does not depend on this crate).
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-harness = { workspace = true }
 

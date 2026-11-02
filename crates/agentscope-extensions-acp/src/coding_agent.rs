@@ -39,7 +39,7 @@ use super::support::ClientSupport;
 
 /// Default agent info advertised during initialization.
 const AGENT_NAME: &str = "agentscope-coding-agent";
-const AGENT_VERSION: &str = "0.1.0";
+const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How many per-`cwd` index agents stay cached. Each one is a full `HarnessAgent`.
 const MAX_CATALOG_AGENTS: usize = 4;

@@ -1,13 +1,19 @@
-﻿[package]
+[package]
 name = "agentscope-extensions-mongodb"
+description = "AgentScope Rust - MongoDB backed distributed storage, sandbox snapshots and execution guard"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-core = { workspace = true }
+agentscope-harness = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
@@ -26,8 +32,8 @@ mongodb = { workspace = true }
 [dev-dependencies]
 # Live integration tests (`tests/mongodb_live.rs`) drive the real driver against a
 # server named by `AGENTSCOPE_TEST_MONGODB_URL`.
-agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-core = { workspace = true }
+agentscope-harness = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

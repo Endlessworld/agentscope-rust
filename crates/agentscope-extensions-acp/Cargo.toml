@@ -5,11 +5,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# 本 crate 自带 README（比根 README 更贴近 ACP），故不继承 workspace 的 readme。
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
-agentscope-extensions-model = { path = "../agentscope-extensions-model" }
-agentscope-harness = { path = "../agentscope-harness", default-features = false }
+agentscope-core = { workspace = true }
+agentscope-extensions-model = { workspace = true }
+agentscope-harness = { version = "0.1.0-alpha.1", path = "../agentscope-harness", default-features = false }
 agent-client-protocol = { version = "2.2.0", features = [
     # 2.2.0（schema 1.9）起「程序化工具名」已在 v1 稳定，`unstable_tool_call_name`
     # 特性被移除。改动理由与影响见 memory/2026-10-16.md。

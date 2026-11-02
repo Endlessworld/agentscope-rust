@@ -1,118 +1,161 @@
 # AgentScope Rust
 
-AgentScope（Java）的 Rust 实现：把 `io.agentscope.core` 与 `io.agentscope.harness` 迁移为
-原生异步 Rust 库（Tokio + serde + async-openai），并在其上实现可用的 **ACP 编程智能体**。
+AgentScope 的**原生异步 Rust 实现**。以 `agentscope-core`（智能体运行时与公共抽象）和
+`agentscope-harness`（可直接使用的装配层）为骨架，外加 27 个 `agentscope-extensions-*`
+适配 crate，覆盖模型 provider、协议接入、持久化、RAG、沙箱、平台通道与可观测性；
+仓库同时提供开箱即用的 **ACP 编程智能体**（`acp_harness_agent` / `acp_agent_cli`）。
 
-- **目标**：与 Java 参考实现功能对齐（API 语义、事件/状态 JSON、工具治理行为）
-- **技术栈**：Rust 2021 · Tokio · serde · async-openai · rust-mcp-sdk · rusqlite
-- **进度**：见 [`docs/MIGRATION_GAP_TRACKER.md`](docs/MIGRATION_GAP_TRACKER.md)
+- **基线**：对齐 Java 参考实现（`io.agentscope.core` / `io.agentscope.harness` 及其 extension 模块）
+  的 API 语义、事件/状态 JSON 与工具治理行为
+- **技术栈**：Rust 2021（MSRV 1.85）· Tokio · serde · reqwest/rustls · async-openai / async-anthropic ·
+  rust-mcp-sdk · axum · rusqlite
+- **规模**：29 个 crate（2 个骨架 + 27 个扩展），线性依赖，无循环
+- **进度**：`docs/MIGRATION_GAP_TRACKER.md`、`docs/extensions/EXTENSIONS_GAP_TRACKER.md`
+  （各模块另有独立 tracker，为单一事实来源）
 
 ## 核心能力
 
-- **ReAct 智能体运行时**：reasoning→acting 循环、流式事件（31 种 `AgentEvent`）、结构化输出、串行门与优雅关闭。
-- **模型层**：`Model` trait / `ModelRegistry` 等抽象在 `agentscope-core`；全部具体 provider（openai / responses / anthropic / dashscope / gemini / ollama）实现在 `agentscope-extensions-model`。
-- **工具系统**：`Tool` / `Toolkit` / `ToolGroup` / `ToolExecutor`（超时、重试、并行、JSON Schema 校验、挂起语义）+ MCP 工具桥。
-- **Harness 运行时**：`HarnessAgent` 一键装配文件系统工具、shell、压缩（compaction）、plan mode 与 skills。
-- **ACP Coding Agent**：stdio 上实现 ACP 协议（initialize / session.* / prompt / set_mode / cancel），含权限确认（HITL）与运行时模型切换。
-- **沙箱与文件系统**：Local/Docker 沙箱、快照与 Lease、Local/Overlay/Composite/Sandbox/Remote 文件系统。
-- **多智能体**：子智能体声明与动态 spawn、后台任务仓库（本地/远程）、消息总线、Gateway 与通道路由、记忆/技能巩固。
+**运行时（core）**
 
-## 仓库结构
+- ReAct 循环、流式事件（32 种 `AgentEvent`）、结构化输出、串行门与优雅关闭
+- run 级控制（`AgentRun` / `RunControl`）、中断恢复与 pending tool 修复
+- 双轨会话：`SessionLogStore`（journal）+ 事件日志，可换后端（本地 / SQLite / BaseStore）
+
+**模型层**
+
+- `Model` / `ModelRegistry` 等抽象在 core，全部具体 provider 在 `agentscope-extensions-model`
+  （OpenAI Chat / Responses、Anthropic、DashScope、Gemini、Ollama、DeepSeek 兼容）
+- 统一 `HttpTransport` 缝：单测零真实网络；模型重试与上下文窗口按目录（models.dev）解析
+
+**工具与状态**
+
+- `Tool` / `Toolkit` / `ToolGroup` / `ToolExecutor`（超时、重试、并发、JSON Schema 校验、挂起语义）
+- MCP 工具桥、文件 / shell / web / memory / session / task / plan mode 等内置工具
+- `AgentState` + 版本化 CAS（core 的 `AgentStateStore` trait），状态文件与 Java 侧互通
+
+**装配层（harness）**
+
+- `HarnessAgent` 一键装配 workspace、文件系统、工具、中间件、skills、子智能体与记忆管线
+- 沙箱（Local / Docker）与快照 Lease；Local / Overlay / Composite / Sandbox / Remote 文件系统
+- 多智能体：声明式 + 动态 spawn、后台任务仓库、消息总线、gateway 与通道路由、team 协作
+- 记忆管线：对话压缩（compaction）、刷新、巩固、驱逐与会话记忆
+
+**生态（extensions）**
+
+- 协议：ACP、A2A（client / server）、Agent Protocol、AG-UI、OpenAI 兼容 Chat Completions
+- 存储：JDBC / MySQL / PostgreSQL / MongoDB / Redis / COS / OSS
+- 能力：RAG、长期记忆、skills 仓库、定时调度、影子训练、Studio 遥测、judge 决策 API
+
+## Crate 地图
+
+### 骨架
+
+| crate | 职责 |
+| --- | --- |
+| `agentscope-core` | 运行时与公共抽象：`ReActAgent`、`Msg`/`ContentBlock`、`AgentEvent`、`Model`/`ModelRegistry` SPI、`Tool`/`Toolkit`/`ToolExecutor`、`Middleware`、`AgentState`/`AgentStateStore`、session journal、权限 / 中断 / 关闭、formatter、credential、tls |
+| `agentscope-harness` | 装配层：`HarnessAgent` 与 builder、workspace + 文件系统、沙箱、skills、子智能体与任务、记忆管线、gateway / 通道 / 总线、MCP 客户端、SQLite 工作区索引 |
+
+### 协议与接入
+
+| crate | 职责 |
+| --- | --- |
+| `agentscope-extensions-acp` | ACP 编程智能体：stdio 服务端 `acp_harness_agent` + REPL 客户端 `acp_agent_cli`，含权限确认（HITL）、会话压缩、动态模型切换 |
+| `agentscope-extensions-a2a-client` | A2A 客户端：AgentCard 解析、JSON-RPC、`Msg` ⇄ A2A 转换、`A2aAgent` 门面 |
+| `agentscope-extensions-a2a-server` | A2A 服务端：runner、任务注册表、JSON-RPC handler、registry 服务 |
+| `agentscope-extensions-agent-protocol` | Agent Protocol：`/tasks` HTTP+SSE 任务生命周期与控制面 |
+| `agentscope-extensions-agui` | AG-UI 事件分类、转换器、SSE 编码与请求处理 |
+| `agentscope-extensions-chat-completions-web` | OpenAI 兼容 Chat Completions 请求 / 响应 / 流式适配 |
+| `agentscope-extensions-protocol` | 上述协议的总装 crate（feature：`a2a` / `agent-protocol` / `agui` / `chat-completions-web`，默认全开） |
+
+### 模型
+
+| crate | 职责 |
+| --- | --- |
+| `agentscope-extensions-model` | 全部 provider 实现（OpenAI Chat / Responses、Anthropic、DashScope、Gemini、Ollama、DeepSeek 兼容），统一传输缝 + 离线测试替身 |
+
+### 存储
+
+| crate | 职责 |
+| --- | --- |
+| `agentscope-extensions-jdbc` | 多方言 JDBC 抽象：SQLite / Postgres / MySQL executor、原生锁会话、版本化 state |
+| `agentscope-extensions-mysql` · `-postgresql` · `-mongodb` · `-redis` | 分布式存储：`AgentStateStore`、`BaseStore`、沙箱快照、执行锁 |
+| `agentscope-extensions-cos` · `-oss` | 对象存储：腾讯云 COS / S3 兼容（分片上传、预签名 URL） |
+
+### 能力扩展
+
+| crate | 职责 |
+| --- | --- |
+| `agentscope-extensions-rag` | RAG：simple / dify / ragflow / haystack / bailian 知识库、embedding provider、文档 reader |
+| `agentscope-extensions-mem` | 长期记忆：Mem0 / 百炼 / ReMe |
+| `agentscope-extensions-sandbox` | 远程沙箱：AgentRun / Daytona / E2B / Kubernetes |
+| `agentscope-extensions-skills` | Skill 仓库后端：git / MySQL / PostgreSQL（适配 harness `SkillRepository`） |
+| `agentscope-extensions-scheduler` | 定时执行：Quartz 风格调度 + XXL-Job handler 注册 |
+| `agentscope-extensions-training` | 影子流量训练：策略选择、奖励计算、Trinity backend、runner |
+| `agentscope-extensions-channel` | 平台通道：钉钉 / 飞书 / 企业微信 / 个人微信 / GitHub / GitLab（回调 + 长连接） |
+| `agentscope-extensions-nacos` | Nacos：A2A 注册发现、prompt 订阅、只读 skill 仓库 |
+| `agentscope-extensions-higress` | Higress AI 网关工具检索（`x_higress_tool_search`） |
+| `agentscope-extensions-controlplane` | control-plane 数据面 SDK：会话快照、事件流、有效上下文 |
+| `agentscope-extensions-studio` | AgentScope Studio 集成（REST + Socket.IO）+ OpenTelemetry GenAI 遥测 |
+| `agentscope-extensions-judge` | 校准式决策 API：TypeSafe JEV（概率分布）+ OpenAI Decisions |
+
+## 架构与依赖规则
 
 ```text
 agentscope-rust/
-├── Cargo.toml                  # workspace：core + harness + extensions-*
+├── Cargo.toml                     # workspace：版本 / 依赖 / profile 统一在此
 ├── crates/
-│   ├── agentscope-core/              # 公共抽象 + 核心实现（仅接口/运行时，不依赖其它模块）
-│   ├── agentscope-harness/           # 增强运行时（workspace / ACP / 沙箱 / skill / subagent…），最终使用者
-│   └── agentscope-extensions-*/      # 供应商 / 平台适配（model / rag / sandbox / channel / mem / store…）
-├── docs/                       # 迁移方案与进度跟踪
-└── .agents/context/            # 跨会话项目上下文（画像 / 状态 / ADR / 经验）
+│   ├── agentscope-core/           # 运行时与公共抽象（不依赖任何其它 workspace crate）
+│   ├── agentscope-harness/        # 装配层（依赖 core + extensions-model）
+│   └── agentscope-extensions-*/   # 27 个适配 crate
+├── docs/                          # 迁移方案、进度 tracker、环境变量、设计记录
+│   └── extensions/                # 每个模块的迁移 tracker
+└── LICENSE · README.md
 ```
 
-## 模块依赖规则
+- **`agentscope-core`**：只允许依赖第三方 crate。公共抽象若被多个模块需要，下沉到这里。
+- **`agentscope-extensions-*`**：一般依赖 `core`（多数还需要 `harness` 的 `BaseStore` /
+  `Sandbox` / `SkillRepository` 等 trait），少数依赖其它扩展（如 `mysql` → `jdbc`、`nacos` → `a2a-*`）。
+  确需新增跨模块引用时，先在 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` 记「跨模块需求」并获裁定。
+- **`agentscope-harness`**：装配层，不反向依赖任何 `extensions-*`（`extensions-model` 除外）。
+- **禁止循环引用**：依赖图必须保持 DAG；出现循环时把公共抽象下沉到 core。
 
-- **`agentscope-core`**：公共抽象与核心实现，**如无必要不得引入其它模块 crate 依赖**（仅第三方依赖）。
-- **`agentscope-extensions-*`**：供应商 / 平台适配实现。一般只允许依赖 `agentscope-core`；如无必要尽量不引用其它模块。确需跨 extension 引用时，先在汇总 tracker 记「跨模块需求」并获裁定。
-- **`agentscope-harness`**：最终使用者 / 装配层，可以引入其它任意模块（core 与 extensions-*），负责把 provider 适配、运行时装配成完整应用。
-- **禁止循环引用**：模块依赖图必须保持 DAG。出现循环时由汇总方裁定归属（通常把公共抽象下沉到 core）。
+## 快速开始
 
-### agentscope-core 模块
+### 从 crates.io 引入
 
-| 模块 | 内容 |
-| --- | --- |
-| `agent` | `ReActAgent` + builder、生命周期、流式选项、`RuntimeContext` |
-| `model` | `Model` / `ModelRegistry` SPI、DTO（`GenerateOptions` / `ChatResponse` / `ToolSchema`…）、上下文窗口 |
-| `message` | `Msg` / `MsgRole`、9 类 `ContentBlock`、`Source`、`ChatUsage` |
-| `tool` | Tool / Toolkit / ToolGroup / Executor / Validator、MCP 桥、`TodoWriteTool` |
-| `middleware` | 5 钩子洋葱链 + `TaskReminderMiddleware` |
-| `event` | `AgentEvent`（31 变体）+ `AgentEventEmitter` |
-| `state` | `AgentState`、`InMemory` / `JsonFile` Store（与 Java 状态文件互通） |
-| 其他 | `error`、`memory`、`permission`、`interruption`、`shutdown`、`formatter`、`credential`、`tracing` |
+workspace 已具备发布元数据，首发版本为预发布 `0.1.0-alpha.1`：
 
-### agentscope-harness 模块
+```toml
+[dependencies]
+agentscope-core = "0.1.0-alpha.1"
+agentscope-harness = "0.1.0-alpha.1"
+```
 
-| 模块 | 内容 |
-| --- | --- |
-| `acp` | ACP 协议 CodingAgent（stdio）、会话生命周期、权限确认、配置/模式、动态模型切换 |
-| `agent` | `HarnessAgent` 与 builder（文件系统 + 工具 + 中间件装配） |
-| `agent::sandbox` | Local/Docker 沙箱、快照、Lease/Guard、WorkspaceSpec、容器复用与重启恢复 |
-| `agent::skill` | Open Agent Skills：加载 / 运行时 / 安全扫描 / curator / prompt |
-| `agent::subagent` | 子智能体声明、动态 spawn、后台任务（本地/远程）与完成回调 |
-| `agent::gateway` · `channel` · `bus` | 多智能体网关、通道路由（含 ChatUI）、消息总线、唤醒调度 |
-| `agent::coordination` | 周期门（Local / Store-backed）与运行时协调 |
-| `agent::memory` | 对话压缩、刷新、巩固、驱逐与会话记忆 |
-| `agent::team` · `agent::transcript` | 团队协作与对话转录 |
-| `agent::workspace` | 工作区命名空间、路径规范化、SQLite 索引 |
-| `filesystem` | Local / Overlay / Composite / Sandbox / Remote / Baked 文件系统 |
-| `tool` | 文件系统、shell、web、memory、session、task、team、plan mode 等工具 |
+> 预发布版本不会被 `cargo add` 默认选中，需显式写出（或用 `--precise`）。
 
-## 环境要求
-
-- **Rust** ≥ 1.80（`rust-version`，见根 `Cargo.toml`）
-- **可选工具**：`docker` CLI（Docker 沙箱后端）、`pwsh`（Windows 下的沙箱 shell）。
-- **网络**：全部依赖从 crates.io 拉取，**无外部 path 依赖**（ACP Rust SDK `agent-client-protocol`
-  2.2.0 亦来自 registry，声明在 `crates/agentscope-extensions-acp/Cargo.toml`；
-  `agentscope-harness` 已不再依赖该 SDK）。
-
-## 构建与测试
+### 从源码构建
 
 ```bash
 cargo build  --workspace                 # 构建
-cargo test   --workspace                 # 单元 + 集成测试
-cargo clippy --workspace --all-targets   # 静态检查
-# 构建 harness 与 ACP 二进制（cli + acp_harness_agent）
-cargo build --profile embedded -p agentscope-harness -p agentscope-extensions-acp --no-default-features --features lite --bins
-# release / embedded 构建两个 ACP 二进制（Windows 便捷脚本）
-build-acp-release.bat
-build-acp-embedded.bat
+cargo test   --workspace                 # 单元 + 集成测试（默认全离线）
+cargo clippy --workspace --all-targets    # 静态检查
 ```
 
-体积优化（嵌入式场景）：
+- **Rust** ≥ 1.85（见根 `Cargo.toml` 的 `rust-version`）
+- **可选工具**：`docker` CLI（Docker 沙箱后端与相关集成测试）、`pwsh`（Windows 下的沙箱 shell）
+- 外部依赖全部来自 crates.io；workspace 内部通过 `path` 互相引用（发布时由 `version` 生效）
+
+### 示例
 
 ```bash
-# 构建 harness 与 ACP 二进制（cli + acp_harness_agent）
-cargo build --profile embedded -p agentscope-harness -p agentscope-extensions-acp --no-default-features --features lite --bins
-```
-
-- 默认 feature `rusqlite`：启用工作区 SQLite 索引；
-- `lite`：去掉 rusqlite（省去 bundled SQLite C 引擎），索引降级为目录扫描；
-- `embedded` profile：`opt-level="z"` + fat LTO + strip。
-
-> 若编译报 `os error 112`（磁盘空间不足），先删除 `target/debug/incremental` 再重试。
-
-## 示例
-
-`agentscope-core`（`tool_agent_demo` 用脚本化模型，**无需 API Key**）与 `agentscope-extensions-model`（真实 provider）：
-
-```bash
-cargo run -p agentscope-core --example tool_agent_demo       # ReAct + 工具调用 e2e
-cargo run -p agentscope-extensions-model --example chat_demo # 真实模型 + SSE 流式
+cargo run -p agentscope-core --example tool_agent_demo        # 脚本化模型，无需 API Key
+cargo run -p agentscope-extensions-model --example chat_demo  # 真实 provider + SSE
+cargo run -p agentscope-harness --example session_journal_memory_probe
 ```
 
 `chat_demo` 通过环境变量取凭据（`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `AGENTSCOPE_MODEL`）。
 
-最小内嵌用法：
+### 最小内嵌用法
 
 ```rust
 use std::sync::Arc; // 另需 serde_json
@@ -135,7 +178,7 @@ toolkit.register_tool(Arc::new(FunctionTool::new(
 
 let agent = ReActAgent::builder()
     .name("tool-agent")
-    .model(model)        // Arc<dyn Model>
+    .model(model)        // Arc<dyn Model>，如 agentscope_extensions_model 的 OpenAiChatModel
     .toolkit(toolkit)
     .max_iters(3)
     .build()?;
@@ -149,126 +192,78 @@ println!("{}", reply.text_content());
 ## ACP 编程智能体
 
 ```bash
-# ACP 服务端：等待 ACP 客户端（IDE/CLI）通过 stdio 接入
+# ACP 服务端：等待 ACP 客户端（IDE / CLI）通过 stdio 接入
 cargo run -p agentscope-extensions-acp --bin acp_harness_agent
 
 # 交互式 REPL 客户端：自动拉起上面的 agent 子进程
 cargo run -p agentscope-extensions-acp --bin acp_agent_cli
 ```
 
-模型集中在 `~/.agentscope/models.json`（首次运行自动生成，含默认 provider 与模型列表；解析为宽松模式，允许 `//`、`/* */` 注释与尾随逗号，文件已存在时不会被覆写），
-环境变量可临时覆盖配置：
+不想自己编译的话，[Releases](https://github.com/Endlessworld/agentscope-rust/releases) 提供
+Windows x64 预编译包（embedded profile + `lite` features，压缩包约 6 MB、解压后约 12 MB）：
+`acp_harness_agent.exe`（agent）与 `acp_agent_cli.exe`（REPL）。产物由
+`.github/workflows/release-acp.yml` 在打 tag 时构建，发布前会跑一次 ACP 握手冒烟测试。
+
+模型集中在 `~/.agentscope/models.json`（首次运行自动生成；宽松解析，允许 `//`、`/* */`
+注释与尾随逗号，已存在时不覆写）。最常用的覆盖变量：
 
 | 变量 | 说明 |
 | --- | --- |
 | `CODING_PROVIDER` | 覆盖 `default_provider` |
 | `CODING_MODEL_ID` | 覆盖 `default_model` |
-| `OPENAI_API_KEY` | 覆盖 provider 的 API Key |
-| `OPENAI_BASE_URL` | 覆盖 provider 的 base URL |
-| `ACP_AGENT_EXE` | 指定 CLI 要拉起的 agent 可执行文件路径 |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | 覆盖 provider 的凭据与网关 |
+| `RUST_LOG` | tracing 过滤器（默认 `info,acp_harness_agent=debug,agentscope_harness=debug`） |
+| `AGENTSCOPE_SESSION_RETENTION` | 会话 journal 保留窗口（二进制默认 `12h`） |
+
+完整清单（provider、模型目录、ACP 运行时、扩展、测试变量，含默认值）见
+[`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md)。
 
 REPL slash 命令：`/model <id>` 切换模型、`/models` 列出模型、`/quit` 退出。
 
-完整清单（含 ACP 运行时、模型目录、扩展与测试变量，含默认值）见下文 [环境变量](#环境变量)。
+会话模式（`plan` / `accept_edits` / `yolo`）、权限持久化、支持的 ACP 方法与扩展、
+工具与 skills、排障，以及 Rust / TypeScript / Python / Java / Kotlin 客户端接入示例，
+见 [`crates/agentscope-extensions-acp/README.md`](crates/agentscope-extensions-acp/README.md)。
 
-## 环境变量
+## 构建、测试与体积
 
-约定：布尔型统一接受 `1/true/on/yes`（开）与 `0/false/off/no`（关），大小写不敏感；数值型遇到非法值一律回落默认（不会静默关掉功能）。
+```bash
+# 嵌入式最小集：去掉 rusqlite（省掉 bundled SQLite C 引擎），索引降级为目录扫描
+cargo build --profile embedded -p agentscope-harness -p agentscope-extensions-acp \
+    --no-default-features --features lite --bins
 
-### 模型与 provider
+# Windows 便捷脚本（release / embedded 两个 ACP 二进制）
+build-acp-release.bat
+build-acp-embedded.bat
+```
 
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `CODING_PROVIDER` | `~/.agentscope/models.json` 的 `default_provider` | ACP：覆盖默认 provider |
-| `CODING_MODEL_ID` | 同上的 `default_model` | ACP：覆盖默认模型 id |
-| `OPENAI_API_KEY` | 配置文件中的 `api_key` | 覆盖 provider 的 api_key（启动时会打 warn 提示它覆盖了配置） |
-| `OPENAI_BASE_URL` | 配置文件中的 `base_url` | 覆盖 provider 的 base URL |
-| `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | - | Anthropic 凭据：api key 优先，其次 auth token |
-| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Anthropic 网关 |
-| `DASHSCOPE_API_KEY` | - | DashScope 凭据（缺失即报错） |
-| `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com` | DashScope 网关 |
-| `GEMINI_API_KEY` | - | Gemini 凭据（缺失即报错） |
-| `GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com` | Gemini 网关 |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 地址 |
-| `DEEPSEEK_API_KEY` | - | harness `web_fetch` / `web_search` 走 DeepSeek 抓取通道时的 Bearer 密钥 |
-| `TYPESAFE_API_KEY` / `JEV_API_KEY` | - | judge 扩展 `jev` 的凭据（前者优先） |
+- 默认 feature `rusqlite`：启用工作区 SQLite 索引；`lite` 关闭它
+- `embedded` profile：`opt-level="z"` + fat LTO + `strip`（详见 `docs/EMBEDDED_SIZE.md`）
 
-### 模型目录（models.dev catalog）
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `AGENTSCOPE_MODEL_CATALOG` | 开 | 设为 `0` 即不加载目录，模型能力与上下文窗口回落内置前缀表 |
-| `AGENTSCOPE_MODEL_CATALOG_API` | 开 | 是否使用详细来源 `api.json` |
-| `AGENTSCOPE_MODEL_CATALOG_DIR` | `<home>/.agentscope/model-catalog` | 本地缓存目录 |
-| `AGENTSCOPE_MODEL_CATALOG_URL` | `https://models.dev/models.json?type=all` | 平铺来源 URL |
-| `AGENTSCOPE_MODEL_CATALOG_API_URL` | `https://models.dev/api.json` | 详细来源 URL |
-| `AGENTSCOPE_MODEL_CATALOG_TTL_HOURS` | `24` | 缓存有效期（小时） |
-| `AGENTSCOPE_MODEL_CATALOG_COLD_BLOCK_MS` | `0` | 冷启动时阻塞等待目录刷新的上限（毫秒） |
-
-### ACP 智能体（`acp_harness_agent` / `acp_agent_cli`）
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `ACP_AGENT_EXE` | 与 CLI 同目录的 `acp_harness_agent` | CLI 拉起的 agent 可执行文件 |
-| `ACP_SESSION_ID` | 新建会话 | CLI 打开的会话 id |
-| `ACP_SESSION_REPLAY` | 关 | 设置任意非空值即重放该会话历史 |
-| `AGENTSCOPE_LOG_DIR` | `<cwd>/.agentscope/log` | 日志目录，写 `acp-agent.log` |
-| `RUST_LOG` | `info,acp_harness_agent=debug,agentscope_harness=debug` | tracing 过滤器（如 `RUST_LOG=trace`） |
-| `AGENTSCOPE_ACP_WORKER_THREADS` | `min(ncpu, 8)` | tokio worker 线程数（每线程一份栈与分配器缓存） |
-| `AGENTSCOPE_ACP_MEM_REPORT` | 关 | 每个 turn 额外记录序列化后的 `AgentState` 体积 |
-| `AGENTSCOPE_ACP_MEM_COLLECT` | 开 | 每个 turn 后向分配器归还内存；`=0` 关闭（unix 有效，Windows 为 no-op） |
-| `AGENTSCOPE_ACP_RECORD_MODEL_REQUESTS` | 关 | 把每次模型请求体（`request/prepared`）写进会话 journal，排查用；单次可达数 MB |
-| `AGENTSCOPE_ACP_COMPACTION_WINDOW` | `256000` | 对话压缩使用的窗口属性（tokens），**与所选模型的窗口无关**；触发点为 `trigger_for_window(该值)`，默认 `218419` |
-| `AGENTSCOPE_SESSION_RETENTION` | ACP 二进制 `12h`；库默认 30 天 | 会话 journal 保留窗口；`off/0/false/no` 关闭清理；裸数字按天，支持 `m`/`h`/`d` 后缀 |
-| `AGENTSCOPE_JOURNAL_RETENTION_DAYS` | `min(会话保留天数, 30)` | 空闲会话目录（journal）按天淘汰 |
-
-### 工具输出
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `AGENTSCOPE_OUTPUT_COMPACT` | 开 | 关闭 shell / rg 输出的重复行折叠（`0/false/off/no`） |
-
-### 扩展（沙箱 / 对象存储 / 服务发现 / 控制面）
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `E2B_SANDBOX_URL` | 按 sandbox id 生成通配域名 | E2B envd 数据面网关 |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | - | OSS(S3) 凭据，仅当启用 `env_credentials` 时读取 |
-| `AGENTSCOPE_NACOS_SKILL_VERSION` / `AGENTSCOPE_NACOS_SKILL_LABEL` | - | Nacos skill 版本 / 标签（等价属性键 `agentscope.nacos.skill.version` 与 `agentscope.nacos.skill.label`） |
-| `NACOS_A2A_AGENT_<TRANSPORT>_<ATTR>` | - | A2A 传输属性；`ATTR` 取 `HOST`/`PORT`/`PATH`/`PROTOCOL`/`QUERY`/`SUPPORTTLS` |
-| `CONTROL_PLANE_HTTP` / `BUILDER_INTERNAL_TOKEN` / `CONTROL_PLANE_AGENT_NAME` | 必填 | control-plane store 工厂 |
-| `CONTROL_PLANE_NAMESPACE` | `default` | control-plane 命名空间 |
-
-### 测试与示例
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `AGENTSCOPE_TEST_DOCKER_IMAGE` | 内置默认镜像 | Docker 沙箱集成测试使用的镜像（无 daemon 时整组跳过） |
-| `AGENTSCOPE_MODEL` | 示例内默认模型 | 仅 `crates/*/examples/` 下的示例程序读取 |
-
-### 只读取、无需设置的系统变量
-
-`HOME` / `USERPROFILE`（定位 `~/.agentscope`）、`LANG`（系统提示中的语言，缺省 `zh`）、`HOSTNAME` / `COMPUTERNAME`（control-plane 实例 id 的默认值）。
+> 若编译报 `os error 112`（磁盘空间不足），先清 `target/debug/incremental` 与 `target/debug/deps/*.pdb` 再重试。
 
 ## 文档
 
 | 路径 | 说明 |
 | --- | --- |
 | `docs/MIGRATION_PLAN.md` | 迁移方案：可行性、依赖映射、技术难点、测试策略 |
-| `docs/MIGRATION_GAP_TRACKER.md` | 迁移进度与缺口清单（单一事实来源） |
-| `docs/ACP_AGENT_PLAN.md` | ACP CodingAgent 方案与架构设计 |
-| `docs/ACP_AGENT__GAP_TRACKER.md` | ACP CodingAgent 进度跟踪 |
+| `docs/MIGRATION_GAP_TRACKER.md` | core / harness 迁移进度与缺口清单 |
+| `docs/extensions/EXTENSIONS_MIGRATION_PLAN.md` | 27 个扩展 crate 的迁移编排与回执约定 |
+| `docs/extensions/*__GAP_TRACKER.md` | 各扩展模块的进度 tracker（单一事实来源） |
+| `docs/ENVIRONMENT.md` | 全部环境变量参考 |
+| `docs/ACP_AGENT_PLAN.md` · `docs/ACP_AGENT__GAP_TRACKER.md` | ACP 编程智能体的设计与进度 |
 | `crates/agentscope-extensions-acp/README.md` | ACP 运行说明（skills / 环境变量） |
-| `.agents/context/` | 跨会话项目上下文（项目画像、当前状态、ADR、经验教训） |
+| `.agents/context/` | 跨会话项目上下文（画像、状态、ADR、经验教训） |
 
 ## 已知限制
 
-- 迁移仍在进行（以 core + harness 为主）：`core.hook` 因 Java 侧已废弃而**不迁移**；`core.rag` 尚未开始。
-- Docker 沙箱走 `docker` CLI；本机无 daemon 时相关集成测试自动跳过（真实容器 e2e 未验证）。
+- **迁移仍在收尾**：以各模块 tracker 为准。`core.hook` 因 Java 侧已废弃而**不迁移**；
+  部分扩展仍有 P2 长尾（如 AISTIO 的 gRPC 传输、e2b 的 snapshot prune）。
+- **真实后端需要外部服务**：MySQL / PostgreSQL / MongoDB / Redis / 对象存储的集成测试需
+  自备服务或 Docker，默认跳过；单元测试全部离线（传输均经 trait 注入替身）。
+- **Docker 沙箱**走 `docker` CLI，本机无 daemon 时相关测试自动跳过。
 - 暂无 Java 风格的 `@Tool` 过程宏，工具 schema 目前手写（`FunctionTool`）。
-- 仓库尚无 `LICENSE` 文件（`Cargo.toml` 中声明 Apache-2.0）。
+- 部分运行时优化仅在 Unix 生效（如 `AGENTSCOPE_ACP_MEM_COLLECT` 在 Windows 为 no-op）。
 
 ## 许可证
 
-Apache-2.0（见 `Cargo.toml`）
-
+Apache-2.0，见 [`LICENSE`](LICENSE)。

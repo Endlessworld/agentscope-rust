@@ -1,9 +1,15 @@
-﻿[package]
+[package]
 name = "agentscope-extensions-skills"
+description = "AgentScope Rust - skill repository backends (git, MySQL, PostgreSQL)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 # The default build stays driver-free: only `InMemorySqlDatabase` is compiled and no new
@@ -31,7 +37,7 @@ mysql-tls = [
 ]
 
 [dependencies]
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-harness = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

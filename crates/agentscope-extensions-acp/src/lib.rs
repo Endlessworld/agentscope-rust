@@ -5,7 +5,7 @@
 //! ACP client (IDE/CLI) over stdio. It mirrors the Kotlin `AgiHarnessAgent`
 //! and Java `HarnessCodingAgent` from the ai-agents project.
 //!
-//! Reference SDK: `agent-client-protocol` (path dependency, v2.0.0).
+//! Reference SDK: `agent-client-protocol` 2.2 (crates.io; schema 1.9, protocol v1).
 
 pub mod coding_agent;
 pub mod config;

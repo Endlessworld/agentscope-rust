@@ -1,13 +1,19 @@
-﻿[package]
+[package]
 name = "agentscope-extensions-redis"
+description = "AgentScope Rust - Redis backed distributed storage, sandbox snapshots and execution guard"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-core = { workspace = true }
+agentscope-harness = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

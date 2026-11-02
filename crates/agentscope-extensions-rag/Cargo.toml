@@ -1,13 +1,19 @@
-﻿[package]
+[package]
 name = "agentscope-extensions-rag"
+description = "AgentScope Rust - RAG knowledge bases, embedding providers and document readers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-core = { workspace = true }
+agentscope-harness = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror = { workspace = true }
@@ -32,7 +38,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # but the Ollama/OpenAI wire shapes must stay identical to the MODEL extension's). A path
 # dev-dependency on a workspace member: it is already compiled for every workspace build (harness
 # depends on it), so this adds no new third-party crate.
-agentscope-extensions-model = { path = "../agentscope-extensions-model" }
+agentscope-extensions-model = { workspace = true }
 
 [features]
 default = []

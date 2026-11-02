@@ -1,9 +1,15 @@
-﻿[package]
+[package]
 name = "agentscope-extensions-jdbc"
+description = "AgentScope Rust - multi-database JDBC dialect abstraction and distributed storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 # The default build pulls in **no** driver crate and compiles/tests fully offline against
@@ -18,12 +24,12 @@ postgres-executor = ["dep:tokio-postgres"]
 mysql-executor = ["dep:mysql_async"]
 
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-core = { workspace = true }
+agentscope-harness = { workspace = true }
 # Skill domain types (`AgentSkill`) come from harness; the repository backend contract
 # (`AgentSkillRepository`) lives in the skills extension crate. Per §4.5 adjudication 2,
 # the JDBC implementation lives here and the skills crate does not duplicate it.
-agentscope-extensions-skills = { path = "../agentscope-extensions-skills" }
+agentscope-extensions-skills = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

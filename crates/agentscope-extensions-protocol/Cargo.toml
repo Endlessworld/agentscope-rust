@@ -1,10 +1,15 @@
-﻿[package]
+[package]
 name = "agentscope-extensions-protocol"
 description = "AgentScope Rust - protocol extensions (umbrella crate)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # Umbrella crate mirroring the Java `agentscope-extensions-protocol` aggregator.
 # Each protocol lives in its own crate so its dependency set stays isolated:
@@ -18,11 +23,11 @@ rust-version.workspace = true
 # Depend on an individual crate when you only need one protocol; depend on this
 # crate (default features) for the previous `a2a` / `agui` / ... module paths.
 [dependencies]
-agentscope-extensions-a2a-client = { path = "../agentscope-extensions-a2a-client", optional = true }
-agentscope-extensions-a2a-server = { path = "../agentscope-extensions-a2a-server", optional = true }
-agentscope-extensions-agent-protocol = { path = "../agentscope-extensions-agent-protocol", optional = true }
-agentscope-extensions-agui = { path = "../agentscope-extensions-agui", optional = true }
-agentscope-extensions-chat-completions-web = { path = "../agentscope-extensions-chat-completions-web", optional = true }
+agentscope-extensions-a2a-client = { workspace = true, optional = true }
+agentscope-extensions-a2a-server = { workspace = true, optional = true }
+agentscope-extensions-agent-protocol = { workspace = true, optional = true }
+agentscope-extensions-agui = { workspace = true, optional = true }
+agentscope-extensions-chat-completions-web = { workspace = true, optional = true }
 
 [features]
 default = ["a2a", "agent-protocol", "agui", "chat-completions-web"]

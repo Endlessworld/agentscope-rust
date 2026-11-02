@@ -1,9 +1,15 @@
-﻿[package]
+[package]
 name = "agentscope-extensions-postgresql"
+description = "AgentScope Rust - PostgreSQL backed distributed persistence and advisory-lock guard"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 # Default build is dependency-light so the crate compiles/tests without a live
@@ -19,8 +25,8 @@ postgres-pool = ["postgres-driver"]
 testing = []
 
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-core = { workspace = true }
+agentscope-harness = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

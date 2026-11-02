@@ -1,9 +1,15 @@
-﻿[package]
+[package]
 name = "agentscope-extensions-mysql"
+description = "AgentScope Rust - MySQL backed distributed storage, sandbox snapshots and execution guard"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 # The default build stays dependency-light: the crate compiles and its unit tests run
@@ -21,10 +27,10 @@ jdbc-bridge = [
 ]
 
 [dependencies]
-agentscope-core = { path = "../agentscope-core" }
-agentscope-harness = { path = "../agentscope-harness" }
+agentscope-core = { workspace = true }
+agentscope-harness = { workspace = true }
 # JDBC façade bridge (optional, feature = "jdbc-bridge"); see [features].
-agentscope-extensions-jdbc = { path = "../agentscope-extensions-jdbc", optional = true }
+agentscope-extensions-jdbc = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
