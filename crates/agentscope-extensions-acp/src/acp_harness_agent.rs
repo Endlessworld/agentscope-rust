@@ -545,6 +545,14 @@ impl ModelConfig {
             .split_once('/')
             .map(|(p, _)| p)
             .filter(|p| !p.is_empty());
+        // 下拉列表在同名模型出现在多个 provider 下时会合成 `ProviderKey/model`
+        // （见 `all_models`）。剥掉这段本地 provider key 后才是配置文件的原始值；
+        // 配置项本身带 `/`（如 `workbuddy/auto`）时不会被剥，因为 `workbuddy`
+        // 不是 provider key。
+        let configured = match model_id.split_once('/') {
+            Some((p, rest)) if self.providers.keys().any(|k| k.eq_ignore_ascii_case(p)) => rest,
+            _ => model_id,
+        };
 
         let mut keys: Vec<&String> = self.providers.keys().collect();
         keys.sort();
@@ -557,22 +565,33 @@ impl ModelConfig {
 
         for key in keys {
             let provider = &self.providers[key];
-            if provider.models.contains(bare) || provider.models.contains(model_id) {
-                let api_key = resolve_api_key(key, &provider.api_key);
-                let base_url = resolve_base_url(key, &provider.base_url);
-                let protocol = protocol_for(&provider.models, bare);
-                tracing::info!(
-                    "model-config: resolve_model '{model_id}' -> provider='{key}' \
-                     model='{bare}' protocol={} base_url='{base_url}'",
-                    protocol.label()
-                );
-                return Ok(ResolvedModel {
-                    model_id: bare.to_string(),
-                    base_url,
-                    api_key,
-                    protocol,
-                });
-            }
+            // 请求上送的 model 必须与配置文件里的写法一致：优先用原始值（其中可能
+            // 自带 `/`，如网关要求的 `workbuddy/deepseek-v4.1-flash`），只有合成
+            // 前缀形态才退到 `configured` / `bare`。
+            let matched = if provider.models.contains(model_id) {
+                model_id
+            } else if provider.models.contains(configured) {
+                configured
+            } else if provider.models.contains(bare) {
+                bare
+            } else {
+                continue;
+            };
+            let api_key = resolve_api_key(key, &provider.api_key);
+            let base_url = resolve_base_url(key, &provider.base_url);
+            // 协议按实际命中的写法查表，否则带前缀的项会退化成 ChatCompletions。
+            let protocol = protocol_for(&provider.models, matched);
+            tracing::info!(
+                "model-config: resolve_model '{model_id}' -> provider='{key}' \
+                 model='{matched}' protocol={} base_url='{base_url}'",
+                protocol.label()
+            );
+            return Ok(ResolvedModel {
+                model_id: matched.to_string(),
+                base_url,
+                api_key,
+                protocol,
+            });
         }
         tracing::error!("model-config: model '{model_id}' not found in any provider");
         Err(format!(
@@ -1004,7 +1023,7 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
             let cfg = ModelConfig::load_or_create();
             let resolved = cfg.resolve_model(model_id).ok()?;
             Some(build_model(
-                model_id,
+                &resolved.model_id,
                 &resolved.base_url,
                 &resolved.api_key,
                 resolved.protocol,
@@ -1356,4 +1375,100 @@ async fn drain_sessions(sessions: &Arc<Mutex<HashMap<String, AcpAgentSession>>>,
         session.close();
     }
     tokio::time::sleep(Duration::from_millis(250)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A provider whose configured model ids themselves contain `/` (a gateway that
+    /// routes by `vendor/model`), plus one bare id that exists under two providers so
+    /// the dropdown has to synthesize a `ProviderKey/model` value.
+    fn config() -> ModelConfig {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "Gateway".to_string(),
+            ModelProviderConfig {
+                base_url: "http://127.0.0.1:3425/v1".to_string(),
+                api_key: "magpie".to_string(),
+                models: ModelsSpec {
+                    completions: vec![
+                        "workbuddy/auto".to_string(),
+                        "deepseek/deepseek-v4-flash".to_string(),
+                    ],
+                    messages: vec!["workbuddy/minimax-m3.1-flash".to_string()],
+                    responses: vec![],
+                },
+            },
+        );
+        providers.insert(
+            "Go".to_string(),
+            ModelProviderConfig {
+                base_url: "https://example.invalid/v1".to_string(),
+                api_key: "k".to_string(),
+                models: ModelsSpec {
+                    completions: vec!["auto".to_string()],
+                    messages: vec![],
+                    responses: vec![],
+                },
+            },
+        );
+        ModelConfig {
+            default_provider: "Gateway".to_string(),
+            default_model: "workbuddy/auto".to_string(),
+            providers,
+        }
+    }
+
+    /// `base_url` 可被 `OPENAI_BASE_URL` 覆盖，测试里只在其未设置时校验。
+    fn assert_base_url(resolved: &ResolvedModel, expected: &str) {
+        let overridden = std::env::var("OPENAI_BASE_URL")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if !overridden {
+            assert_eq!(resolved.base_url, expected);
+        }
+    }
+
+    #[test]
+    fn resolve_model_sends_the_configured_id_verbatim() {
+        let cfg = config();
+        for id in [
+            "workbuddy/auto",
+            "deepseek/deepseek-v4-flash",
+            "workbuddy/minimax-m3.1-flash",
+        ] {
+            let resolved = cfg.resolve_model(id).unwrap();
+            assert_eq!(resolved.model_id, id, "wire model must match models.json");
+            assert_base_url(&resolved, "http://127.0.0.1:3425/v1");
+        }
+    }
+
+    #[test]
+    fn resolve_model_keeps_the_matched_protocol_group() {
+        let cfg = config();
+        let resolved = cfg.resolve_model("workbuddy/minimax-m3.1-flash").unwrap();
+        assert_eq!(resolved.protocol, ApiProtocol::Messages);
+        let resolved = cfg.resolve_model("workbuddy/auto").unwrap();
+        assert_eq!(resolved.protocol, ApiProtocol::ChatCompletions);
+    }
+
+    #[test]
+    fn resolve_model_strips_only_a_real_provider_prefix() {
+        let cfg = config();
+        // `Go/auto` is the disambiguated dropdown value; the configured id is `auto`.
+        let resolved = cfg.resolve_model("Go/auto").unwrap();
+        assert_eq!(resolved.model_id, "auto");
+        assert_base_url(&resolved, "https://example.invalid/v1");
+        // `Gateway/<configured id>` is the same form for an id that contains `/`.
+        let resolved = cfg.resolve_model("Gateway/workbuddy/auto").unwrap();
+        assert_eq!(resolved.model_id, "workbuddy/auto");
+        assert_base_url(&resolved, "http://127.0.0.1:3425/v1");
+    }
+
+    #[test]
+    fn resolve_model_rejects_unknown_ids() {
+        let cfg = config();
+        assert!(cfg.resolve_model("Gateway/nope").is_err());
+    }
 }
