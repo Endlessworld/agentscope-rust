@@ -24,12 +24,10 @@ pub mod message;
 pub mod transcript;
 
 pub use archive::{ArchiveEnvelope, ArchiveScope, JevContextArchive, UnavailableContextArchive};
-pub use compactor::{
-    Action, CompactionRequest, Config, ContextPlan, JevContextCompactor, Scores,
-};
+pub use compactor::{Action, CompactionRequest, Config, ContextPlan, JevContextCompactor, Scores};
 pub use file_archive::FileJevContextArchive;
 pub use message::{
-    ContextBlock, ContextMessage, ContextResultPart, ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL,
-    ROLE_USER, ToolResultState,
+    ContextBlock, ContextMessage, ContextResultPart, ToolResultState, ROLE_ASSISTANT, ROLE_SYSTEM,
+    ROLE_TOOL, ROLE_USER,
 };
 pub use transcript::{estimate_tokens, truncate, CompactionTranscript, Fitted, Pair};

@@ -1068,7 +1068,8 @@ mod tests {
 
         // Java flags `>=` the budget, so exactly-at-budget output is truncated without dropping
         // a byte.
-        let mut at_budget = RemoteExecOutput::new(0, "y".repeat(OUTPUT_TRUNCATE_BYTES), String::new());
+        let mut at_budget =
+            RemoteExecOutput::new(0, "y".repeat(OUTPUT_TRUNCATE_BYTES), String::new());
         at_budget.truncate_stdout();
         assert!(at_budget.truncated);
         assert_eq!(at_budget.stdout.len(), OUTPUT_TRUNCATE_BYTES);
@@ -1183,17 +1184,13 @@ mod tests {
             cwd: Option<&str>,
             _timeout_seconds: u64,
         ) -> SandboxResult<RemoteExecOutput> {
-            self.cwds
-                .lock()
-                .unwrap()
-                .push(cwd.map(str::to_string));
+            self.cwds.lock().unwrap().push(cwd.map(str::to_string));
             self.commands.lock().unwrap().push(command.to_string());
             // Emulate `tar | base64` with a real archive so `stop` -> snapshot.persist and a later
             // `start` -> snapshot.restore carry bytes instead of an empty stream.
             if command.contains("base64 -w0") {
                 use base64::Engine as _;
-                let encoded =
-                    base64::engine::general_purpose::STANDARD.encode(FAKE_ARCHIVE);
+                let encoded = base64::engine::general_purpose::STANDARD.encode(FAKE_ARCHIVE);
                 return Ok(RemoteExecOutput::new(0, encoded, String::new()));
             }
             Ok(RemoteExecOutput::new(0, String::new(), String::new()))
@@ -1335,7 +1332,11 @@ mod tests {
             other => panic!("expected a remote state, got {other:?}"),
         }
         resumed.start().await.unwrap();
-        assert_eq!(*backend.creates.lock().unwrap(), 1, "resume must not call create_sandbox");
+        assert_eq!(
+            *backend.creates.lock().unwrap(),
+            1,
+            "resume must not call create_sandbox"
+        );
     }
 
     #[tokio::test]
@@ -1378,7 +1379,10 @@ mod tests {
         let spec = WorkspaceSpec::new("/workspace").with_file("a.txt", "hi");
         let mut sandbox = client.create(&spec, None, None).await.unwrap();
         sandbox.start().await.unwrap();
-        assert!(*backend.alive.lock().unwrap(), "start creates the remote sandbox");
+        assert!(
+            *backend.alive.lock().unwrap(),
+            "start creates the remote sandbox"
+        );
 
         // `Sandbox::close` = stop (archive the workspace) + shutdown (kill the remote sandbox).
         // This is what harness `SandboxManager::release` calls for self-managed sandboxes
@@ -1423,7 +1427,11 @@ mod tests {
             let mut extra = BTreeMap::new();
             extra.insert(key.to_string(), value.to_string());
             let data = RemoteSandboxStateData::from_harness_state(&state_with(extra)).unwrap();
-            assert_eq!(data.sandbox_id.as_deref(), Some(value), "fallback key {key}");
+            assert_eq!(
+                data.sandbox_id.as_deref(),
+                Some(value),
+                "fallback key {key}"
+            );
             // The recovered id is promoted into the dedicated metadata key on re-projection.
             match data.to_harness_state() {
                 SandboxState::Remote(remote) => assert_eq!(
@@ -1543,9 +1551,8 @@ mod tests {
         backend: Arc<FakeBackend>,
         snapshots: Arc<MemorySnapshotClient>,
     ) -> RemoteSandboxClient {
-        RemoteSandboxClient::new(backend).with_snapshot_spec(Arc::new(RemoteSnapshotSpec::new(
-            snapshots,
-        )))
+        RemoteSandboxClient::new(backend)
+            .with_snapshot_spec(Arc::new(RemoteSnapshotSpec::new(snapshots)))
     }
 
     #[tokio::test]
@@ -1587,7 +1594,10 @@ mod tests {
 
         // A new session resumes the persisted state through the same client.
         backend.commands.lock().unwrap().clear();
-        let mut resumed = client.resume(&client.deserialize_state(&json).unwrap()).await.unwrap();
+        let mut resumed = client
+            .resume(&client.deserialize_state(&json).unwrap())
+            .await
+            .unwrap();
         resumed.start().await.unwrap();
 
         let commands = backend.commands.lock().unwrap().clone();
@@ -1612,7 +1622,8 @@ mod tests {
             creates: Mutex::new(0),
             cwds: Mutex::new(Vec::new()),
         });
-        let with_spec = snapshotted_client(backend.clone(), Arc::new(MemorySnapshotClient::default()));
+        let with_spec =
+            snapshotted_client(backend.clone(), Arc::new(MemorySnapshotClient::default()));
         let mut sandbox = with_spec
             .create(&WorkspaceSpec::new("/workspace"), None, None)
             .await
@@ -1623,7 +1634,10 @@ mod tests {
 
         let plain = RemoteSandboxClient::new(backend.clone());
         backend.commands.lock().unwrap().clear();
-        let mut resumed = plain.resume(&plain.deserialize_state(&json).unwrap()).await.unwrap();
+        let mut resumed = plain
+            .resume(&plain.deserialize_state(&json).unwrap())
+            .await
+            .unwrap();
         resumed.start().await.unwrap();
 
         let commands = backend.commands.lock().unwrap().clone();

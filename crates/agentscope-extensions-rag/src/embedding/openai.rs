@@ -650,8 +650,11 @@ mod tests {
         // Java built a new SDK client per subscription (and per retry), accumulating resources
         // until 07c5f3078 made it lazy-but-single. The Rust port builds one transport in
         // `build()` and every call goes through that instance.
-        let transport =
-            ScriptedTransport::with_responses((0..20).map(|_| HttpResponse::new(200, success_body())).collect());
+        let transport = ScriptedTransport::with_responses(
+            (0..20)
+                .map(|_| HttpResponse::new(200, success_body()))
+                .collect(),
+        );
         let model = model(transport.clone());
         for _ in 0..20 {
             model

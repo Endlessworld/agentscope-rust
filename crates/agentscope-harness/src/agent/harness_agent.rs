@@ -35,6 +35,7 @@ use super::bus::{AsyncToolRegistry, MessageBus, WorkspaceAsyncToolRegistry, Work
 use super::distributed_store::DistributedStore;
 use super::gateway::create_completion_callback;
 use super::isolation_scope::IsolationScope;
+use super::mcp::Registrar;
 use super::memory::compaction::{CompactionConfig, ConversationCompactor};
 use super::memory::{
     MemoryConfig, MemoryConsolidator, MemoryFlushManager, ToolResultEvictionConfig,
@@ -48,8 +49,6 @@ use super::middleware::{
     ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware, WorkspaceContextMiddleware,
 };
 use super::sandbox::{SandboxContext, SandboxManager};
-use super::mcp::Registrar;
-use super::tools::{ToolFilter, ToolsConfig, ToolsConfigLoader};
 use super::shutdown::GracefulShutdownController;
 use super::skill::{
     build_promoter, compose_skill_repositories, default_gate, AuditEntry,
@@ -61,10 +60,11 @@ use super::skill::{
 use super::subagent::task::repository::TaskRepository;
 use super::subagent::task::WorkspaceTaskRepository;
 use super::subagent::{
-    CustomSubagentFactory, DefaultAgentManager, SharedModelSlot, SubagentBlueprint, SubagentDeclaration,
-    SubagentEntry,
+    CustomSubagentFactory, DefaultAgentManager, SharedModelSlot, SubagentBlueprint,
+    SubagentDeclaration, SubagentEntry,
 };
 use super::team::{TeamClient, TeamContext};
+use super::tools::{ToolFilter, ToolsConfig, ToolsConfigLoader};
 use super::workspace::{
     PlanModeManager, WorkspaceIndex, WorkspaceManager, WorkspacePathNormalizer,
 };
@@ -737,9 +737,7 @@ fn no_model_error() -> agentscope_core::error::Error {
 ///
 /// Both recorder paths (the session scheduler's and the one a `ReActAgent` opens for itself)
 /// resolve the policy here, so the switch cannot mean two different things.
-fn recording_policy_for(
-    record_model_requests: bool,
-) -> agentscope_core::session::RecordingPolicy {
+fn recording_policy_for(record_model_requests: bool) -> agentscope_core::session::RecordingPolicy {
     if record_model_requests {
         agentscope_core::session::RecordingPolicy::journaling_requests()
     } else {
@@ -2711,9 +2709,9 @@ impl HarnessAgentBuilder {
             }
             // Java `inner.enableTaskRequirements(contextSources.taskContext().requirementProposals())`:
             // the task-context projection decides by default, an explicit knob overrides it.
-            let task_requirements = self.task_requirements_enabled.unwrap_or_else(|| {
-                self.context_sources.task_context().requirement_proposals
-            });
+            let task_requirements = self
+                .task_requirements_enabled
+                .unwrap_or_else(|| self.context_sources.task_context().requirement_proposals);
             agent_builder = agent_builder.task_requirements_enabled(task_requirements);
             // ACP renders file diffs from the tool-result event and never reads them back
             // from history: archiving them would keep a copy of every edited file's old+new
@@ -2940,7 +2938,9 @@ mod tests {
                 .as_ref(),
             Some(&config)
         );
-        assert!(HarnessAgent::builder().effective_generate_options().is_none());
+        assert!(HarnessAgent::builder()
+            .effective_generate_options()
+            .is_none());
     }
 
     #[tokio::test]
@@ -3048,7 +3048,9 @@ mod tests {
             _options: GenerateOptions,
         ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
             Box::pin(futures::stream::once(async {
-                Err(agentscope_core::error::Error::Http("primary is down".into()))
+                Err(agentscope_core::error::Error::Http(
+                    "primary is down".into(),
+                ))
             }))
         }
 
@@ -3104,7 +3106,10 @@ mod tests {
             .effective_generate_options()
             .expect("max_retries alone still yields options");
         assert_eq!(
-            options.execution_config.expect("an execution policy").max_attempts,
+            options
+                .execution_config
+                .expect("an execution policy")
+                .max_attempts,
             Some(3)
         );
 
@@ -3185,8 +3190,7 @@ mod tests {
             .name("projected-agent")
             .model(Arc::new(NoopModel))
             .task_context(
-                crate::agent::context::TaskContextOptions::disabled()
-                    .allow_requirement_proposals(),
+                crate::agent::context::TaskContextOptions::disabled().allow_requirement_proposals(),
             )
             .cwd(root.clone())
             .workspace(root.join("workspace"))

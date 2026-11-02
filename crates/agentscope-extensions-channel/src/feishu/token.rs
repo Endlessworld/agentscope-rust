@@ -250,7 +250,9 @@ mod tests {
         assert_eq!(p.token().await.unwrap(), "t-fresh");
         assert_eq!(transport.request_count(), 1);
         // The re-fetched token is usable immediately: its deadline is 80 % of the TTL out.
-        let cached = store.get().expect("the refresh must write through the store");
+        let cached = store
+            .get()
+            .expect("the refresh must write through the store");
         assert_eq!(cached.value, "t-fresh");
         assert!(cached.refresh_at_ms > now_ms());
         assert_eq!(p.token().await.unwrap(), "t-fresh");

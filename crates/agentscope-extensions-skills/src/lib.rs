@@ -1,4 +1,4 @@
-﻿//! agentscope-extensions-skills — skill repository backends (git / MySQL / PostgreSQL).
+//! agentscope-extensions-skills — skill repository backends (git / MySQL / PostgreSQL).
 //!
 //! Ports the Java `agentscope-extensions-skills` module (submodules
 //! `skill-git-repository`, `skill-mysql-repository`, `skill-postgresql-repository`).
@@ -40,7 +40,7 @@ pub use git::{GitSkillRepository, GitSkillRepositoryConfig};
 pub use mysql::{MysqlSkillRepository, MysqlSkillRepositoryConfig};
 pub use postgresql::{PostgresSkillRepository, PostgresSkillRepositoryConfig};
 
-#[cfg(feature = "postgres-driver")]
-pub use driver::{PgSqlConnection, PgSqlDatabase};
 #[cfg(feature = "mysql-driver")]
 pub use driver::{MysqlSqlConnection, MysqlSqlDatabase};
+#[cfg(feature = "postgres-driver")]
+pub use driver::{PgSqlConnection, PgSqlDatabase};

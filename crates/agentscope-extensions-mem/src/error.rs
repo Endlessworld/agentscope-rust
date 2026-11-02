@@ -80,9 +80,7 @@ impl MemError {
     /// status branch only); every other kind passes through unchanged.
     pub fn with_context(self, vendor: &'static str, operation: &'static str) -> Self {
         match self {
-            Self::HttpStatus {
-                status, body, ..
-            } => Self::HttpStatus {
+            Self::HttpStatus { status, body, .. } => Self::HttpStatus {
                 vendor,
                 operation,
                 status,

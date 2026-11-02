@@ -636,7 +636,8 @@ impl HigressMcpClientWrapper {
     ///
     /// Mirrors Java `McpClientWrapper.getPropagateMeta()`.
     pub fn propagate_meta(&self) -> bool {
-        self.propagate_meta.load(std::sync::atomic::Ordering::Relaxed)
+        self.propagate_meta
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Toggles request-metadata propagation.

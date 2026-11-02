@@ -186,7 +186,10 @@ mod tests {
         let builder = MysqlJdbcStoreBuilder::new("mysql://root@127.0.0.1:3306/agentscope");
         assert_eq!(builder.url(), "mysql://root@127.0.0.1:3306/agentscope");
         assert!(builder.initialize_schema, "schema bootstrap on by default");
-        assert!(builder.native_lock_guard, "Java's MySQL lock path is GET_LOCK");
+        assert!(
+            builder.native_lock_guard,
+            "Java's MySQL lock path is GET_LOCK"
+        );
         assert_eq!(builder.isolation_scope, IsolationScope::User);
     }
 

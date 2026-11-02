@@ -54,9 +54,9 @@ mod pg_tls;
 mod postgres;
 
 #[cfg(feature = "mysql-driver")]
-pub use mysql::{MysqlSqlDatabase, MysqlSqlConnection};
+pub use mysql::{MysqlSqlConnection, MysqlSqlDatabase};
 #[cfg(feature = "postgres-driver")]
-pub use postgres::{PgSqlDatabase, PgSqlConnection};
+pub use postgres::{PgSqlConnection, PgSqlDatabase};
 
 /// Wraps a driver failure in [`SkillRepositoryError::Database`].
 fn db_error(context: &str, error: impl Display) -> SkillRepositoryError {

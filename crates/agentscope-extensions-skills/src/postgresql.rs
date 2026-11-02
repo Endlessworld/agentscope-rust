@@ -16,9 +16,8 @@ use crate::error::SkillRepositoryError;
 use crate::repository::{AgentSkillRepository, AgentSkillRepositoryInfo};
 use crate::sql::{SqlConnection, SqlDatabase, SqlParam};
 use crate::util::{
-    build_skill, has_extended_metadata, is_skill_document, resolve_identifier,
-    serialize_metadata, skill_body, validate_identifier, validate_resource_path,
-    validate_skill_name,
+    build_skill, has_extended_metadata, is_skill_document, resolve_identifier, serialize_metadata,
+    skill_body, validate_identifier, validate_resource_path, validate_skill_name,
 };
 
 /// Default schema name.
@@ -860,7 +859,9 @@ mod tests {
         };
         assert!(matches!(error, SkillRepositoryError::Database(_)));
         assert!(
-            error.to_string().contains("schema does not exist: agentscope"),
+            error
+                .to_string()
+                .contains("schema does not exist: agentscope"),
             "{error}"
         );
         assert!(error.to_string().contains("createIfNotExist"), "{error}");

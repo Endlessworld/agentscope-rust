@@ -613,7 +613,9 @@ impl AsdpTransport {
         }
         {
             let mut state = self.lock();
-            state.pending.insert(report.report_id.clone(), report.clone());
+            state
+                .pending
+                .insert(report.report_id.clone(), report.clone());
         }
         if !self.is_connected() {
             return Ok(false);
@@ -666,12 +668,8 @@ impl AsdpTransport {
                 AsdpEvent::Acked(ack)
             }
             DownstreamPayload::SessionCmd(command) => AsdpEvent::SessionCommand(command),
-            DownstreamPayload::ExecutionAttempt(command) => {
-                AsdpEvent::ExecutionAttempt(command)
-            }
-            DownstreamPayload::ConversationTurn(command) => {
-                AsdpEvent::ConversationTurn(command)
-            }
+            DownstreamPayload::ExecutionAttempt(command) => AsdpEvent::ExecutionAttempt(command),
+            DownstreamPayload::ConversationTurn(command) => AsdpEvent::ConversationTurn(command),
             DownstreamPayload::ConnectAck(response) if !response.accepted => {
                 AsdpEvent::ConnectRejected(response)
             }
@@ -719,7 +717,9 @@ impl AsdpTransport {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, AsdpState> {
-        self.state.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
@@ -890,9 +890,7 @@ mod tests {
 
         // An ack carrying an error keeps the report in the outbox for retry.
         let failed = transport
-            .handle_downstream(
-                r#"{"eventAck":{"reportId":"r-1","error":"store unavailable"}}"#,
-            )
+            .handle_downstream(r#"{"eventAck":{"reportId":"r-1","error":"store unavailable"}}"#)
             .unwrap();
         assert!(matches!(failed, AsdpEvent::Acked(_)));
         assert_eq!(transport.pending_reports().len(), 1);
@@ -931,7 +929,9 @@ mod tests {
         }
 
         let rejected = transport
-            .handle_downstream(r#"{"connectAck":{"accepted":false,"rejectReason":"stale generation"}}"#)
+            .handle_downstream(
+                r#"{"connectAck":{"accepted":false,"rejectReason":"stale generation"}}"#,
+            )
             .unwrap();
         match rejected {
             AsdpEvent::ConnectRejected(response) => {

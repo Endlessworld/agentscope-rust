@@ -341,14 +341,8 @@ mod tests {
 
     fn response(a: f64, b: f64) -> SystemOneResult {
         let mut answers = BTreeMap::new();
-        answers.insert(
-            "a".to_string(),
-            Answer::Noul(NoulAnswer { noul: Some(a) }),
-        );
-        answers.insert(
-            "b".to_string(),
-            Answer::Noul(NoulAnswer { noul: Some(b) }),
-        );
+        answers.insert("a".to_string(), Answer::Noul(NoulAnswer { noul: Some(a) }));
+        answers.insert("b".to_string(), Answer::Noul(NoulAnswer { noul: Some(b) }));
         SystemOneResult {
             model: Some("jev".to_string()),
             answers: Some(answers),
@@ -356,15 +350,9 @@ mod tests {
         }
     }
 
-    fn judge_with(
-        result: Result<SystemOneResult, CallFailure>,
-    ) -> (JevJudge, Arc<ScriptedCaller>) {
+    fn judge_with(result: Result<SystemOneResult, CallFailure>) -> (JevJudge, Arc<ScriptedCaller>) {
         let scripted = Arc::new(ScriptedCaller::new(vec![result]));
-        let judge = JevJudge::new(
-            scripted.as_caller(),
-            Duration::from_millis(200),
-        )
-        .unwrap();
+        let judge = JevJudge::new(scripted.as_caller(), Duration::from_millis(200)).unwrap();
         (judge, scripted)
     }
 
@@ -402,13 +390,19 @@ mod tests {
     async fn contract_violations_and_backend_errors_are_error_results() {
         let (judge, _) = judge_with(Err(CallFailure::invalid_reply("llm:x", None)));
         assert_eq!(
-            judge.judge(serde_json::json!({}), &definition()).await.error,
+            judge
+                .judge(serde_json::json!({}), &definition())
+                .await
+                .error,
             ErrorCode::InvalidResponse
         );
 
         let (judge, _) = judge_with(Err(CallFailure::backend("down")));
         assert_eq!(
-            judge.judge(serde_json::json!({}), &definition()).await.error,
+            judge
+                .judge(serde_json::json!({}), &definition())
+                .await
+                .error,
             ErrorCode::Backend
         );
 
@@ -422,7 +416,10 @@ mod tests {
 
         let (judge, _) = judge_with(Ok(response(f64::NAN, 0.1)));
         assert_eq!(
-            judge.judge(serde_json::json!({}), &definition()).await.error,
+            judge
+                .judge(serde_json::json!({}), &definition())
+                .await
+                .error,
             ErrorCode::InvalidResponse
         );
     }
@@ -484,9 +481,12 @@ mod tests {
         );
         assert_eq!(duplicated.unwrap_err().message(), "duplicate criterion id");
         assert_eq!(
-            JevJudge::new(Arc::new(|_r| Box::pin(async { Err(CallFailure::backend("x")) })), Duration::ZERO)
-                .unwrap_err()
-                .message(),
+            JevJudge::new(
+                Arc::new(|_r| Box::pin(async { Err(CallFailure::backend("x")) })),
+                Duration::ZERO
+            )
+            .unwrap_err()
+            .message(),
             "budget must be positive"
         );
     }

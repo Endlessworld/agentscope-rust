@@ -166,11 +166,7 @@ impl JevTrace {
         if id.trim().is_empty() {
             return Err(JevError::invalid("trace id required"));
         }
-        Ok(Self {
-            id,
-            fields,
-            issues,
-        })
+        Ok(Self { id, fields, issues })
     }
 
     /// Creates a trace with no issues.
@@ -500,7 +496,10 @@ mod tests {
         let trace = JevTrace::from_messages("t", &[assistant], None).unwrap();
         assert_eq!(trace.issues, vec!["UNSUPPORTED_TOOL_CONTENT".to_string()]);
         assert_eq!(trace.list("tool_calls")[0]["result"], json!("a\nb"));
-        assert_eq!(trace.list("tool_calls")[0]["result_state"], json!("UNKNOWN"));
+        assert_eq!(
+            trace.list("tool_calls")[0]["result_state"],
+            json!("UNKNOWN")
+        );
     }
 
     #[test]

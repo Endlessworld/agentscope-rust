@@ -25,8 +25,8 @@ use std::sync::Arc;
 use agentscope_extensions_jdbc::backend::{ColumnValue, JdbcError, JdbcExecutor};
 use agentscope_extensions_jdbc::dialect::vendor::MysqlDialect;
 use agentscope_extensions_jdbc::dialect::{
-    detect_dialect, AbstractJdbcDialect, BoundSql, DialectKind, JdbcDialectBuilder, TableNameConfig,
-    TableNameConfigurable,
+    detect_dialect, AbstractJdbcDialect, BoundSql, DialectKind, JdbcDialectBuilder,
+    TableNameConfig, TableNameConfigurable,
 };
 use agentscope_extensions_jdbc::sandbox::NativeLockFlavor;
 use agentscope_extensions_jdbc::skill::JdbcAgentSkillRepository;
@@ -35,9 +35,9 @@ use agentscope_extensions_jdbc::{
     JdbcRemoteSnapshotClient, MysqlExecutor, MYSQL_URL_ENV,
 };
 use agentscope_extensions_skills::AgentSkillRepository;
-use agentscope_harness::agent::skill::AgentSkill;
 use agentscope_harness::agent::sandbox::snapshot::RemoteSnapshotClient;
 use agentscope_harness::agent::sandbox::{SandboxGuard, SandboxIsolationKey};
+use agentscope_harness::agent::skill::AgentSkill;
 use agentscope_harness::agent::IsolationScope;
 use agentscope_harness::filesystem::BaseStore;
 use serde_json::json;
@@ -144,8 +144,8 @@ async fn snapshot_blob_round_trip() {
     let Some(executor) = executor() else {
         return;
     };
-    let client = JdbcRemoteSnapshotClient::with_schema(executor, mysql_dialect())
-        .expect("snapshot schema");
+    let client =
+        JdbcRemoteSnapshotClient::with_schema(executor, mysql_dialect()).expect("snapshot schema");
     let id = unique("it-mysql-snapshot");
     // Deliberately binary (non-UTF-8): MySQL reports TEXT and BLOB with the same wire type,
     // so the payload must be decoded by the column's character set, not by UTF-8 validity.
@@ -171,9 +171,8 @@ async fn long_lock_name_is_sha256_normalised() {
         .expect("the store projects its guard");
 
     let long_value = format!("agent-{}", "x".repeat(120));
-    let isolation =
-        SandboxIsolationKey::resolve(Some(&IsolationScope::Global), None, &long_value)
-            .expect("isolation key");
+    let isolation = SandboxIsolationKey::resolve(Some(&IsolationScope::Global), None, &long_value)
+        .expect("isolation key");
 
     let lease = guard.try_enter(isolation.clone()).await.expect("lease");
     assert!(
@@ -289,10 +288,9 @@ async fn namespaced_skill_isolation() {
         .build();
 
     assert!(repo.save_in("team-a", &[team_a], false).expect("team-a"));
-    assert!(
-        repo.save_in("team-b", &[team_b], false)
-            .expect("UNIQUE(namespace, name) must admit the same name in another namespace"),
-    );
+    assert!(repo
+        .save_in("team-b", &[team_b], false)
+        .expect("UNIQUE(namespace, name) must admit the same name in another namespace"),);
     let from_a = repo.get_skill_in("team-a", &name).expect("team-a read");
     let from_b = repo.get_skill_in("team-b", &name).expect("team-b read");
     assert_eq!("team-a", from_a.description());

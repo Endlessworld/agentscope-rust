@@ -230,7 +230,9 @@ impl MessageBus for ControlPlaneMessageBus {
     async fn publish(&self, key: &str, payload: Value) -> Result<()> {
         // Native fire-and-forget broadcast does not exist on the control plane either:
         // Java appends to the bounded replay log and lets subscribers poll it.
-        self.log_append(key, payload, PUBLISH_MAX_LEN).await.map(|_| ())
+        self.log_append(key, payload, PUBLISH_MAX_LEN)
+            .await
+            .map(|_| ())
     }
 
     fn subscribe(&self, key: &str) -> tokio::sync::mpsc::UnboundedReceiver<Value> {
@@ -245,7 +247,10 @@ impl MessageBus for ControlPlaneMessageBus {
             ticker.tick().await; // `Flux.interval` fires after the first period
             loop {
                 ticker.tick().await;
-                let entries = match this.log_read(&key, cursor.as_deref(), SUBSCRIBE_BATCH).await {
+                let entries = match this
+                    .log_read(&key, cursor.as_deref(), SUBSCRIBE_BATCH)
+                    .await
+                {
                     Ok(entries) => entries,
                     // A failed poll is skipped, not fatal (Java `onErrorResume(empty)`).
                     Err(_) => continue,
@@ -287,7 +292,10 @@ mod tests {
 
     async fn read(State(stub): State<SharedStub>, Json(body): Json<Value>) -> Json<Value> {
         stub.reads.lock().unwrap().push(body.clone());
-        let since = body.get("since").and_then(|v| v.as_str()).map(str::to_string);
+        let since = body
+            .get("since")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let log = stub.log.lock().unwrap().clone();
         let start = match since {
             Some(id) => log

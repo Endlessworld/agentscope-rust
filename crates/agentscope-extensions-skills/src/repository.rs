@@ -192,7 +192,9 @@ impl RepoBackedSkillRepository {
         let stripe = materialize_lock_for(name);
         // A poisoned stripe only means a previous materialisation panicked; the lock itself is
         // still usable, so recover instead of propagating the panic.
-        let _guard = stripe.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = stripe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Double-check: another thread may have finished while this one waited on the stripe.
         if let Some(dir) = self.materialized.lock().unwrap().get(name) {
             if dir.is_dir() {
@@ -565,7 +567,10 @@ mod tests {
             .name("calc")
             .source("postgresql")
             .description("d")
-            .add_resource("SKILL.md", "---\nname: calc\n---\nbody that is long enough to split")
+            .add_resource(
+                "SKILL.md",
+                "---\nname: calc\n---\nbody that is long enough to split",
+            )
             .add_resource("refs/a.txt", &"x".repeat(4096))
             .add_resource("refs/b.txt", &"y".repeat(4096))
             .build();
@@ -592,7 +597,9 @@ mod tests {
         let first = dirs[0].clone();
         assert!(dirs.iter().all(|dir| dir == &first));
         assert_eq!(
-            std::fs::read_to_string(first.join("refs/a.txt")).unwrap().len(),
+            std::fs::read_to_string(first.join("refs/a.txt"))
+                .unwrap()
+                .len(),
             4096
         );
         let _ = std::fs::remove_dir_all(first);
@@ -639,7 +646,9 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            error.to_string().contains("connection lost while listing skills"),
+            error
+                .to_string()
+                .contains("connection lost while listing skills"),
             "unexpected error: {error}"
         );
         assert!(matches!(error, SkillRepositoryError::Database(_)));

@@ -41,11 +41,11 @@ pub use skill_middleware::{
     build_skill_entries, HarnessSkillMiddleware, SkillCuratorMiddleware, SkillUsageMiddleware,
 };
 pub use state_checkpoint::{StateCheckpointMiddleware, AGENT_STATE_KEY};
+pub(crate) use subagents::prepend_events;
 pub use subagents::{
     build_delivery_reminder, build_task_summary, prepend_to_system_message,
     render_subagent_section, SubagentsMiddleware,
 };
-pub(crate) use subagents::prepend_events;
 pub use teams::TeamsMiddleware;
 pub use tool_call_sanitizer::ToolCallPairSanitizerMiddleware;
 pub use tool_result_eviction::{ToolResultEvictionMiddleware, EVICTED_METADATA_KEY};

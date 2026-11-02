@@ -824,7 +824,12 @@ mod tests {
             tool_choice: Some(ToolChoice::None),
             ..Default::default()
         };
-        let request = build_request(&[Msg::user("hi")], &[tool_schema("f")], &per_call, &defaults);
+        let request = build_request(
+            &[Msg::user("hi")],
+            &[tool_schema("f")],
+            &per_call,
+            &defaults,
+        );
         assert_eq!(
             request.tool_config.unwrap().function_calling_config.mode,
             "NONE"

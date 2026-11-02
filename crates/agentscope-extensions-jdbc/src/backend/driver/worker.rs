@@ -41,9 +41,7 @@ impl<C: Send + 'static> DriverWorker<C> {
         std::thread::Builder::new()
             .name("agentscope-jdbc-driver".to_string())
             .spawn(move || Self::run(connect, started, incoming))
-            .map_err(|e| {
-                JdbcError::database(format!("failed to spawn the driver thread: {e}"))
-            })?;
+            .map_err(|e| JdbcError::database(format!("failed to spawn the driver thread: {e}")))?;
         match start_report.recv() {
             Ok(Ok(())) => Ok(Self {
                 jobs: Mutex::new(jobs),
@@ -106,8 +104,8 @@ impl<C: Send + 'static> DriverWorker<C> {
             jobs.send(job)
                 .map_err(|_| JdbcError::database("the driver thread is gone".to_string()))?;
         }
-        response.recv().map_err(|_| {
-            JdbcError::database("the driver thread dropped the reply".to_string())
-        })?
+        response
+            .recv()
+            .map_err(|_| JdbcError::database("the driver thread dropped the reply".to_string()))?
     }
 }

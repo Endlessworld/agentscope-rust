@@ -86,10 +86,7 @@ impl ToolSearchMiddleware {
         let (messages, loaded) = refresh_search_results(&input.messages, &input.tools, self.mode);
         if !active {
             *self.context.lock().unwrap() = None;
-            return ReasoningInput {
-                messages,
-                ..input
-            };
+            return ReasoningInput { messages, ..input };
         }
 
         if !loaded.is_empty() {
@@ -128,8 +125,7 @@ impl ToolSearchMiddleware {
             .tools
             .iter()
             .filter(|schema| {
-                schema.name != TOOL_SEARCH_TOOL_NAME
-                    && schema.name != STRUCTURED_OUTPUT_TOOL_NAME
+                schema.name != TOOL_SEARCH_TOOL_NAME && schema.name != STRUCTURED_OUTPUT_TOOL_NAME
             })
             .cloned()
             .collect();
@@ -147,9 +143,8 @@ impl ToolSearchMiddleware {
             })
             .map(|schema| {
                 let mut exposed = schema.clone();
-                exposed.defer_loading = Some(
-                    self.mode == ToolSearchMode::Deferred && !visible.contains(&schema.name),
-                );
+                exposed.defer_loading =
+                    Some(self.mode == ToolSearchMode::Deferred && !visible.contains(&schema.name));
                 exposed
             })
             .collect();
@@ -184,8 +179,10 @@ fn refresh_search_results(
     tools: &[ToolSchema],
     mode: ToolSearchMode,
 ) -> (Vec<Msg>, HashSet<String>) {
-    let eligible: HashMap<&str, &ToolSchema> =
-        tools.iter().map(|tool| (tool.name.as_str(), tool)).collect();
+    let eligible: HashMap<&str, &ToolSchema> = tools
+        .iter()
+        .map(|tool| (tool.name.as_str(), tool))
+        .collect();
     let mut loaded = HashSet::new();
     let mut changed = false;
     let mut refreshed: Vec<Msg> = Vec::with_capacity(messages.len());
@@ -195,8 +192,7 @@ fn refresh_search_results(
         for block in &message.content {
             let mut next = block.clone();
             if let ContentBlock::ToolResult(result) = block {
-                if let Some(serde_json::Value::Array(matches)) =
-                    result.metadata.get(METADATA_TOOLS)
+                if let Some(serde_json::Value::Array(matches)) = result.metadata.get(METADATA_TOOLS)
                 {
                     let current: Vec<serde_json::Value> = matches
                         .iter()
@@ -241,7 +237,14 @@ fn refresh_search_results(
             refreshed.push(message.clone());
         }
     }
-    (if changed { refreshed } else { messages.to_vec() }, loaded)
+    (
+        if changed {
+            refreshed
+        } else {
+            messages.to_vec()
+        },
+        loaded,
+    )
 }
 
 #[cfg(test)]
@@ -285,14 +288,8 @@ mod tests {
             .map(|name| describe_tool(&tool(name, "searchable capability")))
             .collect();
         let mut metadata = JsonMap::new();
-        metadata.insert(
-            METADATA_MODE.to_string(),
-            serde_json::json!(mode.as_str()),
-        );
-        metadata.insert(
-            METADATA_TOOLS.to_string(),
-            serde_json::Value::Array(tools),
-        );
+        metadata.insert(METADATA_MODE.to_string(), serde_json::json!(mode.as_str()));
+        metadata.insert(METADATA_TOOLS.to_string(), serde_json::Value::Array(tools));
         Msg::builder()
             .role(crate::message::MsgRole::Tool)
             .content(vec![ContentBlock::ToolResult(ToolResultBlock {
@@ -327,7 +324,10 @@ mod tests {
 
         let rewritten = rewrite(&middleware, &RuntimeContext::default(), input);
 
-        assert_eq!(schema_names(&rewritten), vec![TOOL_SEARCH_TOOL_NAME, "plan_write"]);
+        assert_eq!(
+            schema_names(&rewritten),
+            vec![TOOL_SEARCH_TOOL_NAME, "plan_write"]
+        );
     }
 
     #[test]
@@ -338,11 +338,17 @@ mod tests {
             tool(TOOL_SEARCH_TOOL_NAME, "search"),
             tool("read_file", "reads a file"),
         ]);
-        input.messages = vec![search_result_message(&["read_file"], ToolSearchMode::Function)];
+        input.messages = vec![search_result_message(
+            &["read_file"],
+            ToolSearchMode::Function,
+        )];
 
         let rewritten = rewrite(&middleware, &RuntimeContext::default(), input);
 
-        assert_eq!(schema_names(&rewritten), vec![TOOL_SEARCH_TOOL_NAME, "read_file"]);
+        assert_eq!(
+            schema_names(&rewritten),
+            vec![TOOL_SEARCH_TOOL_NAME, "read_file"]
+        );
     }
 
     #[test]
@@ -362,7 +368,10 @@ mod tests {
 
         let rewritten = rewrite(&middleware, &RuntimeContext::default(), input);
 
-        assert_eq!(schema_names(&rewritten), vec![TOOL_SEARCH_TOOL_NAME, "read_file"]);
+        assert_eq!(
+            schema_names(&rewritten),
+            vec![TOOL_SEARCH_TOOL_NAME, "read_file"]
+        );
         assert_eq!(rewritten.tools[0].defer_loading, Some(false));
         assert_eq!(rewritten.tools[1].defer_loading, Some(true));
     }
@@ -387,7 +396,10 @@ mod tests {
 
         let rewritten = rewrite(&middleware, &ctx, input);
 
-        assert_eq!(schema_names(&rewritten), vec![TOOL_SEARCH_TOOL_NAME, "read_file"]);
+        assert_eq!(
+            schema_names(&rewritten),
+            vec![TOOL_SEARCH_TOOL_NAME, "read_file"]
+        );
     }
 
     #[test]
@@ -406,7 +418,10 @@ mod tests {
 
         let rewritten = rewrite(&middleware, &RuntimeContext::default(), input);
 
-        assert_eq!(schema_names(&rewritten), vec![TOOL_SEARCH_TOOL_NAME, "read_file"]);
+        assert_eq!(
+            schema_names(&rewritten),
+            vec![TOOL_SEARCH_TOOL_NAME, "read_file"]
+        );
     }
 
     #[test]
@@ -420,5 +435,4 @@ mod tests {
 
         assert!(error.to_string().contains("tool_search"), "{error}");
     }
-
 }

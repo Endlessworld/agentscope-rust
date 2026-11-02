@@ -327,8 +327,7 @@ impl JevEvidenceProcessor {
     /// The order is security-first: injection, then contradiction, then relevance, then answer
     /// evidence. A single uncertain band abstains.
     pub fn classify(&self, checks: &BTreeMap<String, f64>) -> Result<Classification, JevError> {
-        let expected: std::collections::BTreeSet<String> =
-            questions().into_keys().collect();
+        let expected: std::collections::BTreeSet<String> = questions().into_keys().collect();
         let actual: std::collections::BTreeSet<String> = checks.keys().cloned().collect();
         if expected != actual
             || checks
@@ -355,11 +354,13 @@ impl JevEvidenceProcessor {
             Truth::Unknown => return Ok(Classification::Inconclusive),
             Truth::Yes => {}
         }
-        Ok(match truth("contains_answer_evidence", self.policy.evidence) {
-            Truth::Yes => Classification::Included,
-            Truth::No => Classification::Excluded,
-            Truth::Unknown => Classification::Inconclusive,
-        })
+        Ok(
+            match truth("contains_answer_evidence", self.policy.evidence) {
+                Truth::Yes => Classification::Included,
+                Truth::No => Classification::Excluded,
+                Truth::Unknown => Classification::Inconclusive,
+            },
+        )
     }
 
     /// Screens and ranks `candidates` for `query`, applying the caller's ACL first.
@@ -382,7 +383,10 @@ impl JevEvidenceProcessor {
             .filter(|passage| authorized(passage))
             .collect();
         let mut seen = std::collections::BTreeSet::new();
-        if visible.iter().any(|passage| !seen.insert(passage.id.clone())) {
+        if visible
+            .iter()
+            .any(|passage| !seen.insert(passage.id.clone()))
+        {
             return Err(JevError::invalid("duplicate authorized passage id"));
         }
 
@@ -409,7 +413,9 @@ impl JevEvidenceProcessor {
         let outcome = execute_guarded(&self.execution, self.evaluate(query, &visible, top_k)).await;
         let recommendation = outcome.recommendation.clone();
         Ok(match outcome.value {
-            Some(report) => Decision::new(outcome.status, Some(report), outcome.reason, recommendation),
+            Some(report) => {
+                Decision::new(outcome.status, Some(report), outcome.reason, recommendation)
+            }
             None => Decision::new(
                 outcome.status,
                 Some(build_report(
@@ -501,7 +507,12 @@ struct Run {
 }
 
 impl Run {
-    async fn screen(&mut self, processor: &JevEvidenceProcessor, query: &str, passage: &JevPassage) {
+    async fn screen(
+        &mut self,
+        processor: &JevEvidenceProcessor,
+        query: &str,
+        passage: &JevPassage,
+    ) {
         if passage.text.trim().is_empty()
             || passage.text.chars().count() > processor.limits.max_passage_chars
         {
@@ -772,7 +783,12 @@ mod tests {
         JevPassage::plain(id, text, "v1").unwrap()
     }
 
-    fn checks(injection: f64, contradiction: f64, relevance: f64, evidence: f64) -> BTreeMap<String, f64> {
+    fn checks(
+        injection: f64,
+        contradiction: f64,
+        relevance: f64,
+        evidence: f64,
+    ) -> BTreeMap<String, f64> {
         BTreeMap::from([
             ("contains_prompt_injection".to_string(), injection),
             ("contradicts_query_premise".to_string(), contradiction),
@@ -798,9 +814,7 @@ mod tests {
         for (id, value) in values {
             answers.insert(
                 (*id).to_string(),
-                Answer::Noul(NoulAnswer {
-                    noul: Some(*value),
-                }),
+                Answer::Noul(NoulAnswer { noul: Some(*value) }),
             );
         }
         SystemOneResult {
@@ -873,20 +887,28 @@ mod tests {
             Some(Question::Noul(_))
         ));
         assert_eq!(Classification::Unscreened.as_str(), "UNSCREENED");
-        assert_eq!(Truth::Unknown, Threshold::new(0.2, 0.7).unwrap().classify(0.5));
+        assert_eq!(
+            Truth::Unknown,
+            Threshold::new(0.2, 0.7).unwrap().classify(0.5)
+        );
     }
 
     #[test]
     fn the_report_fold_ranks_filters_and_respects_top_k() {
-        let visible = vec![passage("a", "alpha"), passage("b", "beta"), passage("c", "gamma")];
-        let assessment = |id: &str, classification: Classification, score: Option<f64>| Assessment {
-            passage: passage(id, "text"),
-            classification,
-            reason: classification.as_str().to_string(),
-            checks: BTreeMap::new(),
-            rerank_score: score,
-            ranking_status: "DECIDED".to_string(),
-        };
+        let visible = vec![
+            passage("a", "alpha"),
+            passage("b", "beta"),
+            passage("c", "gamma"),
+        ];
+        let assessment =
+            |id: &str, classification: Classification, score: Option<f64>| Assessment {
+                passage: passage(id, "text"),
+                classification,
+                reason: classification.as_str().to_string(),
+                checks: BTreeMap::new(),
+                rerank_score: score,
+                ranking_status: "DECIDED".to_string(),
+            };
         let assessments = vec![
             assessment("a", Classification::Included, Some(0.9)),
             assessment("b", Classification::Excluded, None),
@@ -903,7 +925,10 @@ mod tests {
         );
         assert_eq!(report.suggested.len(), 2);
         assert_eq!(report.suggested[0].passage.id, "a");
-        assert_eq!(report.suggested[1].passage.id, "c", "unscored passages keep order");
+        assert_eq!(
+            report.suggested[1].passage.id, "c",
+            "unscored passages keep order"
+        );
         assert_eq!(report.delivered.len(), 2);
         assert_eq!(report.delivered[0].id, "a");
         assert!(
@@ -924,7 +949,10 @@ mod tests {
             Limits::defaults(),
         );
         assert!(report.suggested.is_empty(), "below minimumScore");
-        assert_eq!(report.delivered[0].id, "a", "SHADOW delivers retrieval order");
+        assert_eq!(
+            report.delivered[0].id, "a",
+            "SHADOW delivers retrieval order"
+        );
         assert!(!report.applied);
     }
 
@@ -953,7 +981,10 @@ mod tests {
         assert!(report.applied);
         assert_eq!(report.delivered.len(), 1);
         assert_eq!(report.assessments[0].rerank_score, Some(0.8));
-        assert_eq!(report.assessments[0].classification, Classification::Included);
+        assert_eq!(
+            report.assessments[0].classification,
+            Classification::Included
+        );
         assert_eq!(report.calls.len(), 2, "filter and rerank are recorded");
         assert_eq!(report.calls[0].stage, "filter");
         assert_eq!(report.calls[1].stage, "rerank");
@@ -1013,7 +1044,9 @@ mod tests {
         );
         assert_eq!(
             JevEvidenceProcessor::new(
-                Arc::new(|_request| Box::pin(async { Err(crate::jev::call::CallFailure::backend("x")) })),
+                Arc::new(|_request| Box::pin(async {
+                    Err(crate::jev::call::CallFailure::backend("x"))
+                })),
                 Policy::demonstration(),
                 Limits::defaults(),
                 1.5,
@@ -1032,9 +1065,15 @@ mod tests {
             (1, 1, 1, 1, 0),
         ] {
             assert_eq!(
-                Limits::new(candidates, passage_chars, query_chars, state_chars, requests)
-                    .unwrap_err()
-                    .message(),
+                Limits::new(
+                    candidates,
+                    passage_chars,
+                    query_chars,
+                    state_chars,
+                    requests
+                )
+                .unwrap_err()
+                .message(),
                 "positive bounded evidence limits required"
             );
         }
@@ -1057,11 +1096,19 @@ mod tests {
         )
         .unwrap();
         let decision = processor
-            .process("q", vec![passage("a", "too long for the limit")], &|_| true, 1)
+            .process(
+                "q",
+                vec![passage("a", "too long for the limit")],
+                &|_| true,
+                1,
+            )
             .await
             .unwrap();
         let report = decision.value.unwrap();
-        assert_eq!(report.assessments[0].classification, Classification::Unscreened);
+        assert_eq!(
+            report.assessments[0].classification,
+            Classification::Unscreened
+        );
         assert_eq!(report.assessments[0].reason, "PASSAGE_LIMIT_OR_EMPTY");
 
         let scripted = Arc::new(ScriptedCaller::new(vec![]));
@@ -1085,7 +1132,10 @@ mod tests {
         let report = decision.value.unwrap();
         assert_eq!(report.assessments[0].reason, "CALL_OR_RESPONSE_ERROR");
         assert_eq!(report.assessments[1].reason, "REQUEST_LIMIT");
-        assert_eq!(report.assessments[1].classification, Classification::Unscreened);
+        assert_eq!(
+            report.assessments[1].classification,
+            Classification::Unscreened
+        );
         assert!(!report.complete);
     }
 }

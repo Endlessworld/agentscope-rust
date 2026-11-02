@@ -164,7 +164,10 @@ mod tests {
 
     use super::super::state::{RemoteSandboxState, SandboxSnapshotRef};
 
-    fn store() -> (Arc<InMemoryAgentStateStore>, AgentStateStoreSandboxStateStore) {
+    fn store() -> (
+        Arc<InMemoryAgentStateStore>,
+        AgentStateStoreSandboxStateStore,
+    ) {
         let raw = Arc::new(InMemoryAgentStateStore::new());
         let store = AgentStateStoreSandboxStateStore::new(raw.clone(), "agent-1");
         (raw, store)
@@ -215,7 +218,10 @@ mod tests {
         let json = value.get("json").and_then(|v| v.as_str()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
         assert_eq!(parsed["type"], serde_json::json!("Remote"));
-        assert_eq!(parsed["snapshot"], serde_json::json!({"type": "remote", "id": "snap-1"}));
+        assert_eq!(
+            parsed["snapshot"],
+            serde_json::json!({"type": "remote", "id": "snap-1"})
+        );
     }
 
     #[tokio::test]
@@ -240,7 +246,10 @@ mod tests {
         let (_raw, store) = store();
         assert_eq!(store.slot_session_id("session:s1"), "sandbox/session/s1");
         assert_eq!(store.slot_session_id("user:u1"), "sandbox/user/agent-1/u1");
-        assert_eq!(store.slot_session_id("agent:agent-1"), "sandbox/agent/agent-1");
+        assert_eq!(
+            store.slot_session_id("agent:agent-1"),
+            "sandbox/agent/agent-1"
+        );
         assert_eq!(store.slot_session_id("global:global"), "sandbox/global");
     }
 
@@ -260,10 +269,15 @@ mod tests {
             .await
             .unwrap();
         // A slot owned by another agent must be skipped.
-        raw.save(None, "sandbox/agent/agent-2", SANDBOX_STATE_KEY, serde_json::json!({
-            "json": "",
-            "deleted": true
-        }))
+        raw.save(
+            None,
+            "sandbox/agent/agent-2",
+            SANDBOX_STATE_KEY,
+            serde_json::json!({
+                "json": "",
+                "deleted": true
+            }),
+        )
         .await;
 
         assert_eq!(

@@ -1,4 +1,4 @@
-﻿//! # agentscope-extensions-mongodb
+//! # agentscope-extensions-mongodb
 //!
 //! MongoDB-backed implementations of the harness/core storage traits, mirroring the
 //! Java module `agentscope-extensions-mongodb`.
@@ -78,11 +78,11 @@ pub mod snapshot;
 pub mod state_store;
 pub mod store;
 
+pub use client_mongodb::MongodbClient;
 pub use constants::{
     BASE_STORE_COLLECTION, DEFAULT_DATABASE, SANDBOX_LOCKS_COLLECTION, SESSIONS_COLLECTION,
     SNAPSHOTS_COLLECTION,
 };
-pub use client_mongodb::MongodbClient;
 pub use distributed_store::MongodbDistributedStore;
 pub use index_utils::{create_index_with_migration, IndexSpec};
 pub use sandbox_guard::{MongodbGuardClient, MongodbSandboxExecutionGuard};

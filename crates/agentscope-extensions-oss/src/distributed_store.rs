@@ -11,13 +11,13 @@
 
 use std::sync::Arc;
 
-use agentscope_harness::agent::distributed_store::DistributedStore;
 use crate::base_store::OssStore;
 use crate::client::{normalize_prefix, OssClient};
 use crate::error::{OssError, OssResult};
 use crate::guard::OssSandboxExecutionGuard;
 use crate::snapshot::OssSnapshotSpec;
 use crate::state_store::OssAgentStateStore;
+use agentscope_harness::agent::distributed_store::DistributedStore;
 
 /// Default top-level key prefix used by the composed distributed store.
 pub const DEFAULT_KEY_PREFIX: &str = "agentscope/";

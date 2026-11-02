@@ -14,11 +14,11 @@
 
 use std::sync::Arc;
 
-use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::config::SslMode;
-use tokio_postgres::{Client, Config};
+use tokio_postgres::types::{ToSql, Type};
 #[cfg(not(feature = "postgres-tls"))]
 use tokio_postgres::NoTls;
+use tokio_postgres::{Client, Config};
 
 #[cfg(feature = "postgres-tls")]
 use super::pg_tls;
@@ -221,7 +221,11 @@ fn with_returning(sql: &str, column: &str) -> String {
     if sql.to_ascii_uppercase().contains("RETURNING") {
         return sql.to_string();
     }
-    format!("{} RETURNING {}", sql.trim_end().trim_end_matches(';'), column)
+    format!(
+        "{} RETURNING {}",
+        sql.trim_end().trim_end_matches(';'),
+        column
+    )
 }
 
 impl PgSqlConnection {
@@ -436,7 +440,8 @@ mod tests {
     #[test]
     fn connect_rejects_sslmode_require_without_a_tls_backend() {
         // Rejected before any I/O (port 1 never accepts a TCP connection), so this stays offline.
-        let error = match PgSqlDatabase::connect("host=127.0.0.1 port=1 user=none sslmode=require") {
+        let error = match PgSqlDatabase::connect("host=127.0.0.1 port=1 user=none sslmode=require")
+        {
             Ok(_) => panic!("a TLS-only connection string must be rejected"),
             Err(e) => e,
         };

@@ -34,7 +34,10 @@ pub struct SimpleKnowledge {
 
 impl SimpleKnowledge {
     /// Creates a knowledge base from an embedding model and a vector store.
-    pub fn new(embedding_model: Arc<dyn EmbeddingModel>, embedding_store: Arc<dyn VdbStore>) -> Self {
+    pub fn new(
+        embedding_model: Arc<dyn EmbeddingModel>,
+        embedding_store: Arc<dyn VdbStore>,
+    ) -> Self {
         Self {
             embedding_model,
             embedding_store,
@@ -295,10 +298,7 @@ mod tests {
 
     #[async_trait]
     impl EmbeddingModel for UsageEmbedding {
-        async fn embed(
-            &self,
-            block: &agentscope_core::message::ContentBlock,
-        ) -> Result<Vec<f64>> {
+        async fn embed(&self, block: &agentscope_core::message::ContentBlock) -> Result<Vec<f64>> {
             Ok(self.embed_with_usage(block).await?.embedding)
         }
 

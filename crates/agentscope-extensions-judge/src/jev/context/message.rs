@@ -198,12 +198,16 @@ impl ContextMessage {
 
     /// Whether the message was pinned by metadata.
     pub fn pinned_by_metadata(&self) -> bool {
-        matches!(self.metadata.get(PINNED_METADATA_KEY), Some(Value::Bool(true)))
+        matches!(
+            self.metadata.get(PINNED_METADATA_KEY),
+            Some(Value::Bool(true))
+        )
     }
 
     /// Sets the pinned metadata flag.
     pub fn with_pinned(mut self) -> Self {
-        self.metadata.insert(PINNED_METADATA_KEY.to_string(), Value::Bool(true));
+        self.metadata
+            .insert(PINNED_METADATA_KEY.to_string(), Value::Bool(true));
         self
     }
 

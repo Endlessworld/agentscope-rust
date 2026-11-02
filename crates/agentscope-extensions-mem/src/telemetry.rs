@@ -143,7 +143,10 @@ mod tests {
         let mock = MockTransport::new();
         mock.push_response(Err(MemError::http_status(500, "boom")));
         let (transport, metrics) = instrumented(&mock);
-        let err = transport.post_json("http://x/a", &[], "{}").await.unwrap_err();
+        let err = transport
+            .post_json("http://x/a", &[], "{}")
+            .await
+            .unwrap_err();
         assert!(matches!(err, MemError::HttpStatus { status: 500, .. }));
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.requests, 1);

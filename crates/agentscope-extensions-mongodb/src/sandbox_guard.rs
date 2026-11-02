@@ -240,7 +240,9 @@ impl MongodbSandboxExecutionGuard {
                     }
                     Err(e) => {
                         // Never let an error escape; TTL expiry remains a safety valve.
-                        tracing::warn!("[sandbox-guard] failed to renew MongoDB lock {renew_id}: {e}");
+                        tracing::warn!(
+                            "[sandbox-guard] failed to renew MongoDB lock {renew_id}: {e}"
+                        );
                     }
                 }
             }

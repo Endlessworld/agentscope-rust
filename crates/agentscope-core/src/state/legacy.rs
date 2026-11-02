@@ -100,8 +100,8 @@ mod tests {
     use super::*;
     use crate::permission::PermissionMode;
     use crate::session::{
-        import_baseline, AtomicSessionStorage, JournalSessionLog, MemorySessionStorage,
-        SessionLog, SessionProjection,
+        import_baseline, AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionLog,
+        SessionProjection,
     };
     use crate::state::InMemoryAgentStateStore;
     use std::sync::Arc;
@@ -174,7 +174,10 @@ mod tests {
 
         let result = load(&store, USER, SESSION, None).await;
 
-        assert!(result.found, "a persisted empty group list is not a missing key");
+        assert!(
+            result.found,
+            "a persisted empty group list is not a missing key"
+        );
         assert!(result.state.tool_context().activated_groups().is_empty());
     }
 

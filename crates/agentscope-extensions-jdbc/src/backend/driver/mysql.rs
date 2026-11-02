@@ -117,7 +117,10 @@ impl SqlClient for MysqlSqlClient {
             .map_err(map_error)?;
         // Column metadata comes with the result set; copy it before consuming the rows.
         let columns = result.columns_ref().to_vec();
-        let rows = result.collect::<mysql_async::Row>().await.map_err(map_error)?;
+        let rows = result
+            .collect::<mysql_async::Row>()
+            .await
+            .map_err(map_error)?;
         Ok(rows.iter().map(|row| decode_row(row, &columns)).collect())
     }
 
@@ -285,7 +288,10 @@ mod tests {
     fn every_value_kind_decodes_to_a_column_value() {
         assert_eq!(decode_cell(None, false), ColumnValue::Null);
         assert_eq!(decode_cell(Some(&Value::NULL), true), ColumnValue::Null);
-        assert_eq!(decode_cell(Some(&Value::Int(42)), false), ColumnValue::Int(42));
+        assert_eq!(
+            decode_cell(Some(&Value::Int(42)), false),
+            ColumnValue::Int(42)
+        );
         assert_eq!(
             decode_cell(Some(&Value::UInt(9)), false),
             ColumnValue::Int(9)

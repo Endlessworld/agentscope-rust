@@ -589,9 +589,11 @@ impl TrainingConfigBuilder {
     /// (Java `SampleRate` rejects it with `IllegalArgumentException`; a library must not
     /// abort the host thread).
     pub fn sample_rate(self, sample_rate: f64) -> Result<Self> {
-        Ok(self.selection_strategy(Arc::new(
-            crate::strategy::SamplingRateStrategy::try_of(sample_rate)?,
-        )))
+        Ok(
+            self.selection_strategy(Arc::new(crate::strategy::SamplingRateStrategy::try_of(
+                sample_rate,
+            )?)),
+        )
     }
     pub fn reward_calculator(mut self, calculator: Arc<dyn RewardCalculator>) -> Self {
         self.reward_calculator = Some(calculator);
@@ -3295,7 +3297,10 @@ mod tests {
             .repeat_time(2)
             .build()
             .unwrap();
-        let client = TrinityClient::builder().endpoint(&endpoint).build().unwrap();
+        let client = TrinityClient::builder()
+            .endpoint(&endpoint)
+            .build()
+            .unwrap();
         let router = Arc::new(TrainingRouter::new(config, client));
         *saturator.router.lock().unwrap() = Arc::downgrade(&router);
 
@@ -3321,7 +3326,10 @@ mod tests {
         assert!(reports[0].feedback_submitted);
         // Before the fix the cleanup only ran on the last iteration, so an early `break`
         // left the counter in the registry for the life of the process.
-        assert_eq!(router.run_registry().get_current_run_count("task-cleanup"), 0);
+        assert_eq!(
+            router.run_registry().get_current_run_count("task-cleanup"),
+            0
+        );
         assert_eq!(router.run_registry().size(), 0);
         assert_eq!(served.load(Ordering::SeqCst), 2);
         let _ = server.join().unwrap();
@@ -3388,7 +3396,10 @@ mod tests {
             .repeat_time(1)
             .build()
             .unwrap();
-        let client = TrinityClient::builder().endpoint(&endpoint).build().unwrap();
+        let client = TrinityClient::builder()
+            .endpoint(&endpoint)
+            .build()
+            .unwrap();
         let router = TrainingRouter::new(config, client);
         assert_eq!(router.available_shadow_slots(), 1);
 

@@ -470,9 +470,10 @@ mod tests {
     fn default_lock_timeout_matches_java() {
         assert_eq!(DEFAULT_LOCK_TIMEOUT, Duration::from_secs(1800));
         assert_eq!(guard().lock_timeout, DEFAULT_LOCK_TIMEOUT);
-        let narrowed = MysqlSandboxExecutionGuard::builder(Arc::new(InMemoryLockBackend::default()))
-            .lock_timeout_seconds(5)
-            .build();
+        let narrowed =
+            MysqlSandboxExecutionGuard::builder(Arc::new(InMemoryLockBackend::default()))
+                .lock_timeout_seconds(5)
+                .build();
         assert_eq!(narrowed.lock_timeout, Duration::from_secs(5));
     }
 
@@ -570,7 +571,10 @@ mod tests {
         let g = guard();
         let raw = format!("agentscope:sandbox:lock:user:{}", "y".repeat(35));
         assert_eq!(raw.len(), MAX_LOCK_NAME_LENGTH);
-        assert_eq!(g.compose_lock_name(&SandboxIsolationKey::new("user", "y".repeat(35))), raw);
+        assert_eq!(
+            g.compose_lock_name(&SandboxIsolationKey::new("user", "y".repeat(35))),
+            raw
+        );
     }
 
     /// 65 chars is truncated to `前 50 + ":" + Integer.toHexString(hashCode())`
@@ -609,7 +613,11 @@ mod tests {
     fn truncated_names_never_exceed_the_limit() {
         let g = guard();
         let long = "z".repeat(300);
-        let name = g.compose_lock_name(&SandboxIsolationKey::with_sub_key("session", long.clone(), long));
+        let name = g.compose_lock_name(&SandboxIsolationKey::with_sub_key(
+            "session",
+            long.clone(),
+            long,
+        ));
         assert!(name.len() <= MAX_LOCK_NAME_LENGTH);
         assert_eq!(name.len(), 59, "50 head chars + ':' + 8 hex chars");
     }

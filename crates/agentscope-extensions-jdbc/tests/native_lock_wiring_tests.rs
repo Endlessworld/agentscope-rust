@@ -64,7 +64,11 @@ impl LockBackend {
     }
 
     fn is_held(&self, key: &str) -> bool {
-        self.held.lock().unwrap().iter().any(|(_, held)| held == key)
+        self.held
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, held)| held == key)
     }
 
     fn set_busy(&self) {
@@ -167,10 +171,7 @@ impl JdbcExecutor for FakeExecutor {
     }
 }
 
-fn native_guard(
-    backend: &Arc<LockBackend>,
-    flavor: NativeLockFlavor,
-) -> JdbcSandboxExecutionGuard {
+fn native_guard(backend: &Arc<LockBackend>, flavor: NativeLockFlavor) -> JdbcSandboxExecutionGuard {
     let executor: SharedExecutor = Arc::new(FakeExecutor {
         backend: backend.clone(),
     });
@@ -346,4 +347,3 @@ async fn a_contended_lock_times_out_to_a_noop_lease() {
     assert_eq!(backend.attempts().len(), 1);
     assert_eq!(backend.closes(), 1);
 }
-

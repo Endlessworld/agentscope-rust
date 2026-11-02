@@ -49,9 +49,8 @@ pub use agentscope_core::state::UNVERSIONED;
 /// It returns a boxed future so the callback can await the backend directly; a
 /// synchronous callback would have to bridge with `futures::executor::block_on`, which
 /// stalls (and can deadlock) the runtime.
-pub type SessionDeleteCallback = Arc<
-    dyn Fn(Option<String>, String) -> futures::future::BoxFuture<'static, ()> + Send + Sync,
->;
+pub type SessionDeleteCallback =
+    Arc<dyn Fn(Option<String>, String) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// Validates a state key for use as a field name inside the `states` sub-document.
 ///
@@ -799,10 +798,14 @@ mod tests {
     async fn single_key_reads_project_the_requested_fields() {
         let raw = Arc::new(InMemoryMongoClient::new());
         let s = MongodbAgentStateStore::new(raw.clone(), SESSIONS_COLLECTION);
-        s.save(Some("u"), "sess", "history", json!([1, 2, 3]))
-            .await;
-        s.save(Some("u"), "sess", "other", json!({ "blob": "x".repeat(1024) }))
-            .await;
+        s.save(Some("u"), "sess", "history", json!([1, 2, 3])).await;
+        s.save(
+            Some("u"),
+            "sess",
+            "other",
+            json!({ "blob": "x".repeat(1024) }),
+        )
+        .await;
 
         assert_eq!(
             s.get(Some("u"), "sess", "history").await,
@@ -1274,8 +1277,7 @@ mod tests {
                 let flag = flag.clone();
                 let observed = observed_slot.clone();
                 Box::pin(async move {
-                    *observed.lock().unwrap() =
-                        Some((user.unwrap_or_default(), session));
+                    *observed.lock().unwrap() = Some((user.unwrap_or_default(), session));
                     flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 })
             }))

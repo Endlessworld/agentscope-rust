@@ -335,7 +335,7 @@ pub fn abstained(status: MetricStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jev::call::{Caller, CallFailure};
+    use crate::jev::call::{CallFailure, Caller};
     use crate::jev::dto::{Answer, NoulAnswer, SystemOneResult, Usage};
     use crate::jev::judge::Criterion;
 
@@ -344,22 +344,10 @@ mod tests {
             Definition::new(
                 "v1",
                 vec![
-                    Criterion::new(
-                        "a",
-                        NoulQuestion::new(json!("is a?"), None),
-                        true,
-                        0.2,
-                        0.8,
-                    )
-                    .unwrap(),
-                    Criterion::new(
-                        "b",
-                        NoulQuestion::new(json!("is b?"), None),
-                        true,
-                        0.2,
-                        0.8,
-                    )
-                    .unwrap(),
+                    Criterion::new("a", NoulQuestion::new(json!("is a?"), None), true, 0.2, 0.8)
+                        .unwrap(),
+                    Criterion::new("b", NoulQuestion::new(json!("is b?"), None), true, 0.2, 0.8)
+                        .unwrap(),
                 ],
             )
             .unwrap(),
@@ -372,18 +360,8 @@ mod tests {
             let (a, b) = probabilities[0];
             Box::pin(async move {
                 let mut answers = BTreeMap::new();
-                answers.insert(
-                    "a".to_string(),
-                    Answer::Noul(NoulAnswer {
-                        noul: Some(a),
-                    }),
-                );
-                answers.insert(
-                    "b".to_string(),
-                    Answer::Noul(NoulAnswer {
-                        noul: Some(b),
-                    }),
-                );
+                answers.insert("a".to_string(), Answer::Noul(NoulAnswer { noul: Some(a) }));
+                answers.insert("b".to_string(), Answer::Noul(NoulAnswer { noul: Some(b) }));
                 Ok(SystemOneResult {
                     model: Some("jev".to_string()),
                     answers: Some(answers),
@@ -461,7 +439,12 @@ mod tests {
         let evaluator = Fixed(vec![
             ("c1".to_string(), true, 1.0, verdict(JudgeStatus::Pass)),
             ("c2".to_string(), false, 0.0, verdict(JudgeStatus::Fail)),
-            ("c3".to_string(), false, 0.0, verdict(JudgeStatus::Inconclusive)),
+            (
+                "c3".to_string(),
+                false,
+                0.0,
+                verdict(JudgeStatus::Inconclusive),
+            ),
             (
                 "c4".to_string(),
                 false,
@@ -470,16 +453,8 @@ mod tests {
             ),
         ]);
         let cases = vec![
-            EvaluationCase::new(
-                "good",
-                Request::new("c1", "q", vec![], "a"),
-                true,
-            ),
-            EvaluationCase::new(
-                "good",
-                Request::new("c2", "q", vec![], "a"),
-                true,
-            ),
+            EvaluationCase::new("good", Request::new("c1", "q", vec![], "a"), true),
+            EvaluationCase::new("good", Request::new("c2", "q", vec![], "a"), true),
             EvaluationCase::new("edge", Request::new("c3", "q", vec![], "a"), false),
             EvaluationCase::new("edge", Request::new("c4", "q", vec![], "a"), false),
         ];
@@ -514,7 +489,10 @@ mod tests {
         )];
         let report = JevEvaluationRunner.run(&Failing, cases, 1).await.unwrap();
         assert_eq!(report.overall.errors, 1);
-        assert_eq!(report.rows[0].response.verdict.definition_version, "evaluation-error");
+        assert_eq!(
+            report.rows[0].response.verdict.definition_version,
+            "evaluation-error"
+        );
         assert!(!report.rows[0].response.pass);
         assert_eq!(report.rows[0].response.score, 0.0);
     }

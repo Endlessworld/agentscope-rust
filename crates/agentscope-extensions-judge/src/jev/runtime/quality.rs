@@ -181,7 +181,8 @@ impl Revision {
 ///
 /// Java returns a `Flux<String>`; the port returns the same stream as collected chunks so the
 /// caller can apply Java's `BUFFER_LIMIT` accounting before using the text.
-pub type Reviser = Arc<dyn Fn(Revision) -> BoxedFuture<Result<Vec<String>, JevError>> + Send + Sync>;
+pub type Reviser =
+    Arc<dyn Fn(Revision) -> BoxedFuture<Result<Vec<String>, JevError>> + Send + Sync>;
 
 /// The default reviser (`JevResponseMiddleware.reviseWithModel`).
 ///
@@ -298,7 +299,9 @@ pub fn capture(
             Ok(agentscope_core::event::AgentEvent::TextBlockDelta(data)) => {
                 if let Some(delta) = data.fields.get("delta").and_then(|value| value.as_str()) {
                     if delta.chars().count()
-                        > limits.max_chars.saturating_sub(capture.text.chars().count())
+                        > limits
+                            .max_chars
+                            .saturating_sub(capture.text.chars().count())
                     {
                         return Err(JevError::invalid("TEXT_LIMIT"));
                     }
@@ -342,8 +345,10 @@ pub fn replace_text(
         match event {
             Ok(AgentEvent::TextBlockDelta(mut data)) => {
                 if !emitted {
-                    data.fields
-                        .insert("delta".to_string(), serde_json::Value::String(text.to_string()));
+                    data.fields.insert(
+                        "delta".to_string(),
+                        serde_json::Value::String(text.to_string()),
+                    );
                     replaced.push(Ok(AgentEvent::TextBlockDelta(data)));
                     emitted = true;
                 }
@@ -392,10 +397,16 @@ pub async fn assess(
                 revisions(attempt),
             );
         }
-        let size = serde_json::Value::Object(state.fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .to_string()
-            .chars()
-            .count();
+        let size = serde_json::Value::Object(
+            state
+                .fields
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
+        .to_string()
+        .chars()
+        .count();
         if size > limits.max_chars {
             return Decision::new(
                 Status::Inconclusive,
@@ -408,16 +419,27 @@ pub async fn assess(
             .judge
             .judge(
                 serde_json::Value::Object(
-                    state.fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    state
+                        .fields
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
                 ),
                 &settings.definition,
             )
             .await;
         match review.status {
             JudgeStatus::Pass => {
-                return Decision::new(Status::Decided, Some(draft), "QUALITY_PASS", revisions(attempt))
+                return Decision::new(
+                    Status::Decided,
+                    Some(draft),
+                    "QUALITY_PASS",
+                    revisions(attempt),
+                )
             }
-            JudgeStatus::Fail if settings.mode == Mode::Enforce && attempt < settings.max_revisions => {
+            JudgeStatus::Fail
+                if settings.mode == Mode::Enforce && attempt < settings.max_revisions =>
+            {
                 let revision = Revision::new(
                     input.messages.clone(),
                     input.options.clone(),
@@ -626,15 +648,15 @@ mod tests {
 
     #[test]
     fn replace_text_rewrites_the_first_delta_and_requires_one() {
-        let events = vec![
-            text_event("a"),
-            text_event("b"),
-        ];
+        let events = vec![text_event("a"), text_event("b")];
         let replaced = replace_text(events, "revised").unwrap();
         assert_eq!(replaced.len(), 1);
         match &replaced[0] {
             Ok(AgentEvent::TextBlockDelta(data)) => {
-                assert_eq!(data.fields.get("delta").and_then(Value::as_str), Some("revised"))
+                assert_eq!(
+                    data.fields.get("delta").and_then(Value::as_str),
+                    Some("revised")
+                )
             }
             other => panic!("unexpected event {other:?}"),
         }
@@ -731,13 +753,8 @@ mod tests {
             .message(),
             "invalid response limits"
         );
-        let settings = QualitySettings::with_default_reviser(
-            Mode::Shadow,
-            judge,
-            definition(),
-            1,
-        )
-        .unwrap();
+        let settings =
+            QualitySettings::with_default_reviser(Mode::Shadow, judge, definition(), 1).unwrap();
         assert_eq!(settings.mode, Mode::Shadow);
         assert_eq!(settings.max_revisions, 1);
     }

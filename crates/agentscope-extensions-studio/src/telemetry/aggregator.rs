@@ -276,7 +276,10 @@ mod tests {
         agg.append(&ChatResponse::new(
             "",
             vec![],
-            ChatUsage::builder().input_tokens(11).output_tokens(4).build(),
+            ChatUsage::builder()
+                .input_tokens(11)
+                .output_tokens(4)
+                .build(),
             None,
             None,
         ));

@@ -281,42 +281,45 @@ impl StateBackend for MysqlAsyncBackend {
 
     fn database_exists(&self, database_name: &str) -> MysqlResult<bool> {
         let mut conn = self.conn()?;
-        let found = self.block_on(async {
-            conn.exec_first::<i64, _, _>(
-                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?",
-                (database_name.to_string(),),
-            )
-            .await
-        })
-        .map_err(driver_error)?;
+        let found = self
+            .block_on(async {
+                conn.exec_first::<i64, _, _>(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?",
+                    (database_name.to_string(),),
+                )
+                .await
+            })
+            .map_err(driver_error)?;
         Ok(found.unwrap_or(0) > 0)
     }
 
     fn table_exists(&self, database_name: &str, table_name: &str) -> MysqlResult<bool> {
         let mut conn = self.conn()?;
-        let found = self.block_on(async {
-            conn.exec_first::<i64, _, _>(
-                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES \
+        let found = self
+            .block_on(async {
+                conn.exec_first::<i64, _, _>(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES \
                  WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-                (database_name.to_string(), table_name.to_string()),
-            )
-            .await
-        })
-        .map_err(driver_error)?;
+                    (database_name.to_string(), table_name.to_string()),
+                )
+                .await
+            })
+            .map_err(driver_error)?;
         Ok(found.unwrap_or(0) > 0)
     }
 
     fn table_columns(&self, database_name: &str, table_name: &str) -> MysqlResult<Vec<String>> {
         let mut conn = self.conn()?;
-        let rows = self.block_on(async {
-            conn.exec::<String, _, _>(
-                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
+        let rows = self
+            .block_on(async {
+                conn.exec::<String, _, _>(
+                    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
                  WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
-                (database_name.to_string(), table_name.to_string()),
-            )
-            .await
-        })
-        .map_err(driver_error)?;
+                    (database_name.to_string(), table_name.to_string()),
+                )
+                .await
+            })
+            .map_err(driver_error)?;
         Ok(rows)
     }
 
@@ -391,11 +394,8 @@ impl StateBackend for MysqlAsyncBackend {
         let sid = self.session_key(user_id, session_id);
         let mut conn = self.conn()?;
         match self.block_on(async {
-            conn.exec_drop(
-                &sql,
-                (sid, state_key.to_string(), value_json.to_string()),
-            )
-            .await
+            conn.exec_drop(&sql, (sid, state_key.to_string(), value_json.to_string()))
+                .await
         }) {
             Ok(()) => Ok(CasOutcome::Applied(1)),
             Err(e) => {
@@ -727,11 +727,7 @@ impl SqlBackend for MysqlAsyncBackend {
         self.block_on(async {
             conn.exec::<(String, String, i64), _, _>(
                 sql,
-                (
-                    like_pattern.to_string(),
-                    limit as i64,
-                    offset as i64,
-                ),
+                (like_pattern.to_string(), limit as i64, offset as i64),
             )
             .await
         })

@@ -129,11 +129,7 @@ impl SqlClient for RecordingClient {
         Ok(1)
     }
 
-    async fn query(
-        &mut self,
-        sql: &str,
-        params: &[SqlParam],
-    ) -> JdbcResult<Vec<Vec<ColumnValue>>> {
+    async fn query(&mut self, sql: &str, params: &[SqlParam]) -> JdbcResult<Vec<Vec<ColumnValue>>> {
         self.recorder.record(sql, params);
         let row = |value: i64| vec![vec![ColumnValue::Int(value)]];
         let rows = if sql.contains("IS_USED_LOCK") {
@@ -171,7 +167,9 @@ fn connect(
 #[test]
 fn dollar_placeholders_are_numbered_in_positional_order() {
     assert_eq!(
-        to_dollar_placeholders("INSERT INTO t (a, b) VALUES (?, ?) ON CONFLICT (a) DO UPDATE SET b = ?"),
+        to_dollar_placeholders(
+            "INSERT INTO t (a, b) VALUES (?, ?) ON CONFLICT (a) DO UPDATE SET b = ?"
+        ),
         "INSERT INTO t (a, b) VALUES ($1, $2) ON CONFLICT (a) DO UPDATE SET b = $3"
     );
     assert_eq!(to_dollar_placeholders("SELECT 1"), "SELECT 1");
@@ -198,7 +196,10 @@ fn statements_run_on_the_dedicated_driver_thread() {
     // One connection ⇒ one thread for every statement.
     assert_eq!(threads[0], threads[1]);
     // Parameters survive the hop onto the driver thread.
-    assert_eq!(recorder.last_params(), vec![SqlParam::Text("b".to_string())]);
+    assert_eq!(
+        recorder.last_params(),
+        vec![SqlParam::Text("b".to_string())]
+    );
 }
 
 #[test]
@@ -209,10 +210,7 @@ fn query_returns_the_driver_rows() {
         .unwrap();
     assert_eq!(
         rows,
-        vec![
-            vec![ColumnValue::Int(7)],
-            vec![ColumnValue::Null],
-        ]
+        vec![vec![ColumnValue::Int(7)], vec![ColumnValue::Null],]
     );
 }
 
@@ -410,11 +408,19 @@ fn the_postgres_session_speaks_the_advisory_lock_sql() {
     assert_eq!(recorder.connections(), 2);
 
     assert!(session.try_acquire("1234567890", Duration::ZERO).unwrap());
-    assert!(recorder.sql().last().unwrap().contains("pg_try_advisory_lock"));
+    assert!(recorder
+        .sql()
+        .last()
+        .unwrap()
+        .contains("pg_try_advisory_lock"));
     assert_eq!(recorder.last_params(), vec![SqlParam::Int(1_234_567_890)]);
 
     session.release("1234567890").unwrap();
-    assert!(recorder.sql().last().unwrap().contains("pg_advisory_unlock"));
+    assert!(recorder
+        .sql()
+        .last()
+        .unwrap()
+        .contains("pg_advisory_unlock"));
 
     assert!(!session.is_held("1234567890").unwrap());
     assert!(recorder.sql().last().unwrap().contains("pg_locks"));
@@ -437,9 +443,7 @@ fn the_mysql_session_speaks_get_lock_sql() {
         ]
     );
 
-    session
-        .release("agentscope:sandbox:lock:agent:1")
-        .unwrap();
+    session.release("agentscope:sandbox:lock:agent:1").unwrap();
     assert!(recorder.sql().last().unwrap().contains("RELEASE_LOCK"));
 
     // IS_USED_LOCK reports the owning session id (the fake answers 42) ⇒ held.

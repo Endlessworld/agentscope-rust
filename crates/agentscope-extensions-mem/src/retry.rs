@@ -279,7 +279,10 @@ mod tests {
         server.push_response(Err(MemError::http_status(503, "busy")));
         server.push_body("ok");
         let retry = transport(&server, fast_policy(3));
-        assert_eq!(retry.post_json("http://x/y", &[], "{}").await.unwrap(), "ok");
+        assert_eq!(
+            retry.post_json("http://x/y", &[], "{}").await.unwrap(),
+            "ok"
+        );
         assert_eq!(server.requests().len(), 2);
 
         let client_err = MockTransport::new();

@@ -690,9 +690,7 @@ impl NacosAgentRegistry {
                     .support_tls(p.support_tls)
                     .build()
                     .map(|built| (built.transport.to_uppercase(), built))
-                    .map_err(|error| {
-                        format!("Invalid A2A transport `{transport_type}`: {error}")
-                    })
+                    .map_err(|error| format!("Invalid A2A transport `{transport_type}`: {error}"))
             })
             .collect::<Result<_, String>>()?;
 
@@ -978,7 +976,10 @@ mod tests {
         let card = A2aAgentCard::new("agent", "http://localhost:8080");
 
         let error = registry
-            .register(&card, vec![TransportProperties::new("   ", "localhost", 8080)])
+            .register(
+                &card,
+                vec![TransportProperties::new("   ", "localhost", 8080)],
+            )
             .await
             .unwrap_err();
         assert!(error.contains("`transport`"), "{error}");

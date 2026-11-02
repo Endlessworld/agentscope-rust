@@ -801,12 +801,17 @@ impl CosHttpObjectStore {
         loop {
             let mut params = vec![
                 ("uploadId".to_string(), upload_id.to_string()),
-                ("max-parts".to_string(), multipart::MAX_LIST_PARTS.to_string()),
+                (
+                    "max-parts".to_string(),
+                    multipart::MAX_LIST_PARTS.to_string(),
+                ),
             ];
             if let Some(marker) = &marker {
                 params.push(("part-number-marker".to_string(), marker.clone()));
             }
-            let response = self.send(Method::GET, Some(key), &params, None, &[]).await?;
+            let response = self
+                .send(Method::GET, Some(key), &params, None, &[])
+                .await?;
             let response = ensure_success(response).await?;
             let body = response.text().await.map_err(|e| {
                 CosError::Backend(format!("failed to read COS ListParts response: {e}"))
@@ -3086,7 +3091,10 @@ mod tests {
             })
             .await;
 
-        let err = store.resume_multipart(key, "u-open", &data).await.unwrap_err();
+        let err = store
+            .resume_multipart(key, "u-open", &data)
+            .await
+            .unwrap_err();
         assert_eq!(err.status(), Some(403));
         abort.assert_hits_async(0).await;
         complete.assert_hits_async(0).await;

@@ -69,9 +69,8 @@ where
 
 /// The future returned by a [`ConnectionPool`] factory.
 #[cfg(feature = "postgres-pool")]
-type ConnectFuture<T> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = PgResult<T>> + Send + 'static>,
->;
+type ConnectFuture<T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = PgResult<T>> + Send + 'static>>;
 
 /// A bounded, self-contained pool of driver connections (feature `postgres-pool`, PG-05).
 ///
@@ -464,10 +463,16 @@ async fn execute_statement(
     // empty result set. `Statement::columns()` is empty exactly when there is no result set.
     let statement = client.prepare(sql).await.map_err(driver_error)?;
     if statement.columns().is_empty() {
-        let affected = client.execute(&statement, &refs).await.map_err(driver_error)?;
+        let affected = client
+            .execute(&statement, &refs)
+            .await
+            .map_err(driver_error)?;
         return Ok(QueryOutcome::Affected(affected as u64));
     }
-    let rows = client.query(&statement, &refs).await.map_err(driver_error)?;
+    let rows = client
+        .query(&statement, &refs)
+        .await
+        .map_err(driver_error)?;
     let mut out: Vec<Row> = Vec::with_capacity(rows.len());
     for row in rows {
         out.push(decode_row(&row));
@@ -629,7 +634,10 @@ mod tests {
     }
 
     #[cfg(feature = "postgres-pool")]
-    fn counting_pool(max_connections: usize, created: Arc<AtomicUsize>) -> Arc<ConnectionPool<usize>> {
+    fn counting_pool(
+        max_connections: usize,
+        created: Arc<AtomicUsize>,
+    ) -> Arc<ConnectionPool<usize>> {
         Arc::new(ConnectionPool::new(max_connections, move || {
             let created = Arc::clone(&created);
             Box::pin(async move { Ok(created.fetch_add(1, Ordering::SeqCst)) })

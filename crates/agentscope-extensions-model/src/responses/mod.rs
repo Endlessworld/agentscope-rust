@@ -31,13 +31,15 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 
 use agentscope_core::error::{Error, Result};
-use agentscope_core::formatter::{convert_tool_result_to_string, extract_text_content, ResponseFormat};
+use agentscope_core::formatter::{
+    convert_tool_result_to_string, extract_text_content, ResponseFormat,
+};
 use agentscope_core::message::{
     ChatUsage, ContentBlock, JsonMap, Msg, MsgRole, Source, TextBlock, ThinkingBlock, ToolUseBlock,
 };
 use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
-use agentscope_core::model::finish_reasons as FinishReasons;
 use agentscope_core::model::context_windows::resolve_context_window;
+use agentscope_core::model::finish_reasons as FinishReasons;
 use agentscope_core::model::generate_options::GenerateOptions;
 use agentscope_core::model::model::{Model, ModelCapabilities};
 use agentscope_core::model::provider::{
@@ -915,12 +917,14 @@ mod tests {
     fn user_audio_degrades_to_a_text_reference() {
         let msg = Msg::builder()
             .role(MsgRole::User)
-            .content(vec![ContentBlock::Audio(agentscope_core::message::AudioBlock {
-                source: Source::Base64(agentscope_core::message::Base64Source {
-                    media_type: "audio/wav".to_string(),
-                    data: "AAAA".to_string(),
-                }),
-            })])
+            .content(vec![ContentBlock::Audio(
+                agentscope_core::message::AudioBlock {
+                    source: Source::Base64(agentscope_core::message::Base64Source {
+                        media_type: "audio/wav".to_string(),
+                        data: "AAAA".to_string(),
+                    }),
+                },
+            )])
             .build();
         let req = build_request(
             "gpt-5".to_string(),
@@ -946,10 +950,7 @@ mod tests {
     #[test]
     fn response_format_maps_to_text_format() {
         let mut schema = serde_json::Map::new();
-        schema.insert(
-            "type".to_string(),
-            serde_json::json!("object"),
-        );
+        schema.insert("type".to_string(), serde_json::json!("object"));
         let rf = ResponseFormat::json_schema(
             agentscope_core::formatter::JsonSchema::builder()
                 .name("answer")

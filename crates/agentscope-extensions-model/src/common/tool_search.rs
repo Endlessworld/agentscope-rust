@@ -195,12 +195,18 @@ mod tests {
         assert_eq!(schemas[0].strict, Some(true));
         assert!(schemas[0].output_schema.is_some());
         assert_eq!(schemas[0].defer_loading, Some(true));
-        assert_eq!(loaded_tool_names(&metadata), vec!["get_weather", "get_time"]);
+        assert_eq!(
+            loaded_tool_names(&metadata),
+            vec!["get_weather", "get_time"]
+        );
 
         // Malformed / missing metadata yields no tools instead of panicking.
         assert!(loaded_tool_schemas(&JsonMap::new()).is_empty());
         let mut malformed = JsonMap::new();
-        malformed.insert(METADATA_TOOLS.to_string(), json!([{"description": "no name"}]));
+        malformed.insert(
+            METADATA_TOOLS.to_string(),
+            json!([{"description": "no name"}]),
+        );
         assert!(loaded_tool_schemas(&malformed).is_empty());
     }
 

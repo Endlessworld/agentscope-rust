@@ -275,7 +275,10 @@ fn search_asks_only_for_the_requested_page() {
         .into_iter()
         .map(|item| item.key)
         .collect();
-    assert_eq!(keys, (0..10).map(|i| format!("k{i:02}")).collect::<Vec<_>>());
+    assert_eq!(
+        keys,
+        (0..10).map(|i| format!("k{i:02}")).collect::<Vec<_>>()
+    );
     assert_eq!(client.list_requests(), vec![20]);
 }
 
@@ -290,7 +293,10 @@ fn search_follows_tokens_until_the_offset_page_is_complete() {
         .into_iter()
         .map(|item| item.key)
         .collect();
-    assert_eq!(keys, (40..50).map(|i| format!("k{i:02}")).collect::<Vec<_>>());
+    assert_eq!(
+        keys,
+        (40..50).map(|i| format!("k{i:02}")).collect::<Vec<_>>()
+    );
 
     let requests = client.list_requests();
     assert_eq!(requests, vec![100, 60, 20]);

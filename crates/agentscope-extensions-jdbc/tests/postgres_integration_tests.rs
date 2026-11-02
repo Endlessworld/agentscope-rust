@@ -57,7 +57,8 @@ async fn base_store_round_trip() {
     let Some(executor) = executor() else {
         return;
     };
-    let store = JdbcDistributedStore::create(executor, "PostgreSQL").expect("schema initialisation");
+    let store =
+        JdbcDistributedStore::create(executor, "PostgreSQL").expect("schema initialisation");
     let base = store.base_store();
     let namespace = vec![unique("it-store")];
 
@@ -79,7 +80,8 @@ async fn agent_state_round_trip() {
     let Some(executor) = executor() else {
         return;
     };
-    let store = JdbcDistributedStore::create(executor, "PostgreSQL").expect("schema initialisation");
+    let store =
+        JdbcDistributedStore::create(executor, "PostgreSQL").expect("schema initialisation");
     let state = store.agent_state_store();
     let session = unique("it-session");
 

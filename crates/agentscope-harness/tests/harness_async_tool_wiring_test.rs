@@ -157,7 +157,10 @@ async fn async_tool_timeout_installs_the_offloading_middleware() {
     );
 
     let events: Vec<_> = agent
-        .stream_events(vec![Msg::user("run the slow tool")], StreamOptions::default())
+        .stream_events(
+            vec![Msg::user("run the slow tool")],
+            StreamOptions::default(),
+        )
         .collect()
         .await;
     assert!(
@@ -213,7 +216,10 @@ async fn without_async_tool_timeout_the_tool_result_is_inline() {
         .build();
 
     let events: Vec<_> = agent
-        .stream_events(vec![Msg::user("run the slow tool")], StreamOptions::default())
+        .stream_events(
+            vec![Msg::user("run the slow tool")],
+            StreamOptions::default(),
+        )
         .collect()
         .await;
     assert!(

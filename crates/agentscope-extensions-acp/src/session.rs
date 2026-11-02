@@ -1532,8 +1532,7 @@ impl AcpAgentSession {
         &self,
     ) -> Vec<agent_client_protocol::schema::v1::SessionNotification> {
         use agent_client_protocol::schema::v1::{
-            ContentChunk, SessionNotification, SessionUpdate, TextContent, ToolCall,
-            ToolCallStatus,
+            ContentChunk, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
         };
         use agentscope_core::message::{ContentBlock as CoreBlock, MsgRole};
 
@@ -1565,8 +1564,8 @@ impl AcpAgentSession {
             let message_id = MessageId::new(format!("history-{}", message.id));
             for block in &message.content {
                 match (message.role, block) {
-                    (MsgRole::User, CoreBlock::Text(text)) => notifications.push(
-                        SessionNotification::new(
+                    (MsgRole::User, CoreBlock::Text(text)) => {
+                        notifications.push(SessionNotification::new(
                             self.session_id.clone(),
                             SessionUpdate::UserMessageChunk(
                                 ContentChunk::new(ContentBlock::Text(TextContent::new(
@@ -1574,10 +1573,10 @@ impl AcpAgentSession {
                                 )))
                                 .message_id(message_id.clone()),
                             ),
-                        ),
-                    ),
-                    (MsgRole::Assistant, CoreBlock::Text(text)) => notifications.push(
-                        SessionNotification::new(
+                        ))
+                    }
+                    (MsgRole::Assistant, CoreBlock::Text(text)) => {
+                        notifications.push(SessionNotification::new(
                             self.session_id.clone(),
                             SessionUpdate::AgentMessageChunk(
                                 ContentChunk::new(ContentBlock::Text(TextContent::new(
@@ -1585,10 +1584,10 @@ impl AcpAgentSession {
                                 )))
                                 .message_id(message_id.clone()),
                             ),
-                        ),
-                    ),
-                    (MsgRole::Assistant, CoreBlock::ToolUse(tool)) => notifications.push(
-                        SessionNotification::new(
+                        ))
+                    }
+                    (MsgRole::Assistant, CoreBlock::ToolUse(tool)) => {
+                        notifications.push(SessionNotification::new(
                             self.session_id.clone(),
                             SessionUpdate::ToolCall(
                                 ToolCall::new(tool.id.clone(), event::human_title(&tool.name))
@@ -1599,8 +1598,8 @@ impl AcpAgentSession {
                                     .status(ToolCallStatus::Completed)
                                     .raw_input(serde_json::Value::Object(tool.input.clone())),
                             ),
-                        ),
-                    ),
+                        ))
+                    }
                     // Thinking and tool results are not replayed: the transcript view owns the
                     // message order, and the tool call above already carries its arguments.
                     _ => {}

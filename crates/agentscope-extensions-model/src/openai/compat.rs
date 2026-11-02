@@ -68,7 +68,10 @@ pub fn apply_vendor_rules(model: &str, body: &mut Value) {
             if !model.starts_with("kimi-k3") {
                 remove_key(body, "reasoning_effort");
             }
-            degrade_tool_choice(body, /* required_is_supported */ !model.starts_with("kimi-k2"));
+            degrade_tool_choice(
+                body,
+                /* required_is_supported */ !model.starts_with("kimi-k2"),
+            );
         }
         Vendor::MiniMax => {
             minimax_tool_choice(body);
@@ -199,8 +202,7 @@ fn ensure_user_message(body: &mut Value) {
 fn backfill_reasoning_content(body: &mut Value) {
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
-            let is_assistant =
-                message.get("role").and_then(Value::as_str) == Some("assistant");
+            let is_assistant = message.get("role").and_then(Value::as_str) == Some("assistant");
             if is_assistant && message.get("reasoning_content").is_none() {
                 if let Some(map) = message.as_object_mut() {
                     map.insert("reasoning_content".to_string(), json!(""));
@@ -276,7 +278,12 @@ mod tests {
     fn kimi_strips_fixed_sampling_params_and_model_specific_reasoning_effort() {
         let mut body = wire_body();
         apply_vendor_rules("kimi-k2.6", &mut body);
-        for key in ["temperature", "top_p", "frequency_penalty", "presence_penalty"] {
+        for key in [
+            "temperature",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+        ] {
             assert!(body.get(key).is_none(), "kimi kept {key}");
         }
         // `reasoning_effort` is only documented for kimi-k3.

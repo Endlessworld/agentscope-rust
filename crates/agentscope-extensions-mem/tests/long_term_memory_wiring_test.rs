@@ -19,8 +19,8 @@ use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_mem::http::HttpTransport;
 use agentscope_extensions_mem::{
     Mem0ApiType, Mem0Client, Mem0LongTermMemory, Mem0LongTermMemoryConfig,
-    MemLongTermMemoryMiddleware, Result, LONG_TERM_MEMORY_MESSAGE_NAME,
-    PLATFORM_MEMORIES_ENDPOINT, PLATFORM_SEARCH_ENDPOINT,
+    MemLongTermMemoryMiddleware, Result, LONG_TERM_MEMORY_MESSAGE_NAME, PLATFORM_MEMORIES_ENDPOINT,
+    PLATFORM_SEARCH_ENDPOINT,
 };
 use agentscope_harness::agent::HarnessAgent;
 use async_trait::async_trait;
@@ -56,7 +56,9 @@ impl HttpTransport for RecordingTransport {
             .unwrap()
             .push((url.to_string(), body.to_string()));
         if url.ends_with(PLATFORM_SEARCH_ENDPOINT) {
-            Ok(format!("{{\"results\":[{{\"memory\":\"{MEMORY_TEXT}\"}}]}}"))
+            Ok(format!(
+                "{{\"results\":[{{\"memory\":\"{MEMORY_TEXT}\"}}]}}"
+            ))
         } else {
             Ok("{}".to_string())
         }
@@ -97,10 +99,7 @@ impl Model for RecordingModel {
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "agentscope_mem_{tag}_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("agentscope_mem_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -130,7 +129,9 @@ async fn the_middleware_retrieves_before_reasoning_and_records_after_the_turn() 
 
     let model = Arc::new(RecordingModel::default());
     let mut chain = MiddlewareChain::new();
-    chain.add(Box::new(MemLongTermMemoryMiddleware::new(Arc::new(adapter))));
+    chain.add(Box::new(MemLongTermMemoryMiddleware::new(Arc::new(
+        adapter,
+    ))));
 
     let agent = HarnessAgent::builder()
         .name("mem-agent")

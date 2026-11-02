@@ -23,8 +23,8 @@ use crate::error::{RagError, Result};
 use crate::model::Document;
 use crate::reader::external_api::{DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP_SIZE};
 use crate::reader::{
-    chunk_documents, doc_id_for_input, input_as_path, input_path_bytes, validate_chunking_parameters,
-    Reader, ReaderInput, SplitStrategy,
+    chunk_documents, doc_id_for_input, input_as_path, input_path_bytes,
+    validate_chunking_parameters, Reader, ReaderInput, SplitStrategy,
 };
 
 /// The cargo feature that enables the bundled `pandoc` extractor.
@@ -147,10 +147,7 @@ impl Reader for DocxReader {
     async fn read(&self, input: ReaderInput) -> Result<Vec<Document>> {
         let source = input_as_path(&input);
         let bytes = input_path_bytes(&input)?;
-        let extractor = self
-            .extractor
-            .as_ref()
-            .ok_or_else(no_extractor_error)?;
+        let extractor = self.extractor.as_ref().ok_or_else(no_extractor_error)?;
         let text = extractor.extract_text(&bytes, &source)?;
         let doc_id = doc_id_for_input(&input);
         chunk_documents(

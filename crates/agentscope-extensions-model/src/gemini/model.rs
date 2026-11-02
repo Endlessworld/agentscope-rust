@@ -478,12 +478,16 @@ mod tests {
             Msg::builder().name("alice").text_content("hello").build(),
             Msg::builder().name("bob").text_content("hi there").build(),
         ];
-        let spec = model.build_http_request(messages, Vec::new(), &GenerateOptions::default(), false);
+        let spec =
+            model.build_http_request(messages, Vec::new(), &GenerateOptions::default(), false);
 
         let contents = spec.body["contents"].as_array().unwrap();
         // System prompt becomes the leading `user` content, agent turns merge into one.
         assert_eq!(contents.len(), 2, "unexpected contents: {contents:?}");
-        assert_eq!(contents[0]["parts"][0]["text"], serde_json::json!("be brief"));
+        assert_eq!(
+            contents[0]["parts"][0]["text"],
+            serde_json::json!("be brief")
+        );
         let merged = contents[1]["parts"][0]["text"].as_str().unwrap();
         assert!(merged.starts_with("HISTORY PROMPT<history>"), "{merged}");
         assert!(merged.contains("alice: hello"), "{merged}");

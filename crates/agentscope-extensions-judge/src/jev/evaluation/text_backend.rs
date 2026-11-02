@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use crate::error::JevError;
-use crate::jev::call::{Caller, CallFailure, TextTransport};
+use crate::jev::call::{CallFailure, Caller, TextTransport};
 use crate::jev::dto::{
     Answer, ChoiceAnswer, NoulAnswer, Question, ScoreAnswer, SystemOneRequest, SystemOneResult,
     Usage,
@@ -186,7 +186,8 @@ impl JevTextBackend {
                     }
                     Question::Score(score_question) => {
                         let levels = score_question.criteria.as_ref().ok_or(())?;
-                        let keys: Vec<String> = (0..levels.len()).map(|index| index.to_string()).collect();
+                        let keys: Vec<String> =
+                            (0..levels.len()).map(|index| index.to_string()).collect();
                         let probabilities = distribution(value, &keys).ok_or(())?;
                         let mut legend = BTreeMap::new();
                         let mut score = 0.0;
@@ -292,7 +293,10 @@ mod tests {
     fn noul_request() -> SystemOneRequest {
         SystemOneRequest::builder()
             .state(json!({"q": "is it?"}))
-            .question("q", Question::Noul(NoulQuestion::new(json!("is it?"), None)))
+            .question(
+                "q",
+                Question::Noul(NoulQuestion::new(json!("is it?"), None)),
+            )
             .build()
     }
 
@@ -484,10 +488,10 @@ mod tests {
             .collect();
         assert_eq!(confidence(&certain), 1.0);
         assert!(distribution(&json!({"a": 0.5}), &["a".to_string(), "b".to_string()]).is_none());
-        assert!(distribution(&json!({"a": 1.5, "b": -0.5}), &[
-            "a".to_string(),
-            "b".to_string()
-        ])
+        assert!(distribution(
+            &json!({"a": 1.5, "b": -0.5}),
+            &["a".to_string(), "b".to_string()]
+        )
         .is_none());
         assert_eq!(level_text(&json!(1)), "1");
     }

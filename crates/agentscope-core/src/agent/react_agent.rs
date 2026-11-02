@@ -1143,7 +1143,12 @@ impl ReActAgent {
             // so the prepared request is the one the provider actually receives
             // (Java 51a74e2ef: append reminder/schema -> prepare -> model).
             let msg = model_call_through_chain(&self.core, &ctx, input).await?;
-            self.core.state.lock().unwrap().context_mut().push(msg.clone());
+            self.core
+                .state
+                .lock()
+                .unwrap()
+                .context_mut()
+                .push(msg.clone());
 
             let mut gen_called = false;
             for tc in msg.tool_use_blocks() {
@@ -1394,10 +1399,7 @@ impl ReActAgentBuilder {
     }
     /// Sets the observer notified when the fallback takes over. Mirrors Java
     /// `ReActAgent.Builder.failoverListener`.
-    pub fn failover_listener(
-        mut self,
-        listener: Arc<dyn crate::agent::FailoverListener>,
-    ) -> Self {
+    pub fn failover_listener(mut self, listener: Arc<dyn crate::agent::FailoverListener>) -> Self {
         self.failover_listener = Some(listener);
         self
     }
@@ -2248,11 +2250,7 @@ fn event_generate_reason(data: &EventData) -> Option<GenerateReason> {
         crate::message::metadata_keys::EVENT_GENERATE_REASON,
         "generateReason",
     ] {
-        let Some(raw) = data
-            .metadata
-            .get(key)
-            .or_else(|| data.fields.get(key))
-        else {
+        let Some(raw) = data.metadata.get(key).or_else(|| data.fields.get(key)) else {
             continue;
         };
         if let Ok(reason) = serde_json::from_value::<GenerateReason>(raw.clone()) {
@@ -2260,9 +2258,9 @@ fn event_generate_reason(data: &EventData) -> Option<GenerateReason> {
         }
         // Tolerate a lower-case wire spelling from a hand-built payload.
         if let Some(name) = raw.as_str() {
-            if let Ok(reason) = serde_json::from_value::<GenerateReason>(
-                serde_json::Value::String(name.to_ascii_uppercase()),
-            ) {
+            if let Ok(reason) = serde_json::from_value::<GenerateReason>(serde_json::Value::String(
+                name.to_ascii_uppercase(),
+            )) {
                 return Some(reason);
             }
         }
@@ -3018,8 +3016,7 @@ async fn model_call_impl(
                     // a call that already streamed visible output never does either
                     // (that case returned above, because replaying the request would
                     // render the prefix twice). Mirrors Java `ModelConfig.fallbackModel`.
-                    if !using_fallback
-                        && !matches!(e, Error::Interrupted(_) | Error::Cancelled(_))
+                    if !using_fallback && !matches!(e, Error::Interrupted(_) | Error::Cancelled(_))
                     {
                         if let Some(fallback) = core.fallback_model.as_ref() {
                             if let Some(listener) = core.failover_listener.as_ref() {
@@ -6005,7 +6002,10 @@ mod tests {
             .expect("the merged thinking block must survive");
         assert_eq!(thinking.thinking, "step one step two step three");
         assert_eq!(
-            thinking.metadata.as_ref().and_then(|m| m.get("encryptedContent")),
+            thinking
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("encryptedContent")),
             Some(&serde_json::json!("cipher-2")),
             "the empty map must not clear a key, a later value must win"
         );
@@ -6032,9 +6032,7 @@ mod tests {
     #[test]
     fn tool_runtime_omits_the_history_entry_when_there_is_nothing_to_share() {
         let runtime = tool_runtime(&crate::agent::RuntimeContext::new(), &[]);
-        assert!(runtime
-            .get(crate::tool::CONVERSATION_HISTORY_KEY)
-            .is_none());
+        assert!(runtime.get(crate::tool::CONVERSATION_HISTORY_KEY).is_none());
     }
 
     #[test]
@@ -6380,9 +6378,9 @@ mod tests {
         ) -> BoxStream<'_, Result<ChatResponse>> {
             *self.calls.lock().unwrap() += 1;
             let text = self.text;
-            Box::pin(futures::stream::once(async move {
-                Ok(text_response(text))
-            }))
+            Box::pin(futures::stream::once(
+                async move { Ok(text_response(text)) },
+            ))
         }
 
         fn model_name(&self) -> &str {
@@ -6895,10 +6893,7 @@ mod tests {
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let mut chain = MiddlewareChain::new();
         chain.add(Box::new(Recorder(Arc::clone(&seen))));
-        let model = Arc::new(MockModel::new(
-            "mock",
-            vec![text_response("reasoned once")],
-        ));
+        let model = Arc::new(MockModel::new("mock", vec![text_response("reasoned once")]));
         let agent = ReActAgent::builder()
             .name("t-reasoning-result")
             .model(model)
@@ -7734,7 +7729,11 @@ mod tests {
         let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
 
         assert_eq!(reply.text_content(), "done");
-        assert_eq!(*seen.lock().unwrap(), 0, "one allowed call disqualifies the round");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            0,
+            "one allowed call disqualifies the round"
+        );
         assert_eq!(*counter.lock().unwrap(), 0, "the denied call never runs");
     }
 
@@ -7862,21 +7861,35 @@ mod tests {
         // No result at all: the round cannot be judged as all-denied.
         assert!(!all_tool_calls_denied(&state, &calls));
         // Only one of two calls answered: same.
-        state.context_mut().push(Msg::builder().role(MsgRole::Tool).content(vec![
-            ContentBlock::ToolResult(denied("c1", "add")),
-        ]).build());
+        state.context_mut().push(
+            Msg::builder()
+                .role(MsgRole::Tool)
+                .content(vec![ContentBlock::ToolResult(denied("c1", "add"))])
+                .build(),
+        );
         assert!(!all_tool_calls_denied(&state, &calls));
         // A denied call plus an errored one: not all denied.
-        state.context_mut().push(Msg::builder().role(MsgRole::Tool).content(vec![
-            ContentBlock::ToolResult(error_result(&calls[1], "bad input")),
-        ]).build());
+        state.context_mut().push(
+            Msg::builder()
+                .role(MsgRole::Tool)
+                .content(vec![ContentBlock::ToolResult(error_result(
+                    &calls[1],
+                    "bad input",
+                ))])
+                .build(),
+        );
         assert!(!all_tool_calls_denied(&state, &calls));
 
         let mut state = AgentState::default();
-        state.context_mut().push(Msg::builder().role(MsgRole::Tool).content(vec![
-            ContentBlock::ToolResult(denied("c1", "add")),
-            ContentBlock::ToolResult(denied("c2", "echo")),
-        ]).build());
+        state.context_mut().push(
+            Msg::builder()
+                .role(MsgRole::Tool)
+                .content(vec![
+                    ContentBlock::ToolResult(denied("c1", "add")),
+                    ContentBlock::ToolResult(denied("c2", "echo")),
+                ])
+                .build(),
+        );
         assert!(all_tool_calls_denied(&state, &calls));
         assert!(!all_tool_calls_denied(&state, &[]));
     }
@@ -7894,7 +7907,10 @@ mod tests {
             _tools: Vec<crate::model::ToolSchema>,
             options: GenerateOptions,
         ) -> BoxStream<'_, Result<ChatResponse>> {
-            self.seen.lock().unwrap().push(options.response_format.clone());
+            self.seen
+                .lock()
+                .unwrap()
+                .push(options.response_format.clone());
             Box::pin(futures::stream::once(async { Ok(text_response("done")) }))
         }
 
@@ -8770,7 +8786,10 @@ mod tests {
             "text".to_string(),
             serde_json::json!("Never call the billing API twice"),
         );
-        input.insert("source_ref".to_string(), serde_json::json!("user-message-5"));
+        input.insert(
+            "source_ref".to_string(),
+            serde_json::json!("user-message-5"),
+        );
         let agent = ReActAgent::builder()
             .name("t-req-state")
             .model(Arc::new(MockModel::new(
@@ -8784,12 +8803,18 @@ mod tests {
             .build()
             .unwrap();
 
-        agent.call(vec![Msg::user("remember the constraint")]).await.unwrap();
+        agent
+            .call(vec![Msg::user("remember the constraint")])
+            .await
+            .unwrap();
 
         let state = agent.agent_state();
         let requirements = state.tasks_context().requirements();
         assert_eq!(requirements.len(), 1);
-        assert_eq!(requirements[0].kind, crate::state::RequirementKind::Constraint);
+        assert_eq!(
+            requirements[0].kind,
+            crate::state::RequirementKind::Constraint
+        );
         assert_eq!(requirements[0].text, "Never call the billing API twice");
         assert_eq!(requirements[0].proposed_source_ref, "user-message-5");
     }

@@ -55,7 +55,10 @@ impl ChannelSink for ReceiptSink {
         _messages: Vec<Msg>,
         delivery_id: Option<&str>,
     ) -> Result<DeliveryReceipt> {
-        self.seen.lock().unwrap().push(delivery_id.map(str::to_string));
+        self.seen
+            .lock()
+            .unwrap()
+            .push(delivery_id.map(str::to_string));
         Ok(DeliveryReceipt {
             message_id: Some("om_1".to_string()),
             raw: serde_json::json!({ "code": 0 }),
@@ -91,7 +94,10 @@ async fn sink_receipt_defaults_to_unsupported_and_is_overridable() {
         .expect_err("the default receipt path must fail closed");
     let text = format!("{err}");
     assert!(text.contains("unsupported"), "{text}");
-    assert!(text.contains("plain"), "the error names the channel: {text}");
+    assert!(
+        text.contains("plain"),
+        "the error names the channel: {text}"
+    );
 
     let sink = ReceiptSink::default();
     let receipt = sink
@@ -118,7 +124,9 @@ async fn channel_receipt_default_is_unsupported() {
     assert!(text.contains("unsupported"), "{text}");
     assert!(text.contains("plain-channel"), "{text}");
     assert_eq!(
-        DeliveryReceipt::with_message_id("om_2").message_id.as_deref(),
+        DeliveryReceipt::with_message_id("om_2")
+            .message_id
+            .as_deref(),
         Some("om_2")
     );
 }

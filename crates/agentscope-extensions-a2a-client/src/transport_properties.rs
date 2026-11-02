@@ -159,7 +159,10 @@ mod tests {
         assert_eq!(format_host_for_url("::1"), "[::1]");
         assert_eq!(format_host_for_url("2001:db8::1"), "[2001:db8::1]");
         assert_eq!(format_host_for_url("[::1]"), "[::1]");
-        assert_eq!(format_host_for_url("agent.example.com"), "agent.example.com");
+        assert_eq!(
+            format_host_for_url("agent.example.com"),
+            "agent.example.com"
+        );
         assert_eq!(format_host_for_url("127.0.0.1"), "127.0.0.1");
         assert_eq!(format_host_for_url(""), "");
     }

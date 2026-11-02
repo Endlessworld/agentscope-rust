@@ -90,7 +90,9 @@ async fn keyed_commands_follow_slot_redirects() {
     assert_eq!(ids.len(), 64, "every routed session is enumerable");
 
     for i in 0..64u64 {
-        store.delete(Some("cluster-it"), &format!("session-{i}")).await;
+        store
+            .delete(Some("cluster-it"), &format!("session-{i}"))
+            .await;
     }
     assert!(
         store.list_session_ids(Some("cluster-it")).await.is_empty(),
@@ -110,7 +112,12 @@ async fn lists_and_key_index_stay_in_one_slot() {
     for i in 0..32u64 {
         let session = format!("list-{i}");
         store
-            .save_list(Some("cluster-it"), &session, "items", &[json!(1), json!(2), json!(3)])
+            .save_list(
+                Some("cluster-it"),
+                &session,
+                "items",
+                &[json!(1), json!(2), json!(3)],
+            )
             .await;
         assert_eq!(
             store.get_list(Some("cluster-it"), &session, "items").await,

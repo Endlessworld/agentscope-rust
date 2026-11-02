@@ -144,15 +144,14 @@ fn decode_value(value: &Value) -> SqlValue {
 
 /// Builds a [`SqlRow`] from a driver row (column names come from the result metadata).
 fn to_sql_row(row: &mysql_async::Row) -> SqlRow {
-    let cells = row
-        .columns_ref()
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            let name = column.name_str().to_string();
-            let value = row.as_ref(index).map(decode_value).unwrap_or(SqlValue::Null);
-            (name, value)
-        });
+    let cells = row.columns_ref().iter().enumerate().map(|(index, column)| {
+        let name = column.name_str().to_string();
+        let value = row
+            .as_ref(index)
+            .map(decode_value)
+            .unwrap_or(SqlValue::Null);
+        (name, value)
+    });
     SqlRow::new(cells)
 }
 
@@ -294,17 +293,21 @@ mod tests {
             "mysql://root@127.0.0.1:3306/agentscope?require_ssl=true&verify_identity=false",
         )
         .expect("opts");
-        assert!(relaxed.ssl_opts().expect("ssl opts").skip_domain_validation());
+        assert!(relaxed
+            .ssl_opts()
+            .expect("ssl opts")
+            .skip_domain_validation());
     }
 
     #[cfg(not(feature = "mysql-tls"))]
     #[test]
     fn connect_rejects_require_ssl_without_a_tls_backend() {
         // Rejected before any I/O (port 1 never accepts a TCP connection), so this stays offline.
-        let error = match MysqlSqlDatabase::connect("mysql://root@127.0.0.1:1/none?require_ssl=true") {
-            Ok(_) => panic!("a TLS-only URL must be rejected"),
-            Err(e) => e,
-        };
+        let error =
+            match MysqlSqlDatabase::connect("mysql://root@127.0.0.1:1/none?require_ssl=true") {
+                Ok(_) => panic!("a TLS-only URL must be rejected"),
+                Err(e) => e,
+            };
         assert!(error.to_string().contains("mysql-tls"), "{error}");
     }
 

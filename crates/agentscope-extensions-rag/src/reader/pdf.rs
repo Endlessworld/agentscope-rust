@@ -27,8 +27,8 @@ use crate::error::{RagError, Result};
 use crate::model::Document;
 use crate::reader::external_api::{DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP_SIZE};
 use crate::reader::{
-    chunk_documents, doc_id_for_input, input_as_path, input_path_bytes, validate_chunking_parameters,
-    Reader, ReaderInput, SplitStrategy,
+    chunk_documents, doc_id_for_input, input_as_path, input_path_bytes,
+    validate_chunking_parameters, Reader, ReaderInput, SplitStrategy,
 };
 
 /// The cargo feature that enables the bundled `pdftotext` extractor.
@@ -152,10 +152,7 @@ impl Reader for PdfReader {
     async fn read(&self, input: ReaderInput) -> Result<Vec<Document>> {
         let source = input_as_path(&input);
         let bytes = input_path_bytes(&input)?;
-        let extractor = self
-            .extractor
-            .as_ref()
-            .ok_or_else(no_extractor_error)?;
+        let extractor = self.extractor.as_ref().ok_or_else(no_extractor_error)?;
         let text = extractor.extract_text(&bytes, &source)?;
         let doc_id = doc_id_for_input(&input);
         chunk_documents(
@@ -192,7 +189,10 @@ fn with_temp_file<T>(
         std::process::id()
     ));
     std::fs::write(&path, bytes).map_err(|error| {
-        RagError::Reader(format!("failed to stage {source} in {}: {error}", path.display()))
+        RagError::Reader(format!(
+            "failed to stage {source} in {}: {error}",
+            path.display()
+        ))
     })?;
     let outcome = action(&path);
     std::fs::remove_file(&path).ok();
@@ -301,7 +301,10 @@ mod tests {
 
         impl PdfTextExtractor for Fixed {
             fn extract_text(&self, bytes: &[u8], source: &str) -> Result<String> {
-                assert_eq!(bytes, b"%PDF-1.4\n%%EOF\n", "raw document bytes reach the seam");
+                assert_eq!(
+                    bytes, b"%PDF-1.4\n%%EOF\n",
+                    "raw document bytes reach the seam"
+                );
                 assert!(source.ends_with(".pdf"));
                 Ok("first page\n\nsecond page".to_string())
             }
@@ -337,7 +340,10 @@ mod tests {
     #[test]
     fn the_builtin_extractor_reports_a_missing_binary() {
         let extractor = PdftotextExtractor::new("agentscope-definitely-missing-pdftotext");
-        assert_eq!(extractor.binary(), "agentscope-definitely-missing-pdftotext");
+        assert_eq!(
+            extractor.binary(),
+            "agentscope-definitely-missing-pdftotext"
+        );
         let error = extractor.extract_text(b"%PDF-1.4", "doc.pdf").unwrap_err();
         assert!(matches!(error, RagError::Reader(_)), "err={error:?}");
         assert!(error.to_string().contains("doc.pdf"), "err={error}");

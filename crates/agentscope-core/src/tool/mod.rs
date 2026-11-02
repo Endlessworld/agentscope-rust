@@ -49,8 +49,7 @@ pub use search::{
 pub use suspend::ToolSuspendException;
 pub use todo::TodoWriteTool;
 pub use tool::{
-    FunctionTool, Tool, ToolExecutionContext, CONVERSATION_HISTORY_KEY,
-    MAX_CONVERSATION_HISTORY,
+    FunctionTool, Tool, ToolExecutionContext, CONVERSATION_HISTORY_KEY, MAX_CONVERSATION_HISTORY,
 };
 pub use tool_request_config::{ToolMergeMode, ToolRequestConfig, TOOL_REQUEST_CONFIG_CONTEXT_KEY};
 pub use toolkit::Toolkit;

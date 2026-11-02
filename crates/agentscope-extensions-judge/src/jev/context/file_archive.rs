@@ -71,9 +71,7 @@ impl FileJevContextArchive {
         let metadata = tokio::fs::symlink_metadata(file)
             .await
             .map_err(|_error| JevError::invalid("missing, unsafe or oversized archive"))?;
-        if !metadata.file_type().is_file()
-            || metadata.len() as usize > self.max_bytes
-        {
+        if !metadata.file_type().is_file() || metadata.len() as usize > self.max_bytes {
             return Err(JevError::invalid("missing, unsafe or oversized archive"));
         }
         let data = tokio::fs::read(file)
@@ -94,8 +92,8 @@ impl JevContextArchive for FileJevContextArchive {
         messages: &[ContextMessage],
     ) -> Result<String, JevError> {
         let envelope = ArchiveEnvelope::new(scope.clone(), messages.to_vec());
-        let data = serde_json::to_vec(&envelope)
-            .map_err(|_error| JevError::invalid("archive limit"))?;
+        let data =
+            serde_json::to_vec(&envelope).map_err(|_error| JevError::invalid("archive limit"))?;
         if data.len() > self.max_bytes {
             return Err(JevError::invalid("archive limit"));
         }
@@ -116,10 +114,12 @@ impl JevContextArchive for FileJevContextArchive {
             .await
             .map_err(|_error| JevError::protocol("cannot write archive snapshot"))?;
         restrict_permissions(&temporary, 0o600).await;
-        tokio::fs::rename(&temporary, &target).await.map_err(|_error| {
-            let _ = std::fs::remove_file(&temporary);
-            JevError::protocol("cannot publish archive snapshot")
-        })?;
+        tokio::fs::rename(&temporary, &target)
+            .await
+            .map_err(|_error| {
+                let _ = std::fs::remove_file(&temporary);
+                JevError::protocol("cannot publish archive snapshot")
+            })?;
         Ok(reference)
     }
 
@@ -227,7 +227,10 @@ mod tests {
         assert!(reference.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(archive.root().is_absolute());
         assert_eq!(archive.max_bytes(), 10_000);
-        assert_eq!(archive.restore(&scope(), &reference).await.unwrap(), messages());
+        assert_eq!(
+            archive.restore(&scope(), &reference).await.unwrap(),
+            messages()
+        );
 
         // Saving the same content is idempotent and reuses the content address.
         assert_eq!(
@@ -243,7 +246,11 @@ mod tests {
         let reference = archive.save(&scope(), &messages()).await.unwrap();
         let other = ArchiveScope::new("user", "agent", "other").unwrap();
         assert_eq!(
-            archive.restore(&other, &reference).await.unwrap_err().message(),
+            archive
+                .restore(&other, &reference)
+                .await
+                .unwrap_err()
+                .message(),
             "missing, unsafe or oversized archive"
         );
     }
@@ -263,7 +270,11 @@ mod tests {
 
         let small = FileJevContextArchive::new(&root.0, 8).unwrap();
         assert_eq!(
-            small.save(&scope(), &messages()).await.unwrap_err().message(),
+            small
+                .save(&scope(), &messages())
+                .await
+                .unwrap_err()
+                .message(),
             "archive limit"
         );
 
@@ -274,12 +285,18 @@ mod tests {
             .join(format!("{reference}.json"));
         std::fs::write(&file, b"tampered").unwrap();
         assert_eq!(
-            archive.restore(&scope(), &reference).await.unwrap_err().message(),
+            archive
+                .restore(&scope(), &reference)
+                .await
+                .unwrap_err()
+                .message(),
             "archive checksum mismatch"
         );
 
         assert_eq!(
-            FileJevContextArchive::new(&root.0, 0).unwrap_err().message(),
+            FileJevContextArchive::new(&root.0, 0)
+                .unwrap_err()
+                .message(),
             "positive archive byte limit required"
         );
     }

@@ -212,10 +212,16 @@ pub struct AnthropicToolResultBlock {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicToolResultContent {
-    Text { text: String },
-    Image { source: AnthropicImageSource },
+    Text {
+        text: String,
+    },
+    Image {
+        source: AnthropicImageSource,
+    },
     /// Reference to a tool discovered by `tool_search` (deferred loading).
-    ToolReference { tool_name: String },
+    ToolReference {
+        tool_name: String,
+    },
 }
 
 /// Ephemeral prompt-cache marker (`{"type":"ephemeral"}`).

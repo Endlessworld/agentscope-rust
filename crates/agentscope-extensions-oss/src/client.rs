@@ -191,12 +191,7 @@ pub trait OssClient: Send + Sync + std::fmt::Debug {
     /// Default: [`OssError::Unsupported`]. The capability is opt-in because the default
     /// single [`OssClient::put`] is correct for anything below the backend's per-request
     /// limit; a multipart upload only lifts that limit (5 GiB on S3/OSS).
-    fn put_multipart(
-        &self,
-        object_key: &str,
-        content: &[u8],
-        part_size: usize,
-    ) -> OssResult<()> {
+    fn put_multipart(&self, object_key: &str, content: &[u8], part_size: usize) -> OssResult<()> {
         let _ = (object_key, content, part_size);
         Err(OssError::Unsupported("multipart upload"))
     }

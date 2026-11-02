@@ -36,8 +36,8 @@ pub use abstract_dialect::{
 pub use bound_sql::{BoundSql, SqlParam};
 pub use detection::{detect_dialect, JdbcDialectBuilder};
 pub use lock_strategy::{
-    next_lock_poll_interval, LockLease, LockOutcome, SandboxLockStrategy, DEFAULT_LOCK_POLL_INTERVAL,
-    MAX_LOCK_POLL_INTERVAL,
+    next_lock_poll_interval, LockLease, LockOutcome, SandboxLockStrategy,
+    DEFAULT_LOCK_POLL_INTERVAL, MAX_LOCK_POLL_INTERVAL,
 };
 pub use native_lock::{
     normalize_lock_name, postgres_lock_key, ExecutorNativeLockProvider, MysqlNativeLockStrategy,

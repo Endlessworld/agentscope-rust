@@ -688,8 +688,8 @@ impl AgentCard {
             return Err("agent card must be a JSON object".to_string());
         };
 
-        let name = string_field(&map, "name")
-            .ok_or_else(|| "agent card is missing `name`".to_string())?;
+        let name =
+            string_field(&map, "name").ok_or_else(|| "agent card is missing `name`".to_string())?;
 
         let interfaces =
             optional_field::<Vec<AgentInterface>>(&map, "supportedInterfaces")?.unwrap_or_default();
@@ -1062,7 +1062,10 @@ mod tests {
         assert_eq!(methods::PUSH_CONFIG_SET, "CreateTaskPushNotificationConfig");
         assert_eq!(methods::PUSH_CONFIG_GET, "GetTaskPushNotificationConfig");
         assert_eq!(methods::PUSH_CONFIG_LIST, "ListTaskPushNotificationConfigs");
-        assert_eq!(methods::PUSH_CONFIG_DELETE, "DeleteTaskPushNotificationConfig");
+        assert_eq!(
+            methods::PUSH_CONFIG_DELETE,
+            "DeleteTaskPushNotificationConfig"
+        );
         assert_eq!(methods::AGENT_CARD_GET, "GetExtendedAgentCard");
         // The 0.3 names survive only as dispatch aliases.
         assert_eq!(methods::LEGACY_MESSAGE_SEND, "message/send");
@@ -1075,7 +1078,10 @@ mod tests {
         let card = AgentCard::new("test-agent", "http://localhost:8080");
         let json = serde_json::to_value(&card).unwrap();
         assert_eq!(json["name"], "test-agent");
-        assert_eq!(json["supportedInterfaces"][0]["url"], "http://localhost:8080");
+        assert_eq!(
+            json["supportedInterfaces"][0]["url"],
+            "http://localhost:8080"
+        );
         assert_eq!(json["supportedInterfaces"][0]["protocolBinding"], "JSONRPC");
         assert_eq!(json["supportedInterfaces"][0]["protocolVersion"], "1.0");
         assert_eq!(json["defaultInputModes"][0], "text/plain");
@@ -1145,7 +1151,10 @@ mod tests {
         assert_eq!(card.url, "http://localhost:8080");
         assert_eq!(card.protocol_version.as_deref(), Some("0.3.0"));
         assert_eq!(card.preferred_transport.as_deref(), Some("JSONRPC"));
-        assert_eq!(card.additional_interfaces.as_ref().unwrap()[0].transport, "GRPC");
+        assert_eq!(
+            card.additional_interfaces.as_ref().unwrap()[0].transport,
+            "GRPC"
+        );
         assert_eq!(
             card.security.as_ref().unwrap()[0]["apiKey"][0],
             serde_json::json!("read")

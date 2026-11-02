@@ -15,9 +15,9 @@ use agentscope_core::error::Result;
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_harness::agent::{
-    ExecResult, HarnessAgent, InMemorySandboxStateStore, LocalSandboxState, Sandbox,
-    SandboxClient, SandboxClientOptions, SandboxContext, SandboxManager, SandboxSnapshotSpec,
-    SandboxState, WorkspaceSpec,
+    ExecResult, HarnessAgent, InMemorySandboxStateStore, LocalSandboxState, Sandbox, SandboxClient,
+    SandboxClientOptions, SandboxContext, SandboxManager, SandboxSnapshotSpec, SandboxState,
+    WorkspaceSpec,
 };
 use futures::StreamExt;
 

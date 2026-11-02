@@ -274,7 +274,10 @@ mod tests {
         for blank in ["", "   ", " \u{0009} "] {
             let err = ReMeLongTermMemory::new(Arc::clone(&client), blank).unwrap_err();
             assert!(matches!(&err, MemError::Config(_)));
-            assert_eq!(err.to_string(), "invalid memory configuration: userId is required");
+            assert_eq!(
+                err.to_string(),
+                "invalid memory configuration: userId is required"
+            );
         }
     }
 

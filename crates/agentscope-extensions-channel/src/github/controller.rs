@@ -139,7 +139,9 @@ mod tests {
     async fn an_unhandled_event_type_is_204() {
         let registry = registry_with_channel().await;
         let body = r#"{"action":"created"}"#;
-        let signature = GitHubSignatureVerifier::new("s").unwrap().sign(body.as_bytes());
+        let signature = GitHubSignatureVerifier::new("s")
+            .unwrap()
+            .sign(body.as_bytes());
         let mut headers = HeaderMap::new();
         headers.insert(EVENT_HEADER, "push".parse().unwrap());
         headers.insert(SIGNATURE_HEADER, signature.parse().unwrap());

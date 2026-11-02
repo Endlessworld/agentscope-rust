@@ -154,7 +154,9 @@ impl BailianMemoryClient {
     /// Searches memories: `POST /api/v2/apps/memory/memory_nodes/search`.
     pub async fn search(&self, request: &BailianSearchRequest) -> Result<BailianSearchResponse> {
         let body = serde_json::to_string(request)?;
-        let raw = self.post("search memory", SEARCH_MEMORY_ENDPOINT, &body).await?;
+        let raw = self
+            .post("search memory", SEARCH_MEMORY_ENDPOINT, &body)
+            .await?;
         Ok(serde_json::from_str(&raw)?)
     }
 }
@@ -202,12 +204,9 @@ mod tests {
     async fn http_failures_name_the_vendor_and_the_operation() {
         let mock = MockTransport::new();
         mock.push_response(Err(MemError::http_status(403, "forbidden")));
-        let client = BailianMemoryClient::with_transport(
-            Arc::new(mock.clone()),
-            "key",
-            DEFAULT_BASE_URL,
-        )
-        .unwrap();
+        let client =
+            BailianMemoryClient::with_transport(Arc::new(mock.clone()), "key", DEFAULT_BASE_URL)
+                .unwrap();
         let err = client
             .add(&crate::bailian::dto::BailianAddRequest::new())
             .await

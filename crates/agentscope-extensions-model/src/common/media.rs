@@ -255,10 +255,7 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.mime_type, "image/png");
         assert_eq!(resolved.base64, "AQID");
-        assert!(transport
-            .last_get_url()
-            .unwrap()
-            .ends_with("a.png"));
+        assert!(transport.last_get_url().unwrap().ends_with("a.png"));
 
         // A second prefetch is served from the cache: the transport would
         // otherwise fail (only one response configured).

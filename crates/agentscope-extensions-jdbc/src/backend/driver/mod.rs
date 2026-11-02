@@ -297,14 +297,16 @@ impl<C: SqlClient> JdbcExecutor for DriverExecutor<C> {
         self.transaction_op(|client, runtime| runtime.block_on(client.begin()))?;
         let mut session = DriverSession { executor: self };
         match work(&mut session) {
-            Ok(()) => match self.transaction_op(|client, runtime| runtime.block_on(client.commit()))
-            {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    let _ = self.transaction_op(|client, runtime| runtime.block_on(client.rollback()));
-                    Err(error)
+            Ok(()) => {
+                match self.transaction_op(|client, runtime| runtime.block_on(client.commit())) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let _ = self
+                            .transaction_op(|client, runtime| runtime.block_on(client.rollback()));
+                        Err(error)
+                    }
                 }
-            },
+            }
             Err(error) => {
                 let _ = self.transaction_op(|client, runtime| runtime.block_on(client.rollback()));
                 Err(error)
@@ -413,7 +415,10 @@ impl<C: SqlClient> NativeLockSession for DriverNativeLockSession<C> {
     fn release(&self, lock_key: &str) -> Result<(), NativeLockError> {
         match self.flavor {
             NativeLockFlavor::Mysql => self
-                .probe_int(MYSQL_RELEASE_LOCK_SQL, vec![SqlParam::Text(lock_key.to_string())])
+                .probe_int(
+                    MYSQL_RELEASE_LOCK_SQL,
+                    vec![SqlParam::Text(lock_key.to_string())],
+                )
                 .map(|_| ()),
             NativeLockFlavor::Postgres => {
                 let key = postgres_advisory_key(lock_key)?;
@@ -426,7 +431,10 @@ impl<C: SqlClient> NativeLockSession for DriverNativeLockSession<C> {
     fn is_held(&self, lock_key: &str) -> Result<bool, NativeLockError> {
         match self.flavor {
             NativeLockFlavor::Mysql => Ok(self
-                .probe_int(MYSQL_IS_USED_LOCK_SQL, vec![SqlParam::Text(lock_key.to_string())])?
+                .probe_int(
+                    MYSQL_IS_USED_LOCK_SQL,
+                    vec![SqlParam::Text(lock_key.to_string())],
+                )?
                 .is_some()),
             NativeLockFlavor::Postgres => {
                 let key = postgres_advisory_key(lock_key)?;

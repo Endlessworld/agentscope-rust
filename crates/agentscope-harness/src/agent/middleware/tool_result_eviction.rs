@@ -134,7 +134,8 @@ pub(crate) async fn evict_messages(
     let mut rebuilt: Vec<Msg> = Vec::with_capacity(messages.len());
     let mut changed = false;
     for msg in messages {
-        let (msg, msg_changed) = evict_message(fs, config, agent_name, ctx, msg, replacements).await;
+        let (msg, msg_changed) =
+            evict_message(fs, config, agent_name, ctx, msg, replacements).await;
         changed |= msg_changed;
         rebuilt.push(msg);
     }
@@ -187,7 +188,9 @@ async fn evict_message(
         .into_iter()
         .zip(placeholders)
         .map(|(block, placeholder)| match (block, placeholder) {
-            (ContentBlock::ToolResult(tr), Some(p)) => ContentBlock::ToolResult(with_placeholder(tr, p)),
+            (ContentBlock::ToolResult(tr), Some(p)) => {
+                ContentBlock::ToolResult(with_placeholder(tr, p))
+            }
             (block, _) => block,
         })
         .collect();
@@ -410,7 +413,8 @@ mod tests {
     async fn an_eviction_is_written_back_to_the_archived_history() {
         // The middleware runs on a copy of the conversation; unless the offload is mirrored
         // into the agent state the full output stays resident (and checkpointed) forever.
-        let dir = std::env::temp_dir().join(format!("agentscope_evict_state_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agentscope_evict_state_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(dir));

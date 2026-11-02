@@ -245,7 +245,8 @@ mod tests {
             );
         }
         // A successful response is still fine.
-        c.handle_send_response(r#"{"errcode":0,"errmsg":"ok"}"#).unwrap();
+        c.handle_send_response(r#"{"errcode":0,"errmsg":"ok"}"#)
+            .unwrap();
     }
 
     #[test]
@@ -284,7 +285,10 @@ mod tests {
     #[tokio::test]
     async fn send_propagates_a_rejection() {
         let transport = Arc::new(RecordingTransport::with_responses(vec![
-            PreparedResponse::new(200, r#"{"errcode":81013,"errmsg":"user & party & tag all invalid"}"#),
+            PreparedResponse::new(
+                200,
+                r#"{"errcode":81013,"errmsg":"user & party & tag all invalid"}"#,
+            ),
         ]));
         let c = client(transport, Arc::new(StaticTokenProvider::new("tok")));
         let address = OutboundAddress::direct("wecom", "wecom:DIRECT:user-1");

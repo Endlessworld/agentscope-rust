@@ -103,7 +103,8 @@ mod tests {
         let unset = JsonSchema::new("Person", Map::new());
         let value = serde_json::to_value(&unset).unwrap();
         assert!(value.get("description").is_none(), "{value}");
-        let back: JsonSchema = serde_json::from_value(json!({"name": "Person", "schema": {}})).unwrap();
+        let back: JsonSchema =
+            serde_json::from_value(json!({"name": "Person", "schema": {}})).unwrap();
         assert_eq!(back.description, None);
     }
 }

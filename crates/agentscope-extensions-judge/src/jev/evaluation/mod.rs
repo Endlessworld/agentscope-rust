@@ -30,8 +30,8 @@ pub mod trace_data;
 
 pub use capture::{JevTraceEvaluationMiddleware, TraceCapture};
 pub use evaluation_runner::{
-    EvaluationCase, EvaluationReport, EvaluationRow, EvaluationSummary, Evaluator, JevEvaluationRunner,
-    JevEvaluator, Request, Response,
+    EvaluationCase, EvaluationReport, EvaluationRow, EvaluationSummary, Evaluator,
+    JevEvaluationRunner, JevEvaluator, Request, Response,
 };
 pub use evaluator::{Entry, JevTraceEvaluator, Limits, RequestUsage, TraceReport};
 pub use metric::JevTraceMetric;
@@ -46,6 +46,6 @@ pub use runner::{
 };
 pub use text_backend::{JevTextBackend, TextBackendError};
 pub use trace::{
-    JevTrace, TraceBlock, TraceMessage, TraceResultPart, TraceToolResult,
-    TraceToolSchema, TraceToolUse,
+    JevTrace, TraceBlock, TraceMessage, TraceResultPart, TraceToolResult, TraceToolSchema,
+    TraceToolUse,
 };

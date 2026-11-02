@@ -27,11 +27,11 @@ use crate::committed_export::committed_event_sink;
 use crate::config::ControlPlaneConfig;
 use crate::error::{ControlPlaneError, ControlPlaneResult};
 use crate::event_journal::EventJournal;
+use crate::model::session_event::{TYPE_SESSION_END, TYPE_SESSION_START};
 use crate::model::{
     AgentTaskAssignment, ContextSnapshot, ContextTracker, Inventory, MessagePage, SessionEvent,
     ToolInfo,
 };
-use crate::model::session_event::{TYPE_SESSION_END, TYPE_SESSION_START};
 use crate::transport::{
     AsdpEvent, AsdpTransport, ContractHttpServer, ContractProvider, ConversationTurnPhase,
     ConversationTurnReport, EventReport, EventReportAck, ExecutionAttemptCommand,
@@ -74,11 +74,17 @@ fn bridge_capabilities(
     state: &Arc<Mutex<BridgeState>>,
     adapter: Option<&Arc<dyn FrameworkAdapter>>,
 ) -> Vec<String> {
-    let mut caps: std::collections::BTreeSet<String> = [CAP_SESSION_REPORTING, CAP_CONTEXT_REPORTING]
-        .iter()
-        .map(|cap| cap.to_string())
-        .collect();
-    if state.lock().unwrap_or_else(|p| p.into_inner()).journal.is_some() {
+    let mut caps: std::collections::BTreeSet<String> =
+        [CAP_SESSION_REPORTING, CAP_CONTEXT_REPORTING]
+            .iter()
+            .map(|cap| cap.to_string())
+            .collect();
+    if state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .journal
+        .is_some()
+    {
         caps.insert(CAP_EVENT_REPORTING.to_string());
     }
     if let Some(adapter) = adapter {
@@ -189,9 +195,7 @@ impl BridgeState {
             self.busy.remove(session_id);
         }
         let current = self.phase(session_id);
-        if current == PHASE_COMPRESSING
-            || current == PHASE_ARCHIVED
-            || current == PHASE_TERMINATED
+        if current == PHASE_COMPRESSING || current == PHASE_ARCHIVED || current == PHASE_TERMINATED
         {
             self.touch(session_id);
             return;
@@ -209,7 +213,8 @@ impl BridgeState {
         if phase.is_empty() {
             return;
         }
-        self.phases.insert(session_id.to_string(), phase.to_string());
+        self.phases
+            .insert(session_id.to_string(), phase.to_string());
         if phase == PHASE_ACTIVE {
             self.busy.insert(session_id.to_string());
         } else {
@@ -626,10 +631,7 @@ impl ControlPlaneBridge {
 
     /// The attached ASDP channel, when any.
     pub fn asdp(&self) -> Option<Arc<AsdpTransport>> {
-        self.asdp
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+        self.asdp.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Whether Level-2 events can leave the durable outbox.
@@ -1032,7 +1034,11 @@ fn summarize_tasks(tasks: &[serde_json::Value]) -> Option<serde_json::Value> {
     }
     let (mut pending, mut in_progress, mut completed) = (0, 0, 0);
     for task in tasks {
-        match task.get("state").and_then(|state| state.as_str()).unwrap_or("") {
+        match task
+            .get("state")
+            .and_then(|state| state.as_str())
+            .unwrap_or("")
+        {
             "in_progress" => in_progress += 1,
             "completed" => completed += 1,
             _ => pending += 1,
@@ -1049,7 +1055,9 @@ fn summarize_tasks(tasks: &[serde_json::Value]) -> Option<serde_json::Value> {
 #[async_trait]
 impl ContractProvider for BridgeContractView {
     async fn inventory(&self) -> ControlPlaneResult<Inventory> {
-        Ok(Inventory::health_only(self.lock_state().trackers.len() as i64))
+        Ok(Inventory::health_only(
+            self.lock_state().trackers.len() as i64
+        ))
     }
 
     async fn context(&self, session_id: &str) -> ControlPlaneResult<ContextSnapshot> {
@@ -1170,7 +1178,10 @@ impl ContractProvider for BridgeContractView {
             if !version.is_empty() {
                 session.insert("frameworkVersion".into(), version.clone().into());
             }
-            session.insert("contextHash".into(), tracker.context_hash().to_string().into());
+            session.insert(
+                "contextHash".into(),
+                tracker.context_hash().to_string().into(),
+            );
             if tracker.is_compacted() {
                 session.insert("isCompacted".into(), true.into());
             }
@@ -1272,7 +1283,11 @@ impl ContractProvider for BridgeContractView {
     async fn subagents(&self) -> ControlPlaneResult<Vec<serde_json::Value>> {
         let adapter = self.require_adapter(CAP_SUBAGENT_INVENTORY)?;
         let inventory = adapter.list_subagents().await?;
-        Ok(inventory.subagents.iter().map(|s| s.to_json_value()).collect())
+        Ok(inventory
+            .subagents
+            .iter()
+            .map(|s| s.to_json_value())
+            .collect())
     }
 
     async fn workspaces(&self) -> ControlPlaneResult<Vec<serde_json::Value>> {
@@ -1295,7 +1310,11 @@ impl ContractProvider for BridgeContractView {
     }
 
     /// `DELETE .../subagent-tasks/{taskId}` (capability `subagent-task-command`).
-    async fn cancel_subagent_task(&self, session_id: &str, task_id: &str) -> ControlPlaneResult<()> {
+    async fn cancel_subagent_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> ControlPlaneResult<()> {
         let adapter = self.require_adapter(crate::adapter::CAP_SUBAGENT_TASK_COMMAND)?;
         adapter.cancel_subagent_task(session_id, task_id).await
     }
@@ -1336,7 +1355,11 @@ impl ContractProvider for BridgeContractView {
     }
 
     /// `POST .../messages`: injects a console message (capability `conversation-inbound`).
-    async fn post_message(&self, session_id: &str, body: serde_json::Value) -> ControlPlaneResult<()> {
+    async fn post_message(
+        &self,
+        session_id: &str,
+        body: serde_json::Value,
+    ) -> ControlPlaneResult<()> {
         if self.is_busy(session_id) {
             return Err(ControlPlaneError::Busy("session is busy".into()));
         }
@@ -1361,7 +1384,12 @@ impl ContractProvider for BridgeContractView {
 
 /// Reads the injected message text, mirroring `SessionBridge.readNotice`.
 fn message_content(body: &serde_json::Value) -> String {
-    let text_of = |key: &str| body.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let text_of = |key: &str| {
+        body.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     let content = text_of("content");
     if !content.is_empty() {
         return content;
@@ -1387,18 +1415,12 @@ fn session_event_msg(event: &SessionEvent) -> SessionEventMsg {
         role: event.role.clone(),
         content: event.content.clone(),
         tool_name: event.tool_name.clone(),
-        tool_input: event
-            .tool_input
-            .as_ref()
-            .map(|value| value.to_string()),
+        tool_input: event.tool_input.as_ref().map(|value| value.to_string()),
         tool_output: event.tool_output.clone(),
         tokens_in: event.tokens_in as i32,
         tokens_out: event.tokens_out as i32,
         duration_ms: event.duration_ms as i32,
-        framework_meta: event
-            .framework_meta
-            .as_ref()
-            .map(|value| value.to_string()),
+        framework_meta: event.framework_meta.as_ref().map(|value| value.to_string()),
     }
 }
 
@@ -1413,7 +1435,9 @@ async fn dispatch_session_command(
     command: &str,
     payload: Option<serde_json::Value>,
 ) -> ControlPlaneResult<CommandOutcome> {
-    let outcome = adapter.execute_command(session_id, command, payload).await?;
+    let outcome = adapter
+        .execute_command(session_id, command, payload)
+        .await?;
     if !outcome.ok {
         let message = if outcome.message.is_empty() {
             format!("session {session_id} is not active")
@@ -1643,7 +1667,12 @@ fn assignment_of(command: &ExecutionAttemptCommand) -> AgentTaskAssignment {
 fn execution_session_id(binding: Option<&str>) -> String {
     binding
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .and_then(|value| value.get("sessionId").and_then(|id| id.as_str()).map(str::to_string))
+        .and_then(|value| {
+            value
+                .get("sessionId")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_default()
 }
 
@@ -1794,8 +1823,14 @@ impl ContractProvider for ControlPlaneBridge {
         self.contract_view().subagent_tasks(session_id).await
     }
 
-    async fn cancel_subagent_task(&self, session_id: &str, task_id: &str) -> ControlPlaneResult<()> {
-        self.contract_view().cancel_subagent_task(session_id, task_id).await
+    async fn cancel_subagent_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> ControlPlaneResult<()> {
+        self.contract_view()
+            .cancel_subagent_task(session_id, task_id)
+            .await
     }
 
     async fn compress(&self, session_id: &str) -> ControlPlaneResult<()> {
@@ -1814,7 +1849,11 @@ impl ContractProvider for ControlPlaneBridge {
         self.contract_view().plan_mode(session_id, body).await
     }
 
-    async fn post_message(&self, session_id: &str, body: serde_json::Value) -> ControlPlaneResult<()> {
+    async fn post_message(
+        &self,
+        session_id: &str,
+        body: serde_json::Value,
+    ) -> ControlPlaneResult<()> {
         self.contract_view().post_message(session_id, body).await
     }
 
@@ -1845,7 +1884,10 @@ mod tests {
     }
 
     async fn temp_bridge() -> ControlPlaneBridge {
-        ControlPlaneBridge::new(events_config()).start().await.unwrap()
+        ControlPlaneBridge::new(events_config())
+            .start()
+            .await
+            .unwrap()
     }
 
     /// A started bridge with an open event journal but no HTTP server and no self-registration.
@@ -1991,16 +2033,17 @@ mod tests {
 
         let mut bridge = ControlPlaneBridge::new(cfg).start().await.unwrap();
 
-        let port = bridge.contract_port().expect("contract server was not started");
+        let port = bridge
+            .contract_port()
+            .expect("contract server was not started");
         assert_ne!(port, 0, "contract_http_port(0) must bind an ephemeral port");
-        let health: serde_json::Value = reqwest::get(format!(
-            "http://127.0.0.1:{port}/agentscope/health"
-        ))
-        .await
-        .expect("health request")
-        .json()
-        .await
-        .expect("health body");
+        let health: serde_json::Value =
+            reqwest::get(format!("http://127.0.0.1:{port}/agentscope/health"))
+                .await
+                .expect("health request")
+                .json()
+                .await
+                .expect("health body");
         assert_eq!(health["status"], "ok");
 
         let bodies = recorded.lock().unwrap().clone();
@@ -2189,14 +2232,19 @@ mod tests {
             }
             Ok(format!("echo: {content}"))
         }
-        async fn list_tasks(&self, _session_id: &str) -> ControlPlaneResult<Vec<serde_json::Value>> {
+        async fn list_tasks(
+            &self,
+            _session_id: &str,
+        ) -> ControlPlaneResult<Vec<serde_json::Value>> {
             Ok(vec![serde_json::json!({ "id": "t1", "state": "pending" })])
         }
         async fn list_subagent_tasks(
             &self,
             _session_id: &str,
         ) -> ControlPlaneResult<Vec<serde_json::Value>> {
-            Ok(vec![serde_json::json!({ "id": "st1", "status": "running" })])
+            Ok(vec![
+                serde_json::json!({ "id": "st1", "status": "running" }),
+            ])
         }
         async fn cancel_subagent_task(
             &self,
@@ -2230,7 +2278,10 @@ mod tests {
         let target: Arc<dyn std::any::Any + Send + Sync> = Arc::new(0u8);
         // `attach` takes ownership, so mount a proxy that shares the recorded state.
         bridge
-            .attach(target, Box::new(SharedRecordingAdapter(Arc::clone(&adapter))))
+            .attach(
+                target,
+                Box::new(SharedRecordingAdapter(Arc::clone(&adapter))),
+            )
             .unwrap();
         (bridge, adapter)
     }
@@ -2332,7 +2383,9 @@ mod tests {
             bridge.abort("s1").await,
             bridge.compress("s1").await,
             bridge.plan_mode("s1", serde_json::json!({})).await,
-            bridge.post_message("s1", serde_json::json!({ "content": "hi" })).await,
+            bridge
+                .post_message("s1", serde_json::json!({ "content": "hi" }))
+                .await,
             bridge.cancel_subagent_task("s1", "t1").await,
         ] {
             assert!(
@@ -2407,7 +2460,8 @@ mod tests {
             Err(ControlPlaneError::Busy(_))
         ));
         assert!(matches!(
-            bridge.post_message("s1", serde_json::json!({ "content": "hi" }))
+            bridge
+                .post_message("s1", serde_json::json!({ "content": "hi" }))
                 .await,
             Err(ControlPlaneError::Busy(_))
         ));
@@ -2485,7 +2539,11 @@ mod tests {
     #[tokio::test]
     async fn phase_follows_the_turn_and_terminate_is_terminal() {
         let (bridge, _adapter) = adapter_bridge();
-        bridge.record_event(SessionEvent::builder("s1", TYPE_MESSAGE).content("hi").build());
+        bridge.record_event(
+            SessionEvent::builder("s1", TYPE_MESSAGE)
+                .content("hi")
+                .build(),
+        );
         assert_eq!(bridge.session_phase("s1"), PHASE_IDLE);
 
         bridge.set_busy("s1", true);
@@ -2509,7 +2567,11 @@ mod tests {
     #[tokio::test]
     async fn compress_reports_the_compressing_phase_while_it_runs() {
         let (bridge, adapter) = adapter_bridge();
-        bridge.record_event(SessionEvent::builder("s1", TYPE_MESSAGE).content("hi").build());
+        bridge.record_event(
+            SessionEvent::builder("s1", TYPE_MESSAGE)
+                .content("hi")
+                .build(),
+        );
         let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
         let gate = Arc::new(CompressGate {
             entered: entered_tx,
@@ -2518,7 +2580,10 @@ mod tests {
         *adapter.compress_gate.lock().unwrap() = Some(Arc::clone(&gate));
 
         let probe = async {
-            entered_rx.recv().await.expect("compress never reached the adapter");
+            entered_rx
+                .recv()
+                .await
+                .expect("compress never reached the adapter");
             let state = bridge.session_state("s1").await.unwrap();
             assert_eq!(state["phase"], PHASE_COMPRESSING);
             assert_eq!(state["busy"], false);
@@ -2714,9 +2779,8 @@ mod tests {
         let now = Arc::new(AtomicU64::new(0));
         let base = Instant::now();
         let clock_now = Arc::clone(&now);
-        let clock: Clock = Arc::new(move || {
-            base + Duration::from_millis(clock_now.load(Ordering::SeqCst))
-        });
+        let clock: Clock =
+            Arc::new(move || base + Duration::from_millis(clock_now.load(Ordering::SeqCst)));
 
         let mut bridge = outbox_bridge().await;
         bridge.set_clock(clock);
@@ -2811,7 +2875,10 @@ mod tests {
                         .and_then(|value| value.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let seq = event.get("seq").and_then(|value| value.as_i64()).unwrap_or(0) as i32;
+                    let seq = event
+                        .get("seq")
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or(0) as i32;
                     let entry = committed.entry(session_id).or_insert(0);
                     if seq > *entry {
                         *entry = seq;
@@ -2826,7 +2893,9 @@ mod tests {
                     .collect(),
                 error: String::new(),
             };
-            let _ = self.tx.send(serde_json::json!({ "eventAck": ack }).to_string());
+            let _ = self
+                .tx
+                .send(serde_json::json!({ "eventAck": ack }).to_string());
             Ok(())
         }
         async fn recv(&self) -> ControlPlaneResult<Option<String>> {
@@ -3073,7 +3142,9 @@ mod tests {
     async fn a_failed_attempt_reports_fail_with_the_error() {
         let (bridge, adapter, link, _transport) = reporting_bridge().await;
         adapter.fail_task.store(true, Ordering::SeqCst);
-        let outcome = bridge.dispatch_downstream(execution_attempt("dispatch")).await;
+        let outcome = bridge
+            .dispatch_downstream(execution_attempt("dispatch"))
+            .await;
         assert!(
             matches!(outcome, Err(ControlPlaneError::Internal(ref message))
                 if message == "agent task exploded"),
@@ -3117,8 +3188,9 @@ mod tests {
                 ConversationTurnPhase::Completed
             ]
         );
-        assert!(reports.iter().all(|report| report.session_id == "s1"
-            && report.turn_id == "turn-1"));
+        assert!(reports
+            .iter()
+            .all(|report| report.session_id == "s1" && report.turn_id == "turn-1"));
         assert!(reports[0].reply.is_none());
         assert_eq!(
             reports[1].reply,
@@ -3311,7 +3383,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(dispatched, "the ASDP reader never dispatched the pushed command");
+        assert!(
+            dispatched,
+            "the ASDP reader never dispatched the pushed command"
+        );
         assert_eq!(
             *adapter.commands.lock().unwrap(),
             vec![COMMAND_TERMINATE.to_string()]

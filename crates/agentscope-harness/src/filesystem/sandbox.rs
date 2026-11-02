@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use base64::Engine;
 use tokio::io::AsyncReadExt;
 
-use super::{ExecuteResponse, FileData, FileInfo, Filesystem, FilesystemKind, GrepMatch};
 use super::CompositeFilesystem;
+use super::{ExecuteResponse, FileData, FileInfo, Filesystem, FilesystemKind, GrepMatch};
 
 /// A `Filesystem` that additionally supports shell command execution.
 #[async_trait]
@@ -560,7 +560,14 @@ mod tests {
 
         let ctx = RuntimeContext::default();
         pinned.write(&ctx, "mirror.txt", "hello").await.unwrap();
-        assert_eq!(pinned.read(&ctx, "mirror.txt", 0, 10).await.unwrap().content, "hello");
+        assert_eq!(
+            pinned
+                .read(&ctx, "mirror.txt", 0, 10)
+                .await
+                .unwrap()
+                .content,
+            "hello"
+        );
         assert!(!pinned.is_released());
 
         pinned.release();
@@ -591,7 +598,11 @@ mod tests {
 
         let ctx = RuntimeContext::default();
         assert_eq!(
-            routed.read(&ctx, "memory/m.md", 0, 100).await.unwrap().content,
+            routed
+                .read(&ctx, "memory/m.md", 0, 100)
+                .await
+                .unwrap()
+                .content,
             "from the store"
         );
         routed.write(&ctx, "notes.txt", "primary").await.unwrap();

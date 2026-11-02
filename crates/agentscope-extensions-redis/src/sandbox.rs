@@ -554,8 +554,8 @@ mod tests {
         // It used to be rounded up to 1ms, which hands out a lease that is expired before
         // the caller can use it (REDIS-12).
         let commands = Arc::new(MemoryRedisCommands::new());
-        let _ = RedisSandboxExecutionGuard::builder_from_commands(commands)
-            .lease_ttl(Duration::ZERO);
+        let _ =
+            RedisSandboxExecutionGuard::builder_from_commands(commands).lease_ttl(Duration::ZERO);
     }
 
     #[test]

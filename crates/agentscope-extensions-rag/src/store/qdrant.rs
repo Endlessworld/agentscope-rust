@@ -275,9 +275,7 @@ fn split_authority(authority: &str) -> (String, Option<String>) {
     }
     match authority.rsplit_once(':') {
         Some((host, port))
-            if !host.is_empty()
-                && !port.is_empty()
-                && port.chars().all(|c| c.is_ascii_digit()) =>
+            if !host.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
         {
             (host.to_string(), Some(port.to_string()))
         }

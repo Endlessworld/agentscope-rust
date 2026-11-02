@@ -287,11 +287,7 @@ impl Tool for KnowledgeSearchTool {
 #[async_trait]
 pub trait CodeReviewSource: Send + Sync {
     /// Resolves `snapshot_id` for this caller, or fails closed.
-    async fn load(
-        &self,
-        scope: &ToolScope,
-        snapshot_id: &str,
-    ) -> Result<JevReviewInput, JevError>;
+    async fn load(&self, scope: &ToolScope, snapshot_id: &str) -> Result<JevReviewInput, JevError>;
 }
 
 /// Runs the staged review over a loaded snapshot (`JevCodeReviewer.review`).
@@ -599,7 +595,9 @@ mod tests {
             EvidenceSearchTool::new(
                 Arc::new(
                     JevEvidenceProcessor::new(
-                        Arc::new(|_request| Box::pin(async { Err(crate::jev::call::CallFailure::backend("unused")) })),
+                        Arc::new(|_request| Box::pin(async {
+                            Err(crate::jev::call::CallFailure::backend("unused"))
+                        })),
                         Policy::demonstration(),
                         Limits::defaults(),
                         0.0,
@@ -689,10 +687,7 @@ mod tests {
 
     #[async_trait]
     impl crate::jev::integration::knowledge::KnowledgeSource for FixedKnowledge {
-        async fn add_documents(
-            &self,
-            documents: Vec<KnowledgeDocument>,
-        ) -> Result<(), JevError> {
+        async fn add_documents(&self, documents: Vec<KnowledgeDocument>) -> Result<(), JevError> {
             self.documents.lock().unwrap().extend(documents);
             Ok(())
         }
@@ -724,12 +719,16 @@ mod tests {
             Box::pin(async { Err(crate::jev::call::CallFailure::backend("unused")) })
         });
         let selector = Arc::new(
-            crate::jev::application::JevCandidateSelector::new(caller, Options::disabled(), 0.3, 0.7)
-                .unwrap(),
+            crate::jev::application::JevCandidateSelector::new(
+                caller,
+                Options::disabled(),
+                0.3,
+                0.7,
+            )
+            .unwrap(),
         );
-        let knowledge = Arc::new(
-            JevKnowledge::new(source, selector, Options::disabled(), 16).unwrap(),
-        );
+        let knowledge =
+            Arc::new(JevKnowledge::new(source, selector, Options::disabled(), 16).unwrap());
         KnowledgeSearchTool::new(
             knowledge,
             Arc::new(|_scope: &ToolScope, document: &KnowledgeDocument| document.id != "d2"),
@@ -794,10 +793,7 @@ mod tests {
 
     #[async_trait]
     impl CodeReviewDriver for FailClosedDriver {
-        async fn review(
-            &self,
-            _input: JevReviewInput,
-        ) -> Result<Decision<ReviewReport>, JevError> {
+        async fn review(&self, _input: JevReviewInput) -> Result<Decision<ReviewReport>, JevError> {
             Err(JevError::protocol("CODE_REVIEWER_UNAVAILABLE"))
         }
     }

@@ -742,7 +742,10 @@ mod tests {
     #[test]
     fn completeness_follows_the_java_rule() {
         let config = ReviewConfig::reference_policy();
-        let matrix = vec![screening("a.rs", &[("correctness", 0.9), ("security", 0.1)])];
+        let matrix = vec![screening(
+            "a.rs",
+            &[("correctness", 0.9), ("security", 0.1)],
+        )];
         let profiles = vec![profile("a.rs", 0.9)];
         let follow_ups = vec![located(2.5)];
         assert!(compute_complete(
@@ -799,7 +802,14 @@ mod tests {
             &config
         ));
         let low = vec![profile("a.rs", 0.1)];
-        assert!(!compute_complete(true, &matrix, &follow_ups, &low, &[], &config));
+        assert!(!compute_complete(
+            true,
+            &matrix,
+            &follow_ups,
+            &low,
+            &[],
+            &config
+        ));
     }
 
     #[test]

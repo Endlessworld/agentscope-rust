@@ -440,10 +440,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Middleware for ReasoningResultRecorder {
         async fn on_reasoning_result(&self, _ctx: &RuntimeContext, message: &Msg) {
-            self.seen
-                .lock()
-                .unwrap()
-                .push(message.text_content());
+            self.seen.lock().unwrap().push(message.text_content());
         }
 
         fn active_points(&self) -> Vec<ExtensionPoint> {

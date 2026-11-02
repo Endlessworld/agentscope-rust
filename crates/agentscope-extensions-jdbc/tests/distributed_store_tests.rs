@@ -269,16 +269,11 @@ async fn reopen_with_auto_create_disabled_accepts_the_existing_schema() {
 
     // Re-open the *same* database with auto-creation off: verification must pass and the
     // component must keep working against the tables the first open left behind.
-    let reopened = JdbcDistributedStore::create_with_dialect_and_schema(
-        executor,
-        dialect,
-        false,
-    )
-    .expect("re-opening an existing schema with auto-create off must succeed");
+    let reopened = JdbcDistributedStore::create_with_dialect_and_schema(executor, dialect, false)
+        .expect("re-opening an existing schema with auto-create off must succeed");
     let item = reopened
         .base_store()
         .get(&ns(&["reopen"]), "k")
         .expect("the data written by the first open must still be there");
     assert_eq!(item.value.get("v"), Some(&serde_json::json!(1)));
 }
-

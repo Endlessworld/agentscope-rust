@@ -75,7 +75,9 @@ impl SessionHistorySource for StoreSessionHistorySource {
     ) -> Option<Vec<MessageItem>> {
         let key = SessionKey::new(user_id, self.agent_id.as_str(), session_id).ok()?;
         let log = self.store.open(&key, &self.context).await.ok()?;
-        let transcript = agentscope_core::session::transcript(log.as_ref()).await.ok()?;
+        let transcript = agentscope_core::session::transcript(log.as_ref())
+            .await
+            .ok()?;
         Some(
             transcript
                 .messages
@@ -244,9 +246,9 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use async_trait::async_trait;
     use agentscope_core::session::{InMemorySessionLogStore, SessionEvent, SessionLog};
     use agentscope_harness::agent::subagent::task::{TaskRunSpec, TaskStatus};
+    use async_trait::async_trait;
 
     use super::*;
     use crate::model::{ROLE_ASSISTANT, ROLE_USER};
@@ -411,12 +413,7 @@ mod tests {
                 .collect()
         }
 
-        async fn cancel_task(
-            &self,
-            ctx: &RuntimeContext,
-            session_id: &str,
-            task_id: &str,
-        ) -> bool {
+        async fn cancel_task(&self, ctx: &RuntimeContext, session_id: &str, task_id: &str) -> bool {
             match self.get_task(ctx, session_id, task_id).await {
                 Some(task) => {
                     task.cancel();

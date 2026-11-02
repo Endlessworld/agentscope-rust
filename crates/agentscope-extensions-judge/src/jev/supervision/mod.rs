@@ -14,8 +14,8 @@ pub mod supervisor;
 
 pub use evidence::{SupervisionEvidence, Verification};
 pub use middleware::{
-    append_tail, EvidenceRequest, EvidenceSource, Observation, Schedule, SupervisionMiddlewareUnavailable,
-    SUPERVISION_MIDDLEWARE_UNAVAILABLE,
+    append_tail, EvidenceRequest, EvidenceSource, Observation, Schedule,
+    SupervisionMiddlewareUnavailable, SUPERVISION_MIDDLEWARE_UNAVAILABLE,
 };
 pub use supervisor::{
     Check, Finding, JevTaskSupervisor, Limits, Proposal, Report, Scope, Snapshot, TaskAdvice,

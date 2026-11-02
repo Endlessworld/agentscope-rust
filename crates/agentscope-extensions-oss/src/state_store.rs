@@ -195,11 +195,7 @@ impl OssAgentStateStore {
     }
 
     /// Whether the session holds any object, propagating backend failures.
-    pub async fn exists_strict(
-        &self,
-        user_id: Option<&str>,
-        session_id: &str,
-    ) -> OssResult<bool> {
+    pub async fn exists_strict(&self, user_id: Option<&str>, session_id: &str) -> OssResult<bool> {
         let prefix = self.session_prefix(user_id, session_id)?;
         Ok(!self.client.list_page(&prefix, 1, None)?.objects.is_empty())
     }
@@ -415,7 +411,9 @@ impl AgentStateStore for OssAgentStateStore {
         // other methods), so the failure must stay observable instead of being logged away.
         OssAgentStateStore::delete_key(self, user_id, session_id, key)
             .await
-            .map_err(|e| agentscope_core::error::Error::Other(format!("OSS per-key delete failed: {e}")))
+            .map_err(|e| {
+                agentscope_core::error::Error::Other(format!("OSS per-key delete failed: {e}"))
+            })
     }
 
     async fn list_session_ids(&self, user_id: Option<&str>) -> Vec<String> {

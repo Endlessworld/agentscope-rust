@@ -49,7 +49,12 @@ impl Expected {
     }
 
     /// Whether the metric's result matches this expectation.
-    pub fn matches(&self, status: MetricStatus, passed: Option<bool>, label: Option<&str>) -> Option<bool> {
+    pub fn matches(
+        &self,
+        status: MetricStatus,
+        passed: Option<bool>,
+        label: Option<&str>,
+    ) -> Option<bool> {
         if status != MetricStatus::Decided {
             return None;
         }
@@ -207,11 +212,7 @@ impl JevTraceRunner {
         }
         let metric_ids = evaluator.metric_ids();
         for case in &cases {
-            if !case
-                .expected
-                .keys()
-                .all(|key| metric_ids.contains(key))
-            {
+            if !case.expected.keys().all(|key| metric_ids.contains(key)) {
                 return Err(JevError::invalid(
                     "expectations must refer to configured metrics",
                 ));
@@ -238,7 +239,9 @@ impl JevTraceRunner {
 
 fn has_duplicate_trace_ids(cases: &[TraceCase]) -> bool {
     let mut seen = std::collections::BTreeSet::new();
-    cases.iter().any(|case| !seen.insert(case.trace.id.as_str()))
+    cases
+        .iter()
+        .any(|case| !seen.insert(case.trace.id.as_str()))
 }
 
 fn report(rows: Vec<TraceRow>, elapsed: Duration) -> RunnerReport {
@@ -356,9 +359,7 @@ mod tests {
         let mut answers = BTreeMap::new();
         answers.insert(
             "used_tool_result.q".to_string(),
-            Answer::Noul(NoulAnswer {
-                noul: Some(value),
-            }),
+            Answer::Noul(NoulAnswer { noul: Some(value) }),
         );
         SystemOneResult {
             model: Some("jev".to_string()),

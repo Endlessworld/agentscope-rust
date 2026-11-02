@@ -143,12 +143,9 @@ impl Tool for KnowledgeRetrievalTool {
     }
 
     async fn call(&self, args: JsonMap, ctx: ToolExecutionContext) -> CoreResult<ToolResultBlock> {
-        let query = args
-            .get("query")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                Error::Tool("invalid tool arguments: query must be a string".to_string())
-            })?;
+        let query = args.get("query").and_then(Value::as_str).ok_or_else(|| {
+            Error::Tool("invalid tool arguments: query must be a string".to_string())
+        })?;
 
         let mut config = self.default_config.clone();
         config.limit = limit_arg(&args)?;
@@ -247,19 +244,28 @@ mod tests {
             "hello", 0.75,
         )]));
         let block = tool(knowledge.clone())
-            .call(args(json!({ "query": "hello" })), ToolExecutionContext::default())
+            .call(
+                args(json!({ "query": "hello" })),
+                ToolExecutionContext::default(),
+            )
             .await
             .unwrap();
 
         assert_eq!(block.state, ToolResultState::Success);
         let text = block.text_content();
-        assert!(text.starts_with("Retrieved 1 relevant document(s):"), "{text}");
+        assert!(
+            text.starts_with("Retrieved 1 relevant document(s):"),
+            "{text}"
+        );
         assert!(text.contains("Document 1 (Score: 0.750):\nhello"), "{text}");
 
         let config = knowledge.last_config();
         assert_eq!(config.limit, DEFAULT_RETRIEVE_LIMIT);
         assert_eq!(config.conversation_history, None);
-        assert_eq!(config.score_threshold, RetrieveConfig::default().score_threshold);
+        assert_eq!(
+            config.score_threshold,
+            RetrieveConfig::default().score_threshold
+        );
     }
 
     #[tokio::test]
@@ -278,7 +284,10 @@ mod tests {
     #[tokio::test]
     async fn a_retrieval_failure_is_reported_as_an_error_result() {
         let block = tool(Arc::new(RecordingKnowledge::failing()))
-            .call(args(json!({ "query": "hello" })), ToolExecutionContext::default())
+            .call(
+                args(json!({ "query": "hello" })),
+                ToolExecutionContext::default(),
+            )
             .await
             .unwrap();
 
@@ -292,13 +301,19 @@ mod tests {
     #[tokio::test]
     async fn the_history_source_fills_the_retrieve_config() {
         let knowledge = Arc::new(RecordingKnowledge::new(vec![]));
-        let history = vec![Msg::text(agentscope_core::message::MsgRole::User, "earlier")];
-        let tool = tool(knowledge.clone())
-            .with_history_source(Arc::new(move |_ctx| history.clone()));
+        let history = vec![Msg::text(
+            agentscope_core::message::MsgRole::User,
+            "earlier",
+        )];
+        let tool =
+            tool(knowledge.clone()).with_history_source(Arc::new(move |_ctx| history.clone()));
 
-        tool.call(args(json!({ "query": "hello" })), ToolExecutionContext::default())
-            .await
-            .unwrap();
+        tool.call(
+            args(json!({ "query": "hello" })),
+            ToolExecutionContext::default(),
+        )
+        .await
+        .unwrap();
 
         let config = knowledge.last_config();
         assert_eq!(config.conversation_history.unwrap().len(), 1);
@@ -323,7 +338,10 @@ mod tests {
         ];
 
         tool(knowledge.clone())
-            .call(args(json!({ "query": "hello" })), context_with_history(&history))
+            .call(
+                args(json!({ "query": "hello" })),
+                context_with_history(&history),
+            )
             .await
             .unwrap();
 
@@ -337,7 +355,10 @@ mod tests {
     async fn a_call_without_runtime_history_keeps_the_config_none() {
         let knowledge = Arc::new(RecordingKnowledge::new(vec![]));
         tool(knowledge.clone())
-            .call(args(json!({ "query": "hello" })), ToolExecutionContext::default())
+            .call(
+                args(json!({ "query": "hello" })),
+                ToolExecutionContext::default(),
+            )
             .await
             .unwrap();
 

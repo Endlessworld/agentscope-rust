@@ -72,7 +72,11 @@ pub fn map_request(
             "Hosted and client-executed tool search cannot be combined".to_string(),
         ));
     }
-    let client_tools = map_tools(tools, strict_tools, has_tool_search || has_client_tool_search)?;
+    let client_tools = map_tools(
+        tools,
+        strict_tools,
+        has_tool_search || has_client_tool_search,
+    )?;
     let merged = ResponsesServerToolHelper::merge_tools(client_tools, server_tools);
     if !merged.is_empty() {
         body["tools"] = Value::Array(merged);
@@ -733,8 +737,7 @@ fn apply_tool_search_strict_defaults(items: Vec<Value>, strict_tools: Option<boo
             }
             if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
                 for tool in tools {
-                    let is_function =
-                        tool.get("type").and_then(Value::as_str) == Some("function");
+                    let is_function = tool.get("type").and_then(Value::as_str) == Some("function");
                     if is_function && tool.get("strict").is_none() {
                         tool["strict"] = json!(strict_tools.unwrap_or(false));
                     }

@@ -217,7 +217,10 @@ async fn tools_json_in_the_workspace_is_loaded_and_applied() {
         .toolkit(base)
         .disable_web_tools()
         .on_agent_built(move |handle| {
-            seen_hook.lock().unwrap().push(handle.toolkit().tool_names());
+            seen_hook
+                .lock()
+                .unwrap()
+                .push(handle.toolkit().tool_names());
         })
         .build();
 

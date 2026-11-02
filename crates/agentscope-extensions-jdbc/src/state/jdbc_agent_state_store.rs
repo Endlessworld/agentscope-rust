@@ -506,7 +506,10 @@ impl JdbcAgentStateStore {
         let hash_key = format!("{key}{HASH_KEY_SUFFIX}");
         let current_hash = core_compute_hash(values);
         // Serialize before opening the transaction so a bad value cannot leave one behind.
-        let payloads = values.iter().map(Self::json_of).collect::<JdbcResult<Vec<_>>>()?;
+        let payloads = values
+            .iter()
+            .map(Self::json_of)
+            .collect::<JdbcResult<Vec<_>>>()?;
         let mut full_rewrite = false;
 
         self.executor

@@ -130,8 +130,10 @@ impl JevBrowserPlanner {
                 return Err(JevError::invalid("duplicate action"));
             }
         }
-        let actions: BTreeMap<&str, &BrowserAction> =
-            observed.iter().map(|action| (action.id.as_str(), action)).collect();
+        let actions: BTreeMap<&str, &BrowserAction> = observed
+            .iter()
+            .map(|action| (action.id.as_str(), action))
+            .collect();
         let decision = self
             .selector
             .select(
@@ -147,7 +149,10 @@ impl JevBrowserPlanner {
                 reason: "STALE_PAGE".to_string(),
             });
         }
-        let Some(selection) = decision.value.as_ref().filter(|_| decision.status == Status::Decided)
+        let Some(selection) = decision
+            .value
+            .as_ref()
+            .filter(|_| decision.status == Status::Decided)
         else {
             return Ok(BrowserProposal {
                 page_version: page_version.to_string(),
@@ -258,7 +263,10 @@ impl JevContextPlanner {
     ) -> Result<ContextPlan, JevError> {
         let original = exchanges.clone();
         let mut seen = std::collections::BTreeSet::new();
-        if exchanges.iter().any(|exchange| !seen.insert(exchange.id.clone())) {
+        if exchanges
+            .iter()
+            .any(|exchange| !seen.insert(exchange.id.clone()))
+        {
             return Err(JevError::invalid("duplicate exchange id"));
         }
         let candidates: BTreeMap<String, Value> = exchanges
@@ -279,7 +287,10 @@ impl JevContextPlanner {
                 candidates,
             )
             .await?;
-        let Some(selection) = decision.value.as_ref().filter(|_| decision.status == Status::Decided)
+        let Some(selection) = decision
+            .value
+            .as_ref()
+            .filter(|_| decision.status == Status::Decided)
         else {
             return Ok(ContextPlan {
                 retained: original.clone(),
@@ -622,9 +633,7 @@ impl JevMemoryGate {
         candidate: MemoryFact,
         existing: Vec<MemoryFact>,
     ) -> Result<JudgeResult, JevError> {
-        if candidate.owner != owner
-            || existing.iter().any(|fact| fact.owner != owner)
-        {
+        if candidate.owner != owner || existing.iter().any(|fact| fact.owner != owner) {
             return Err(JevError::invalid("cross-owner memory input"));
         }
         let definition = Self::definition()?;
@@ -872,9 +881,7 @@ mod tests {
         for (id, value) in values {
             answers.insert(
                 (*id).to_string(),
-                Answer::Noul(NoulAnswer {
-                    noul: Some(*value),
-                }),
+                Answer::Noul(NoulAnswer { noul: Some(*value) }),
             );
         }
         SystemOneResult {
@@ -925,7 +932,10 @@ mod tests {
             .propose(
                 "find the price",
                 "v1",
-                vec![action("a", BrowserOperation::Read), action("b", BrowserOperation::Scroll)],
+                vec![
+                    action("a", BrowserOperation::Read),
+                    action("b", BrowserOperation::Scroll),
+                ],
                 "v1",
                 false,
             )
@@ -937,7 +947,13 @@ mod tests {
         assert!(!proposal.is_valid_for("v2"));
 
         let stale = planner
-            .propose("g", "v1", vec![action("a", BrowserOperation::Read)], "v2", false)
+            .propose(
+                "g",
+                "v1",
+                vec![action("a", BrowserOperation::Read)],
+                "v2",
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(stale.reason, "STALE_PAGE");
@@ -946,12 +962,24 @@ mod tests {
         // A `Done` action needs independent completion evidence.
         let planner = JevBrowserPlanner::new(selector_calls(&[&[0.9], &[0.9]]));
         let unverified = planner
-            .propose("g", "v1", vec![action("a", BrowserOperation::Done)], "v1", false)
+            .propose(
+                "g",
+                "v1",
+                vec![action("a", BrowserOperation::Done)],
+                "v1",
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(unverified.reason, "COMPLETION_NOT_VERIFIED");
         let verified = planner
-            .propose("g", "v1", vec![action("a", BrowserOperation::Done)], "v1", true)
+            .propose(
+                "g",
+                "v1",
+                vec![action("a", BrowserOperation::Done)],
+                "v1",
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(verified.reason, "PROPOSAL_ONLY");
@@ -969,7 +997,10 @@ mod tests {
                 .propose(
                     "g",
                     "v1",
-                    vec![action("a", BrowserOperation::Read), action("a", BrowserOperation::Wait)],
+                    vec![
+                        action("a", BrowserOperation::Read),
+                        action("a", BrowserOperation::Wait)
+                    ],
                     "v1",
                     false,
                 )
@@ -988,7 +1019,10 @@ mod tests {
             .propose(
                 "g",
                 "v1",
-                vec![action("a", BrowserOperation::Read), action("b", BrowserOperation::Read)],
+                vec![
+                    action("a", BrowserOperation::Read),
+                    action("b", BrowserOperation::Read),
+                ],
                 "v1",
                 false,
             )
@@ -1123,9 +1157,7 @@ mod tests {
             "positive limit required"
         );
         assert_eq!(
-            KnowledgeDocument::new(" ", "t", "v")
-                .unwrap_err()
-                .message(),
+            KnowledgeDocument::new(" ", "t", "v").unwrap_err().message(),
             "document id/text/version required"
         );
     }
@@ -1143,7 +1175,11 @@ mod tests {
             judge(vec![noul_response(&[("grounded", 0.9)])]),
         );
         let result = rag
-            .verify("q", "a", vec![KnowledgeDocument::new("d1", "t", "v").unwrap()])
+            .verify(
+                "q",
+                "a",
+                vec![KnowledgeDocument::new("d1", "t", "v").unwrap()],
+            )
             .await
             .unwrap();
         assert_eq!(result.status, JudgeStatus::Pass);
@@ -1182,24 +1218,35 @@ mod tests {
             noul_response(&[("complete", 0.5), ("off_track", 0.1)]),
             noul_response(&[("complete", 0.9), ("off_track", 0.1)]),
         ]));
-        let report = supervisor
-            .assess(json!({}), json!({}), true)
-            .await
-            .unwrap();
+        let report = supervisor.assess(json!({}), json!({}), true).await.unwrap();
         assert_eq!(report.advice, SupervisorAdvice::ReviewCompletion);
         assert_eq!(report.advice.as_str(), "REVIEW_COMPLETION");
 
-        let report = supervisor.assess(json!({}), json!({}), false).await.unwrap();
+        let report = supervisor
+            .assess(json!({}), json!({}), false)
+            .await
+            .unwrap();
         assert_eq!(report.advice, SupervisorAdvice::Continue);
 
         let report = supervisor.assess(json!({}), json!({}), true).await.unwrap();
-        assert_eq!(report.advice, SupervisorAdvice::ManualReview, "off track is manual review");
+        assert_eq!(
+            report.advice,
+            SupervisorAdvice::ManualReview,
+            "off track is manual review"
+        );
 
         let report = supervisor.assess(json!({}), json!({}), true).await.unwrap();
-        assert_eq!(report.advice, SupervisorAdvice::ManualReview, "inconclusive is manual review");
+        assert_eq!(
+            report.advice,
+            SupervisorAdvice::ManualReview,
+            "inconclusive is manual review"
+        );
 
         // Verification pending on a complete, on-track job asks for verification.
-        let report = supervisor.assess(json!({}), json!({}), false).await.unwrap();
+        let report = supervisor
+            .assess(json!({}), json!({}), false)
+            .await
+            .unwrap();
         assert_eq!(report.advice, SupervisorAdvice::RequestVerification);
     }
 
@@ -1218,9 +1265,6 @@ mod tests {
         assert_eq!(report.triage.status, Status::Decided);
         assert_eq!(report.review.status, JudgeStatus::Pass);
         assert_eq!(report.review.definition_version, "support-draft-v1");
-        assert_eq!(
-            JevCustomerSupport::definition().unwrap().criteria.len(),
-            2
-        );
+        assert_eq!(JevCustomerSupport::definition().unwrap().criteria.len(), 2);
     }
 }

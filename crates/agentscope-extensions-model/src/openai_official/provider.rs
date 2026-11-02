@@ -122,12 +122,13 @@ impl OpenAIOfficialModelProvider {
         let server_tools = take_server_tools(&mut options)?;
         let proxy = take_proxy(&mut options)?;
 
-        let mut model = OpenAIResponsesChatModel::new(model_name, api_key, Some(base_url), transport)
-            .with_default_options(options)
-            .with_stream(ctx.stream.unwrap_or(true))
-            .with_strict_tools(strict_tools)
-            .with_strict_json_schema(strict_json_schema)
-            .with_server_tools(server_tools);
+        let mut model =
+            OpenAIResponsesChatModel::new(model_name, api_key, Some(base_url), transport)
+                .with_default_options(options)
+                .with_stream(ctx.stream.unwrap_or(true))
+                .with_strict_tools(strict_tools)
+                .with_strict_json_schema(strict_json_schema)
+                .with_server_tools(server_tools);
         if let Some(formatter) = formatter {
             model = model.with_formatter(formatter);
         }

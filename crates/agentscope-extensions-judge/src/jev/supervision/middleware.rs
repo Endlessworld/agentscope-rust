@@ -142,10 +142,7 @@ pub fn append_tail(output: &mut String, value: &str, limit: usize) -> bool {
     let mut clipped = false;
     if value.chars().count() >= limit {
         clipped = value.chars().count() > limit || !output.is_empty();
-        *output = value
-            .chars()
-            .skip(value.chars().count() - limit)
-            .collect();
+        *output = value.chars().skip(value.chars().count() - limit).collect();
         return clipped;
     }
     output.push_str(value);
@@ -168,21 +165,15 @@ mod tests {
             "positive bounded supervision schedule required"
         );
         assert_eq!(
-            Schedule::new(30_000, 5_000, 1, 1)
-                .unwrap_err()
-                .message(),
+            Schedule::new(30_000, 5_000, 1, 1).unwrap_err().message(),
             "positive bounded supervision schedule required"
         );
         assert_eq!(
-            Schedule::new(5_000, 30_000, 0, 1)
-                .unwrap_err()
-                .message(),
+            Schedule::new(5_000, 30_000, 0, 1).unwrap_err().message(),
             "positive bounded supervision schedule required"
         );
         assert_eq!(
-            Schedule::new(5_000, 30_000, 1, 0)
-                .unwrap_err()
-                .message(),
+            Schedule::new(5_000, 30_000, 1, 0).unwrap_err().message(),
             "positive bounded supervision schedule required"
         );
         let schedule = Schedule::defaults();
@@ -201,7 +192,10 @@ mod tests {
         assert_eq!(error.message(), SUPERVISION_MIDDLEWARE_UNAVAILABLE);
         assert!(error.message().contains("middleware"));
         assert_ne!(
-            SupervisionMiddlewareUnavailable::new("custom").start().unwrap_err().message(),
+            SupervisionMiddlewareUnavailable::new("custom")
+                .start()
+                .unwrap_err()
+                .message(),
             SUPERVISION_MIDDLEWARE_UNAVAILABLE
         );
     }

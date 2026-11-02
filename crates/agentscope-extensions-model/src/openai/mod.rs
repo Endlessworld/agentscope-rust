@@ -17,20 +17,18 @@ use serde::Deserialize;
 use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-    ChatCompletionNamedToolChoice,
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartAudio,
-    ChatCompletionRequestMessageContentPartImage,
-    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
-    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
-    ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionTools, CompletionUsage, CreateChatCompletionRequest, FinishReason, FunctionCall,
-    FunctionName, FunctionObject, ImageDetail, ImageUrl, InputAudio, InputAudioFormat,
-    ReasoningEffort, ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema,
-    ToolChoiceOptions,
+    ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
+    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionStreamOptions, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionUsage,
+    CreateChatCompletionRequest, FinishReason, FunctionCall, FunctionName, FunctionObject,
+    ImageDetail, ImageUrl, InputAudio, InputAudioFormat, ReasoningEffort,
+    ResponseFormat as OaiResponseFormat, ResponseFormatJsonSchema, ToolChoiceOptions,
 };
 use async_openai::Client;
 use futures::stream::BoxStream;
@@ -156,9 +154,7 @@ impl OpenAiChatModel {
         let descriptor = descriptor_for(None, &model_name, base_url_for_catalog.as_deref());
         let (capabilities, supports_tool_choice_specific) = resolve_model_capabilities(
             &HashMap::new(),
-            base_url_for_catalog
-                .as_deref()
-                .unwrap_or(OFFICIAL_BASE_URL),
+            base_url_for_catalog.as_deref().unwrap_or(OFFICIAL_BASE_URL),
             &model_name,
             descriptor.as_deref(),
         );
@@ -371,7 +367,10 @@ impl OpenAiChatModel {
         };
         if let Some(budget) = thinking_budget {
             if let Some(object) = body.as_object_mut() {
-                object.insert("thinking_budget".to_string(), serde_json::Value::from(budget));
+                object.insert(
+                    "thinking_budget".to_string(),
+                    serde_json::Value::from(budget),
+                );
             }
         }
         if let Some(effort) = unknown_reasoning_effort {
@@ -840,12 +839,15 @@ fn build_request(
     if let Some(rf) = &options.response_format {
         req.response_format = to_response_format(rf, strict_json_schema);
     }
-    (req, MessageExtras {
-        reasoning,
-        reasoning_details,
-        cache_directives,
-        tool_signatures,
-    })
+    (
+        req,
+        MessageExtras {
+            reasoning,
+            reasoning_details,
+            cache_directives,
+            tool_signatures,
+        },
+    )
 }
 
 /// Bookkeeping recorded while converting core `Msg`s, addressed by wire index.
@@ -938,7 +940,10 @@ fn audio_content_part(source: &Source) -> ChatCompletionRequestUserMessageConten
                         audio.media_type
                     ),
                 );
-                text_content_part(format!("[Audio - unsupported format: {}]", audio.media_type))
+                text_content_part(format!(
+                    "[Audio - unsupported format: {}]",
+                    audio.media_type
+                ))
             }
         },
         Source::Base64(_) => text_content_part("[Audio - data missing]"),
@@ -1674,13 +1679,10 @@ fn thinking_block(
     }
     let mut block = ThinkingBlock::new(text.unwrap_or_default());
     if let Some(details) = details {
-        block
-            .metadata
-            .get_or_insert_with(JsonMap::new)
-            .insert(
-                ThinkingBlock::METADATA_REASONING_DETAILS.to_string(),
-                details.clone(),
-            );
+        block.metadata.get_or_insert_with(JsonMap::new).insert(
+            ThinkingBlock::METADATA_REASONING_DETAILS.to_string(),
+            details.clone(),
+        );
     }
     Some(block)
 }
@@ -1717,10 +1719,9 @@ impl StreamIncrementer {
                     blocks.push(ContentBlock::Text(TextBlock::new(content.clone())));
                 }
             }
-            if let Some(thinking) = thinking_block(
-                delta.reasoning_text(),
-                delta.reasoning_details.as_ref(),
-            ) {
+            if let Some(thinking) =
+                thinking_block(delta.reasoning_text(), delta.reasoning_details.as_ref())
+            {
                 blocks.push(ContentBlock::Thinking(thinking));
             }
             if let Some(refusal) = &delta.refusal {
@@ -2019,7 +2020,10 @@ mod tests {
         let body = serde_json::to_value(&req).unwrap();
         let wire = body["messages"].as_array().expect("messages array");
 
-        assert_eq!(wire[0]["role"], "system", "system stays individual: {body:?}");
+        assert_eq!(
+            wire[0]["role"], "system",
+            "system stays individual: {body:?}"
+        );
         let first_history = wire[1]["content"].as_str().expect("history text");
         assert!(
             first_history.starts_with(crate::common::DEFAULT_CONVERSATION_HISTORY_PROMPT),
@@ -2195,7 +2199,10 @@ mod tests {
 
         // The knobs are provider-side only: they never reach the wire body.
         let (body, _) = model.prepare_body(vec![sample_msg()], vec![], GenerateOptions::default());
-        assert!(body.get(NATIVE_STRUCTURED_OUTPUT_OPTION).is_none(), "{body:?}");
+        assert!(
+            body.get(NATIVE_STRUCTURED_OUTPUT_OPTION).is_none(),
+            "{body:?}"
+        );
         assert!(body.get(CONTEXT_WINDOW_SIZE_OPTION).is_none(), "{body:?}");
     }
 
@@ -2206,9 +2213,7 @@ mod tests {
         // configured string as-is) instead of being dropped.
         let ctx = ModelCreationContext::new("openai", "gateway-chat").api_key("sk-test");
         let model = OpenAiChatModel::from_context(&ctx).expect("model");
-        let per_call = GenerateOptions::builder()
-            .reasoning_effort("ultra")
-            .build();
+        let per_call = GenerateOptions::builder().reasoning_effort("ultra").build();
         let (body, _) = model.prepare_body(vec![sample_msg()], vec![], per_call);
         assert_eq!(body["reasoning_effort"], serde_json::json!("ultra"));
 
@@ -2771,9 +2776,9 @@ mod tests {
             ),
             (None, None),
         ] {
-            let mut image = ImageBlock::new(Source::Url(
-                agentscope_core::message::URLSource::new("https://example.test/cat.png"),
-            ));
+            let mut image = ImageBlock::new(Source::Url(agentscope_core::message::URLSource::new(
+                "https://example.test/cat.png",
+            )));
             image.detail = detail;
             let (req, _) = build_request(
                 "gpt-4o".into(),
@@ -2942,9 +2947,7 @@ mod tests {
     #[test]
     fn provider_strips_the_reasoning_suffix_and_seeds_the_thinking_knobs() {
         let provider = OpenAiProvider::new().with_reasoning_suffix(true);
-        let model = provider
-            .create(context("gpt-4o-thinking-4096"))
-            .unwrap();
+        let model = provider.create(context("gpt-4o-thinking-4096")).unwrap();
         assert_eq!(model.model_name(), "gpt-4o");
 
         let model = provider.create(context("gpt-4o-high")).unwrap();
@@ -3039,8 +3042,7 @@ mod tests {
             .as_array()
             .expect("media blocks switch the message to the content-part array");
         assert_eq!(
-            parts[1]["text"],
-            "[Video URL: https://example.test/clip.mp4]",
+            parts[1]["text"], "[Video URL: https://example.test/clip.mp4]",
             "video must surface as a text reference: {body:?}"
         );
     }
@@ -3057,11 +3059,7 @@ mod tests {
             STRICT_JSON_SCHEMA_OPTION.to_string(),
             serde_json::json!(true),
         );
-        let (body, _) = cache_capable_model().prepare_body(
-            vec![sample_msg()],
-            vec![],
-            options,
-        );
+        let (body, _) = cache_capable_model().prepare_body(vec![sample_msg()], vec![], options);
         assert_eq!(
             body["response_format"]["json_schema"]["strict"],
             serde_json::json!(true),
@@ -3112,7 +3110,10 @@ mod tests {
         let marked = Msg::builder()
             .role(MsgRole::User)
             .text_content("remember this")
-            .metadata_entry(agentscope_core::metadata_keys::CACHE_CONTROL, serde_json::json!(true))
+            .metadata_entry(
+                agentscope_core::metadata_keys::CACHE_CONTROL,
+                serde_json::json!(true),
+            )
             .build();
         let (body, _) = cache_capable_model().prepare_body(
             vec![Msg::system("be helpful"), marked],

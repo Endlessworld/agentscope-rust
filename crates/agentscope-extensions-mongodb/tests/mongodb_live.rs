@@ -82,7 +82,12 @@ async fn state_store_roundtrip_versioning_and_lists() {
 
         // Plain values survive the JSON -> BSON -> JSON round-trip.
         state
-            .save(Some("u1"), "s1", "scratchpad", json!({"note": "hi", "n": 3}))
+            .save(
+                Some("u1"),
+                "s1",
+                "scratchpad",
+                json!({"note": "hi", "n": 3}),
+            )
             .await;
         assert_eq!(
             state.get(Some("u1"), "s1", "scratchpad").await,
@@ -144,7 +149,10 @@ async fn state_store_roundtrip_versioning_and_lists() {
         assert_eq!(state.get(Some("u1"), "s1", "cas").await, Some(json!(3)));
 
         // Sessions are discoverable per user.
-        assert_eq!(state.list_session_ids(Some("u1")).await, vec!["s1".to_string()]);
+        assert_eq!(
+            state.list_session_ids(Some("u1")).await,
+            vec!["s1".to_string()]
+        );
         assert!(state.list_session_ids(Some("other")).await.is_empty());
 
         // Key deletion only removes that key.
@@ -173,10 +181,7 @@ async fn state_store_roundtrip_versioning_and_lists() {
         );
         let compound = indexes
             .iter()
-            .find(|i| {
-                i.keys
-                    == vec![("user_id".to_string(), 1), ("session_id".to_string(), 1)]
-            })
+            .find(|i| i.keys == vec![("user_id".to_string(), 1), ("session_id".to_string(), 1)])
             .unwrap_or_else(|| panic!("compound index missing: {indexes:?}"));
         assert!(!compound.unique);
         assert_eq!(compound.expire_after_seconds, None);
@@ -201,7 +206,10 @@ async fn base_store_roundtrip_through_blocking_api() {
         );
         let item = base.get(&namespace, "a.txt").expect("item stored");
         assert_eq!(item.version, 1);
-        assert_eq!(item.value, store_value(json!({"content": "hello", "meta": {"a.b": "$x"}})));
+        assert_eq!(
+            item.value,
+            store_value(json!({"content": "hello", "meta": {"a.b": "$x"}}))
+        );
 
         base.put(&namespace, "a.txt", store_value(json!({"content": "v2"})));
         assert_eq!(base.get(&namespace, "a.txt").expect("item").version, 2);
@@ -213,9 +221,17 @@ async fn base_store_roundtrip_through_blocking_api() {
         assert!(!base.put_if_version(&namespace, "b.txt", store_value(json!({"v": 3})), 1));
 
         // Namespace search is key-ordered and paginated.
-        let keys: Vec<String> = base.search(&namespace, 10, 0).into_iter().map(|i| i.key).collect();
+        let keys: Vec<String> = base
+            .search(&namespace, 10, 0)
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
         assert_eq!(keys, vec!["a.txt".to_string(), "b.txt".to_string()]);
-        let page: Vec<String> = base.search(&namespace, 1, 1).into_iter().map(|i| i.key).collect();
+        let page: Vec<String> = base
+            .search(&namespace, 1, 1)
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
         assert_eq!(page, vec!["b.txt".to_string()]);
         assert!(base.search(&namespace, 0, 0).is_empty());
 
@@ -269,17 +285,33 @@ async fn index_options_conflict_is_migrated_on_live_server() {
             .expect("migration succeeds");
 
         let indexes = client.list_indexes(&collection).await.unwrap();
-        assert_eq!(indexes.len(), 1, "conflicting index was replaced: {indexes:?}");
+        assert_eq!(
+            indexes.len(),
+            1,
+            "conflicting index was replaced: {indexes:?}"
+        );
         assert_eq!(indexes[0].expire_after_seconds, Some(3600));
         assert!(indexes[0].sparse);
         assert_eq!(indexes[0].name, "_updated_at_1");
 
         // `count` (part of the seam, unused by the stores) round-trips.
-        assert_eq!(client.count(&collection, &FindFilter::default()).await.unwrap(), 0);
+        assert_eq!(
+            client
+                .count(&collection, &FindFilter::default())
+                .await
+                .unwrap(),
+            0
+        );
         let mut doc = serde_json::Map::new();
         doc.insert("_id".to_string(), json!("only"));
         client.insert_one(&collection, doc).await.unwrap();
-        assert_eq!(client.count(&collection, &FindFilter::default()).await.unwrap(), 1);
+        assert_eq!(
+            client
+                .count(&collection, &FindFilter::default())
+                .await
+                .unwrap(),
+            1
+        );
         assert_eq!(
             client
                 .count(&collection, &FindFilter::eq("_id", json!("only")))
@@ -315,9 +347,15 @@ async fn snapshot_gridfs_roundtrip_and_chunking() {
     with_store(|store, _database| async move {
         let snapshots = store.snapshot_client();
 
-        snapshots.upload("snap-small", b"hello snapshot").await.unwrap();
+        snapshots
+            .upload("snap-small", b"hello snapshot")
+            .await
+            .unwrap();
         assert!(snapshots.exists("snap-small").await.unwrap());
-        assert_eq!(snapshots.download("snap-small").await.unwrap(), b"hello snapshot");
+        assert_eq!(
+            snapshots.download("snap-small").await.unwrap(),
+            b"hello snapshot"
+        );
 
         // A payload spanning several 255 KB GridFS chunks.
         let big: Vec<u8> = (0..600 * 1024).map(|i| (i % 251) as u8).collect();
@@ -325,7 +363,10 @@ async fn snapshot_gridfs_roundtrip_and_chunking() {
         assert_eq!(snapshots.download("snap-big").await.unwrap(), big);
 
         // Re-upload replaces the previous revision (upsert keyed by filename).
-        snapshots.upload("snap-small", b"second revision").await.unwrap();
+        snapshots
+            .upload("snap-small", b"second revision")
+            .await
+            .unwrap();
         assert_eq!(
             snapshots.download("snap-small").await.unwrap(),
             b"second revision"
@@ -348,7 +389,10 @@ async fn sandbox_guard_lease_is_mutually_exclusive() {
         let view = store.sandbox_execution_guard();
         let key = SandboxIsolationKey::new("user", "u-live");
 
-        let mut lease = guard.try_enter(&key).await.expect("first acquisition succeeds");
+        let mut lease = guard
+            .try_enter(&key)
+            .await
+            .expect("first acquisition succeeds");
         assert!(view.is_held(&key));
 
         // A second guard on the same database/lock collection must contend.
@@ -359,7 +403,10 @@ async fn sandbox_guard_lease_is_mutually_exclusive() {
             .retry_interval(Duration::from_millis(50))
             .build();
         let error = contender.try_enter(&key).await.expect_err("lock is held");
-        assert!(error.to_string().contains("Timed out"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("Timed out"),
+            "unexpected error: {error}"
+        );
 
         lease.release_async().await;
         assert!(!view.is_held(&key));

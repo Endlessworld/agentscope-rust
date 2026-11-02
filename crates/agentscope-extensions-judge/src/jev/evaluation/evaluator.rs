@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::error::JevError;
-use crate::jev::call::{Caller, CallFailure};
+use crate::jev::call::{CallFailure, Caller};
 use crate::jev::client::JevClient;
 use crate::jev::dto::{Answer, Question, SystemOneRequest, SystemOneResult, Usage};
 use crate::jev::validation::validate_response;
@@ -35,7 +35,11 @@ pub struct Limits {
 
 impl Limits {
     /// Creates and validates limits (`Limits` compact constructor).
-    pub fn new(budget: Duration, max_questions: usize, max_state_chars: usize) -> Result<Self, JevError> {
+    pub fn new(
+        budget: Duration,
+        max_questions: usize,
+        max_state_chars: usize,
+    ) -> Result<Self, JevError> {
         if budget.is_zero() || max_questions < 1 || max_state_chars < 1 {
             return Err(JevError::invalid(
                 "positive trace evaluation limits required",
@@ -96,10 +100,11 @@ pub struct TraceReport {
 impl TraceReport {
     /// Whether every metric decided *and* passed (`Report.passed`).
     pub fn passed(&self) -> bool {
-        !self.results.is_empty() && self.results.iter().all(|entry| match &entry.result {
-            Some(result) => result.is_pass(),
-            None => false,
-        })
+        !self.results.is_empty()
+            && self.results.iter().all(|entry| match &entry.result {
+                Some(result) => result.is_pass(),
+                None => false,
+            })
     }
 
     /// The result of one metric, by id.
@@ -177,7 +182,11 @@ impl JevTraceEvaluator {
         metrics: Vec<Arc<dyn JevTraceMetric>>,
         limits: Limits,
     ) -> Result<Self, JevError> {
-        Self::new(crate::jev::call::caller_from_client(client), metrics, limits)
+        Self::new(
+            crate::jev::call::caller_from_client(client),
+            metrics,
+            limits,
+        )
     }
 
     /// The configured metric ids, in order (`metricIds`).
@@ -213,7 +222,14 @@ impl JevTraceEvaluator {
                     break;
                 }
             };
-            let run = run_group(&self.caller, &group, trace, &mut done, &mut usage, &mut requests);
+            let run = run_group(
+                &self.caller,
+                &group,
+                trace,
+                &mut done,
+                &mut usage,
+                &mut requests,
+            );
             if tokio::time::timeout(remaining, run).await.is_err() {
                 timed_out = true;
                 break;
@@ -244,11 +260,7 @@ impl JevTraceEvaluator {
         }
     }
 
-    fn plan(
-        &self,
-        trace: &JevTrace,
-        done: &mut BTreeMap<String, JevMetricResult>,
-    ) -> Vec<Group> {
+    fn plan(&self, trace: &JevTrace, done: &mut BTreeMap<String, JevMetricResult>) -> Vec<Group> {
         let mut groups: Vec<Group> = Vec::new();
         for metric in &self.metrics {
             if !trace.issues.is_empty() {
@@ -299,7 +311,9 @@ impl JevTraceEvaluator {
             return Ok(Some(metric.reduce(&BTreeMap::new(), trace)?));
         }
         let request = SystemOneRequest::new(
-            Some(Value::Object(state.iter().map(|(k, v)| (k.clone(), v.clone())).collect())),
+            Some(Value::Object(
+                state.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            )),
             None,
             questions.clone(),
         );
@@ -356,7 +370,11 @@ async fn run_group(
     *requests += 1;
     let request = SystemOneRequest::new(
         Some(Value::Object(
-            group.state.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            group
+                .state
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         )),
         None,
         group.questions.clone(),
@@ -396,11 +414,7 @@ fn record_invalid_usage(failure: &CallFailure, usage: &mut Vec<RequestUsage>) {
     }
 }
 
-fn fail_members(
-    group: &Group,
-    done: &mut BTreeMap<String, JevMetricResult>,
-    reason: &str,
-) {
+fn fail_members(group: &Group, done: &mut BTreeMap<String, JevMetricResult>, reason: &str) {
     for member in &group.members {
         done.insert(
             member.metric.id().to_string(),
@@ -481,9 +495,7 @@ mod tests {
         for (id, value) in pairs {
             answers.insert(
                 (*id).to_string(),
-                Answer::Noul(NoulAnswer {
-                    noul: Some(*value),
-                }),
+                Answer::Noul(NoulAnswer { noul: Some(*value) }),
             );
         }
         SystemOneResult {
@@ -570,7 +582,10 @@ mod tests {
         let trace = JevTrace::new("t", map, vec!["PENDING_TOOL_CALL".to_string()]).unwrap();
         let report = evaluator.evaluate(&trace).await;
         assert_eq!(report.requests, 0);
-        assert_eq!(report.result("completeness").unwrap().reason, "INCOMPLETE_TRACE");
+        assert_eq!(
+            report.result("completeness").unwrap().reason,
+            "INCOMPLETE_TRACE"
+        );
         assert!(!report.passed());
     }
 
@@ -595,8 +610,14 @@ mod tests {
             "tool_results": [{"result": "x"}],
         }));
         let report = evaluator.evaluate(&trace).await;
-        assert_eq!(report.result("used_tool_result").unwrap().status, super::super::MetricStatus::Decided);
-        assert_eq!(report.result("indirect_injection").unwrap().reason, "BACKEND_ERROR");
+        assert_eq!(
+            report.result("used_tool_result").unwrap().status,
+            super::super::MetricStatus::Decided
+        );
+        assert_eq!(
+            report.result("indirect_injection").unwrap().reason,
+            "BACKEND_ERROR"
+        );
         assert!(!report.passed());
     }
 
@@ -619,7 +640,10 @@ mod tests {
             "tool_results": [{"result": "x"}],
         }));
         let report = evaluator.evaluate(&trace).await;
-        assert_eq!(report.result("used_tool_result").unwrap().reason, "INVALID_RESPONSE");
+        assert_eq!(
+            report.result("used_tool_result").unwrap().reason,
+            "INVALID_RESPONSE"
+        );
         assert_eq!(report.usage.len(), 1);
         assert_eq!(report.usage[0].model.as_deref(), Some("llm:test"));
         assert_eq!(report.usage[0].usage, Some(usage));
@@ -643,7 +667,10 @@ mod tests {
             "tool_results": [{"result": "x"}],
         }));
         let report = evaluator.evaluate(&trace).await;
-        assert_eq!(report.result("used_tool_result").unwrap().reason, "INVALID_RESPONSE");
+        assert_eq!(
+            report.result("used_tool_result").unwrap().reason,
+            "INVALID_RESPONSE"
+        );
         assert_eq!(report.usage.len(), 1, "the invalid reply is still billed");
     }
 
@@ -684,7 +711,10 @@ mod tests {
             "tool_results": [{"result": "x"}],
         }));
         let report = evaluator.evaluate(&trace).await;
-        assert_eq!(report.result("used_tool_result").unwrap().reason, "EVALUATION_LIMIT");
+        assert_eq!(
+            report.result("used_tool_result").unwrap().reason,
+            "EVALUATION_LIMIT"
+        );
         assert_eq!(report.requests, 0);
     }
 
@@ -713,7 +743,8 @@ mod tests {
 
     #[test]
     fn construction_rejects_empty_duplicate_and_malformed_metrics() {
-        let caller: Caller = Arc::new(|_request| Box::pin(async { Err(CallFailure::backend("x")) }));
+        let caller: Caller =
+            Arc::new(|_request| Box::pin(async { Err(CallFailure::backend("x")) }));
         assert_eq!(
             JevTraceEvaluator::new(caller.clone(), vec![], limits())
                 .unwrap_err()

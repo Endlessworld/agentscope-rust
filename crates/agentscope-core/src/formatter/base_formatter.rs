@@ -136,7 +136,10 @@ fn convert_media_block_to_text_reference(source: &Source, media_type: &str) -> S
             Err(e) => format!("[{media_type} - failed to save file: {e}]"),
         },
         Source::FileId(file) => {
-            format!("The returned {media_type} can be found at: fileid://{}", file.file_id)
+            format!(
+                "The returned {media_type} can be found at: fileid://{}",
+                file.file_id
+            )
         }
     }
 }

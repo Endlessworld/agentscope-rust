@@ -444,7 +444,8 @@ impl FrameworkAdapter for AgentScopeAdapter {
                 // Compacting a copy would only change what the control plane shows while the
                 // next turn still sends the full history (tracker CP-07): write the compacted
                 // context back into the buffer the agent actually reads.
-                self.commit_compacted_state(&target, session_id, &state).await;
+                self.commit_compacted_state(&target, session_id, &state)
+                    .await;
                 // A compactor that found nothing to compact returns an empty summary;
                 // publishing an empty `compaction` event would tell the control plane a
                 // rewrite happened when the history is unchanged.
@@ -503,7 +504,11 @@ impl FrameworkAdapter for AgentScopeAdapter {
     }
 
     /// Cancels one background subagent task; a task the host did not find is a 404.
-    async fn cancel_subagent_task(&self, session_id: &str, task_id: &str) -> ControlPlaneResult<()> {
+    async fn cancel_subagent_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> ControlPlaneResult<()> {
         let src = self.runtime_source().ok_or_else(|| {
             ControlPlaneError::Unsupported(
                 "subagent-task-command is not supported by this adapter".into(),
@@ -550,7 +555,9 @@ impl FrameworkAdapter for AgentScopeAdapter {
 
     /// Injects a user message through the framework's own `call` path.
     async fn inject_user_message(&self, session_id: &str, content: &str) -> ControlPlaneResult<()> {
-        self.call_user_message(session_id, content).await.map(|_| ())
+        self.call_user_message(session_id, content)
+            .await
+            .map(|_| ())
     }
 
     /// Runs one control-plane turn and returns the terminal assistant reply.
@@ -574,11 +581,15 @@ impl FrameworkAdapter for AgentScopeAdapter {
         if !name.is_empty() {
             cfg.insert("name".into(), name.into());
         }
-        let description = react.map(|r| r.description().to_string()).unwrap_or_default();
+        let description = react
+            .map(|r| r.description().to_string())
+            .unwrap_or_default();
         if !description.is_empty() {
             cfg.insert("description".into(), description.into());
         }
-        let sys_prompt = react.map(|r| r.sys_prompt().to_string()).unwrap_or_default();
+        let sys_prompt = react
+            .map(|r| r.sys_prompt().to_string())
+            .unwrap_or_default();
         if !sys_prompt.is_empty() {
             cfg.insert("systemPrompt".into(), truncate_prompt(&sys_prompt).into());
         }
@@ -679,7 +690,12 @@ impl AgentScopeAdapter {
             return;
         };
         store
-            .save(self.user_of(session_id).as_deref(), session_id, "state", value)
+            .save(
+                self.user_of(session_id).as_deref(),
+                session_id,
+                "state",
+                value,
+            )
             .await;
     }
 
@@ -1182,12 +1198,15 @@ mod tests {
                     .await
                     .map(|_| ()),
                 CAP_TASK_QUERY => adapter.list_tasks(&session).await.map(|_| ()),
-                CAP_PLAN_MODE => adapter
-                    .set_plan_mode(&session, serde_json::json!({ "active": true }))
-                    .await,
-                CAP_EXPORT_TRANSCRIPT => {
-                    adapter.list_messages(&session, 0, i64::MAX).await.map(|_| ())
+                CAP_PLAN_MODE => {
+                    adapter
+                        .set_plan_mode(&session, serde_json::json!({ "active": true }))
+                        .await
                 }
+                CAP_EXPORT_TRANSCRIPT => adapter
+                    .list_messages(&session, 0, i64::MAX)
+                    .await
+                    .map(|_| ()),
                 // The probe only needs to prove the route is wired, not that the stub model
                 // can answer: a real `Unsupported` is what the capability bit forbids.
                 CAP_CONVERSATION_INBOUND => adapter.inject_user_message(&session, "hi").await,
@@ -1216,7 +1235,10 @@ mod tests {
         }
         assert!(adapter.list_subagents().await.is_ok());
         assert_eq!(adapter.list_workspaces().await.unwrap().len(), 1);
-        assert_eq!(adapter.list_subagent_tasks(&session).await.unwrap().len(), 1);
+        assert_eq!(
+            adapter.list_subagent_tasks(&session).await.unwrap().len(),
+            1
+        );
         adapter.cancel_subagent_task(&session, "t1").await.unwrap();
     }
 

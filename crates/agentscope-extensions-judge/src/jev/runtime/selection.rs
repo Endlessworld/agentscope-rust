@@ -82,8 +82,11 @@ pub const DEFAULT_ROUTING_INSTRUCTIONS: &str =
 pub const DEFAULT_ROUTING_CONFIDENCE: f64 = 0.8;
 
 /// Java `JevToolSelectionMiddleware.Builder.alwaysIncludeTools` default.
-pub const DEFAULT_ALWAYS_INCLUDE_TOOLS: [&str; 3] =
-    ["load_skill_through_path", "reset_tools", "generate_response"];
+pub const DEFAULT_ALWAYS_INCLUDE_TOOLS: [&str; 3] = [
+    "load_skill_through_path",
+    "reset_tools",
+    "generate_response",
+];
 
 /// Java `JevToolSelectionMiddleware.Builder.maxTools` default.
 pub const DEFAULT_MAX_TOOLS: usize = 3;
@@ -169,7 +172,10 @@ pub fn recent_window_state(messages: &[Msg], max_messages: usize, max_chars: usi
             text
         };
         remaining -= text.chars().count();
-        entries.insert(0, json!({ "role": role_name(message.role()), "text": text }));
+        entries.insert(
+            0,
+            json!({ "role": role_name(message.role()), "text": text }),
+        );
     }
     json!({ "messages": entries })
 }
@@ -218,7 +224,9 @@ pub fn selected_names(
     let none_probability = probabilities.get(NONE_OPTION).copied().unwrap_or(0.0);
     let mut entries: Vec<(String, f64)> = probabilities
         .iter()
-        .filter(|(name, probability)| name.as_str() != NONE_OPTION && **probability > none_probability)
+        .filter(|(name, probability)| {
+            name.as_str() != NONE_OPTION && **probability > none_probability
+        })
         .map(|(name, probability)| (name.clone(), *probability))
         .collect();
     entries.sort_by(|left, right| {
@@ -416,11 +424,7 @@ impl JevModelRouterMiddleware {
             .insert(key.to_string(), decision);
     }
 
-    fn request(
-        &self,
-        user_text: &str,
-        candidates: &[(String, ModelChoice)],
-    ) -> SystemOneRequest {
+    fn request(&self, user_text: &str, candidates: &[(String, ModelChoice)]) -> SystemOneRequest {
         let mut criteria = serde_json::Map::new();
         for (name, choice) in candidates {
             criteria.insert(name.clone(), Value::String(choice.criteria.clone()));
@@ -587,7 +591,12 @@ impl JevModelRouterMiddlewareBuilder {
     }
 
     /// Adds (or replaces) one named choice (`Builder.choice`).
-    pub fn choice(mut self, name: impl Into<String>, model: Arc<dyn Model>, criteria: impl Into<String>) -> Self {
+    pub fn choice(
+        mut self,
+        name: impl Into<String>,
+        model: Arc<dyn Model>,
+        criteria: impl Into<String>,
+    ) -> Self {
         let name = name.into();
         let criteria = criteria.into();
         match self.choices.iter_mut().find(|(key, _)| key == &name) {
@@ -662,7 +671,8 @@ impl JevModelRouterMiddlewareBuilder {
         if self.instructions.trim().is_empty() {
             return Err(JevError::invalid("instructions must not be blank"));
         }
-        if !self.confidence_threshold.is_finite() || !(0.0..=1.0).contains(&self.confidence_threshold)
+        if !self.confidence_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.confidence_threshold)
         {
             return Err(JevError::invalid(
                 "confidenceThreshold must be between 0 and 1",
@@ -753,11 +763,9 @@ impl JevToolSelectionMiddleware {
 
     fn state_for(&self, messages: &[Msg]) -> Value {
         match self.strategy {
-            ContextStrategy::RecentWindow => recent_window_state(
-                messages,
-                self.max_context_messages,
-                self.max_context_chars,
-            ),
+            ContextStrategy::RecentWindow => {
+                recent_window_state(messages, self.max_context_messages, self.max_context_chars)
+            }
             ContextStrategy::LatestUserMessage => latest_user_state(&latest_user_text(messages)),
             ContextStrategy::FullConversation => messages_state(messages),
         }
@@ -788,12 +796,15 @@ impl JevToolSelectionMiddleware {
             let result = (self.call)(builder.build())
                 .await
                 .map_err(|failure| JevError::invalid(failure.message()))?;
-            let answers = result.answers.ok_or_else(|| JevError::invalid("invalid answers"))?;
+            let answers = result
+                .answers
+                .ok_or_else(|| JevError::invalid("invalid answers"))?;
             if answers.len() != batch.len() {
                 return Err(JevError::invalid("invalid answers"));
             }
             for (index, tool) in batch.iter().enumerate() {
-                let Some(Answer::Noul(answer)) = answers.get(&format!("{QUESTION_ID_PREFIX}{index}"))
+                let Some(Answer::Noul(answer)) =
+                    answers.get(&format!("{QUESTION_ID_PREFIX}{index}"))
                 else {
                     return Err(JevError::invalid("invalid relevance"));
                 };
@@ -1140,7 +1151,10 @@ impl JevAutoModeMiddleware {
         result: &SystemOneResult,
         guarded: &[ToolUseBlock],
     ) -> Result<RiskDecision, JevError> {
-        let answers = result.answers.as_ref().ok_or_else(|| JevError::invalid("invalid answers"))?;
+        let answers = result
+            .answers
+            .as_ref()
+            .ok_or_else(|| JevError::invalid("invalid answers"))?;
         if answers.len() != guarded.len() {
             return Err(JevError::invalid("invalid answers"));
         }
@@ -1213,15 +1227,18 @@ impl Middleware for JevAutoModeMiddleware {
         if self.execution.mode() == Mode::Off {
             return next(input);
         }
-        let ActingInput { tool_calls, results } = input;
+        let ActingInput {
+            tool_calls,
+            results,
+        } = input;
         let (guarded, _rest) = self.partition_calls(ctx, &tool_calls);
         if guarded.is_empty() {
             return next(ActingInput::with_results(tool_calls, results));
         }
         let messages = state_messages(ctx);
-        let confirmation_changed = guarded
-            .iter()
-            .any(|call| confirmed_calls::contains(ctx, call) && !confirmed_calls::matches(ctx, call));
+        let confirmation_changed = guarded.iter().any(|call| {
+            confirmed_calls::contains(ctx, call) && !confirmed_calls::matches(ctx, call)
+        });
         let reply_id = reply_id(ctx);
         let this = self.clone();
         deferred(async move {
@@ -1299,10 +1316,7 @@ impl JevAutoModeMiddlewareBuilder {
     }
 
     /// Replaces the guarded tool names (`Builder.guardedTools`).
-    pub fn guarded_tools<S: AsRef<str>>(
-        mut self,
-        tool_names: impl IntoIterator<Item = S>,
-    ) -> Self {
+    pub fn guarded_tools<S: AsRef<str>>(mut self, tool_names: impl IntoIterator<Item = S>) -> Self {
         self.guarded_tools = tool_names
             .into_iter()
             .map(|name| name.as_ref().to_string())
@@ -1337,9 +1351,7 @@ impl JevAutoModeMiddlewareBuilder {
             return Err(JevError::invalid("guarded tool names must not be blank"));
         }
         if !self.safety_threshold.is_finite() || !(0.0..=1.0).contains(&self.safety_threshold) {
-            return Err(JevError::invalid(
-                "safetyThreshold must be between 0 and 1",
-            ));
+            return Err(JevError::invalid("safetyThreshold must be between 0 and 1"));
         }
         if self.deny_message.trim().is_empty() {
             return Err(JevError::invalid("denyMessage must not be blank"));
@@ -1433,8 +1445,8 @@ mod tests {
     use std::time::Duration;
 
     use crate::jev::call::testing::ScriptedCaller;
-    use crate::jev::dto::Usage;
     use crate::jev::confirmed_calls::JevConfirmedCalls;
+    use crate::jev::dto::Usage;
 
     struct StubModel {
         name: &'static str,
@@ -1686,7 +1698,10 @@ mod tests {
             Box::new(|_: AgentInput| -> EventStream { Box::pin(futures::stream::empty()) }),
         );
         assert!(drain(stream).await.is_empty());
-        assert_eq!(middleware.decision(&ctx).unwrap().model_name(), Some("slow"));
+        assert_eq!(
+            middleware.decision(&ctx).unwrap().model_name(),
+            Some("slow")
+        );
 
         let stream = middleware.on_model_call(
             &ctx,
@@ -1811,11 +1826,7 @@ mod tests {
             &RuntimeContext::new(),
             reasoning_input(&["low", "best", "second"]),
             Box::new(move |input: ReasoningInput| -> EventStream {
-                *sink.lock().unwrap() = input
-                    .tools
-                    .iter()
-                    .map(|tool| tool.name.clone())
-                    .collect();
+                *sink.lock().unwrap() = input.tools.iter().map(|tool| tool.name.clone()).collect();
                 Box::pin(futures::stream::empty())
             }),
         );
@@ -1998,10 +2009,9 @@ mod tests {
         assert_eq!(snapshot.results.len(), 1);
         assert_eq!(snapshot.results[0].id.as_deref(), Some("call-1"));
         assert_eq!(snapshot.results[0].state, ToolResultState::Denied);
-        assert!(snapshot.results[0]
-            .output
-            .iter()
-            .any(|block| matches!(block, ContentBlock::Text(text) if text.text == DEFAULT_DENY_MESSAGE)));
+        assert!(snapshot.results[0].output.iter().any(
+            |block| matches!(block, ContentBlock::Text(text) if text.text == DEFAULT_DENY_MESSAGE)
+        ));
     }
 
     #[tokio::test]
@@ -2081,11 +2091,11 @@ mod tests {
             Box::new(|_: ActingInput| -> EventStream { Box::pin(futures::stream::empty()) }),
         );
         assert_eq!(drain(stream).await.len(), 3);
-        assert!(calls.requests().is_empty(), "a changed approval is not re-judged");
-        assert_eq!(
-            results.snapshot().results[0].state,
-            ToolResultState::Denied
+        assert!(
+            calls.requests().is_empty(),
+            "a changed approval is not re-judged"
         );
+        assert_eq!(results.snapshot().results[0].state, ToolResultState::Denied);
     }
 
     #[tokio::test]
@@ -2103,10 +2113,7 @@ mod tests {
         );
         assert_eq!(drain(stream).await.len(), 3);
         assert!(calls.requests().is_empty());
-        assert_eq!(
-            results.snapshot().results[0].state,
-            ToolResultState::Denied
-        );
+        assert_eq!(results.snapshot().results[0].state, ToolResultState::Denied);
     }
 
     #[test]
@@ -2149,30 +2156,21 @@ mod tests {
             latest_user_text(&[Msg::user(" first "), Msg::assistant("reply")]),
             "first"
         );
-        assert_eq!(
-            latest_user_state("hi"),
-            json!({ "userRequest": "hi" })
-        );
+        assert_eq!(latest_user_state("hi"), json!({ "userRequest": "hi" }));
 
         let window = recent_window_state(&[Msg::user("old"), Msg::assistant("new")], 1, 100);
         assert_eq!(
             window,
             json!({ "messages": [{ "role": "assistant", "text": "new" }] })
         );
-        assert_eq!(
-            recent_window_state(&[], 8, 8000),
-            json!({ "messages": [] })
-        );
+        assert_eq!(recent_window_state(&[], 8, 8000), json!({ "messages": [] }));
 
         let criteria = tool_criteria(&[tool("web_search")]);
         assert_eq!(criteria.len(), 2);
         assert!(criteria.contains_key("web_search"));
         assert!(criteria.contains_key(NONE_OPTION));
 
-        assert_eq!(
-            partition(&[1, 2, 3], 2),
-            vec![vec![1, 2], vec![3]]
-        );
+        assert_eq!(partition(&[1, 2, 3], 2), vec![vec![1, 2], vec![3]]);
         assert!(partition::<u8>(&[], 2).is_empty());
         assert!(partition(&[1], 0).is_empty());
     }
@@ -2202,5 +2200,4 @@ mod tests {
         assert!(selected_names(&none_wins, 3, 0.8).is_empty());
         assert_eq!(top_name(&none_wins), None);
     }
-
 }

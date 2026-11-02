@@ -153,7 +153,12 @@ impl BlockingRedisCommands {
         f: impl FnMut(&mut redis::Connection) -> redis::RedisResult<T>,
     ) -> Result<T> {
         let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        run_with_reconnect(&mut guard, context, || open_blocking_connection(&self.url), f)
+        run_with_reconnect(
+            &mut guard,
+            context,
+            || open_blocking_connection(&self.url),
+            f,
+        )
     }
 }
 

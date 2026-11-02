@@ -145,19 +145,20 @@ impl ModelProvider for DashScopeModelProvider {
             crate::dashscope::converter::DEFAULT_BASE_URL,
         );
 
-        let model = DashScopeChatModel::new(model_name, api_key, Some(base_url), default_transport())
-            .with_default_options(options)
-            .with_stream(ctx.stream.unwrap_or(true))
-            .with_endpoint_type(endpoint_type)
-            .with_enable_thinking(ctx.enable_thinking)
-            .with_context_window_size(context_window_size)
-            .with_multi_agent_formatter(multi_agent_prompt)
-            .with_enable_search(enable_search)
-            .with_enable_code_interpreter(enable_code_interpreter)
-            .with_multimodal_patterns(multimodal_patterns)
-            .with_native_structured_output(native_structured_output)
-            .with_native_structured_output_with_tools(native_structured_output_with_tools)
-            .with_encryption_enabled(enable_encrypt);
+        let model =
+            DashScopeChatModel::new(model_name, api_key, Some(base_url), default_transport())
+                .with_default_options(options)
+                .with_stream(ctx.stream.unwrap_or(true))
+                .with_endpoint_type(endpoint_type)
+                .with_enable_thinking(ctx.enable_thinking)
+                .with_context_window_size(context_window_size)
+                .with_multi_agent_formatter(multi_agent_prompt)
+                .with_enable_search(enable_search)
+                .with_enable_code_interpreter(enable_code_interpreter)
+                .with_multimodal_patterns(multimodal_patterns)
+                .with_native_structured_output(native_structured_output)
+                .with_native_structured_output_with_tools(native_structured_output_with_tools)
+                .with_encryption_enabled(enable_encrypt);
         let model = match search_options {
             Some(search_options) => model.with_search_options(search_options),
             None => model,
@@ -204,9 +205,10 @@ mod tests {
     fn native_structured_output_option_is_consumed_from_the_provider() {
         let provider = DashScopeModelProvider::new();
         let mut options = agentscope_core::GenerateOptions::default();
-        options
-            .additional_body_params
-            .insert("nativeStructuredOutput".to_string(), serde_json::json!(false));
+        options.additional_body_params.insert(
+            "nativeStructuredOutput".to_string(),
+            serde_json::json!(false),
+        );
         options.additional_body_params.insert(
             "nativeStructuredOutputWithTools".to_string(),
             serde_json::json!(false),

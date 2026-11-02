@@ -802,7 +802,7 @@ mod tests {
         let s = PostgresStore::builder(Arc::new(FailingClient { fail_batch: false }))
             .build()
             .unwrap();
-        let n = ns(&[ "filesystem" ]);
+        let n = ns(&["filesystem"]);
 
         assert!(s.get(&n, "k").is_none());
         s.put(&n, "k", val(json!({ "a": 1 })));

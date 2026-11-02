@@ -84,10 +84,7 @@ async fn harness_bundle_carries_every_component() {
     value.insert("kv".to_string(), json!(2));
     assert!(base.put_if_version(&namespace, "k", value, 0));
     assert_eq!(
-        base.get(&namespace, "k")
-            .expect("item")
-            .value
-            .get("kv"),
+        base.get(&namespace, "k").expect("item").value.get("kv"),
         Some(&json!(2))
     );
 
@@ -97,7 +94,10 @@ async fn harness_bundle_carries_every_component() {
         .expect("snapshot spec");
     let snapshot = spec.build(unique("bridge-snap").as_str()).expect("build");
     // Non UTF-8 bytes: the LONGBLOB must decode as `ColumnValue::Blob`, not as text.
-    snapshot.persist(&[0x1f, 0x8b, 0xff, 0xfe]).await.expect("persist");
+    snapshot
+        .persist(&[0x1f, 0x8b, 0xff, 0xfe])
+        .await
+        .expect("persist");
     assert!(snapshot.is_restorable().await.expect("restorable"));
 }
 

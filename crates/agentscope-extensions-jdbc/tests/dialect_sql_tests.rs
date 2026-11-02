@@ -546,7 +546,11 @@ fn default_table_groups_cover_the_base_tables_only() {
     assert!(d.base_tables_enabled());
     assert!(!d.skill_tables_enabled());
     assert_eq!(
-        vec!["agentscope_store", "agentscope_sessions", "agentscope_snapshots"],
+        vec![
+            "agentscope_store",
+            "agentscope_sessions",
+            "agentscope_snapshots"
+        ],
         d.enabled_table_names()
     );
     let joined = d.create_table_ddls().join("\n").to_lowercase();
@@ -883,7 +887,11 @@ fn default_session_state_probe_is_fail_closed() {
 
     // The shipped vendors answer for real (PostgreSQL asks `information_schema`).
     let postgres = PostgresDialect::new().session_state_check_table_exists("agentscope_sessions");
-    assert!(postgres.sql.contains("information_schema.tables"), "{}", postgres.sql);
+    assert!(
+        postgres.sql.contains("information_schema.tables"),
+        "{}",
+        postgres.sql
+    );
     assert_eq!(postgres.params.len(), 1);
 }
 
@@ -951,12 +959,19 @@ fn skill_statements_never_update_the_namespace() {
             bound.sql
         );
         assert!(
-            !bound.sql.trim_start().to_ascii_uppercase().starts_with("UPDATE"),
+            !bound
+                .sql
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with("UPDATE"),
             "skill statements never update rows: {}",
             bound.sql
         );
         assert!(
-            bound.params.iter().any(|param| param.as_text() == Some("team-a")),
+            bound
+                .params
+                .iter()
+                .any(|param| param.as_text() == Some("team-a")),
             "the namespace must be bound, not inlined: {}",
             bound.sql
         );

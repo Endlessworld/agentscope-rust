@@ -509,7 +509,9 @@ mod tests {
         let s = MongodbDistributedStore::new(raw.clone(), None);
         assert_eq!(s.database_name(), "mydb");
 
-        s.agent_state_store().save(None, "sess", "k", json!(1)).await;
+        s.agent_state_store()
+            .save(None, "sess", "k", json!(1))
+            .await;
         let scoped = scoped_collection("mydb", SESSIONS_COLLECTION);
         assert_eq!(raw.document_count(&scoped), 1);
         assert_eq!(raw.document_count(SESSIONS_COLLECTION), 0);
@@ -642,9 +644,6 @@ mod tests {
             a.agent_state_store().collection(),
             b.agent_state_store().collection()
         );
-        assert!(a
-            .agent_state_store()
-            .collection()
-            .starts_with("db_a::"));
+        assert!(a.agent_state_store().collection().starts_with("db_a::"));
     }
 }

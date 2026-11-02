@@ -17,4 +17,4 @@ pub use processor::{
     questions, Assessment, Call, Classification, JevEvidenceProcessor, Limits, Policy, Report,
     Threshold, Truth,
 };
-pub use tool::{evidence_result, EvidenceResult, ToolPassage, TOOL_UNAVAILABLE, JevEvidenceTool};
+pub use tool::{evidence_result, EvidenceResult, JevEvidenceTool, ToolPassage, TOOL_UNAVAILABLE};

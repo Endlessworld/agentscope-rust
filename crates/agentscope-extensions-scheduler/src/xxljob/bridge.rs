@@ -205,18 +205,17 @@ mod tests {
 
     #[async_trait]
     impl AgentFactory for RecordingFactory {
-        async fn run(
-            &self,
-            _config: &RuntimeAgentConfig,
-            messages: Vec<Msg>,
-        ) -> CoreResult<Msg> {
+        async fn run(&self, _config: &RuntimeAgentConfig, messages: Vec<Msg>) -> CoreResult<Msg> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.seen.lock().unwrap().push((
                 XxlJobHelper::get_job_id().unwrap_or(-1),
                 XxlJobHelper::get_shard_index().unwrap_or(-1),
                 XxlJobHelper::get_shard_total().unwrap_or(-1),
                 XxlJobHelper::get_log_id().unwrap_or(-1),
-                messages.first().map(|m| m.text_content()).unwrap_or_default(),
+                messages
+                    .first()
+                    .map(|m| m.text_content())
+                    .unwrap_or_default(),
             ));
             Ok(Msg::assistant("ok"))
         }

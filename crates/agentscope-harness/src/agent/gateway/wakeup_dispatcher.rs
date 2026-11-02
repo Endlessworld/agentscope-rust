@@ -124,7 +124,11 @@ impl DispatcherCore {
                 continue;
             }
             // One attempt per completion: a failing turn is not retried in a loop.
-            if let Err(e) = self.target.run_wakeup(user_id.as_deref(), &session_id).await {
+            if let Err(e) = self
+                .target
+                .run_wakeup(user_id.as_deref(), &session_id)
+                .await
+            {
                 tracing::warn!("WakeupDispatcher: wakeup run failed for session {session_id}: {e}");
             }
         }
@@ -227,10 +231,8 @@ mod tests {
     }
 
     async fn dispatcher_with(dir_tag: &str, target: Arc<StubTarget>) -> WakeupDispatcher {
-        let dir = std::env::temp_dir().join(format!(
-            "wakeup_test_{dir_tag}_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("wakeup_test_{dir_tag}_{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&dir).await;
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
         let bus: Arc<dyn MessageBus> = Arc::new(WorkspaceMessageBus::new(fs, "/bus"));

@@ -47,7 +47,8 @@ fn crud_and_resource_batch_round_trip() {
     let Some(url) = mysql_url() else {
         return;
     };
-    let db = Arc::new(MysqlSqlDatabase::connect(&url).expect("connect to AGENTSCOPE_TEST_MYSQL_URL"));
+    let db =
+        Arc::new(MysqlSqlDatabase::connect(&url).expect("connect to AGENTSCOPE_TEST_MYSQL_URL"));
     let skills_table = unique_table("skills_it");
     let resources_table = unique_table("resources_it");
     let repo = MysqlSkillRepository::with_config(
@@ -81,9 +82,7 @@ fn crud_and_resource_batch_round_trip() {
     // Raw column check: `skill_content` holds the body (SKILLS-08) and `SKILL.md` is not a
     // resource row, which is exactly what a Java reader sharing the table expects.
     let mut conn = db.connection().expect("second session");
-    let sql = format!(
-        "SELECT skill_content FROM {database}.{skills_table} WHERE name = ?"
-    );
+    let sql = format!("SELECT skill_content FROM {database}.{skills_table} WHERE name = ?");
     let rows = conn
         .query(&sql, &[SqlParam::Text("calc".to_string())])
         .expect("skill_content query");

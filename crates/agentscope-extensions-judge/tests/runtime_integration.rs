@@ -33,9 +33,7 @@ use agentscope_extensions_judge::http::{
 use agentscope_extensions_judge::jev::call::{CallFailure, Caller};
 use agentscope_extensions_judge::jev::client::JevClient;
 use agentscope_extensions_judge::jev::confirmed_calls::JevConfirmedCalls;
-use agentscope_extensions_judge::jev::context::{
-    ArchiveScope, ContextMessage, JevContextArchive,
-};
+use agentscope_extensions_judge::jev::context::{ArchiveScope, ContextMessage, JevContextArchive};
 use agentscope_extensions_judge::jev::evidence::{
     JevEvidenceProcessor, JevPassage, Limits, Policy,
 };
@@ -47,7 +45,8 @@ use agentscope_extensions_judge::jev::runtime::middleware::{
     Auditor, ResponseMiddleware, SupervisionMiddleware,
 };
 use agentscope_extensions_judge::jev::runtime::tools::{
-    register_jev_tools, EvidenceRequest, EvidenceSearchTool, EvidenceSource, JevToolConfig, ToolScope,
+    register_jev_tools, EvidenceRequest, EvidenceSearchTool, EvidenceSource, JevToolConfig,
+    ToolScope,
 };
 use agentscope_extensions_judge::jev::screening::GuardrailScreener;
 use agentscope_extensions_judge::jev::supervision::middleware::Schedule;
@@ -223,9 +222,9 @@ fn a_chain_routes_the_guardrail_screener_and_the_supervisor() {
             .lock()
             .unwrap()
             .push((snapshot.worker_active, snapshot.worker_failed));
-        Box::pin(async move {
-            Ok::<_, JevError>(Decision::decided(supervision_report(snapshot.scope)))
-        })
+        Box::pin(
+            async move { Ok::<_, JevError>(Decision::decided(supervision_report(snapshot.scope))) },
+        )
     });
     let published = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&published);
@@ -257,9 +256,7 @@ fn a_chain_routes_the_guardrail_screener_and_the_supervisor() {
             .wrap_model_call(
                 runtime(),
                 input,
-                Box::new(|_input| {
-                    stream_of(vec![text_event("draft")])
-                }),
+                Box::new(|_input| stream_of(vec![text_event("draft")])),
             )
             .collect::<Vec<_>>(),
     );
@@ -300,9 +297,8 @@ fn a_chain_routes_the_guardrail_screener_and_the_supervisor() {
 
 #[test]
 fn the_toolkit_runs_a_registered_jev_tool() {
-    let caller: Caller = Arc::new(|_request| {
-        Box::pin(async { Err(CallFailure::backend("unused in this test")) })
-    });
+    let caller: Caller =
+        Arc::new(|_request| Box::pin(async { Err(CallFailure::backend("unused in this test")) }));
     let processor = JevEvidenceProcessor::new(
         caller,
         Policy::demonstration(),

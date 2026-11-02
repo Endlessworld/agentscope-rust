@@ -733,7 +733,8 @@ impl SessionRecorder {
         lease: Duration,
         policy: RecordingPolicy,
     ) -> crate::error::Result<Self> {
-        Self::open_with_lease_and_baseline(log, turn_id, run_id, exporter, lease, None, policy).await
+        Self::open_with_lease_and_baseline(log, turn_id, run_id, exporter, lease, None, policy)
+            .await
     }
 
     async fn open_with_lease_and_baseline(
@@ -2092,7 +2093,8 @@ mod tests {
             _messages: Vec<Msg>,
             _tools: Vec<crate::model::ToolSchema>,
             _options: crate::model::GenerateOptions,
-        ) -> futures::stream::BoxStream<'_, crate::error::Result<crate::model::ChatResponse>> {
+        ) -> futures::stream::BoxStream<'_, crate::error::Result<crate::model::ChatResponse>>
+        {
             unimplemented!("prepare_model never streams")
         }
 

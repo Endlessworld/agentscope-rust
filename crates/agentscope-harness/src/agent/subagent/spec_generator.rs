@@ -84,7 +84,8 @@ impl SubagentSpecGenerator {
         let prompt = PROMPT_TEMPLATE
             .replacen("{}", description, 1)
             .replacen("{}", &existing, 1);
-        let markdown = auxiliary_text(Arc::clone(&self.model), vec![Msg::user(prompt)], None).await?;
+        let markdown =
+            auxiliary_text(Arc::clone(&self.model), vec![Msg::user(prompt)], None).await?;
         Ok(markdown.trim().to_string())
     }
 

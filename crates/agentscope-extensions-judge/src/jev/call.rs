@@ -304,14 +304,18 @@ mod tests {
             "x",
             Options::new(Mode::Shadow, Duration::from_millis(50), "v1").unwrap(),
         );
-        let decided: Decision<u8> = execute_guarded(&shadow, async { Ok(Decision::decided(2)) }).await;
+        let decided: Decision<u8> =
+            execute_guarded(&shadow, async { Ok(Decision::decided(2)) }).await;
         assert_eq!(decided.status, Status::Decided);
         assert_eq!(decided.value, Some(2));
 
         let failed: Decision<u8> =
             execute_guarded(&shadow, async { Err(JevError::invalid("nope")) }).await;
         assert_eq!(failed.status, Status::Error);
-        assert_eq!(failed.reason, super::super::execution::reason::CALL_OR_RESPONSE_ERROR);
+        assert_eq!(
+            failed.reason,
+            super::super::execution::reason::CALL_OR_RESPONSE_ERROR
+        );
 
         let slow: Decision<u8> = execute_guarded(&shadow, async {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -361,12 +365,8 @@ mod tests {
         .await;
         assert_eq!(timed_out.reason, reason::TIMEOUT);
 
-        let off = JevExecution::new(
-            "quality",
-            Options::disabled().with_observer(observer),
-        );
-        let skipped: Decision<u8> =
-            execute_guarded(&off, async { Ok(Decision::decided(3)) }).await;
+        let off = JevExecution::new("quality", Options::disabled().with_observer(observer));
+        let skipped: Decision<u8> = execute_guarded(&off, async { Ok(Decision::decided(3)) }).await;
         assert_eq!(skipped.status, Status::Skipped);
 
         let records = seen.lock().unwrap().clone();

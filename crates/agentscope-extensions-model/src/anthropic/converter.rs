@@ -260,12 +260,12 @@ pub fn message_content_blocks(
                 // requires it once the history mixes thinking with tool use
                 // (MODEL-18). Java replays thinking as plain text, which loses the
                 // signature, so this is a hardening addition, not an alignment gap.
-                Some(signature) => out.push(AnthropicContentBlock::Thinking(
-                    AnthropicThinkingBlock {
+                Some(signature) => {
+                    out.push(AnthropicContentBlock::Thinking(AnthropicThinkingBlock {
                         thinking: t.thinking.clone(),
                         signature: Some(signature.to_string()),
-                    },
-                )),
+                    }))
+                }
                 None => {
                     if !t.thinking.is_empty() {
                         out.push(AnthropicContentBlock::Text(AnthropicTextBlock::new(
@@ -365,9 +365,7 @@ pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> 
                 // three states to `is_error: true`).
                 is_error: matches!(
                     block.state,
-                    ToolResultState::Error
-                        | ToolResultState::Denied
-                        | ToolResultState::Interrupted
+                    ToolResultState::Error | ToolResultState::Denied | ToolResultState::Interrupted
                 )
                 .then_some(true),
                 cache_control: fmt.cache_control.then(|| fmt.marker()),
@@ -481,10 +479,7 @@ fn collect_split_tool_results(messages: &[Msg], start: usize) -> SplitToolResult
 
 /// Whether the assistant message should be expanded into the anthropic
 /// tool-use/tool-result alternation (Java `shouldSplitParallelToolCalls`).
-fn should_split_parallel_tool_calls(
-    tool_uses: &[&ToolUseBlock],
-    split: &SplitToolResults,
-) -> bool {
+fn should_split_parallel_tool_calls(tool_uses: &[&ToolUseBlock], split: &SplitToolResults) -> bool {
     if split.consumed == 0 || tool_uses.len() <= 1 {
         return false;
     }
@@ -558,8 +553,7 @@ pub fn to_anthropic_tools(tools: &[ToolSchema], fmt: &ChatFormatOptions) -> Vec<
             description: schema.description.clone(),
             input_schema: serde_json::Value::Object(schema.parameters.clone()),
             defer_loading: schema.defer_loading,
-            cache_control: (fmt.cache_control && Some(index) == last_eager)
-                .then(|| fmt.marker()),
+            cache_control: (fmt.cache_control && Some(index) == last_eager).then(|| fmt.marker()),
         })
         .collect()
 }

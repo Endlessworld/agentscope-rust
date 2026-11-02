@@ -68,9 +68,7 @@ mod tests {
             "bounded passage id/version required"
         );
         assert_eq!(
-            JevPassage::plain("id", "text", "  ")
-                .unwrap_err()
-                .message(),
+            JevPassage::plain("id", "text", "  ").unwrap_err().message(),
             "bounded passage id/version required"
         );
         assert_eq!(

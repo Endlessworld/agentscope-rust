@@ -33,8 +33,13 @@ const SHARED_PREFIXES: [&str; 5] = ["memory/", "skills/", "subagents/", "knowled
 
 /// Workspace roots projected into the sandbox workspace by default (Java
 /// `SandboxFilesystemSpec.DEFAULT_WORKSPACE_PROJECTION_ROOTS`).
-pub const DEFAULT_WORKSPACE_PROJECTION_ROOTS: [&str; 5] =
-    ["AGENTS.md", "skills", "subagents", "knowledge", ".skills-cache"];
+pub const DEFAULT_WORKSPACE_PROJECTION_ROOTS: [&str; 5] = [
+    "AGENTS.md",
+    "skills",
+    "subagents",
+    "knowledge",
+    ".skills-cache",
+];
 
 // ---------------------------------------------------------------------------
 // LocalFilesystemSpec
@@ -317,7 +322,11 @@ impl NamespaceFactory for ScopedRouteNamespace {
 
 /// Normalizes a configured prefix to a workspace-relative, slash-separated route.
 fn normalize_prefix(prefix: &str) -> String {
-    prefix.replace('\\', "/").trim().trim_matches('/').to_string()
+    prefix
+        .replace('\\', "/")
+        .trim()
+        .trim_matches('/')
+        .to_string()
 }
 
 /// Namespace segment for a workspace prefix (`memory/` → `memory`).
@@ -351,8 +360,14 @@ impl std::fmt::Debug for SandboxFilesystemSpec {
             .field("client_options", &self.client_options)
             .field("layout", &self.layout)
             .field("isolation_scope", &self.isolation_scope)
-            .field("workspace_projection_enabled", &self.workspace_projection_enabled)
-            .field("workspace_projection_roots", &self.workspace_projection_roots)
+            .field(
+                "workspace_projection_enabled",
+                &self.workspace_projection_enabled,
+            )
+            .field(
+                "workspace_projection_roots",
+                &self.workspace_projection_roots,
+            )
             .finish()
     }
 }
@@ -526,13 +541,21 @@ mod tests {
         let ctx = RuntimeContext::default().with_user_id("u1");
         // The scaffolded template is the baseline until the agent writes.
         assert_eq!(
-            fs.read(&ctx, "memory/notes.md", 0, 100).await.unwrap().content,
+            fs.read(&ctx, "memory/notes.md", 0, 100)
+                .await
+                .unwrap()
+                .content,
             "template"
         );
-        fs.write(&ctx, "memory/notes.md", "agent note").await.unwrap();
+        fs.write(&ctx, "memory/notes.md", "agent note")
+            .await
+            .unwrap();
         assert_eq!(store.size(), 1, "the edit must land in the shared store");
         assert_eq!(
-            fs.read(&ctx, "memory/notes.md", 0, 100).await.unwrap().content,
+            fs.read(&ctx, "memory/notes.md", 0, 100)
+                .await
+                .unwrap()
+                .content,
             "agent note"
         );
 
@@ -654,8 +677,7 @@ mod tests {
             .workspace_spec(Some(Path::new("/host/workspace")));
         assert!(disabled.workspace_projection.is_none());
 
-        let rootless =
-            SandboxFilesystemSpec::new(Box::new(NoopSandboxClient)).workspace_spec(None);
+        let rootless = SandboxFilesystemSpec::new(Box::new(NoopSandboxClient)).workspace_spec(None);
         assert!(rootless.workspace_projection.is_none());
     }
 

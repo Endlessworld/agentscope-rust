@@ -59,7 +59,8 @@ pub fn evidence_result(report: &Report) -> EvidenceResult {
                 id: passage.id.clone(),
                 version: passage.version.clone(),
                 text: passage.text.clone(),
-                classification: classified.map(|assessment| assessment.classification.as_str().to_string()),
+                classification: classified
+                    .map(|assessment| assessment.classification.as_str().to_string()),
                 score: classified.and_then(|assessment| assessment.rerank_score),
             }
         })
@@ -130,8 +131,8 @@ impl JevEvidenceTool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::processor::{Assessment, Classification, Limits};
+    use super::*;
     use crate::jev::evidence::passage::JevPassage;
     use std::collections::BTreeMap;
 
@@ -165,7 +166,10 @@ mod tests {
     fn applied_reports_expose_classification_and_score() {
         let result = evidence_result(&report(true, true));
         assert_eq!(result.status, "RETRIEVED");
-        assert_eq!(result.passages[0].classification.as_deref(), Some("CONFLICTING"));
+        assert_eq!(
+            result.passages[0].classification.as_deref(),
+            Some("CONFLICTING")
+        );
         assert_eq!(result.passages[0].score, Some(0.7));
         assert_eq!(result.passages[0].version, "v1");
     }

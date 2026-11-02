@@ -220,7 +220,10 @@ fn convert_extension_to_a2a(extension: &NacosAgentExtension) -> Value {
     let mut map = serde_json::Map::new();
     map.insert("uri".to_string(), Value::String(extension.uri.clone()));
     if let Some(description) = &extension.description {
-        map.insert("description".to_string(), Value::String(description.clone()));
+        map.insert(
+            "description".to_string(),
+            Value::String(description.clone()),
+        );
     }
     // A2A's `required` is a primitive boolean: a missing Nacos value maps to `false`
     // (Java `Boolean.TRUE.equals(extension.getRequired())`).
@@ -282,11 +285,10 @@ fn convert_capabilities_to_nacos(c: &A2aAgentCapabilities) -> NacosAgentCapabili
         push_notifications: c.push_notifications,
         state_transition_history: Some(false),
         // `null` (absent) stays `None`; an explicitly empty list stays `Some(vec![])`.
-        extensions: c.extensions.as_ref().map(|list| {
-            list.iter()
-                .filter_map(convert_extension_to_nacos)
-                .collect()
-        }),
+        extensions: c
+            .extensions
+            .as_ref()
+            .map(|list| list.iter().filter_map(convert_extension_to_nacos).collect()),
     }
 }
 
@@ -591,11 +593,11 @@ mod tests {
         // A2A 1.0 moved the endpoints into `supportedInterfaces`; the old flat
         // `preferredTransport` key is no longer emitted (PROTO-A2A-01).
         assert!(json.get("preferredTransport").is_none());
+        assert_eq!(json["supportedInterfaces"][0]["protocolBinding"], "JSONRPC");
         assert_eq!(
-            json["supportedInterfaces"][0]["protocolBinding"],
-            "JSONRPC"
+            json["supportedInterfaces"][0]["url"],
+            "http://localhost:8080"
         );
-        assert_eq!(json["supportedInterfaces"][0]["url"], "http://localhost:8080");
         // Flattened wrapper must deserialize back into the same card. The card-level
         // `protocolVersion` is not part of the 1.0 wire shape (every interface
         // carries it), so only the stable fields are compared.
@@ -696,10 +698,16 @@ mod tests {
         }]);
 
         let a2a = convert_to_a2a_agent_card(&card);
-        assert_eq!(a2a.capabilities.extensions.as_ref().unwrap()[0]["x-vendor"]["a"], 1);
+        assert_eq!(
+            a2a.capabilities.extensions.as_ref().unwrap()[0]["x-vendor"]["a"],
+            1
+        );
         let back = convert_to_nacos_agent_card(&a2a);
         let restored = &back.capabilities.extensions.as_ref().unwrap()[0];
-        assert_eq!(restored.extra.get("x-vendor"), Some(&serde_json::json!({"a": 1})));
+        assert_eq!(
+            restored.extra.get("x-vendor"),
+            Some(&serde_json::json!({"a": 1}))
+        );
     }
 
     #[test]
@@ -718,6 +726,9 @@ mod tests {
         assert_eq!(extensions[0].required, Some(true));
         // An explicit JSON null parameter is "absent", not `Value::Null`.
         assert_eq!(extensions[0].params, None);
-        assert_eq!(extensions[0].extra.get("other"), Some(&serde_json::json!(5)));
+        assert_eq!(
+            extensions[0].extra.get("other"),
+            Some(&serde_json::json!(5))
+        );
     }
 }

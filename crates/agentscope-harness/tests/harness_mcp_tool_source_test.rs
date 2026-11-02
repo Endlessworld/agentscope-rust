@@ -5,7 +5,9 @@
 //! which fronts one server on the harness `McpClientManager`.
 use std::sync::Arc;
 
-use agentscope_harness::agent::{McpClientManager, McpClientSource, McpServerConfig, McpToolSource};
+use agentscope_harness::agent::{
+    McpClientManager, McpClientSource, McpServerConfig, McpToolSource,
+};
 
 async fn manager_with_server(name: &str, config: McpServerConfig) -> Arc<McpClientManager> {
     let manager = Arc::new(McpClientManager::new());
@@ -26,7 +28,10 @@ async fn adapter_reports_unconfigured_servers_instead_of_faking_a_connection() {
         .initialize()
         .await
         .expect_err("a server nobody registered cannot be initialised");
-    assert!(format!("{err}").contains("No MCP client configured"), "{err}");
+    assert!(
+        format!("{err}").contains("No MCP client configured"),
+        "{err}"
+    );
 
     let err = source
         .list_tools()

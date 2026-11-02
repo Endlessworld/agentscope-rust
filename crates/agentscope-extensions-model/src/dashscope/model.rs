@@ -789,7 +789,10 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(spec.body["parameters"]["enable_search"], serde_json::json!(true));
+        assert_eq!(
+            spec.body["parameters"]["enable_search"],
+            serde_json::json!(true)
+        );
         assert_eq!(
             spec.body["parameters"]["search_options"]["forced_search"],
             serde_json::json!(true)

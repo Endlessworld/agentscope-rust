@@ -126,12 +126,8 @@ pub use bailian::{
     BailianMemoryClient, BailianMemoryNode, BailianMessage, BailianSearchRequest,
     BailianSearchResponse, ADD_MEMORY_ENDPOINT,
 };
-pub use error::{
-    MemError, Result, UNSPECIFIED_OPERATION, UNSPECIFIED_VENDOR,
-};
+pub use error::{MemError, Result, UNSPECIFIED_OPERATION, UNSPECIFIED_VENDOR};
 pub use http::{HttpTransport, ReqwestTransport, DEFAULT_CONNECT_TIMEOUT};
-pub use retry::{RetryPolicy, RetryTransport};
-pub use telemetry::{InstrumentedTransport, MemMetrics, MemMetricsSnapshot};
 pub use mem0::{
     Mem0AddRequest, Mem0AddResponse, Mem0ApiType, Mem0Client, Mem0LongTermMemory,
     Mem0LongTermMemoryConfig, Mem0Message, Mem0SearchRequest, Mem0SearchResponse, Mem0SearchResult,
@@ -142,3 +138,5 @@ pub use reme::{
     ReMeAddRequest, ReMeAddResponse, ReMeClient, ReMeLongTermMemory, ReMeMemoryItem, ReMeMessage,
     ReMeSearchRequest, ReMeSearchResponse, ReMeTrajectory, RETRIEVE_ENDPOINT, SUMMARY_ENDPOINT,
 };
+pub use retry::{RetryPolicy, RetryTransport};
+pub use telemetry::{InstrumentedTransport, MemMetrics, MemMetricsSnapshot};

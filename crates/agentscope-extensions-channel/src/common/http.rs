@@ -397,7 +397,10 @@ mod tests {
             let value: HeaderValue = value.parse().expect("valid header value");
             map.append(name, value);
         }
-        assert_eq!(map.get("retry-after").map(|v| v.as_bytes()), Some(&b"1"[..]));
+        assert_eq!(
+            map.get("retry-after").map(|v| v.as_bytes()),
+            Some(&b"1"[..])
+        );
         assert_eq!(map.len(), 2);
     }
 

@@ -117,7 +117,11 @@ async fn state_absent_values_are_ok_none_not_errors() {
         .unwrap()
         .is_empty());
     assert!(!store.exists_strict(None, "s1").await.unwrap());
-    assert!(store.list_session_ids_strict(None).await.unwrap().is_empty());
+    assert!(store
+        .list_session_ids_strict(None)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -211,9 +215,7 @@ async fn trait_delete_key_removes_only_the_targeted_key() {
         AgentStateStore::get(&store, Some("alice"), "s1", "keep").await,
         Some(json!(2))
     );
-    assert!(!client
-        .exists("agentscope/state/alice/s1/k.json")
-        .unwrap());
+    assert!(!client.exists("agentscope/state/alice/s1/k.json").unwrap());
     assert!(!client
         .exists("agentscope/state/alice/s1/k.list.json")
         .unwrap());
@@ -226,7 +228,10 @@ async fn trait_delete_key_removes_only_the_targeted_key() {
     let err = AgentStateStore::delete_key(&store, Some("alice"), "  ", "k")
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("OSS per-key delete failed"), "{err}");
+    assert!(
+        err.to_string().contains("OSS per-key delete failed"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -288,13 +293,13 @@ fn accessors_expose_the_configured_bucket_and_prefix() {
     assert_eq!(store.bucket_name(), "bucket");
     assert_eq!(store.key_prefix(), "kv/");
 
-    let snap = OssRemoteSnapshotClient::new(common::as_dyn(&client), "bucket", Some("snap"))
-        .unwrap();
+    let snap =
+        OssRemoteSnapshotClient::new(common::as_dyn(&client), "bucket", Some("snap")).unwrap();
     assert_eq!(snap.bucket_name(), "bucket");
     assert_eq!(snap.key_prefix(), "snap/");
 
-    let composed = OssDistributedStore::create(common::as_dyn(&client), "bucket", Some("root"))
-        .unwrap();
+    let composed =
+        OssDistributedStore::create(common::as_dyn(&client), "bucket", Some("root")).unwrap();
     assert_eq!(composed.bucket_name(), "bucket");
     assert_eq!(composed.key_prefix(), "root/");
 }

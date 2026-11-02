@@ -98,7 +98,9 @@ impl ToolSearchStrategy for KeywordToolSearchStrategy {
             .filter(|(_, score)| *score > 0)
             .collect();
         matches.sort_by(|(left, left_score), (right, right_score)| {
-            right_score.cmp(left_score).then_with(|| left.name.cmp(&right.name))
+            right_score
+                .cmp(left_score)
+                .then_with(|| left.name.cmp(&right.name))
         });
         Ok(ToolSearchResult {
             tool_names: matches

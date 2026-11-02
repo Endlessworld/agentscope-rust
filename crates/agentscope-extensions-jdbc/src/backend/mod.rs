@@ -368,9 +368,8 @@ mod tests {
     fn vendor_codes_decide_ahead_of_a_generic_sqlstate() {
         // MySQL reports a duplicate key as SQLSTATE 23000 (generic integrity violation) plus
         // its own ER_DUP_ENTRY = 1062.
-        let error = database(
-            DbError::new("Duplicate entry 'k' for key 'PRIMARY'").with_sql_state("23000"),
-        );
+        let error =
+            database(DbError::new("Duplicate entry 'k' for key 'PRIMARY'").with_sql_state("23000"));
         assert!(!is_unique_violation(&error), "23000 alone is ambiguous");
         let error = database(
             DbError::new("Duplicate entry 'k' for key 'PRIMARY'")
@@ -386,7 +385,10 @@ mod tests {
         // SQLite NOT NULL (1299) / CHECK (275) / FOREIGN KEY (787) are not.
         for code in [1299, 275, 787] {
             let error = database(DbError::new("constraint failed").with_vendor_code(code));
-            assert!(!is_unique_violation(&error), "sqlite {code} is not a duplicate");
+            assert!(
+                !is_unique_violation(&error),
+                "sqlite {code} is not a duplicate"
+            );
         }
     }
 

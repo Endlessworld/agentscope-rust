@@ -400,12 +400,8 @@ async fn snapshot_upload_and_download_over_s3() {
             .body("tar-bytes");
     });
 
-    let snapshots = OssRemoteSnapshotClient::new(
-        client(&server),
-        BUCKET,
-        Some(SNAPSHOT_PREFIX),
-    )
-    .unwrap();
+    let snapshots =
+        OssRemoteSnapshotClient::new(client(&server), BUCKET, Some(SNAPSHOT_PREFIX)).unwrap();
 
     snapshots.upload("snap-1", b"tar-bytes").await.unwrap();
     assert_eq!(snapshots.download("snap-1").await.unwrap(), b"tar-bytes");
@@ -417,7 +413,11 @@ async fn snapshot_upload_and_download_over_s3() {
 
 /// A real backend built from the `AGENTSCOPE_OSS_S3_*` environment, if configured.
 fn real_backend() -> Option<S3OssClient> {
-    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.trim().is_empty());
+    let env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
     let endpoint = env("AGENTSCOPE_OSS_S3_ENDPOINT")?;
     let bucket = env("AGENTSCOPE_OSS_S3_BUCKET")?;
     let access_key = env("AGENTSCOPE_OSS_S3_ACCESS_KEY")?;

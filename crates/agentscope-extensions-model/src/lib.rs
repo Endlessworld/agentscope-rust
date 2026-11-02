@@ -44,9 +44,9 @@
 //! `tests/registry_semantics.rs`; moving to a cached registry is a **core-side**
 //! change, recorded in `docs/extensions/MODEL__GAP_TRACKER.md` §4.2 #11.
 
-pub mod assembly;
 pub mod anthropic;
 pub mod anthropic_async;
+pub mod assembly;
 pub mod common;
 pub mod dashscope;
 pub mod gemini;
@@ -56,15 +56,15 @@ pub mod openai_official;
 pub mod relay;
 pub mod responses;
 
-pub use assembly::{
-    build_messages_wire_model, build_model_for_protocol, build_model_for_protocol_with_transport,
-    build_openai_official_model, full_registry, implementation_for, MessagesImplementation,
-    ModelImplementation, ProtocolImplementations, ResponsesImplementation,
-};
 pub use anthropic::AnthropicServerTool;
 pub use anthropic::{AnthropicChatModel, AnthropicModelProvider};
 pub use anthropic_async::{
     default_anthropic_registry, AnthropicMessagesModel, AnthropicMessagesProvider,
+};
+pub use assembly::{
+    build_messages_wire_model, build_model_for_protocol, build_model_for_protocol_with_transport,
+    build_openai_official_model, full_registry, implementation_for, MessagesImplementation,
+    ModelImplementation, ProtocolImplementations, ResponsesImplementation,
 };
 pub use common::{
     decode_stream_line, media_resolver, merge_non_zero, remote_media_cache, resolve_capabilities,

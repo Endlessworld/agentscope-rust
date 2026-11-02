@@ -838,7 +838,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_spec_defaults_streaming_and_detail() {        let mut decl = SubagentDeclaration::new("coder", "desc", "prompt");
+    fn remote_spec_defaults_streaming_and_detail() {
+        let mut decl = SubagentDeclaration::new("coder", "desc", "prompt");
         decl.url = Some("http://remote:8080".into());
         let spec = remote_spec(&decl, "coder", "do it");
         match spec {
@@ -887,10 +888,7 @@ mod tests {
     struct EchoFactory;
 
     impl crate::agent::subagent::SubagentFactory for EchoFactory {
-        fn create(
-            &self,
-            _rc: &agentscope_core::agent::RuntimeContext,
-        ) -> Arc<dyn CallableAgent> {
+        fn create(&self, _rc: &agentscope_core::agent::RuntimeContext) -> Arc<dyn CallableAgent> {
             Arc::new(EchoChild(Toolkit::new()))
         }
     }
@@ -937,15 +935,14 @@ mod tests {
         assert!(out.contains("task_id: "), "spawn failed: {out}");
 
         // The middleware drains the sink at the next reasoning step.
-        let events = crate::agent::middleware::subagents::take_subagent_exposed_events(&Some(
-            sink.clone(),
-        ));
-        assert_eq!(events.len(), 1, "one spawn must announce exactly one exposure");
-        let event = events
-            .into_iter()
-            .next()
-            .expect("event")
-            .expect("ok event");
+        let events =
+            crate::agent::middleware::subagents::take_subagent_exposed_events(&Some(sink.clone()));
+        assert_eq!(
+            events.len(),
+            1,
+            "one spawn must announce exactly one exposure"
+        );
+        let event = events.into_iter().next().expect("event").expect("ok event");
         assert_eq!(
             event.event_type(),
             agentscope_core::event::AgentEventType::SubagentExposed
@@ -955,23 +952,28 @@ mod tests {
             fields.get("agentId").and_then(|v| v.as_str()),
             Some("researcher")
         );
-        assert_eq!(
-            fields.get("label").and_then(|v| v.as_str()),
-            Some("alpha")
-        );
+        assert_eq!(fields.get("label").and_then(|v| v.as_str()), Some("alpha"));
         let subagent_id = fields
             .get("subagentId")
             .and_then(|v| v.as_str())
             .expect("subagentId");
-        assert!(subagent_id.starts_with("agent:researcher:"), "{subagent_id}");
+        assert!(
+            subagent_id.starts_with("agent:researcher:"),
+            "{subagent_id}"
+        );
         assert_eq!(
-            fields.get("sessionId").and_then(|v| v.as_str()).map(str::is_empty),
+            fields
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(str::is_empty),
             Some(false)
         );
 
         // One-shot: the same announcement must not be replayed on the next step.
-        assert!(crate::agent::middleware::subagents::take_subagent_exposed_events(&Some(sink))
-            .is_empty());
+        assert!(
+            crate::agent::middleware::subagents::take_subagent_exposed_events(&Some(sink))
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

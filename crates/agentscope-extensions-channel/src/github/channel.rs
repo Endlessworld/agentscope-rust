@@ -39,8 +39,7 @@ use crate::common::{
 pub const CHANNEL_TYPE: &str = "github";
 
 /// The webhook events this adapter maps. Java answers **204 No Content** for every other event.
-pub const SUPPORTED_EVENT_TYPES: &[&str] =
-    &["issue_comment", "pull_request_review_comment"];
+pub const SUPPORTED_EVENT_TYPES: &[&str] = &["issue_comment", "pull_request_review_comment"];
 
 /// Typed registry of `GitHubChannel` handles, keyed by `channel_id`.
 pub type GitHubChannelRegistry = ChannelRegistry<GitHubChannel>;

@@ -103,7 +103,10 @@ impl TraceCapture {
             "after_message_count": window.len(),
             "tools": snapshot.fields.get("available_tools").cloned().unwrap_or(Value::Null),
         }));
-        snapshot = snapshot.with("available_tool_snapshots", Value::Array(self.tool_snapshots.clone()));
+        snapshot = snapshot.with(
+            "available_tool_snapshots",
+            Value::Array(self.tool_snapshots.clone()),
+        );
         match trace_data::size(&Value::Object(
             snapshot
                 .fields
@@ -168,8 +171,12 @@ impl TraceCapture {
         }
         match (&self.finished, &self.latest) {
             (true, Some(latest)) => latest.clone(),
-            _ => JevTrace::new(self.id.clone(), empty, vec!["INCOMPLETE_INVOCATION".to_string()])
-                .expect("capture ids are non-blank"),
+            _ => JevTrace::new(
+                self.id.clone(),
+                empty,
+                vec!["INCOMPLETE_INVOCATION".to_string()],
+            )
+            .expect("capture ids are non-blank"),
         }
     }
 }
@@ -278,12 +285,7 @@ impl JevTraceEvaluationMiddleware {
         let mut recommendation = BTreeMap::new();
         recommendation.insert("metrics".to_string(), report.results.len().to_string());
         recommendation.insert("passed".to_string(), report.passed().to_string());
-        Decision::new(
-            Status::Decided,
-            Some(report),
-            "EVALUATED",
-            recommendation,
-        )
+        Decision::new(Status::Decided, Some(report), "EVALUATED", recommendation)
     }
 }
 
@@ -294,7 +296,9 @@ mod tests {
     use crate::jev::dto::{Answer, NoulAnswer, SystemOneResult, Usage};
     use crate::jev::evaluation::evaluator::Limits;
     use crate::jev::evaluation::metrics::{self, Thresholds};
-    use crate::jev::evaluation::trace::{TraceBlock, TraceToolResult, TraceToolUse, TraceResultPart};
+    use crate::jev::evaluation::trace::{
+        TraceBlock, TraceResultPart, TraceToolResult, TraceToolUse,
+    };
     use std::sync::Mutex;
 
     fn tool_use(id: &str) -> TraceBlock {
@@ -466,12 +470,7 @@ mod tests {
 
     #[test]
     fn enforce_and_non_positive_limits_are_rejected() {
-        let options = Options::new(
-            Mode::Enforce,
-            std::time::Duration::from_secs(1),
-            "v1",
-        )
-        .unwrap();
+        let options = Options::new(Mode::Enforce, std::time::Duration::from_secs(1), "v1").unwrap();
         assert_eq!(
             JevTraceEvaluationMiddleware::new(
                 evaluator(),

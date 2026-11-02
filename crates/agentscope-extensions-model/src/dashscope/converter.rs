@@ -1093,7 +1093,10 @@ mod tests {
         match msgs[0].content.as_ref().unwrap() {
             DashScopeContent::Parts(parts) => {
                 assert_eq!(parts[0].text.as_deref(), Some("here"));
-                assert_eq!(parts[1].image.as_deref(), Some("data:image/png;base64,AAAA"));
+                assert_eq!(
+                    parts[1].image.as_deref(),
+                    Some("data:image/png;base64,AAAA")
+                );
             }
             other => panic!("expected parts, got {other:?}"),
         }
@@ -1270,8 +1273,7 @@ mod tests {
     #[test]
     fn automatic_cache_control_disabled_by_default() {
         let msgs = vec![user("hello")];
-        let converted =
-            convert_with_options(msgs, false, &GenerateOptions::default());
+        let converted = convert_with_options(msgs, false, &GenerateOptions::default());
         let value = serde_json::to_value(&converted).unwrap();
         assert!(value[0]["content"][0].get("cache_control").is_none());
     }
@@ -1399,7 +1401,8 @@ mod tests {
             ContentBlock::Document(
                 agentscope_core::DocumentBlock::builder()
                     .source(Source::FileId(agentscope_core::FileIdSource::new(
-                        "dashscope", file_id,
+                        "dashscope",
+                        file_id,
                     )))
                     .name("report.pdf")
                     .mime_type("application/pdf")

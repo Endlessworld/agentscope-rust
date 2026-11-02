@@ -106,11 +106,9 @@ impl JevStageRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jev::call::{Caller, CallFailure};
+    use crate::jev::call::{CallFailure, Caller};
     use crate::jev::execution::Status;
-    use crate::jev::routing::catalog::{
-        Candidate, Effort, Quota, Route, RouteRequest,
-    };
+    use crate::jev::routing::catalog::{Candidate, Effort, Quota, Route, RouteRequest};
     use std::collections::BTreeSet;
     use std::sync::Mutex;
 
@@ -145,7 +143,9 @@ mod tests {
             let calls = Arc::clone(&calls);
             Box::pin(async move {
                 *calls.lock().unwrap() += 1;
-                Err(CallFailure::backend("the stage router must not ask the judge"))
+                Err(CallFailure::backend(
+                    "the stage router must not ask the judge",
+                ))
             })
         });
         JevPhaseRouting::new(
@@ -197,7 +197,10 @@ mod tests {
             )
             .await;
         assert_eq!(decision.status, Status::Decided);
-        assert_eq!(decision.reason, crate::jev::routing::route_reason::EXPLICIT_PHASE);
+        assert_eq!(
+            decision.reason,
+            crate::jev::routing::route_reason::EXPLICIT_PHASE
+        );
         let report = decision.value.unwrap();
         assert_eq!(report.route.as_deref(), Some("code"));
         assert_eq!(report.model.as_deref(), Some("m-code"));

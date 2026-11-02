@@ -93,7 +93,10 @@ impl Tool for RequirementProposeTool {
                 Err(_) => return Ok(ToolResultBlock::error(KIND_INVALID)),
             },
         };
-        let text = args.get("text").and_then(|value| value.as_str()).unwrap_or("");
+        let text = args
+            .get("text")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         let source_ref = args
             .get("source_ref")
             .and_then(|value| value.as_str())
@@ -140,7 +143,10 @@ mod tests {
 
         assert_eq!(result.final_state(), ToolResultState::Success);
         let receipt = result.text_content();
-        assert!(receipt.contains("status=CANDIDATE"), "receipt was {receipt}");
+        assert!(
+            receipt.contains("status=CANDIDATE"),
+            "receipt was {receipt}"
+        );
         let tasks = tasks.lock().unwrap();
         let requirements: &[TaskRequirement] = tasks.requirements();
         assert_eq!(requirements.len(), 1);

@@ -58,7 +58,11 @@ impl SnapshotBackend for InMemorySnapshotBackend {
     }
 
     fn exists(&self, table: &str, snapshot_id: &str) -> Result<bool> {
-        Ok(self.blobs.lock().unwrap().contains_key(&row_key(table, snapshot_id)))
+        Ok(self
+            .blobs
+            .lock()
+            .unwrap()
+            .contains_key(&row_key(table, snapshot_id)))
     }
 }
 

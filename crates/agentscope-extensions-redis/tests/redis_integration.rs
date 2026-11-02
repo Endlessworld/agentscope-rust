@@ -817,9 +817,7 @@ async fn base_store_reconnects_after_its_blocking_socket_is_killed() {
     assert!(attempts <= 20, "reconnect took {attempts} attempts");
     assert_eq!(item.value.get("size"), Some(&json!(1)));
 
-    let after = store
-        .client_id()
-        .expect("CLIENT ID after the reconnect");
+    let after = store.client_id().expect("CLIENT ID after the reconnect");
     assert_ne!(
         after, before,
         "the dead socket must be replaced, not reused"

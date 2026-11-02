@@ -235,10 +235,7 @@ impl JevContextCompactor {
     /// `OFF` and `SHADOW` report `None`, preserving the host's existing compaction flow; `ENFORCE`
     /// reports the retained messages on a decided plan and the original messages otherwise, so a
     /// failed compaction is conservative rather than lossy.
-    pub async fn compact(
-        &self,
-        request: &CompactionRequest,
-    ) -> Decision<Vec<ContextMessage>> {
+    pub async fn compact(&self, request: &CompactionRequest) -> Decision<Vec<ContextMessage>> {
         let original = request.messages.clone();
         let decision = self.plan(request).await;
         let value = if self.mode() == Mode::Enforce {
@@ -262,7 +259,10 @@ impl JevContextCompactor {
         execute_guarded(&self.execution, self.evaluate(request)).await
     }
 
-    async fn evaluate(&self, request: &CompactionRequest) -> Result<Decision<ContextPlan>, JevError> {
+    async fn evaluate(
+        &self,
+        request: &CompactionRequest,
+    ) -> Result<Decision<ContextPlan>, JevError> {
         let enforce = self.mode() == Mode::Enforce;
         let scope = if enforce {
             Some(ArchiveScope::new(
@@ -395,9 +395,7 @@ impl JevContextCompactor {
             (Some(scope), Some(archive)) => {
                 let reference = archive.save(scope, &transcript.messages).await?;
                 if reference.trim().is_empty() {
-                    return Err(JevError::protocol(
-                        "archive did not acknowledge snapshot",
-                    ));
+                    return Err(JevError::protocol("archive did not acknowledge snapshot"));
                 }
                 reference
             }
@@ -660,19 +658,19 @@ mod tests {
         assert_eq!(decision.reason, "INSUFFICIENT_REDUCTION");
         let plan = decision.value.unwrap();
         assert_eq!(plan.scores["t1"].reason, "UNCERTAIN");
-        assert_eq!(plan.messages, messages(), "an inconclusive plan keeps the input");
+        assert_eq!(
+            plan.messages,
+            messages(),
+            "an inconclusive plan keeps the input"
+        );
     }
 
     #[tokio::test]
     async fn off_registers_no_work_and_no_candidates_skips() {
         let scripted = Arc::new(ScriptedCaller::new(vec![]));
-        let compactor = JevContextCompactor::new(
-            scripted.as_caller(),
-            config(),
-            Options::disabled(),
-            None,
-        )
-        .unwrap();
+        let compactor =
+            JevContextCompactor::new(scripted.as_caller(), config(), Options::disabled(), None)
+                .unwrap();
         let decision = compactor.plan(&request()).await;
         assert_eq!(decision.status, Status::Skipped);
         assert_eq!(decision.reason, "DISABLED");
@@ -681,13 +679,9 @@ mod tests {
         let mut pinned_only = config();
         pinned_only.eligible_tools = BTreeSet::new();
         let scripted = Arc::new(ScriptedCaller::new(vec![]));
-        let compactor = JevContextCompactor::new(
-            scripted.as_caller(),
-            pinned_only,
-            shadow_options(),
-            None,
-        )
-        .unwrap();
+        let compactor =
+            JevContextCompactor::new(scripted.as_caller(), pinned_only, shadow_options(), None)
+                .unwrap();
         let decision = compactor.plan(&request()).await;
         assert_eq!(decision.status, Status::Skipped);
         assert_eq!(decision.reason, "NO_CANDIDATES");
@@ -807,7 +801,6 @@ mod tests {
         );
         let compactor = shadow(vec![wrong]);
         assert_eq!(compactor.plan(&request()).await.status, Status::Error);
-
     }
 
     #[test]

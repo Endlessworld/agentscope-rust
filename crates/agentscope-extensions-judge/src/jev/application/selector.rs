@@ -124,11 +124,7 @@ impl JevCandidateSelector {
                 return Err(JevError::invalid("id required"));
             }
         }
-        Ok(execute_guarded(
-            &self.execution,
-            self.evaluate(state, question, &candidates),
-        )
-        .await)
+        Ok(execute_guarded(&self.execution, self.evaluate(state, question, &candidates)).await)
     }
 
     async fn evaluate(
@@ -233,9 +229,7 @@ mod tests {
         for (index, value) in values.iter().enumerate() {
             answers.insert(
                 format!("item_{index}"),
-                Answer::Noul(crate::jev::dto::NoulAnswer {
-                    noul: Some(*value),
-                }),
+                Answer::Noul(crate::jev::dto::NoulAnswer { noul: Some(*value) }),
             );
         }
         SystemOneResult {
@@ -247,7 +241,8 @@ mod tests {
 
     fn selector(values: Vec<f64>) -> (JevCandidateSelector, Arc<ScriptedCaller>) {
         let scripted = Arc::new(ScriptedCaller::new(vec![Ok(response(&values))]));
-        let selector = JevCandidateSelector::new(scripted.as_caller(), options(), 0.2, 0.8).unwrap();
+        let selector =
+            JevCandidateSelector::new(scripted.as_caller(), options(), 0.2, 0.8).unwrap();
         (selector, scripted)
     }
 
@@ -295,7 +290,8 @@ mod tests {
             Ok(response(&vec![0.9; 64])),
             Ok(response(&vec![0.1; 10])),
         ]));
-        let selector = JevCandidateSelector::new(scripted.as_caller(), options(), 0.2, 0.8).unwrap();
+        let selector =
+            JevCandidateSelector::new(scripted.as_caller(), options(), 0.2, 0.8).unwrap();
         let ids: Vec<String> = (0..74).map(|index| format!("c{index}")).collect();
         let candidates = ids
             .iter()
@@ -322,7 +318,11 @@ mod tests {
         );
         assert_eq!(
             selector
-                .select(json!({}), "q", BTreeMap::from([(" ".to_string(), Value::Null)]))
+                .select(
+                    json!({}),
+                    "q",
+                    BTreeMap::from([(" ".to_string(), Value::Null)])
+                )
                 .await
                 .unwrap_err()
                 .message(),
@@ -330,7 +330,8 @@ mod tests {
         );
 
         let scripted = Arc::new(ScriptedCaller::new(vec![Ok(response(&[0.9]))]));
-        let selector = JevCandidateSelector::new(scripted.as_caller(), options(), 0.2, 0.8).unwrap();
+        let selector =
+            JevCandidateSelector::new(scripted.as_caller(), options(), 0.2, 0.8).unwrap();
         // Two candidates but one answer: the response is rejected.
         let mismatched = selector
             .select(json!({}), "q", candidates(&["a", "b"]))
@@ -341,8 +342,12 @@ mod tests {
         let scripted = Arc::new(ScriptedCaller::new(vec![Err(
             crate::jev::call::CallFailure::backend("down"),
         )]));
-        let selector = JevCandidateSelector::new(scripted.as_caller(), options(), 0.2, 0.8).unwrap();
-        let failed = selector.select(json!({}), "q", candidates(&["a"])).await.unwrap();
+        let selector =
+            JevCandidateSelector::new(scripted.as_caller(), options(), 0.2, 0.8).unwrap();
+        let failed = selector
+            .select(json!({}), "q", candidates(&["a"]))
+            .await
+            .unwrap();
         assert_eq!(failed.status, Status::Error);
         assert_eq!(failed.reason, "CALL_OR_RESPONSE_ERROR");
     }
@@ -353,7 +358,10 @@ mod tests {
         let selector =
             JevCandidateSelector::new(scripted.as_caller(), Options::disabled(), 0.2, 0.8).unwrap();
         assert_eq!(selector.mode(), Mode::Off);
-        let decision = selector.select(json!({}), "q", candidates(&["a"])).await.unwrap();
+        let decision = selector
+            .select(json!({}), "q", candidates(&["a"]))
+            .await
+            .unwrap();
         assert_eq!(decision.status, Status::Skipped);
         assert_eq!(scripted.requests().len(), 0);
     }

@@ -27,8 +27,8 @@ pub mod service;
 pub mod skill;
 
 pub use http::{
-    HttpRequest, HttpResponse, NacosHttpAiService, NacosHttpConfig, NacosHttpTransport, RetryPolicy,
-    DEFAULT_NAMESPACE, DEFAULT_RETRY_INITIAL_BACKOFF, DEFAULT_RETRY_MAX_ATTEMPTS,
+    HttpRequest, HttpResponse, NacosHttpAiService, NacosHttpConfig, NacosHttpTransport,
+    RetryPolicy, DEFAULT_NAMESPACE, DEFAULT_RETRY_INITIAL_BACKOFF, DEFAULT_RETRY_MAX_ATTEMPTS,
     DEFAULT_RETRY_MAX_BACKOFF, DEFAULT_TOKEN_REFRESH_RATIO, DEFAULT_TOKEN_TTL,
 };
 pub use service::{

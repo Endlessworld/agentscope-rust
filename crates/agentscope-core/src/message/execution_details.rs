@@ -68,7 +68,10 @@ mod tests {
             (ToolExecutionOutcome::Partial, "PARTIAL"),
             (ToolExecutionOutcome::Unknown, "UNKNOWN"),
         ] {
-            assert_eq!(serde_json::to_value(outcome).unwrap(), serde_json::json!(wire));
+            assert_eq!(
+                serde_json::to_value(outcome).unwrap(),
+                serde_json::json!(wire)
+            );
             assert_eq!(
                 serde_json::from_value::<ToolExecutionOutcome>(serde_json::json!(wire)).unwrap(),
                 outcome

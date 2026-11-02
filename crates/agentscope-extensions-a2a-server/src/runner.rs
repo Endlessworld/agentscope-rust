@@ -43,7 +43,8 @@ pub trait TaskAgent: Send + Sync {
     fn description(&self) -> String;
 
     /// Runs one request, mirroring Java `ReActAgent#streamEvents(List<Msg>) -> Flux<AgentEvent>`.
-    fn stream_events(&self, messages: Vec<Msg>) -> BoxStream<'static, Result<AgentEvent, A2aError>>;
+    fn stream_events(&self, messages: Vec<Msg>)
+        -> BoxStream<'static, Result<AgentEvent, A2aError>>;
 
     /// Interrupts the run, mirroring Java `ReActAgent#interrupt()`.
     fn interrupt(&self);
@@ -58,7 +59,10 @@ impl TaskAgent for ReActAgent {
         ReActAgent::description(self).to_string()
     }
 
-    fn stream_events(&self, messages: Vec<Msg>) -> BoxStream<'static, Result<AgentEvent, A2aError>> {
+    fn stream_events(
+        &self,
+        messages: Vec<Msg>,
+    ) -> BoxStream<'static, Result<AgentEvent, A2aError>> {
         Box::pin(
             ReActAgent::stream_events(self, messages, StreamOptions::defaults())
                 .map(|item| item.map_err(A2aError::Core)),
@@ -474,10 +478,8 @@ mod tests {
     #[test]
     fn every_task_gets_its_own_agent() {
         let recorder = Arc::new(Recorder::default());
-        let runner = BaseReActAgentRunner::new(FakeFactory::new(
-            recorder.clone(),
-            FakeOutcome::Complete,
-        ));
+        let runner =
+            BaseReActAgentRunner::new(FakeFactory::new(recorder.clone(), FakeOutcome::Complete));
 
         let first = rt()
             .block_on(runner.stream_events(vec![Msg::user("one")], options("t1")))
@@ -503,10 +505,8 @@ mod tests {
     #[test]
     fn stop_interrupts_only_the_targeted_task() {
         let recorder = Arc::new(Recorder::default());
-        let runner = BaseReActAgentRunner::new(FakeFactory::new(
-            recorder.clone(),
-            FakeOutcome::Pending,
-        ));
+        let runner =
+            BaseReActAgentRunner::new(FakeFactory::new(recorder.clone(), FakeOutcome::Pending));
 
         let first = rt().block_on(async {
             let mut stream = runner
@@ -542,30 +542,23 @@ mod tests {
     #[test]
     fn cache_entry_is_dropped_when_the_run_finishes_errors_or_is_abandoned() {
         let recorder = Arc::new(Recorder::default());
-        let runner = BaseReActAgentRunner::new(FakeFactory::new(
-            recorder.clone(),
-            FakeOutcome::Complete,
-        ));
+        let runner =
+            BaseReActAgentRunner::new(FakeFactory::new(recorder.clone(), FakeOutcome::Complete));
         let events = rt()
             .block_on(runner.stream_events(vec![Msg::user("one")], options("t1")))
             .unwrap();
         assert_eq!(events.len(), 1);
         assert!(!runner.is_cached("t1"));
 
-        let failing = BaseReActAgentRunner::new(FakeFactory::new(
-            recorder.clone(),
-            FakeOutcome::Fail,
-        ));
+        let failing =
+            BaseReActAgentRunner::new(FakeFactory::new(recorder.clone(), FakeOutcome::Fail));
         let error = rt()
             .block_on(failing.stream_events(vec![Msg::user("two")], options("t2")))
             .unwrap_err();
         assert!(matches!(error, A2aError::Transport(_)));
         assert!(!failing.is_cached("t2"));
 
-        let pending = BaseReActAgentRunner::new(FakeFactory::new(
-            recorder,
-            FakeOutcome::Pending,
-        ));
+        let pending = BaseReActAgentRunner::new(FakeFactory::new(recorder, FakeOutcome::Pending));
         let stream = pending
             .stream_events_incremental(vec![Msg::user("three")], options("t3"))
             .expect("incremental stream");
@@ -578,10 +571,8 @@ mod tests {
     #[test]
     fn concurrent_tasks_do_not_share_agents() {
         let recorder = Arc::new(Recorder::default());
-        let runner = BaseReActAgentRunner::new(FakeFactory::new(
-            recorder.clone(),
-            FakeOutcome::Complete,
-        ));
+        let runner =
+            BaseReActAgentRunner::new(FakeFactory::new(recorder.clone(), FakeOutcome::Complete));
 
         rt().block_on(async {
             let mut first = runner
@@ -642,10 +633,7 @@ mod tests {
     #[test]
     fn a_task_id_cannot_be_started_twice() {
         let recorder = Arc::new(Recorder::default());
-        let runner = BaseReActAgentRunner::new(FakeFactory::new(
-            recorder,
-            FakeOutcome::Pending,
-        ));
+        let runner = BaseReActAgentRunner::new(FakeFactory::new(recorder, FakeOutcome::Pending));
 
         let _first = runner
             .stream_events_incremental(vec![Msg::user("one")], options("t1"))
@@ -669,10 +657,8 @@ mod tests {
     #[test]
     fn a_missing_task_id_is_rejected_and_never_cached() {
         let recorder = Arc::new(Recorder::default());
-        let runner = BaseReActAgentRunner::new(FakeFactory::new(
-            recorder.clone(),
-            FakeOutcome::Complete,
-        ));
+        let runner =
+            BaseReActAgentRunner::new(FakeFactory::new(recorder.clone(), FakeOutcome::Complete));
 
         let error = rt()
             .block_on(runner.stream_events(vec![Msg::user("one")], AgentRequestOptions::new()))
@@ -691,10 +677,8 @@ mod tests {
     #[test]
     fn stop_of_an_unknown_task_is_a_noop() {
         let recorder = Arc::new(Recorder::default());
-        let runner = BaseReActAgentRunner::new(FakeFactory::new(
-            recorder.clone(),
-            FakeOutcome::Complete,
-        ));
+        let runner =
+            BaseReActAgentRunner::new(FakeFactory::new(recorder.clone(), FakeOutcome::Complete));
         runner.stop("missing");
         assert!(recorder.interrupted().is_empty());
     }
@@ -720,7 +704,10 @@ mod tests {
             let second = handler
                 .stream_responses(&stream_request("t2"))
                 .expect("streaming request");
-            assert!(first.next().await.is_some(), "the working frame arrives first");
+            assert!(
+                first.next().await.is_some(),
+                "the working frame arrives first"
+            );
             let mut second = second;
             assert!(second.next().await.is_some());
             assert_eq!(runner.cached_task_ids(), vec!["t1", "t2"]);
@@ -837,10 +824,8 @@ mod tests {
     #[test]
     fn an_old_stream_never_evicts_the_replacement_agent() {
         let recorder = Arc::new(Recorder::default());
-        let runner = BaseReActAgentRunner::new(FakeFactory::new(
-            recorder.clone(),
-            FakeOutcome::Pending,
-        ));
+        let runner =
+            BaseReActAgentRunner::new(FakeFactory::new(recorder.clone(), FakeOutcome::Pending));
 
         let old_stream = rt().block_on(async {
             let mut stream = runner
@@ -942,10 +927,7 @@ mod tests {
     #[test]
     fn a_stream_error_releases_the_cache_slot() {
         let recorder = Arc::new(Recorder::default());
-        let runner = BaseReActAgentRunner::new(FakeFactory::new(
-            recorder,
-            FakeOutcome::Fail,
-        ));
+        let runner = BaseReActAgentRunner::new(FakeFactory::new(recorder, FakeOutcome::Fail));
 
         let error = rt()
             .block_on(runner.stream_events(vec![Msg::user("go")], options("t1")))

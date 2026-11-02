@@ -67,11 +67,7 @@ impl A2aError {
     }
 
     /// Wraps a resolver failure as a fail-fast [`A2aError::CardUnavailable`].
-    pub fn card_unavailable(
-        agent_name: &str,
-        resolver: &str,
-        error: A2aError,
-    ) -> Self {
+    pub fn card_unavailable(agent_name: &str, resolver: &str, error: A2aError) -> Self {
         A2aError::CardUnavailable {
             agent_name: agent_name.to_string(),
             resolver: resolver.to_string(),

@@ -358,15 +358,19 @@ impl GitSkillRepository {
         };
         let mut state = self.state.lock().unwrap();
         if state.last_remote_ref.is_none() {
-            state.last_remote_ref = Self::rev_parse(&self.git_binary, &self.local_path, "HEAD").ok();
+            state.last_remote_ref =
+                Self::rev_parse(&self.git_binary, &self.local_path, "HEAD").ok();
         }
         Ok(state.last_remote_ref.as_deref() != Some(remote.as_str()))
     }
 
     /// Pulls the latest changes into an existing clone.
     fn pull_repository(&self) -> Result<(), SkillRepositoryError> {
-        let output =
-            Self::run_git(&self.git_binary, Some(&self.local_path), &["pull", "--ff-only"])?;
+        let output = Self::run_git(
+            &self.git_binary,
+            Some(&self.local_path),
+            &["pull", "--ff-only"],
+        )?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SkillRepositoryError::Git(format!(
@@ -375,7 +379,8 @@ impl GitSkillRepository {
                 stderr.trim()
             )));
         }
-        self.state.lock().unwrap().last_remote_ref = Self::rev_parse(&self.git_binary, &self.local_path, "HEAD").ok();
+        self.state.lock().unwrap().last_remote_ref =
+            Self::rev_parse(&self.git_binary, &self.local_path, "HEAD").ok();
         Ok(())
     }
 
@@ -1088,7 +1093,10 @@ mod tests {
             (Some("name: calc\r\n"), "body\r\n")
         );
         // A fence followed by blanks but no line break is still not a fence.
-        assert_eq!(split_frontmatter("---  x\nbody\n"), (None, "---  x\nbody\n"));
+        assert_eq!(
+            split_frontmatter("---  x\nbody\n"),
+            (None, "---  x\nbody\n")
+        );
     }
 
     /// SKILLS-05 end-to-end: a skill whose opening fence carries blanks keeps its frontmatter
@@ -1265,10 +1273,7 @@ mod tests {
                 .git_binary("  git  "),
         )
         .expect("an explicit git path must work");
-        assert_eq!(
-            repo.get_all_skill_names().unwrap(),
-            vec!["s1".to_string()]
-        );
+        assert_eq!(repo.get_all_skill_names().unwrap(), vec!["s1".to_string()]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1768,7 +1773,10 @@ mod tests {
         let local = repo.local_path().to_path_buf();
         // Keep a handle open so the directory cannot be unlinked on Windows.
         let held = std::fs::File::open(local.join(".git").join("HEAD")).ok();
-        assert!(repo.close().is_ok(), "a failed cleanup must not surface as Err");
+        assert!(
+            repo.close().is_ok(),
+            "a failed cleanup must not surface as Err"
+        );
         drop(held);
 
         let _ = std::fs::remove_dir_all(&local);

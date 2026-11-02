@@ -54,8 +54,8 @@ use tracing::warn;
 
 use crate::a2a::model::{NacosAgentCard, NacosAgentEndpoint};
 use crate::service::{
-    AiServiceError, AiServiceResult, AgentCardListener, NacosAiService, NacosPrompt, PromptListener,
-    SkillZip,
+    AgentCardListener, AiServiceError, AiServiceResult, NacosAiService, NacosPrompt,
+    PromptListener, SkillZip,
 };
 
 /// A single HTTP request produced by [`NacosHttpAiService`].
@@ -360,10 +360,7 @@ pub const MAX_POLLING_BACKOFF: std::time::Duration = std::time::Duration::from_s
 /// A healthy service polls every `interval`; a failing one backs off exponentially and is capped
 /// at [`MAX_POLLING_BACKOFF`], so a broken connection does not hammer the server. Kept as a pure
 /// function so the schedule is unit-testable without sleeping.
-pub fn polling_backoff(
-    interval: std::time::Duration,
-    failures: u32,
-) -> std::time::Duration {
+pub fn polling_backoff(interval: std::time::Duration, failures: u32) -> std::time::Duration {
     crate::service::exponential_backoff(interval, failures, MAX_POLLING_BACKOFF)
 }
 
@@ -633,7 +630,10 @@ impl NacosHttpAiService {
         let token = self.access_token().await?;
         let response = self.execute_with_token(request, token.as_deref()).await?;
         if matches!(response.status, 401 | 403) && self.config.has_credentials() {
-            warn!(status = response.status, "Nacos rejected the accessToken, logging in again");
+            warn!(
+                status = response.status,
+                "Nacos rejected the accessToken, logging in again"
+            );
             self.invalidate_token();
             if let Some(refreshed) = self.access_token().await? {
                 return self.execute_with_token(request, Some(&refreshed)).await;
@@ -1087,8 +1087,7 @@ mod tests {
 
     fn service(transport: Arc<FakeTransport>) -> NacosHttpAiService {
         NacosHttpAiService::new(
-            NacosHttpConfig::new("http://nacos:8848/nacos/", "public")
-                .with_access_token("tok en"),
+            NacosHttpConfig::new("http://nacos:8848/nacos/", "public").with_access_token("tok en"),
             transport,
         )
     }
@@ -1122,17 +1121,18 @@ mod tests {
             HttpResponse::new(200, "{\"unexpected\": true}"),
         ]);
         let service = service(Arc::clone(&transport));
-        assert!(service.get_agent_card("missing", None).await.unwrap().is_none());
+        assert!(service
+            .get_agent_card("missing", None)
+            .await
+            .unwrap()
+            .is_none());
         let error = service.get_agent_card("broken", None).await.unwrap_err();
         assert!(error.message().contains("invalid agent card payload"));
     }
 
     #[tokio::test]
     async fn the_nacos_envelope_is_unwrapped() {
-        let payload = format!(
-            "{{\"code\":0,\"data\":{}}}",
-            card_json("wrapped")
-        );
+        let payload = format!("{{\"code\":0,\"data\":{}}}", card_json("wrapped"));
         let transport = FakeTransport::new(vec![HttpResponse::new(200, payload)]);
         let card = service(Arc::clone(&transport))
             .get_agent_card("wrapped", None)
@@ -1159,7 +1159,8 @@ mod tests {
             "http://nacos:8848/nacos/v1/ai/agent?endpointType=service&setAsLatest=true&namespaceId=public&accessToken=tok%20en"
         );
         assert_eq!(request.content_type.as_deref(), Some("application/json"));
-        let posted: NacosAgentCard = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+        let posted: NacosAgentCard =
+            serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
         assert_eq!(posted, card);
     }
 
@@ -1177,7 +1178,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), 12001);
         assert_eq!(error.message(), "invalid param");
-        assert!(matches!(error, AiServiceError::Business { code: 12001, .. }));
+        assert!(matches!(
+            error,
+            AiServiceError::Business { code: 12001, .. }
+        ));
     }
 
     #[tokio::test]
@@ -1199,7 +1203,9 @@ mod tests {
             .await
             .unwrap();
         let request = &transport.requests()[0];
-        assert!(request.url.contains("/v1/ai/agent/endpoint?agentName=local"));
+        assert!(request
+            .url
+            .contains("/v1/ai/agent/endpoint?agentName=local"));
         let posted: NacosAgentEndpoint =
             serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
         assert_eq!(posted.port, 9000);
@@ -1207,9 +1213,10 @@ mod tests {
 
     #[tokio::test]
     async fn prompts_are_parsed_and_subscriptions_fire_on_change() {
-        let transport = FakeTransport::new(vec![
-            HttpResponse::new(200, "{\"template\":\"hello {{name}}\",\"version\":\"1\"}"),
-        ]);
+        let transport = FakeTransport::new(vec![HttpResponse::new(
+            200,
+            "{\"template\":\"hello {{name}}\",\"version\":\"1\"}",
+        )]);
         let service = service(Arc::clone(&transport));
         let fired = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&fired);
@@ -1234,12 +1241,18 @@ mod tests {
         assert_eq!(prompt.template, "hello {{name}}");
 
         // No server-side change: nothing fires.
-        transport.push(HttpResponse::new(200, "{\"template\":\"hello {{name}}\",\"version\":\"1\"}"));
+        transport.push(HttpResponse::new(
+            200,
+            "{\"template\":\"hello {{name}}\",\"version\":\"1\"}",
+        ));
         assert_eq!(service.poll_once().await.unwrap(), 0);
         assert_eq!(fired.load(Ordering::SeqCst), 0);
 
         // A changed template fires the listener once.
-        transport.push(HttpResponse::new(200, "{\"template\":\"hi {{name}}\",\"version\":\"2\"}"));
+        transport.push(HttpResponse::new(
+            200,
+            "{\"template\":\"hi {{name}}\",\"version\":\"2\"}",
+        ));
         assert_eq!(service.poll_once().await.unwrap(), 1);
         assert_eq!(fired.load(Ordering::SeqCst), 1);
     }
@@ -1251,16 +1264,24 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = Arc::clone(&seen);
         let listener: AgentCardListener = Arc::new(move |name: &str, card: &NacosAgentCard| {
-            sink.lock().unwrap().push(format!("{name}:{}", card.url.clone().unwrap_or_default()));
+            sink.lock()
+                .unwrap()
+                .push(format!("{name}:{}", card.url.clone().unwrap_or_default()));
         });
-        service.subscribe_agent_card("remote", listener).await.unwrap();
+        service
+            .subscribe_agent_card("remote", listener)
+            .await
+            .unwrap();
 
         transport.push(HttpResponse::new(200, card_json("remote")));
         assert_eq!(service.poll_once().await.unwrap(), 0);
 
         let mut changed = NacosAgentCard::new("remote", "http://agent:9999");
         changed.version = Some("2".to_string());
-        transport.push(HttpResponse::new(200, serde_json::to_string(&changed).unwrap()));
+        transport.push(HttpResponse::new(
+            200,
+            serde_json::to_string(&changed).unwrap(),
+        ));
         assert_eq!(service.poll_once().await.unwrap(), 1);
         assert_eq!(
             seen.lock().unwrap().as_slice(),
@@ -1273,7 +1294,10 @@ mod tests {
         let transport = FakeTransport::new(vec![HttpResponse::new(404, "")]);
         let service = service(Arc::clone(&transport));
         let noop: AgentCardListener = Arc::new(|_, _| {});
-        let error = service.subscribe_agent_card("gone", noop).await.unwrap_err();
+        let error = service
+            .subscribe_agent_card("gone", noop)
+            .await
+            .unwrap_err();
         assert!(error.is_not_found());
     }
 
@@ -1354,7 +1378,10 @@ mod tests {
         // Nacos now serves a new card and a new template.
         let mut changed = NacosAgentCard::new("remote", "http://agent:9999");
         changed.version = Some("2".to_string());
-        transport.push(HttpResponse::new(200, serde_json::to_string(&changed).unwrap()));
+        transport.push(HttpResponse::new(
+            200,
+            serde_json::to_string(&changed).unwrap(),
+        ));
         transport.push(HttpResponse::new(
             200,
             "{\"template\":\"hi {{name}}\",\"version\":\"2\",\"label\":\"prod\"}",
@@ -1392,7 +1419,10 @@ mod tests {
 
         let mut changed = NacosAgentCard::new("remote", "http://agent:9999");
         changed.version = Some("2".to_string());
-        transport.push(HttpResponse::new(200, serde_json::to_string(&changed).unwrap()));
+        transport.push(HttpResponse::new(
+            200,
+            serde_json::to_string(&changed).unwrap(),
+        ));
 
         let handle = http.polling(Duration::from_millis(5));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1435,7 +1465,11 @@ mod tests {
                 .unwrap(),
             vec![0x50, 0x4b, 0x05, 0x06]
         );
-        assert!(service.download_skill_zip_by_label("calc", "stable").await.unwrap_err().is_not_found());
+        assert!(service
+            .download_skill_zip_by_label("calc", "stable")
+            .await
+            .unwrap_err()
+            .is_not_found());
 
         let requests = transport.requests();
         assert!(requests[0].url.contains("skillName=calc"));
@@ -1451,7 +1485,11 @@ mod tests {
         let transport = FakeTransport::new(vec![HttpResponse::new(200, card_json("remote"))]);
         let http: Arc<dyn NacosAiService> = Arc::new(service(transport));
         assert_eq!(
-            http.get_agent_card("remote", None).await.unwrap().unwrap().name,
+            http.get_agent_card("remote", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
             "remote"
         );
         assert!(memory
@@ -1469,7 +1507,10 @@ mod tests {
             transport,
         );
         assert_eq!(
-            service.url("/v1/ai/prompt", &[("promptKey", "k".into()), ("label", String::new())]),
+            service.url(
+                "/v1/ai/prompt",
+                &[("promptKey", "k".into()), ("label", String::new())]
+            ),
             "http://nacos:8848/nacos/v1/ai/prompt?promptKey=k&namespaceId=dev"
         );
     }
@@ -1593,7 +1634,11 @@ mod tests {
         assert_eq!(card.name, "remote");
 
         let requests = transport.requests();
-        assert_eq!(requests.len(), 4, "login, 401, re-login, replay: {requests:?}");
+        assert_eq!(
+            requests.len(),
+            4,
+            "login, 401, re-login, replay: {requests:?}"
+        );
         assert!(requests[1].url.ends_with("accessToken=t1"));
         assert!(requests[2].url.contains("/v1/auth/login"));
         assert!(requests[3].url.ends_with("accessToken=t2"));
@@ -1607,7 +1652,10 @@ mod tests {
             DEFAULT_TOKEN_REFRESH_RATIO
         );
         let deadline = refresh_deadline(std::time::Duration::from_secs(18_000), 0.9);
-        assert!((deadline.as_secs_f64() - 16_200.0).abs() < 0.001, "{deadline:?}");
+        assert!(
+            (deadline.as_secs_f64() - 16_200.0).abs() < 0.001,
+            "{deadline:?}"
+        );
         // A non-finite ratio falls back to the default instead of producing a bogus deadline.
         assert_eq!(
             refresh_deadline(std::time::Duration::from_secs(10), f64::NAN),
@@ -1718,11 +1766,17 @@ mod tests {
 
         let requests = transport.requests();
         assert!(
-            requests[0].url.contains("endpointType=service&setAsLatest=false"),
+            requests[0]
+                .url
+                .contains("endpointType=service&setAsLatest=false"),
             "{}",
             requests[0].url
         );
-        assert!(requests[1].url.contains("endpointType=agent"), "{}", requests[1].url);
+        assert!(
+            requests[1].url.contains("endpointType=agent"),
+            "{}",
+            requests[1].url
+        );
     }
 
     /// NACOS-06: a retryable status is retried and the last attempt's result is returned.
@@ -1755,12 +1809,17 @@ mod tests {
     async fn terminal_failures_are_not_retried_and_the_budget_is_finite() {
         // `404` is terminal: exactly one request.
         let transport = FakeTransport::new(vec![HttpResponse::new(404, "")]);
-        let service = NacosHttpAiService::new(
-            NacosHttpConfig::new("http://nacos:8848/nacos", "public")
-                .with_retry(RetryPolicy::new(3, Duration::ZERO, Duration::ZERO)),
-            transport.clone(),
-        );
-        assert!(service.get_agent_card("missing", None).await.unwrap().is_none());
+        let service =
+            NacosHttpAiService::new(
+                NacosHttpConfig::new("http://nacos:8848/nacos", "public")
+                    .with_retry(RetryPolicy::new(3, Duration::ZERO, Duration::ZERO)),
+                transport.clone(),
+            );
+        assert!(service
+            .get_agent_card("missing", None)
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(transport.requests().len(), 1);
 
         // Every attempt fails with a retryable status: the last response is surfaced.
@@ -1770,11 +1829,12 @@ mod tests {
             HttpResponse::new(500, "boom"),
             HttpResponse::new(200, card_json("unused")),
         ]);
-        let service = NacosHttpAiService::new(
-            NacosHttpConfig::new("http://nacos:8848/nacos", "public")
-                .with_retry(RetryPolicy::new(3, Duration::ZERO, Duration::ZERO)),
-            transport.clone(),
-        );
+        let service =
+            NacosHttpAiService::new(
+                NacosHttpConfig::new("http://nacos:8848/nacos", "public")
+                    .with_retry(RetryPolicy::new(3, Duration::ZERO, Duration::ZERO)),
+                transport.clone(),
+            );
         let error = service.get_agent_card("remote", None).await.unwrap_err();
         assert_eq!(error.code(), 500);
         assert!(error.is_retryable());
@@ -1786,13 +1846,17 @@ mod tests {
     #[tokio::test]
     async fn a_transport_timeout_is_retryable() {
         let transport = FakeTransport::new(Vec::new());
-        let service = NacosHttpAiService::new(
-            NacosHttpConfig::new("http://nacos:8848/nacos", "public")
-                .with_retry(RetryPolicy::new(2, Duration::ZERO, Duration::ZERO)),
-            transport.clone(),
-        );
+        let service =
+            NacosHttpAiService::new(
+                NacosHttpConfig::new("http://nacos:8848/nacos", "public")
+                    .with_retry(RetryPolicy::new(2, Duration::ZERO, Duration::ZERO)),
+                transport.clone(),
+            );
         let error = service.get_agent_card("remote", None).await.unwrap_err();
-        assert!(matches!(error, AiServiceError::Transport { .. }), "{error:?}");
+        assert!(
+            matches!(error, AiServiceError::Transport { .. }),
+            "{error:?}"
+        );
         assert!(error.is_retryable());
         // Two attempts: the fake transport answers "no queued response" (a transport failure).
         assert_eq!(transport.requests().len(), 2);
@@ -1801,11 +1865,7 @@ mod tests {
     /// NACOS-06: the backoff schedule is exponential and capped.
     #[test]
     fn the_retry_policy_backs_off_exponentially_and_stops_at_the_budget() {
-        let policy = RetryPolicy::new(
-            4,
-            Duration::from_millis(100),
-            Duration::from_millis(300),
-        );
+        let policy = RetryPolicy::new(4, Duration::from_millis(100), Duration::from_millis(300));
         assert_eq!(policy.backoff(0), Duration::ZERO);
         assert_eq!(policy.backoff(1), Duration::from_millis(100));
         assert_eq!(policy.backoff(2), Duration::from_millis(200));
@@ -1817,7 +1877,10 @@ mod tests {
         assert!(policy.should_retry(3));
         assert!(!policy.should_retry(4));
 
-        assert_eq!(RetryPolicy::default().max_attempts, DEFAULT_RETRY_MAX_ATTEMPTS);
+        assert_eq!(
+            RetryPolicy::default().max_attempts,
+            DEFAULT_RETRY_MAX_ATTEMPTS
+        );
         assert!(!RetryPolicy::none().should_retry(1));
     }
 }

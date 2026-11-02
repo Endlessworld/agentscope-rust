@@ -158,12 +158,7 @@ pub trait AgentStateStore: Send + Sync {
     /// Not every backend can honour a per-key delete, so the default implementation reports an
     /// error instead of silently succeeding — callers must see that the value is still there.
     /// [`InMemoryAgentStateStore`] and the object-storage backends override it.
-    async fn delete_key(
-        &self,
-        user_id: Option<&str>,
-        session_id: &str,
-        key: &str,
-    ) -> Result<()> {
+    async fn delete_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Result<()> {
         let _ = (user_id, session_id, key);
         Err(crate::Error::Other(
             "this AgentStateStore backend does not support per-key delete".to_string(),
@@ -420,12 +415,7 @@ impl AgentStateStore for InMemoryAgentStateStore {
             .unwrap_or_default()
     }
 
-    async fn delete_key(
-        &self,
-        user_id: Option<&str>,
-        session_id: &str,
-        key: &str,
-    ) -> Result<()> {
+    async fn delete_key(&self, user_id: Option<&str>, session_id: &str, key: &str) -> Result<()> {
         require_session_id(session_id)?;
         if let Some(session) = self
             .inner

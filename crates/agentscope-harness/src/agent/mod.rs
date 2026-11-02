@@ -46,7 +46,9 @@ pub use gateway::{
     PlatformCtx, RouteResult, SendOptions, SessionTurnGate, SubagentMaterializer, SubagentRecord,
     SubagentRegistry, TaskCompletionBridge, WakeupDispatcher, WakeupTarget,
 };
-pub use harness_agent::{AgentBuiltCallback, HarnessAgent, HarnessAgentBuilder, HarnessAgentHandle};
+pub use harness_agent::{
+    AgentBuiltCallback, HarnessAgent, HarnessAgentBuilder, HarnessAgentHandle,
+};
 pub use isolation_scope::IsolationScope;
 pub use mcp::{
     bridge_mcp_tools_to_toolkit, try_bridge_mcp_tools_to_toolkit, McpClientSource,
@@ -110,9 +112,7 @@ pub use subagent::{
     TaskCompletionCallback, TaskDelivery, TaskRecord, TaskRepository, TaskRunSpec, TaskStatus,
     WorkspaceTaskRepository, SUBAGENTS_DIR, SUBAGENT_GLOB, SUPPRESS_COMPLETION_CALLBACK,
 };
-pub use tools::{
-    HarnessPlatformTools, McpServerEntry, ToolFilter, ToolsConfig, ToolsConfigLoader,
-};
+pub use tools::{HarnessPlatformTools, McpServerEntry, ToolFilter, ToolsConfig, ToolsConfigLoader};
 pub use verification::{verify, DeterministicVerifier, SettledAction, Verdict};
 pub use workspace::{
     NamespaceFactory, NoNamespace, PlanModeManager, UserSessionNamespace, WorkspaceConstants,

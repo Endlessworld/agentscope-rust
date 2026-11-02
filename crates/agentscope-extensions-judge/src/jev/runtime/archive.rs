@@ -34,7 +34,10 @@ pub const SNAPSHOT_KEY: &str = "snapshot";
 
 /// The namespace a scope's snapshots live in: `jev/context/<u>/<a>/<s>`, each id hashed.
 pub fn context_namespace(scope: &ArchiveScope) -> Vec<String> {
-    let mut namespace: Vec<String> = NAMESPACE_PREFIX.iter().map(|part| (*part).to_string()).collect();
+    let mut namespace: Vec<String> = NAMESPACE_PREFIX
+        .iter()
+        .map(|part| (*part).to_string())
+        .collect();
     for value in [&scope.user_id, &scope.agent_id, &scope.session_id] {
         namespace.push(sha256_hex(value.as_bytes()));
     }
@@ -97,10 +100,12 @@ impl JevContextArchive for StoreJevContextArchive {
         let mut value = StoreValue::new();
         value.insert(SNAPSHOT_KEY.to_string(), Value::String(snapshot.clone()));
         if !self.store.put_if_version(&namespace, &reference, value, 0) {
-            let existing = self
-                .store
-                .get(&namespace, &reference)
-                .and_then(|item| item.value.get(SNAPSHOT_KEY).and_then(Value::as_str).map(str::to_string));
+            let existing = self.store.get(&namespace, &reference).and_then(|item| {
+                item.value
+                    .get(SNAPSHOT_KEY)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
             if existing.as_deref() != Some(snapshot.as_str()) {
                 return Err(JevError::protocol(
                     "archive requires acknowledged create-if-absent storage",
@@ -120,7 +125,12 @@ impl JevContextArchive for StoreJevContextArchive {
         let snapshot = self
             .store
             .get(&namespace, reference)
-            .and_then(|item| item.value.get(SNAPSHOT_KEY).and_then(Value::as_str).map(str::to_string))
+            .and_then(|item| {
+                item.value
+                    .get(SNAPSHOT_KEY)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .ok_or_else(Self::missing_snapshot)?;
         if snapshot.len() > self.max_bytes || sha256_hex(snapshot.as_bytes()) != reference {
             return Err(Self::missing_snapshot());
@@ -152,8 +162,8 @@ mod tests {
 
     fn archive(max_bytes: usize) -> (Arc<InMemoryStore>, StoreJevContextArchive) {
         let store = Arc::new(InMemoryStore::new());
-        let archive = StoreJevContextArchive::new(store.clone() as Arc<dyn BaseStore>, max_bytes)
-            .unwrap();
+        let archive =
+            StoreJevContextArchive::new(store.clone() as Arc<dyn BaseStore>, max_bytes).unwrap();
         (store, archive)
     }
 
@@ -179,12 +189,9 @@ mod tests {
             vec![
                 "jev".to_string(),
                 "context".to_string(),
-                "04f8996da763b7a969b1028ee3007569eaf3a635486ddab211d512c85b9df8fb"
-                    .to_string(),
-                "d4f0bc5a29de06b510f9aa428f1eedba926012b591fef7a518e776a7c9bd1824"
-                    .to_string(),
-                "3f3af1ecebbd1410ab417ec0d27bbfcb5d340e177ae159b59fc8626c2dfd9175"
-                    .to_string(),
+                "04f8996da763b7a969b1028ee3007569eaf3a635486ddab211d512c85b9df8fb".to_string(),
+                "d4f0bc5a29de06b510f9aa428f1eedba926012b591fef7a518e776a7c9bd1824".to_string(),
+                "3f3af1ecebbd1410ab417ec0d27bbfcb5d340e177ae159b59fc8626c2dfd9175".to_string(),
             ]
         );
     }
@@ -236,7 +243,11 @@ mod tests {
             "snapshot limit"
         );
         assert_eq!(
-            archive.restore(&scope(), "nope").await.unwrap_err().message(),
+            archive
+                .restore(&scope(), "nope")
+                .await
+                .unwrap_err()
+                .message(),
             "invalid archive reference"
         );
         let reference = "0".repeat(64);

@@ -45,9 +45,7 @@ impl RetryPolicy {
     /// Backoff before retry number `attempt` (0-based): `base_delay * 2^attempt`, capped by
     /// [`max_delay`](Self::max_delay).
     pub fn delay_for(&self, attempt: u32) -> Duration {
-        let delay = self
-            .base_delay
-            .saturating_mul(2u32.saturating_pow(attempt));
+        let delay = self.base_delay.saturating_mul(2u32.saturating_pow(attempt));
         match self.max_delay {
             Some(cap) => delay.min(cap),
             None => delay,

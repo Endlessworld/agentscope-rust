@@ -253,9 +253,9 @@ impl WorkspaceIndex {
         }
         let guard = self.conn.lock().unwrap();
         let conn = guard.as_ref().unwrap();
-        let mut stmt = match conn.prepare(
-            "SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\' AND present_local=1",
-        ) {
+        let mut stmt = match conn
+            .prepare("SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\' AND present_local=1")
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!("Index listByPrefix prepare failed (non-fatal): {e}");
@@ -422,8 +422,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("as_ws_idx_{name}_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("as_ws_idx_{name}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

@@ -883,12 +883,16 @@ mod tests {
             &[SqlParam::Int(42), SqlParam::Text("a".into())],
         )
         .unwrap();
-        let rows = conn.query("SELECT id, name FROM t WHERE id = ?", &[SqlParam::Int(42)])
+        let rows = conn
+            .query("SELECT id, name FROM t WHERE id = ?", &[SqlParam::Int(42)])
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_int("id"), Some(42));
         let deleted = conn
-            .execute("DELETE FROM t WHERE name = ?", &[SqlParam::Text("a".into())])
+            .execute(
+                "DELETE FROM t WHERE name = ?",
+                &[SqlParam::Text("a".into())],
+            )
             .unwrap();
         assert_eq!(deleted, 1);
         assert!(db.rows("t").is_empty());
@@ -923,7 +927,11 @@ mod tests {
         let mut conn = db.connection().unwrap();
         conn.execute("CREATE TABLE t (id BIGINT, name VARCHAR(255))", &[])
             .unwrap();
-        assert_eq!(conn.execute_batch("INSERT INTO t (name) VALUES (?)", &[]).unwrap(), 0);
+        assert_eq!(
+            conn.execute_batch("INSERT INTO t (name) VALUES (?)", &[])
+                .unwrap(),
+            0
+        );
         assert!(db.rows("t").is_empty());
     }
 }

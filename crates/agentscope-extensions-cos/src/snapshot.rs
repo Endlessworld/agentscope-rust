@@ -149,7 +149,10 @@ mod tests {
         let err = client.download("absent").await.unwrap_err().to_string();
         assert!(err.contains("snapshot not found"), "unexpected: {err}");
         assert!(err.contains("snap/absent.tar"), "unexpected: {err}");
-        assert_eq!(CosError::NotFound("x".into()).to_string(), "snapshot not found: x");
+        assert_eq!(
+            CosError::NotFound("x".into()).to_string(),
+            "snapshot not found: x"
+        );
     }
 
     #[tokio::test]

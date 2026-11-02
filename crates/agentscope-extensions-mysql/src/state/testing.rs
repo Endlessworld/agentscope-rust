@@ -190,7 +190,12 @@ impl InMemoryStateBackend {
     }
 
     /// Stored `item_index` values of a list key, ascending.
-    pub fn list_indices(&self, user_id: Option<&str>, session_id: &str, state_key: &str) -> Vec<i64> {
+    pub fn list_indices(
+        &self,
+        user_id: Option<&str>,
+        session_id: &str,
+        state_key: &str,
+    ) -> Vec<i64> {
         self.rows
             .lock()
             .unwrap()
@@ -202,7 +207,11 @@ impl InMemoryStateBackend {
 
     /// Whether the modelled database exists.
     pub fn has_database(&self, database_name: &str) -> bool {
-        self.schema.lock().unwrap().databases.contains_key(database_name)
+        self.schema
+            .lock()
+            .unwrap()
+            .databases
+            .contains_key(database_name)
     }
 
     /// Whether the modelled table exists.
@@ -279,7 +288,13 @@ fn parse_columns(ddl: &str) -> Vec<String> {
             }
             let upper = seg.to_ascii_uppercase();
             const KEYWORDS: [&str; 7] = [
-                "PRIMARY", "UNIQUE", "KEY", "INDEX", "CONSTRAINT", "FOREIGN", "CHECK",
+                "PRIMARY",
+                "UNIQUE",
+                "KEY",
+                "INDEX",
+                "CONSTRAINT",
+                "FOREIGN",
+                "CHECK",
             ];
             if KEYWORDS.iter().any(|kw| upper.starts_with(kw)) {
                 return None;
@@ -346,7 +361,12 @@ impl StateBackend for InMemoryStateBackend {
     }
 
     fn database_exists(&self, database_name: &str) -> MysqlResult<bool> {
-        Ok(self.schema.lock().unwrap().databases.contains_key(database_name))
+        Ok(self
+            .schema
+            .lock()
+            .unwrap()
+            .databases
+            .contains_key(database_name))
     }
 
     fn table_exists(&self, database_name: &str, table_name: &str) -> MysqlResult<bool> {
@@ -899,7 +919,8 @@ mod tests {
     fn create_statements_update_the_modelled_schema() {
         let b = InMemoryStateBackend::default();
         assert!(!b.database_exists("db").unwrap());
-        b.execute_ddl(&super::super::create_database_sql("db")).unwrap();
+        b.execute_ddl(&super::super::create_database_sql("db"))
+            .unwrap();
         assert!(b.database_exists("db").unwrap());
         assert!(!b.table_exists("db", "t").unwrap());
 
@@ -946,7 +967,10 @@ mod tests {
         // MySQL and does not add a duplicate column either.
         b.execute_ddl(&sql).unwrap();
         assert_eq!(
-            b.columns("db", "t").iter().filter(|c| *c == "version").count(),
+            b.columns("db", "t")
+                .iter()
+                .filter(|c| *c == "version")
+                .count(),
             1
         );
         assert_eq!(b.ddl_log(), vec![sql.clone(), sql]);

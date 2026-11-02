@@ -449,14 +449,7 @@ impl HttpTransport for ReqwestTransport {
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
-            .map(|value| {
-                value
-                    .split(';')
-                    .next()
-                    .unwrap_or(value)
-                    .trim()
-                    .to_string()
-            });
+            .map(|value| value.split(';').next().unwrap_or(value).trim().to_string());
         let bytes = response
             .bytes()
             .await

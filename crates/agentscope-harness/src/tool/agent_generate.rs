@@ -245,8 +245,9 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_generation_falls_back_to_the_template() {
         let (dir, fs) = workspace("fallback");
-        let tool = AgentGenerateTool::new(fs)
-            .with_model(Arc::new(StubModel { text: "not markdown".into() }) as Arc<dyn Model>);
+        let tool = AgentGenerateTool::new(fs).with_model(Arc::new(StubModel {
+            text: "not markdown".into(),
+        }) as Arc<dyn Model>);
         call_tool(&tool).await;
 
         let content = written_spec(&dir);

@@ -233,10 +233,7 @@ impl GracefulShutdownManager {
     /// 登记会生成一个内部 id（`anon-<n>`），注销时按 FIFO 配对移除，因此活跃
     /// 计数与 id 集合始终保持一致。
     pub fn register_request(&self) {
-        let id = format!(
-            "anon-{}",
-            self.anonymous_seq.fetch_add(1, Ordering::SeqCst)
-        );
+        let id = format!("anon-{}", self.anonymous_seq.fetch_add(1, Ordering::SeqCst));
         self.anonymous.lock().unwrap().push_back(id.clone());
         self.register_request_with_id(id);
     }

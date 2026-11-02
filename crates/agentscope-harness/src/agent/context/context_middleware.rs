@@ -43,10 +43,7 @@ fn build_event(
     error_type: Option<&str>,
 ) -> agentscope_core::event::AgentEvent {
     let mut fields = serde_json::Map::new();
-    fields.insert(
-        "kind".to_string(),
-        serde_json::json!(BUILD_EVENT_NAME),
-    );
+    fields.insert("kind".to_string(), serde_json::json!(BUILD_EVENT_NAME));
     fields.insert("agent_id".to_string(), serde_json::json!(agent_id));
     fields.insert("model_call_id".to_string(), serde_json::json!(call_id));
     fields.insert("purpose".to_string(), serde_json::json!(purpose.as_str()));
@@ -208,7 +205,7 @@ impl Middleware for ContextMiddleware {
                         prepared.tools,
                         prepared.options,
                         model,
-                    ))
+                    ));
                 }
                 Ok(PrepareOutcome::BudgetExceeded(info)) => info,
                 Err(error) => {
@@ -221,7 +218,7 @@ impl Middleware for ContextMiddleware {
                         Some("ContextError"),
                     ));
                     return Box::pin(futures::stream::once(async move { Err(error) }))
-                        as EventStream
+                        as EventStream;
                 }
             };
 
@@ -309,7 +306,7 @@ impl Middleware for ContextMiddleware {
                             prepared.tools,
                             prepared.options,
                             model,
-                        ))
+                        ));
                     }
                     Ok(PrepareOutcome::BudgetExceeded(info)) => {
                         tracing::warn!(
@@ -331,7 +328,7 @@ impl Middleware for ContextMiddleware {
                             Some("ContextError"),
                         ));
                         return Box::pin(futures::stream::once(async move { Err(error) }))
-                            as EventStream
+                            as EventStream;
                     }
                 }
             }

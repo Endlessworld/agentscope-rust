@@ -1529,11 +1529,8 @@ async fn task_events(
             .and_then(|value| value.to_str().ok()),
     );
 
-    let body = axum::body::Body::from_stream(event_stream(
-        store.event_bus().clone(),
-        task_id,
-        from_seq,
-    ));
+    let body =
+        axum::body::Body::from_stream(event_stream(store.event_bus().clone(), task_id, from_seq));
     axum::response::Response::builder()
         .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
         .header(axum::http::header::CACHE_CONTROL, "no-cache")
@@ -2303,8 +2300,11 @@ mod tests {
         let mut record = harness_record("t-1");
         record.status = TaskStatus::Running;
         record.awaiting_confirm = true;
-        record.pending_confirms =
-            Some(vec![RemotePendingConfirm::new("call-1", "write_file", None)]);
+        record.pending_confirms = Some(vec![RemotePendingConfirm::new(
+            "call-1",
+            "write_file",
+            None,
+        )]);
         store.task_repository().save(&record);
 
         let (status, body) = rt().block_on(async {
@@ -2322,7 +2322,13 @@ mod tests {
         assert_eq!(body["task_id"], "t-1");
         assert_java_status(&body);
         // The snake-case decision was applied, so the task is no longer parked.
-        assert!(!store.task_repository().find("t-1").unwrap().awaiting_confirm);
+        assert!(
+            !store
+                .task_repository()
+                .find("t-1")
+                .unwrap()
+                .awaiting_confirm
+        );
     }
 
     // Java `#parseDecisions` reads `toolCallId`, then `tool_call_id`; both must land on one DTO.

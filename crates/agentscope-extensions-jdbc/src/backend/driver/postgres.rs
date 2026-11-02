@@ -179,9 +179,7 @@ fn decode_column(row: &Row, index: usize, column_type: &Type) -> JdbcResult<Colu
     // `Copy`, and the name is what the wire protocol reports for built-in and custom types.
     if column_type.name() == "bytea" {
         let value: Option<Vec<u8>> = row.try_get(index).map_err(context)?;
-        return Ok(value
-            .map(ColumnValue::Blob)
-            .unwrap_or(ColumnValue::Null));
+        return Ok(value.map(ColumnValue::Blob).unwrap_or(ColumnValue::Null));
     }
     if column_type.name() == "int2" {
         let value: Option<i16> = row.try_get(index).map_err(context)?;

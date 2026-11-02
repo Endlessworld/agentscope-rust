@@ -8,9 +8,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    describe_tool, KeywordToolSearchStrategy, SearchContext, ToolSearchRequest,
-    ToolSearchStrategy, DEFAULT_LIMIT, METADATA_MODE, METADATA_TOOLS, TOOL_SEARCH_DESCRIPTION,
-    TOOL_SEARCH_TOOL_NAME,
+    describe_tool, KeywordToolSearchStrategy, SearchContext, ToolSearchRequest, ToolSearchStrategy,
+    DEFAULT_LIMIT, METADATA_MODE, METADATA_TOOLS, TOOL_SEARCH_DESCRIPTION, TOOL_SEARCH_TOOL_NAME,
 };
 use crate::error::Result;
 use crate::message::{ContentBlock, JsonMap, TextBlock, ToolResultBlock, ToolResultState};
@@ -37,7 +36,10 @@ impl ToolSearchTool {
     ///
     /// Only useful to inspect the tool's declaration; a search needs the middleware.
     pub fn with_keyword_search() -> Self {
-        Self::new(Arc::new(KeywordToolSearchStrategy::new()), Arc::new(Mutex::new(None)))
+        Self::new(
+            Arc::new(KeywordToolSearchStrategy::new()),
+            Arc::new(Mutex::new(None)),
+        )
     }
 }
 
@@ -195,14 +197,16 @@ mod tests {
     #[tokio::test]
     async fn a_search_without_limit_returns_at_most_the_default_limit() {
         let names = [
-            "search_a", "search_b", "search_c", "search_d", "search_e", "search_f",
-            "search_g",
+            "search_a", "search_b", "search_c", "search_d", "search_e", "search_f", "search_g",
         ];
         let tool = searchable(&names);
         let mut args = JsonMap::new();
         args.insert("query".to_string(), serde_json::json!("search"));
 
-        let block = tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        let block = tool
+            .call(args, ToolExecutionContext::default())
+            .await
+            .unwrap();
 
         assert_eq!(block.state, ToolResultState::Success);
         assert_eq!(
@@ -225,7 +229,10 @@ mod tests {
         let mut args = JsonMap::new();
         args.insert("query".to_string(), serde_json::json!("search"));
 
-        let block = tool.call(args, ToolExecutionContext::default()).await.unwrap();
+        let block = tool
+            .call(args, ToolExecutionContext::default())
+            .await
+            .unwrap();
 
         assert_eq!(block.state, ToolResultState::Error);
     }

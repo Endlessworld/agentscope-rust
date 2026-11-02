@@ -423,11 +423,7 @@ impl RedisConnection {
     ///
     /// A standalone / Sentinel connection (no router) sends straight to the single node, so
     /// the behaviour is unchanged there.
-    pub(crate) async fn run_keyed(
-        &self,
-        key: &str,
-        cmd: &redis::Cmd,
-    ) -> Result<redis::Value> {
+    pub(crate) async fn run_keyed(&self, key: &str, cmd: &redis::Cmd) -> Result<redis::Value> {
         match &self.router {
             Some(router) => router.run(key, cmd).await,
             None => self.run_on_connection(cmd).await,
@@ -444,7 +440,9 @@ impl RedisConnection {
 
     async fn run_on_connection(&self, cmd: &redis::Cmd) -> Result<redis::Value> {
         let mut conn = self.manager.clone();
-        cmd.query_async(&mut conn).await.map_err(|e| map_err("command", e))
+        cmd.query_async(&mut conn)
+            .await
+            .map_err(|e| map_err("command", e))
     }
 }
 
@@ -573,8 +571,7 @@ impl RedisClientAdapter for RedisConnection {
 
 /// Decodes a raw reply into `T`, reporting a decode failure as a Redis error.
 fn decode_reply<T: redis::FromRedisValue>(value: &redis::Value) -> Result<T> {
-    T::from_redis_value(value.clone())
-        .map_err(|e| Error::Other(format!("Redis reply decode: {e}")))
+    T::from_redis_value(value.clone()).map_err(|e| Error::Other(format!("Redis reply decode: {e}")))
 }
 
 /// Routes key-scoped commands across a Redis Cluster.

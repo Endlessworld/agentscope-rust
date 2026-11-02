@@ -227,7 +227,9 @@ impl SocketIoProtocol {
 
     /// The Engine.IO session id, once the handshake was seen.
     pub fn sid(&self) -> Option<&str> {
-        self.handshake.as_ref().map(|handshake| handshake.sid.as_str())
+        self.handshake
+            .as_ref()
+            .map(|handshake| handshake.sid.as_str())
     }
 
     /// The Engine.IO handshake, once the open packet was seen.
@@ -1020,7 +1022,10 @@ mod tests {
         });
 
         let transport = transport_for(port, 2);
-        transport.connect().await.expect("the first socket is ready");
+        transport
+            .connect()
+            .await
+            .expect("the first socket is ready");
         tokio::time::timeout(Duration::from_secs(5), second_rx)
             .await
             .expect("the heartbeat timeout must trigger a reconnect")

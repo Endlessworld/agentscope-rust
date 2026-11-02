@@ -328,10 +328,9 @@ mod tests {
     #[test]
     fn responses_official_implementation_declares_server_tools_on_the_wire() {
         let mut options = GenerateOptions::default();
-        options.additional_body_params.insert(
-            "serverTools".to_string(),
-            json!([{ "type": "web_search" }]),
-        );
+        options
+            .additional_body_params
+            .insert("serverTools".to_string(), json!([{ "type": "web_search" }]));
         options
             .additional_body_params
             .insert("strictJsonSchema".to_string(), json!(true));
@@ -378,11 +377,14 @@ mod tests {
             .api_key("sk")
             .protocol(ApiProtocol::Messages);
         assert!(
-            AnthropicModelProvider::new().create(messages.clone()).is_err(),
+            AnthropicModelProvider::new()
+                .create(messages.clone())
+                .is_err(),
             "bare gateway ids are not claimed by the anthropic provider"
         );
-        assert!(build_model_for_protocol(&messages, ProtocolImplementations::full_capability())
-            .is_ok());
+        assert!(
+            build_model_for_protocol(&messages, ProtocolImplementations::full_capability()).is_ok()
+        );
 
         let responses = ModelCreationContext::new("openai", "gateway-chat")
             .api_key("sk")
@@ -390,8 +392,10 @@ mod tests {
         assert!(OpenAIOfficialModelProvider::new()
             .create(responses.clone())
             .is_err());
-        assert!(build_model_for_protocol(&responses, ProtocolImplementations::full_capability())
-            .is_ok());
+        assert!(
+            build_model_for_protocol(&responses, ProtocolImplementations::full_capability())
+                .is_ok()
+        );
     }
 
     #[test]

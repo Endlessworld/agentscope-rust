@@ -79,9 +79,6 @@ mod tests {
 
         let error = MysqlJdbcStore::connect("mysql://root@127.0.0.1:3306/agentscope")
             .expect_err("the bridge must not pretend to connect without its feature");
-        assert!(matches!(
-            error,
-            crate::MysqlError::DriverUnavailable(_)
-        ));
+        assert!(matches!(error, crate::MysqlError::DriverUnavailable(_)));
     }
 }

@@ -628,7 +628,10 @@ impl InMemoryMongoClient {
     }
 
     fn record_projection(&self, projection: Option<&Vec<String>>) {
-        let mut slot = self.last_projection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut slot = self
+            .last_projection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         *slot = projection.cloned();
     }
 
@@ -1193,10 +1196,10 @@ mod tests {
             found.get("user_id").is_none(),
             "unprojected fields must not be transferred: {found:?}"
         );
-        assert_eq!(c.last_projection(), Some(vec![
-            "states.foo".to_string(),
-            "hashes.foo".to_string()
-        ]));
+        assert_eq!(
+            c.last_projection(),
+            Some(vec!["states.foo".to_string(), "hashes.foo".to_string()])
+        );
 
         // An absent path stays absent instead of materialising nulls.
         let empty = c

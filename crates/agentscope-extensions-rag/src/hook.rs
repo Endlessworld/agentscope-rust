@@ -389,10 +389,7 @@ mod tests {
         ReasoningInput::new(messages, Vec::new(), GenerateOptions::default())
     }
 
-    async fn drive(
-        middleware: &GenericRagMiddleware,
-        messages: Vec<Msg>,
-    ) -> Vec<Msg> {
+    async fn drive(middleware: &GenericRagMiddleware, messages: Vec<Msg>) -> Vec<Msg> {
         let captured: Arc<Mutex<Option<Vec<Msg>>>> = Arc::new(Mutex::new(None));
         let sink = captured.clone();
         let next: Next<ReasoningInput> = Box::new(move |input| {
@@ -400,7 +397,8 @@ mod tests {
             Box::pin(futures::stream::empty())
         });
 
-        let mut stream = middleware.on_reasoning(&RuntimeContext::new(), reasoning_input(messages), next);
+        let mut stream =
+            middleware.on_reasoning(&RuntimeContext::new(), reasoning_input(messages), next);
         while stream.next().await.is_some() {}
         let taken = captured.lock().unwrap().take().unwrap();
         taken
@@ -417,12 +415,16 @@ mod tests {
 
         let delivered = drive(&middleware, vec![user("what is rust")]).await;
         assert_eq!(delivered.len(), 2);
-        assert!(delivered[1].text_content().contains("<retrieved_knowledge>"));
+        assert!(delivered[1]
+            .text_content()
+            .contains("<retrieved_knowledge>"));
     }
 
     #[tokio::test]
     async fn middleware_passes_the_input_through_when_nothing_matches() {
-        let hook = Arc::new(GenericRagHook::new(StubKnowledge::with_documents(Vec::new())));
+        let hook = Arc::new(GenericRagHook::new(StubKnowledge::with_documents(
+            Vec::new(),
+        )));
         let middleware = GenericRagMiddleware::new(hook);
 
         let delivered = drive(&middleware, vec![user("what is rust")]).await;

@@ -91,10 +91,7 @@ impl NacosAgentCardResolver {
     /// The local [`AgentCardResolver`] trait reports failures as `String` (it predates the
     /// protocol trait); the protocol adapter needs the classification to report `NOT_FOUND` as
     /// [`A2aError::CardUnavailable`] instead of a transport failure (NACOS-02).
-    pub async fn resolve_detailed(
-        &self,
-        agent_name: &str,
-    ) -> Result<A2aAgentCard, AiServiceError> {
+    pub async fn resolve_detailed(&self, agent_name: &str) -> Result<A2aAgentCard, AiServiceError> {
         if let Some(cached) = self.cached(agent_name) {
             return Ok(cached);
         }
@@ -115,7 +112,10 @@ impl NacosAgentCardResolver {
             );
         });
 
-        let fetched = self.service.subscribe_agent_card(agent_name, listener).await?;
+        let fetched = self
+            .service
+            .subscribe_agent_card(agent_name, listener)
+            .await?;
         let card = convert_to_a2a_agent_card(&fetched);
 
         // Merge: the listener may have written a newer value during the call.
@@ -169,9 +169,10 @@ impl agentscope_extensions_a2a_client::card::AgentCardResolver for NacosAgentCar
         // copied before the async block captures it.
         let agent_name = agent_name.to_string();
         Box::pin(async move {
-            let card = self.resolve_detailed(&agent_name).await.map_err(|error| {
-                to_protocol_error(PROTOCOL_RESOLVER_NAME, &agent_name, error)
-            })?;
+            let card = self
+                .resolve_detailed(&agent_name)
+                .await
+                .map_err(|error| to_protocol_error(PROTOCOL_RESOLVER_NAME, &agent_name, error))?;
             Ok(card.inner)
         })
     }

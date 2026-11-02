@@ -825,7 +825,8 @@ mod tests {
     #[test]
     fn model_switch_propagates_to_children_created_afterwards() {
         let bp = blueprint(false);
-        bp.model.set(Arc::new(NamedStub("switched")) as Arc<dyn Model>);
+        bp.model
+            .set(Arc::new(NamedStub("switched")) as Arc<dyn Model>);
         let child = bp.general_purpose_leaf().build(&RuntimeContext::new());
         let model = child
             .agent()

@@ -28,7 +28,9 @@ use serde_json::{json, Value};
 
 use crate::error::JevError;
 use crate::jev::call::{CallFailure, Caller};
-use crate::jev::dto::{Answer, ChoiceAnswer, ChoiceQuestion, Question, SystemOneRequest, SystemOneResult};
+use crate::jev::dto::{
+    Answer, ChoiceAnswer, ChoiceQuestion, Question, SystemOneRequest, SystemOneResult,
+};
 use crate::jev::execution::{Decision, Status};
 use crate::jev::validation::validate_response;
 
@@ -377,7 +379,15 @@ impl JevPhaseRouting {
                 route,
                 reason,
                 skipped,
-            } => self.chosen(snapshot, Some(&candidate), &route, None, None, skipped, reason),
+            } => self.chosen(
+                snapshot,
+                Some(&candidate),
+                &route,
+                None,
+                None,
+                skipped,
+                reason,
+            ),
             Selection::Ask(ask) => self.ask(caller, snapshot, ask).await,
         }
     }
@@ -617,12 +627,7 @@ impl JevPhaseRouting {
     }
 
     /// The judge round-trip and its validation chain.
-    async fn ask(
-        &self,
-        caller: &Caller,
-        snapshot: &Snapshot,
-        ask: Ask,
-    ) -> Decision<RoutingReport> {
+    async fn ask(&self, caller: &Caller, snapshot: &Snapshot, ask: Ask) -> Decision<RoutingReport> {
         let Ask {
             request,
             offers,
@@ -651,26 +656,14 @@ impl JevPhaseRouting {
             }
         };
         if validate_response(&request, &reply).is_err() {
-            return fallback(
-                skipped,
-                route_reason::CALL_OR_RESPONSE_ERROR,
-                Some(&reply),
-            );
+            return fallback(skipped, route_reason::CALL_OR_RESPONSE_ERROR, Some(&reply));
         }
         let Some(route_answer) = route_answer(Some(&reply)) else {
-            return fallback(
-                skipped,
-                route_reason::CALL_OR_RESPONSE_ERROR,
-                Some(&reply),
-            );
+            return fallback(skipped, route_reason::CALL_OR_RESPONSE_ERROR, Some(&reply));
         };
         let confidence = route_answer.confidence.unwrap_or(0.0);
         if confidence < self.confidence {
-            return fallback(
-                skipped,
-                route_reason::LOW_ROUTE_CONFIDENCE,
-                Some(&reply),
-            );
+            return fallback(skipped, route_reason::LOW_ROUTE_CONFIDENCE, Some(&reply));
         }
         let Some(choice) = route_answer.choice.clone() else {
             return fallback(skipped, route_reason::NO_APPLICABLE_ROUTE, Some(&reply));
@@ -681,28 +674,16 @@ impl JevPhaseRouting {
         let mut wanted = pinned_effort;
         if asks_effort {
             let Some(effort_answer) = effort_answer(Some(&reply)) else {
-                return fallback(
-                    skipped,
-                    route_reason::LOW_EFFORT_CONFIDENCE,
-                    Some(&reply),
-                );
+                return fallback(skipped, route_reason::LOW_EFFORT_CONFIDENCE, Some(&reply));
             };
             let effort_confidence = effort_answer.confidence.unwrap_or(0.0);
             if effort_confidence < self.confidence {
-                return fallback(
-                    skipped,
-                    route_reason::LOW_EFFORT_CONFIDENCE,
-                    Some(&reply),
-                );
+                return fallback(skipped, route_reason::LOW_EFFORT_CONFIDENCE, Some(&reply));
             }
             wanted = Effort::parse(effort_answer.choice.as_deref());
         }
         let Some(candidate) = offer.first() else {
-            return fallback(
-                skipped,
-                route_reason::NO_CAPABLE_CANDIDATES,
-                Some(&reply),
-            );
+            return fallback(skipped, route_reason::NO_CAPABLE_CANDIDATES, Some(&reply));
         };
         self.chosen(
             snapshot,
@@ -805,7 +786,10 @@ fn fallback(
 
 fn insert_judge_usage(metadata: &mut BTreeMap<String, String>, report: &RoutingReport) {
     if let Some(usage) = report.judge_usage {
-        metadata.insert("judgeInputTokens".to_string(), usage.input_tokens.to_string());
+        metadata.insert(
+            "judgeInputTokens".to_string(),
+            usage.input_tokens.to_string(),
+        );
         metadata.insert(
             "judgeOutputTokens".to_string(),
             usage.output_tokens.to_string(),
@@ -858,9 +842,15 @@ pub fn candidate_state(candidate: &Candidate) -> Value {
     let mut state = serde_json::Map::new();
     state.insert("id".to_string(), json!(candidate.id));
     state.insert("description".to_string(), json!(candidate.description));
-    state.insert("context_window".to_string(), json!(candidate.context_window));
+    state.insert(
+        "context_window".to_string(),
+        json!(candidate.context_window),
+    );
     state.insert("max_output".to_string(), json!(candidate.max_output));
-    state.insert("supports_tools".to_string(), json!(candidate.supports_tools));
+    state.insert(
+        "supports_tools".to_string(),
+        json!(candidate.supports_tools),
+    );
     state.insert("quota".to_string(), json!(candidate.quota.as_str()));
     let efforts: Vec<&str> = candidate.efforts.iter().map(Effort::value).collect();
     state.insert("efforts".to_string(), json!(efforts));
@@ -920,7 +910,10 @@ mod tests {
 
     fn router(models: &[&str]) -> JevPhaseRouting {
         JevPhaseRouting::new(
-            vec![route("fast", &["m-fast", "m-slow"]), route("deep", &["m-deep"])],
+            vec![
+                route("fast", &["m-fast", "m-slow"]),
+                route("deep", &["m-deep"]),
+            ],
             allowed(models),
             0.6,
             true,
@@ -931,7 +924,10 @@ mod tests {
     /// The same routes, but the router never asks for an effort (one question per request).
     fn router_no_effort(models: &[&str]) -> JevPhaseRouting {
         JevPhaseRouting::new(
-            vec![route("fast", &["m-fast", "m-slow"]), route("deep", &["m-deep"])],
+            vec![
+                route("fast", &["m-fast", "m-slow"]),
+                route("deep", &["m-deep"]),
+            ],
             allowed(models),
             0.6,
             false,
@@ -1008,9 +1004,14 @@ mod tests {
         );
         for confidence in [-0.1, 1.1, f64::NAN] {
             assert_eq!(
-                JevPhaseRouting::new(vec![route("fast", &["m"])], allowed(&["m"]), confidence, false)
-                    .unwrap_err()
-                    .message(),
+                JevPhaseRouting::new(
+                    vec![route("fast", &["m"])],
+                    allowed(&["m"]),
+                    confidence,
+                    false
+                )
+                .unwrap_err()
+                .message(),
                 "invalid phase routing configuration"
             );
         }
@@ -1053,14 +1054,16 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_routes_to_the_first_model_of_the_chosen_route() {
-        let scripted = Arc::new(ScriptedCaller::new(vec![Ok(reply(vec![(
-            "route",
-            Answer::Choice(choice("deep", &["fast", "deep", "none"], 0.9)),
-        ),
-        (
-            "effort",
-            Answer::Choice(choice("medium", &["low", "medium", "high"], 0.8)),
-        )]))]));
+        let scripted = Arc::new(ScriptedCaller::new(vec![Ok(reply(vec![
+            (
+                "route",
+                Answer::Choice(choice("deep", &["fast", "deep", "none"], 0.9)),
+            ),
+            (
+                "effort",
+                Answer::Choice(choice("medium", &["low", "medium", "high"], 0.8)),
+            ),
+        ]))]));
         let router = router(&["m-fast", "m-slow", "m-deep"]).with_caller(scripted.as_caller());
         let decision = router
             .resolve(&three_candidates(), &input("summarise the release"))
@@ -1078,9 +1081,24 @@ mod tests {
         assert_eq!(report.judge_model.as_deref(), Some("jev"));
         assert_eq!(report.judge_usage, Some(Usage::new(11, 3)));
         assert!(report.skipped.is_empty());
-        assert_eq!(decision.recommendation.get("model").map(String::as_str), Some("m-deep"));
-        assert_eq!(decision.recommendation.get("effortAdjusted").map(String::as_str), Some("true"));
-        assert_eq!(decision.recommendation.get("judgeInputTokens").map(String::as_str), Some("11"));
+        assert_eq!(
+            decision.recommendation.get("model").map(String::as_str),
+            Some("m-deep")
+        );
+        assert_eq!(
+            decision
+                .recommendation
+                .get("effortAdjusted")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            decision
+                .recommendation
+                .get("judgeInputTokens")
+                .map(String::as_str),
+            Some("11")
+        );
 
         let requests = scripted.requests();
         assert_eq!(requests.len(), 1);
@@ -1137,7 +1155,10 @@ mod tests {
         assert_eq!(report.confidence, Some(0.3));
         assert_eq!(report.judge_model.as_deref(), Some("jev"));
         assert_eq!(
-            decision.recommendation.get("suggestedRoute").map(String::as_str),
+            decision
+                .recommendation
+                .get("suggestedRoute")
+                .map(String::as_str),
             Some("fast")
         );
     }
@@ -1184,7 +1205,9 @@ mod tests {
         let backend = Arc::new(ScriptedCaller::new(vec![Err(CallFailure::backend("boom"))]));
         let backend_router =
             router(&["m-fast", "m-slow", "m-deep"]).with_caller(backend.as_caller());
-        let decision = backend_router.resolve(&three_candidates(), &input("hi")).await;
+        let decision = backend_router
+            .resolve(&three_candidates(), &input("hi"))
+            .await;
         assert_eq!(decision.reason, route_reason::CALL_OR_RESPONSE_ERROR);
         let report = decision.value.unwrap();
         assert!(report.judge_model.is_none());
@@ -1196,7 +1219,9 @@ mod tests {
         ))]));
         let invalid_router =
             router(&["m-fast", "m-slow", "m-deep"]).with_caller(invalid.as_caller());
-        let decision = invalid_router.resolve(&three_candidates(), &input("hi")).await;
+        let decision = invalid_router
+            .resolve(&three_candidates(), &input("hi"))
+            .await;
         let report = decision.value.unwrap();
         assert_eq!(report.judge_model.as_deref(), Some("llm:jev"));
         assert_eq!(report.judge_usage, Some(Usage::new(7, 2)));
@@ -1209,7 +1234,10 @@ mod tests {
             Answer::Choice(choice("fast", &["fast", "deep", "none"], 0.9)),
         )]))]));
         let router = JevPhaseRouting::new(
-            vec![route("fast", &["m-fast", "m-ok"]), route("deep", &["m-deep"])],
+            vec![
+                route("fast", &["m-fast", "m-ok"]),
+                route("deep", &["m-deep"]),
+            ],
             allowed(&["m-fast", "m-ok", "m-deep"]),
             0.6,
             false,
@@ -1239,7 +1267,10 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(decision.recommendation.get("skipped").map(String::as_str), Some("2"));
+        assert_eq!(
+            decision.recommendation.get("skipped").map(String::as_str),
+            Some("2")
+        );
     }
 
     #[tokio::test]
@@ -1352,7 +1383,9 @@ mod tests {
         tools.request.tools_present = true;
         let mut no_tools_snapshot = snapshot.clone();
         no_tools_snapshot.candidates[1].supports_tools = false;
-        assert!(!router.revalidate(&no_tools_snapshot, &tools, &report).is_valid());
+        assert!(!router
+            .revalidate(&no_tools_snapshot, &tools, &report)
+            .is_valid());
 
         let mut floor = snapshot.clone();
         floor.minimum_effort = Some(Effort::High);
@@ -1366,7 +1399,9 @@ mod tests {
 
         let mut restricted = routing.clone();
         restricted.request.pinned_options = true;
-        assert!(!router.revalidate(&snapshot, &restricted, &report).is_valid());
+        assert!(!router
+            .revalidate(&snapshot, &restricted, &report)
+            .is_valid());
 
         let mut unknown = report.clone();
         unknown.model = Some("m-gone".to_string());
@@ -1374,7 +1409,9 @@ mod tests {
 
         let mut unsupported_effort = report.clone();
         unsupported_effort.effort = Some("ultra".to_string());
-        assert!(!router.revalidate(&snapshot, &routing, &unsupported_effort).is_valid());
+        assert!(!router
+            .revalidate(&snapshot, &routing, &unsupported_effort)
+            .is_valid());
 
         let mut no_model = report.clone();
         no_model.model = None;

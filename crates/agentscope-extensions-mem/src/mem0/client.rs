@@ -94,8 +94,7 @@ impl Mem0Client {
             Arc::new(ReqwestTransport::new(timeout)?),
             Arc::clone(&metrics),
         ));
-        let transport: Arc<dyn HttpTransport> =
-            Arc::new(RetryTransport::new(instrumented, policy));
+        let transport: Arc<dyn HttpTransport> = Arc::new(RetryTransport::new(instrumented, policy));
         let mut client = Self::assemble(transport, api_base_url.into(), api_key, api_type)?;
         client.metrics = Some(metrics);
         Ok(client)
@@ -218,7 +217,9 @@ impl Mem0Client {
         let mut request = request.clone();
         request.sync_filters();
         let body = serde_json::to_string(&request)?;
-        let raw = self.post("search request", &self.search_endpoint, &body).await?;
+        let raw = self
+            .post("search request", &self.search_endpoint, &body)
+            .await?;
         let trimmed = raw.trim();
         if trimmed.starts_with('[') {
             let results: Vec<Mem0SearchResult> = serde_json::from_str(trimmed)?;
@@ -438,10 +439,7 @@ mod tests {
         );
 
         mock.push_response(Err(MemError::http_status(500, "boom")));
-        let err = client
-            .search(&Mem0SearchRequest::new())
-            .await
-            .unwrap_err();
+        let err = client.search(&Mem0SearchRequest::new()).await.unwrap_err();
         assert_eq!(
             err.to_string(),
             "Mem0 API search request failed with status 500: boom"

@@ -139,10 +139,7 @@ impl OllamaOptions {
     /// therefore excluded from this map (matching `OllamaToolsHelper`). The
     /// execution config is an execution-layer concern and is excluded as well
     /// (Java `OllamaChatModelExecutionOptionsTest` asserts the same).
-    pub fn resolved_execution_config(
-        &self,
-        per_call: Option<ExecutionConfig>,
-    ) -> ExecutionConfig {
+    pub fn resolved_execution_config(&self, per_call: Option<ExecutionConfig>) -> ExecutionConfig {
         let defaults = ExecutionConfig::model_defaults();
         ExecutionConfig::merge_configs(per_call.as_ref(), self.execution_config.as_ref())
             .and_then(|merged| ExecutionConfig::merge_configs(Some(&merged), Some(&defaults)))
@@ -396,7 +393,10 @@ mod tests {
             ..Default::default()
         }
         .with_extra("top_k", 999);
-        assert_eq!(typed.to_options_map().get("top_k"), Some(&serde_json::json!(40)));
+        assert_eq!(
+            typed.to_options_map().get("top_k"),
+            Some(&serde_json::json!(40))
+        );
     }
 
     #[test]

@@ -101,10 +101,7 @@ impl MysqlDistributedStore {
     /// lands in is the table that was configured — previously the config only reached the
     /// driver adapter's own bookkeeping while the components kept their defaults.
     #[cfg(feature = "mysql_async")]
-    pub fn connect_with_config(
-        url: &str,
-        config: crate::MysqlAsyncConfig,
-    ) -> MysqlResult<Self> {
+    pub fn connect_with_config(url: &str, config: crate::MysqlAsyncConfig) -> MysqlResult<Self> {
         let backend = crate::MysqlAsyncBackend::connect_with_config(url, config.clone())?;
         let state: Arc<dyn StateBackend> = backend.clone();
         let sql: Arc<dyn SqlBackend> = backend.clone();

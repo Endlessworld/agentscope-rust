@@ -1946,17 +1946,22 @@ mod tests {
     #[test]
     fn every_save_path_binds_updated_at_as_a_timestamp() {
         let client = Arc::new(RecordingClient::new());
-        let store = PostgresAgentStateStore::create_if_not_exist(
-            client.clone() as Arc<dyn PostgresClient>
-        )
-        .unwrap();
+        let store =
+            PostgresAgentStateStore::create_if_not_exist(client.clone() as Arc<dyn PostgresClient>)
+                .unwrap();
 
         // 1. Unconditional upsert (`save` / `save_versioned`).
-        store.save_versioned(Some("u"), "s1", "k", &json!(1)).unwrap();
+        store
+            .save_versioned(Some("u"), "s1", "k", &json!(1))
+            .unwrap();
         // 2. Create-if-absent (`save_if_version(..., 0)`): INSERT ... DO NOTHING.
-        store.save_if_version(Some("u"), "s1", "k2", &json!(2), 0).unwrap();
+        store
+            .save_if_version(Some("u"), "s1", "k2", &json!(2), 0)
+            .unwrap();
         // 3. CAS update of an existing row: UPDATE ... updated_at = $3.
-        store.save_if_version(Some("u"), "s1", "k", &json!(3), 1).unwrap();
+        store
+            .save_if_version(Some("u"), "s1", "k", &json!(3), 1)
+            .unwrap();
 
         let captured = client.captured();
         let mut checked: Vec<String> = Vec::new();
@@ -1984,7 +1989,11 @@ mod tests {
         }
         assert_eq!(
             checked,
-            vec!["INSERT".to_string(), "INSERT".to_string(), "UPDATE".to_string()],
+            vec![
+                "INSERT".to_string(),
+                "INSERT".to_string(),
+                "UPDATE".to_string()
+            ],
             "all three save paths must bind updated_at: {captured:#?}"
         );
     }

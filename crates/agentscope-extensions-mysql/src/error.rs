@@ -158,8 +158,9 @@ mod tests {
 
     #[test]
     fn other_server_errors_are_not_duplicate_keys() {
-        assert!(!server(1054, Some("42S22"), "Unknown column 'x' in 'field list'")
-            .is_duplicate_key());
+        assert!(
+            !server(1054, Some("42S22"), "Unknown column 'x' in 'field list'").is_duplicate_key()
+        );
         assert!(!server(1064, Some("42000"), "syntax error").is_duplicate_key());
     }
 
@@ -176,6 +177,9 @@ mod tests {
         let err = server(1062, Some("23000"), "Duplicate entry 'a' for key 'PRIMARY'");
         let text = err.to_string();
         assert!(text.contains("1062"), "unexpected display: {text}");
-        assert!(text.contains("Duplicate entry"), "unexpected display: {text}");
+        assert!(
+            text.contains("Duplicate entry"),
+            "unexpected display: {text}"
+        );
     }
 }

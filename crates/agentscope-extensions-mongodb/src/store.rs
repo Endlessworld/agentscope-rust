@@ -505,10 +505,7 @@ mod tests {
             "namespace".to_string(),
             json!(MongodbStore::namespace_path(&ns()).unwrap()),
         );
-        doc.insert(
-            "value".to_string(),
-            json!(r#"{"content":"legacy"}"#),
-        );
+        doc.insert("value".to_string(), json!(r#"{"content":"legacy"}"#));
         doc.insert("version".to_string(), json!(7));
         futures::executor::block_on(client.insert_one(BASE_STORE_COLLECTION, doc)).unwrap();
 

@@ -10,7 +10,7 @@ pub mod knowledge;
 pub mod response;
 
 pub use knowledge::{
-    KnowledgePassage, KnowledgeSource, KnowledgeTool, JevKnowledge, KNOWLEDGE_TOOL_UNAVAILABLE,
+    JevKnowledge, KnowledgePassage, KnowledgeSource, KnowledgeTool, KNOWLEDGE_TOOL_UNAVAILABLE,
 };
 pub use response::{
     conversation_text, quality_state, ResponseLimits, ResponseMiddlewareUnavailable,

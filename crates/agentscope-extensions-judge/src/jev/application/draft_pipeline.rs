@@ -124,7 +124,14 @@ impl JevDraftPipeline {
     ) -> DraftOutcome {
         match tokio::time::timeout(
             self.budget,
-            self.run_inner(request, evidence, input_checks, output_checks, generate, revise),
+            self.run_inner(
+                request,
+                evidence,
+                input_checks,
+                output_checks,
+                generate,
+                revise,
+            ),
         )
         .await
         {
@@ -225,14 +232,9 @@ mod tests {
     fn definition(id: &str) -> Definition {
         Definition::new(
             "v1",
-            vec![Criterion::new(
-                id,
-                NoulQuestion::new(json!("ok?"), None),
-                true,
-                0.2,
-                0.8,
-            )
-            .unwrap()],
+            vec![
+                Criterion::new(id, NoulQuestion::new(json!("ok?"), None), true, 0.2, 0.8).unwrap(),
+            ],
         )
         .unwrap()
     }
@@ -246,9 +248,7 @@ mod tests {
                     model: Some("jev".to_string()),
                     answers: Some(BTreeMap::from([(
                         "ok".to_string(),
-                        Answer::Noul(NoulAnswer {
-                            noul: Some(value),
-                        }),
+                        Answer::Noul(NoulAnswer { noul: Some(value) }),
                     )])),
                     usage: Some(Usage::new(1, 1)),
                 })
@@ -267,9 +267,7 @@ mod tests {
     }
 
     fn unchanged() -> ReviseSource {
-        Arc::new(|revision: Revision| {
-            Box::pin(async move { Ok(revision.draft) })
-        })
+        Arc::new(|revision: Revision| Box::pin(async move { Ok(revision.draft) }))
     }
 
     #[tokio::test]
@@ -371,13 +369,8 @@ mod tests {
         assert_eq!(outcome.reason, "UNCHANGED_DRAFT");
         assert_eq!(outcome.revisions, 1);
 
-        let pipeline = JevDraftPipeline::new(
-            judge(vec![0.9, 0.1]),
-            5,
-            2,
-            Duration::from_secs(2),
-        )
-        .unwrap();
+        let pipeline =
+            JevDraftPipeline::new(judge(vec![0.9, 0.1]), 5, 2, Duration::from_secs(2)).unwrap();
         let outcome = pipeline
             .run(
                 json!({}),
@@ -399,9 +392,7 @@ mod tests {
                 &definition("ok"),
                 &definition("ok"),
                 source("abc"),
-                Arc::new(|_revision: Revision| {
-                    Box::pin(async { Err(JevError::invalid("boom")) })
-                }),
+                Arc::new(|_revision: Revision| Box::pin(async { Err(JevError::invalid("boom")) })),
             )
             .await;
         assert_eq!(outcome.reason, "PIPELINE_ERROR");

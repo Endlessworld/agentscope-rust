@@ -329,10 +329,7 @@ mod tests {
     #[test]
     fn composite_filter_requires_every_filter_to_admit() {
         let filter = CompositeFilter::new(vec![
-            Arc::new(AllowListFilter::new(vec![
-                "a".to_string(),
-                "b".to_string(),
-            ])),
+            Arc::new(AllowListFilter::new(vec!["a".to_string(), "b".to_string()])),
             Arc::new(DenyListFilter::new(vec!["b".to_string()])),
         ]);
         assert!(filter.is_visible(&candidate("a")));

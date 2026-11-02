@@ -153,12 +153,7 @@ impl OssStore {
     }
 
     /// Writes an item unconditionally (`version + 1`), propagating backend failures.
-    pub fn put_strict(
-        &self,
-        namespace: &[String],
-        key: &str,
-        value: StoreValue,
-    ) -> OssResult<()> {
+    pub fn put_strict(&self, namespace: &[String], key: &str, value: StoreValue) -> OssResult<()> {
         let data_key = self.data_object_key(namespace, key);
         let version_key = self.version_object_key(namespace, key);
         let json = serde_json::to_string(&value)?;

@@ -37,8 +37,14 @@ impl StudioHttpTransport for AlwaysOkHttp {
 }
 
 /// Plays the Studio server side of the Socket.IO handshake for one connection.
-async fn serve_studio_socket(listener: TcpListener, push_input: tokio::sync::oneshot::Receiver<()>) {
-    let (stream, _) = listener.accept().await.expect("accept the socket.io client");
+async fn serve_studio_socket(
+    listener: TcpListener,
+    push_input: tokio::sync::oneshot::Receiver<()>,
+) {
+    let (stream, _) = listener
+        .accept()
+        .await
+        .expect("accept the socket.io client");
     let mut ws = tokio_tungstenite::accept_async(stream)
         .await
         .expect("websocket handshake");

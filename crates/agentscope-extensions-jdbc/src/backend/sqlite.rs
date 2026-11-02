@@ -53,8 +53,8 @@ impl std::fmt::Debug for RusqliteExecutor {
 impl RusqliteExecutor {
     /// Opens an in-memory SQLite database.
     pub fn in_memory() -> JdbcResult<Self> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| sqlite_error("open in-memory sqlite", e))?;
+        let conn =
+            Connection::open_in_memory().map_err(|e| sqlite_error("open in-memory sqlite", e))?;
         Self::with_busy_timeout(conn)
     }
 

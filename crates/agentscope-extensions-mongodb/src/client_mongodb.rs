@@ -186,9 +186,9 @@ where
             let _ = tx.send(outcome);
         });
     });
-    driver_sender()?
-        .send(job)
-        .map_err(|_| MongoError::Backend("the MongoDB driver thread is no longer running".into()))?;
+    driver_sender()?.send(job).map_err(|_| {
+        MongoError::Backend("the MongoDB driver thread is no longer running".into())
+    })?;
     rx.await
         .map_err(|_| MongoError::Backend("the MongoDB driver dropped the operation".into()))?
 }
@@ -215,9 +215,7 @@ impl MongodbClient {
     pub async fn connect(uri: impl AsRef<str>) -> MongoResult<Self> {
         let uri = uri.as_ref().to_string();
         let options = exec_on_driver(move || async move {
-            ClientOptions::parse(uri)
-                .await
-                .map_err(map_driver_error)
+            ClientOptions::parse(uri).await.map_err(map_driver_error)
         })
         .await?;
         Self::connect_with_options(options).await
@@ -294,8 +292,7 @@ impl MongodbClient {
     /// seam because the stores never need it.
     pub async fn drop_database(&self, database: &str) -> MongoResult<()> {
         let db = self.client.database(database);
-        exec_on_driver(move || async move { db.drop().await.map_err(map_driver_error) })
-            .await
+        exec_on_driver(move || async move { db.drop().await.map_err(map_driver_error) }).await
     }
 
     // ── helpers ──
@@ -452,10 +449,7 @@ fn insert_operator(doc: &mut Document, field: &str, operator: &str, value: Bson)
             existing.insert(operator.to_string(), value);
         }
         Some(_) => {
-            let previous = doc
-                .get(field)
-                .cloned()
-                .unwrap_or(Bson::Null);
+            let previous = doc.get(field).cloned().unwrap_or(Bson::Null);
             let mut merged = Document::new();
             merged.insert("$eq".to_string(), previous);
             merged.insert(operator.to_string(), value);
@@ -596,10 +590,10 @@ impl MongoClient for MongodbClient {
             );
         }
         exec_on_driver(move || async move {
-                coll.insert_one(document).await.map_err(map_driver_error)?;
-                Ok(())
-            })
-            .await
+            coll.insert_one(document).await.map_err(map_driver_error)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn find_one(
@@ -610,12 +604,12 @@ impl MongoClient for MongodbClient {
         let coll = self.collection(collection);
         let filter = find_filter_to_document(filter);
         exec_on_driver(move || async move {
-                coll.find_one(filter)
-                    .await
-                    .map_err(map_driver_error)
-                    .map(|found| found.map(|doc| document_to_json_map(&doc)))
-            })
-            .await
+            coll.find_one(filter)
+                .await
+                .map_err(map_driver_error)
+                .map(|found| found.map(|doc| document_to_json_map(&doc)))
+        })
+        .await
     }
 
     async fn find_one_projected(
@@ -628,13 +622,13 @@ impl MongoClient for MongodbClient {
         let filter = find_filter_to_document(filter);
         let projection = include_projection(projection);
         exec_on_driver(move || async move {
-                coll.find_one(filter)
-                    .projection(projection)
-                    .await
-                    .map_err(map_driver_error)
-                    .map(|found| found.map(|doc| document_to_json_map(&doc)))
-            })
-            .await
+            coll.find_one(filter)
+                .projection(projection)
+                .await
+                .map_err(map_driver_error)
+                .map(|found| found.map(|doc| document_to_json_map(&doc)))
+        })
+        .await
     }
 
     async fn find_many(
@@ -654,26 +648,26 @@ impl MongoClient for MongodbClient {
             include_projection(&fields.iter().map(String::as_str).collect::<Vec<_>>())
         });
         exec_on_driver(move || async move {
-                let mut find = coll.find(filter);
-                if let Some(projection) = projection {
-                    find = find.projection(projection);
-                }
-                if let Some(field) = sort_field {
-                    let mut sort = Document::new();
-                    sort.insert(field, Bson::Int32(1));
-                    find = find.sort(sort);
-                }
-                if let Some(skip) = skip {
-                    find = find.skip(skip as u64);
-                }
-                if let Some(limit) = limit {
-                    find = find.limit(limit as i64);
-                }
-                let cursor = find.await.map_err(map_driver_error)?;
-                let docs: Vec<Document> = cursor.try_collect().await.map_err(map_driver_error)?;
-                Ok(docs.iter().map(document_to_json_map).collect())
-            })
-            .await
+            let mut find = coll.find(filter);
+            if let Some(projection) = projection {
+                find = find.projection(projection);
+            }
+            if let Some(field) = sort_field {
+                let mut sort = Document::new();
+                sort.insert(field, Bson::Int32(1));
+                find = find.sort(sort);
+            }
+            if let Some(skip) = skip {
+                find = find.skip(skip as u64);
+            }
+            if let Some(limit) = limit {
+                find = find.limit(limit as i64);
+            }
+            let cursor = find.await.map_err(map_driver_error)?;
+            let docs: Vec<Document> = cursor.try_collect().await.map_err(map_driver_error)?;
+            Ok(docs.iter().map(document_to_json_map).collect())
+        })
+        .await
     }
 
     async fn find_one_and_update(
@@ -689,21 +683,21 @@ impl MongoClient for MongodbClient {
         let upsert = options.upsert;
         let return_after = options.return_after;
         exec_on_driver(move || async move {
-                let mut action = coll.find_one_and_update(filter, update);
-                if upsert {
-                    action = action.upsert(true);
-                }
-                action = action.return_document(if return_after {
-                    ReturnDocument::After
-                } else {
-                    ReturnDocument::Before
-                });
-                action
-                    .await
-                    .map_err(map_driver_error)
-                    .map(|found| found.map(|doc| document_to_json_map(&doc)))
-            })
-            .await
+            let mut action = coll.find_one_and_update(filter, update);
+            if upsert {
+                action = action.upsert(true);
+            }
+            action = action.return_document(if return_after {
+                ReturnDocument::After
+            } else {
+                ReturnDocument::Before
+            });
+            action
+                .await
+                .map_err(map_driver_error)
+                .map(|found| found.map(|doc| document_to_json_map(&doc)))
+        })
+        .await
     }
 
     async fn update_one(
@@ -718,30 +712,32 @@ impl MongoClient for MongodbClient {
         let update = update_to_document(update);
         let upsert = options.upsert;
         exec_on_driver(move || async move {
-                coll.update_one(filter, update)
-                    .upsert(upsert)
-                    .await
-                    .map_err(map_driver_error)?;
-                Ok(())
-            })
-            .await
+            coll.update_one(filter, update)
+                .upsert(upsert)
+                .await
+                .map_err(map_driver_error)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn delete_one(&self, collection: &str, filter: &FindFilter) -> MongoResult<bool> {
         let coll = self.collection(collection);
         let filter = find_filter_to_document(filter);
         exec_on_driver(move || async move {
-                let result = coll.delete_one(filter).await.map_err(map_driver_error)?;
-                Ok(result.deleted_count > 0)
-            })
-            .await
+            let result = coll.delete_one(filter).await.map_err(map_driver_error)?;
+            Ok(result.deleted_count > 0)
+        })
+        .await
     }
 
     async fn count(&self, collection: &str, filter: &FindFilter) -> MongoResult<u64> {
         let coll = self.collection(collection);
         let filter = find_filter_to_document(filter);
-        exec_on_driver(move || async move { coll.count_documents(filter).await.map_err(map_driver_error) })
-            .await
+        exec_on_driver(move || async move {
+            coll.count_documents(filter).await.map_err(map_driver_error)
+        })
+        .await
     }
 
     async fn distinct(
@@ -754,10 +750,13 @@ impl MongoClient for MongodbClient {
         let filter = find_filter_to_document(filter);
         let field = field.to_string();
         exec_on_driver(move || async move {
-                let values = coll.distinct(field, filter).await.map_err(map_driver_error)?;
-                Ok(values.iter().map(bson_to_json).collect())
-            })
-            .await
+            let values = coll
+                .distinct(field, filter)
+                .await
+                .map_err(map_driver_error)?;
+            Ok(values.iter().map(bson_to_json).collect())
+        })
+        .await
     }
 
     async fn first_field_size_and_string(
@@ -782,53 +781,53 @@ impl MongoClient for MongodbClient {
             ]
         };
         exec_on_driver(move || async move {
-                // Only the count and the hash string cross the wire, never the array
-                // itself (MONGO-05).
-                let pipeline = vec![
-                    doc! { "$match": filter },
-                    doc! { "$limit": 1 },
-                    doc! {
-                        "$project": {
-                            "_id": 0,
-                            "count": count_expr,
-                            "storedHash": hash_ref,
-                        }
-                    },
-                ];
-                let mut cursor = coll.aggregate(pipeline).await.map_err(map_driver_error)?;
-                let Some(doc) = cursor.try_next().await.map_err(map_driver_error)? else {
-                    return Ok((None, None));
-                };
-                let count = match doc.get("count") {
-                    Some(Bson::Int32(n)) => Some(*n as usize),
-                    Some(Bson::Int64(n)) => Some(*n as usize),
-                    Some(Bson::Double(n)) => Some(*n as usize),
-                    _ => None,
-                };
-                let stored_hash = doc.get_str("storedHash").ok().map(|s| s.to_string());
-                Ok((count, stored_hash))
-            })
-            .await
+            // Only the count and the hash string cross the wire, never the array
+            // itself (MONGO-05).
+            let pipeline = vec![
+                doc! { "$match": filter },
+                doc! { "$limit": 1 },
+                doc! {
+                    "$project": {
+                        "_id": 0,
+                        "count": count_expr,
+                        "storedHash": hash_ref,
+                    }
+                },
+            ];
+            let mut cursor = coll.aggregate(pipeline).await.map_err(map_driver_error)?;
+            let Some(doc) = cursor.try_next().await.map_err(map_driver_error)? else {
+                return Ok((None, None));
+            };
+            let count = match doc.get("count") {
+                Some(Bson::Int32(n)) => Some(*n as usize),
+                Some(Bson::Int64(n)) => Some(*n as usize),
+                Some(Bson::Double(n)) => Some(*n as usize),
+                _ => None,
+            };
+            let stored_hash = doc.get_str("storedHash").ok().map(|s| s.to_string());
+            Ok((count, stored_hash))
+        })
+        .await
     }
 
     async fn create_index(&self, collection: &str, spec: &IndexSpec) -> MongoResult<()> {
         let coll = self.collection(collection);
         let model = index_model(spec);
         exec_on_driver(move || async move {
-                coll.create_index(model).await.map_err(map_driver_error)?;
-                Ok(())
-            })
-            .await
+            coll.create_index(model).await.map_err(map_driver_error)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn drop_index(&self, collection: &str, name: &str) -> MongoResult<()> {
         let coll = self.collection(collection);
         let name = name.to_string();
         exec_on_driver(move || async move {
-                coll.drop_index(name).await.map_err(map_driver_error)?;
-                Ok(())
-            })
-            .await
+            coll.drop_index(name).await.map_err(map_driver_error)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn list_indexes(&self, collection: &str) -> MongoResult<Vec<IndexInfo>> {
@@ -836,23 +835,23 @@ impl MongoClient for MongodbClient {
 
         let coll = self.collection(collection);
         exec_on_driver(move || async move {
-                let cursor = match coll.list_indexes().await {
-                    Ok(cursor) => cursor,
-                    // No namespace yet == no indexes (the in-process backend returns an
-                    // empty list rather than an error for an unknown collection).
-                    Err(e) if driver_error_code(&e) == Some(ERROR_NAMESPACE_NOT_FOUND) => {
-                        return Ok(Vec::new())
-                    }
-                    Err(e) => return Err(map_driver_error(e)),
-                };
-                let models: Vec<mongodb::IndexModel> =
-                    cursor.try_collect().await.map_err(map_driver_error)?;
-                Ok(models
-                    .iter()
-                    .filter_map(index_model_to_info)
-                    .collect::<Vec<_>>())
-            })
-            .await
+            let cursor = match coll.list_indexes().await {
+                Ok(cursor) => cursor,
+                // No namespace yet == no indexes (the in-process backend returns an
+                // empty list rather than an error for an unknown collection).
+                Err(e) if driver_error_code(&e) == Some(ERROR_NAMESPACE_NOT_FOUND) => {
+                    return Ok(Vec::new())
+                }
+                Err(e) => return Err(map_driver_error(e)),
+            };
+            let models: Vec<mongodb::IndexModel> =
+                cursor.try_collect().await.map_err(map_driver_error)?;
+            Ok(models
+                .iter()
+                .filter_map(index_model_to_info)
+                .collect::<Vec<_>>())
+        })
+        .await
     }
 
     async fn gridfs_upload(&self, bucket: &str, filename: &str, data: Vec<u8>) -> MongoResult<()> {
@@ -861,79 +860,76 @@ impl MongoClient for MongodbClient {
         let bucket = self.bucket(bucket);
         let filename = filename.to_string();
         exec_on_driver(move || async move {
-                // Upload is an upsert keyed by `filename` (Java `deleteIfExists`): drop
-                // older revisions so `download`/`exists` stay unambiguous.
-                for id in gridfs_file_ids(&bucket, &filename).await? {
-                    bucket.delete(id).await.map_err(map_driver_error)?;
-                }
-                let mut metadata = Document::new();
-                metadata.insert(
-                    crate::client::GRIDFS_META_CREATED_AT.to_string(),
-                    Bson::DateTime(DateTime::now()),
-                );
-                let mut stream = bucket
-                    .open_upload_stream(&filename)
-                    .metadata(metadata)
-                    .await
-                    .map_err(map_driver_error)?;
-                stream
-                    .write_all(&data)
-                    .await
-                    .map_err(map_gridfs_io_error)?;
-                stream.close().await.map_err(map_gridfs_io_error)?;
-                Ok(())
-            })
-            .await
+            // Upload is an upsert keyed by `filename` (Java `deleteIfExists`): drop
+            // older revisions so `download`/`exists` stay unambiguous.
+            for id in gridfs_file_ids(&bucket, &filename).await? {
+                bucket.delete(id).await.map_err(map_driver_error)?;
+            }
+            let mut metadata = Document::new();
+            metadata.insert(
+                crate::client::GRIDFS_META_CREATED_AT.to_string(),
+                Bson::DateTime(DateTime::now()),
+            );
+            let mut stream = bucket
+                .open_upload_stream(&filename)
+                .metadata(metadata)
+                .await
+                .map_err(map_driver_error)?;
+            stream.write_all(&data).await.map_err(map_gridfs_io_error)?;
+            stream.close().await.map_err(map_gridfs_io_error)?;
+            Ok(())
+        })
+        .await
     }
 
-    async fn gridfs_download(
-        &self,
-        bucket: &str,
-        filename: &str,
-    ) -> MongoResult<Option<Vec<u8>>> {
+    async fn gridfs_download(&self, bucket: &str, filename: &str) -> MongoResult<Option<Vec<u8>>> {
         use futures::io::AsyncReadExt as _;
 
         let bucket = self.bucket(bucket);
         let filename = filename.to_string();
         exec_on_driver(move || async move {
-                let Some(id) = gridfs_file_ids(&bucket, &filename).await?.into_iter().next() else {
-                    return Ok(None);
-                };
-                let mut stream = bucket
-                    .open_download_stream(id)
-                    .await
-                    .map_err(map_driver_error)?;
-                let mut data = Vec::new();
-                stream
-                    .read_to_end(&mut data)
-                    .await
-                    .map_err(map_gridfs_io_error)?;
-                Ok(Some(data))
-            })
-            .await
+            let Some(id) = gridfs_file_ids(&bucket, &filename)
+                .await?
+                .into_iter()
+                .next()
+            else {
+                return Ok(None);
+            };
+            let mut stream = bucket
+                .open_download_stream(id)
+                .await
+                .map_err(map_driver_error)?;
+            let mut data = Vec::new();
+            stream
+                .read_to_end(&mut data)
+                .await
+                .map_err(map_gridfs_io_error)?;
+            Ok(Some(data))
+        })
+        .await
     }
 
     async fn gridfs_exists(&self, bucket: &str, filename: &str) -> MongoResult<bool> {
         let bucket = self.bucket(bucket);
         let filename = filename.to_string();
-        exec_on_driver(move || async move {
-                Ok(!gridfs_file_ids(&bucket, &filename).await?.is_empty())
-            })
-            .await
+        exec_on_driver(
+            move || async move { Ok(!gridfs_file_ids(&bucket, &filename).await?.is_empty()) },
+        )
+        .await
     }
 
     async fn gridfs_delete(&self, bucket: &str, filename: &str) -> MongoResult<bool> {
         let bucket = self.bucket(bucket);
         let filename = filename.to_string();
         exec_on_driver(move || async move {
-                let ids = gridfs_file_ids(&bucket, &filename).await?;
-                let removed = !ids.is_empty();
-                for id in ids {
-                    bucket.delete(id).await.map_err(map_driver_error)?;
-                }
-                Ok(removed)
-            })
-            .await
+            let ids = gridfs_file_ids(&bucket, &filename).await?;
+            let removed = !ids.is_empty();
+            for id in ids {
+                bucket.delete(id).await.map_err(map_driver_error)?;
+            }
+            Ok(removed)
+        })
+        .await
     }
 
     async fn insert_raw_index(&self, collection: &str, info: IndexInfo) -> MongoResult<()> {
@@ -952,10 +948,10 @@ impl MongoClient for MongodbClient {
             ))
             .build();
         exec_on_driver(move || async move {
-                coll.create_index(model).await.map_err(map_driver_error)?;
-                Ok(())
-            })
-            .await
+            coll.create_index(model).await.map_err(map_driver_error)?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -979,8 +975,8 @@ fn index_options(
         .sparse(sparse)
         .build();
     options.name = name;
-    options.expire_after = expire_after_seconds
-        .map(|seconds| Duration::from_secs(seconds.max(0) as u64));
+    options.expire_after =
+        expire_after_seconds.map(|seconds| Duration::from_secs(seconds.max(0) as u64));
     options
 }
 
@@ -1054,7 +1050,10 @@ mod tests {
         let filter = FindFilter::eq("versions.k", json!(3)).not_exists("versions.k");
         let doc = find_filter_to_document(&filter);
         let rendered = bson_to_json(&Bson::Document(doc));
-        assert_eq!(rendered, json!({"versions.k": {"$eq": 3, "$exists": false}}));
+        assert_eq!(
+            rendered,
+            json!({"versions.k": {"$eq": 3, "$exists": false}})
+        );
     }
 
     /// MONGO-09: connection settings can be injected programmatically (the Java

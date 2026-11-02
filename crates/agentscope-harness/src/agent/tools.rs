@@ -327,10 +327,9 @@ impl ToolsConfigLoader {
             };
             let name = &after[..end];
             let valid = !name.is_empty()
-                && name
-                    .chars()
-                    .enumerate()
-                    .all(|(i, c)| c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit()));
+                && name.chars().enumerate().all(|(i, c)| {
+                    c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit())
+                });
             if !valid {
                 out.push_str(&rest[start..start + 2 + end + 1]);
             } else {
@@ -427,15 +426,16 @@ mod tests {
         ToolFilter::apply(&toolkit, &config);
         let mut names = toolkit.tool_names();
         names.sort();
-        assert_eq!(names, vec!["read_file".to_string(), "task_list".to_string()]);
+        assert_eq!(
+            names,
+            vec!["read_file".to_string(), "task_list".to_string()]
+        );
     }
 
     #[test]
     fn loader_reads_the_workspace_file_and_substitutes_env() {
-        let root = std::env::temp_dir().join(format!(
-            "agentscope_tools_json_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("agentscope_tools_json_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
@@ -474,10 +474,14 @@ mod tests {
     #[test]
     fn env_references_are_substituted_and_unknown_shapes_left_alone() {
         std::env::set_var("AGENTSCOPE_TOOLS_TEST_TOKEN", "secret");
-        let rendered =
-            ToolsConfigLoader::substitute_env(r#"{"a": "${AGENTSCOPE_TOOLS_TEST_TOKEN}", "b": "${}"}"#);
+        let rendered = ToolsConfigLoader::substitute_env(
+            r#"{"a": "${AGENTSCOPE_TOOLS_TEST_TOKEN}", "b": "${}"}"#,
+        );
         assert!(rendered.contains("\"secret\""), "{rendered}");
-        assert!(rendered.contains("${}"), "invalid references stay verbatim: {rendered}");
+        assert!(
+            rendered.contains("${}"),
+            "invalid references stay verbatim: {rendered}"
+        );
         std::env::remove_var("AGENTSCOPE_TOOLS_TEST_TOKEN");
     }
 }

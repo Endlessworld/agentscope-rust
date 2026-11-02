@@ -115,6 +115,9 @@ mod tests {
         );
         let custom = ReqwestNacosTransport::new().with_timeout(Duration::from_millis(250));
         assert_eq!(custom.timeout(), Some(Duration::from_millis(250)));
-        assert_eq!(ReqwestNacosTransport::new().without_timeout().timeout(), None);
+        assert_eq!(
+            ReqwestNacosTransport::new().without_timeout().timeout(),
+            None
+        );
     }
 }

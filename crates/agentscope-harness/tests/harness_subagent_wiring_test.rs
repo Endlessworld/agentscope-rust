@@ -988,7 +988,8 @@ async fn the_wakeup_guard_sees_both_task_results_and_inbox_hints() {
     assert!(
         agent.has_pending_background_work(&ctx).await,
         "an inbox hint alone must count as pending work"
-    );    assert!(
+    );
+    assert!(
         !bus.inbox_drain("s1", 10).await.expect("drain").is_empty(),
         "the hint must be readable back"
     );

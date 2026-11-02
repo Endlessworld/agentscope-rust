@@ -28,11 +28,8 @@ pub trait KnowledgeSource: Send + Sync {
     async fn add_documents(&self, documents: Vec<KnowledgeDocument>) -> Result<(), JevError>;
 
     /// Retrieves up to `limit` documents for `query`.
-    async fn retrieve(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<KnowledgeDocument>, JevError>;
+    async fn retrieve(&self, query: &str, limit: usize)
+        -> Result<Vec<KnowledgeDocument>, JevError>;
 }
 
 /// The agent-visible passage (`JevKnowledgeTool.Passage`).
@@ -159,7 +156,9 @@ impl JevKnowledge {
             )));
         }
         let Some(selection) = decision.value else {
-            return Err(JevError::protocol("JEV retrieval unavailable: empty decision"));
+            return Err(JevError::protocol(
+                "JEV retrieval unavailable: empty decision",
+            ));
         };
         if selection.selected.is_empty() && !selection.uncertain.is_empty() {
             return Err(JevError::protocol("JEV retrieval inconclusive"));
@@ -232,9 +231,7 @@ mod tests {
         for (index, value) in values.iter().enumerate() {
             answers.insert(
                 format!("item_{index}"),
-                Answer::Noul(NoulAnswer {
-                    noul: Some(*value),
-                }),
+                Answer::Noul(NoulAnswer { noul: Some(*value) }),
             );
         }
         let scripted = Arc::new(ScriptedCaller::new(vec![Ok(SystemOneResult {
@@ -315,9 +312,14 @@ mod tests {
         );
         for limit in [0usize, 1025] {
             assert_eq!(
-                JevKnowledge::new(source.clone(), selector(&[], Mode::Off), Options::disabled(), limit)
-                    .unwrap_err()
-                    .message(),
+                JevKnowledge::new(
+                    source.clone(),
+                    selector(&[], Mode::Off),
+                    Options::disabled(),
+                    limit
+                )
+                .unwrap_err()
+                .message(),
                 "candidateLimit must be 1..1024"
             );
         }
@@ -327,7 +329,10 @@ mod tests {
         );
         let tool = KnowledgeTool::new(4).unwrap();
         assert_eq!(tool.limit(), 4);
-        assert_eq!(tool.register().unwrap_err().message(), KNOWLEDGE_TOOL_UNAVAILABLE);
+        assert_eq!(
+            tool.register().unwrap_err().message(),
+            KNOWLEDGE_TOOL_UNAVAILABLE
+        );
         assert_eq!(
             knowledge_passages(&[document("a")]),
             vec![KnowledgePassage {

@@ -198,7 +198,9 @@ impl AguiRequestProcessor {
             .resume_coordinator
             .add_resume_interrupts(input, runtime_context.clone());
 
-        let adapter = self.adapter_factory.create(agent.clone(), self.config.clone());
+        let adapter = self
+            .adapter_factory
+            .create(agent.clone(), self.config.clone());
         let mut events = Vec::new();
         let mut run_error_seen = false;
         let mut run = adapter.run_with_context(&effective_input, Some(effective_runtime_context));

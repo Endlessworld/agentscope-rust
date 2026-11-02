@@ -60,7 +60,10 @@ async fn mem0_live_round_trip_when_configured() {
         },
     )
     .expect("mem0 adapter should build");
-    adapter.record(&[probe_message()]).await.expect("mem0 record");
+    adapter
+        .record(&[probe_message()])
+        .await
+        .expect("mem0 record");
     // Memory extraction is asynchronous on the Mem0 side, so only reachability of
     // the search endpoint is asserted here.
     adapter
@@ -105,7 +108,10 @@ async fn reme_live_round_trip_when_configured() {
         unique_user_id("agentscope-mem-live"),
     )
     .expect("reme adapter should build");
-    adapter.record(&[probe_message()]).await.expect("reme record");
+    adapter
+        .record(&[probe_message()])
+        .await
+        .expect("reme record");
     adapter
         .retrieve(&probe_message())
         .await

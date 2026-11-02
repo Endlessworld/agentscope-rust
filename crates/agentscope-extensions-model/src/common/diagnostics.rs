@@ -84,7 +84,11 @@ pub fn clear_diagnostic_sink() {
 
 /// Records a diagnostic with `tracing` (the default sink).
 pub fn emit(diagnostic: &ConversionDiagnostic) {
-    if let Some(sink) = sink_slot().read().ok().and_then(|slot| slot.as_ref().cloned()) {
+    if let Some(sink) = sink_slot()
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref().cloned())
+    {
         sink(diagnostic);
     }
     match diagnostic.severity {

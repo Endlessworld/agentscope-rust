@@ -38,8 +38,8 @@ use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
 use crate::http::{bypass_proxy_for_loopback, join_url};
 use crate::kubernetes_files::SandboxFileTransfer;
 use crate::remote::{
-    ensure_output_success, truncate_utf8_bytes, RemoteBackend, RemoteExecOutput, RemoteSandboxClient,
-    RemoteSandboxHandle, OUTPUT_TRUNCATE_BYTES, TAR_TIMEOUT_SECONDS,
+    ensure_output_success, truncate_utf8_bytes, RemoteBackend, RemoteExecOutput,
+    RemoteSandboxClient, RemoteSandboxHandle, OUTPUT_TRUNCATE_BYTES, TAR_TIMEOUT_SECONDS,
 };
 use crate::retry::{with_retries, RetryPolicy};
 use crate::workspace::{shell_quote, short_hash};

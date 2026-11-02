@@ -250,7 +250,8 @@ pub trait StateBackend: Send + Sync {
     }
 
     /// Reads all list values ordered by `item_index`.
-    fn get_list(        &self,
+    fn get_list(
+        &self,
         user_id: Option<&str>,
         session_id: &str,
         state_key: &str,
@@ -389,7 +390,8 @@ impl MysqlAgentStateStore {
         let database_name = &self.database_name;
         let table_name = &self.table_name;
         if self.create_if_not_exist {
-            self.backend.execute_ddl(&create_database_sql(database_name))?;
+            self.backend
+                .execute_ddl(&create_database_sql(database_name))?;
             self.backend
                 .execute_ddl(&create_sessions_table_sql(database_name, table_name))?;
         } else {
@@ -729,10 +731,7 @@ impl AgentStateStore for MysqlAgentStateStore {
         }
         // One statement: Java `getVersioned` selects `state_data` and `version` together, so
         // the pair can never come from two different row versions.
-        match self
-            .backend
-            .get_single_versioned(user_id, session_id, key)
-        {
+        match self.backend.get_single_versioned(user_id, session_id, key) {
             Ok(Some((json, version))) => agentscope_core::state::VersionedState {
                 value: serde_json::from_str(&json).ok(),
                 version,
@@ -1102,8 +1101,7 @@ mod tests {
         );
 
         // A hash describing the 3-item list makes the write an append of `d` at index 3.
-        let expected_prefix_hash =
-            list_hash::compute_hash(&[json!("a"), json!("b"), json!("c")]);
+        let expected_prefix_hash = list_hash::compute_hash(&[json!("a"), json!("b"), json!("c")]);
         backend
             .save_single(Some("u"), "sess", "msgs:_hash", &expected_prefix_hash)
             .unwrap();
@@ -1266,7 +1264,10 @@ mod tests {
             err.to_string().contains("expected 0, found 5"),
             "conflict message should report the stored version: {err}"
         );
-        assert_eq!(s.get(Some("u"), "sess", "k").await, Some(json!({"old": true})));
+        assert_eq!(
+            s.get(Some("u"), "sess", "k").await,
+            Some(json!({"old": true}))
+        );
         assert_eq!(s.read_version(Some("u"), "sess", "k").unwrap(), 5);
     }
 
@@ -1371,7 +1372,11 @@ mod tests {
         }
         // Java: `CREATE DATABASE IF NOT EXISTS` then `CREATE TABLE IF NOT EXISTS`.
         let ddl = backend.ddl_log();
-        assert_eq!(ddl.len(), 2, "one CREATE DATABASE + one CREATE TABLE: {ddl:?}");
+        assert_eq!(
+            ddl.len(),
+            2,
+            "one CREATE DATABASE + one CREATE TABLE: {ddl:?}"
+        );
         assert_eq!(ddl[0], create_database_sql(DEFAULT_DATABASE_NAME));
         assert_eq!(
             ddl[1],
@@ -1384,8 +1389,7 @@ mod tests {
     #[test]
     fn create_table_ddl_pins_binary_collation_on_key_columns() {
         let ddl = create_sessions_table_sql("agentscope", "agentscope_sessions");
-        assert!(ddl
-            .starts_with("CREATE TABLE IF NOT EXISTS `agentscope`.`agentscope_sessions` ("));
+        assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS `agentscope`.`agentscope_sessions` ("));
         assert!(ddl.contains("session_id VARCHAR(255) COLLATE utf8mb4_bin NOT NULL"));
         assert!(ddl.contains("state_key VARCHAR(255) COLLATE utf8mb4_bin NOT NULL"));
         assert!(ddl.contains("version BIGINT NOT NULL DEFAULT 0"));
@@ -1480,8 +1484,7 @@ mod tests {
     #[test]
     fn existing_version_column_is_left_alone() {
         let backend = Arc::new(InMemoryStateBackend::default());
-        MysqlAgentStateStore::with_config(backend.clone(), None, None, true)
-            .expect("bootstrap");
+        MysqlAgentStateStore::with_config(backend.clone(), None, None, true).expect("bootstrap");
         let after_create = backend.ddl_log().len();
         assert_eq!(after_create, 2);
 

@@ -44,13 +44,13 @@ pub use multi_agent::{
     DEFAULT_CONVERSATION_HISTORY_PROMPT, HISTORY_END_TAG, HISTORY_START_TAG,
     MULTI_AGENT_FORMATTER_KEY,
 };
-pub use transport::{
-    decode_stream_line, HttpRequestSpec, HttpTransport, JsonStream, MemoryTransport,
-    ReqwestTransport, SharedTransport, TransportConfig,
-};
 pub use tool_search::{
     is_tool_search_schema, loaded_tool_names, loaded_tool_schemas, tool_search_schema,
     ToolSearchMode, METADATA_CLIENT_TOOL_SEARCH_CALL, METADATA_MODE, METADATA_TOOLS,
     TOOL_SEARCH_TOOL_NAME,
+};
+pub use transport::{
+    decode_stream_line, HttpRequestSpec, HttpTransport, JsonStream, MemoryTransport,
+    ReqwestTransport, SharedTransport, TransportConfig,
 };
 pub use usage::{merge_into, merge_non_zero};

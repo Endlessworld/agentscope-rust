@@ -357,7 +357,10 @@ impl JevTaskSupervisor {
         state.insert("original_job".to_string(), json!(snapshot.task));
         state.insert(
             "latest_worker_output".to_string(),
-            json!(trace_data::tail(&snapshot.output_tail, self.limits.text_chars)),
+            json!(trace_data::tail(
+                &snapshot.output_tail,
+                self.limits.text_chars
+            )),
         );
         state.insert("worker_active".to_string(), json!(snapshot.worker_active));
         state.insert("worker_failed".to_string(), json!(snapshot.worker_failed));
@@ -373,7 +376,10 @@ impl JevTaskSupervisor {
         );
         state.insert(
             "git_status".to_string(),
-            json!(trace_data::tail(&evidence.repository_status, self.limits.text_chars)),
+            json!(trace_data::tail(
+                &evidence.repository_status,
+                self.limits.text_chars
+            )),
         );
         state.insert(
             "git_diff".to_string(),
@@ -388,23 +394,33 @@ impl JevTaskSupervisor {
                 .map(|file| trace_data::tail(file, 1024))
                 .collect::<Vec<_>>()),
         );
-        state.insert("agents_md_instructions".to_string(), json!(evidence.instructions));
+        state.insert(
+            "agents_md_instructions".to_string(),
+            json!(evidence.instructions),
+        );
         state.insert(
             "documentation_required".to_string(),
             json!(evidence.documentation_required),
         );
-        state.insert("verification_current_and_passed".to_string(), json!(verified));
+        state.insert(
+            "verification_current_and_passed".to_string(),
+            json!(verified),
+        );
         state.insert(
             "verification_summary".to_string(),
             json!(match &evidence.verification {
                 None => "NO_VERIFICATION".to_string(),
-                Some(verification) => trace_data::tail(&verification.summary, self.limits.text_chars),
+                Some(verification) =>
+                    trace_data::tail(&verification.summary, self.limits.text_chars),
             }),
         );
         state.insert("evidence_truncated".to_string(), json!(truncated));
         state.insert("evidence_rules".to_string(), json!(EVIDENCE_RULES));
         let serialized = serde_json::to_string(&Value::Object(
-            state.iter().map(|(key, value)| (key.clone(), value.clone())).collect(),
+            state
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
         ))
         .map_err(|_error| JevError::invalid("state exceeds budget"))?;
         if serialized.chars().count() > self.limits.max_state_chars {
@@ -418,9 +434,11 @@ impl JevTaskSupervisor {
                 Question::Noul(NoulQuestion::new(json!(check.instructions), None)),
             );
         }
-        let request = SystemOneRequest::new(Some(Value::Object(
-            state.into_iter().collect(),
-        )), None, questions.clone());
+        let request = SystemOneRequest::new(
+            Some(Value::Object(state.into_iter().collect())),
+            None,
+            questions.clone(),
+        );
         let response = (self.caller)(request.clone())
             .await
             .map_err(|failure| JevError::protocol(failure.message().to_string()))?;
@@ -633,7 +651,11 @@ pub fn arbitrate(
     }
     if !snapshot.worker_active {
         if snapshot.evidence.documentation_required
-            && truth(findings, "quality.documentation", "documentation_sufficient") == Truth::No
+            && truth(
+                findings,
+                "quality.documentation",
+                "documentation_sufficient",
+            ) == Truth::No
         {
             proposals.push(Proposal {
                 responsibility: "quality.documentation",
@@ -714,7 +736,11 @@ fn uncertain_for_decision(
             || truth(findings, "core.worker-health", "work_off_track") == Truth::Unknown;
     }
     if snapshot.evidence.documentation_required
-        && truth(findings, "quality.documentation", "documentation_sufficient") == Truth::Unknown
+        && truth(
+            findings,
+            "quality.documentation",
+            "documentation_sufficient",
+        ) == Truth::Unknown
     {
         return true;
     }
@@ -807,7 +833,13 @@ mod tests {
             .evidence
             .clone()
             .with_verification(Verification::new(
-                "u", "s", "r", "rev1", "cargo test", true, "ok",
+                "u",
+                "s",
+                "r",
+                "rev1",
+                "cargo test",
+                true,
+                "ok",
             ))
             .unwrap();
         snapshot
@@ -841,12 +873,7 @@ mod tests {
             } else {
                 0.1
             };
-            answers.insert(
-                key,
-                Answer::Noul(NoulAnswer {
-                    noul: Some(value),
-                }),
-            );
+            answers.insert(key, Answer::Noul(NoulAnswer { noul: Some(value) }));
         }
         SystemOneResult {
             model: Some("jev".to_string()),
@@ -1010,7 +1037,10 @@ mod tests {
             .proposals
             .iter()
             .any(|proposal| proposal.reason == "DOCUMENTATION_INCOMPLETE"));
-        assert_eq!(report.proposals.last().unwrap().reason, "WORKER_MAY_CONTINUE");
+        assert_eq!(
+            report.proposals.last().unwrap().reason,
+            "WORKER_MAY_CONTINUE"
+        );
 
         let mut failed = snapshot(false, false);
         failed.worker_failed = true;
@@ -1064,13 +1094,9 @@ mod tests {
         assert_eq!(thresholds.classify(0.2), Truth::No);
         assert_eq!(thresholds.classify(0.8), Truth::Yes);
         assert_eq!(thresholds.classify(0.5), Truth::Unknown);
-        let supervisor = JevTaskSupervisor::new(
-            caller,
-            thresholds,
-            Limits::defaults(),
-            Options::disabled(),
-        )
-        .unwrap();
+        let supervisor =
+            JevTaskSupervisor::new(caller, thresholds, Limits::defaults(), Options::disabled())
+                .unwrap();
         assert_eq!(supervisor.mode(), Mode::Off);
         assert_eq!(supervisor.limits().text_chars, 12_000);
         assert!(format!("{supervisor:?}").contains("JevTaskSupervisor"));

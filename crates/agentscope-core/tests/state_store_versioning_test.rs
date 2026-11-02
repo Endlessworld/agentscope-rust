@@ -92,7 +92,9 @@ async fn json_file_store_degrades_to_unconditional_writes() {
 async fn in_memory_delete_key_removes_only_that_key() {
     let store = InMemoryAgentStateStore::new();
     store.save(Some("u"), "s", "a", json!(1)).await;
-    store.save_list(Some("u"), "s", "b", &[json!(1), json!(2)]).await;
+    store
+        .save_list(Some("u"), "s", "b", &[json!(1), json!(2)])
+        .await;
 
     store.delete_key(Some("u"), "s", "a").await.unwrap();
 
@@ -176,10 +178,7 @@ async fn in_memory_try_methods_reject_a_blank_session_id() {
     // The infallible methods drop a blank session id on the floor (`let _ = require_...`);
     // the fallible surface must report it instead of writing to the `""` session.
     let store = InMemoryAgentStateStore::new();
-    assert!(store
-        .try_get_versioned(None, "  ", "k")
-        .await
-        .is_err());
+    assert!(store.try_get_versioned(None, "  ", "k").await.is_err());
     assert!(store
         .try_save_if_version(None, "  ", "k", json!(1), 0)
         .await

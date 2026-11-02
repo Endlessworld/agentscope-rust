@@ -42,9 +42,7 @@ fn skip() -> bool {
     if url().is_some() {
         return false;
     }
-    eprintln!(
-        "skipping: set AGENTSCOPE_TEST_MYSQL_URL to run the live MySQL integration tests"
-    );
+    eprintln!("skipping: set AGENTSCOPE_TEST_MYSQL_URL to run the live MySQL integration tests");
     true
 }
 
@@ -90,8 +88,7 @@ fn reset_schema(backend: &Arc<MysqlAsyncBackend>) {
         config.snapshot_table.clone(),
     ] {
         let sql = format!("DROP TABLE IF EXISTS `{}`.`{}`", config.database, table);
-        <MysqlAsyncBackend as StateBackend>::execute_ddl(&**backend, &sql)
-            .expect("drop table");
+        <MysqlAsyncBackend as StateBackend>::execute_ddl(&**backend, &sql).expect("drop table");
     }
 }
 
@@ -142,7 +139,10 @@ fn state_store_round_trip_cas_and_lists() {
     ))
     .expect("unconditional save");
     assert_eq!(first, 1);
-    assert_eq!(store.read_version(Some("alice"), "s1", "counter").unwrap(), 1);
+    assert_eq!(
+        store.read_version(Some("alice"), "s1", "counter").unwrap(),
+        1
+    );
 
     let created = futures::executor::block_on(store.save_if_version(
         Some("alice"),
@@ -163,23 +163,40 @@ fn state_store_round_trip_cas_and_lists() {
         Some(1),
     ));
     assert!(stale.is_err(), "stale CAS must fail: {stale:?}");
-    assert_eq!(store.read_version(Some("alice"), "s1", "counter").unwrap(), 2);
+    assert_eq!(
+        store.read_version(Some("alice"), "s1", "counter").unwrap(),
+        2
+    );
 
     // Lists: append, mutate a prefix, then shrink.
     let store_ref = &store;
     futures::executor::block_on(async move {
         use agentscope_core::state::AgentStateStore as _;
-        store_ref.save_list(Some("alice"), "s1", "items", &[json!(1), json!(2)]).await;
-        assert_eq!(store_ref.get_list(Some("alice"), "s1", "items").await, vec![json!(1), json!(2)]);
+        store_ref
+            .save_list(Some("alice"), "s1", "items", &[json!(1), json!(2)])
+            .await;
+        assert_eq!(
+            store_ref.get_list(Some("alice"), "s1", "items").await,
+            vec![json!(1), json!(2)]
+        );
 
-        store_ref.save_list(Some("alice"), "s1", "items", &[json!(9), json!(2), json!(3)]).await;
+        store_ref
+            .save_list(
+                Some("alice"),
+                "s1",
+                "items",
+                &[json!(9), json!(2), json!(3)],
+            )
+            .await;
         assert_eq!(
             store_ref.get_list(Some("alice"), "s1", "items").await,
             vec![json!(9), json!(2), json!(3)],
             "a mutated prefix is rewritten, not just appended"
         );
 
-        store_ref.save_list(Some("alice"), "s1", "items", &[json!(9)]).await;
+        store_ref
+            .save_list(Some("alice"), "s1", "items", &[json!(9)])
+            .await;
         assert_eq!(
             store_ref.get_list(Some("alice"), "s1", "items").await,
             vec![json!(9)],
@@ -207,7 +224,10 @@ fn state_store_round_trip_cas_and_lists() {
 
     // Cleanup helper from the Java store.
     assert_eq!(store.truncate_all_sessions().expect("truncate"), 0);
-    assert_eq!(store.read_version(Some("alice"), "s1", "counter").unwrap(), 0);
+    assert_eq!(
+        store.read_version(Some("alice"), "s1", "counter").unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -226,12 +246,7 @@ fn kv_store_cas_and_prefix_search() {
         .build();
 
     let namespace = vec!["it".to_string(), "kv".to_string()];
-    let value = |n: i64| {
-        json!({ "n": n })
-            .as_object()
-            .cloned()
-            .expect("object")
-    };
+    let value = |n: i64| json!({ "n": n }).as_object().cloned().expect("object");
 
     store.put(&namespace, "alpha", value(1));
     assert_eq!(store.get(&namespace, "alpha").expect("get").version, 1);
@@ -315,23 +330,19 @@ fn advisory_lock_is_session_scoped_across_backends() {
 
     // A second session must *not* get the lock: MySQL `GET_LOCK` is session scoped, so the
     // acquire really happened on a dedicated connection.
-    assert!(
-        !<MysqlAsyncBackend as LockBackend>::try_acquire(
-            &*second,
-            "agentscope:it:lock:user:alice",
-            Duration::from_secs(0),
-        )
-        .expect("contended acquire")
-    );
+    assert!(!<MysqlAsyncBackend as LockBackend>::try_acquire(
+        &*second,
+        "agentscope:it:lock:user:alice",
+        Duration::from_secs(0),
+    )
+    .expect("contended acquire"));
 
     drop(lease);
     assert!(!guard.is_held(&key));
-    assert!(
-        <MysqlAsyncBackend as LockBackend>::try_acquire(
-            &*second,
-            "agentscope:it:lock:user:alice",
-            Duration::from_secs(5),
-        )
-        .expect("released acquire")
-    );
+    assert!(<MysqlAsyncBackend as LockBackend>::try_acquire(
+        &*second,
+        "agentscope:it:lock:user:alice",
+        Duration::from_secs(5),
+    )
+    .expect("released acquire"));
 }

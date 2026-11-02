@@ -387,9 +387,7 @@ fn resolve_cron(schedule_config: &ScheduleConfig) -> Result<Option<Arc<CronPlan>
     }
     let expression = schedule_config.cron_expression().unwrap_or_default();
     let parsed = CronExpression::parse(expression).map_err(|e| {
-        SchedulerError::invalid_argument(format!(
-            "CronExpression '{expression}' is invalid: {e}"
-        ))
+        SchedulerError::invalid_argument(format!("CronExpression '{expression}' is invalid: {e}"))
     })?;
     let offset = schedule_config.zone_offset().map_err(|e| {
         SchedulerError::invalid_argument(format!(
@@ -691,10 +689,7 @@ mod tests {
         );
 
         let err = expect_err(sched.trigger("missing").await, "unknown task");
-        assert!(
-            matches!(err, SchedulerError::Backend(_)),
-            "err was {err}"
-        );
+        assert!(matches!(err, SchedulerError::Backend(_)), "err was {err}");
 
         sched.shutdown().await;
         let err = expect_err(
@@ -994,7 +989,10 @@ mod tests {
             .initial_delay(1)
             .build()
             .unwrap();
-        let task = sched.schedule_runtime(runtime("Rate"), cfg, None).await.unwrap();
+        let task = sched
+            .schedule_runtime(runtime("Rate"), cfg, None)
+            .await
+            .unwrap();
         let qt = task
             .as_any()
             .downcast_ref::<QuartzScheduleAgentTask>()
@@ -1117,12 +1115,14 @@ mod tests {
             config: &RuntimeAgentConfig,
             _messages: Vec<Msg>,
         ) -> agentscope_core::error::Result<Msg> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // The factory-resolved model is injected into the config, so building
             // the agent from `config.model()` works exactly like Java.
             assert_eq!(
-                config.model().expect("resolved model injected").model_name(),
+                config
+                    .model()
+                    .expect("resolved model injected")
+                    .model_name(),
                 "stub-model"
             );
             Ok(Msg::assistant("ran"))
@@ -1218,12 +1218,9 @@ mod tests {
 
         // `notify_one` stores a permit when nobody waits yet, so registering the
         // waiter after `schedule_runtime` cannot miss the first acquisition.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            lock.acquired.notified(),
-        )
-        .await
-        .expect("the injected lock was never consulted");
+        tokio::time::timeout(std::time::Duration::from_secs(5), lock.acquired.notified())
+            .await
+            .expect("the injected lock was never consulted");
 
         let granted = lock.granted.lock().unwrap().clone();
         assert_eq!(granted.len(), 1, "one firing, one lock acquisition");
@@ -1280,12 +1277,9 @@ mod tests {
             .downcast_ref::<QuartzScheduleAgentTask>()
             .unwrap();
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            lock.acquired.notified(),
-        )
-        .await
-        .expect("the injected lock was never consulted");
+        tokio::time::timeout(std::time::Duration::from_secs(5), lock.acquired.notified())
+            .await
+            .expect("the injected lock was never consulted");
 
         assert_eq!(qt.execution_count(), 0, "a denied slot must not execute");
         assert!(lock.granted.lock().unwrap()[0].contains(":delay:"));
@@ -1403,8 +1397,7 @@ mod tests {
             _config: &RuntimeAgentConfig,
             _messages: Vec<Msg>,
         ) -> agentscope_core::error::Result<Msg> {
-            self.fires
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.fires.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if !self.work.is_zero() {
                 tokio::time::sleep(self.work).await;
             }
@@ -1472,7 +1465,10 @@ mod tests {
         let err = task.run_empty().await.unwrap_err();
         match err {
             agentscope_core::error::Error::Agent(message) => {
-                assert!(message.contains("cancelled"), "unexpected message: {message}")
+                assert!(
+                    message.contains("cancelled"),
+                    "unexpected message: {message}"
+                )
             }
             other => panic!("expected an agent error, got {other:?}"),
         }

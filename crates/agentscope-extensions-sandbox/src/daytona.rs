@@ -539,9 +539,7 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(POST)
                     .path("/toolbox/sbx-9/process/execute")
-                    .json_body_partial(
-                        r#"{"command":"ls","cwd":"home/daytona/workspace"}"#,
-                    );
+                    .json_body_partial(r#"{"command":"ls","cwd":"home/daytona/workspace"}"#);
                 then.status(200)
                     .json_body(json!({"exitCode": 0, "result": "x".repeat(600 * 1024)}));
             })

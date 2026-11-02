@@ -134,7 +134,11 @@ impl AnthropicModelProvider {
         // fields: Anthropic rejects unknown top-level body keys with HTTP 400
         // (MODEL-09).
         let mut default_options = ctx.options.clone();
-        for key in [OPTION_AUTH_TOKEN, OPTION_CACHE_TTL, OPTION_CONTEXT_WINDOW_SIZE] {
+        for key in [
+            OPTION_AUTH_TOKEN,
+            OPTION_CACHE_TTL,
+            OPTION_CONTEXT_WINDOW_SIZE,
+        ] {
             default_options.additional_body_params.remove(key);
         }
         // Formatter selector (mirrors Java's `AnthropicModelProvider` picking an
@@ -147,11 +151,12 @@ impl AnthropicModelProvider {
             BASE_URL_ENV,
             crate::anthropic::credential::DEFAULT_BASE_URL,
         );
-        let mut model = AnthropicChatModel::new(model_name, auth_mode, secret, Some(base_url), transport)
-            .with_default_options(default_options)
-            .with_stream(ctx.stream.unwrap_or(true))
-            .with_context_window_size(context_window_size)
-            .with_multi_agent_formatter(multi_agent_prompt);
+        let mut model =
+            AnthropicChatModel::new(model_name, auth_mode, secret, Some(base_url), transport)
+                .with_default_options(default_options)
+                .with_stream(ctx.stream.unwrap_or(true))
+                .with_context_window_size(context_window_size)
+                .with_multi_agent_formatter(multi_agent_prompt);
         if let Some(ttl) = cache_ttl {
             model = model.with_cache_ttl(ttl);
         }

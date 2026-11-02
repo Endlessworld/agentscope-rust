@@ -112,7 +112,10 @@ pub fn quality_state(messages: &[TraceMessage], draft: &str) -> Result<JevTrace,
     state.insert("answer".to_string(), json!(draft));
     state.insert("user_question".to_string(), json!(user_question));
     state.insert("assistant_answer".to_string(), json!(draft));
-    state.insert("tool_calls".to_string(), Value::Array(trace.list("tool_calls").to_vec()));
+    state.insert(
+        "tool_calls".to_string(),
+        Value::Array(trace.list("tool_calls").to_vec()),
+    );
     state.insert(
         "supporting_context".to_string(),
         Value::Array(supporting_context),

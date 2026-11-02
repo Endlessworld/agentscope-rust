@@ -728,7 +728,10 @@ pub fn answer_relevancy(thresholds: Thresholds) -> Arc<dyn JevTraceMetric> {
 }
 
 /// `trajectory_match`.
-pub fn trajectory_match(mode: TrajectoryMatchMode, match_arguments: bool) -> Arc<dyn JevTraceMetric> {
+pub fn trajectory_match(
+    mode: TrajectoryMatchMode,
+    match_arguments: bool,
+) -> Arc<dyn JevTraceMetric> {
     Arc::new(TrajectoryMatchMetric {
         base: BaseMetric::new(
             "trajectory_match",
@@ -796,7 +799,10 @@ fn noul(answers: &BTreeMap<String, Answer>, id: &str) -> Result<f64, JevError> {
     }
 }
 
-fn choice<'a>(answers: &'a BTreeMap<String, Answer>, id: &str) -> Result<&'a ChoiceAnswer, JevError> {
+fn choice<'a>(
+    answers: &'a BTreeMap<String, Answer>,
+    id: &str,
+) -> Result<&'a ChoiceAnswer, JevError> {
     match answers.get(id) {
         Some(Answer::Choice(answer)) => Ok(answer),
         _ => Err(JevError::invalid(format!(
@@ -880,7 +886,10 @@ mod tests {
     fn noul_metrics_skip_when_required_fields_are_missing() {
         let metric = used_tool_result(thresholds());
         assert_eq!(
-            metric.precheck(&sample_trace(json!({"request": "q"}))).unwrap().reason,
+            metric
+                .precheck(&sample_trace(json!({"request": "q"})))
+                .unwrap()
+                .reason,
             "MISSING_FIELDS"
         );
         assert_eq!(
@@ -945,9 +954,12 @@ mod tests {
             Answer::Choice(ChoiceAnswer {
                 choice: Some("correct".to_string()),
                 probabilities: Some(
-                    [("correct".to_string(), 0.9), ("unnecessary".to_string(), 0.1)]
-                        .into_iter()
-                        .collect(),
+                    [
+                        ("correct".to_string(), 0.9),
+                        ("unnecessary".to_string(), 0.1),
+                    ]
+                    .into_iter()
+                    .collect(),
                 ),
                 confidence: Some(0.8),
             }),
@@ -963,9 +975,12 @@ mod tests {
             Answer::Choice(ChoiceAnswer {
                 choice: Some("unnecessary".to_string()),
                 probabilities: Some(
-                    [("correct".to_string(), 0.1), ("unnecessary".to_string(), 0.9)]
-                        .into_iter()
-                        .collect(),
+                    [
+                        ("correct".to_string(), 0.1),
+                        ("unnecessary".to_string(), 0.9),
+                    ]
+                    .into_iter()
+                    .collect(),
                 ),
                 confidence: Some(0.5),
             }),
@@ -1137,7 +1152,10 @@ mod tests {
     #[test]
     fn claims_prefer_an_explicit_list_and_split_sentences_otherwise() {
         let explicit = sample_trace(json!({"claims": ["one", "two"], "final_answer": "ignored"}));
-        assert_eq!(claims(&explicit), vec!["one".to_string(), "two".to_string()]);
+        assert_eq!(
+            claims(&explicit),
+            vec!["one".to_string(), "two".to_string()]
+        );
 
         assert_eq!(
             split_sentences("First one. Second one! Third?\nFourth"),

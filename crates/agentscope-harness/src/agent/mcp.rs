@@ -533,7 +533,12 @@ impl McpToolSource for McpClientSource {
     }
 
     async fn initialize(&self) -> Result<()> {
-        if self.manager.find_client_id_by_server(&self.server).await.is_some() {
+        if self
+            .manager
+            .find_client_id_by_server(&self.server)
+            .await
+            .is_some()
+        {
             return Ok(());
         }
         let client_id = self

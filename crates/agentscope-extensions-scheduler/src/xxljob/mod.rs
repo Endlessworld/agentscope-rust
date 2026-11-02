@@ -282,7 +282,9 @@ mod tests {
         let sched = XxlJobAgentScheduler::new(Arc::new(EchoFactory));
         let input = runtime("A");
         assert!(input.middleware().is_empty());
-        let task = sched.schedule_runtime(input.clone(), ScheduleConfig::none()).unwrap();
+        let task = sched
+            .schedule_runtime(input.clone(), ScheduleConfig::none())
+            .unwrap();
 
         let base = task
             .as_any()
@@ -413,10 +415,7 @@ mod tests {
 
         // Unknown handler / failed execution are backend failures (`RuntimeException`).
         let err = sched.trigger("missing", "").await.unwrap_err();
-        assert!(
-            matches!(err, SchedulerError::Backend(_)),
-            "err was {err}"
-        );
+        assert!(matches!(err, SchedulerError::Backend(_)), "err was {err}");
 
         sched.shutdown().await;
         let err = sched

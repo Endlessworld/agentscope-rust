@@ -14,9 +14,8 @@ use crate::error::SkillRepositoryError;
 use crate::repository::{AgentSkillRepository, AgentSkillRepositoryInfo};
 use crate::sql::{SqlConnection, SqlDatabase, SqlParam};
 use crate::util::{
-    build_skill, has_extended_metadata, is_skill_document, resolve_identifier,
-    serialize_metadata, skill_body, validate_identifier, validate_resource_path,
-    validate_skill_name,
+    build_skill, has_extended_metadata, is_skill_document, resolve_identifier, serialize_metadata,
+    skill_body, validate_identifier, validate_resource_path, validate_skill_name,
 };
 
 /// Default database name.
@@ -1213,18 +1212,30 @@ mod tests {
     fn all_skill_names_are_sorted() {
         let r = repo();
         r.save(
-            &[skill("charlie", "c"), skill("alpha", "a"), skill("bravo", "b")],
+            &[
+                skill("charlie", "c"),
+                skill("alpha", "a"),
+                skill("bravo", "b"),
+            ],
             false,
         )
         .unwrap();
         assert_eq!(
             r.get_all_skill_names().unwrap(),
-            vec!["alpha".to_string(), "bravo".to_string(), "charlie".to_string()]
+            vec![
+                "alpha".to_string(),
+                "bravo".to_string(),
+                "charlie".to_string()
+            ]
         );
         let all = r.get_all_skills().unwrap();
         assert_eq!(
             all.iter().map(|s| s.name().to_string()).collect::<Vec<_>>(),
-            vec!["alpha".to_string(), "bravo".to_string(), "charlie".to_string()]
+            vec![
+                "alpha".to_string(),
+                "bravo".to_string(),
+                "charlie".to_string()
+            ]
         );
     }
 

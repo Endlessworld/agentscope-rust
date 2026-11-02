@@ -148,7 +148,8 @@ impl Price {
         {
             return None;
         }
-        let total = ((usage.input_tokens - usage.cached_tokens - usage.cache_creation_tokens) as f64
+        let total = ((usage.input_tokens - usage.cached_tokens - usage.cache_creation_tokens)
+            as f64
             * self.input
             + usage.output_tokens as f64 * self.output
             + usage.cached_tokens as f64 * self.cached
@@ -215,10 +216,19 @@ impl Candidate {
     pub fn state(&self) -> serde_json::Value {
         let mut state = serde_json::Map::new();
         state.insert("id".to_string(), serde_json::json!(self.id));
-        state.insert("description".to_string(), serde_json::json!(self.description));
-        state.insert("context_window".to_string(), serde_json::json!(self.context_window));
+        state.insert(
+            "description".to_string(),
+            serde_json::json!(self.description),
+        );
+        state.insert(
+            "context_window".to_string(),
+            serde_json::json!(self.context_window),
+        );
         state.insert("max_output".to_string(), serde_json::json!(self.max_output));
-        state.insert("supports_tools".to_string(), serde_json::json!(self.supports_tools));
+        state.insert(
+            "supports_tools".to_string(),
+            serde_json::json!(self.supports_tools),
+        );
         state.insert("quota".to_string(), serde_json::json!(self.quota.as_str()));
         state.insert(
             "efforts".to_string(),
@@ -400,7 +410,11 @@ pub fn excluded(
 ///
 /// Falls back to the highest supported effort when the floor is above every supported effort
 /// (the host already decided the candidate is usable).
-pub fn effort(candidate: &Candidate, wanted: Option<Effort>, floor: Option<Effort>) -> Option<Effort> {
+pub fn effort(
+    candidate: &Candidate,
+    wanted: Option<Effort>,
+    floor: Option<Effort>,
+) -> Option<Effort> {
     let mut target = wanted;
     if let Some(floor) = floor {
         if target.is_none_or(|target| target < floor) {
@@ -517,9 +531,18 @@ mod tests {
             "invalid model id"
         );
         assert_eq!(
-            Candidate::new("m", "d", Some(0), None, true, BTreeSet::new(), Quota::Low, None)
-                .unwrap_err()
-                .message(),
+            Candidate::new(
+                "m",
+                "d",
+                Some(0),
+                None,
+                true,
+                BTreeSet::new(),
+                Quota::Low,
+                None
+            )
+            .unwrap_err()
+            .message(),
             "positive capability limits required"
         );
         assert_eq!(
@@ -556,8 +579,14 @@ mod tests {
         let snapshot = snapshot(vec![sample_candidate("m")]);
         assert_eq!(snapshot.input_tokens, 1_000);
         assert_eq!(sample_candidate("m").state()["id"], json!("m"));
-        assert_eq!(sample_candidate("m").state()["efforts"], json!(["low", "medium", "high"]));
-        assert!(sample_candidate("m").state().get("price_usd_per_million").is_none());
+        assert_eq!(
+            sample_candidate("m").state()["efforts"],
+            json!(["low", "medium", "high"])
+        );
+        assert!(sample_candidate("m")
+            .state()
+            .get("price_usd_per_million")
+            .is_none());
     }
 
     #[test]
@@ -591,7 +620,8 @@ mod tests {
             Some("CONTEXT_UNKNOWN")
         );
 
-        let tight = Snapshot::new(vec![sample_candidate("m")], 199_000, 4_000, None, None, 0).unwrap();
+        let tight =
+            Snapshot::new(vec![sample_candidate("m")], 199_000, 4_000, None, None, 0).unwrap();
         assert_eq!(
             excluded(&sample_candidate("m"), &tight, &request),
             Some("CONTEXT_LIMIT")
@@ -632,28 +662,12 @@ mod tests {
 
         let mut narrow = sample_candidate("m");
         narrow.efforts = efforts(&[Effort::Minimal]);
-        let floor = Snapshot::new(
-            vec![narrow.clone()],
-            0,
-            0,
-            Some(Effort::High),
-            None,
-            0,
-        )
-        .unwrap();
+        let floor = Snapshot::new(vec![narrow.clone()], 0, 0, Some(Effort::High), None, 0).unwrap();
         assert_eq!(excluded(&narrow, &floor, &request), Some("EFFORT_FLOOR"));
 
         let mut wide = sample_candidate("m");
         wide.efforts = efforts(&[Effort::Low, Effort::High]);
-        let floor = Snapshot::new(
-            vec![wide.clone()],
-            0,
-            0,
-            Some(Effort::High),
-            None,
-            0,
-        )
-        .unwrap();
+        let floor = Snapshot::new(vec![wide.clone()], 0, 0, Some(Effort::High), None, 0).unwrap();
         let low = RouteRequest {
             reasoning_effort: Some("low".to_string()),
             ..RouteRequest::default()
@@ -668,7 +682,10 @@ mod tests {
     #[test]
     fn effort_rounds_up_to_the_smallest_supported_value() {
         let candidate = sample_candidate("m");
-        assert_eq!(effort(&candidate, Some(Effort::Low), None), Some(Effort::Low));
+        assert_eq!(
+            effort(&candidate, Some(Effort::Low), None),
+            Some(Effort::Low)
+        );
         assert_eq!(
             effort(&candidate, Some(Effort::Minimal), None),
             Some(Effort::Low),

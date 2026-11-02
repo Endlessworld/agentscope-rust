@@ -673,10 +673,7 @@ impl AgentRunBackend {
                 if let Some(account_id) = account_id.filter(|a| !a.trim().is_empty()) {
                     request = request.header("X-Acs-Parent-Id", account_id);
                 }
-                if let Some(session_id) = session_id
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                {
+                if let Some(session_id) = session_id.as_deref().filter(|s| !s.trim().is_empty()) {
                     request = request.header(MCP_SESSION_ID_HEADER, session_id);
                 }
                 let response = request
@@ -1228,7 +1225,10 @@ mod tests {
         assert!(id.bytes().all(|b| SANDBOX_ID_ALPHABET.contains(&b)));
         // Same session -> same id (idempotent re-create); a different one diverges.
         assert_eq!(id, derive_sandbox_id(session));
-        assert_ne!(id, derive_sandbox_id("6f9a0f2f-0000-4000-8000-000000000001"));
+        assert_ne!(
+            id,
+            derive_sandbox_id("6f9a0f2f-0000-4000-8000-000000000001")
+        );
     }
 
     #[test]
@@ -1373,10 +1373,16 @@ mod tests {
         call.assert_hits_async(1).await;
         assert_eq!(output.exit_code, 0);
         assert_eq!(output.stdout, "hi");
-        assert_eq!(backend.mcp_session_id("sbx-1").await.as_deref(), Some("mcp-sess-1"));
+        assert_eq!(
+            backend.mcp_session_id("sbx-1").await.as_deref(),
+            Some("mcp-sess-1")
+        );
 
         // The cached session is reused: no second `initialize`.
-        backend.exec_in(&handle, "echo again", None, 5).await.unwrap();
+        backend
+            .exec_in(&handle, "echo again", None, 5)
+            .await
+            .unwrap();
         init.assert_hits_async(1).await;
         call.assert_hits_async(2).await;
 
@@ -1421,7 +1427,10 @@ mod tests {
 
         let backend = mock_backend(&server, None);
         let handle = RemoteSandboxHandle::new("sbx-2", BTreeMap::new());
-        let err = backend.exec_in(&handle, "echo hi", None, 5).await.unwrap_err();
+        let err = backend
+            .exec_in(&handle, "echo hi", None, 5)
+            .await
+            .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("Mcp-Session-Id"), "got {message}");
         init.assert_hits_async(1).await;

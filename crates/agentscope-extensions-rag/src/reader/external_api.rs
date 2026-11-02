@@ -29,8 +29,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use agentscope_core::message::{ContentBlock, TextBlock};
+use async_trait::async_trait;
 
 use crate::error::{RagError, Result};
 use crate::model::{Document, DocumentMetadata};
@@ -38,7 +38,9 @@ use crate::reader::utils::generate_doc_id_sha256;
 use crate::reader::{
     chunk_text, input_as_path, validate_chunking_parameters, Reader, ReaderInput, SplitStrategy,
 };
-use crate::transport::{HttpRequest, HttpResponse, HttpTransport, ReqwestTransport, TransportOptions};
+use crate::transport::{
+    HttpRequest, HttpResponse, HttpTransport, ReqwestTransport, TransportOptions,
+};
 
 /// Java `ExternalApiReader.Builder` default: connect timeout (10s).
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -117,12 +119,13 @@ impl FileBodyRequest {
 
 impl ExternalApiRequestBuilder for FileBodyRequest {
     fn build_request(&self, file_path: &str) -> Result<HttpRequest> {
-        let body = serde_json::to_string(&serde_json::json!({ "file_path": file_path }))
-            .map_err(|error| {
+        let body = serde_json::to_string(&serde_json::json!({ "file_path": file_path })).map_err(
+            |error| {
                 RagError::Reader(format!(
                     "failed to serialize the parsing-service request: {error}"
                 ))
-            })?;
+            },
+        )?;
         Ok(HttpRequest::post_json(self.endpoint.clone(), body))
     }
 }
@@ -493,7 +496,10 @@ mod tests {
         }
     }
 
-    struct FixedRequest { url: &'static str, body: &'static str }
+    struct FixedRequest {
+        url: &'static str,
+        body: &'static str,
+    }
 
     impl ExternalApiRequestBuilder for FixedRequest {
         fn build_request(&self, file_path: &str) -> Result<HttpRequest> {
@@ -622,10 +628,8 @@ mod tests {
     #[tokio::test]
     async fn read_assigns_sequential_chunk_ids() {
         let path = temp_file("chunks.txt");
-        let transport = MockTransport::with_responses(vec![HttpResponse::new(
-            200,
-            "aaaa\n\nbbbb\n\ncccc",
-        )]);
+        let transport =
+            MockTransport::with_responses(vec![HttpResponse::new(200, "aaaa\n\nbbbb\n\ncccc")]);
         let reader = reader(transport, 8);
 
         let documents = reader
@@ -639,9 +643,8 @@ mod tests {
             .map(|document| document.metadata.chunk_id.as_str())
             .collect();
         assert_eq!(ids, vec!["0", "1", "2"]);
-        assert!(documents
-            .iter()
-            .all(|document| document.metadata.doc_id == generate_doc_id_sha256(&path.display().to_string())));
+        assert!(documents.iter().all(|document| document.metadata.doc_id
+            == generate_doc_id_sha256(&path.display().to_string())));
     }
 
     #[tokio::test]
@@ -740,8 +743,8 @@ mod tests {
             response: &HttpResponse,
             transport: &dyn HttpTransport,
         ) -> Result<String> {
-            let task_id: serde_json::Value = serde_json::from_str(&response.body)
-                .map_err(|error| RagError::Api {
+            let task_id: serde_json::Value =
+                serde_json::from_str(&response.body).map_err(|error| RagError::Api {
                     status_code: 500,
                     error_code: None,
                     message: format!("bad submit response: {error}"),
@@ -816,7 +819,11 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
         assert_eq!(body["file_path"], "C:\\docs\\a b.pdf");
-        assert_eq!(body.as_object().unwrap().len(), 1, "only `file_path` is sent");
+        assert_eq!(
+            body.as_object().unwrap().len(),
+            1,
+            "only `file_path` is sent"
+        );
         assert_eq!(
             FileBodyRequest::new("https://parser.test").endpoint(),
             "https://parser.test"
@@ -826,10 +833,8 @@ mod tests {
     #[tokio::test]
     async fn the_parsing_service_reader_advertises_pdf_and_docx_and_chunks_the_reply() {
         let path = temp_file("service.pdf");
-        let transport = MockTransport::with_responses(vec![HttpResponse::new(
-            200,
-            "page one\n\npage two",
-        )]);
+        let transport =
+            MockTransport::with_responses(vec![HttpResponse::new(200, "page one\n\npage two")]);
         let reader = ExternalApiReader::for_parsing_service("https://parser.test/v1/parse")
             .transport(transport.clone())
             .chunk_size(512)
@@ -848,14 +853,15 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert_eq!(documents.len(), 1);
-        assert_eq!(
-            documents[0].metadata.content_text(),
-            "page one\n\npage two"
-        );
+        assert_eq!(documents[0].metadata.content_text(), "page one\n\npage two");
         assert_eq!(documents[0].metadata.doc_id, expected_doc_id);
 
         let requests = transport.requests();
-        assert_eq!(requests.len(), 1, "the registered transport carried the call");
+        assert_eq!(
+            requests.len(),
+            1,
+            "the registered transport carried the call"
+        );
         assert_eq!(requests[0].url, "https://parser.test/v1/parse");
         let body: serde_json::Value =
             serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
@@ -870,10 +876,15 @@ mod tests {
             .build()
             .unwrap();
         let error = reader
-            .read(ReaderInput::from_string("definitely/missing.docx".to_string()))
+            .read(ReaderInput::from_string(
+                "definitely/missing.docx".to_string(),
+            ))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("File does not exist"), "err={error}");
+        assert!(
+            error.to_string().contains("File does not exist"),
+            "err={error}"
+        );
         assert!(transport.requests().is_empty());
     }
 

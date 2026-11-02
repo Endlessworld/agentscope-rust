@@ -332,11 +332,8 @@ mod tests {
             .build()
             .unwrap();
         assert!(cfg.model().is_none());
-        let task = BaseScheduleAgentTask::new(
-            Arc::new(cfg),
-            ScheduleConfig::none(),
-            factory.clone(),
-        );
+        let task =
+            BaseScheduleAgentTask::new(Arc::new(cfg), ScheduleConfig::none(), factory.clone());
 
         let err = task.run_empty().await.unwrap_err();
         // `Error::Agent` renders as `Agent error: {0}`; the Java text is the payload.
@@ -380,11 +377,7 @@ mod tests {
             (config.model_name() == "qwen-max").then(|| crate::test_support::stub_model("resolved"))
         }
 
-        async fn run(
-            &self,
-            config: &RuntimeAgentConfig,
-            _messages: Vec<Msg>,
-        ) -> Result<Msg> {
+        async fn run(&self, config: &RuntimeAgentConfig, _messages: Vec<Msg>) -> Result<Msg> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.saw_model
                 .store(config.model().is_some(), Ordering::SeqCst);
@@ -411,11 +404,8 @@ mod tests {
                 .unwrap(),
         );
         assert!(cfg.model().is_none(), "serializable path carries no model");
-        let task = BaseScheduleAgentTask::new(
-            Arc::new(cfg),
-            ScheduleConfig::none(),
-            factory.clone(),
-        );
+        let task =
+            BaseScheduleAgentTask::new(Arc::new(cfg), ScheduleConfig::none(), factory.clone());
 
         let reply = task.run_empty().await.unwrap();
         assert_eq!(reply.text_content(), "ran");

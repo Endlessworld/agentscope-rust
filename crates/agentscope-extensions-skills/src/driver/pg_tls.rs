@@ -56,13 +56,19 @@ fn root_store() -> rustls::RootCertStore {
     root_store_from(native.certs)
 }
 
-fn root_store_from(certs: Vec<rustls::pki_types::CertificateDer<'static>>) -> rustls::RootCertStore {
+fn root_store_from(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+) -> rustls::RootCertStore {
     let mut store = rustls::RootCertStore::empty();
     let (added, ignored) = store.add_parsable_certificates(certs);
     if added == 0 {
         store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     } else if ignored > 0 {
-        tracing::debug!(backend = BACKEND, ignored, "ignored unusable native certificates");
+        tracing::debug!(
+            backend = BACKEND,
+            ignored,
+            "ignored unusable native certificates"
+        );
     }
     store
 }

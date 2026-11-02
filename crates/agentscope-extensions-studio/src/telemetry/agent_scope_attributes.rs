@@ -6,8 +6,7 @@ pub const AGENTSCOPE_FUNCTION_INPUT: &str = "agentscope.function.input";
 pub const AGENTSCOPE_FUNCTION_OUTPUT: &str = "agentscope.function.output";
 pub const AGENTSCOPE_FORMAT_TARGET: &str = "agentscope.format.output";
 pub const AGENTSCOPE_FORMAT_COUNT: &str = "agentscope.format.count";
-pub const AGENTSCOPE_USAGE_TOOL_USE_PROMPT_TOKENS: &str =
-    "agentscope.usage.tool_use_prompt_tokens";
+pub const AGENTSCOPE_USAGE_TOOL_USE_PROMPT_TOKENS: &str = "agentscope.usage.tool_use_prompt_tokens";
 
 /// Values for the AgentScope operation name (`gen_ai.operation.name`).
 pub mod operation_name {

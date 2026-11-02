@@ -8,7 +8,9 @@ use serde_json::{json, Value};
 use crate::error::JevError;
 
 use super::compactor::{Action, Config};
-use super::message::{ContextBlock, ContextMessage, ContextResultPart, ToolResultState, ROLE_SYSTEM};
+use super::message::{
+    ContextBlock, ContextMessage, ContextResultPart, ToolResultState, ROLE_SYSTEM,
+};
 
 /// The message the model sees when a tool result was replaced by its head.
 pub const ARCHIVED_RESULT_NOTICE: &str = "[JEV archived the full result. Ask the host to restore the scoped snapshot; do not re-execute this tool for recovery.]";
@@ -155,8 +157,9 @@ impl CompactionTranscript {
                     if let ContextBlock::ToolUse { id, name, input } = block {
                         let call_id = id.as_deref().unwrap_or("");
                         let pair = self.pairs.iter().find(|pair| pair.call_id == call_id);
-                        let serialized = serde_json::to_string(input)
-                            .map_err(|_error| JevError::invalid("unsupported transcript content"))?;
+                        let serialized = serde_json::to_string(input).map_err(|_error| {
+                            JevError::invalid("unsupported transcript content")
+                        })?;
                         tools.push(json!({
                             "id": pair.map(|pair| pair.key.clone()).unwrap_or_else(|| "pending".to_string()),
                             "tool": name,
@@ -184,7 +187,10 @@ impl CompactionTranscript {
             state.insert("context".to_string(), json!(COMPACTION_CONTEXT));
             state.insert("history".to_string(), Value::Array(history));
             let serialized = serde_json::to_string(&Value::Object(
-                state.iter().map(|(key, value)| (key.clone(), value.clone())).collect(),
+                state
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
             ))
             .map_err(|_error| JevError::invalid("unsupported transcript content"))?;
             let tokens = estimate_tokens(&serialized);
@@ -202,7 +208,11 @@ impl CompactionTranscript {
     }
 
     /// Rewrites the transcript according to the per-pair actions (`CompactionTranscript.apply`).
-    pub fn apply(&self, actions: &BTreeMap<String, Action>, head_chars: usize) -> Vec<ContextMessage> {
+    pub fn apply(
+        &self,
+        actions: &BTreeMap<String, Action>,
+        head_chars: usize,
+    ) -> Vec<ContextMessage> {
         let mut by_id: BTreeMap<&str, Action> = BTreeMap::new();
         for pair in &self.pairs {
             by_id.insert(
@@ -269,7 +279,10 @@ impl CompactionTranscript {
 fn pinned(messages: &[ContextMessage], index: usize, config: &Config) -> bool {
     let message = &messages[index];
     index == 0
-        || index >= messages.len().saturating_sub(config.preserve_recent_messages)
+        || index
+            >= messages
+                .len()
+                .saturating_sub(config.preserve_recent_messages)
         || message.role == ROLE_SYSTEM
         || config.pinned_message_ids.contains(&message.id)
         || message.pinned_by_metadata()

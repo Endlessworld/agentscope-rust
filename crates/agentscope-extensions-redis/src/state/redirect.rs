@@ -383,10 +383,7 @@ mod tests {
             target: Option<&ClusterNodeAddr>,
             asking: bool,
         ) -> std::result::Result<Value, CommandFailure> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((target.cloned(), asking));
+            self.calls.lock().unwrap().push((target.cloned(), asking));
             self.outcomes
                 .lock()
                 .unwrap()
@@ -534,7 +531,10 @@ mod tests {
             transport.calls(),
             vec![(None, false), (Some(node("127.0.0.1", 6381)), false)]
         );
-        assert_eq!(cache.lock().unwrap().get(3999), Some(&node("127.0.0.1", 6381)));
+        assert_eq!(
+            cache.lock().unwrap().get(3999),
+            Some(&node("127.0.0.1", 6381))
+        );
     }
 
     #[tokio::test]
@@ -667,7 +667,9 @@ mod tests {
     #[tokio::test]
     async fn a_refresh_can_be_followed_by_one_redirect() {
         let transport = ScriptedTransport::new(vec![
-            Err(CommandFailure::from_message("CLUSTERDOWN The cluster is down")),
+            Err(CommandFailure::from_message(
+                "CLUSTERDOWN The cluster is down",
+            )),
             Err(CommandFailure::Redirect(Redirect::Moved {
                 slot: 7,
                 node: node("10.0.0.2", 7001),
@@ -699,7 +701,9 @@ mod tests {
             Err(CommandFailure::from_message(
                 "READONLY You can't write against a read only replica.",
             )),
-            Err(CommandFailure::from_message("TRYAGAIN rehashing in progress")),
+            Err(CommandFailure::from_message(
+                "TRYAGAIN rehashing in progress",
+            )),
         ]);
         let cache = Mutex::new(SlotCache::new());
 

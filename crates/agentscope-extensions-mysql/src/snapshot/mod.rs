@@ -353,11 +353,15 @@ mod tests {
     fn upload_sql_refreshes_created_at() {
         let sql = snapshot_upload_sql("agentscope-prod-snaps");
         assert!(
-            sql.contains("ON DUPLICATE KEY UPDATE data = VALUES(data), created_at = CURRENT_TIMESTAMP"),
+            sql.contains(
+                "ON DUPLICATE KEY UPDATE data = VALUES(data), created_at = CURRENT_TIMESTAMP"
+            ),
             "unexpected upload statement: {sql}"
         );
         assert!(
-            sql.starts_with("INSERT INTO `agentscope-prod-snaps` (snapshot_id, data) VALUES (?, ?)"),
+            sql.starts_with(
+                "INSERT INTO `agentscope-prod-snaps` (snapshot_id, data) VALUES (?, ?)"
+            ),
             "the table name must be backtick-quoted (it contains '-'): {sql}"
         );
     }

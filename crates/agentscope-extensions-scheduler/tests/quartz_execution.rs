@@ -57,11 +57,9 @@ impl agentscope_core::model::Model for StubModel {
     ) -> futures::stream::BoxStream<'_, Result<agentscope_core::model::ChatResponse>> {
         Box::pin(futures::stream::once(async {
             Ok(agentscope_core::model::ChatResponse::builder()
-                .content(vec![
-                    agentscope_core::message::ContentBlock::Text(
-                        agentscope_core::message::TextBlock::new("stub"),
-                    ),
-                ])
+                .content(vec![agentscope_core::message::ContentBlock::Text(
+                    agentscope_core::message::TextBlock::new("stub"),
+                )])
                 .build())
         }))
     }

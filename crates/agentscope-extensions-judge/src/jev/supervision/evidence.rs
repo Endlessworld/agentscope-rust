@@ -132,10 +132,7 @@ impl SupervisionEvidence {
     }
 
     /// Adds a verification, validating that it is non-blank where Java requires it.
-    pub fn with_verification(
-        mut self,
-        verification: Verification,
-    ) -> Result<Self, JevError> {
+    pub fn with_verification(mut self, verification: Verification) -> Result<Self, JevError> {
         if verification.user_id.trim().is_empty()
             || verification.session_id.trim().is_empty()
             || verification.run_id.trim().is_empty()
@@ -183,37 +180,16 @@ mod tests {
         assert!(!evidence.verified_for("u", "other", "r"));
         assert!(!evidence.verified_for("u", "s", "other"));
 
-        let failed = SupervisionEvidence::new(
-            "rev1",
-            "",
-            "",
-            vec![],
-            "",
-            false,
-            Some(verification(false)),
-        );
+        let failed =
+            SupervisionEvidence::new("rev1", "", "", vec![], "", false, Some(verification(false)));
         assert!(!failed.verified_for("u", "s", "r"));
 
-        let stale = SupervisionEvidence::new(
-            "rev2",
-            "",
-            "",
-            vec![],
-            "",
-            false,
-            Some(verification(true)),
-        );
+        let stale =
+            SupervisionEvidence::new("rev2", "", "", vec![], "", false, Some(verification(true)));
         assert!(!stale.verified_for("u", "s", "r"));
 
-        let no_revision = SupervisionEvidence::new(
-            "",
-            "",
-            "",
-            vec![],
-            "",
-            false,
-            Some(verification(true)),
-        );
+        let no_revision =
+            SupervisionEvidence::new("", "", "", vec![], "", false, Some(verification(true)));
         assert!(!no_revision.verified_for("u", "s", "r"));
     }
 

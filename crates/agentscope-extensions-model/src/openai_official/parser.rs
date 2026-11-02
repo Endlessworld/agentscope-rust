@@ -259,7 +259,8 @@ impl ResponsesStreamingAssembler {
                     results.push(block_response(block));
                 } else {
                     let companion = self.pairing.companion_call_id(item);
-                    for block in ResponsesServerToolHelper::decode_blocks(item, companion.as_deref())
+                    for block in
+                        ResponsesServerToolHelper::decode_blocks(item, companion.as_deref())
                     {
                         results.push(ChatResponse::new(
                             String::new(),

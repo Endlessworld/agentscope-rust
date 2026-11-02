@@ -160,7 +160,11 @@ pub trait FrameworkAdapter: Send + Sync {
 
     /// Cancels one background subagent task (`DELETE .../subagent-tasks/{taskId}`, capability
     /// `subagent-task-command`).
-    async fn cancel_subagent_task(&self, _session_id: &str, _task_id: &str) -> ControlPlaneResult<()> {
+    async fn cancel_subagent_task(
+        &self,
+        _session_id: &str,
+        _task_id: &str,
+    ) -> ControlPlaneResult<()> {
         Err(ControlPlaneError::Unsupported(
             CAP_SUBAGENT_TASK_COMMAND.to_string(),
         ))
@@ -180,7 +184,11 @@ pub trait FrameworkAdapter: Send + Sync {
 
     /// Injects a control-plane user message into the live session (`POST .../messages`,
     /// capability `conversation-inbound`).
-    async fn inject_user_message(&self, _session_id: &str, _content: &str) -> ControlPlaneResult<()> {
+    async fn inject_user_message(
+        &self,
+        _session_id: &str,
+        _content: &str,
+    ) -> ControlPlaneResult<()> {
         Err(ControlPlaneError::Unsupported(
             CAP_CONVERSATION_INBOUND.to_string(),
         ))
@@ -263,7 +271,10 @@ mod tests {
             Err(ControlPlaneError::Unsupported(reason)) => assert_eq!(reason, cap),
             other => panic!("expected Unsupported({cap}), got {other:?}"),
         };
-        unsupported(a.list_workspaces().await.map(|_| ()), CAP_WORKSPACE_INVENTORY);
+        unsupported(
+            a.list_workspaces().await.map(|_| ()),
+            CAP_WORKSPACE_INVENTORY,
+        );
         unsupported(a.list_tasks("s1").await.map(|_| ()), CAP_TASK_QUERY);
         unsupported(
             a.list_subagent_tasks("s1").await.map(|_| ()),

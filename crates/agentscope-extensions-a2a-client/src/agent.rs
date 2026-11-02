@@ -431,7 +431,9 @@ impl A2aAgent {
             return Ok(None);
         };
         Ok(Some(
-            self.parts.cancel_task(&self.parts.client(), &task_id).await?,
+            self.parts
+                .cancel_task(&self.parts.client(), &task_id)
+                .await?,
         ))
     }
 }
@@ -455,7 +457,11 @@ impl CallParts {
 
     /// The runtime context handed to the middlewares: the session scope of the agent state.
     fn runtime_context(&self) -> RuntimeContext {
-        let state = self.state.lock().map(|state| state.clone()).unwrap_or_default();
+        let state = self
+            .state
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default();
         let mut context = RuntimeContext::new().with_agent_id(self.name.clone());
         if !state.session_id.is_empty() {
             context = context.with_session_id(state.session_id.clone());
@@ -822,7 +828,12 @@ impl IncrementalCall {
             configuration: None,
             metadata: None,
         };
-        match self.handler.client().message_stream_incremental(params).await {
+        match self
+            .handler
+            .client()
+            .message_stream_incremental(params)
+            .await
+        {
             Ok(frames) => self.frames = Some(frames),
             Err(error) => {
                 publish(&self.outcome, Err(error));
@@ -856,7 +867,8 @@ async fn next_incremental_item(
                     call.done = true;
                 } else {
                     if let StreamEvent::Message(message) = &event {
-                        let reply = MessageConvert::convert_from_message(message, &call.handler.name);
+                        let reply =
+                            MessageConvert::convert_from_message(message, &call.handler.name);
                         call.message_reply = Some(reply);
                     }
                     call.frames = Some(frames);

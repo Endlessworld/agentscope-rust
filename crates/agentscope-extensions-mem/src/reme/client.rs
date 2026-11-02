@@ -125,14 +125,18 @@ impl ReMeClient {
     /// Adds memories: `POST /summary_personal_memory`.
     pub async fn add(&self, request: &ReMeAddRequest) -> Result<ReMeAddResponse> {
         let body = serde_json::to_string(request)?;
-        let raw = self.post("summary_personal_memory", SUMMARY_ENDPOINT, &body).await?;
+        let raw = self
+            .post("summary_personal_memory", SUMMARY_ENDPOINT, &body)
+            .await?;
         Ok(parse_or_default::<ReMeAddResponse>(&raw)?)
     }
 
     /// Searches memories: `POST /retrieve_personal_memory`.
     pub async fn search(&self, request: &ReMeSearchRequest) -> Result<ReMeSearchResponse> {
         let body = serde_json::to_string(request)?;
-        let raw = self.post("retrieve_personal_memory", RETRIEVE_ENDPOINT, &body).await?;
+        let raw = self
+            .post("retrieve_personal_memory", RETRIEVE_ENDPOINT, &body)
+            .await?;
         Ok(parse_or_default::<ReMeSearchResponse>(&raw)?)
     }
 }
@@ -220,10 +224,12 @@ mod tests {
         )
         .unwrap();
         assert!(client.metrics().is_some());
-        assert!(ReMeClient::with_transport(Arc::new(MockTransport::new()), "https://reme.test")
-            .unwrap()
-            .metrics()
-            .is_none());
+        assert!(
+            ReMeClient::with_transport(Arc::new(MockTransport::new()), "https://reme.test")
+                .unwrap()
+                .metrics()
+                .is_none()
+        );
     }
 
     /// MEM-02: the ReMe client uses Java's endpoint-derived operation names
@@ -244,10 +250,7 @@ mod tests {
         );
 
         mock.push_response(Err(MemError::http_status(503, "busy")));
-        let err = client
-            .search(&ReMeSearchRequest::new())
-            .await
-            .unwrap_err();
+        let err = client.search(&ReMeSearchRequest::new()).await.unwrap_err();
         assert_eq!(
             err.to_string(),
             "ReMe API retrieve_personal_memory failed with status 503: busy"
@@ -290,8 +293,7 @@ mod tests {
         let mock = MockTransport::new();
         mock.push_body("not json");
         mock.push_body("not json either");
-        let client =
-            ReMeClient::with_transport(Arc::new(mock), "https://reme.test").unwrap();
+        let client = ReMeClient::with_transport(Arc::new(mock), "https://reme.test").unwrap();
         assert!(matches!(
             client
                 .add(&ReMeAddRequest::new("ws", Vec::new()))

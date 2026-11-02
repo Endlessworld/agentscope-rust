@@ -140,17 +140,11 @@ mod tests {
         fn parameters_schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object", "properties": {}})
         }
-        async fn call(
-            &self,
-            args: JsonMap,
-            _ctx: ToolExecutionContext,
-        ) -> Result<ToolResultBlock> {
+        async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
             self.seen.lock().unwrap().push(args.clone());
             Ok(ToolResultBlock::text(format!(
                 "value={}",
-                args.get("value")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("none")
+                args.get("value").and_then(|v| v.as_str()).unwrap_or("none")
             )))
         }
     }
@@ -183,7 +177,10 @@ mod tests {
         map
     }
 
-    fn toolkit(interceptors: Vec<Arc<dyn ToolCallInterceptor>>, seen: Arc<Mutex<Vec<JsonMap>>>) -> Toolkit {
+    fn toolkit(
+        interceptors: Vec<Arc<dyn ToolCallInterceptor>>,
+        seen: Arc<Mutex<Vec<JsonMap>>>,
+    ) -> Toolkit {
         let toolkit = Toolkit::with_config(
             ToolkitConfig::builder()
                 .call_interceptors(interceptors)

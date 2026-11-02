@@ -122,8 +122,7 @@ impl InstrumentedExecutor {
             .store(0, std::sync::atomic::Ordering::SeqCst);
         self.transaction_statements
             .store(0, std::sync::atomic::Ordering::SeqCst);
-        self.conflicts
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.conflicts.store(0, std::sync::atomic::Ordering::SeqCst);
         self.interposed
             .store(false, std::sync::atomic::Ordering::SeqCst);
         self.interpose_after
@@ -963,14 +962,10 @@ async fn save_list_append_is_atomic_against_a_writer_committing_mid_write() {
     //    warning — an append silently lost;
     //  * with it no statement of this call runs outside the transaction, so the reads and
     //    writes are one unit of work and no duplicate-key abort can lose the append.
-    let (store, instrumented) = new_instrumented_store_with(
-        Arc::new(SqliteDialect::new()),
-        CompetingWrite::ListAppend,
-    );
+    let (store, instrumented) =
+        new_instrumented_store_with(Arc::new(SqliteDialect::new()), CompetingWrite::ListAppend);
     // Base state: the list already holds `a1`.
-    store
-        .save_list(Some("u"), "s", "l", &[text("a1")])
-        .await;
+    store.save_list(Some("u"), "s", "l", &[text("a1")]).await;
     // Arm the competing writer for after this call's second session statement (the
     // `MAX(item_index)` read).
     instrumented.arm_after(2);
@@ -1053,7 +1048,8 @@ impl StoreDialect for NoReturningSqliteDialect {
         json: &str,
         timestamp: i64,
     ) -> BoundSql {
-        self.inner.store_upsert(namespace_path, key, json, timestamp)
+        self.inner
+            .store_upsert(namespace_path, key, json, timestamp)
     }
 }
 
@@ -1664,7 +1660,9 @@ fn sqlite_constraint_classes_are_told_apart_by_their_codes() {
     assert!(is_unique_violation(&duplicate), "{duplicate}");
 
     let not_null = executor
-        .execute(&BoundSql::no_params("INSERT INTO probe (id, name) VALUES (2, NULL)"))
+        .execute(&BoundSql::no_params(
+            "INSERT INTO probe (id, name) VALUES (2, NULL)",
+        ))
         .unwrap_err();
     assert!(
         !is_unique_violation(&not_null),

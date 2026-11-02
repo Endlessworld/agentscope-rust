@@ -4,8 +4,8 @@
 pub mod agent_state;
 pub mod conflict_policy;
 pub mod context;
-pub mod list_hash;
 pub mod legacy;
+pub mod list_hash;
 pub mod requirement;
 pub mod session_info;
 pub mod store;
@@ -17,9 +17,7 @@ pub use context::{
     PlanModeContextState, ReadCacheEntry, Task, TaskContextState, TaskScope, TaskState,
     ToolContextState,
 };
-pub use legacy::{
-    LegacyLoadResult, ToolkitState, MEMORY_MESSAGES_KEY, TOOLKIT_ACTIVE_GROUPS_KEY,
-};
+pub use legacy::{LegacyLoadResult, ToolkitState, MEMORY_MESSAGES_KEY, TOOLKIT_ACTIVE_GROUPS_KEY};
 pub use list_hash::{
     compute_hash, has_changed, needs_full_rewrite, EMPTY_HASH, SAMPLING_THRESHOLD,
 };

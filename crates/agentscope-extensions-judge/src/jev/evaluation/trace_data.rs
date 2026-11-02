@@ -21,7 +21,9 @@ pub fn size(value: &Value) -> Result<usize, JevError> {
 
 /// Serialized length of a state map, treating a map as a JSON object.
 pub fn size_of_map(state: &std::collections::BTreeMap<String, Value>) -> Result<usize, JevError> {
-    size(&Value::Object(state.iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
+    size(&Value::Object(
+        state.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+    ))
 }
 
 /// Keeps the last `limit` characters of `value`, prefixing an omission marker when truncated
@@ -42,7 +44,10 @@ mod tests {
     #[test]
     fn size_counts_the_serialized_json() {
         let value = serde_json::json!({"a":1,"b":"xy"});
-        assert_eq!(size(&value).unwrap(), serde_json::to_string(&value).unwrap().len());
+        assert_eq!(
+            size(&value).unwrap(),
+            serde_json::to_string(&value).unwrap().len()
+        );
         assert_eq!(size(&serde_json::json!(null)).unwrap(), 4);
     }
 
@@ -50,7 +55,10 @@ mod tests {
     fn size_of_map_matches_the_equivalent_object() {
         let mut map = std::collections::BTreeMap::new();
         map.insert("k".to_string(), serde_json::json!([1, 2]));
-        assert_eq!(size_of_map(&map).unwrap(), size(&serde_json::json!({"k":[1,2]})).unwrap());
+        assert_eq!(
+            size_of_map(&map).unwrap(),
+            size(&serde_json::json!({"k":[1,2]})).unwrap()
+        );
     }
 
     #[test]

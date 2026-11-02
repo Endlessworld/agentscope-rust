@@ -74,18 +74,16 @@ pub mod snapshot;
 pub mod state;
 pub mod store;
 
-pub use backend::{
-    ColumnValue, DbError, JdbcError, JdbcExecutor, JdbcResult, JdbcSession, RusqliteExecutor,
-    SharedExecutor,
-};
-pub use backend::driver::{DriverExecutor, SqlClient};
+#[cfg(feature = "mysql-executor")]
+pub use backend::driver::{connect_mysql, mysql_executor_from_env, MysqlExecutor, MYSQL_URL_ENV};
 #[cfg(feature = "postgres-executor")]
 pub use backend::driver::{
     connect_postgres, postgres_executor_from_env, PostgresExecutor, POSTGRES_URL_ENV,
 };
-#[cfg(feature = "mysql-executor")]
-pub use backend::driver::{
-    connect_mysql, mysql_executor_from_env, MysqlExecutor, MYSQL_URL_ENV,
+pub use backend::driver::{DriverExecutor, SqlClient};
+pub use backend::{
+    ColumnValue, DbError, JdbcError, JdbcExecutor, JdbcResult, JdbcSession, RusqliteExecutor,
+    SharedExecutor,
 };
 pub use distributed_store::JdbcDistributedStore;
 pub use sandbox::{

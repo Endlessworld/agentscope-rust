@@ -679,12 +679,12 @@ impl RedisAgentStateStore {
         let existing_count = self.client.get_list_length(&list_key).await?.max(0) as usize;
 
         // Which items the script has to push, and whether the stored list must go first.
-        let (rewrite, items) =
-            if needs_full_rewrite(values, stored_hash.as_deref(), existing_count) {
-                (true, values)
-            } else {
-                (false, &values[values.len().min(existing_count)..])
-            };
+        let (rewrite, items) = if needs_full_rewrite(values, stored_hash.as_deref(), existing_count)
+        {
+            (true, values)
+        } else {
+            (false, &values[values.len().min(existing_count)..])
+        };
 
         let mut args: Vec<String> = Vec::with_capacity(3 + items.len());
         args.push(layout.list_track_key(key));
@@ -1343,10 +1343,7 @@ mod tests {
         AgentStateStore::delete_key(&store, Some("u1"), "s1", "never-written")
             .await
             .expect("deleting an absent key is not an error");
-        assert_eq!(
-            store.get(Some("u1"), "s1", "tracked").await,
-            Some(json!(1))
-        );
+        assert_eq!(store.get(Some("u1"), "s1", "tracked").await, Some(json!(1)));
         assert_eq!(
             adapter.set_members("t:session:u1/s1:_keys"),
             vec!["tracked".to_string()]

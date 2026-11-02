@@ -374,8 +374,11 @@ mod tests {
         assert!(!bridge.is_busy("s8"), "an errored turn stayed busy");
 
         // A consumer that drops the stream mid-turn releases it through the guard.
-        let pending: Next<AgentInput> =
-            Box::new(|_i| Box::pin(futures::stream::pending::<agentscope_core::error::Result<AgentEvent>>()));
+        let pending: Next<AgentInput> = Box::new(|_i| {
+            Box::pin(futures::stream::pending::<
+                agentscope_core::error::Result<AgentEvent>,
+            >())
+        });
         let stream = mw.on_agent(&ctx("s9"), AgentInput::new(vec![Msg::user("hi")]), pending);
         assert!(bridge.is_busy("s9"));
         drop(stream);

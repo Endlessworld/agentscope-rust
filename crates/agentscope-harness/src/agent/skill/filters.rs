@@ -139,7 +139,10 @@ const MAX_CAS_RETRIES: usize = 5;
 const SCAN_PAGE_SIZE: usize = 1000;
 
 fn usage_namespace() -> Vec<String> {
-    USAGE_STORE_NAMESPACE.iter().map(|s| s.to_string()).collect()
+    USAGE_STORE_NAMESPACE
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn record_from_item(item: &StoreItem) -> Option<SkillUsageRecord> {
@@ -205,15 +208,12 @@ impl SkillUsageBackend for BaseStoreSkillUsageBackend {
         for _ in 0..MAX_CAS_RETRIES {
             let item = self.store.get(&namespace, name);
             let expected_version = item.as_ref().map(|i| i.version).unwrap_or(0);
-            let current = item
-                .as_ref()
-                .and_then(record_from_item)
-                .unwrap_or_else(|| {
-                    SkillUsageRecord::agent_created(
-                        super::curator::SkillState::Active,
-                        chrono::Utc::now(),
-                    )
-                });
+            let current = item.as_ref().and_then(record_from_item).unwrap_or_else(|| {
+                SkillUsageRecord::agent_created(
+                    super::curator::SkillState::Active,
+                    chrono::Utc::now(),
+                )
+            });
             let updated = mutator(current.clone());
             if updated.as_ref() == Some(&current) {
                 // Explicit no-op (e.g. a provenance gate denied the change).
@@ -541,7 +541,10 @@ mod tests {
         assert_eq!(store.get(&namespace, "a").unwrap().version, 2);
 
         backend.replace_all(BTreeMap::from([("b".to_string(), rec("agent", vec![]))]));
-        assert_eq!(backend.load_all().keys().cloned().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            backend.load_all().keys().cloned().collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
 
         backend.mutate("a", &mut |_| None);
         assert!(backend.get("a").is_none());

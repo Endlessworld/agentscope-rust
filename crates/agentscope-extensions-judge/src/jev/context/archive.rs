@@ -43,9 +43,7 @@ impl ArchiveScope {
         };
         for value in [&scope.user_id, &scope.agent_id, &scope.session_id] {
             if value.trim().is_empty() || value.chars().count() > 512 || value.contains('\u{0}') {
-                return Err(JevError::invalid(
-                    "user, agent and session scope required",
-                ));
+                return Err(JevError::invalid("user, agent and session scope required"));
             }
         }
         Ok(scope)
@@ -94,10 +92,7 @@ pub fn require_reference(reference: &str) -> Result<(), JevError> {
 ///
 /// A missing version or a scope mismatch is rejected with the Java message; this is the guard
 /// against reading another tenant's or another format's snapshot.
-pub fn decode_envelope(
-    data: &[u8],
-    scope: &ArchiveScope,
-) -> Result<Vec<ContextMessage>, JevError> {
+pub fn decode_envelope(data: &[u8], scope: &ArchiveScope) -> Result<Vec<ContextMessage>, JevError> {
     let envelope: ArchiveEnvelope = serde_json::from_slice(data)
         .map_err(|_error| JevError::invalid("missing or invalid snapshot"))?;
     if envelope.version != ARCHIVE_VERSION || envelope.scope != *scope {
@@ -218,10 +213,7 @@ mod tests {
 
     #[test]
     fn envelopes_round_trip_and_check_version_and_scope() {
-        let envelope = ArchiveEnvelope::new(
-            scope(),
-            vec![ContextMessage::user("m1", "hello")],
-        );
+        let envelope = ArchiveEnvelope::new(scope(), vec![ContextMessage::user("m1", "hello")]);
         let data = serde_json::to_vec(&envelope).unwrap();
         assert_eq!(decode_envelope(&data, &scope()).unwrap().len(), 1);
 
@@ -252,9 +244,15 @@ mod tests {
         let archive = UnavailableContextArchive::harness_store_missing();
         let error = archive.save(&scope(), &[]).await.unwrap_err();
         assert!(error.message().contains("StoreJevContextArchive"));
-        let restore = archive.restore(&scope(), &"a".repeat(64)).await.unwrap_err();
+        let restore = archive
+            .restore(&scope(), &"a".repeat(64))
+            .await
+            .unwrap_err();
         assert_eq!(restore.message(), error.message());
         assert!(format!("{archive:?}").contains("UnavailableContextArchive"));
-        assert!(UnavailableContextArchive::new("custom").save(&scope(), &[]).await.is_err());
+        assert!(UnavailableContextArchive::new("custom")
+            .save(&scope(), &[])
+            .await
+            .is_err());
     }
 }

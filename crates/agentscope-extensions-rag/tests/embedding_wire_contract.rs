@@ -138,7 +138,10 @@ fn the_ollama_embedding_request_targets_api_embed_on_the_shared_endpoint() {
     let model = ollama_model(ScriptedTransport::with_responses(Vec::new()));
     let request = model.build_embedding_request(&text("hello")).unwrap();
     assert_eq!(request.url, "http://localhost:11434/api/embed");
-    assert!(request.header("Authorization").is_none(), "Ollama is unauthenticated");
+    assert!(
+        request.header("Authorization").is_none(),
+        "Ollama is unauthenticated"
+    );
     assert_eq!(
         serde_json::from_str::<Value>(request.body.as_deref().unwrap()).unwrap(),
         serde_json::from_str::<Value>(OLLAMA_REQUEST).unwrap()
@@ -147,7 +150,8 @@ fn the_ollama_embedding_request_targets_api_embed_on_the_shared_endpoint() {
 
 #[tokio::test]
 async fn both_crates_read_the_same_ollama_embedding_response() {
-    let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(200, OLLAMA_RESPONSE)]);
+    let transport =
+        ScriptedTransport::with_responses(vec![HttpResponse::new(200, OLLAMA_RESPONSE)]);
     let model = ollama_model(transport);
     let response = model.embed_with_usage(&text("hello")).await.unwrap();
     assert_eq!(response.embedding, vec![0.5, 0.25, -0.5]);
@@ -180,7 +184,8 @@ fn the_openai_embedding_request_is_the_pinned_contract() {
 
 #[tokio::test]
 async fn the_openai_embedding_response_envelope_is_the_pinned_contract() {
-    let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(200, OPENAI_RESPONSE)]);
+    let transport =
+        ScriptedTransport::with_responses(vec![HttpResponse::new(200, OPENAI_RESPONSE)]);
     let model = openai_model(transport);
     let response = model.embed_with_usage(&text("hello")).await.unwrap();
 
@@ -194,12 +199,10 @@ async fn the_openai_embedding_response_envelope_is_the_pinned_contract() {
 async fn a_provider_reply_of_the_other_shape_is_rejected_rather_than_misread() {
     // An OpenAI envelope must not be silently accepted by the Ollama client (the drift that the
     // shared contract exists to prevent).
-    let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(200, OPENAI_RESPONSE)]);
+    let transport =
+        ScriptedTransport::with_responses(vec![HttpResponse::new(200, OPENAI_RESPONSE)]);
     let model = ollama_model(transport);
-    let error = model
-        .embed_with_usage(&text("hello"))
-        .await
-        .unwrap_err();
+    let error = model.embed_with_usage(&text("hello")).await.unwrap_err();
     assert!(
         error.to_string().contains("embedding"),
         "unexpected error: {error}"

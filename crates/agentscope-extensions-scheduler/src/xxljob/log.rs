@@ -88,7 +88,10 @@ mod tests {
 
         // Java `PostReasoningEvent` -> `XxlJobHelper.log`, once per reasoning step.
         assert_eq!(ctx.logs(), vec!["reasoned step".to_string()]);
-        assert!(ctx.handle_result().is_none(), "logging must not report a result");
+        assert!(
+            ctx.handle_result().is_none(),
+            "logging must not report a result"
+        );
     }
 
     #[tokio::test]

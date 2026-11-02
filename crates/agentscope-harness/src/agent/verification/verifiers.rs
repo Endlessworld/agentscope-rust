@@ -412,9 +412,7 @@ mod tests {
     fn conforming_json_passes() {
         let verdict = report_schema().verify(&json_evidence("{\"status\":\"ok\"}"));
         assert_eq!(verdict.outcome, VerificationOutcome::Passed);
-        assert!(verdict
-            .reason
-            .contains("conforms to the configured schema"));
+        assert!(verdict.reason.contains("conforms to the configured schema"));
     }
 
     #[test]

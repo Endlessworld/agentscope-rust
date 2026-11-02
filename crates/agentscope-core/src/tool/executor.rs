@@ -279,7 +279,9 @@ mod tests {
 
     #[tokio::test]
     async fn long_running_tool_skips_the_execution_timeout() {
-        let out = run(true).await.expect("long-running tool must not be cut off");
+        let out = run(true)
+            .await
+            .expect("long-running tool must not be cut off");
         assert_eq!(out.text_content(), "done");
     }
 
