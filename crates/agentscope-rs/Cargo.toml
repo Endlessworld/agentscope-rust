@@ -1,0 +1,119 @@
+[package]
+name = "agentscope-rs"
+description = "AgentScope Rust - one-dependency facade: core, harness and every extension module behind opt-in features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Every module is optional: only the features you enable get compiled. This crate holds no
+# logic of its own, it only re-exports the sibling crates under short module names.
+[dependencies]
+agentscope-core = { workspace = true, optional = true }
+agentscope-extensions-model = { workspace = true, optional = true }
+agentscope-harness = { workspace = true, optional = true }
+agentscope-extensions-protocol = { workspace = true, optional = true }
+agentscope-extensions-a2a-client = { workspace = true, optional = true }
+agentscope-extensions-a2a-server = { workspace = true, optional = true }
+agentscope-extensions-agent-protocol = { workspace = true, optional = true }
+agentscope-extensions-agui = { workspace = true, optional = true }
+agentscope-extensions-chat-completions-web = { workspace = true, optional = true }
+agentscope-extensions-acp = { workspace = true, optional = true }
+agentscope-extensions-rag = { workspace = true, optional = true }
+agentscope-extensions-sandbox = { workspace = true, optional = true }
+agentscope-extensions-channel = { workspace = true, optional = true }
+agentscope-extensions-mem = { workspace = true, optional = true }
+agentscope-extensions-jdbc = { workspace = true, optional = true }
+agentscope-extensions-redis = { workspace = true, optional = true }
+agentscope-extensions-mongodb = { workspace = true, optional = true }
+agentscope-extensions-mysql = { workspace = true, optional = true }
+agentscope-extensions-postgresql = { workspace = true, optional = true }
+agentscope-extensions-cos = { workspace = true, optional = true }
+agentscope-extensions-oss = { workspace = true, optional = true }
+agentscope-extensions-controlplane = { workspace = true, optional = true }
+agentscope-extensions-studio = { workspace = true, optional = true }
+agentscope-extensions-skills = { workspace = true, optional = true }
+agentscope-extensions-scheduler = { workspace = true, optional = true }
+agentscope-extensions-training = { workspace = true, optional = true }
+agentscope-extensions-nacos = { workspace = true, optional = true }
+agentscope-extensions-higress = { workspace = true, optional = true }
+agentscope-extensions-judge = { workspace = true, optional = true }
+
+[features]
+# Light default: the agent runtime and the harness, nothing that needs a database or an HTTP
+# client stack.
+default = ["core", "harness"]
+
+# Foundations.
+core = ["dep:agentscope-core"]
+model = ["core", "dep:agentscope-extensions-model"]
+harness = ["core", "model", "dep:agentscope-harness"]
+
+# Protocol surfaces. `protocol` is the umbrella that pulls in the four protocol crates at once
+# (it enables their own defaults), the individual features exist for narrower builds.
+protocol = ["harness", "dep:agentscope-extensions-protocol"]
+a2a-client = ["core", "dep:agentscope-extensions-a2a-client"]
+a2a-server = ["a2a-client", "dep:agentscope-extensions-a2a-server"]
+agent-protocol = ["harness", "dep:agentscope-extensions-agent-protocol"]
+agui = ["harness", "dep:agentscope-extensions-agui"]
+chat-completions-web = ["core", "dep:agentscope-extensions-chat-completions-web"]
+
+# Agent integrations.
+acp = ["harness", "dep:agentscope-extensions-acp"]
+rag = ["harness", "dep:agentscope-extensions-rag"]
+sandbox = ["harness", "dep:agentscope-extensions-sandbox"]
+channel = ["harness", "dep:agentscope-extensions-channel"]
+mem = ["harness", "dep:agentscope-extensions-mem"]
+controlplane = ["harness", "dep:agentscope-extensions-controlplane"]
+studio = ["harness", "dep:agentscope-extensions-studio"]
+skills = ["harness", "dep:agentscope-extensions-skills"]
+scheduler = ["core", "dep:agentscope-extensions-scheduler"]
+training = ["harness", "dep:agentscope-extensions-training"]
+nacos = ["harness", "dep:agentscope-extensions-nacos"]
+higress = ["harness", "dep:agentscope-extensions-higress"]
+judge = ["harness", "dep:agentscope-extensions-judge"]
+
+# Storage backends.
+jdbc = ["harness", "dep:agentscope-extensions-jdbc"]
+mysql = ["harness", "dep:agentscope-extensions-mysql"]
+postgresql = ["harness", "dep:agentscope-extensions-postgresql"]
+mongodb = ["harness", "dep:agentscope-extensions-mongodb"]
+redis = ["harness", "dep:agentscope-extensions-redis"]
+cos = ["harness", "dep:agentscope-extensions-cos"]
+oss = ["harness", "dep:agentscope-extensions-oss"]
+
+# Everything. Convenient for exploration and for building examples that exercise the whole
+# workspace; a production dependency should pick only what it needs.
+full = [
+    "protocol",
+    "a2a-client",
+    "a2a-server",
+    "agent-protocol",
+    "agui",
+    "chat-completions-web",
+    "acp",
+    "rag",
+    "sandbox",
+    "channel",
+    "mem",
+    "controlplane",
+    "studio",
+    "skills",
+    "scheduler",
+    "training",
+    "nacos",
+    "higress",
+    "judge",
+    "jdbc",
+    "mysql",
+    "postgresql",
+    "mongodb",
+    "redis",
+    "cos",
+    "oss",
+]

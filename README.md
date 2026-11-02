@@ -9,7 +9,7 @@ AgentScope 的**原生异步 Rust 实现**。以 `agentscope-core`（智能体�
   的 API 语义、事件/状态 JSON 与工具治理行为
 - **技术栈**：Rust 2021（MSRV 1.85）· Tokio · serde · reqwest/rustls · async-openai / async-anthropic ·
   rust-mcp-sdk · axum · rusqlite
-- **规模**：29 个 crate（2 个骨架 + 27 个扩展），线性依赖，无循环
+- **规模**：30 个 crate（1 个门面 `agentscope-rs` + 2 个骨架 + 27 个扩展），线性依赖，无循环
 - **进度**：`docs/MIGRATION_GAP_TRACKER.md`、`docs/extensions/EXTENSIONS_GAP_TRACKER.md`
   （各模块另有独立 tracker，为单一事实来源）
 
@@ -47,6 +47,21 @@ AgentScope 的**原生异步 Rust 实现**。以 `agentscope-core`（智能体�
 - 能力：RAG、长期记忆、skills 仓库、定时调度、影子训练、Studio 遥测、judge 决策 API
 
 ## Crate 地图
+
+不想逐个声明依赖时用门面 crate **`agentscope-rs`**：它不含逻辑，只用 `pub use` 把下列 crate 重导出为
+`agentscope_rs::core` / `::harness` / `::acp` / `::rag` …，由 features 决定编译哪些模块。
+
+| 用法 | 结果 |
+| --- | --- |
+| `cargo add agentscope-rs` | `core` + `harness` + `model`（默认，不拉数据库与 HTTP 栈） |
+| `cargo add agentscope-rs --features acp,rag` | 再加 ACP 与 RAG |
+| `cargo add agentscope-rs --features full` | 全部 29 个 crate 一次装全（编译重，适合探索与示例） |
+
+```rust
+use agentscope_rs::{core::agent::ReActAgent, harness::HarnessAgent};
+```
+
+需要细粒度控制（如 `lite` 嵌入式构建、MySQL 驱动后端）时，直接依赖下表的具体 crate。
 
 ### 骨架
 

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    # facade crate：re-export 下面所有 crate，`crates/agentscope-rs` 本身不含逻辑。
+    "crates/agentscope-rs",
     "crates/agentscope-core",
     "crates/agentscope-harness",
     # agentscope-extensions/* 迁移 crate（每个 crate 由 docs/extensions/<MODULE>__GAP_TRACKER.md 跟踪）
@@ -48,6 +50,7 @@ rust-version = "1.85.0"
 # 内部 crate：`path` 供本地开发，`version` 供 crates.io 发布（发布时 cargo 会丢掉 path）。
 # 注意：成员侧写 `default-features = false` 在继承模式下会被 cargo 忽略，故
 # `agentscope-extensions-acp` 对 `agentscope-harness` 仍用显式 `{ version, path, default-features }`。
+agentscope-rs = { version = "0.1.0-alpha.1", path = "crates/agentscope-rs" }
 agentscope-core = { version = "0.1.0-alpha.1", path = "crates/agentscope-core" }
 agentscope-harness = { version = "0.1.0-alpha.1", path = "crates/agentscope-harness" }
 agentscope-extensions-model = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-model" }

@@ -643,6 +643,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentscope-rs"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "agentscope-core",
+ "agentscope-extensions-a2a-client",
+ "agentscope-extensions-a2a-server",
+ "agentscope-extensions-acp",
+ "agentscope-extensions-agent-protocol",
+ "agentscope-extensions-agui",
+ "agentscope-extensions-channel",
+ "agentscope-extensions-chat-completions-web",
+ "agentscope-extensions-controlplane",
+ "agentscope-extensions-cos",
+ "agentscope-extensions-higress",
+ "agentscope-extensions-jdbc",
+ "agentscope-extensions-judge",
+ "agentscope-extensions-mem",
+ "agentscope-extensions-model",
+ "agentscope-extensions-mongodb",
+ "agentscope-extensions-mysql",
+ "agentscope-extensions-nacos",
+ "agentscope-extensions-oss",
+ "agentscope-extensions-postgresql",
+ "agentscope-extensions-protocol",
+ "agentscope-extensions-rag",
+ "agentscope-extensions-redis",
+ "agentscope-extensions-sandbox",
+ "agentscope-extensions-scheduler",
+ "agentscope-extensions-skills",
+ "agentscope-extensions-studio",
+ "agentscope-extensions-training",
+ "agentscope-harness",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
