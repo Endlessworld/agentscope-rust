@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use agentscope_core::agent::react_agent::ReActAgent;
 use agentscope_core::event::AgentEvent;
 use agentscope_core::message::Msg;
+use agentscope_core::state::AgentState;
 use agentscope_core::StreamOptions;
 use agentscope_extensions_a2a_client::error::A2aError;
 use futures::stream::BoxStream;
@@ -46,6 +47,16 @@ pub trait TaskAgent: Send + Sync {
     fn stream_events(&self, messages: Vec<Msg>)
         -> BoxStream<'static, Result<AgentEvent, A2aError>>;
 
+    /// The agent state shared with the run, when the agent exposes one.
+    ///
+    /// Java hands the per-call identity to `streamEvents(List<Msg>, RuntimeContext)`; the Rust
+    /// contract has no context parameter, so the runner writes the identity into the agent state
+    /// the run reads ([`BaseReActAgentRunner`] does it before every run). The default reports no
+    /// state, which leaves agents without one unchanged.
+    fn state_handle(&self) -> Option<Arc<Mutex<AgentState>>> {
+        None
+    }
+
     /// Interrupts the run, mirroring Java `ReActAgent#interrupt()`.
     fn interrupt(&self);
 }
@@ -67,6 +78,10 @@ impl TaskAgent for ReActAgent {
             ReActAgent::stream_events(self, messages, StreamOptions::defaults())
                 .map(|item| item.map_err(A2aError::Core)),
         )
+    }
+
+    fn state_handle(&self) -> Option<Arc<Mutex<AgentState>>> {
+        Some(ReActAgent::state_handle(self))
     }
 
     fn interrupt(&self) {
@@ -216,6 +231,7 @@ impl<F: TaskAgentFactory + 'static> AgentRunner for BaseReActAgentRunner<F> {
         let agent = self.register(&task_id)?;
         // Dropped on every exit path below, including an erroring event stream.
         let _guard = self.guard(&task_id, &agent);
+        apply_identity(&agent, &options);
         let mut stream = agent.stream_events(request_messages);
         let mut events = Vec::new();
         while let Some(item) = stream.next().await {
@@ -235,6 +251,7 @@ impl<F: TaskAgentFactory + 'static> AgentRunner for BaseReActAgentRunner<F> {
         match self.register(&task_id) {
             Ok(agent) => {
                 let guard = self.guard(&task_id, &agent);
+                apply_identity(&agent, &options);
                 let stream = agent.stream_events(request_messages).map(move |item| {
                     // The closure owns the guard, so dropping the stream releases the cache slot.
                     let _ = &guard;
@@ -258,6 +275,26 @@ impl<F: TaskAgentFactory + 'static> AgentRunner for BaseReActAgentRunner<F> {
         if let Some(agent) = agent {
             agent.interrupt();
         }
+    }
+}
+
+/// Writes the per-call identity into the agent state before the run starts, so per-user state
+/// slots, session logs and tool-visible identity see the caller's `(userId, sessionId)`.
+///
+/// Blank ids mean "not found" and leave the current value alone, mirroring Java
+/// `BaseReActAgentRunner#buildRuntimeContext`.
+fn apply_identity(agent: &Arc<dyn TaskAgent>, options: &AgentRequestOptions) {
+    let Some(handle) = agent.state_handle() else {
+        return;
+    };
+    let Ok(mut state) = handle.lock() else {
+        return;
+    };
+    if let Some(user_id) = options.user_id().filter(|id| !id.trim().is_empty()) {
+        state.user_id = Some(user_id.to_string());
+    }
+    if let Some(session_id) = options.session_id().filter(|id| !id.trim().is_empty()) {
+        state.session_id = session_id.to_string();
     }
 }
 
@@ -671,6 +708,108 @@ mod tests {
             "without a task id the server falls back to the buffered contract"
         );
         assert!(recorder.built().is_empty());
+    }
+
+    /// Agent exposing its state, so the runner's identity injection is observable.
+    struct StatefulAgent {
+        state: Arc<Mutex<AgentState>>,
+    }
+
+    impl TaskAgent for StatefulAgent {
+        fn name(&self) -> String {
+            "stateful-agent".to_string()
+        }
+
+        fn description(&self) -> String {
+            "keeps its state".to_string()
+        }
+
+        fn stream_events(
+            &self,
+            _messages: Vec<Msg>,
+        ) -> BoxStream<'static, Result<AgentEvent, A2aError>> {
+            Box::pin(futures::stream::iter(vec![Ok(text_delta("ran"))]))
+        }
+
+        fn state_handle(&self) -> Option<Arc<Mutex<AgentState>>> {
+            Some(self.state.clone())
+        }
+
+        fn interrupt(&self) {}
+    }
+
+    struct StatefulFactory {
+        state: Arc<Mutex<AgentState>>,
+    }
+
+    impl TaskAgentFactory for StatefulFactory {
+        fn build(&self) -> Result<Arc<dyn TaskAgent>, A2aError> {
+            Ok(Arc::new(StatefulAgent {
+                state: self.state.clone(),
+            }))
+        }
+    }
+
+    // Java: `BaseReActAgentRunner` builds the per-call `RuntimeContext` from the options, so the
+    // agent (and the tools and session logs it runs) sees the caller's `(userId, sessionId)`.
+    #[test]
+    fn the_per_call_identity_reaches_the_agent_state() {
+        let shared = Arc::new(Mutex::new(AgentState::default()));
+        let runner = BaseReActAgentRunner::new(StatefulFactory {
+            state: shared.clone(),
+        });
+
+        rt().block_on(
+            runner.stream_events(
+                vec![Msg::user("one")],
+                options("t1")
+                    .with_user_id("alice")
+                    .with_session_id("chat-1"),
+            ),
+        )
+        .expect("the run succeeds");
+
+        {
+            let state = shared.lock().unwrap();
+            assert_eq!(state.user_id.as_deref(), Some("alice"));
+            assert_eq!(state.session_id, "chat-1");
+        }
+
+        // Blank ids mean "not found" and leave the current values alone.
+        rt().block_on(runner.stream_events(
+            vec![Msg::user("two")],
+            options("t2").with_user_id("  ").with_session_id(""),
+        ))
+        .expect("the run succeeds");
+
+        let state = shared.lock().unwrap();
+        assert_eq!(state.user_id.as_deref(), Some("alice"));
+        assert_eq!(state.session_id, "chat-1");
+    }
+
+    // The incremental (`message/stream`) path injects the identity before opening the stream.
+    #[test]
+    fn the_incremental_path_applies_the_per_call_identity() {
+        let shared = Arc::new(Mutex::new(AgentState::default()));
+        let runner = BaseReActAgentRunner::new(StatefulFactory {
+            state: shared.clone(),
+        });
+
+        rt().block_on(async {
+            let mut stream = runner
+                .stream_events_incremental(
+                    vec![Msg::user("one")],
+                    options("t1")
+                        .with_user_id("alice")
+                        .with_session_id("chat-1"),
+                )
+                .expect("incremental stream");
+            assert!(stream.next().await.is_some());
+        });
+
+        let state = shared.lock().unwrap();
+        assert_eq!(state.user_id.as_deref(), Some("alice"));
+        assert_eq!(state.session_id, "chat-1");
     }
 
     // Java: `stop(String)` on an unknown task id is a no-op.

@@ -159,6 +159,15 @@
 | `CORE-32` | `51a74e2ef` | 结构化输出提醒 + `generate_response` schema 必须在**最终请求准备之前**组装，否则预算检查看到的是不完整请求；提醒 request-local 且带 `SYNTHETIC`/`reminderKind` 标记 | `agent/react_agent.rs`：新增 `model_call_through_chain()`；`call_fallback_structured` 不再直连 `model_call_impl`，而是把「已追加提醒 + 已注册 `generate_response` 工具」的 `ModelCallInput` 交给 `MiddlewareChain::wrap_model_call`（harness `ContextMiddleware` 即 Java `ModelRequestPreparer` 的等价物），并使用准备后返回的 messages/tools/options；`structured_output_reminder` 增补 `REMINDER_KIND = "structured_output"` 元数据 | 已完成（**修正此前误记为「已满足、无代码改动」**：旧实现整条 fallback 路径绕过中间件链，请求从未进入准备环节）。core 单测 `structured_output_request_is_prepared_with_reminder_and_schema`、`structured_output_uses_the_prepared_request`、`structured_output_propagates_preparation_rejection`；harness 端到端见 HARNESS-34。反向验证：把派发改回直连 `model_call_impl` → 3 条用例 FAILED → 恢复后绿 |
 | `CORE-D16` | `ac59f61e7` | 新增 `@Tool(timeoutManaged)` / `AgentTool.isTimeoutManaged()`，让 `agent_spawn` / `agent_send` 绕过普通工具超时 | 等价机制已存在：`Tool::is_long_running()`（`tool/tool.rs:122`）在 `tool/executor.rs:186` 跳过执行超时；Rust `agent_spawn`/`agent_send` 为**后台非阻塞**（提交即返回 task_id，无 force-sync 等待），不存在 Java 那个「普通超时截断同步委派」缺陷 | 设计决定（不迁移）：语义已由 `is_long_running` 覆盖，新增 `timeout_managed` 会与既有开关重复 |
 
+### 3.5.5 2026-11-03 Java 提交批次（`abf3c35a3` 之后 7 个提交，`abf3c35a3..1d8f9dc04`）
+
+> 来源：用户确认的「Java 又有新提交」批次。本节只登记落在 core 的项；harness / protocol / nacos / model 侧见各自 tracker。
+
+| 项 | Java 提交 | 变更 | Rust 落点 | 状态 / 验证 |
+|---|---|---|---|---|
+| `CORE-33` | `d8e02107a` | 同 session 串行闸在取消时立即释放，而收尾状态写入仍 fire-and-forget 派发到 `boundedElastic`：下一调用读到陈旧 state，又被晚到的写入覆盖 | 无生产代码改动。`CallGate::run`（`agent/lifecycle.rs:34`，RAII `ReleaseGuard`）与 `recorder.start`/`finish_with_error`（`agent/react_agent.rs:716/756`）、`save_state_snapshot`（harness `middleware/state_checkpoint.rs:106`）在**同一 future** 内 await；取消是协作式的（`call_with_cancel` 在检查点返回 `Err(Cancelled)`，future 跑完收尾才释放闸），drop future 时写入一起被 drop；state 是共享 `Arc<Mutex<AgentState>>`，不存在「按调用重载」路径 | 已完成（结构上不存在该竞态）+ 守护测试 `a_call_admitted_after_a_cancelled_one_completes_and_owns_the_state`（取消后立刻重入，断言回复是第二次调用的结果且无 cancelled 回合残留），防止将来把 checkpoint 改成 detached spawn |
+| `CORE-D17` | `960d7e46c` | `ModelRegistry.unregister(name)` + `evictResolvedCache(context, modelId)`（null 通配、只改映射不关闭实例） | `core/src/model/provider.rs:155` | 设计决定（不迁移）：Rust `ModelRegistry` 是 provider 注册表（按 `provider_id` 覆盖），**既无命名模型实例映射，也无解析缓存**（`resolve`/`resolve_with` 每次新建实例）；「无解析缓存」已被 `extensions-model/tests/registry_semantics.rs` 固化为不变量（MODEL-13，若加缓存须同时做注册驱逐与单飞），照搬会与「provider 按 id 唯一」冲突 |
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

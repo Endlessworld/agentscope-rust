@@ -154,6 +154,15 @@
 1. `agent/workspace/index.rs` 的 `#[cfg(all(test, feature = "rusqlite"))] mod tests` 原本嵌在 `walk_files` 内部 `rec` 函数体里，**测试从未被执行**（`cargo test -- --list` 零命中，且编译报 dead-code）。已移到文件末尾，模块路径变为 `agent::workspace::index::tests::*`。
 2. 移出后暴露出 `rebuild_from_disk` 的 Windows 真实缺陷：`workspace_root.canonicalize()` 返回 `\\?\C:\...` 而 `walk_files` 用的是未规范化的 `dir`，`strip_prefix` 永不命中 → 相对路径退化为绝对路径 → 全部被判为非索引路径。已改为「规范化一次 + 用规范化根拼目录」。
 
+### 3.5.4 2026-11-03 Java 提交批次（`abf3c35a3` 之后 7 个提交，`abf3c35a3..1d8f9dc04`）
+
+> 来源：用户确认的「Java 又有新提交」批次。core / protocol / nacos / model 侧见各自 tracker。
+
+| 编号 | Java 提交 | 变更 | Rust 落点 | 状态 / 验证 |
+|---|---|---|---|---|
+| `HARNESS-35` | `57faf0fe1` | `SubAgentTool` 子调用改用**子会话** sessionId 读写状态、不覆盖父 `AgentState`，父 user id 继续传给子会话 | 父子状态隔离本已成立（`agent/subagent/materialize.rs::LeafFactory::build` 生成独立 `HarnessAgent` + `derive_child_session_id`，子 agent 有自己的 `Arc<Mutex<AgentState>>`，`run_child_turn` 不继承父 recorder）；补齐缺口：子 agent 现在**继承父 `user_id`**（原先只设 `session_id` → 子 checkpoint/journal 落在 `__anon__`，`Shared` 模式多租户共槽、历史互串） | 已完成（**行为变更**：子会话存储 key 现在带 user 段）；`cargo test -p agentscope-harness --lib agent::subagent::materialize` → **17 passed / 0 failed**（新增 `a_declared_child_inherits_the_parent_user_id`、`a_declared_child_without_a_parent_user_id_stays_anonymous`） |
+| `HARNESS-D09` | `adf2dea27` | 沙箱原生 edit 路径把 heredoc 脚本换成 base64 单行命令；缺 `__RESULT__` 标记时降级到 transfer | 无 | 设计决定（不迁移）：Rust `edit_file` 全程 Rust 侧读写（`filesystem/local.rs:424`、`filesystem/remote/mod.rs:280` 走带 CAS 的 PUT、`filesystem/sandbox.rs:77` 委托）；唯一走沙箱命令的实现 `extensions-sandbox/src/fs_spec.rs:703-729` 用 `printf %s <b64> \| base64 -d`，不调 python、无 heredoc、无 `__RESULT__`（transfer 是提前优先而非失败降级）；`extensions-sandbox/src/workspace.rs:77` 的 heredoc 属 workspace 初始化脚本，另一功能 |
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

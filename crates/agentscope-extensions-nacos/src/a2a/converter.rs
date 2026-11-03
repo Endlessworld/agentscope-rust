@@ -14,6 +14,8 @@
 //!   copied back from Nacos, and is forced to `false` when writing to Nacos.
 //! * Security schemes are stored in Nacos as maps in the A2A 0.3 format, see
 //!   [`super::security_scheme`].
+//! * Native `signatures` metadata is preserved verbatim in both directions; conversion never
+//!   verifies a signature nor re-signs a card whose endpoints were rewritten.
 
 use agentscope_extensions_a2a_client::model::AgentCard;
 use serde_json::Value;
@@ -62,7 +64,14 @@ impl NacosAgentCardConverter {
                 supports_authenticated_extended_card: Some(
                     card.supports_authenticated_extended_card.unwrap_or(false),
                 ),
-                signatures: None,
+                // Native signature metadata is kept verbatim; conversion never verifies or
+                // re-signs a card.
+                signatures: card.signatures.as_ref().map(|signatures| {
+                    signatures
+                        .iter()
+                        .map(|signature| Value::Object(signature.clone()))
+                        .collect()
+                }),
                 documentation_url: card.documentation_url.clone(),
             },
         }
@@ -94,6 +103,16 @@ impl NacosAgentCardConverter {
             skills: card.skills.iter().map(convert_skill_to_nacos).collect(),
             security_schemes: convert_to_nacos_security_schemes(card.security_schemes.as_ref()),
             security: card.security.clone(),
+            // The A2A model carries signatures as arbitrary JSON; a Nacos signature is an
+            // object, so only object entries can be represented (Java maps to
+            // `Map<String, Object>` the same way).
+            signatures: card.signatures.as_ref().map(|signatures| {
+                signatures
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .cloned()
+                    .collect()
+            }),
             supports_authenticated_extended_card: Some(
                 card.supports_authenticated_extended_card.unwrap_or(false),
             ),
@@ -393,6 +412,32 @@ mod tests {
         card.capabilities.streaming = Some(false);
         card.capabilities.push_notifications = Some(false);
         card
+    }
+
+    #[test]
+    fn native_signatures_survive_a_round_trip() {
+        let mut signature = serde_json::Map::new();
+        signature.insert("protected".into(), Value::String("signed-header".into()));
+        signature.insert("signature".into(), Value::String("c2ln".into()));
+        let mut header = serde_json::Map::new();
+        header.insert("kid".into(), Value::String("k1".into()));
+        signature.insert("header".into(), Value::Object(header));
+
+        let mut nacos = NacosAgentCard::new("signed", "http://h:1");
+        nacos.signatures = Some(vec![signature.clone()]);
+
+        let a2a = convert_to_a2a_agent_card(&nacos);
+        assert_eq!(
+            a2a.signatures.as_deref(),
+            Some([Value::Object(signature.clone())].as_slice())
+        );
+        let back = convert_to_nacos_agent_card(&a2a);
+        assert_eq!(back.signatures, Some(vec![signature.clone()]));
+        // …and it reaches the wire under the `signatures` key.
+        assert_eq!(
+            serde_json::to_value(&back).unwrap()["signatures"],
+            Value::Array(vec![Value::Object(signature)])
+        );
     }
 
     #[test]

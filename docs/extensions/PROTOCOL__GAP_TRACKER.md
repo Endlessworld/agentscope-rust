@@ -219,6 +219,15 @@ cargo test -p agentscope-extensions-protocol -p agentscope-extensions-a2a-client
 
 
 
+### 3.5.3 2026-11-03 Java 提交批次（`abf3c35a3` 之后 7 个提交，`abf3c35a3..1d8f9dc04`）
+
+> 来源：用户确认的「Java 又有新提交」批次。core / harness / nacos / model 侧见各自 tracker。
+
+| 编号 | Java 提交 | 变更 | Rust 落点 | 状态 / 验证 |
+|---|---|---|---|---|
+| `PROTO-A2A-14` | `fcc36d6d3` | userId/sessionId 端到端：客户端把 user id 写进 envelope metadata `_agentscope_user_id`、session 走原生 `contextId`；服务端优先读 envelope（扁平 `userId` 保留为 deprecated fallback）；runner 用 options 构造 per-call 身份；新增 `A2aContextResolver`（transport 验证身份覆盖断言，优先级 resolver > envelope > none，抛错 fail-closed，未配 resolver 而采纳断言时一次性 WARN） | `a2a-client/src/message.rs:30/507`（`USER_ID_METADATA_KEY`、`convert_from_msgs_with_identity`：envelope 键在 per-message `<msgId, metadata>` 包装**之后**写入，msgId 碰撞无法伪造）；`a2a-client/src/agent.rs:456`（`CallParts::identity`，`send_call`/`stream_call`/`IncrementalCall::open` 三处带身份）；`a2a-server/src/context_resolver.rs`（新：`A2aCallContext`/`A2aIdentity`/`A2aResolveError`/trait + 闭包 impl）；`a2a-server/src/lib.rs:1094/1108/1150`（envelope 优先、resolver 裁决、一次性 WARN、日志值截断去控制字符）；`a2a-server/src/server.rs:188`（builder `context_resolver`）；`a2a-server/src/transport.rs`（headers+method 下传）；`a2a-server/src/runner.rs:56/83/286`（`TaskAgent::state_handle` 默认 `None`、`ReActAgent` 覆盖、流式前注入身份，未改 core） | 已完成（**wire 行为变更**：客户端开始发送 `contextId`，服务端 task context_id 从「每调用新 UUID」变为「客户端会话稳定值」；resolver 抛错返回 `INVALID_REQUEST`——A2A 无 Unauthenticated 码）；`cargo test -p agentscope-extensions-a2a-client -p agentscope-extensions-a2a-server` → **77 + 82 passed / 0 failed**（新增 17 例，含 `call_identity_rides_on_the_envelope`、`a_message_id_colliding_with_the_reserved_key_cannot_spoof_the_identity`、`a_failing_resolver_rejects_the_call`、`the_per_call_identity_reaches_the_agent_state`） |
+| `PROTO-AGUI-06` | `5e2e7d01a` | 请求级 `userId`：`AguiRuntimeContextRequest` 新增字段，processor 按 resolver > request > none 合并，冲突 WARN；未配置 resolver 时不再静默落到 `__anon__` | `agui/src/runtime.rs:31`（字段 + getter + builder `user_id()`）；`agui/src/processor/request_processor.rs:142-166`（非空白判断、冲突 WARN、仅 resolver 未给值时采纳断言） | 已完成；`cargo test -p agentscope-extensions-agui --lib` → **199 passed / 0 failed**（新增 `user_id_from_the_builder_is_readable`、`the_request_level_user_id_is_adopted_when_no_resolver_decides`、`the_resolver_user_id_wins_over_the_request_assertion`、`a_blank_user_id_is_ignored_on_both_sides`） |
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

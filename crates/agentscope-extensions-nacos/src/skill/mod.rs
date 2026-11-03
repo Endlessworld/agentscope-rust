@@ -34,6 +34,12 @@ pub const ENV_SKILL_LABEL_PATH: &str = "AGENTSCOPE_NACOS_SKILL_LABEL";
 /// The default namespace when none is provided (mirrors Java's `public`).
 pub const DEFAULT_NAMESPACE: &str = "public";
 
+/// The label a skill download resolves to when no version/label is configured.
+///
+/// Nacos publishes a skill's released content under the `latest` label, so an unconfigured
+/// repository never exposes a draft-only version.
+pub const DEFAULT_SKILL_LABEL: &str = "latest";
+
 /// A [`SkillRepository`] backed by Nacos AI skill packages, mirroring
 /// `NacosSkillRepository`.
 ///
@@ -151,7 +157,8 @@ impl NacosSkillRepository {
         self.skill_version.as_deref()
     }
 
-    /// The resolved skill label, if any.
+    /// The configured skill label, if any. A download with no version/label resolves to
+    /// [`DEFAULT_SKILL_LABEL`].
     pub fn skill_label(&self) -> Option<&str> {
         self.skill_label.as_deref()
     }
@@ -180,8 +187,9 @@ impl NacosSkillRepository {
         }
     }
 
-    /// Downloads a skill ZIP bytes using the version/label precedence: version
-    /// wins when both resolve. Mirrors `downloadSkillZipBytes`.
+    /// Downloads a skill ZIP with the version/label precedence: a configured version wins; a
+    /// configured label is used instead; with neither, the published [`DEFAULT_SKILL_LABEL`]
+    /// content is downloaded. Mirrors `downloadSkillZipBytes` on Nacos 3.3.0.
     async fn download_skill_zip_bytes(&self, skill_name: &str) -> Result<Vec<u8>, AiServiceError> {
         if let Some(version) = self.skill_version.as_deref() {
             return self
@@ -189,13 +197,10 @@ impl NacosSkillRepository {
                 .download_skill_zip_by_version(skill_name, version)
                 .await;
         }
-        if let Some(label) = self.skill_label.as_deref() {
-            return self
-                .service
-                .download_skill_zip_by_label(skill_name, label)
-                .await;
-        }
-        self.service.download_skill_zip(skill_name).await
+        let label = self.skill_label.as_deref().unwrap_or(DEFAULT_SKILL_LABEL);
+        self.service
+            .download_skill_zip_by_label(skill_name, label)
+            .await
     }
 
     /// Loads a skill from Nacos, mirroring `getSkill(String)`. Returns `Err` on
@@ -530,16 +535,48 @@ mod tests {
         assert_eq!(repo.skill_label(), Some("prod"));
     }
 
-    #[test]
-    fn version_takes_precedence_over_label_on_download() {
+    #[tokio::test]
+    async fn version_takes_precedence_over_label_on_download() {
         // Java: `downloadSkillZipBytes` prefers version; the label is not used.
         let svc = Arc::new(InMemoryNacosAiService::new());
         let mut props = HashMap::new();
         props.insert(SKILL_VERSION_PATH.to_string(), "2.0".to_string());
         props.insert(SKILL_LABEL_PATH.to_string(), "prod".to_string());
-        let repo = NacosSkillRepository::with_properties(svc, "public", Some(&props));
+        let repo = NacosSkillRepository::with_properties(svc.clone(), "public", Some(&props));
         assert_eq!(repo.skill_version(), Some("2.0"));
         assert_eq!(repo.skill_label(), Some("prod"));
+        let _ = repo.download_skill_zip_bytes("demo").await;
+        assert_eq!(
+            svc.skill_downloads(),
+            vec![("demo".to_string(), Some("2.0".to_string()), None)]
+        );
+    }
+
+    /// Nacos 3.3.0: an unconfigured repository downloads the **published** content through the
+    /// `latest` label, so a draft-only version is never exposed.
+    #[tokio::test]
+    async fn downloads_the_published_latest_label_by_default() {
+        let svc = service_with_skill("demo");
+        let repo = NacosSkillRepository::new(svc.clone(), "public");
+        assert_eq!(repo.skill_label(), None);
+        assert_eq!(repo.get_skill("demo").await.unwrap().name(), "demo");
+        assert_eq!(
+            svc.skill_downloads(),
+            vec![("demo".to_string(), None, Some("latest".to_string()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_label_replaces_latest() {
+        let svc = service_with_skill("demo");
+        let mut props = HashMap::new();
+        props.insert(SKILL_LABEL_PATH.to_string(), "prod".to_string());
+        let repo = NacosSkillRepository::with_properties(svc.clone(), "public", Some(&props));
+        assert_eq!(repo.get_skill("demo").await.unwrap().name(), "demo");
+        assert_eq!(
+            svc.skill_downloads(),
+            vec![("demo".to_string(), None, Some("prod".to_string()))]
+        );
     }
 
     #[test]

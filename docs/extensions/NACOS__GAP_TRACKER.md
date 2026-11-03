@@ -152,6 +152,19 @@
 | NACOS-22 | skill 只读仓库：zip 结构校验、Nacos 折叠 YAML 重打包、资源 key 相对根、version→label→default 分派、`knownSkillNames` 列举、`getRepositoryInfo` 形态 | `skill/NacosSkillRepository.java#getSkill`/`#downloadSkillZipBytes`/`#adaptNacosSkillZipForYamlFrontmatter`/`#getRepositoryInfo` | `src/skill/mod.rs:203`、`:206-224`、`:173`（info，`Display` 与 Java `toString` 逐字一致）、`src/skill/frontmatter.rs`；用例 `get_skill_downloads_and_parses`、`load_returns_known_skills`、`repo_metadata_matches_java` | 已完成（仓库抽象差异见 NACOS-X06） |
 | NACOS-23 | 真实 HTTP `NacosAiService` + 传输 seam + 离线 fake transport（默认构建不引入 HTTP 栈） | `AiFactory.createAiService(Properties)` | `src/http.rs:108`（seam）、`:133`（service）、`:196`（订阅簿记）；`src/http/reqwest_transport.rs:16`（真实客户端，`http-client` feature）；`Cargo.toml` `http-client = ["dep:reqwest"]`；用例 10 个，含 `the_http_service_is_interchangeable_with_the_in_memory_one`、`a_nacos_error_body_keeps_its_code_and_message`；既有实测 92 passed | 已完成（取证/超时/错误码缺口见 NACOS-03/06/11） |
 
+### 3.5.3 2026-11-03 Java 提交批次（`abf3c35a3` 之后 7 个提交，`abf3c35a3..1d8f9dc04`）
+
+> 来源：用户确认的「Java 又有新提交」批次（`1d8f9dc04`，Nacos 3.3.0 适配）。core / harness / protocol / model 侧见各自 tracker。
+
+| 编号 | Java 提交 | 变更 | Rust 落点 | 状态 / 验证 |
+|---|---|---|---|---|
+| `NACOS-24` | `1d8f9dc04` | Marketplace Skill 通过 published `latest` label + 精确 version 解析，不暴露 draft | `src/skill/mod.rs:41/193`（`DEFAULT_SKILL_LABEL = "latest"`；优先级 version > label > latest；`http.rs` 已原生区分 404 与业务错误） | 已完成；用例 `downloads_the_published_latest_label_by_default`、`an_explicit_label_replaces_latest`、`version_takes_precedence_over_label_on_download` |
+| `NACOS-25` | `1d8f9dc04` | 注册/查询失败保留原始错误码与 cause；只有 NOT_FOUND 视为「不存在」 | `src/a2a/registry/mod.rs:449`（`try_get_agent_card_from_nacos` 仅 NOT_FOUND → `Ok(None)`，其余 `Err` 透传） | 已完成；用例 `a_failed_card_lookup_is_not_treated_as_missing`、`a_not_found_lookup_still_registers_the_card` |
+| `NACOS-26` | `1d8f9dc04` | Prompt 订阅按 name/version/label 隔离；version+label 互斥；变量默认值 + 调用方覆盖；listener 级 close 等在途读取后按 selection 退订；同 selection 串行初始化、不同 selection 并发 | `src/prompt.rs:29/119/166/279`（`PromptSelection`、按 selection 缓存/订阅、`close()`、默认值合并）；`src/http.rs:388/510/784/870/998`（selection 级 listener 表、退订、互斥校验、订阅、variables 解析）；`src/service.rs:174/198/210/353`（`variables`、`NacosPromptVariable`、`SelectionKey`、`unsubscribe_prompt`） | 已完成；`cargo test -p agentscope-extensions-nacos` → **138 passed / 0 failed**（新增 20 例，含 `selections_are_cached_independently`、`version_and_label_together_are_rejected`、`close_waits_for_an_in_flight_read_and_cancels_its_subscription`、`slow_initialization_does_not_block_other_selections`） |
+| `NACOS-27` | `1d8f9dc04` | Card 转换保留原生 `signatures` | `src/a2a/model.rs:200`（`NacosAgentCard.signatures`）、`src/a2a/converter.rs:69/109`（双向往返原样映射） | 已完成；用例 `native_signatures_survive_a_round_trip` |
+| `NACOS-D04` | `1d8f9dc04` | Nacos client / maintainer client 升到 3.3.0 | 无 | 设计决定（不迁移）：Rust 无 Nacos SDK，是自实现 `/v1/ai/*` HTTP 客户端（`src/http.rs`），没有客户端版本可升；只跟随协议语义（上四条） |
+| `NACOS-B02` | `1d8f9dc04` | A2A/RAD discovery 分离（capability 探测、显式 mode 覆盖、RAD 模式清空不可用 Card、按 agent 初始化订阅）与 RAD 原生发布（tenant、per-interface protocolVersion endpoint、canonical URL 去重、歧义拒绝） | `src/a2a/discovery.rs:53`（仅 A2A 缓存+订阅）、`src/a2a/model.rs:137`（`NacosAgentInterface` 只有 url/transport）、`src/a2a/registry/mod.rs:433`（固定 legacy `endpointType=service`） | **阻塞（本轮不做）**：RAD 需要 `NacosAiService` 不具备的 discovery/publication HTTP 接口（capability 探测、`AgentPublishRequest`/`CallInterface`/`EndpointSet`），且本机无 Nacos 3.3.0 实例可验证协议细节；照抄字段名无法验证，故整条挂账（前置：先补 HTTP 接口与集成环境） |
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

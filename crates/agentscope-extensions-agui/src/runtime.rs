@@ -28,6 +28,12 @@ pub enum AguiTransport {
 pub struct AguiRuntimeContextRequest {
     /// The parsed AG-UI run input.
     pub input: RunAgentInput,
+    /// Caller-asserted user id, when the host resolved one in its service layer.
+    ///
+    /// AG-UI payloads carry no user identity, so this is the only entry point for hosts that
+    /// drive the processor directly. A configured [`AguiRuntimeContextResolver`] still wins
+    /// over this value (see `AguiRequestProcessor::process`).
+    user_id: Option<String>,
     header_agent_id: Option<String>,
     path_agent_id: Option<String>,
     transport: AguiTransport,
@@ -41,6 +47,14 @@ impl AguiRuntimeContextRequest {
     /// Creates a builder.
     pub fn builder() -> AguiRuntimeContextRequestBuilder {
         AguiRuntimeContextRequestBuilder::default()
+    }
+
+    /// The user id asserted by the caller, when present.
+    ///
+    /// Only used when the configured [`AguiRuntimeContextResolver`] supplies no user id;
+    /// see `AguiRequestProcessor::process` for the merge priority.
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
     }
 
     /// The agent id supplied through a header, when present.
@@ -112,6 +126,7 @@ fn first_value<'a>(
 #[derive(Debug, Default, Clone)]
 pub struct AguiRuntimeContextRequestBuilder {
     input: Option<RunAgentInput>,
+    user_id: Option<String>,
     header_agent_id: Option<String>,
     path_agent_id: Option<String>,
     transport: Option<AguiTransport>,
@@ -125,6 +140,14 @@ impl AguiRuntimeContextRequestBuilder {
     /// Sets the parsed run input (required).
     pub fn input(mut self, input: RunAgentInput) -> Self {
         self.input = Some(input);
+        self
+    }
+
+    /// Sets the caller-asserted user id.
+    ///
+    /// A configured [`AguiRuntimeContextResolver`] takes precedence over this value.
+    pub fn user_id(mut self, value: impl Into<String>) -> Self {
+        self.user_id = Some(value.into());
         self
     }
 
@@ -184,6 +207,7 @@ impl AguiRuntimeContextRequestBuilder {
     pub fn build(self) -> AguiRuntimeContextRequest {
         AguiRuntimeContextRequest {
             input: self.input.expect("input cannot be null"),
+            user_id: self.user_id,
             header_agent_id: self.header_agent_id,
             path_agent_id: self.path_agent_id,
             transport: self.transport.unwrap_or_default(),
@@ -319,6 +343,19 @@ mod tests {
         assert_eq!(request.first_query_param("tag"), Some("a"));
         // Query params are case-sensitive, unlike headers.
         assert_eq!(request.first_query_param("agentid"), None);
+    }
+
+    #[test]
+    fn user_id_from_the_builder_is_readable() {
+        let request = AguiRuntimeContextRequest::builder()
+            .input(RunAgentInput::of("t", "r"))
+            .user_id("alice")
+            .build();
+        assert_eq!(request.user_id(), Some("alice"));
+        let anonymous = AguiRuntimeContextRequest::builder()
+            .input(RunAgentInput::of("t", "r"))
+            .build();
+        assert_eq!(anonymous.user_id(), None);
     }
 
     #[test]

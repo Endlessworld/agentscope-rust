@@ -9404,4 +9404,80 @@ mod tests {
             "the agent-level slot must not keep a dead run"
         );
     }
+
+    /// A model that keeps the first call ticking (so it can be cancelled at a checkpoint) and
+    /// answers every later call immediately, so a cancelled turn can be followed by one that
+    /// must complete.
+    struct FirstCallBlocksModel {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Model for FirstCallBlocksModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Box::pin(futures::stream::unfold((), |_| async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    Some((Ok(text_response("tick")), ()))
+                }));
+            }
+            Box::pin(futures::stream::once(async { Ok(text_response("done")) }))
+        }
+
+        fn model_name(&self) -> &str {
+            "first-call-blocks"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_call_admitted_after_a_cancelled_one_completes_and_owns_the_state() {
+        // Java #3924: the same-call gate is released on cancellation, while the cancelled
+        // turn's state write may still be in flight; the next call then runs against stale
+        // state and is overwritten by the late write. Rust holds the gate and the write in
+        // the same future, so a call admitted right after a cancellation must both run and
+        // leave *its own* turn as the final state.
+        let agent = Arc::new(
+            ReActAgent::builder()
+                .name("t-reentry")
+                .model(Arc::new(FirstCallBlocksModel {
+                    calls: AtomicUsize::new(0),
+                }))
+                .build()
+                .unwrap(),
+        );
+        let signal = CancelSignal::new();
+        let first_agent = Arc::clone(&agent);
+        let first_signal = signal.clone();
+        let first = tokio::spawn(async move {
+            first_agent
+                .call_with_cancel(vec![Msg::user("first")], first_signal)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(signal.cancel());
+        let error = first
+            .await
+            .expect("the call task must not panic")
+            .expect_err("a cancelled call must not produce a reply");
+        assert!(matches!(error, Error::Cancelled(_)), "got: {error}");
+
+        let reply = agent
+            .call(vec![Msg::user("second")])
+            .await
+            .expect("a call right after a cancellation must run");
+        assert_eq!(reply.text_content(), "done");
+
+        let context = agent.agent_state().context().to_vec();
+        let texts: Vec<String> = context.iter().map(Msg::text_content).collect();
+        assert_eq!(texts.last().map(String::as_str), Some("done"));
+        assert!(
+            !texts.iter().any(|text| text.contains("tick")),
+            "the cancelled turn must not appear as an assistant reply: {texts:?}"
+        );
+    }
 }

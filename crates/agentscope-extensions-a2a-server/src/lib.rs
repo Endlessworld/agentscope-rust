@@ -10,6 +10,7 @@
 //! * [`ServerMessageConvert`] - `utils.MessageConvertUtil`
 //! * [`A2aTaskRegistry`] - `tasks` (`InMemoryTaskStore`)
 //! * [`A2aRequestHandler`] - `request.AgentScopeA2aRequestHandler`
+//! * [`context_resolver`] - `executor.A2aContextResolver`
 //! * [`registry::AgentRegistry`] / [`registry::AgentRegistryService`] - `registry`
 //! * [`transport`] - `transport.*` (`TransportWrapper`, `DeploymentProperties`, JSON-RPC)
 //! * [`server::AgentScopeA2aServer`] - `AgentScopeA2aServer`
@@ -21,12 +22,14 @@
 //! the SDK-agnostic layer actually contributes.
 
 pub mod card;
+pub mod context_resolver;
 pub mod executor;
 pub mod registry;
 pub mod runner;
 pub mod server;
 pub mod transport;
 
+pub use context_resolver::{A2aCallContext, A2aContextResolver, A2aIdentity, A2aResolveError};
 pub use executor::{AgentExecuteProperties, AgentOutputProjector};
 pub use registry::{AgentRegistry, AgentRegistryService, RegistrationReport};
 pub use runner::{
@@ -665,6 +668,10 @@ fn part_metadata_mut(part: &mut Part) -> &mut agentscope_core::message::JsonMap 
 ///   card
 /// * the four push-notification methods - answer `UnsupportedOperationError` (`-32004`)
 ///
+/// The user identity of a call comes from the envelope-level `_agentscope_user_id` key, unless
+/// a [`A2aContextResolver`] is configured: a transport-verified identity then wins over the
+/// envelope assertion, and a resolver error rejects the call.
+///
 /// Output assembly follows [`AgentExecuteProperties`]: which agent events become visible
 /// [`Msg`]s is decided by [`AgentOutputProjector`], and a non-blocking run only completes with a
 /// message when `complete_with_message` is set (a blocking `message/send` always does, as in
@@ -674,6 +681,7 @@ pub struct A2aRequestHandler {
     registry: Arc<A2aTaskRegistry>,
     agent_card: AgentCard,
     execute_properties: AgentExecuteProperties,
+    context_resolver: Option<Arc<dyn A2aContextResolver>>,
 }
 
 impl A2aRequestHandler {
@@ -704,7 +712,16 @@ impl A2aRequestHandler {
             registry,
             agent_card,
             execute_properties,
+            context_resolver: None,
         }
+    }
+
+    /// Sets the deployment-side adjudication of the user identity of each call.
+    ///
+    /// Without a resolver the user id a client asserts in the message envelope is used as-is.
+    pub fn with_context_resolver(mut self, context_resolver: Arc<dyn A2aContextResolver>) -> Self {
+        self.context_resolver = Some(context_resolver);
+        self
     }
 
     /// The agent execution properties driving output assembly.
@@ -734,10 +751,23 @@ impl A2aRequestHandler {
         &self.registry
     }
 
-    /// Dispatches one JSON-RPC request.
+    /// Dispatches one JSON-RPC request, without a transport context.
     pub async fn handle(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
+        self.handle_with_context(request, &A2aCallContext::in_process(request.method.clone()))
+            .await
+    }
+
+    /// Dispatches one JSON-RPC request carrying the transport context of the call.
+    ///
+    /// The context is what a configured [`A2aContextResolver`] adjudicates the call identity
+    /// from.
+    pub async fn handle_with_context(
+        &self,
+        request: &JsonRpcRequest,
+        call_context: &A2aCallContext,
+    ) -> JsonRpcResponse {
         let id = request.id.clone();
-        match self.dispatch(request).await {
+        match self.dispatch_with_context(request, call_context).await {
             Ok(result) => JsonRpcResponse::success(result, id),
             Err(error) => JsonRpcResponse::failure(error, id),
         }
@@ -748,17 +778,27 @@ impl A2aRequestHandler {
         &self,
         request: &JsonRpcRequest,
     ) -> Result<serde_json::Value, JsonRpcError> {
+        self.dispatch_with_context(request, &A2aCallContext::in_process(request.method.clone()))
+            .await
+    }
+
+    /// Dispatches one JSON-RPC request with the transport context of the call.
+    pub async fn dispatch_with_context(
+        &self,
+        request: &JsonRpcRequest,
+        call_context: &A2aCallContext,
+    ) -> Result<serde_json::Value, JsonRpcError> {
         match request.method.as_str() {
             methods::MESSAGE_SEND | methods::LEGACY_MESSAGE_SEND => {
-                self.message_send(request).await
+                self.message_send(request, call_context).await
             }
             methods::MESSAGE_STREAM | methods::LEGACY_MESSAGE_STREAM => {
-                self.collect_stream_responses(request).await
+                self.collect_stream_responses(request, call_context).await
             }
             methods::TASKS_GET | methods::LEGACY_TASKS_GET => self.tasks_get(request),
             methods::TASKS_CANCEL | methods::LEGACY_TASKS_CANCEL => self.tasks_cancel(request),
             methods::TASKS_RESUBSCRIBE | methods::LEGACY_TASKS_RESUBSCRIBE => {
-                self.collect_stream_responses(request).await
+                self.collect_stream_responses(request, call_context).await
             }
             methods::AGENT_CARD_GET | methods::LEGACY_AGENT_CARD_GET => {
                 serde_json::to_value(&self.agent_card)
@@ -797,9 +837,10 @@ impl A2aRequestHandler {
     async fn message_send(
         &self,
         request: &JsonRpcRequest,
+        call_context: &A2aCallContext,
     ) -> Result<serde_json::Value, JsonRpcError> {
         let params: MessageSendParams = parse_params(request)?;
-        let task = self.run_task(&params).await?;
+        let task = self.run_task(&params, call_context).await?;
         let result = SendResult::Task(Box::new(task));
         serde_json::to_value(&result).map_err(internal)
     }
@@ -813,8 +854,9 @@ impl A2aRequestHandler {
     async fn collect_stream_responses(
         &self,
         request: &JsonRpcRequest,
+        call_context: &A2aCallContext,
     ) -> Result<serde_json::Value, JsonRpcError> {
-        let mut stream = self.stream_responses(request)?;
+        let mut stream = self.stream_responses_with_context(request, call_context)?;
         let mut results: Vec<serde_json::Value> = Vec::new();
         while let Some(response) = futures::StreamExt::next(&mut stream).await {
             if let Some(error) = response.error {
@@ -839,6 +881,18 @@ impl A2aRequestHandler {
         &self,
         request: &JsonRpcRequest,
     ) -> Result<BoxStream<'static, JsonRpcResponse>, JsonRpcError> {
+        self.stream_responses_with_context(
+            request,
+            &A2aCallContext::in_process(request.method.clone()),
+        )
+    }
+
+    /// Answers a streaming method, carrying the transport context of the call.
+    pub fn stream_responses_with_context(
+        &self,
+        request: &JsonRpcRequest,
+        call_context: &A2aCallContext,
+    ) -> Result<BoxStream<'static, JsonRpcResponse>, JsonRpcError> {
         let phase = match request.method.as_str() {
             methods::TASKS_RESUBSCRIBE | methods::LEGACY_TASKS_RESUBSCRIBE => {
                 let (task_id, cursor) = resubscribe_params(request)?;
@@ -855,6 +909,8 @@ impl A2aRequestHandler {
             runner: self.runner.clone(),
             registry: self.registry.clone(),
             execute_properties: self.execute_properties,
+            context_resolver: self.context_resolver.clone(),
+            call_context: call_context.clone(),
             request: request.clone(),
             id: request.id.clone(),
             phase,
@@ -867,9 +923,19 @@ impl A2aRequestHandler {
     ///
     /// Mirrors Java `processTaskBlocking`: a blocking request always completes with a message
     /// carrying the compacted output.
-    async fn run_task(&self, params: &MessageSendParams) -> Result<Task, JsonRpcError> {
-        let (task_id, context_id, mut events) =
-            start_run(&self.runner, &self.registry, params).await?;
+    async fn run_task(
+        &self,
+        params: &MessageSendParams,
+        call_context: &A2aCallContext,
+    ) -> Result<Task, JsonRpcError> {
+        let (task_id, context_id, mut events) = start_run(
+            &self.runner,
+            &self.registry,
+            self.context_resolver.as_ref(),
+            call_context,
+            params,
+        )
+        .await?;
         let mut projector = AgentOutputProjector::new(self.execute_properties);
         while let Some(event) = futures::StreamExt::next(&mut events).await {
             let event = event
@@ -951,6 +1017,8 @@ impl A2aRequestHandler {
 async fn start_run(
     runner: &Arc<dyn AgentRunner>,
     registry: &Arc<A2aTaskRegistry>,
+    context_resolver: Option<&Arc<dyn A2aContextResolver>>,
+    call_context: &A2aCallContext,
     params: &MessageSendParams,
 ) -> Result<
     (
@@ -972,6 +1040,10 @@ async fn start_run(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    // Resolved before the task is recorded: a rejected call (fail-closed resolver) must not
+    // leave a stray task behind.
+    let user_id = resolve_call_user_id(context_resolver, call_context, &params.message)?;
+
     registry.put(Task::new(
         task_id.clone(),
         TaskStatus::new(TaskState::Submitted),
@@ -981,7 +1053,7 @@ async fn start_run(
     let options = AgentRequestOptions::new()
         .with_task_id(task_id.clone())
         .with_session_id(resolve_session_id(&params.message, &context_id))
-        .with_user_id(resolve_user_id(&params.message).unwrap_or_default());
+        .with_user_id(user_id);
 
     let stream = match runner.stream_events_incremental(msgs.clone(), options.clone()) {
         Some(stream) => stream,
@@ -1016,14 +1088,87 @@ fn resolve_session_id(message: &Message, context_id: &str) -> String {
     context_id.to_string()
 }
 
-/// Resolves the user id of one request from `message.metadata["userId"]`, mirroring Java
-/// `AgentScopeAgentExecutor#getUserId`.
+/// Resolves the user id of one request from the envelope-level
+/// `metadata["_agentscope_user_id"]` key, falling back to the flat legacy `metadata["userId"]`
+/// key (deprecated). Mirrors Java `AgentScopeAgentExecutor#getUserId`.
 fn resolve_user_id(message: &Message) -> Option<String> {
-    message
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("userId"))
+    let metadata = message.metadata.as_ref()?;
+    metadata
+        .get(MessageConstants::USER_ID_METADATA_KEY)
+        .or_else(|| metadata.get("userId"))
         .map(metadata_text)
+}
+
+/// Resolves the user id of a call: the resolver's transport-verified identity wins over the
+/// envelope-asserted one, which wins over none. Mirrors Java
+/// `AgentScopeAgentExecutor#resolveUserId`.
+///
+/// A resolver error fails the call closed: the request is rejected instead of being downgraded
+/// to the unverified envelope assertion.
+fn resolve_call_user_id(
+    context_resolver: Option<&Arc<dyn A2aContextResolver>>,
+    call_context: &A2aCallContext,
+    message: &Message,
+) -> Result<String, JsonRpcError> {
+    let asserted = resolve_user_id(message).unwrap_or_default();
+    let Some(resolver) = context_resolver else {
+        if !asserted.trim().is_empty() {
+            warn_about_unverified_identity_once();
+        }
+        return Ok(asserted);
+    };
+    let identity = resolver.resolve(call_context).map_err(|error| {
+        tracing::error!(
+            error = bounded_log_value(error.message()).as_str(),
+            "adjudicating the call identity failed, rejecting the call"
+        );
+        JsonRpcError::new(
+            JsonRpcError::INVALID_REQUEST,
+            "the call identity could not be verified",
+        )
+    })?;
+    let Some(verified) = identity
+        .map(|identity| identity.user_id().to_string())
+        .filter(|user_id| !user_id.trim().is_empty())
+    else {
+        return Ok(asserted);
+    };
+    if !asserted.trim().is_empty() && verified != asserted {
+        tracing::warn!(
+            verified = bounded_log_value(&verified).as_str(),
+            asserted = bounded_log_value(&asserted).as_str(),
+            "the transport-verified user id overrides the envelope-asserted one"
+        );
+    }
+    Ok(verified)
+}
+
+/// Warns once per process that an envelope-asserted identity is trusted as-is.
+///
+/// The assertion is a delegation claim any caller can make, and it keys per-user agent state,
+/// session logs and tool-visible identity.
+fn warn_about_unverified_identity_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "using the envelope-asserted user id of A2A messages without a configured \
+             A2aContextResolver: the identity is unverified and any caller can claim any user \
+             id. Configure AgentScopeA2aServerBuilder::context_resolver when the transport \
+             verifies callers."
+        );
+    });
+}
+
+/// Renders an untrusted value for a log line: control characters stripped, length bounded.
+fn bounded_log_value(value: &str) -> String {
+    const LIMIT: usize = 64;
+    let mut chars = value.chars().filter(|c| !c.is_control());
+    let head: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{head}...")
+    } else {
+        head
+    }
 }
 
 /// Renders a metadata value the way Java's `String.valueOf(Object)` does: strings verbatim,
@@ -1093,6 +1238,9 @@ struct StreamState {
     runner: Arc<dyn AgentRunner>,
     registry: Arc<A2aTaskRegistry>,
     execute_properties: AgentExecuteProperties,
+    context_resolver: Option<Arc<dyn A2aContextResolver>>,
+    /// The transport context the configured resolver adjudicates the call identity from.
+    call_context: A2aCallContext,
     request: JsonRpcRequest,
     id: Option<serde_json::Value>,
     phase: StreamPhase,
@@ -1187,7 +1335,15 @@ async fn next_stream_item(mut state: StreamState) -> Option<(JsonRpcResponse, St
                         continue;
                     }
                 };
-                match start_run(&state.runner, &state.registry, &params).await {
+                match start_run(
+                    &state.runner,
+                    &state.registry,
+                    state.context_resolver.as_ref(),
+                    &state.call_context,
+                    &params,
+                )
+                .await
+                {
                     Ok((task_id, context_id, events)) => {
                         let mut status = TaskStatus::new(TaskState::Working);
                         status.timestamp = None;
@@ -1771,7 +1927,15 @@ mod tests {
         let mut metadata = serde_json::Map::new();
         metadata.insert("sessionId".to_string(), serde_json::json!("legacy-session"));
         metadata.insert("userId".to_string(), serde_json::json!("alice"));
-        let message = Message {
+        let message = message_with_metadata(metadata);
+
+        assert_eq!(resolve_session_id(&message, "ctx-1"), "legacy-session");
+        assert_eq!(resolve_user_id(&message).as_deref(), Some("alice"));
+    }
+
+    /// A protocol message carrying `metadata` and a `ctx-1` context id.
+    fn message_with_metadata(metadata: serde_json::Map<String, serde_json::Value>) -> Message {
+        Message {
             message_id: "m1".to_string(),
             role: MessageRole::User,
             parts: vec![Part::text("ping")],
@@ -1779,10 +1943,196 @@ mod tests {
             context_id: Some("ctx-1".to_string()),
             task_id: None,
             kind: "message".to_string(),
-        };
+        }
+    }
 
-        assert_eq!(resolve_session_id(&message, "ctx-1"), "legacy-session");
-        assert_eq!(resolve_user_id(&message).as_deref(), Some("alice"));
+    /// A `message/send` request carrying `message`.
+    fn send_request(message: Message) -> JsonRpcRequest {
+        let params = MessageSendParams {
+            message,
+            configuration: None,
+            metadata: None,
+        };
+        JsonRpcRequest::new(
+            methods::MESSAGE_SEND,
+            Some(serde_json::to_value(params).unwrap()),
+            Some(serde_json::Value::from(1)),
+        )
+    }
+
+    /// A resolver reading the caller identity from the `x-user-id` request header.
+    fn header_resolver() -> Arc<dyn A2aContextResolver> {
+        Arc::new(
+            |context: &A2aCallContext| -> Result<Option<A2aIdentity>, A2aResolveError> {
+                Ok(context.header("x-user-id").map(A2aIdentity::new))
+            },
+        )
+    }
+
+    // Java: `getUserId` reads the envelope-level key, keeping the flat legacy key as a
+    // deprecated fallback.
+    #[test]
+    fn the_envelope_user_id_wins_over_the_legacy_flat_key() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("userId".to_string(), serde_json::json!("legacy"));
+        metadata.insert(
+            MessageConstants::USER_ID_METADATA_KEY.to_string(),
+            serde_json::json!("alice"),
+        );
+
+        assert_eq!(
+            resolve_user_id(&message_with_metadata(metadata)).as_deref(),
+            Some("alice")
+        );
+    }
+
+    // Java: #1603 — the identity the client puts on the envelope reaches the runner.
+    #[test]
+    fn the_envelope_user_id_reaches_the_runner() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler = A2aRequestHandler::new(
+            Arc::new(CapturingRunner { seen: seen.clone() }),
+            AgentCard::new("capturing-agent", "http://localhost"),
+            registry(),
+        );
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            MessageConstants::USER_ID_METADATA_KEY.to_string(),
+            serde_json::json!("alice"),
+        );
+
+        rt().block_on(handler.handle(&send_request(message_with_metadata(metadata))));
+
+        let options = seen.lock().unwrap().first().cloned().expect("one run");
+        assert_eq!(options.user_id(), Some("alice"));
+        assert_eq!(options.session_id(), Some("ctx-1"));
+    }
+
+    // Java: `resolveUserId` — a transport-verified identity overrides the envelope assertion.
+    #[test]
+    fn a_transport_verified_user_id_overrides_the_envelope_assertion() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler = A2aRequestHandler::new(
+            Arc::new(CapturingRunner { seen: seen.clone() }),
+            AgentCard::new("capturing-agent", "http://localhost"),
+            registry(),
+        )
+        .with_context_resolver(header_resolver());
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            MessageConstants::USER_ID_METADATA_KEY.to_string(),
+            serde_json::json!("alice"),
+        );
+        let mut headers = TransportHeaders::new();
+        headers.insert("x-user-id".to_string(), "bob".to_string());
+
+        let response = rt().block_on(handler.handle_with_context(
+            &send_request(message_with_metadata(metadata)),
+            &A2aCallContext::new(headers, methods::MESSAGE_SEND),
+        ));
+
+        assert!(!response.is_error(), "the call is served: {response:?}");
+        let options = seen.lock().unwrap().first().cloned().expect("one run");
+        assert_eq!(options.user_id(), Some("bob"));
+    }
+
+    // Java: a resolver returning nothing (or a blank user id) deliberately keeps the envelope
+    // trust.
+    #[test]
+    fn a_resolver_without_an_identity_keeps_the_envelope_assertion() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler = A2aRequestHandler::new(
+            Arc::new(CapturingRunner { seen: seen.clone() }),
+            AgentCard::new("capturing-agent", "http://localhost"),
+            registry(),
+        )
+        .with_context_resolver(header_resolver());
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            MessageConstants::USER_ID_METADATA_KEY.to_string(),
+            serde_json::json!("alice"),
+        );
+
+        rt().block_on(handler.handle(&send_request(message_with_metadata(metadata))));
+
+        let options = seen.lock().unwrap().first().cloned().expect("one run");
+        assert_eq!(options.user_id(), Some("alice"));
+    }
+
+    // Java: a resolver that throws fails closed — the request is rejected and never downgraded
+    // to the unverified envelope assertion.
+    #[test]
+    fn a_failing_resolver_rejects_the_call() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let resolver: Arc<dyn A2aContextResolver> = Arc::new(
+            |_: &A2aCallContext| -> Result<Option<A2aIdentity>, A2aResolveError> {
+                Err(A2aResolveError::new("the token is not valid"))
+            },
+        );
+        let handler = A2aRequestHandler::new(
+            Arc::new(CapturingRunner { seen: seen.clone() }),
+            AgentCard::new("capturing-agent", "http://localhost"),
+            registry(),
+        )
+        .with_context_resolver(resolver);
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            MessageConstants::USER_ID_METADATA_KEY.to_string(),
+            serde_json::json!("alice"),
+        );
+
+        let response =
+            rt().block_on(handler.handle(&send_request(message_with_metadata(metadata))));
+
+        let error = response.error.expect("the call is rejected");
+        assert_eq!(error.code, JsonRpcError::INVALID_REQUEST);
+        assert!(seen.lock().unwrap().is_empty(), "the agent never runs");
+        assert_eq!(handler.registry().len(), 0, "no task is recorded");
+    }
+
+    // The transport headers are what a resolver adjudicates from, so they must reach it through
+    // the JSON-RPC wrapper.
+    #[test]
+    fn the_transport_headers_reach_the_context_resolver() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(
+            A2aRequestHandler::new(
+                Arc::new(CapturingRunner { seen: seen.clone() }),
+                AgentCard::new("capturing-agent", "http://localhost"),
+                registry(),
+            )
+            .with_context_resolver(header_resolver()),
+        );
+        let mut headers = TransportHeaders::new();
+        headers.insert("x-user-id".to_string(), "bob".to_string());
+        let body = serde_json::to_string(&send_request(Message::new(
+            "m1",
+            MessageRole::User,
+            vec![Part::text("ping")],
+        )))
+        .unwrap();
+
+        rt().block_on(JsonRpcTransportWrapper::new(handler).handle_request(
+            &body,
+            &headers,
+            &TransportMetadata::new(),
+        ));
+
+        let options = seen.lock().unwrap().first().cloned().expect("one run");
+        assert_eq!(options.user_id(), Some("bob"));
+    }
+
+    #[test]
+    fn a_logged_identity_value_is_bounded_and_stripped() {
+        assert_eq!(bounded_log_value("ali\u{7}ce\n"), "alice");
+        let long = "a".repeat(80);
+        let bounded = bounded_log_value(&long);
+        assert_eq!(
+            bounded.chars().count(),
+            67,
+            "64 characters plus the ellipsis"
+        );
+        assert!(bounded.ends_with("..."));
     }
 
     // Java: null, empty and whitespace-only legacy values fall back to the protocol context id.

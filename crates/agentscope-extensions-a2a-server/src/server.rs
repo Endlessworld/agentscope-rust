@@ -28,7 +28,7 @@ use crate::transport::{
     default_transport_builders, CustomTransportProperties, DeploymentProperties, TransportHeaders,
     TransportMetadata, TransportResponse, TransportWrapper, TransportWrapperBuilder,
 };
-use crate::{A2aRequestHandler, A2aTaskRegistry, AgentRunner};
+use crate::{A2aContextResolver, A2aRequestHandler, A2aTaskRegistry, AgentRunner};
 
 /// A failure while building an [`AgentScopeA2aServer`].
 ///
@@ -75,6 +75,7 @@ pub struct AgentScopeA2aServerBuilder {
     deployment_properties: Option<DeploymentProperties>,
     execute_properties: AgentExecuteProperties,
     task_registry: Option<Arc<A2aTaskRegistry>>,
+    context_resolver: Option<Arc<dyn A2aContextResolver>>,
 }
 
 impl std::fmt::Debug for AgentScopeA2aServerBuilder {
@@ -101,6 +102,7 @@ impl AgentScopeA2aServerBuilder {
             deployment_properties: None,
             execute_properties: AgentExecuteProperties::default(),
             task_registry: None,
+            context_resolver: None,
         }
     }
 
@@ -177,6 +179,17 @@ impl AgentScopeA2aServerBuilder {
         self
     }
 
+    /// Sets the deployment-side adjudication of the user identity of each call, e.g. from an
+    /// mTLS certificate or an OAuth token in the request headers.
+    ///
+    /// A transport-verified user id overrides the one the client asserts in the message
+    /// envelope; without a resolver the asserted one is used as-is. See
+    /// [`A2aContextResolver`] for the precedence and the fail-closed contract.
+    pub fn context_resolver(mut self, context_resolver: Arc<dyn A2aContextResolver>) -> Self {
+        self.context_resolver = Some(context_resolver);
+        self
+    }
+
     /// Assembles the server.
     ///
     /// Mirrors Java `Builder#build`: normalize the transports, derive the agent card, build the
@@ -235,13 +248,17 @@ impl AgentScopeA2aServerBuilder {
 
         let descriptor = RunnerDescriptor(self.agent_runner.as_ref());
         let agent_card = create_agent_card(&self.agent_card, &descriptor, &available);
-        let request_handler = Arc::new(A2aRequestHandler::new_with_properties(
+        let mut request_handler = A2aRequestHandler::new_with_properties(
             self.agent_runner.clone(),
             agent_card.clone(),
             self.task_registry
                 .unwrap_or_else(|| Arc::new(A2aTaskRegistry::new())),
             self.execute_properties,
-        ));
+        );
+        if let Some(context_resolver) = self.context_resolver {
+            request_handler = request_handler.with_context_resolver(context_resolver);
+        }
+        let request_handler = Arc::new(request_handler);
 
         let mut transport_wrappers: HashMap<String, Arc<dyn TransportWrapper>> = HashMap::new();
         for properties in &available {

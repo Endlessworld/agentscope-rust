@@ -192,6 +192,12 @@ pub struct NacosAgentCard {
     pub security_schemes: Option<serde_json::Map<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<Vec<serde_json::Map<String, Value>>>,
+    /// Native A2A signature metadata, kept verbatim (Nacos 3.3.0 `AgentCard#getSignatures`).
+    ///
+    /// Conversion neither verifies nor recomputes these values, so a card whose endpoints were
+    /// rewritten still carries its original signatures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<Vec<serde_json::Map<String, Value>>>,
     #[serde(
         rename = "supportsAuthenticatedExtendedCard",
         skip_serializing_if = "Option::is_none"
@@ -219,6 +225,7 @@ impl NacosAgentCard {
             skills: Vec::new(),
             security_schemes: None,
             security: None,
+            signatures: None,
             supports_authenticated_extended_card: None,
             documentation_url: None,
         }

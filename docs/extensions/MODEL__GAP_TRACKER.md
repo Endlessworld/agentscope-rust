@@ -436,6 +436,14 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 | `MODEL-D09` | `6ee804457` | 其余 provider 的 `Source` 新增 `file_id` 变体 | `src/gemini`、`src/ollama`、`src/openai_official`、`src/responses`、`src/common/media`、`src/common/multi_agent` 各加显式分支：无内联字节 → `Err`（media resolver / image url）或 `fileid://<id>` 文本引用（纯文本降级路径） | 设计决定：Java 对这些 provider 未做文档支持，Rust 采用「显式降级/报错」而非静默丢弃，属 hardening，不新增能力 |
 | `MODEL-D10` | `f911c0c7e` / `0860005c9` / `f6c9fafe3` | 依赖升级：`com.openai:openai-java` 4.88→4.94、`google-genai` 1.78→1.79、`dashscope-sdk-java` 2.23.3→2.23.4；`OpenAIDecisionsClient` 跟随新 SDK 改用 `inputOfDecisionInputItems` | 无 | 设计决定（不迁移）：Rust 用 async-openai 0.41 / 自建 wire DTO，无 SDK 版本对应；judge crate 的 decisions 请求本就按 `"input": [{"role":"user","content":[{"type":"input_text"...}]}]` 构造（`extensions-judge/src/openai_decisions/protocol.rs:88-113`），与 Java 新形态一致，无需改动 |
 
+### 3.7 2026-11-03 Java 提交批次（`abf3c35a3` 之后 7 个提交，`abf3c35a3..1d8f9dc04`）
+
+> 本批只有 `960d7e46c`（`ModelRegistry.unregister` / `evictResolvedCache`）落在模型域。
+
+| 编号 | Java 提交 | 变更 | Rust 落点 | 状态 / 验证 |
+|---|---|---|---|---|
+| `MODEL-D11` | `960d7e46c` | `unregister(name)` + `evictResolvedCache(context, modelId)`（null 通配、只改映射不关闭实例） | `crates/agentscope-core/src/model/provider.rs:155` | 设计决定（不迁移）：Rust `ModelRegistry` 是 provider 注册表（按 `provider_id` 覆盖），既无命名模型实例映射，也无解析缓存——`resolve`/`resolve_with` 每次新建实例，`rg 'resolve_cache\|cache_identity\|cacheKey'` 零命中；「无解析缓存」已是 `tests/registry_semantics.rs` 固化的不变量（MODEL-13，若加缓存须同时做注册驱逐与单飞）。另：ACP/harness 切模型走每次重建（`acp_harness_agent.rs:1022`、`harness_agent.rs:1028` 的无状态 resolver），不存在陈旧缓存。详见 `CORE__GAP_TRACKER.md` §3.5.5 `CORE-D17` |
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

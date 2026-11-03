@@ -144,6 +144,29 @@ impl AguiRequestProcessor {
             .as_ref()
             .and_then(|resolver| resolver.resolve(request));
         let mut runtime_context = resolved.unwrap_or_default();
+        // Priority: resolver (deployer decision) > request assertion > none. A caller
+        // assertion must never override a server-verified identity, but a configured
+        // resolver that supplies nothing leaves room for the caller's value.
+        let resolved_user_id = runtime_context
+            .user_id()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned);
+        let request_user_id = request
+            .user_id()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned);
+        if let (Some(resolved), Some(asserted)) = (&resolved_user_id, &request_user_id) {
+            if resolved != asserted {
+                tracing::warn!(
+                    resolver_user_id = %resolved,
+                    request_user_id = %asserted,
+                    "AG-UI user identity conflict: the resolver value wins"
+                );
+            }
+        }
+        if resolved_user_id.is_none() {
+            runtime_context.user_id = request_user_id;
+        }
         runtime_context.session_id = Some(thread_id.clone());
 
         let agent_id = resolve_agent_id(
@@ -768,6 +791,66 @@ mod tests {
         assert_eq!(result.runtime_context.user_id(), Some("u-42"));
         // The session id is always derived from the AG-UI thread id.
         assert_eq!(result.runtime_context.session_id(), Some("tenant-thread"));
+    }
+
+    #[tokio::test]
+    async fn the_request_level_user_id_is_adopted_when_no_resolver_decides() {
+        let mut resolver = TestResolver::default();
+        resolver.registry.register(
+            "default",
+            Arc::new(StubAgent::new("default", vec![start_event()])),
+        );
+        let processor = processor(resolver, AguiAdapterConfig::default_config());
+        let request = AguiRuntimeContextRequest::builder()
+            .input(RunAgentInput::of("thread-1", "r"))
+            .user_id("alice")
+            .build();
+        let result = processor.process(&request).await;
+        assert_eq!(result.runtime_context.user_id(), Some("alice"));
+        assert_eq!(result.runtime_context.session_id(), Some("thread-1"));
+    }
+
+    #[tokio::test]
+    async fn the_resolver_user_id_wins_over_the_request_assertion() {
+        let mut resolver = TestResolver::default();
+        resolver.registry.register(
+            "default",
+            Arc::new(StubAgent::new("default", vec![start_event()])),
+        );
+        let processor = AguiRequestProcessor::builder()
+            .agent_resolver(Box::new(resolver))
+            .runtime_context_resolver(Arc::new(|_request: &AguiRuntimeContextRequest| {
+                Some(RuntimeContext::default().with_user_id("verified"))
+            }))
+            .build();
+        let request = AguiRuntimeContextRequest::builder()
+            .input(RunAgentInput::of("thread-1", "r"))
+            .user_id("asserted")
+            .build();
+        let result = processor.process(&request).await;
+        // A caller assertion must never override a deployer-verified identity.
+        assert_eq!(result.runtime_context.user_id(), Some("verified"));
+    }
+
+    #[tokio::test]
+    async fn a_blank_user_id_is_ignored_on_both_sides() {
+        let mut resolver = TestResolver::default();
+        resolver.registry.register(
+            "default",
+            Arc::new(StubAgent::new("default", vec![start_event()])),
+        );
+        let processor = AguiRequestProcessor::builder()
+            .agent_resolver(Box::new(resolver))
+            .runtime_context_resolver(Arc::new(|_request: &AguiRuntimeContextRequest| {
+                Some(RuntimeContext::default().with_user_id("  "))
+            }))
+            .build();
+        let request = AguiRuntimeContextRequest::builder()
+            .input(RunAgentInput::of("thread-1", "r"))
+            .user_id("  ")
+            .build();
+        let result = processor.process(&request).await;
+        assert_eq!(result.runtime_context.user_id(), None);
     }
 
     #[test]

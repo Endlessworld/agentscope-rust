@@ -23,6 +23,11 @@ use crate::model::{Artifact, DataPart, FileContent, FilePart, Message, MessageRo
 pub struct MessageConstants;
 
 impl MessageConstants {
+    /// Envelope-level metadata key carrying the caller-asserted user id of a whole call.
+    ///
+    /// Unlike the per-message keys below it is written to the top-level message metadata (never
+    /// wrapped in the `<msgId, metadata>` structure), so the server can always read it flat.
+    pub const USER_ID_METADATA_KEY: &'static str = "_agentscope_user_id";
     /// Source agent name of the originating message.
     pub const SOURCE_NAME_METADATA_KEY: &'static str = "_agentscope_msg_source";
     /// Id of the originating [`Msg`].
@@ -484,12 +489,26 @@ impl MessageConvert {
             .build()
     }
 
-    /// Converts a batch of [`Msg`]s into one A2A [`Message`].
+    /// Converts a batch of [`Msg`]s into one A2A [`Message`], without call identity.
     ///
-    /// Mirrors Java `MessageConvertUtil#convertFromMsg(List)`: per-message metadata is
-    /// nested under its message id, each part is stamped with the source message id/name/
-    /// role, and the message role is resolved from the batch.
+    /// Mirrors Java `MessageConvertUtil#convertFromMsg(List)`.
     pub fn convert_from_msgs(msgs: &[Msg]) -> Message {
+        Self::convert_from_msgs_with_identity(msgs, None, None)
+    }
+
+    /// Converts a batch of [`Msg`]s into one A2A [`Message`], carrying the call identity.
+    ///
+    /// Mirrors Java `MessageConvertUtil#convertFromMsg(List, String, String)`: the user id,
+    /// when not blank, is written to the envelope-level metadata key
+    /// [`MessageConstants::USER_ID_METADATA_KEY`] and never takes part in the `<msgId,
+    /// metadata>` wrapping of per-message metadata, so a message whose id collides with the
+    /// reserved key cannot overwrite the identity; the session id, when not blank, becomes the
+    /// A2A native `contextId` of the message.
+    pub fn convert_from_msgs_with_identity(
+        msgs: &[Msg],
+        user_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Message {
         let mut nested_metadata = JsonMap::new();
         let mut parts: Vec<Part> = Vec::new();
 
@@ -518,12 +537,24 @@ impl MessageConvert {
             }
         }
 
+        // Reserved entries are written last, so a message whose id equals the reserved key
+        // cannot spoof or suppress the identity.
+        if let Some(user_id) = user_id.filter(|id| !id.trim().is_empty()) {
+            nested_metadata.insert(
+                MessageConstants::USER_ID_METADATA_KEY.to_string(),
+                Value::String(user_id.to_string()),
+            );
+        }
+
         let mut message = Message::new(
             uuid::Uuid::new_v4().to_string(),
             Self::resolve_message_role(msgs),
             parts,
         );
         message.metadata = Some(nested_metadata);
+        if let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) {
+            message.context_id = Some(session_id.to_string());
+        }
         message
     }
 
@@ -810,6 +841,90 @@ mod tests {
             "Assistant"
         );
         assert_eq!(json["metadata"]["m1"]["k"], "v");
+    }
+
+    // Java: `convertFromMsg(msgs, userId, sessionId)` — the user id rides on the envelope, the
+    // session id becomes the native `contextId`.
+    #[test]
+    fn call_identity_rides_on_the_envelope() {
+        let msgs = vec![Msg::builder()
+            .id("msg-1")
+            .role(MsgRole::User)
+            .text_content("hi")
+            .metadata_entry("turn", Value::from(1))
+            .build()];
+
+        let message = MessageConvert::convert_from_msgs_with_identity(
+            &msgs,
+            Some("alice"),
+            Some("session-1"),
+        );
+
+        assert_eq!(
+            MessageConstants::metadata_value(message.metadata.as_ref(), "_agentscope_user_id")
+                .as_deref(),
+            Some("alice")
+        );
+        assert_eq!(message.context_id.as_deref(), Some("session-1"));
+        // The envelope key stays flat: per-message metadata is still wrapped by msg id.
+        let wrapped = message.metadata.as_ref().unwrap().get("msg-1").unwrap();
+        assert_eq!(wrapped["turn"], Value::from(1));
+    }
+
+    #[test]
+    fn blank_call_identity_is_not_sent() {
+        let msgs = vec![Msg::builder()
+            .id("msg-1")
+            .role(MsgRole::User)
+            .text_content("hi")
+            .build()];
+
+        let message = MessageConvert::convert_from_msgs_with_identity(&msgs, Some("  "), Some(""));
+
+        assert!(!message
+            .metadata
+            .as_ref()
+            .unwrap()
+            .contains_key(MessageConstants::USER_ID_METADATA_KEY));
+        assert_eq!(message.context_id, None);
+    }
+
+    #[test]
+    fn the_identity_less_overload_sends_no_identity() {
+        let msgs = vec![Msg::builder()
+            .id("msg-1")
+            .role(MsgRole::User)
+            .text_content("hi")
+            .build()];
+
+        let message = MessageConvert::convert_from_msgs(&msgs);
+
+        assert!(!message
+            .metadata
+            .as_ref()
+            .unwrap()
+            .contains_key(MessageConstants::USER_ID_METADATA_KEY));
+        assert_eq!(message.context_id, None);
+    }
+
+    // Java regression: the reserved entry is written after the `<msgId, metadata>` wrapping, so
+    // a message id equal to the reserved key cannot spoof or suppress the identity.
+    #[test]
+    fn a_message_id_colliding_with_the_reserved_key_cannot_spoof_the_identity() {
+        let msgs = vec![Msg::builder()
+            .id(MessageConstants::USER_ID_METADATA_KEY)
+            .role(MsgRole::User)
+            .text_content("hi")
+            .metadata_entry("turn", Value::from(1))
+            .build()];
+
+        let message = MessageConvert::convert_from_msgs_with_identity(&msgs, Some("alice"), None);
+
+        assert_eq!(
+            MessageConstants::metadata_value(message.metadata.as_ref(), "_agentscope_user_id")
+                .as_deref(),
+            Some("alice")
+        );
     }
 
     #[test]

@@ -427,6 +427,12 @@ impl LeafFactory {
         }
         if let Some(decl) = &self.decl {
             builder = builder.session_id(derive_child_session_id(decl, parent_rc));
+            // Java `SubAgentTool` runs each child call under the child session **and the
+            // parent's user identity**. Without the user id a shared-workspace child falls
+            // back to `__anon__` and tenants sharing one subagent name collide on a slot.
+            if let Some(user_id) = parent_rc.user_id() {
+                builder = builder.user_id(user_id);
+            }
         }
         // Java `configurePlanMode` propagates plan mode to both child kinds.
         if self.blueprint.plan_mode_enabled {
@@ -677,6 +683,34 @@ mod tests {
             .general_purpose_leaf()
             .build(&RuntimeContext::new());
         assert!(child.disable_session_persistence());
+    }
+
+    #[test]
+    fn a_declared_child_inherits_the_parent_user_id() {
+        // Java `SubAgentTool` runs the child under the parent's identity; without it a
+        // shared-workspace child resolves to `__anon__` and tenants collide on one slot.
+        let decl = SubagentDeclaration::new("worker", "does work", "You work.");
+        let parent_rc = RuntimeContext::new().with_user_id("alice");
+        let child = blueprint(false)
+            .declared_leaf(&decl)
+            .expect("a local declaration yields a leaf")
+            .build(&parent_rc);
+        let agent = child.agent().expect("the child is built with a model");
+        assert_eq!(
+            agentscope_core::Agent::agent_state(agent).user_id(),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn a_declared_child_without_a_parent_user_id_stays_anonymous() {
+        let decl = SubagentDeclaration::new("worker", "does work", "You work.");
+        let child = blueprint(false)
+            .declared_leaf(&decl)
+            .expect("a local declaration yields a leaf")
+            .build(&RuntimeContext::new());
+        let agent = child.agent().expect("the child is built with a model");
+        assert_eq!(agentscope_core::Agent::agent_state(agent).user_id(), None);
     }
 
     #[tokio::test]

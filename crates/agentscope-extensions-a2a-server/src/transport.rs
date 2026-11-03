@@ -345,7 +345,7 @@ impl TransportWrapper for JsonRpcTransportWrapper {
     async fn handle_request(
         &self,
         body: &str,
-        _headers: &TransportHeaders,
+        headers: &TransportHeaders,
         _metadata: &TransportMetadata,
     ) -> TransportResponse {
         let request = match self.parse(body) {
@@ -353,8 +353,14 @@ impl TransportWrapper for JsonRpcTransportWrapper {
             Err(error) => return TransportResponse::Json(error),
         };
         let id = request.id.clone();
+        // The headers are what a configured `A2aContextResolver` adjudicates the call identity
+        // from, so they travel with the request through the handler.
+        let call_context = crate::A2aCallContext::new(headers.clone(), request.method.clone());
         if is_streaming_method(&request.method) {
-            match self.request_handler.stream_responses(&request) {
+            match self
+                .request_handler
+                .stream_responses_with_context(&request, &call_context)
+            {
                 Ok(stream) => {
                     return TransportResponse::Stream(Box::pin(futures::StreamExt::map(
                         stream,
@@ -369,7 +375,9 @@ impl TransportWrapper for JsonRpcTransportWrapper {
             }
         }
         TransportResponse::Json(serialize_response(
-            self.request_handler.handle(&request).await,
+            self.request_handler
+                .handle_with_context(&request, &call_context)
+                .await,
         ))
     }
 }

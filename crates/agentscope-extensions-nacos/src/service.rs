@@ -168,6 +168,10 @@ pub struct NacosPrompt {
     pub template: String,
     pub version: Option<String>,
     pub label: Option<String>,
+    /// The template's declared variables, mirroring `Prompt#getVariables()`.
+    ///
+    /// Their defaults are applied when rendering and are overridden by the caller's args.
+    pub variables: Option<Vec<NacosPromptVariable>>,
 }
 
 impl NacosPrompt {
@@ -176,6 +180,7 @@ impl NacosPrompt {
             template: template.into(),
             version: None,
             label: None,
+            variables: None,
         }
     }
 
@@ -184,6 +189,58 @@ impl NacosPrompt {
     pub fn render(&self, args: Option<&HashMap<String, String>>) -> String {
         render_template(&self.template, args)
     }
+}
+
+/// A prompt template variable, mirroring
+/// `com.alibaba.nacos.api.ai.model.prompt.PromptVariable`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct NacosPromptVariable {
+    /// Variable name, replaced as `{{name}}` when rendering.
+    pub name: String,
+    /// Default value applied when the caller supplies no override (`None`: no default).
+    #[serde(default, rename = "defaultValue")]
+    pub default_value: Option<String>,
+}
+
+/// A `(name, version, label)` selector triple: the identity of a prompt subscription or a
+/// skill download in Nacos.
+///
+/// Version and label are mutually exclusive, so at most one side is populated.
+pub type SelectionKey = (String, Option<String>, Option<String>);
+
+/// Normalizes one prompt/skill selector: `None`/blank means "unspecified" (trimmed).
+pub fn normalize_selector(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Normalizes the `(version, label)` pair, rejecting both at once (Nacos: version and label
+/// are mutually exclusive selectors).
+pub(crate) fn normalize_selectors(
+    version: Option<&str>,
+    label: Option<&str>,
+) -> AiServiceResult<(Option<String>, Option<String>)> {
+    let version = normalize_selector(version);
+    let label = normalize_selector(label);
+    if version.is_some() && label.is_some() {
+        return Err(AiServiceError::new(
+            AiServiceError::INVALID_PARAM,
+            "prompt version and label are mutually exclusive",
+        ));
+    }
+    Ok((version, label))
+}
+
+/// Builds a [`SelectionKey`] with normalized selectors.
+pub fn selection_key(name: &str, version: Option<&str>, label: Option<&str>) -> SelectionKey {
+    (
+        name.to_string(),
+        normalize_selector(version),
+        normalize_selector(label),
+    )
 }
 
 /// Renders `{{key}}` / `${key}` placeholders in `template` with `args`.
@@ -287,6 +344,21 @@ pub trait NacosAiService: Send + Sync {
         listener: PromptListener,
     ) -> AiServiceResult<Option<NacosPrompt>>;
 
+    /// Cancels the subscription registered for exactly `(prompt_key, version, label)`.
+    ///
+    /// Nacos has no unsubscribe call (the Java module disposes the whole `AiService`), so a
+    /// client only drops its local bookkeeping: further pushes for that exact selection are no
+    /// longer delivered. The default implementation is a no-op for services that keep no local
+    /// subscription state.
+    async fn unsubscribe_prompt(
+        &self,
+        _prompt_key: &str,
+        _version: Option<&str>,
+        _label: Option<&str>,
+    ) -> AiServiceResult<()> {
+        Ok(())
+    }
+
     // ---- Skill ----
 
     /// Downloads a skill ZIP, mirroring `downloadSkillZip(skillName)`.
@@ -317,10 +389,20 @@ pub struct InMemoryNacosAiService {
     released: Mutex<Vec<ReleasedAgentCard>>,
     endpoints: Mutex<Vec<(String, NacosAgentEndpoint)>>,
     prompts: Mutex<HashMap<String, NacosPrompt>>,
-    prompt_listeners: Mutex<HashMap<String, PromptListener>>,
-    prompt_subscriptions: Mutex<Vec<(String, Option<String>, Option<String>)>>,
+    /// Prompts seeded for exactly one version/label selection.
+    prompt_selections: Mutex<HashMap<SelectionKey, NacosPrompt>>,
+    prompt_listeners: Mutex<HashMap<SelectionKey, PromptListener>>,
+    prompt_subscriptions: Mutex<Vec<SelectionKey>>,
+    prompt_unsubscriptions: Mutex<Vec<SelectionKey>>,
+    /// One-shot failure the next `subscribe_prompt` call returns.
+    prompt_subscribe_error: Mutex<Option<AiServiceError>>,
+    /// One-shot gate the next `subscribe_prompt` call awaits (slow-server tests).
+    prompt_subscribe_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Failure `get_agent_card` keeps returning until it is cleared.
+    agent_card_error: Mutex<Option<AiServiceError>>,
     card_listeners: Mutex<HashMap<String, AgentCardListener>>,
     skills: Mutex<HashMap<String, SkillZip>>,
+    skill_downloads: Mutex<Vec<SelectionKey>>,
 }
 
 impl InMemoryNacosAiService {
@@ -337,6 +419,41 @@ impl InMemoryNacosAiService {
     /// Seeds a prompt served by [`NacosAiService::subscribe_prompt`].
     pub fn set_prompt(&self, key: impl Into<String>, prompt: NacosPrompt) {
         self.prompts.lock().unwrap().insert(key.into(), prompt);
+    }
+
+    /// Seeds a prompt for exactly one version/label selection, mirroring a Nacos prompt that
+    /// has several published versions / labels.
+    pub fn set_prompt_selection(
+        &self,
+        key: impl Into<String>,
+        version: Option<&str>,
+        label: Option<&str>,
+        prompt: NacosPrompt,
+    ) {
+        let key = key.into();
+        self.prompt_selections
+            .lock()
+            .unwrap()
+            .insert(selection_key(&key, version, label), prompt);
+    }
+
+    /// Makes the next [`NacosAiService::subscribe_prompt`] call fail with `error`.
+    pub fn fail_next_prompt_subscribe(&self, error: AiServiceError) {
+        *self.prompt_subscribe_error.lock().unwrap() = Some(error);
+    }
+
+    /// Gates the next [`NacosAiService::subscribe_prompt`] call on the returned semaphore
+    /// (created without permits), so a test can hold a subscription open and assert what other
+    /// selections may do meanwhile.
+    pub fn gate_next_prompt_subscribe(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.prompt_subscribe_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Makes [`NacosAiService::get_agent_card`] fail with `error` until cleared with `None`.
+    pub fn set_agent_card_error(&self, error: Option<AiServiceError>) {
+        *self.agent_card_error.lock().unwrap() = error;
     }
 
     /// Seeds a skill ZIP served by the `download_skill_zip*` methods.
@@ -365,8 +482,18 @@ impl InMemoryNacosAiService {
     }
 
     /// Records prompt subscriptions `(key, version, label)` for assertions.
-    pub fn prompt_subscriptions(&self) -> Vec<(String, Option<String>, Option<String>)> {
+    pub fn prompt_subscriptions(&self) -> Vec<SelectionKey> {
         self.prompt_subscriptions.lock().unwrap().clone()
+    }
+
+    /// Records prompt unsubscriptions `(key, version, label)` for assertions.
+    pub fn prompt_unsubscriptions(&self) -> Vec<SelectionKey> {
+        self.prompt_unsubscriptions.lock().unwrap().clone()
+    }
+
+    /// Records the selection of every skill download `(name, version, label)`.
+    pub fn skill_downloads(&self) -> Vec<SelectionKey> {
+        self.skill_downloads.lock().unwrap().clone()
     }
 
     /// Pushes an updated AgentCard to the registered subscriber, mirroring a Nacos
@@ -386,14 +513,47 @@ impl InMemoryNacosAiService {
         }
     }
 
-    /// Pushes an updated prompt to the registered subscriber, mirroring a Nacos
-    /// config change push. Returns whether a subscription existed.
+    /// Pushes an updated prompt to every subscription of `key`, mirroring a Nacos config change
+    /// push. Returns whether at least one subscription existed.
     pub fn fire_prompt_update(&self, key: &str, prompt: NacosPrompt) -> bool {
         self.prompts
             .lock()
             .unwrap()
             .insert(key.to_string(), prompt.clone());
-        let listener = self.prompt_listeners.lock().unwrap().get(key).cloned();
+        let listeners: Vec<PromptListener> = self
+            .prompt_listeners
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(selection, _)| selection.0 == key)
+            .map(|(_, listener)| Arc::clone(listener))
+            .collect();
+        for listener in &listeners {
+            listener(key, &prompt);
+        }
+        !listeners.is_empty()
+    }
+
+    /// Pushes an update to exactly one selection's subscription, the way a Nacos server routes
+    /// an event to the subscription that selected it. Returns whether one existed.
+    pub fn fire_prompt_update_for(
+        &self,
+        key: &str,
+        version: Option<&str>,
+        label: Option<&str>,
+        prompt: NacosPrompt,
+    ) -> bool {
+        let selection = selection_key(key, version, label);
+        self.prompt_selections
+            .lock()
+            .unwrap()
+            .insert(selection.clone(), prompt.clone());
+        let listener = self
+            .prompt_listeners
+            .lock()
+            .unwrap()
+            .get(&selection)
+            .cloned();
         match listener {
             Some(listener) => {
                 listener(key, &prompt);
@@ -441,6 +601,9 @@ impl NacosAiService for InMemoryNacosAiService {
         agent_name: &str,
         _version: Option<&str>,
     ) -> AiServiceResult<Option<NacosAgentCard>> {
+        if let Some(error) = self.agent_card_error.lock().unwrap().clone() {
+            return Err(error);
+        }
         Ok(self.cards.lock().unwrap().get(agent_name).cloned())
     }
 
@@ -468,23 +631,75 @@ impl NacosAiService for InMemoryNacosAiService {
     async fn subscribe_prompt(
         &self,
         prompt_key: &str,
-        _version: Option<&str>,
-        _label: Option<&str>,
+        version: Option<&str>,
+        label: Option<&str>,
         listener: PromptListener,
     ) -> AiServiceResult<Option<NacosPrompt>> {
+        if let Some(error) = self.prompt_subscribe_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        let gate = self.prompt_subscribe_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            // One permit is added by the test once it wants the subscription to complete.
+            let _permit = gate
+                .acquire()
+                .await
+                .map_err(|_| AiServiceError::transport("prompt subscribe gate closed"))?;
+        }
+        let selection = selection_key(prompt_key, version, label);
+        let prompt = self
+            .prompt_selections
+            .lock()
+            .unwrap()
+            .get(&selection)
+            .cloned()
+            .or_else(|| self.prompts.lock().unwrap().get(prompt_key).cloned());
         self.prompt_listeners
             .lock()
             .unwrap()
-            .insert(prompt_key.to_string(), listener);
-        self.prompt_subscriptions.lock().unwrap().push((
-            prompt_key.to_string(),
-            _version.map(|v| v.to_string()),
-            _label.map(|l| l.to_string()),
-        ));
-        Ok(self.prompts.lock().unwrap().get(prompt_key).cloned())
+            .insert(selection.clone(), listener);
+        self.prompt_subscriptions.lock().unwrap().push(selection);
+        Ok(prompt)
+    }
+
+    async fn unsubscribe_prompt(
+        &self,
+        prompt_key: &str,
+        version: Option<&str>,
+        label: Option<&str>,
+    ) -> AiServiceResult<()> {
+        let selection = selection_key(prompt_key, version, label);
+        self.prompt_listeners.lock().unwrap().remove(&selection);
+        self.prompt_unsubscriptions.lock().unwrap().push(selection);
+        Ok(())
     }
 
     async fn download_skill_zip(&self, skill_name: &str) -> AiServiceResult<SkillZip> {
+        self.record_skill_download(skill_name, None, None);
+        self.skill(skill_name)
+    }
+
+    async fn download_skill_zip_by_version(
+        &self,
+        skill_name: &str,
+        version: &str,
+    ) -> AiServiceResult<SkillZip> {
+        self.record_skill_download(skill_name, Some(version), None);
+        self.skill(skill_name)
+    }
+
+    async fn download_skill_zip_by_label(
+        &self,
+        skill_name: &str,
+        label: &str,
+    ) -> AiServiceResult<SkillZip> {
+        self.record_skill_download(skill_name, None, Some(label));
+        self.skill(skill_name)
+    }
+}
+
+impl InMemoryNacosAiService {
+    fn skill(&self, skill_name: &str) -> AiServiceResult<SkillZip> {
         self.skills
             .lock()
             .unwrap()
@@ -493,19 +708,10 @@ impl NacosAiService for InMemoryNacosAiService {
             .ok_or_else(|| AiServiceError::not_found(format!("skill not found: {skill_name}")))
     }
 
-    async fn download_skill_zip_by_version(
-        &self,
-        skill_name: &str,
-        _version: &str,
-    ) -> AiServiceResult<SkillZip> {
-        self.download_skill_zip(skill_name).await
-    }
-
-    async fn download_skill_zip_by_label(
-        &self,
-        skill_name: &str,
-        _label: &str,
-    ) -> AiServiceResult<SkillZip> {
-        self.download_skill_zip(skill_name).await
+    fn record_skill_download(&self, skill_name: &str, version: Option<&str>, label: Option<&str>) {
+        self.skill_downloads
+            .lock()
+            .unwrap()
+            .push(selection_key(skill_name, version, label));
     }
 }

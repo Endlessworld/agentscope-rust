@@ -451,6 +451,18 @@ impl CallParts {
         history_of(&self.state)
     }
 
+    /// The identity of the call's session scope: the user id and the non-empty session id of
+    /// the agent state, which is what Java takes from the `RuntimeContext` of the call.
+    fn identity(&self) -> (Option<String>, Option<String>) {
+        match self.state.lock() {
+            Ok(state) => (
+                state.user_id.clone(),
+                (!state.session_id.is_empty()).then(|| state.session_id.clone()),
+            ),
+            Err(_) => (None, None),
+        }
+    }
+
     fn append_history(&self, messages: &[Msg]) {
         append_to_history(&self.state, messages);
     }
@@ -505,8 +517,13 @@ impl CallParts {
         // Java serializes calls that share a session: they share the history.
         let _gate = self.gate.lock().await;
         self.append_history(&messages);
+        let (user_id, session_id) = self.identity();
         let params = MessageSendParams {
-            message: MessageConvert::convert_from_msgs(&self.history()),
+            message: MessageConvert::convert_from_msgs_with_identity(
+                &self.history(),
+                user_id.as_deref(),
+                session_id.as_deref(),
+            ),
             configuration: None,
             metadata: None,
         };
@@ -527,8 +544,13 @@ impl CallParts {
     async fn stream_call(&self, messages: Vec<Msg>) -> Result<(Msg, Vec<AgentEvent>), A2aError> {
         let _gate = self.gate.lock().await;
         self.append_history(&messages);
+        let (user_id, session_id) = self.identity();
         let params = MessageSendParams {
-            message: MessageConvert::convert_from_msgs(&self.history()),
+            message: MessageConvert::convert_from_msgs_with_identity(
+                &self.history(),
+                user_id.as_deref(),
+                session_id.as_deref(),
+            ),
             configuration: None,
             metadata: None,
         };
@@ -823,8 +845,13 @@ impl IncrementalCall {
     async fn open(&mut self) {
         self.guard = Some(self.handler.gate.clone().lock_owned().await);
         self.handler.append_history(&self.messages);
+        let (user_id, session_id) = self.handler.identity();
         let params = MessageSendParams {
-            message: MessageConvert::convert_from_msgs(&self.handler.history()),
+            message: MessageConvert::convert_from_msgs_with_identity(
+                &self.handler.history(),
+                user_id.as_deref(),
+                session_id.as_deref(),
+            ),
             configuration: None,
             metadata: None,
         };
@@ -1127,6 +1154,7 @@ mod tests {
     /// Transport that answers by method name and records every call.
     struct ScriptedTransport {
         methods: Mutex<Vec<String>>,
+        requests: Mutex<Vec<JsonRpcRequest>>,
         send_reply: JsonRpcResponse,
         get_replies: Mutex<Vec<JsonRpcResponse>>,
         cancel_reply: JsonRpcResponse,
@@ -1140,6 +1168,7 @@ mod tests {
         ) -> Arc<Self> {
             Arc::new(Self {
                 methods: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
                 send_reply,
                 get_replies: Mutex::new(get_replies),
                 cancel_reply,
@@ -1148,6 +1177,10 @@ mod tests {
 
         fn methods(&self) -> Vec<String> {
             self.methods.lock().unwrap().clone()
+        }
+
+        fn requests(&self) -> Vec<JsonRpcRequest> {
+            self.requests.lock().unwrap().clone()
         }
 
         fn next_get(&self) -> JsonRpcResponse {
@@ -1171,6 +1204,7 @@ mod tests {
             _headers: &BTreeMap<String, String>,
         ) -> Pin<Box<dyn Future<Output = Result<JsonRpcResponse, A2aError>> + Send + '_>> {
             self.methods.lock().unwrap().push(request.method.clone());
+            self.requests.lock().unwrap().push(request.clone());
             let response = match request.method.as_str() {
                 crate::model::methods::TASKS_GET => self.next_get(),
                 crate::model::methods::TASKS_CANCEL => self.cancel_reply.clone(),
@@ -1186,6 +1220,7 @@ mod tests {
             _headers: BTreeMap<String, String>,
         ) -> futures::stream::BoxStream<'static, Result<JsonRpcResponse, A2aError>> {
             self.methods.lock().unwrap().push(request.method.clone());
+            self.requests.lock().unwrap().push(request);
             let response = self.send_reply.clone();
             Box::pin(futures::stream::once(async move { Ok(response) }))
         }
@@ -1284,6 +1319,45 @@ mod tests {
             .block_on(agent.call(vec![Msg::user("hi")]))
             .expect("call succeeds");
         assert_eq!(reply.text_content(), "direct");
+    }
+
+    // Java: `A2aAgent#exchange` — the user and session id of the call now travel on the wire.
+    #[test]
+    fn call_sends_the_session_identity_on_the_wire() {
+        let transport = ScriptedTransport::new(
+            completed_task_reply(None, Some("done")),
+            Vec::new(),
+            JsonRpcResponse::success(serde_json::Value::Null, Some(2.into())),
+        );
+        let agent = A2aAgent::builder("remote", resolver())
+            .config(
+                A2aAgentConfig::builder()
+                    .transport(transport.clone())
+                    .poll_attempts(4)
+                    .poll_interval(Duration::from_millis(1))
+                    .build(),
+            )
+            .agent_state(
+                AgentState::builder()
+                    .user_id("alice")
+                    .session_id("session-1")
+                    .build(),
+            )
+            .build();
+
+        rt().block_on(agent.call(vec![Msg::user("hi")]))
+            .expect("call succeeds");
+
+        let requests = transport.requests();
+        let request = requests.first().expect("the send request");
+        let params: crate::model::MessageSendParams =
+            serde_json::from_value(request.params.clone().unwrap()).unwrap();
+        assert_eq!(params.message.context_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            params.message.metadata.unwrap()
+                [crate::message::MessageConstants::USER_ID_METADATA_KEY],
+            serde_json::json!("alice")
+        );
     }
 
     // Java: A2aAgent#doCall blocks until the task is terminal — Rust polls `tasks/get`.

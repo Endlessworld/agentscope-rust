@@ -443,17 +443,21 @@ impl NacosA2aRegistry {
         Ok(())
     }
 
+    /// Looks up the card before publishing, mirroring 3.3.0's
+    /// `tryGetAgentCardFromNacos`: only `NOT_FOUND` means "absent"; any other Nacos failure is
+    /// propagated with its original code and message instead of being treated as missing.
     async fn try_get_agent_card_from_nacos(
         &self,
         card: &NacosAgentCard,
-    ) -> Result<Option<NacosAgentCard>, String> {
+    ) -> AiServiceResult<Option<NacosAgentCard>> {
         match self
             .service
             .get_agent_card(&card.name, card.version.as_deref())
             .await
         {
             Ok(card) => Ok(card),
-            Err(_) => Ok(None),
+            Err(error) if error.is_not_found() => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -1015,6 +1019,40 @@ mod tests {
         assert_eq!(endpoints[0].1.address.as_deref(), Some("localhost"));
         assert_eq!(endpoints[0].1.port, 8080);
         assert_eq!(endpoints[0].1.transport, "JSONRPC");
+    }
+
+    /// Nacos 3.3.0: only `NOT_FOUND` means "the card does not exist yet"; any other lookup
+    /// failure is propagated with its original code instead of being treated as missing.
+    #[tokio::test]
+    async fn a_failed_card_lookup_is_not_treated_as_missing() {
+        let svc = Arc::new(InMemoryNacosAiService::new());
+        svc.set_agent_card_error(Some(AiServiceError::new(503, "nacos unavailable")));
+        let registry = NacosA2aRegistry::new(svc.clone());
+        let card = A2aAgentCard::new("agent", "http://localhost:8080");
+
+        let error = registry
+            .register_agent(&card, &NacosA2aRegistryProperties::default())
+            .await
+            .unwrap_err();
+        assert!(error.contains("503"), "{error}");
+        assert!(error.contains("nacos unavailable"), "{error}");
+        // The publish step never ran.
+        assert!(svc.released_cards().is_empty());
+    }
+
+    /// A `NOT_FOUND` lookup is the normal "first registration" case and must not fail it.
+    #[tokio::test]
+    async fn a_not_found_lookup_still_registers_the_card() {
+        let svc = Arc::new(InMemoryNacosAiService::new());
+        svc.set_agent_card_error(Some(AiServiceError::not_found("no such card")));
+        let registry = NacosA2aRegistry::new(svc.clone());
+        let card = A2aAgentCard::new("agent", "http://localhost:8080");
+
+        registry
+            .register_agent(&card, &NacosA2aRegistryProperties::default())
+            .await
+            .unwrap();
+        assert_eq!(svc.released_cards(), vec![("agent".to_string(), false)]);
     }
 
     /// NACOS-01: the protocol `AgentRegistryService` drives this registry end to end.

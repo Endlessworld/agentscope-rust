@@ -54,8 +54,8 @@ use tracing::warn;
 
 use crate::a2a::model::{NacosAgentCard, NacosAgentEndpoint};
 use crate::service::{
-    AgentCardListener, AiServiceError, AiServiceResult, NacosAiService, NacosPrompt,
-    PromptListener, SkillZip,
+    normalize_selectors, selection_key, AgentCardListener, AiServiceError, AiServiceResult,
+    NacosAiService, NacosPrompt, NacosPromptVariable, PromptListener, SelectionKey, SkillZip,
 };
 
 /// A single HTTP request produced by [`NacosHttpAiService`].
@@ -374,8 +374,6 @@ struct AuthState {
 
 /// A prompt subscription kept by [`NacosHttpAiService`].
 struct SubscribedPrompt {
-    version: Option<String>,
-    label: Option<String>,
     listener: PromptListener,
     last: Option<NacosPrompt>,
 }
@@ -385,7 +383,9 @@ struct SubscribedPrompt {
 struct Subscriptions {
     card_listeners: HashMap<String, AgentCardListener>,
     card_last: HashMap<String, NacosAgentCard>,
-    prompt_listeners: HashMap<String, SubscribedPrompt>,
+    /// Keyed by `(promptKey, version, label)`: Nacos 3.3.0 isolates prompt subscriptions per
+    /// selection, so two selectors of the same prompt are two subscriptions.
+    prompt_listeners: HashMap<SelectionKey, SubscribedPrompt>,
 }
 
 /// A [`NacosAiService`] over the Nacos v1 AI OpenAPI.
@@ -470,21 +470,21 @@ impl NacosHttpAiService {
             }
         }
 
-        let prompts: Vec<(String, Option<String>, Option<String>)> = self
+        let prompts: Vec<SelectionKey> = self
             .subscriptions
             .lock()
             .unwrap()
             .prompt_listeners
-            .iter()
-            .map(|(key, sub)| (key.clone(), sub.version.clone(), sub.label.clone()))
+            .keys()
+            .cloned()
             .collect();
-        for (key, version, label) in prompts {
+        for selection in prompts {
             let fetched = self
-                .fetch_prompt(&key, version.as_deref(), label.as_deref())
+                .fetch_prompt(&selection.0, selection.1.as_deref(), selection.2.as_deref())
                 .await?;
             let listener = {
                 let mut guard = self.subscriptions.lock().unwrap();
-                let Some(sub) = guard.prompt_listeners.get_mut(&key) else {
+                let Some(sub) = guard.prompt_listeners.get_mut(&selection) else {
                     continue;
                 };
                 if sub.last == fetched {
@@ -494,24 +494,31 @@ impl NacosHttpAiService {
                 Some(sub.listener.clone())
             };
             if let (Some(listener), Some(prompt)) = (listener, fetched) {
-                listener(&key, &prompt);
+                listener(&selection.0, &prompt);
                 fired += 1;
             }
         }
         Ok(fired)
     }
 
-    /// Stops pushing changes for `prompt_key`, returning whether a subscription was removed.
+    /// Stops pushing changes for exactly `(prompt_key, version, label)`, returning whether a
+    /// subscription was removed.
     ///
     /// Nacos has no unsubscribe call (the Java module relies on disposing the whole `AiService`),
     /// so this prunes the local subscription table only — after which [`Self::poll_once`] no
-    /// longer re-fetches the key (NACOS-12).
-    pub fn unsubscribe_prompt(&self, prompt_key: &str) -> bool {
+    /// longer re-fetches that selection (NACOS-12).
+    pub fn unsubscribe_prompt(
+        &self,
+        prompt_key: &str,
+        version: Option<&str>,
+        label: Option<&str>,
+    ) -> bool {
+        let selection = selection_key(prompt_key, version, label);
         self.subscriptions
             .lock()
             .unwrap()
             .prompt_listeners
-            .remove(prompt_key)
+            .remove(&selection)
             .is_some()
     }
 
@@ -780,12 +787,14 @@ impl NacosHttpAiService {
         version: Option<&str>,
         label: Option<&str>,
     ) -> AiServiceResult<Option<NacosPrompt>> {
+        // Version and label are mutually exclusive selectors: never send both to Nacos.
+        let (version, label) = normalize_selectors(version, label)?;
         let url = self.url(
             &self.config.prompt_path,
             &[
                 ("promptKey", prompt_key.to_string()),
-                ("version", version.unwrap_or_default().to_string()),
-                ("label", label.unwrap_or_default().to_string()),
+                ("version", version.unwrap_or_default()),
+                ("label", label.unwrap_or_default()),
             ],
         );
         let Some(value) = self.get_json(url).await? else {
@@ -868,15 +877,24 @@ impl NacosAiService for NacosHttpAiService {
         let prompt = self.fetch_prompt(prompt_key, version, label).await?;
         let mut guard = self.subscriptions.lock().unwrap();
         guard.prompt_listeners.insert(
-            prompt_key.to_string(),
+            selection_key(prompt_key, version, label),
             SubscribedPrompt {
-                version: version.map(str::to_string),
-                label: label.map(str::to_string),
                 listener,
                 last: prompt.clone(),
             },
         );
         Ok(prompt)
+    }
+
+    async fn unsubscribe_prompt(
+        &self,
+        prompt_key: &str,
+        version: Option<&str>,
+        label: Option<&str>,
+    ) -> AiServiceResult<()> {
+        // Nacos has no unsubscribe call, so dropping the local subscription always succeeds.
+        NacosHttpAiService::unsubscribe_prompt(self, prompt_key, version, label);
+        Ok(())
     }
 
     async fn download_skill_zip(&self, skill_name: &str) -> AiServiceResult<SkillZip> {
@@ -975,7 +993,8 @@ fn check_write_response(response: &HttpResponse) -> AiServiceResult<()> {
     }
 }
 
-/// Builds a [`NacosPrompt`] from a prompt payload (`template` + optional version/label).
+/// Builds a [`NacosPrompt`] from a prompt payload (`template` + optional version/label and
+/// template variables).
 fn parse_prompt(value: &Value) -> Option<NacosPrompt> {
     let object = value.as_object()?;
     let template = object.get("template")?.as_str()?.to_string();
@@ -989,6 +1008,9 @@ fn parse_prompt(value: &Value) -> Option<NacosPrompt> {
             .get("label")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        variables: object
+            .get("variables")
+            .and_then(|v| serde_json::from_value::<Vec<NacosPromptVariable>>(v.clone()).ok()),
     })
 }
 
@@ -1211,6 +1233,78 @@ mod tests {
         assert_eq!(posted.port, 9000);
     }
 
+    /// Nacos 3.3.0: `version` and `label` are mutually exclusive selectors, so a request is
+    /// rejected before it is sent.
+    #[tokio::test]
+    async fn subscribing_with_version_and_label_is_rejected() {
+        let transport = FakeTransport::new(vec![]);
+        let service = service(Arc::clone(&transport));
+        let noop: PromptListener = Arc::new(|_, _| {});
+        let error = service
+            .subscribe_prompt("greeting", Some("1"), Some("prod"), noop)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), AiServiceError::INVALID_PARAM);
+        assert!(error.message().contains("mutually exclusive"), "{error}");
+        assert!(transport.requests().is_empty());
+    }
+
+    /// Each `(promptKey, version, label)` selection is its own subscription: unsubscribing one
+    /// leaves the other polled.
+    #[tokio::test]
+    async fn unsubscribe_targets_one_selection() {
+        let transport = FakeTransport::new(vec![
+            HttpResponse::new(200, "{\"template\":\"v1\"}"),
+            HttpResponse::new(200, "{\"template\":\"prod\"}"),
+        ]);
+        let http = service(Arc::clone(&transport));
+        let noop: PromptListener = Arc::new(|_, _| {});
+        http.subscribe_prompt("greet", Some("1"), None, Arc::clone(&noop))
+            .await
+            .unwrap();
+        http.subscribe_prompt("greet", None, Some("prod"), noop)
+            .await
+            .unwrap();
+
+        assert!(http.unsubscribe_prompt("greet", Some("1"), None));
+        assert!(!http.unsubscribe_prompt("greet", Some("1"), None));
+
+        // Only the label selection is re-fetched.
+        transport.push(HttpResponse::new(200, "{\"template\":\"prod\"}"));
+        assert_eq!(http.poll_once().await.unwrap(), 0);
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[2].url.contains("label=prod"),
+            "{}",
+            requests[2].url
+        );
+    }
+
+    /// The template's variable defaults travel with the payload.
+    #[test]
+    fn prompt_variables_are_parsed() {
+        let value: Value = serde_json::from_str(
+            "{\"template\":\"hi {{name}}\",\"variables\":[\
+             {\"name\":\"name\",\"defaultValue\":\"there\"},{\"name\":\"other\"}]}",
+        )
+        .unwrap();
+        let prompt = parse_prompt(&value).unwrap();
+        assert_eq!(
+            prompt.variables,
+            Some(vec![
+                NacosPromptVariable {
+                    name: "name".to_string(),
+                    default_value: Some("there".to_string()),
+                },
+                NacosPromptVariable {
+                    name: "other".to_string(),
+                    default_value: None,
+                },
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn prompts_are_parsed_and_subscriptions_fire_on_change() {
         let transport = FakeTransport::new(vec![HttpResponse::new(
@@ -1322,8 +1416,8 @@ mod tests {
             .unwrap();
         assert_eq!(transport.requests().len(), 2);
 
-        assert!(http.unsubscribe_prompt("greet"));
-        assert!(!http.unsubscribe_prompt("greet"));
+        assert!(http.unsubscribe_prompt("greet", None, None));
+        assert!(!http.unsubscribe_prompt("greet", None, None));
 
         // The card is still subscribed, so it is re-fetched; the pruned prompt is not.
         assert_eq!(http.poll_once().await.unwrap(), 0);
