@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     BooleanPropertySchema, CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
     ElicitationContentValue, ElicitationFormMode, ElicitationPropertySchema, ElicitationSchema,
     ElicitationSessionScope, EnumOption, IntegerPropertySchema, MultiSelectPropertySchema,
@@ -510,7 +510,7 @@ fn content_value_to_json(value: &ElicitationContentValue) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::ElicitationAcceptAction;
+    use agent_client_protocol::v1::schema::ElicitationAcceptAction;
 
     fn map(value: serde_json::Value) -> JsonMap {
         match value {

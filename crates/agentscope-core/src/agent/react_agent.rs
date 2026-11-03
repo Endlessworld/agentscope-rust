@@ -4531,6 +4531,8 @@ fn error_result(call: &ToolUseBlock, message: &str) -> ToolResultBlock {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use futures::stream::BoxStream;
 
     use super::*;

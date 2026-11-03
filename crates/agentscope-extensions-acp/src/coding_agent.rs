@@ -10,18 +10,24 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::{
-    AgentAuthCapabilities, AgentCapabilities, CancelNotification, CloseSessionRequest,
-    CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse, DisableProviderRequest,
-    DisableProviderResponse, Implementation, InitializeRequest, InitializeResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, McpCapabilities, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
-    ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
-    SessionDeleteCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SessionResumeCapabilities, SetProviderRequest, SetProviderResponse,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason,
+use agent_client_protocol::v1::schema::{
+    AgentAuthCapabilities, AgentCapabilities, ArchiveSessionRequest, ArchiveSessionResponse,
+    AuthState, AuthStatusCapabilities, AuthStatusRequest, AuthStatusResponse, CancelNotification,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, DeleteSessionRequest,
+    DeleteSessionResponse, DisableProviderRequest, DisableProviderResponse, Implementation,
+    InitializeRequest, InitializeResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionArchiveCapabilities, SessionArchiveFilter,
+    SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionResumeCapabilities, SessionStatus,
+    SessionStatusCapabilities, SessionStatusRequest, SessionStatusResponse,
+    SessionSystemPromptCapabilities, SessionTitleCapabilities, SetProviderRequest,
+    SetProviderResponse, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, SetSessionTitleRequest, SetSessionTitleResponse,
+    StopReason, SystemPrompt, SystemPromptMode, TextContent, UnarchiveSessionRequest,
+    UnarchiveSessionResponse,
 };
 use agent_client_protocol::{Agent, Stdio};
 
@@ -142,6 +148,10 @@ pub struct SessionBuild {
     /// Slot the `ask_user` tool reads the live connection from. The session
     /// fills it on every prompt; the tool holds the same handle.
     pub elicitation_slot: ElicitationSlot,
+    /// Text the client asked to **append** to our own system prompt
+    /// (`systemPrompt.mode = append`). Already validated: never empty, and only
+    /// `append` reaches here — `override` is rejected by the handler.
+    pub system_prompt: Option<String>,
 }
 
 /// An ACP CodingAgent with a session registry and a factory for building the
@@ -329,6 +339,29 @@ impl AcpCodingAgent {
             .image_support
             .get()
             .unwrap_or_else(|| self.refresh_image_support());
+        let mut session_capabilities = SessionCapabilities::new()
+            .list(SessionListCapabilities::new())
+            .delete(SessionDeleteCapabilities::new())
+            .resume(SessionResumeCapabilities::new())
+            .close(SessionCloseCapabilities::new())
+            // The handler already honoured `additionalDirectories`; without this
+            // advertisement a compliant client never sends them (ACP-37).
+            .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
+            // Clients may retitle a session (ACP-33) and probe whether we still hold
+            // it in memory (ACP-34).
+            .title(SessionTitleCapabilities::new())
+            .status(SessionStatusCapabilities::new())
+            // `session/archive` / `session/unarchive` + the `session/list` filter (ACP-36).
+            .archive(SessionArchiveCapabilities::new());
+        // Only `append` mode is implemented; advertising `{}` is exactly the spec's way of
+        // saying "append supported" (ACP-38). It is advertised only when a `session_factory`
+        // can carry the text into the agent -- `model_factory` has no channel for it, so
+        // advertising there would promise something we cannot honour (and we reject the
+        // request instead of dropping it silently).
+        if self.session_factory.is_some() {
+            session_capabilities =
+                session_capabilities.system_prompt(SessionSystemPromptCapabilities::new());
+        }
         AgentCapabilities::new()
             .load_session(true)
             .prompt_capabilities(
@@ -338,18 +371,18 @@ impl AcpCodingAgent {
                     .embedded_context(true),
             )
             .mcp_capabilities(McpCapabilities::new().http(true).sse(true).acp(true))
-            .session_capabilities(
-                SessionCapabilities::new()
-                    .list(SessionListCapabilities::new())
-                    .delete(SessionDeleteCapabilities::new())
-                    .resume(SessionResumeCapabilities::new())
-                    .close(SessionCloseCapabilities::new()),
-            )
-            .auth(AgentAuthCapabilities::new())
+            .session_capabilities(session_capabilities)
+            // We never require a sign-in, so `auth/status` answers `not_required` (ACP-35).
+            .auth(AgentAuthCapabilities::new().status(AuthStatusCapabilities::new()))
     }
 
     /// Creates a new session using the session factory.
-    fn create_session(&self, session_id: SessionId, cwd: PathBuf) -> AcpAgentSession {
+    fn create_session(
+        &self,
+        session_id: SessionId,
+        cwd: PathBuf,
+        system_prompt: Option<String>,
+    ) -> AcpAgentSession {
         // The slot is created *before* the agent so a capability-gated `ask_user`
         // tool can be baked into the toolkit at build time — that is what makes
         // subagents inherit it, since the blueprint snapshots the toolkit once.
@@ -360,6 +393,7 @@ impl AcpCodingAgent {
                 session_id: session_id.to_string(),
                 client_support: self.client_support.clone(),
                 elicitation_slot: Arc::clone(&elicitation_slot),
+                system_prompt,
             }),
             None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
         };
@@ -378,6 +412,23 @@ impl AcpCodingAgent {
             session.set_model_builder(Arc::clone(builder));
         }
         session
+    }
+
+    /// Validates a client-supplied `systemPrompt` for a session lifecycle request (ACP-38).
+    ///
+    /// Beyond the mode/content rules of [`system_prompt_text`], a `model_factory`-built agent
+    /// has no channel for the text: reject the request instead of accepting it and dropping it
+    /// (that configuration does not advertise the capability either).
+    fn client_system_prompt(
+        &self,
+        prompt: Option<SystemPrompt>,
+    ) -> Result<Option<String>, agent_client_protocol::Error> {
+        let text = system_prompt_text(prompt)?;
+        if text.is_some() && self.session_factory.is_none() {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("systemPrompt requires a session factory"));
+        }
+        Ok(text)
     }
 
     /// Registers the session in the registry.
@@ -446,6 +497,38 @@ impl AcpCodingAgent {
             .cloned()
     }
 
+    /// Releases every session once the connection is gone (ACP-42).
+    ///
+    /// A prompt turn runs on a spawned task, so a client that disconnects mid-turn would
+    /// otherwise leave the agent reasoning with nowhere to send the result. Closing each
+    /// session cancels the running turn (the same path `session/close` takes) and drops the
+    /// `HarnessAgent`; the cached `session/list` agents go too. No checkpoint write is needed
+    /// here: the harness commits the journal per turn, so the last completed step is already
+    /// durable.
+    async fn shutdown_sessions(&self) {
+        let sessions: Vec<AcpAgentSession> = {
+            let mut guard = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.drain().map(|(_, session)| session).collect()
+        };
+        // Released concurrently: the per-session wait is bounded, and serialising N sessions
+        // would multiply that bound by N.
+        let releases = sessions.into_iter().map(|session| async move {
+            session.close();
+            // Bounded: a wedged turn must not keep the process alive after the client left.
+            let _ = session
+                .cancel_and_wait(std::time::Duration::from_secs(5))
+                .await;
+        });
+        futures::future::join_all(releases).await;
+        self.catalog_agents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
     /// Whether a persisted journal exists for `session_id`.
     ///
     /// `session/load` and `session/resume` must not silently create an empty session for a
@@ -458,6 +541,7 @@ impl AcpCodingAgent {
                 session_id: session_id.to_string(),
                 client_support: self.client_support.clone(),
                 elicitation_slot: Arc::new(Mutex::new(None)),
+                system_prompt: None,
             }),
             None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
         };
@@ -472,6 +556,107 @@ impl AcpCodingAgent {
         }
     }
 
+    /// Resolves `session/status` for `session_id` (ACP-34).
+    ///
+    /// `open` when this process holds the session, `saved` when only its workspace knows it, and
+    /// `None` (→ `session_not_found`) otherwise.
+    async fn session_status(&self, session_id: &SessionId) -> Option<SessionStatus> {
+        if self.get_session(session_id).is_some() {
+            return Some(SessionStatus::Open);
+        }
+        self.session_workspace(session_id)
+            .await
+            .map(|_| SessionStatus::Saved)
+    }
+
+    /// Finds the workspace that knows `session_id` when the registry does not hold it.
+    ///
+    /// The journal store and the archive markers are per-workspace, while `session/status` and
+    /// `session/archive` carry no `cwd`. So the persisted probe only covers workspaces this
+    /// process has already seen: the live registry plus the index agents `session/list` built. A
+    /// session persisted somewhere never listed here reads as unknown, which is what a client
+    /// that never listed it should conclude anyway.
+    async fn session_workspace(&self, session_id: &SessionId) -> Option<PathBuf> {
+        let mut cwds: Vec<PathBuf> = {
+            let guard = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .values()
+                .map(|session| session.cwd().clone())
+                .collect()
+        };
+        cwds.extend(
+            self.catalog_agents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .keys()
+                .cloned(),
+        );
+        cwds.sort();
+        cwds.dedup();
+        let wanted = session_id.to_string();
+        let context = agentscope_core::agent::RuntimeContext::new();
+        for cwd in cwds {
+            // A marker without a journal entry is still a session this workspace owns.
+            if super::session::is_archived_on_disk(&cwd, session_id) {
+                return Some(cwd);
+            }
+            let agent = self.catalog_agent(&cwd);
+            match agent.list_session_keys(&context).await {
+                Ok(keys) => {
+                    if keys.iter().any(|key| key.session_id == wanted) {
+                        return Some(cwd);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not read the persisted session index")
+                }
+            }
+        }
+        None
+    }
+
+    /// Archives or unarchives a session (ACP-36).
+    ///
+    /// A live session is released exactly like `session/close`: an archived session must not
+    /// keep holding an agent while being invisible to the default `session/list`. A session that
+    /// only exists on disk is marked in its workspace's marker file.
+    async fn archive_session(
+        &self,
+        session_id: &SessionId,
+        archived: bool,
+    ) -> Result<(), agent_client_protocol::Error> {
+        if let Some(mut session) = self.get_session(session_id) {
+            if session.is_archived() == archived {
+                // Idempotent: no state change, and no reason to release a live session.
+                return Ok(());
+            }
+            session.set_archived(archived);
+            if archived {
+                session.close();
+                let _ = session
+                    .cancel_and_wait(std::time::Duration::from_secs(15))
+                    .await;
+                self.remove_session(session_id);
+            } else {
+                self.register_session(session);
+            }
+            return Ok(());
+        }
+        match self.session_workspace(session_id).await {
+            Some(cwd) => {
+                super::session::set_archived_on_disk(&cwd, session_id, archived);
+                Ok(())
+            }
+            None => Err(agent_client_protocol::v1::schema::Error::session_not_found(
+                session_id.clone(),
+            )
+            .into()),
+        }
+    }
+
     /// Builds the `session/list` response, honouring the request's `cursor`.
     ///
     /// The in-memory registry only knows sessions this process created. The journal is the
@@ -479,11 +664,13 @@ impl AcpCodingAgent {
     /// previous process persisted there — otherwise a restart showed an empty history and the
     /// client could not offer `session/load`.
     ///
-    /// Sessions are ordered by id (stable) so pagination is deterministic.
+    /// Sessions are ordered by id (stable) so pagination is deterministic. The archive filter
+    /// is applied before pagination, as the spec requires (ACP-36).
     async fn session_infos(
         &self,
         cwd: Option<&std::path::Path>,
         cursor: Option<&str>,
+        filter: SessionArchiveFilter,
     ) -> ListSessionsResponse {
         const PAGE_SIZE: usize = 50;
         let mut infos: Vec<SessionInfo> = {
@@ -510,10 +697,13 @@ impl AcpCodingAgent {
                         if known.contains(&key.session_id) {
                             continue;
                         }
-                        infos.push(SessionInfo::new(
-                            SessionId::new(key.session_id),
-                            cwd.to_path_buf(),
-                        ));
+                        let session_id = SessionId::new(key.session_id);
+                        // Persisted-only sessions report their archive state from the marker
+                        // file, so `exclude` cannot leak an archived session that is on disk.
+                        let archived = super::session::is_archived_on_disk(cwd, &session_id);
+                        infos.push(
+                            SessionInfo::new(session_id, cwd.to_path_buf()).archived(archived),
+                        );
                     }
                 }
                 Err(error) => {
@@ -525,6 +715,13 @@ impl AcpCodingAgent {
         // after the sort would leave a persisted duplicate of an in-memory session in place.
         let mut seen_ids = std::collections::HashSet::new();
         infos.retain(|info| seen_ids.insert(info.session_id.to_string()));
+        // Archive filter first: the spec applies it before pagination and combines it with cwd.
+        // `Other(_)` is rejected by the handler, so here it falls through as "no filtering".
+        match filter {
+            SessionArchiveFilter::Exclude => infos.retain(|info| info.archived != Some(true)),
+            SessionArchiveFilter::Only => infos.retain(|info| info.archived == Some(true)),
+            _ => {}
+        }
         sort_session_infos(&mut infos);
 
         // The cursor is the exclusive lower bound (last id of the prior page).
@@ -568,6 +765,7 @@ impl AcpCodingAgent {
                 session_id: CATALOG_SESSION_ID.to_string(),
                 client_support: self.client_support.clone(),
                 elicitation_slot: Arc::new(Mutex::new(None)),
+                system_prompt: None,
             }),
             None => (self.model_factory)(cwd.to_path_buf(), CATALOG_SESSION_ID),
         });
@@ -619,12 +817,16 @@ impl AcpCodingAgent {
         let a_load = agent.clone();
         let a_resume = agent.clone();
         let a_delete = agent.clone();
+        let a_title = agent.clone();
+        let a_status = agent.clone();
+        let a_archive = agent.clone();
+        let a_unarchive = agent.clone();
         let a_respond = agent.clone();
         let a_providers = agent.clone();
         let a_providers_set = agent.clone();
         let a_providers_disable = agent.clone();
         let result = Agent
-            .builder()
+            .v1()
             .on_receive_request(
                 async move |initialize: InitializeRequest, responder, _cx| {
                     // Record what the client advertised so capability-gated
@@ -641,7 +843,7 @@ impl AcpCodingAgent {
                     let mut caps = a_init.capabilities();
                     if !a_init.providers.is_empty() {
                         caps = caps.providers(
-                            agent_client_protocol::schema::v1::ProvidersCapabilities::new(),
+                            agent_client_protocol::v1::schema::ProvidersCapabilities::new(),
                         );
                     }
                     let response = InitializeResponse::new(initialize.protocol_version)
@@ -654,13 +856,17 @@ impl AcpCodingAgent {
             .on_receive_request(
                 async move |req: NewSessionRequest, responder, _cx| {
                     let cwd = req.cwd;
+                    let system_prompt = match a_new.client_system_prompt(req.system_prompt) {
+                        Ok(prompt) => prompt,
+                        Err(error) => return responder.respond_with_error(error),
+                    };
                     // A session id is the journal key: two sessions created in the same
                     // millisecond used to collide on `session-<millis>`, so the second
                     // recorder fenced the first one's writer lease ("Session writer ownership
                     // expired or fenced"). Java allocates a UUID here; do the same and keep the
                     // readable prefix for logs.
                     let session_id = SessionId::new(format!("session-{}", uuid::Uuid::new_v4()));
-                    let mut session = a_new.create_session(session_id.clone(), cwd);
+                    let mut session = a_new.create_session(session_id.clone(), cwd, system_prompt);
                     session.set_additional_directories(req.additional_directories.clone());
                     // Bridge any MCP servers the client declared before serving
                     // the first prompt, so their tools are available immediately.
@@ -758,8 +964,10 @@ impl AcpCodingAgent {
                         Some(s) => s,
                         None => {
                             return responder.respond_with_error(
-                                agent_client_protocol::Error::invalid_params()
-                                    .data("unknown session"),
+                                agent_client_protocol::v1::schema::Error::session_not_found(
+                                    sid.clone(),
+                                )
+                                .into(),
                             );
                         }
                     };
@@ -805,10 +1013,10 @@ impl AcpCodingAgent {
                         }
                     }
                     let config_options = session.config_options();
-                    let update = agent_client_protocol::schema::v1::SessionNotification::new(
+                    let update = agent_client_protocol::v1::schema::SessionNotification::new(
                         session.session_id().clone(),
-                        agent_client_protocol::schema::v1::SessionUpdate::ConfigOptionUpdate(
-                            agent_client_protocol::schema::v1::ConfigOptionUpdate::new(
+                        agent_client_protocol::v1::schema::SessionUpdate::ConfigOptionUpdate(
+                            agent_client_protocol::v1::schema::ConfigOptionUpdate::new(
                                 config_options.clone(),
                             ),
                         ),
@@ -841,10 +1049,10 @@ impl AcpCodingAgent {
                     session.set_mode(req.mode_id.to_string());
                     // Reflect the mode change to the client so its UI updates
                     // without waiting for the next prompt turn.
-                    let update = agent_client_protocol::schema::v1::SessionNotification::new(
+                    let update = agent_client_protocol::v1::schema::SessionNotification::new(
                         session.session_id().clone(),
-                        agent_client_protocol::schema::v1::SessionUpdate::CurrentModeUpdate(
-                            agent_client_protocol::schema::v1::CurrentModeUpdate::new(
+                        agent_client_protocol::v1::schema::SessionUpdate::CurrentModeUpdate(
+                            agent_client_protocol::v1::schema::CurrentModeUpdate::new(
                                 req.mode_id.clone(),
                             ),
                         ),
@@ -877,26 +1085,76 @@ impl AcpCodingAgent {
             )
             .on_receive_request(
                 async move |req: ListSessionsRequest, responder, _cx| {
+                    // An unknown filter value is reserved for a future protocol variant: reject it
+                    // rather than silently listing the wrong set (ACP-36).
+                    if matches!(req.archived, Some(SessionArchiveFilter::Other(_))) {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data("unsupported session archive filter"),
+                        );
+                    }
                     let infos = a_list
-                        .session_infos(req.cwd.as_deref(), req.cursor.as_deref())
+                        .session_infos(
+                            req.cwd.as_deref(),
+                            req.cursor.as_deref(),
+                            req.archived.unwrap_or_default(),
+                        )
                         .await;
                     responder.respond(infos)
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
+                async move |req: ArchiveSessionRequest, responder, _cx| {
+                    match a_archive.archive_session(&req.session_id, true).await {
+                        Ok(()) => responder.respond(ArchiveSessionResponse::new()),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: UnarchiveSessionRequest, responder, _cx| {
+                    match a_unarchive.archive_session(&req.session_id, false).await {
+                        Ok(()) => responder.respond(UnarchiveSessionResponse::new()),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
                 async move |req: LoadSessionRequest, responder, cx| {
                     let sid = req.session_id;
+                    let system_prompt = match a_load.client_system_prompt(req.system_prompt) {
+                        Ok(prompt) => prompt,
+                        Err(error) => return responder.respond_with_error(error),
+                    };
                     let session = match a_load.get_session(&sid) {
-                        Some(s) => s,
+                        Some(s) => {
+                            // A live session already owns its agent; the prompt cannot be
+                            // layered on without rebuilding it (which would lose the turn).
+                            if system_prompt.is_some() {
+                                tracing::warn!(
+                                    session = %sid,
+                                    "systemPrompt ignored: the session is already live"
+                                );
+                            }
+                            s
+                        }
                         None => {
                             if !a_load.session_exists(&sid, req.cwd.clone()).await {
                                 return responder.respond_with_error(
-                                    agent_client_protocol::Error::invalid_params()
-                                        .data(format!("unknown session '{sid}'")),
+                                    agent_client_protocol::v1::schema::Error::session_not_found(
+                                        sid.clone(),
+                                    )
+                                    .into(),
                                 );
                             }
-                            let session = a_load.create_session(sid.clone(), req.cwd.clone());
+                            let session = a_load.create_session(
+                                sid.clone(),
+                                req.cwd.clone(),
+                                system_prompt.clone(),
+                            );
                             a_load.register_session(session);
                             a_load.get_session(&sid).unwrap()
                         }
@@ -927,16 +1185,36 @@ impl AcpCodingAgent {
             .on_receive_request(
                 async move |req: ResumeSessionRequest, responder, _cx| {
                     let sid = req.session_id;
+                    let system_prompt = match a_resume.client_system_prompt(req.system_prompt) {
+                        Ok(prompt) => prompt,
+                        Err(error) => return responder.respond_with_error(error),
+                    };
                     let session = match a_resume.get_session(&sid) {
-                        Some(s) => s,
+                        Some(s) => {
+                            // Same as `session/load`: a live session keeps the prompt it was
+                            // built with, so a new one cannot be applied.
+                            if system_prompt.is_some() {
+                                tracing::warn!(
+                                    session = %sid,
+                                    "systemPrompt ignored: the session is already live"
+                                );
+                            }
+                            s
+                        }
                         None => {
                             if !a_resume.session_exists(&sid, req.cwd.clone()).await {
                                 return responder.respond_with_error(
-                                    agent_client_protocol::Error::invalid_params()
-                                        .data(format!("unknown session '{sid}'")),
+                                    agent_client_protocol::v1::schema::Error::session_not_found(
+                                        sid.clone(),
+                                    )
+                                    .into(),
                                 );
                             }
-                            let session = a_resume.create_session(sid.clone(), req.cwd.clone());
+                            let session = a_resume.create_session(
+                                sid.clone(),
+                                req.cwd.clone(),
+                                system_prompt,
+                            );
                             a_resume.register_session(session);
                             a_resume.get_session(&sid).unwrap()
                         }
@@ -967,6 +1245,57 @@ impl AcpCodingAgent {
                     }
                     a_delete.remove_session(&req.session_id);
                     responder.respond(DeleteSessionResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: SetSessionTitleRequest, responder, cx| {
+                    let sid = req.session_id;
+                    // The spec requires rejecting a title that is empty after normalization
+                    // with `-32602`; whitespace-only counts as empty. We store the trimmed form
+                    // and hand it back, which is the normalisation the spec allows.
+                    let title = req.title.trim().to_string();
+                    if title.is_empty() {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data("session title must not be empty"),
+                        );
+                    }
+                    let Some(mut session) = a_title.get_session(&sid) else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::v1::schema::Error::session_not_found(sid.clone())
+                                .into(),
+                        );
+                    };
+                    session.set_title(title.clone());
+                    // Reflect the change now, like the mode/config handlers: the client's
+                    // session list must not wait for the next prompt turn.
+                    let _ = cx.send_notification(session.session_info_update());
+                    a_title.register_session(session);
+                    responder.respond(SetSessionTitleResponse::new(title))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: SessionStatusRequest, responder, _cx| {
+                    match a_status.session_status(&req.session_id).await {
+                        Some(status) => responder.respond(SessionStatusResponse::new(status)),
+                        None => responder.respond_with_error(
+                            agent_client_protocol::v1::schema::Error::session_not_found(
+                                req.session_id.clone(),
+                            )
+                            .into(),
+                        ),
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: AuthStatusRequest, responder, _cx| {
+                    // Credentials come from the environment and sessions start without a
+                    // sign-in, so the honest answer is `not_required` — the spec explicitly
+                    // forbids using `auth/status` to demand authentication.
+                    responder.respond(AuthStatusResponse::new(AuthState::NotRequired))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -1015,9 +1344,12 @@ impl AcpCodingAgent {
             )
             .connect_to(transport)
             .await;
-        // The connection is gone: stop waking sessions nobody is listening to.
+        // The connection is gone: stop waking sessions nobody is listening to, and release
+        // the sessions so a turn that was still running is cancelled instead of finishing
+        // into a closed transport (ACP-42).
         wakeup_stop.store(true, std::sync::atomic::Ordering::SeqCst);
         wakeup.abort();
+        agent.shutdown_sessions().await;
         result
     }
 }
@@ -1096,7 +1428,7 @@ fn spawn_wakeup_loop(
 async fn handle_ext_respond(
     agent: Arc<AcpCodingAgent>,
     req: crate::ext::ExtRespondRequest,
-    responder: agent_client_protocol::Responder<serde_json::Value>,
+    responder: agent_client_protocol::v1::Responder<serde_json::Value>,
 ) -> Result<(), agent_client_protocol::Error> {
     let params = req.params;
     let answers = match params.to_answers() {
@@ -1106,11 +1438,12 @@ async fn handle_ext_respond(
                 .respond_with_error(agent_client_protocol::Error::invalid_params().data(error));
         }
     };
-    let session = match agent.get_session(&SessionId::new(params.session_id)) {
+    let session_id = SessionId::new(params.session_id);
+    let session = match agent.get_session(&session_id) {
         Some(session) => session,
         None => {
             return responder.respond_with_error(
-                agent_client_protocol::Error::invalid_params().data("unknown session"),
+                agent_client_protocol::v1::schema::Error::session_not_found(session_id).into(),
             );
         }
     };
@@ -1139,6 +1472,58 @@ fn sort_session_infos(infos: &mut [SessionInfo]) {
     });
 }
 
+/// Validates a client-supplied `systemPrompt` on a session lifecycle request (ACP-38).
+///
+/// Only `append` mode is implemented: the text is layered on top of our own
+/// instructions, so the coding rules and tool guidance stay in force. Any other mode
+/// is rejected with `-32602` instead of being silently downgraded — the spec forbids
+/// the downgrade, and silently honouring `override` would hand the client's prompt
+/// authority over our safety instructions.
+fn system_prompt_text(
+    prompt: Option<SystemPrompt>,
+) -> Result<Option<String>, agent_client_protocol::Error> {
+    let Some(prompt) = prompt else {
+        return Ok(None);
+    };
+    if prompt.mode != SystemPromptMode::Append {
+        return Err(agent_client_protocol::Error::new(
+            agent_client_protocol::ErrorCode::INVALID_PARAMS,
+            format!(
+                "unsupported systemPrompt mode {:?}; only `append` is supported",
+                prompt.mode
+            ),
+        )
+        .data(serde_json::json!({ "supportedModes": ["append"] })));
+    }
+    let mut text = String::new();
+    for block in prompt.content {
+        match block {
+            ContentBlock::Text(TextContent { text: chunk, .. }) => {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&chunk);
+            }
+            other => {
+                return Err(agent_client_protocol::Error::new(
+                    agent_client_protocol::ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "unsupported systemPrompt content block; only `text` is supported ({other:?})"
+                    ),
+                )
+                .data(serde_json::json!({ "supportedContentBlocks": ["text"] })));
+            }
+        }
+    }
+    if text.trim().is_empty() {
+        return Err(agent_client_protocol::Error::new(
+            agent_client_protocol::ErrorCode::INVALID_PARAMS,
+            "systemPrompt content must contain non-empty text",
+        ));
+    }
+    Ok(Some(text))
+}
+
 /// Builder for [`AcpCodingAgent`].
 #[derive(Default)]
 pub struct AcpCodingAgentBuilder {
@@ -1161,6 +1546,11 @@ impl AcpCodingAgentBuilder {
     /// Sets the factory used to build a [`HarnessAgent`] per session. The
     /// second argument is the freshly assigned ACP session id, so callers can
     /// derive per-session request headers (e.g. `x-opencode-session`).
+    ///
+    /// This factory does not receive the client-supplied `systemPrompt` (ACP-38);
+    /// use [`session_factory`](Self::session_factory) if the session must honour it.
+    /// Consequently the `systemPrompt` capability is **not** advertised for an agent
+    /// built this way, and a request that carries one is rejected with `-32602`.
     pub fn model_factory(
         mut self,
         factory: impl Fn(PathBuf, &str) -> HarnessAgent + Send + Sync + 'static,
@@ -1235,7 +1625,7 @@ impl AcpCodingAgentBuilder {
 #[cfg(test)]
 mod tests {
     use super::sort_session_infos;
-    use agent_client_protocol::schema::v1::{SessionId, SessionInfo};
+    use agent_client_protocol::v1::schema::{SessionId, SessionInfo};
 
     fn info(id: &str, updated_at: Option<&str>) -> SessionInfo {
         let info = SessionInfo::new(SessionId::new(id), std::path::PathBuf::from("/tmp"));
@@ -1311,5 +1701,108 @@ mod tests {
                 "session-never-prompted",
             ]
         );
+    }
+
+    /// ACP-38: only `append` is implemented, and the text is joined from text blocks.
+    #[test]
+    fn a_client_system_prompt_is_only_accepted_in_append_mode() {
+        use agent_client_protocol::v1::schema::{
+            ContentBlock, SystemPrompt, SystemPromptMode, TextContent,
+        };
+
+        assert_eq!(super::system_prompt_text(None).unwrap(), None);
+
+        let append = SystemPrompt::new(vec![
+            ContentBlock::Text(TextContent::new("rule one")),
+            ContentBlock::Text(TextContent::new("rule two")),
+        ]);
+        assert_eq!(
+            super::system_prompt_text(Some(append)).unwrap().as_deref(),
+            Some("rule one\n\nrule two")
+        );
+
+        // `override` would hand the client authority over our coding rules, so it is
+        // rejected rather than downgraded to `append` (the spec forbids the downgrade).
+        let overridden = SystemPrompt::new(vec![ContentBlock::Text(TextContent::new("hijack"))])
+            .mode(SystemPromptMode::Override);
+        let error = super::system_prompt_text(Some(overridden)).unwrap_err();
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
+
+        // Empty / whitespace-only content must not create a session with no instructions.
+        let blank = SystemPrompt::new(vec![ContentBlock::Text(TextContent::new("   "))]);
+        let error = super::system_prompt_text(Some(blank)).unwrap_err();
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
+    }
+
+    /// ACP-42: once the connection is gone nothing can consume a turn's output, so every
+    /// session must be closed (which cancels its running turn) and dropped.
+    #[tokio::test]
+    async fn a_terminated_connection_releases_its_sessions() {
+        use agent_client_protocol::v1::schema::SessionId;
+
+        struct StubModel;
+
+        #[async_trait::async_trait]
+        impl agentscope_core::model::Model for StubModel {
+            fn stream(
+                &self,
+                _messages: Vec<agentscope_core::message::Msg>,
+                _tools: Vec<agentscope_core::model::ToolSchema>,
+                _options: agentscope_core::model::GenerateOptions,
+            ) -> futures::stream::BoxStream<
+                '_,
+                agentscope_core::error::Result<agentscope_core::model::ChatResponse>,
+            > {
+                Box::pin(futures::stream::once(async {
+                    Ok(agentscope_core::model::ChatResponse::builder()
+                        .content(vec![agentscope_core::message::ContentBlock::Text(
+                            agentscope_core::message::TextBlock::new("done"),
+                        )])
+                        .build())
+                }))
+            }
+
+            fn model_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("agentscope_acp_shutdown_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root_for_factory = root.clone();
+        let agent = super::AcpCodingAgent::builder()
+            .model_factory(move |cwd: std::path::PathBuf, session_id: &str| {
+                agentscope_harness::agent::HarnessAgent::builder()
+                    .name("shutdown-test")
+                    .model(std::sync::Arc::new(StubModel))
+                    .session_id(session_id)
+                    .cwd(cwd)
+                    .workspace(root_for_factory.join(".agentscope").join("workspace"))
+                    .disable_memory_hooks()
+                    .max_iters(1)
+                    .build()
+            })
+            .build()
+            .expect("build AcpCodingAgent");
+
+        let session_id = SessionId::new("session-shutdown");
+        let session = agent.create_session(session_id.clone(), root.clone(), None);
+        let handle = session.clone();
+        agent.register_session(session);
+        assert!(agent.get_session(&session_id).is_some());
+
+        agent.shutdown_sessions().await;
+
+        assert!(
+            handle.is_closed(),
+            "shutdown must close the session so its running turn is cancelled"
+        );
+        assert!(
+            agent.get_session(&session_id).is_none(),
+            "the registry must be drained"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -3,7 +3,7 @@
 //! `message_id` and carrying a human-readable tool title.
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock, SessionId, SessionNotification, SessionUpdate,
 };
 use agentscope_core::message::{
@@ -86,7 +86,7 @@ async fn thinking_and_tool_call_reach_client() {
     let stop = session
         .run_prompt(
             vec![ContentBlock::Text(
-                agent_client_protocol::schema::v1::TextContent::new("do it"),
+                agent_client_protocol::v1::schema::TextContent::new("do it"),
             )],
             move |n: SessionNotification| {
                 let mut u = updates_c.lock().unwrap();
@@ -122,7 +122,7 @@ async fn thinking_and_tool_call_reach_client() {
         )
         .await;
 
-    assert_eq!(stop, agent_client_protocol::schema::v1::StopReason::EndTurn);
+    assert_eq!(stop, agent_client_protocol::v1::schema::StopReason::EndTurn);
     let updates = updates.lock().unwrap().clone();
     eprintln!("updates = {updates:?}");
     assert!(
@@ -201,7 +201,7 @@ async fn failed_run_reports_the_actual_error() {
     let stop = session
         .run_prompt(
             vec![ContentBlock::Text(
-                agent_client_protocol::schema::v1::TextContent::new("do it"),
+                agent_client_protocol::v1::schema::TextContent::new("do it"),
             )],
             move |n: SessionNotification| {
                 if let SessionUpdate::AgentMessageChunk(chunk) = n.update {
@@ -215,7 +215,7 @@ async fn failed_run_reports_the_actual_error() {
 
     assert_eq!(
         stop,
-        agent_client_protocol::schema::v1::StopReason::Refusal,
+        agent_client_protocol::v1::schema::StopReason::Refusal,
         "a failed run must stop with refusal"
     );
     let text = chunks.lock().unwrap().join("\n");
@@ -264,7 +264,7 @@ async fn a_clone_sees_the_activity_of_a_turn_it_did_not_run() {
     session
         .run_prompt(
             vec![ContentBlock::Text(
-                agent_client_protocol::schema::v1::TextContent::new("do it"),
+                agent_client_protocol::v1::schema::TextContent::new("do it"),
             )],
             |_| {},
         )

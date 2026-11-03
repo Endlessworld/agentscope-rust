@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::SessionId;
+use agent_client_protocol::v1::schema::SessionId;
 use agentscope_core::message::Msg;
 use agentscope_core::model::catalog::ModelCatalog;
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};

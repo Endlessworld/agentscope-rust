@@ -1,12 +1,14 @@
 //! MCP-over-ACP: an MCP server supplied by the ACP client over the existing
-//! ACP channel, using `mcp/connect` / `mcp/message` / `mcp/disconnect`.
+//! ACP channel, using stateless `mcp/message` requests.
 //!
-//! Per RFD *MCP-over-ACP: Stateless MCP Requests over ACP*: the **client**
-//! declares `McpServer::Acp { name, serverId }` in a session setup request; the
-//! **agent** then drives that server by sending ACP requests to the client. A
-//! `mcp/connect` allocates a connection id, `mcp/message` carries one wrapped MCP
-//! request (e.g. `tools/list`, `tools/call`) and gets one wrapped result, and
-//! `mcp/disconnect` releases the connection.
+//! Per RFD *MCP-over-ACP: Stateless MCP Requests over ACP* (schema 1.15, MCP
+//! 2026-07-28): the **client** declares `McpServer::Acp { name, serverId }` in a
+//! session setup request; the **agent** then drives that server by sending ACP
+//! requests to the client. There is **no** connect/disconnect handshake and no
+//! inner MCP `initialize`: every call is one `mcp/message` carrying
+//! `serverId` + a caller-generated `requestId` + the inner method/params, and is
+//! answered with either an inner MCP result or an inner [`McpError`] (an MCP
+//! error code, never an ACP one).
 //!
 //! This module keeps the wire parsing pure and testable, and bridges the
 //! discovered tools into a core [`Toolkit`] so the ReAct loop can call them.
@@ -15,10 +17,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
-    ConnectMcpRequest, DisconnectMcpRequest, McpConnectionId, McpServerAcpId, MessageMcpRequest,
+use agent_client_protocol::v1::schema::{
+    McpRequestId, McpServerAcpId, MessageMcpRequest, MessageMcpResponse,
 };
-use agent_client_protocol::{Client, ConnectionTo};
+use agent_client_protocol::{v1::ConnectionTo, Client};
 use agentscope_core::message::{ContentBlock, TextBlock, ToolResultBlock};
 use agentscope_core::tool::{McpTool, Toolkit};
 
@@ -87,36 +89,69 @@ pub fn render_tool_result(result: &serde_json::Value) -> String {
     parts.join("\n")
 }
 
-/// A live MCP-over-ACP connection to a client-declared MCP server.
+/// Mints the id for one inner MCP request.
 ///
-/// Cheaply cloneable: it only holds the ACP connection and the ids needed to
-/// address the connection.
+/// The id addresses a single request (it is what a proxy preserves across hops), so it must be
+/// fresh per call — reusing one would make a proxy mistake a later call for an earlier one.
+fn next_request_id() -> McpRequestId {
+    McpRequestId::new(uuid::Uuid::new_v4().to_string())
+}
+
+/// Unwraps the ACP carrier into the inner MCP result, or into a tool-level failure.
+///
+/// An inner MCP error arrives as a *successful* ACP response, so it must be surfaced as a tool
+/// failure instead of pretending the ACP call itself failed.
+fn response_payload(
+    server: &str,
+    response: MessageMcpResponse,
+) -> Result<serde_json::Value, agent_client_protocol::Error> {
+    match response {
+        MessageMcpResponse::Result { result, .. } => Ok(result),
+        MessageMcpResponse::Error { error, .. } => Err(agent_client_protocol::Error::new(
+            agent_client_protocol::ErrorCode::INTERNAL_ERROR,
+            format!(
+                "MCP server `{server}` returned error {}: {}",
+                error.code, error.message
+            ),
+        )),
+        // `MessageMcpResponse` is `#[non_exhaustive]`: a future carrier may add shapes we
+        // cannot interpret, so treat them as a tool-level failure too.
+        _ => Err(agent_client_protocol::Error::new(
+            agent_client_protocol::ErrorCode::INTERNAL_ERROR,
+            format!("MCP server `{server}` sent an unknown response"),
+        )),
+    }
+}
+
+/// A live MCP-over-ACP handle for a client-declared MCP server.
+///
+/// Cheaply cloneable: it only holds the ACP connection plus the `serverId` the
+/// client declared. Each call is self-contained (stateless protocol), so there
+/// is no connection lifecycle to manage.
 #[derive(Clone)]
 pub struct McpAcpConnection {
     connection: ConnectionTo<Client>,
-    connection_id: McpConnectionId,
+    server_id: McpServerAcpId,
     /// Human-readable server name (used when bridging tools into a toolkit).
     name: String,
 }
 
 impl McpAcpConnection {
-    /// Opens a connection for a client-declared ACP MCP server via
-    /// `mcp/connect`.
-    pub async fn connect(
+    /// Binds a handle to a client-declared ACP MCP server.
+    ///
+    /// No round-trip happens here: the stateless protocol has no handshake, so
+    /// this only records `(connection, serverId)`. Tool discovery is an ordinary
+    /// `tools/list` request (see [`Self::list_tools`]).
+    pub fn new(
         connection: ConnectionTo<Client>,
         name: impl Into<String>,
         server_id: impl Into<McpServerAcpId>,
-    ) -> Result<Self, agent_client_protocol::Error> {
-        let name = name.into();
-        let response = connection
-            .send_request(ConnectMcpRequest::new(server_id.into()))
-            .block_task()
-            .await?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             connection,
-            connection_id: response.connection_id,
-            name,
-        })
+            server_id: server_id.into(),
+            name: name.into(),
+        }
     }
 
     /// The server name this connection was opened for.
@@ -124,17 +159,20 @@ impl McpAcpConnection {
         &self.name
     }
 
-    /// Sends one wrapped MCP request (`mcp/message`) and returns the parsed
+    /// Sends one wrapped MCP request (`mcp/message`) and returns the inner MCP
     /// result payload.
+    ///
+    /// Each call gets a fresh [`McpRequestId`]: the id addresses this one inner
+    /// request (it is what a proxy preserves), not a connection.
     pub async fn request(
         &self,
         method: &str,
         params: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<serde_json::Value, agent_client_protocol::Error> {
-        let request = MessageMcpRequest::new(self.connection_id.clone(), method).params(params);
+        let request = MessageMcpRequest::new(self.server_id.clone(), next_request_id(), method)
+            .params(params);
         let response = self.connection.send_request(request).block_task().await?;
-        let raw = response.0.get();
-        Ok(serde_json::from_str(raw).unwrap_or(serde_json::Value::Null))
+        response_payload(&self.name, response)
     }
 
     /// Lists the tools the server offers.
@@ -157,15 +195,6 @@ impl McpAcpConnection {
         params.insert("arguments".to_string(), arguments);
         let result = self.request("tools/call", Some(params)).await?;
         Ok(render_tool_result(&result))
-    }
-
-    /// Releases the connection via `mcp/disconnect`.
-    pub async fn disconnect(&self) -> Result<(), agent_client_protocol::Error> {
-        self.connection
-            .send_request(DisconnectMcpRequest::new(self.connection_id.clone()))
-            .block_task()
-            .await?;
-        Ok(())
     }
 
     /// Discovers the server's tools and registers each as a core [`McpTool`]
@@ -277,5 +306,36 @@ mod tests {
         assert_eq!(render_tool_result(&serde_json::json!(null)), "");
         let rendered = render_tool_result(&serde_json::json!({ "ok": true }));
         assert!(rendered.contains("ok"));
+    }
+
+    /// ACP-34 相关批次的 ACP-U04：`mcp/message` 的两种载体形态都要按「工具结果」处理。
+    #[test]
+    fn unwraps_a_result_and_surfaces_an_inner_error_as_a_tool_failure() {
+        use agent_client_protocol::v1::schema::{McpError, MessageMcpResponse};
+
+        let payload = response_payload(
+            "srv",
+            MessageMcpResponse::success(serde_json::json!({ "tools": [] })),
+        )
+        .expect("an inner result is returned verbatim");
+        assert_eq!(payload, serde_json::json!({ "tools": [] }));
+
+        // The inner MCP error is a successful ACP response, so it must not look like a
+        // transport failure -- but it must still fail the tool call, with a readable message.
+        let error = response_payload(
+            "srv",
+            MessageMcpResponse::error(McpError::new(-32601, "no such tool")),
+        )
+        .expect_err("an inner MCP error fails the tool call");
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::INTERNAL_ERROR);
+        assert!(error.message.contains("no such tool"), "{}", error.message);
+        assert!(error.message.contains("srv"), "{}", error.message);
+    }
+
+    #[test]
+    fn every_request_gets_its_own_id() {
+        let first = next_request_id();
+        let second = next_request_id();
+        assert_ne!(first.0.as_ref(), second.0.as_ref());
     }
 }

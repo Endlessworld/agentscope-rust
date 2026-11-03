@@ -3,7 +3,7 @@
 //! Mirrors `SessionConfigOptionsFactory` from the Kotlin agent: builds the
 //! `model` and `mode` select options advertised to the client.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     SessionConfigGroupId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelect, SessionConfigSelectGroup, SessionConfigSelectOption,
     SessionConfigSelectOptions, SessionConfigValueId,

@@ -10,12 +10,13 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
     StopReason, TextContent,
 };
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Agent, Channel, Client, ConnectionTo};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::{Agent, Channel, Client};
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::AcpCodingAgent;
@@ -96,7 +97,7 @@ async fn session_load_after_restart_resumes_conversation() {
     let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
 
     let session_id = Client
-        .builder()
+        .v1()
         .connect_with(
             client_channel,
             |connection: ConnectionTo<Agent>| async move {
@@ -138,7 +139,7 @@ async fn session_load_after_restart_resumes_conversation() {
     let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
 
     Client
-        .builder()
+        .v1()
         .connect_with(
             client_channel,
             |connection: ConnectionTo<Agent>| async move {

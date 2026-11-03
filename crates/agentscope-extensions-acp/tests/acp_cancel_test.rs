@@ -7,12 +7,13 @@
 //! answers with `StopReason::Cancelled`.
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
     TextContent,
 };
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Agent, Channel, Client, ConnectionTo};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::{Agent, Channel, Client};
 use agentscope_core::message::Msg;
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::AcpCodingAgent;
@@ -60,7 +61,7 @@ async fn cancel_request_stops_prompt_with_stop_reason_cancelled() {
 
     // Client side: initialize, create a session, prompt, then cancel.
     let result = Client
-        .builder()
+        .v1()
         .connect_with(
             client_channel,
             |connection: ConnectionTo<Agent>| async move {
@@ -90,7 +91,7 @@ async fn cancel_request_stops_prompt_with_stop_reason_cancelled() {
                 let response = prompt_request.block_task().await?;
                 assert_eq!(
                     response.stop_reason,
-                    agent_client_protocol::schema::v1::StopReason::Cancelled,
+                    agent_client_protocol::v1::schema::StopReason::Cancelled,
                     "prompt must stop with Cancelled after $/cancel_request"
                 );
                 Ok(())
@@ -117,7 +118,7 @@ async fn session_cancel_notification_stops_the_prompt() {
     let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
 
     Client
-        .builder()
+        .v1()
         .connect_with(
             client_channel,
             |connection: ConnectionTo<Agent>| async move {
@@ -145,7 +146,7 @@ async fn session_cancel_notification_stops_the_prompt() {
                 let response = prompt_request.block_task().await?;
                 assert_eq!(
                     response.stop_reason,
-                    agent_client_protocol::schema::v1::StopReason::Cancelled,
+                    agent_client_protocol::v1::schema::StopReason::Cancelled,
                     "prompt must stop with Cancelled after session/cancel"
                 );
                 Ok(())

@@ -44,7 +44,7 @@ repository = "https://github.com/Endlessworld/agentscope-rust"
 homepage = "https://github.com/Endlessworld/agentscope-rust"
 keywords = ["agent", "llm", "ai", "agentscope","harness"]
 categories = ["development-tools", "asynchronous"]
-rust-version = "1.85.0"
+rust-version = "1.88.0"
 
 [workspace.dependencies]
 # 内部 crate：`path` 供本地开发，`version` 供 crates.io 发布（发布时 cargo 会丢掉 path）。

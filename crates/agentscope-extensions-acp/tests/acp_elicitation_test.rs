@@ -10,16 +10,17 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::util::MatchDispatch;
+use agent_client_protocol::v1::schema::{
     ClientCapabilities, CreateElicitationRequest, CreateElicitationResponse,
     ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities, ElicitationContentValue,
     ElicitationFormCapabilities, InitializeRequest, PermissionOptionKind, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
     SessionNotification, SessionUpdate, StopReason,
 };
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::util::MatchDispatch;
-use agent_client_protocol::{Agent, Channel, Client, ConnectionTo, SessionMessage};
+use agent_client_protocol::v1::{ConnectionTo, SessionMessage};
+use agent_client_protocol::{Agent, Channel, Client};
 use agentscope_core::message::{ContentBlock as CoreBlock, JsonMap, Msg, TextBlock, ToolUseBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::tool::Toolkit;
@@ -137,7 +138,7 @@ async fn ask_user_pushes_a_form_and_feeds_the_answer_back() {
     let tools = Arc::new(AtomicUsize::new(0));
 
     let result = Client
-        .builder()
+        .v1()
         .connect_with(client_channel, {
             let forms = Arc::clone(&forms);
             let tools = Arc::clone(&tools);
@@ -161,16 +162,17 @@ async fn ask_user_pushes_a_form_and_feeds_the_answer_back() {
                         .build_session(std::env::temp_dir())
                         .block_task()
                         .start_session()
-                        .await?;
+                        .await?
+                        .session;
                     session.send_prompt("please ask me")?;
 
                     loop {
                         let update = session.read_update().await?;
                         match update {
-                            SessionMessage::SessionMessage(dispatch) => {
+                            SessionMessage::Message(dispatch) => {
                                 let forms = Arc::clone(&forms);
                                 let tools = Arc::clone(&tools);
-                                MatchDispatch::new(dispatch)
+                                MatchDispatch::new(dispatch.into_raw())
                                     .if_notification(async move |notif: SessionNotification| {
                                         if let SessionUpdate::ToolCall(tc) = &notif.update {
                                             if tc.name.as_deref() == Some("ask_user") {
@@ -190,8 +192,8 @@ async fn ask_user_pushes_a_form_and_feeds_the_answer_back() {
                                     .await
                                     .otherwise_ignore()?;
                             }
-                            SessionMessage::StopReason(reason) => {
-                                assert_eq!(reason, StopReason::EndTurn);
+                            SessionMessage::PromptResponse(response) => {
+                                assert_eq!(response?.stop_reason, StopReason::EndTurn);
                                 break;
                             }
                             _ => break,
@@ -265,7 +267,7 @@ async fn ask_user_is_not_exposed_when_the_client_did_not_advertise_elicitation()
     let forms: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
 
     let result = Client
-        .builder()
+        .v1()
         .connect_with(client_channel, {
             let forms = Arc::clone(&forms);
             move |connection: ConnectionTo<Agent>| {
@@ -281,15 +283,16 @@ async fn ask_user_is_not_exposed_when_the_client_did_not_advertise_elicitation()
                         .build_session(std::env::temp_dir())
                         .block_task()
                         .start_session()
-                        .await?;
+                        .await?
+                        .session;
                     session.send_prompt("please ask me")?;
 
                     loop {
                         let update = session.read_update().await?;
                         match update {
-                            SessionMessage::SessionMessage(dispatch) => {
+                            SessionMessage::Message(dispatch) => {
                                 let forms = Arc::clone(&forms);
-                                MatchDispatch::new(dispatch)
+                                MatchDispatch::new(dispatch.into_raw())
                                     // The (unregistered) `ask_user` tool call still
                                     // triggers a permission prompt; answering it
                                     // keeps the agent moving so the test can assert
@@ -323,7 +326,7 @@ async fn ask_user_is_not_exposed_when_the_client_did_not_advertise_elicitation()
                                     .await
                                     .otherwise_ignore()?;
                             }
-                            SessionMessage::StopReason(_) => break,
+                            SessionMessage::PromptResponse(_) => break,
                             _ => break,
                         }
                     }

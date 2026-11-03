@@ -34,7 +34,9 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 static COUNTING_ALLOCATOR: agentscope_extensions_acp::mem::counting::CountingAlloc =
     agentscope_extensions_acp::mem::counting::CountingAlloc;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::util::MatchDispatch;
+use agent_client_protocol::v1::schema::{
     ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities, ContentBlock,
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
     ElicitationAction, ElicitationCapabilities, ElicitationContentValue,
@@ -45,11 +47,8 @@ use agent_client_protocol::schema::v1::{
     SetSessionConfigOptionRequest, StopReason, TextContent, ToolCallContent, ToolCallLocation,
     ToolCallStatus, ToolKind,
 };
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::util::MatchDispatch;
-use agent_client_protocol::{
-    AcpAgent, ActiveSession, Agent, Client, ConnectionTo, Dispatch, Handled, UntypedMessage,
-};
+use agent_client_protocol::v1::{ActiveSession, ConnectionTo, Dispatch, SessionMessage};
+use agent_client_protocol::{AcpAgent, Agent, Client, Handled, UntypedMessage};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use thiserror::Error;
@@ -166,8 +165,8 @@ struct ToolView {
 }
 
 /// Renders an ACP `Plan` (structured todo list) into printable lines.
-fn render_plan(entries: &[agent_client_protocol::schema::v1::PlanEntry]) -> Vec<String> {
-    use agent_client_protocol::schema::v1::{PlanEntryPriority, PlanEntryStatus};
+fn render_plan(entries: &[agent_client_protocol::v1::schema::PlanEntry]) -> Vec<String> {
+    use agent_client_protocol::v1::schema::{PlanEntryPriority, PlanEntryStatus};
     if entries.is_empty() {
         return vec![format!("{DIM}[plan] cleared{RESET}")];
     }
@@ -193,7 +192,7 @@ fn render_plan(entries: &[agent_client_protocol::schema::v1::PlanEntry]) -> Vec<
 }
 
 /// Renders a `ToolCallContent::Diff` as a compact `diff: path (-a/+b)` summary line.
-fn render_diff(diff: &agent_client_protocol::schema::v1::Diff) -> String {
+fn render_diff(diff: &agent_client_protocol::v1::schema::Diff) -> String {
     let old = diff.old_text.as_deref().unwrap_or("");
     let removed = old.lines().count();
     let added = diff.new_text.lines().count();
@@ -385,13 +384,13 @@ impl Output {
 /// content (tool call or agent message).
 async fn process_update(
     output: &mut Output,
-    update: agent_client_protocol::SessionMessage,
+    update: SessionMessage,
     views: &mut HashMap<String, ToolView>,
     last_was_thinking: &mut bool,
 ) -> Result<bool> {
     match update {
-        agent_client_protocol::SessionMessage::SessionMessage(message) => {
-            MatchDispatch::new(message)
+        SessionMessage::Message(message) => {
+            MatchDispatch::new(message.into_raw())
                 .if_notification(async |notif: SessionNotification| {
                     match notif.update {
                         SessionUpdate::AgentMessageChunk(chunk) => {
@@ -526,7 +525,7 @@ async fn process_update(
                             ));
                         }
                         SessionUpdate::PlanUpdate(u) => {
-                            if let agent_client_protocol::schema::v1::PlanUpdateContent::Items(
+                            if let agent_client_protocol::v1::schema::PlanUpdateContent::Items(
                                 items,
                             ) = &u.plan
                             {
@@ -575,8 +574,8 @@ async fn process_update(
                 .await?;
             Ok(false)
         }
-        agent_client_protocol::SessionMessage::StopReason(reason) => {
-            match reason {
+        SessionMessage::PromptResponse(response) => {
+            match response?.stop_reason {
                 StopReason::EndTurn => {}
                 StopReason::Cancelled => output.line("[Cancelled]"),
                 StopReason::Refusal => output.line("[Agent refused]"),
@@ -957,7 +956,7 @@ async fn run() -> Result<()> {
     eprintln!("Spawning harness agent...");
 
     Client
-        .builder()
+        .v1()
         .on_receive_dispatch(
             async |message: Dispatch<UntypedMessage, UntypedMessage>, _cx| {
                 Ok(Handled::No {
@@ -1010,7 +1009,7 @@ async fn run() -> Result<()> {
                             .block_task()
                             .start_session()
                             .await?
-                            .into_session();
+                            .session;
                         eprintln!("[session] restored via session/load");
                         session
                     } else {
@@ -1019,7 +1018,7 @@ async fn run() -> Result<()> {
                             .block_task()
                             .start_session()
                             .await?
-                            .into_session();
+                            .session;
                         eprintln!("[session] restored via session/resume");
                         session
                     }
@@ -1029,6 +1028,7 @@ async fn run() -> Result<()> {
                         .block_task()
                         .start_session()
                         .await?
+                        .session
                 }
             };
 

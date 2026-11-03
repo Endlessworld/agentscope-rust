@@ -131,6 +131,10 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 | `session/set_config_option` | 切换 `model` / `thought_level` |
 | `session/load` · `session/resume` | 从 journal 恢复会话 |
 | `session/list` · `session/delete` · `session/close` | 会话管理 |
+| `session/set_title` | 客户端改会话标题（空白标题回 `-32602`） |
+| `session/status` | 会话存活探测：`open`（本进程持有）/ `saved`（仅磁盘有）/ `-32002` |
+| `session/archive` · `session/unarchive` | 归档（默认从 `session/list` 隐藏，`archived` 过滤可选 `only`/`include`） |
+| `auth/status` | 登录态探测，恒为 `not_required`（凭据来自环境变量） |
 | `providers/list` · `providers/set` · `providers/disable` | 仅在配了多个 provider 时声明（ACP 不稳定特性） |
 | `_agentscope/session/respond` | 私有扩展：回答被挂起的结构化提问 |
 
@@ -138,6 +142,13 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 
 只有在客户端声明了相应能力时才会发送：`session/notice`（会话提示）、压缩进度、plan 操作通知、
 `end_turn` 的 token usage、MCP over ACP。没声明就不会收到，也不会报错。
+
+### 客户端 `systemPrompt`（仅 append）
+
+`session/new|load|resume` 可带 `systemPrompt`，但**只支持 `append`**：文本接在内置提示词之后，
+编码规则与工具说明仍在前；`override` 及其他 mode 一律 `-32602`（不降级）。该能力**只在用
+`session_factory` 构建 agent 时声明**——`model_factory` 的签名拿不到这段文本，此时不声明，
+且带 `systemPrompt` 的请求会被拒绝而不是被静默丢弃。
 
 ### `thought_level`
 

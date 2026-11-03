@@ -108,18 +108,14 @@ impl JsonRpcMessage for ExtRespondRequest {
 
     fn parse_message(
         method: &str,
-        params: &impl Serialize,
+        params: &serde_json::Value,
     ) -> Result<Self, agent_client_protocol::Error> {
         if method != RESPOND_METHOD {
             return Err(agent_client_protocol::Error::method_not_found());
         }
-        let params: ExtRespondParams =
-            serde_json::from_value(serde_json::to_value(params).map_err(|error| {
-                agent_client_protocol::Error::invalid_params().data(error.to_string())
-            })?)
-            .map_err(|error| {
-                agent_client_protocol::Error::invalid_params().data(error.to_string())
-            })?;
+        let params: ExtRespondParams = serde_json::from_value(params.clone()).map_err(|error| {
+            agent_client_protocol::Error::invalid_params().data(error.to_string())
+        })?;
         Ok(Self {
             method: Arc::from(method),
             params,

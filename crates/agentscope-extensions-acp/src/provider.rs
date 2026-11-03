@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::{LlmProtocol, ProviderCurrentConfig, ProviderInfo};
+use agent_client_protocol::v1::schema::{LlmProtocol, ProviderCurrentConfig, ProviderInfo};
 
 /// A configurable provider as advertised through `providers/list`.
 #[derive(Debug, Clone)]
@@ -166,7 +166,7 @@ impl ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::ProviderId;
+    use agent_client_protocol::v1::schema::ProviderId;
 
     fn registry() -> ProviderRegistry {
         ProviderRegistry::new(vec![

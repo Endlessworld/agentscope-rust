@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use agent_client_protocol::schema::v1::{ClientCapabilities, Implementation};
+use agent_client_protocol::v1::schema::{ClientCapabilities, Implementation};
 /// Capability view of the connected ACP client.
 ///
 /// Defaults to "nothing advertised", i.e. every optional update is suppressed
@@ -98,7 +98,7 @@ impl ClientSupport {
 #[cfg(test)]
 mod tests {
     use super::ClientSupport;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities,
         ElicitationCapabilities, ElicitationFormCapabilities, ElicitationUrlCapabilities,
         NoticeCapabilities, PlanCapabilities,
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn intellij_2026_is_detected_from_client_info() {
-        use agent_client_protocol::schema::v1::Implementation;
+        use agent_client_protocol::v1::schema::Implementation;
 
         let support = ClientSupport::new();
         assert!(!support.is_intellij_2026());

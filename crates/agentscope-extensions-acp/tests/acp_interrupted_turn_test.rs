@@ -16,12 +16,13 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionNotification,
     SessionUpdate, StopReason, TextContent,
 };
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Agent, Channel, Client, ConnectionTo};
+use agent_client_protocol::v1::{ConnectionTo, SessionMessage};
+use agent_client_protocol::{Agent, Channel, Client};
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::AcpCodingAgent;
@@ -86,7 +87,7 @@ async fn a_cancelled_turn_does_not_block_the_next_prompt() {
     let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
 
     let result = Client
-        .builder()
+        .v1()
         .connect_with(
             client_channel,
             move |connection: ConnectionTo<Agent>| async move {
@@ -142,13 +143,13 @@ async fn a_cancelled_turn_does_not_block_the_next_prompt() {
                     .block_task()
                     .start_session()
                     .await?
-                    .into_session();
+                    .session;
                 session.send_prompt("continue")?;
                 let stop = loop {
                     match session.read_update().await? {
-                        agent_client_protocol::SessionMessage::SessionMessage(dispatch) => {
+                        SessionMessage::Message(dispatch) => {
                             let text = Arc::clone(&text_for_handler);
-                            agent_client_protocol::util::MatchDispatch::new(dispatch)
+                            agent_client_protocol::util::MatchDispatch::new(dispatch.into_raw())
                                 .if_notification(async move |notif: SessionNotification| {
                                     if let SessionUpdate::AgentMessageChunk(chunk) = notif.update {
                                         if let ContentBlock::Text(t) = chunk.content {
@@ -160,8 +161,8 @@ async fn a_cancelled_turn_does_not_block_the_next_prompt() {
                                 .await
                                 .otherwise_ignore()?;
                         }
-                        agent_client_protocol::SessionMessage::StopReason(reason) => {
-                            break reason;
+                        SessionMessage::PromptResponse(response) => {
+                            break response?.stop_reason;
                         }
                         _ => break StopReason::EndTurn,
                     }
@@ -217,7 +218,7 @@ async fn a_forced_interrupt_is_continued_without_discarding_the_prompt() {
     let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
 
     Client
-        .builder()
+        .v1()
         .connect_with(
             client_channel,
             move |connection: ConnectionTo<Agent>| async move {
@@ -231,7 +232,8 @@ async fn a_forced_interrupt_is_continued_without_discarding_the_prompt() {
                     .build_session(std::env::temp_dir())
                     .block_task()
                     .start_session()
-                    .await?;
+                    .await?
+                    .session;
                 // The session the SDK created above is the one this prompt runs on.
                 let session_id = session.session_id().to_string();
                 session.send_prompt("start working")?;
@@ -258,24 +260,26 @@ async fn a_forced_interrupt_is_continued_without_discarding_the_prompt() {
                 let stop = tokio::time::timeout(std::time::Duration::from_secs(20), async {
                     loop {
                         match session.read_update().await? {
-                            agent_client_protocol::SessionMessage::SessionMessage(dispatch) => {
+                            SessionMessage::Message(dispatch) => {
                                 let text = Arc::clone(&text_for_handler);
-                                agent_client_protocol::util::MatchDispatch::new(dispatch)
-                                    .if_notification(async move |notif: SessionNotification| {
-                                        if let SessionUpdate::AgentMessageChunk(chunk) =
-                                            notif.update
-                                        {
-                                            if let ContentBlock::Text(t) = chunk.content {
-                                                text.lock().unwrap().push_str(&t.text);
-                                            }
+                                agent_client_protocol::util::MatchDispatch::new(
+                                    dispatch.into_raw(),
+                                )
+                                .if_notification(async move |notif: SessionNotification| {
+                                    if let SessionUpdate::AgentMessageChunk(chunk) = notif.update {
+                                        if let ContentBlock::Text(t) = chunk.content {
+                                            text.lock().unwrap().push_str(&t.text);
                                         }
-                                        Ok(())
-                                    })
-                                    .await
-                                    .otherwise_ignore()?;
+                                    }
+                                    Ok(())
+                                })
+                                .await
+                                .otherwise_ignore()?;
                             }
-                            agent_client_protocol::SessionMessage::StopReason(reason) => {
-                                break Ok::<StopReason, agent_client_protocol::Error>(reason);
+                            SessionMessage::PromptResponse(response) => {
+                                break Ok::<StopReason, agent_client_protocol::Error>(
+                                    response?.stop_reason,
+                                );
                             }
                             _ => break Ok(StopReason::EndTurn),
                         }
@@ -350,7 +354,7 @@ async fn a_failed_turn_reports_the_error_and_does_not_wedge_the_session() {
     let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
 
     Client
-        .builder()
+        .v1()
         .connect_with(
             client_channel,
             |connection: ConnectionTo<Agent>| async move {
@@ -370,13 +374,14 @@ async fn a_failed_turn_reports_the_error_and_does_not_wedge_the_session() {
                     .build_session(std::env::temp_dir())
                     .block_task()
                     .start_session()
-                    .await?;
+                    .await?
+                    .session;
                 session.send_prompt("do it")?;
                 let stop = loop {
                     match session.read_update().await? {
-                        agent_client_protocol::SessionMessage::SessionMessage(dispatch) => {
+                        SessionMessage::Message(dispatch) => {
                             let text = Arc::clone(&text_for_handler);
-                            agent_client_protocol::util::MatchDispatch::new(dispatch)
+                            agent_client_protocol::util::MatchDispatch::new(dispatch.into_raw())
                                 .if_notification(async move |notif: SessionNotification| {
                                     if let SessionUpdate::AgentMessageChunk(chunk) = notif.update {
                                         if let ContentBlock::Text(t) = chunk.content {
@@ -388,8 +393,8 @@ async fn a_failed_turn_reports_the_error_and_does_not_wedge_the_session() {
                                 .await
                                 .otherwise_ignore()?;
                         }
-                        agent_client_protocol::SessionMessage::StopReason(reason) => {
-                            break reason;
+                        SessionMessage::PromptResponse(response) => {
+                            break response?.stop_reason;
                         }
                         _ => break StopReason::EndTurn,
                     }

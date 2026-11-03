@@ -23,13 +23,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
     SessionNotification, TextContent,
 };
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent};
 
 /// Reasoning text the scripted model streams first; the test asserts it reaches
 /// the client verbatim, which proves the thought chunk came from the script.
@@ -223,10 +224,10 @@ async fn stdio_agent_streams_thinking_to_client() {
     let updates_c = Arc::clone(&updates);
 
     let result = agent_client_protocol::Client
-        .builder()
+        .v1()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
-                use agent_client_protocol::schema::v1::SessionUpdate;
+                use agent_client_protocol::v1::schema::SessionUpdate;
                 let mut u = updates_c.lock().unwrap();
                 match notification.update {
                     SessionUpdate::AgentThoughtChunk(chunk) => {

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     Content, ContentBlock, ContentChunk, Diff, MessageId, Notice, NoticeSeverity, Plan, PlanEntry,
     PlanEntryPriority, PlanEntryStatus, SessionId, SessionNotification, SessionUpdate, TextContent,
     ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
@@ -89,7 +89,7 @@ pub fn compaction_notifications(
     compaction_id: &str,
     summary: &str,
 ) -> Vec<SessionNotification> {
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         CompactionStatus, CompactionSummaryChunk, CompactionUpdate,
     };
     let sid = session_id.into();
@@ -332,7 +332,7 @@ fn plan_update_notification(
         return None;
     }
     let plan = plan_from_todos(raw_input)?;
-    use agent_client_protocol::schema::v1::{PlanRemoved, PlanUpdate, PlanUpdateContent};
+    use agent_client_protocol::v1::schema::{PlanRemoved, PlanUpdate, PlanUpdateContent};
     // An empty entry list means the todo list was cleared: the ID-addressed
     // protocol removes the plan instead of rendering an empty one.
     if plan.entries.is_empty() {
@@ -722,7 +722,7 @@ pub fn map_delta_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{SessionId, SessionUpdate};
+    use agent_client_protocol::v1::schema::{SessionId, SessionUpdate};
     use agentscope_core::event::{AgentEvent, EventData};
 
     fn sid() -> SessionId {
@@ -1028,7 +1028,7 @@ mod tests {
             other => panic!("expected PlanUpdate, got {other:?}"),
         };
         match &plan.plan {
-            agent_client_protocol::schema::v1::PlanUpdateContent::Items(items) => {
+            agent_client_protocol::v1::schema::PlanUpdateContent::Items(items) => {
                 assert_eq!(items.plan_id.to_string(), TODO_PLAN_ID);
                 assert_eq!(items.entries.len(), 1);
             }
@@ -1053,7 +1053,7 @@ mod tests {
     fn compaction_notifications_go_in_progress_then_completed() {
         let notifs = compaction_notifications(sid(), "compaction-1", "retained summary");
         assert_eq!(notifs.len(), 3, "in_progress + summary + completed");
-        use agent_client_protocol::schema::v1::CompactionStatus;
+        use agent_client_protocol::v1::schema::CompactionStatus;
         match &notifs[0].update {
             SessionUpdate::CompactionUpdate(u) => {
                 assert_eq!(u.compaction_id.to_string(), "compaction-1");

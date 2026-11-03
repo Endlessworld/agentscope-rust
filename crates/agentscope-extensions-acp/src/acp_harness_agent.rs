@@ -828,6 +828,19 @@ fn build_system_prompt(cwd: &std::path::Path) -> String {
         .replace("{language}", &language)
 }
 
+/// 把客户端通过 `systemPrompt`（`append` 模式，ACP-38）送来的文本接在默认提示词之后。
+/// 默认提示词保留在前，所以编码规则与工具说明仍然生效，客户端只能追加约束。
+fn with_client_system_prompt(base: String, client_prompt: Option<&str>) -> String {
+    match client_prompt {
+        Some(text) => format!(
+            "{base}\n\n# Client-supplied system prompt\n\n\
+             The client that started this session asked for the following to be appended \
+             to your instructions. It does not replace anything above.\n\n{text}"
+        ),
+        None => base,
+    }
+}
+
 /// 通过 `ModelCreationContext` 构建模型，并注入外部指定的附加请求头
 ///（如 `x-opencode-session`，用于 OpenCode Go 网关的 prompt-cache 会话路由）。
 /// 会话头取当前 ACP sessionId，同一会话内保持稳定（利于 prompt-cache 命中）。
@@ -961,6 +974,7 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         session_id,
         client_support,
         elicitation_slot,
+        system_prompt,
     } = ctx;
     let session_id = session_id.as_str();
     let model_config = ModelConfig::load_or_create();
@@ -1038,7 +1052,10 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         // 对话历史 / task / plan 状态，因此不再需要额外挂 `AgentStateStore`（那是 Java 的
         // legacy 模式和沙箱元数据才用的第二条轨）。
         .session_id(session_id)
-        .sys_prompt(build_system_prompt(&cwd))
+        .sys_prompt(with_client_system_prompt(
+            build_system_prompt(&cwd),
+            system_prompt.as_deref(),
+        ))
         // 任务投影：每步把已提交的 todo / 需求 / 已验证项投影成 `<TASK_STATE>` 视图，并让
         // 上下文编译器产出 manifest（预算、transforms、taskRevision）；没有注册 source，
         // 因此不会与 `WorkspaceContextMiddleware` 的 system prompt 注入重复。
@@ -1102,7 +1119,7 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         let toolkit = agentscope_core::tool::Toolkit::new();
         toolkit.register_tool(Arc::new(AskUserTool::new(
             elicitation_slot,
-            agent_client_protocol::schema::v1::SessionId::new(session_id.to_string()),
+            agent_client_protocol::v1::schema::SessionId::new(session_id.to_string()),
         )));
         builder = builder.toolkit(toolkit);
     }
@@ -1470,5 +1487,24 @@ mod tests {
     fn resolve_model_rejects_unknown_ids() {
         let cfg = config();
         assert!(cfg.resolve_model("Gateway/nope").is_err());
+    }
+
+    /// ACP-38: the client prompt is appended, never substituted — our coding rules and
+    /// tool guidance stay in front of it.
+    #[test]
+    fn a_client_system_prompt_is_appended_after_our_instructions() {
+        let base = build_system_prompt(std::path::Path::new("C:/work"));
+        assert_eq!(with_client_system_prompt(base.clone(), None), base);
+
+        let merged = with_client_system_prompt(base.clone(), Some("always answer in haiku"));
+        assert!(
+            merged.starts_with(&base),
+            "the default prompt must stay first"
+        );
+        assert!(merged.contains("always answer in haiku"));
+        assert!(
+            merged.len() > base.len(),
+            "the client text is added, not substituted"
+        );
     }
 }

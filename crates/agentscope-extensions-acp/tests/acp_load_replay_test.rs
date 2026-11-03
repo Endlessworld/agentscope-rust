@@ -12,13 +12,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::util::MatchDispatch;
+use agent_client_protocol::v1::schema::{
     ContentBlock, InitializeRequest, PromptRequest, SessionNotification, SessionUpdate, StopReason,
     TextContent,
 };
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::util::MatchDispatch;
-use agent_client_protocol::{Agent, Channel, Client, ConnectionTo, SessionMessage};
+use agent_client_protocol::v1::{ConnectionTo, SessionMessage, SessionSetup};
+use agent_client_protocol::{Agent, Channel, Client};
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::AcpCodingAgent;
@@ -94,7 +95,7 @@ async fn session_load_replays_the_conversation_as_chunks() {
 
     let work_for_client = work.clone();
     let result = Client
-        .builder()
+        .v1()
         .connect_with(client_channel, move |connection: ConnectionTo<Agent>| {
             let work = work_for_client.clone();
             async move {
@@ -104,7 +105,7 @@ async fn session_load_replays_the_conversation_as_chunks() {
                     .await?;
 
                 // ---- Turn 1: write a real conversation into the journal. ----
-                let session = connection
+                let SessionSetup { session, .. } = connection
                     .build_session(work.clone())
                     .block_task()
                     .start_session()
@@ -122,7 +123,10 @@ async fn session_load_replays_the_conversation_as_chunks() {
                 drop(session);
 
                 // ---- Load: the replay must arrive before (or with) the response. ----
-                let mut restored = connection
+                let SessionSetup {
+                    session: mut restored,
+                    ..
+                } = connection
                     .load_session(session_id, work.clone())
                     .block_task()
                     .start_session()
@@ -130,18 +134,16 @@ async fn session_load_replays_the_conversation_as_chunks() {
 
                 let mut replay: Vec<(bool, String)> = Vec::new();
                 while replay.len() < 2 {
-                    let update = tokio::time::timeout(
-                        Duration::from_secs(10),
-                        restored.session_mut().read_update(),
-                    )
-                    .await
-                    .expect("session/load must replay the conversation")?;
-                    let SessionMessage::SessionMessage(dispatch) = update else {
+                    let update =
+                        tokio::time::timeout(Duration::from_secs(10), restored.read_update())
+                            .await
+                            .expect("session/load must replay the conversation")?;
+                    let SessionMessage::Message(dispatch) = update else {
                         break;
                     };
                     let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
                     let sink_c = Arc::clone(&sink);
-                    MatchDispatch::new(dispatch)
+                    MatchDispatch::new(dispatch.into_raw())
                         .if_notification(async move |notification: SessionNotification| {
                             let mut sink = sink_c.lock().unwrap();
                             match notification.update {

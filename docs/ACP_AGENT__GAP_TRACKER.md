@@ -2,7 +2,7 @@
 
 > **用途**：本文件是 ACP CodingAgent 实现工作的**单一事实来源**。任何会话开工前必须先读本文件；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。以本文件 + `git status`/`cargo build` 实际验证为准。
 > **对照基准**：`docs/ACP_AGENT_PLAN.md`（方案）+ 本文件 + `crates/*`（实际代码）。
-> **参考**：Kotlin `AgiHarnessAgent.kt`、Java `HarnessCodingAgent.java`、ACP RDF 文档 (E:\local-github\agentclientprotocol\agent-client-protocol)、ACP Rust SDK 源码（`E:\local-github\agentclientprotocol\rust-sdk`）。
+> **参考**：Kotlin `AgiHarnessAgent.kt`、Java `HarnessCodingAgent.java`、ACP RDF 文档、ACP Rust SDK 源码（本地 `D:\IdeaProjects\agentclientprotocol\rust-sdk`，**tag `v5.0.0`**；旧路径 `E:\local-github\...` 已失效）。SDK 大版本升级后的复核结论见 **§6**。
 
 ## 0. 如何阅读本文件
 - **执行状态**取值：`待办` / `进行中` / `已完成` / `设计决定（不迁移）`。
@@ -17,8 +17,8 @@
 | acp.session | AcpAgentSession：单会话状态 + prompt 驱动 ReActAgent | 已完成 | `run_prompt` 流式 + 取消（AtomicBool） |
 | acp.config | 会话配置（model/mode）、SessionConfigOption 构造 | 已完成 | select 构造 + 3 单测 |
 | acp.event | AgentEvent → SessionUpdate 转换 | 已完成 | 文本/思考 delta + 工具调用，4 单测 |
-| 依赖 | `agent-client-protocol` 依赖已声明 | 已完成 | harness Cargo.toml 已声明 crates.io **v2.2.0**（无 feature），传递 `agent-client-protocol-schema` **1.9.1**；SDK 提供但本项目未接线的能力见 §2.7 |
-| sdk.ability | SDK v2.2.0 能力盘点 | 已完成 | §2.7.2 中所有「待办（不包含暂缓）」项已接线：Session Notices、Compaction 通知、Plan 操作、Providers、MCP-over-ACP、`PromptResponse.usage`、分页/元数据、CLI 会话恢复；仍暂缓 ACP v2 与 Proxy/路由 |
+| 依赖 | `agent-client-protocol` 依赖已声明 | 待升级 | `crates/agentscope-extensions-acp/Cargo.toml:19` 仍 pin crates.io **v2.2.0** + 6 个 unstable feature，传递 `agent-client-protocol-schema` **1.9.1**；上游已到 **5.0.0 / schema 1.15.1**，升级任务与新增能力见 **§6** |
+| sdk.ability | SDK 能力盘点（2.2.0 一轮 + 5.0.0 一轮） | 已完成（2.2.0） / 待办（5.0.0） | 2.2.0 轮：§2.7.2 所有「待办（不包含暂缓）」项已接线（Notices、Compaction、Plan 操作、Providers、MCP-over-ACP、`PromptResponse.usage`、分页/元数据、CLI 会话恢复）。5.0.0 轮：新增 6 项 v1 能力 + MCP 破坏性改造 + 7 项升级阻断，见 **§6**（`ACP-U01..U08` / `ACP-33..ACP-45`） |
 
 > 2026-10-31 全量对齐复核：本 crate 已独立为 `crates/agentscope-extensions-acp`（17 个 `src/*.rs`），且 **Java 侧无 ACP 模块**（`rg -il 'acp' …/agentscope-java -g '*.java'` exit 1）。本轮以「ACP 规范 + SDK 2.2.0 能力面」为基线逐个文件核对，结论见 **§3.5**（7 项缺口/待裁定，其中 1 项 P0）与 **§4.3**（7 项 Rust 原生设计决定 + 8 项已知差异）。
 
@@ -140,6 +140,8 @@ Form 模式用受限 JSON Schema（扁平 `object`）描述请求内容，`Elici
 - 仍为「设计决定（不迁移）」的：SDK 内建 MCP server 运行时、client 侧 fs/terminal（elicitation 已于 2026-10-19 接入，见 §2.7.2a）、SDK 杂项工具。仍为「待办（暂缓）」的：ACP v2 协议与 Proxy/Conductor 路由。`AvailableCommandsUpdate` 未接（无命令目录来源，无产品需求）。
 - 协议合规要点：所有新增通知均**按 client 能力门控**（未广告则降级或静默），避免向不支持的客户端发送非能力更新。
 
+> **⚠️ 本节基线已过期**：以上三节依据的是 SDK **2.2.0 / schema 1.9.1**。上游已发布 **5.0.0 / schema 1.15.1**（2026-11-02），v1 协议面新增 7 个方法、删除 13 个方法（document 族、NES、`mcp/connect` / `mcp/disconnect`），并有 3 项 Rust API 破坏性变更。**升级项与新增能力缺口统一见 §6**（`ACP-U01..U08` 升级阻断、`ACP-33..ACP-45` 新能力、`ACP-D08..D14` 设计决定、§6.7 批次计划）。本节保留为 2.2.0 轮的历史记录，不再更新。
+
 ## 3. 项目状态与下一步
 ### 3.1 当前状态
 - 方案文档 `docs/ACP_AGENT_PLAN.md` 已创建。
@@ -208,7 +210,7 @@ Form 模式用受限 JSON Schema（扁平 `object`）描述请求内容，`Elici
 - 开工前：读本文件 + `git status` + 确认 `cargo build` 基线。
 - 改动中：保持每阶段 `cargo build`/`cargo test` 通过。
 - 完工后：把对应条目 `执行状态` 改为 `已完成`，更新 `交接信息`（验证结果）。
-- 涉及 SDK 参考时：以 `E:\local-github\agentclientprotocol\rust-sdk`（tag `v2.2.0`）源码与 cargo registry 中 `agent-client-protocol-2.2.0` / `agent-client-protocol-schema-1.9.1` 为准（旧的 `schema-1.6.0` 口径已作废）。
+- 涉及 SDK 参考时：以本地 `D:\IdeaProjects\agentclientprotocol\rust-sdk`（**tag `v5.0.0`**）源码与 cargo registry 中 `agent-client-protocol-5.0.0` / `agent-client-protocol-schema-1.15.1` 为准；升级前实现仍以 `2.2.0` / `1.9.1` 为准（两套口径并存期间，条目里必须写明是哪一套）。旧的 `schema-1.6.0` 口径已作废。
 
 ---
 
@@ -249,3 +251,201 @@ Form 模式用受限 JSON Schema（扁平 `object`）描述请求内容，`Elici
 - 两个 bin：`cargo run -p agentscope-extensions-acp --bin acp_harness_agent|acp_agent_cli`。
 - 5 个 `acp_*` 集成测试与 46 个内联测试随 crate 迁移；`ACP_CONTEXT_WINDOW_TOKENS` 被 harness 测试引用，已在测试内本地化为常量，避免 dev-dependency 环。
 - feature 透传：`default = ["rusqlite"]` → `agentscope-harness/rusqlite`；`lite` 对应 harness `lite`。`cargo check -p agentscope-extensions-acp --no-default-features --features lite --bins` 通过。
+
+---
+
+## 6. 2026-11-03 SDK 复核：`agent-client-protocol` 2.2.0 → 5.0.0（schema 1.9.1 → 1.15.1）
+
+> **触发**：上游 SDK 大版本更新。本地源码 `D:\IdeaProjects\agentclientprotocol\rust-sdk` 当前 `HEAD = 050cd94`、最新 tag **`v5.0.0`（2026-11-02）**；版本序列 `2.2.0 → 3.0.0 → 3.6.0 → 5.0.0`（**没有 4.x**，`1b1399a chore: release v5.0.0`）。
+> **本仓基线**：`crates/agentscope-extensions-acp/Cargo.toml:19` 仍 pin `agent-client-protocol = { version = "2.2.0", features = [6 个 unstable] }`，传递 schema **1.9.1**；5.0.0 精确 pin schema **`=1.15.1`**（`agent-client-protocol-5.0.0/Cargo.toml:345` 区）。
+> **证据来源**（本轮逐个读过，不转述二手资料）：cargo registry 中 `agent-client-protocol-2.2.0` / `-5.0.0`、`agent-client-protocol-schema-1.9.1` / `-1.15.1` 源码（`git diff --no-index` 逐文件比对）；`rust-sdk/md/` 下 `migration-v5.md`、`migration-v3.md`、`migration-stateless-mcp.md`、`migration-connection-drivers.md`、`migration-config-api.md`、`features.md`、`versioning.md`、`protocol-v2.md`、`protocol-v2-quickstart.md`、`http-transport.md`、`transport-architecture.md`、`request-cancellation.md`、`ordered-application-dispatch.md`、`sending-requests.md`、`logging-privacy.md`、`session-operation-coordination.md`、`conductor.md`、`mcp-bridge.md`、`mcp-over-acp.md`；`src/agent-client-protocol/CHANGELOG.md`。
+> **方法**：①`rg 'METHOD_NAME: &str'` 枚举两版 v1 协议方法求差集；②`rg '^pub (struct|enum|fn)'` 求类型差集；③`git diff --no-index` 看字段级变化；④在本 crate 内 `rg` 判定「零命中 = 未接线」。
+> **编号**：本节新增三组前缀——`ACP-U**`（升级阻断项，必做，非新特性）、`ACP-33+`（新能力缺口，接续 §3.5 的 `ACP-32` 单调递增）、`ACP-D08+`（设计决定，接续 §4.3.1 的 `ACP-D07`）。历史编号一律不复用。
+
+### 6.1 版本与工程面事实（升级前必须知道）
+
+| # | 项 | 现状（2.2.0 / schema 1.9.1） | 新基线（5.0.0 / schema 1.15.1） | 对本项目的影响 |
+|---|---|---|---|---|
+| 1 | crate 版本 | `agent-client-protocol 2.2.0` | **`5.0.0`**（全部 SDK crate 同版本号；无 4.x） | 跨两个语义化大版本，必须按 6.3 逐项改 |
+| 2 | schema 版本 | 传递 `agent-client-protocol-schema 1.9.1` | 精确 `=1.15.1` | v1 协议面 +7 / −13 个方法（6.2.1） |
+| 3 | edition / MSRV | schema 1.9.1 已 `edition 2024` / `rust-version 1.88`；本 workspace `edition 2021` / `rust-version 1.85.0`（根 `Cargo.toml:40,47`） | 5.0.0 同 `edition 2024` / MSRV `1.88` | 我们 crate 可继续 `edition 2021`（依赖可混用 edition），但**声明的 `rust-version` 必须 ≥1.88**，否则与实际下限不符；本机 stable 1.97.1 满足要求 |
+| 4 | 默认 feature | `default = []`（3.0 起），但**原生传输在 native 平台无条件编译** | `default = []` 且**原生传输改为 opt-in**：`stdio` → `Stdio`；`process` → `AcpAgent` / `AcpAgentConfig`；`schemars` → `McpTool`/`McpToolRegistry`/`tool_fn` | **不加即编译失败**：`Stdio::new()`（`coding_agent.rs:591`）需要 `stdio`；`AcpAgent::from_args` / `AcpAgent::new`（`acp_agent_cli.rs:79,91`、`tests/acp_stdio_thought_test.rs:220`）需要 `process` |
+| 5 | unstable feature 删除 | `unstable_session_notices`、`unstable_session_compaction` | 二者**转正为稳定**（schema 1.11 起），同名 feature **不复存在** | Cargo.toml 必须删掉这两个 feature 名（否则 cargo 报 `feature ... does not exist`）；`support.rs`/`session.rs`/`event.rs` 的 Notice/Compaction 代码**零改动** |
+| 6 | unstable feature 删除 | `unstable_nes` | **NES 整体移除**：`v1/nes.rs`（3356 行 / 55 个公开类型）、`nes/*` 6 个方法、`ClientCapabilities.nes`、`AgentCapabilities.nes`、`ClientNesCapabilities` 全部消失，**无替代物** | 本 crate 从未使用（相关符号零命中），仅需确认不误开该 feature |
+| 7 | unstable feature 新增 | — | schema 侧新增 `unstable_auth_status`、`unstable_session_archive`、`unstable_session_set_title`、`unstable_session_status`、`unstable_session_system_prompt`、`unstable_subagents`、`unstable_proxy_chains`（`schema-1.15.1/Cargo.toml:59-85`） | 逐一评估见 6.4（`ACP-33..ACP-40`） |
+| 8 | `unstable` 聚合 | 含 notices/compaction/nes 等 | **SDK 侧 `unstable` = 11 项**：auth_status、end_turn_token_usage、llm_providers、mcp_over_acp、plan_operations、session_archive、session_fork、session_set_title、session_status、session_system_prompt、subagents。两个注意点：①**不含 `unstable_proxy_chains`** —— SDK 直接把 schema 依赖写成 `features = ["unstable_proxy_chains"]`（`agent-client-protocol-5.0.0/Cargo.toml:344-347`），即 proxy schema **恒开**，不可关；②**不含 `unstable_protocol_v2`**（schema 侧 `unstable` 有 12 项，比 SDK 多 proxy_chains） | 继续「逐个开启、不开聚合」的既有策略（`ACP-D02` 不变）；proxy 恒开不影响我们（不实现 handler 即可） |
+| 9 | proxy chains | `_proxy/*`（实验） | `proxy/initialize` / `proxy/successor`；SDK **无条件**开启 schema 的 `unstable_proxy_chains`（`agent-client-protocol-5.0.0/Cargo.toml:96-98` 注释） | 不实现即无影响；若将来实现，方法名**无回退**，`_proxy/*` 客户端不再工作 |
+| 10 | 连接/构建器模型 | `Agent.builder()` / `Builder::new()`（隐式 v1） | `Builder` 按协议版本参数化：`Agent.v1()`（v1 语义 + typed handle）、`Agent.v2()`、`Agent.protocol_router()`（v1/v2 双栈）；裸 `Builder::new(role)` 变成 **raw 无 guard** | 见 `ACP-U03`；**误用 raw `Builder::new(Agent)` 不会编译错误，只会静默丢掉 initialize 协商守卫**——这是最危险的静默退化 |
+| 11 | 错误模型 | `Error` 带 v1 语义（`session_not_found` 等构造器） | 根 `Error` **版本中立**；`ErrorCode` 变 newtype；v1 专有错误在 `v1::schema::Error`（新增 `session_not_found()` = `-32002` + `data.sessionId`） | 见 `ACP-U05` |
+| 12 | 文档与工具链 | — | 新增 `agent-client-protocol-http`（HTTP/WS 传输）、`-polyfill`、`-rmcp`、`-conductor`、`-testy`、`-trace-viewer`、`-cookbook`、`-derive` | 见 6.4 与 6.5 的取舍 |
+
+### 6.2 协议面增删（v1，逐项实测）
+
+#### 6.2.1 v1 方法增删（`rg 'METHOD_NAME: &str'` 差集）
+
+| 类型 | 方法 | 归属 | 说明 |
+|---|---|---|---|
+| **新增** | `auth/status` | agent | 登录态只读探测（`AuthStatusRequest/Response`、`AuthState`、`AuthAccount`、`AuthStatusUpdateNotification`），能力位 `AgentAuthCapabilities.status` |
+| **新增** | `session/archive`、`session/unarchive` | agent | 归档 = 从 `session/list` 隐藏但保留历史；`ListSessionsRequest.archived: SessionArchiveFilter`、`SessionInfo.archived` |
+| **新增** | `session/set_title` | agent | 客户端改标题（我们已有 `SessionInfo.title` 与 `set_title`，但只能 agent 侧设置） |
+| **新增** | `session/status` | agent | 查会话是否仍存活：`SessionStatus{open, saved, Other}`，**不是** running/idle |
+| **新增** | `proxy/initialize`、`proxy/successor` | proxy | 代理链（RFD proxy chains 清理后语义），纯 agent 不必实现 |
+| **删除** | `document/didOpen|didChange|didClose|didSave|didFocus` | client | 1.9.1 的文档同步族整体移除 |
+| **删除** | `nes/start|suggest|accept|reject|close` | — | NES（next-edit-suggestion）整体移除，无替代物 |
+| **删除** | `mcp/connect`、`mcp/disconnect` | agent→client | **破坏性**：MCP-over-ACP 改为 request-scoped（见 6.2.4） |
+| 不变（28） | `initialize`、`authenticate`、`logout`、`elicitation/create`、`fs/read_text_file`、`fs/write_text_file`、`mcp/message`、`providers/list|set|disable`、`session/{new|prompt|cancel|load|list|resume|close|delete|fork|set_mode|set_config_option|request_permission}`、`terminal/{create|output|wait_for_exit|kill|release}`、`$/cancel_request` | — | 本项目的 12 个 handler + CLI 客户端全部落在这一栏，**签名与语义均未变** |
+
+#### 6.2.2 `SessionUpdate` 变体增删
+
+| 变化 | 变体 | feature | 说明 |
+|---|---|---|---|
+| 新增 | `SubagentUpdate` | `unstable_subagents` | 父会话宣告/更新子会话：`session_id`、`title`、`description`、`capabilities`、`state`、`cwd`、`additional_directories`，全部 `MaybeUndefined` 三态补丁（省略=不变、`null`=清除、值=整体替换） |
+| 新增 | `SessionMessage` | `unstable_subagents` | 跨会话消息 **upsert**：`message_id` + sender/recipient 的 session/message id（参与方可后到） |
+| 新增 | `SessionMessageChunk` | `unstable_subagents` | 上述消息的内容块增量（只有 `message_id` + `content`） |
+| 转正 | `Notice`、`CompactionUpdate`、`CompactionSummaryChunk` | 无（稳定） | 我们已在用，**只需删 Cargo feature 名** |
+| 不变 | `UserMessageChunk`、`AgentMessageChunk`、`AgentThoughtChunk`、`ToolCall`、`ToolCallUpdate`、`Plan`、`PlanUpdate`、`PlanRemoved`、`AvailableCommandsUpdate`、`CurrentModeUpdate`、`ConfigOptionUpdate`、`SessionInfoUpdate`、`UsageUpdate` | — | `AvailableCommandsUpdate` 我们仍未接（`ACP-D05` 不变） |
+
+#### 6.2.3 能力位（capabilities）变化
+
+| 结构 | 新增 | 删除 | 备注 |
+|---|---|---|---|
+| `AgentCapabilities` | `auth.status`（`AgentAuthCapabilities.status`） | `nes`、`position_encoding` | `prompt_capabilities` / `mcp_capabilities`（http/sse/acp 三项）**形状未变** |
+| `SessionCapabilities` | `system_prompt`、`archive`、`status`、`title`；`fork` 由「文档级 unstable」变真 `cfg` 门控 | — | `list`/`delete`/`additional_directories`/`resume`/`close` 未变（我们已在用前 5 个，`additional_directories` **仍未广告** → 见 `ACP-37`） |
+| `ClientCapabilities` | `subagents`（`SubagentCapabilities`） | `nes`、`position_encodings` | `fs`/`terminal`/`session{notices,compaction,config_options}`/`plan`/`elicitation` 未变 |
+| `ClientSessionCapabilities` | — | — | `notices`/`compaction` 由门控转稳定 |
+| `McpCapabilities` | — | — | `http`/`sse`/`acp` 三项未变 |
+
+#### 6.2.4 MCP-over-ACP：从「连接式」改为「请求式」（唯一破坏性协议改造）
+
+| 维度 | 2.2.0（我们现在的实现） | 5.0.0 |
+|---|---|---|
+| 会话声明 | `McpServer::Acp(McpServerAcp{name, server_id})` | 不变 |
+| 建连 | `mcp/connect(server_id)` → `ConnectMcpResponse{connection_id: McpConnectionId}` | **方法删除**；无建连步骤（只支持 MCP 2026-07-28，**无 initialize 前置**） |
+| 单次调用 | `mcp/message{connection_id, method, params}` | `mcp/message{server_id: McpServerAcpId, request_id: McpRequestId, method, params}`，`request_id` 由调用方生成、跨代理稳定，与 ACP 外层 id 无关 |
+| 收尾 | `mcp/disconnect(connection_id)` | **方法删除**；请求结束即结束 |
+| 响应体 | `MessageMcpResponse(RawValue)`（内层结果原样） | untagged `MessageMcpResponse::{Result{result}, Error{error: McpError{code,message,data,extra}}}`——**内层 MCP 错误不再借 ACP 错误通道** |
+| 通知 | 依附连接 | 依附 `request_id` 所属操作（订阅确认/流式更新） |
+| 我们的代码 | `mcp_over_acp.rs:19` 引入 `ConnectMcpRequest`/`DisconnectMcpRequest`/`McpConnectionId`；`:97` 字段 `connection_id`；`:105 connect()`；`:163 disconnect()` | 三个类型已不存在 → 必须重写该模块（`ACP-U04`） |
+
+#### 6.2.5 其他 Rust API 面变化（可能间接影响我们）
+
+- `v1::schema` 成为 v1 消息类型的**唯一路径**（`SDK 5.0.0: src/v1.rs:58` 注释原文「This is the only path to them」）；根 `schema` 仅保留版本中立项（`ProtocolVersion`、`RequestId` 等）。
+- `v1/rpc.rs` 新增：`RequestId{Null|Number|Str}`、`Request`、`Response<R,E>` 从 `crate::rpc` 迁入 v1（**Rust API 破坏点**，旧 `v1::Response<T>` 别名被删）；我们未直接使用。
+- 根 `Responder<T, P = Raw>` / `SentRequest<T, P>` / `Dispatch<Req, Notif, P = Raw>` 默认 `Raw`；v1 回调拿到的是 `V1` 实例（`v1::Responder` 等别名，`SDK 5.0.0: src/v1.rs:78-94`）。我们的 `Responder` / `Dispatch` / `Handled` / `UntypedMessage` 显式标注处必须改用 `v1::` 别名。
+- `ConnectionTo::terminated() -> ConnectionTermination`（`jsonrpc.rs:3623`，含 `Dropped`）；但 `v1::ConnectionTo` 只有 `termination()` / `is_incoming_closed()`（`v1_connection.rs:68,81`），且**故意不实现 `Deref`**。
+- batch 支持**移除**（`TransportFrame::Batch` 不复存在，`TransportFrame` 改 `non_exhaustive`）。
+- `Responder` 被 drop 而没响应 → 自动回错（取消中 `-32800`，否则 `-32603`），仅在连接仍可写时发送。
+
+### 6.3 升级阻断项（必做，`ACP-U**`）
+
+| 编号 | 优先级 | 项（可执行描述） | 证据（新基线 / 我们的代码） | 改法 | 验收 |
+|---|---|---|---|---|---|
+| ACP-U01 | P0 | **feature 与 MSRV 对齐**：加 `stdio`（`Stdio`）、`process`（`AcpAgent`）、删两个已转正的 feature 名、`rust-version` ≥1.88 | `SDK 5.0.0: Cargo.toml:33-82`、`src/lib.rs:251-279`（`Stdio`/`AcpAgent` 均 cfg 门控）；`crates/agentscope-extensions-acp/Cargo.toml:19-31`；根 `Cargo.toml:47` | `[dependencies]` 改 `features = ["stdio","process","unstable_session_notices"?→删,"unstable_session_compaction"?→删,"unstable_plan_operations","unstable_llm_providers","unstable_end_turn_token_usage","unstable_mcp_over_acp"]`；`rust-version = "1.88.0"`（workspace 级） | `cargo check -p agentscope-extensions-acp --no-default-features --features lite --bins` 与默认构建均通过；`cargo tree -e features -p agentscope-extensions-acp` 显示 `stdio`/`process` |
+| ACP-U02 | P0 | **schema 命名空间迁移**：`agent_client_protocol::schema::v1::X` → `agent_client_protocol::v1::schema::X`；版本中立项（`ProtocolVersion`）留在 `schema::` | `SDK 5.0.0: src/v1.rs:58`（唯一路径）、`src/lib.rs:205`；本 crate **75 处 / 19 文件**（`src/` 10 文件 + `tests/` 9 文件） | 机械替换（含 tests）。建议一次 `rg -l 'schema::v1' \| % { ... }` 批量改，再逐个编译错误收尾 | 编译通过；`rg 'schema::v1' crates/agentscope-extensions-acp` 零命中 |
+| ACP-U03 | P0 | **服务端入口改为 `Agent.v1()`**；禁止用裸 `Builder::new(Agent)` | `SDK 5.0.0: src/role/acp.rs:393-402`；`src/jsonrpc.rs:941-967`（`Builder::new(role)` = raw、**无 wire guard**）；我们 `coding_agent.rs:626-627` 用 `Agent.builder()`（该 API 在 5.0.0 不存在） | `Agent.v1().on_receive_request(...)`；`run_with_transport` 的泛型参数由根 `ConnectionTo<Agent>` 改为 `v1::ConnectionTo<Agent>`；CLI 侧同理用 `v1::` 别名 | 编译通过；`tests/acp_stdio_thought_test.rs` 的 initialize 协商回归（旧版本号客户端仍能握手） |
+| ACP-U04 | P0 | **重写 MCP-over-ACP 客户端**：删除 connect/disconnect/connectionId，改 request-scoped `mcp/message(serverId, requestId, method, params)` + 内层 `Result|Error` 解析 | `schema 1.15.1: src/v1/mcp.rs:23,76,138,160`（`McpError`/`MessageMcpResponse`/`McpRequestId`/`MessageMcpRequest`）；本 crate `mcp_over_acp.rs:19` 仍 import 已删类型，`:97`/`:105`/`:163` 用 `McpConnectionId`/`connect()`/`disconnect()` | `McpAcpConnection{session_id, server_id}` 只保 id；`call_tool` 每次生成 `McpRequestId`（`Uuid`）并解析 `MessageMcpResponse`：`Result` → 现有 `render_tool_result`，`Error(McpError)` → 转成工具错误文本（**不要**抛 ACP 错误）；`apply_acp_mcp_server` 不再“连接”，只在会话内登记 server 元数据 | 新增离线单测：`parses_tool_result_and_inner_error`、`request_ids_are_unique_per_call`；`tests/acp_*` 全绿 |
+| ACP-U05 | P0 | **错误类型版本中立化**：根 `Error` 不再有 v1 专有构造器；`ErrorCode` 变 newtype；需要具体错误码时走 `v1::schema::Error` 的转换 | `SDK 5.0.0: src/error.rs:311-323`（`method_not_found`/`invalid_params`/`internal_error` 仍在）；`schema 1.15.1: src/v1/error.rs:131`（`session_not_found` = `-32002` + `data.sessionId`） | 现有 `Error::invalid_params()` / `internal_error()` 调用**可保持**；`ACP-06` 那条“未知 session 应回 `invalid_params`”改为回 `v1::schema::Error::session_not_found(session_id)`（更合规） | 新增断言：未知 sessionId 的 `session/prompt` 返回 `-32002` 且 `data.sessionId` 命中 |
+| ACP-U06 | P1 | **wire 行为差异回归**：①`MatchDispatch::otherwise_ignore` 未匹配请求现在回 `-32601`（此前静默）；②responder 被 drop 会自动回错；③batch 移除 | `SDK 5.0.0: src/util/typed.rs:416`、`src/jsonrpc.rs:4635-4673`；我们用 `otherwise_ignore()` **6 处 / 3 文件**（`tests/acp_elicitation_test.rs:191,324`、`tests/acp_interrupted_turn_test.rs:161,275,389`、`tests/acp_load_replay_test.rs:163`） | 测试里对手工构造的 `channel.*` 请求保留 `otherwise_ignore`，但断言“未处理请求不得导致客户端报错”；确认没有依赖“静默丢弃”的逻辑 | 4 个测试文件全绿；`acp_agent_cli` 收到 `-32601` 时不 panic |
+| ACP-U07 | P1 | **测试/工具链 API 适配**：`into_channel_and_future` 返回 `(Channel, Option<ConnectionDriver>)`；`Channel` 非穷尽；`TransportFrame` 非穷尽 | `SDK 5.0.0: src/component.rs:376`、`src/jsonrpc.rs`（`Channel::duplex` 保留） | 我们全仓 `into_channel_and_future` 零命中，`Channel::duplex()` 继续可用；只需确认没有 `TransportFrame` 穷尽 match | `cargo test -p agentscope-extensions-acp -j 2` 全绿 |
+| ACP-U08 | P2 | **`cargo fmt`/clippy 基线**：SDK 自身改 `edition 2024` 不影响我们的格式化，但 `rust-version` 变更会进 `Cargo.lock` | 根 `rust-toolchain.toml`=stable 1.97.1 | 升级后重跑 `cargo fmt --all -- --check` 与既有 clippy 口径（仓库无 `-D warnings` 门禁，见 MEMORY） | 两条命令 exit 0（`fmt` 必须 0） |
+
+### 6.4 新能力缺口（`ACP-33+`，接续 §3.5 单调递增）
+
+#### 6.4.1 协议能力（可落地）
+
+| 编号 | 优先级 | 能力 | 协议依据（1.15.1） | 本仓现状（`rg` 实测） | 落地方案 + 验收 |
+|---|---|---|---|---|---|
+| ACP-33 | P1 | `session/set_title`：客户端改会话标题 | `v1/session.rs`（`SetSessionTitleRequest{title: String}` 必填非 null，空串/不合法 → `-32602`）；能力 `AgentSessionCapabilities.title` | 我们只能 agent 侧设置：`session.rs:777` 有 `set_title`（内部 `SessionInfoUpdate`），**无 handler、无能力广告**（`SetSessionTitleRequest` 零命中） | `coding_agent.rs` 注册 handler → 校验非空 → 更新 `SessionInfo.title` → 广播 `SessionInfoUpdate` → 返回 `{}`；`session_capabilities.title=true`；单测：空标题 → `-32602`、正常设置后 `list_sessions` 可见新标题 |
+| ACP-34 | P1 | `session/status`：查询会话是否仍存活 | `v1/session.rs`：`SessionStatus{open, saved, Other}`（**不是** running/idle；未知字符串按 `saved`）；未知 session → `-32002` + `data.sessionId`（`Error::session_not_found`）；能力 `AgentSessionCapabilities.status` | 零命中（`SessionStatusCapabilities`/`session/status` 均 0） | `AcpCodingAgent` 注册 handler：`state.sessions` 命中 → `open`，仅存在于持久化存储 → `saved`，否则 `session_not_found`；`saved` 分支依赖持久化查询，与 `ACP-04`（`session/delete` 未删持久状态）同属存储层缺口，两者宜同批做 |
+| ACP-35 | P1 | `auth/status`：登录态只读探测 | `v1/auth.rs`：`AuthStatusRequest/Response`、`AuthState{NotRequired, Required, Ready, Other}`、`AuthAccount`（仅供展示）、`AuthStatusUpdateNotification`；能力 `AgentAuthCapabilities.status`；**不得**用 `-32000 auth_required` 拒绝 | 零命中；我们 `authenticate` 直接返回成功（无真实凭据） | 注册 handler 恒返 `AuthState::NotRequired`；`auth_status.capabilities.status = true`；**不实现** `auth/status_update` 推送（无状态变化源）；单测：`authenticate` 前后均 `not_required` |
+| ACP-36 | P2 | `session/archive` / `session/unarchive` + `session/list` 归档过滤 | `v1/session.rs`：`SessionArchiveFilter{Exclude(默认)|Include|Only}`、`SessionInfo.archived: Option<bool>`；**声明归档能力后每条 list 结果必须带 `archived`**；活跃会话归档须先按 `session/close` 语义释放；非法过滤值 → `-32602` | 零命中（`ArchiveSessionRequest`/`session/archive` 均 0）；`session/list` 已实现（分页 + cwd） | `AcpStore` 增 `archived: bool`（内存 + 持久化两层，注意 SQLite 侧 schema 迁移）；list 按 filter 过滤并填 `archived`；归档活跃会话 → 先走现有 close 路径释放 `AcpAgentSession`；单测 4 条（archive→list 默认不含、Only 只含、unarchive 恢复、活会话归档释放） |
+| ACP-37 | P1 | **`additional_directories` 能力广告**（不是新方法，是漏广告） | `AgentSessionCapabilities.additional_directories: bool`（1.9.1 已有） | 代码已处理：`session.rs` 的 `set_additional_directories` + `additional_directories` 1 处使用；但 `session_capabilities` **未广告** → 客户端合规地不会发 | 在 `coding_agent.rs` 的 session capabilities 里加 `additional_directories = true`；验收：`initialize` 响应的 `agentCapabilities.sessionCapabilities.additionalDirectories == true` |
+| ACP-38 | P1 | `session/new` / `session/fork` 的 **systemPrompt** 支持 | `v1/session.rs`：`SystemPrompt{mode, content}`、`SystemPromptMode{Append(默认)|Override|Other}`；能力三层门控：agent 未广告 → client 发了必须报错（`invalid_params` 语义），不支持某个 mode 也要报错而**不能降级为 append** | 零命中（`SystemPrompt` 0 处） | 第一阶段只做 `Append`：拼接到 system prompt 末尾 —— 注入点在 `acp_harness_agent.rs:816 build_system_prompt()` → `:1041 .sys_prompt(...)`；`Override` 需产品决策（会绕过我们的编码规则/工具说明）→ 暂不做，收到即返回不支持模式错误；能力 `session_capabilities.system_prompt = true`（仅当 Append 可用 **且** 由 `session_factory` 构建，否则不广告、收到即报错）；单测：append 生效、override → 错误、未广告时收到 → 错误 |
+| ACP-39 | P2 | `unstable_subagents`：向客户端上报子智能体 | `v1/session.rs`：`SessionUpdate::SubagentUpdate`（字段全 `MaybeUndefined` 三态：省略=不变、`null`=清除、值=替换）；`SessionMessage`/`SessionMessageChunk`（message upsert / 增量）；`SubagentCapabilities` 在 **client 侧** `ClientCapabilities.subagents`；v2 另有 `StateUpdate`/`IdleStopReason` | 零命中（`SubagentUpdate`/`SubagentCapabilities`/`SessionMessageChunk` 均 0）；harness 侧子智能体存在（`agent_spawn`/`agent_send`），但**子 agent 事件不回灌父流**（MEMORY 记 `abf3c35a3` 阻塞：`core::event::AgentEventEmitter` 无使用点） | **前置阻塞**：先实现「子智能体事件回灌父流」（core/event 的 `FORWARDING_CONTEXT_KEY` 接缝），再映射为 `SubagentUpdate`（`session_id`/`title`/`state`）+ 是否发 `SessionMessage`（需产品决定是否把子 agent 消息内容透给客户端）；仅当 `client_capabilities.subagents` 存在才发送；不实现 `requires_action` 传播（无 HITL 子流程） |
+| ACP-40 | P2 | `unstable_session_fork` 的实际接线 | 1.9.1 已有方法；1.15.1 请求新增 `systemPrompt` 字段，能力位由文档级改为真 `cfg` 门控 | 未启用 feature（`ACP-D01` 明确暂缓），零 handler | 见 `ACP-D13`：暂不实现（理由：会话存储无 fork 原语 + 产品未要求）。若要做，必须先给 `AcpStore` 加「复制会话历史」原语，再叠加 `ACP-38` 的 systemPrompt 语义 |
+| ACP-41 | —（已对齐） | `$/cancel_request`：**单请求**取消（与 `session/cancel` 严格区分） | v1 稳定方法；`Responder::cancellation()` 返回可 await 的取消信号；`session/cancel` 是「取消该会话当前 turn」，`$/cancel_request` 是「取消某个在飞请求 id」 | **已实现**：`session.rs:1464 run_prompt_cancellable` 已同时监听 SDK 的 per-request cancellation marker（`coding_agent.rs:695-702` 有注释说明），`tests/acp_cancel_test.rs:51` 断言 `StopReason::Cancelled` | 无需新做；升级后只需回归（5.0.0 把 `cancellation()` 变成公开 API，可选重构为直接 await）；验收：`cargo test -p agentscope-extensions-acp acp_cancel` 全绿 |
+
+#### 6.4.2 运行时 / 工程面（非协议）
+
+| 编号 | 优先级 | 项 | 新基线事实 | 本仓现状 | 建议 |
+|---|---|---|---|---|---|
+| ACP-42 | P1 | 连接终止统一用 `terminated()` / `termination()` 做清理 | 根 `ConnectionTo::terminated() -> ConnectionTermination{Dropped, ...}`（`jsonrpc.rs:3623`）；`v1::ConnectionTo` 只有 `termination()` / `is_incoming_closed()`，**故意不 Deref** | 依赖 stdio 读端 EOF 自然退出，无显式终止处理 | 在所有 `forwarder` / 事件泵里 await `termination()`，用于 flush `event_queue`、释放 `AcpAgentSession`、写 checkpoint；避免「客户端断开后 agent 仍在跑」 |
+| ACP-43 | P1 | 日志脱敏口径 | 普通日志只记错误 code + 固定 reason（不含 message/params）；TRACE 记全量行但 `env`/`headers` 的值替换为 `[REDACTED]`；`AcpAgent::with_debug` 回调**不脱敏** | 我们自写 `tracing` 日志，未统一口径 | 关掉对 request/response 全量 body 的 `debug!`；若用 `AcpAgent::with_debug`（CLI）明确它可能打印令牌 |
+| ACP-44 | P2 | 并发模型事实对齐 | 每连接**单 dispatch loop**（handler 跑完才取下一条）；`spawn` 才并发；同连接所有 session 的 update 天然串行；内部全 `mpsc::unbounded`（**无背压**），仅 parked 消息队列限 1024、溢出丢最旧；ordered callback 里 await 其它入站请求 = **死锁** | 我们把长任务丢后台队列（`event_queue.rs`），符合「不要在 callback 里 await」 | 文档化 + 检查 `coding_agent` 的每个 handler 都不在 callback 内 await 别的入站请求；跨会话公平性靠我们自己的 FIFO 队列 |
+| ACP-45 | P2 | 优雅关闭 | `request_finish()` 幂等、**无隐式超时**；须 `request_finish()` + 继续 pump + 自建超时；`ConnectionDriver::with_finish` / `request_finish()` | 无 | agent 收到 SIGINT（CLI 已处理）→ `roadmap`：先停止接新请求，再 `request_finish()`，最后带 5s 超时强制退出 |
+
+### 6.5 设计决定（`ACP-D**`，接续 §4.3.1）
+
+| 编号 | 决定 | 理由 | 若将来重开的前置条件 |
+|---|---|---|---|
+| ACP-D08 | **不实现 proxy chains**（`proxy/initialize`、`proxy/successor`）；不开 `unstable_proxy_chains` | 我们是终端用户直连的 coding agent，没有「agent 被另一个 ACP 客户端通过代理链调度」的部署形态；5.0.0 方法名从 `_proxy/*` 改为 `proxy/*` 且无兼容回退，实现了反而要跟不稳定语义 | 出现「ACP 网关 / 多级客户端」需求时，按 `md/proxying-acp.md` 一次做对（`Proxy`/`ProxyProtocolRouter` 现成） |
+| ACP-D09 | **不实现 protocol v2**；`unstable_protocol_v2` 继续不开 | v2 是「另一套协议」——v2 删 batch、无 `session/load`、无 `session/set_mode`、prompt 先回 `messageId` 再后台执行、能力结构改成必填 `info`、client 侧无 `fs`/`terminal`、`McpServerSse` 删除、错误码 `-32002` 改 `session_not_found(id)`；开启后 `ProtocolVersion::LATEST` 直接消失，且 v2 连接不能 `into_protocol::<V1>`，两套 handler 需并存 | 客户端生态明确要求 v2 时再用 `Agent.protocol_router().with_v1().with_v2()`（SDK 已代劳 initialize 版本协商与降级，但 handler 全集需自己写） |
+| ACP-D10 | **不引入 HTTP / WebSocket 传输**，保持 stdio 主干 | 目标是本地 IDE 集成；`agent-client-protocol-http` 的 `AcpHttpServer` 暴露 `axum::Router`、每连接调一次 factory、`Acp-Connection-Id` 头、未确认会话流上限 16、请求体 16 MiB，**SDK 不含认证** → 自建网关要自己做鉴权/限流，收益不抵成本 | 需要「远程/多客户端接入」时再评估，且必须自带认证层 |
+| ACP-D11 | **Conductor / polyfill / rmcp / testy 不作为运行时依赖** | Conductor 是开发期「多 agent 联调服务」（CLI `conductor agent "p1" "agent" --trace/--serve`，**没有 mcp 子命令**）；polyfill 用旧模型 API 模拟 `tool_call` 更新；rmcp 是「把 MCP server 桥成 ACP 工具」的适配层。三者都会显著增大 embedded 产物体积（当前 `acp_harness_agent.exe` 9.28 MB 是硬指标） | 只在宿主项目里按需引入（dev-dependencies 或独立 bin） |
+| ACP-D12 | **NES 移除无需任何动作** | 我们从未使用 NES（符号零命中），5.0.0 直接删掉 `v1/nes.rs` 与 `client_capabilities.nes` | — |
+| ACP-D13 | **`session/fork` 继续暂缓**（细化 `ACP-D01`） | 1.15.1 只是给请求加了 `systemPrompt` 字段，能力位从文档级变真 `cfg`；但实现 fork 需要 `AcpStore` 能复制「消息历史 + 会话元数据 + checkpoint」，我们目前只有单条会话持久化 | 先做 `ACP-36` 的存储层抽象（archive 已需要 schema 迁移），再评估 fork |
+| ACP-D14 | **不做「把 agent 工具暴露成 MCP server」**（`md/mcp-bridge.md` 方向） | 我们是 ACP agent，客户端负责挂 MCP server；反向桥接会引入 rmcp 依赖与工具语义二次映射（我们的 `Tool` ↔ MCP schema），且没有客户端需求 | 出现「别的 MCP 客户端想复用我们的编码工具」需求时单独评估 |
+
+### 6.6 存量条目联动（必须同步改口径）
+
+| 存量条目 | 原结论 | 新口径 |
+|---|---|---|
+| §1 `依赖` 行 | 「v2.2.0 已声明」 | 改为「待升级」，指向 §6.3 |
+| §2.7「SDK 能力盘点」 | 以 2.2.0/1.9.1 为基线，列「待办（不含暂缓）」 | 2.2.0 那一栏保留为历史；新增 5.0.0 栏，逐项指向 `ACP-33..ACP-41` 与 `ACP-D08..D14` |
+| `ACP-01`（配置选项）等 12 个 handler | 已完成 | 不受影响，但 `session_capabilities` 广告字段需补 `title`/`status`/`archive`/`system_prompt`/`additional_directories`（随 `ACP-33..ACP-38` 分批） |
+| `ACP-02`（协议演进跟踪） | 「暂缓 ACP v2 / Proxy」 | 补 §6.2 的方法增删表 + `ACP-D08`/`ACP-D09` 两条正式决定 |
+| `ACP-06`（未知 session 错误码） | 回 `invalid_params` | 改用 `v1::schema::Error::session_not_found(id)`（`-32002` + `data.sessionId`），见 `ACP-U05` |
+| `ACP-D01`（unstable feature 逐个开） | 6 个 feature 清单 | 清单变化：删 `unstable_session_notices`、`unstable_session_compaction`；新增评估项见 6.1#7；**加 `stdio`/`process`（非 unstable，但必开）** |
+| `ACP-D02`（不用聚合 `unstable`） | 不变 | 仍成立（聚合里新增了 6 项，其中 `unstable_protocol_v2` 仍不在内） |
+
+### 6.7 建议批次（每批独立可编译、可回滚）
+
+| 批次 | 内容 | 涉及文件 | 验收命令 |
+|---|---|---|---|
+| **B0 升级** ✅ 已完成（2026-11-03） | `ACP-U01..U08`（纯迁移，零新特性） | `Cargo.toml`（crate + workspace `rust-version`）、`src/` 10 个含 `schema::v1` 的文件、`tests/` 9 个文件 | `cargo check -p agentscope-extensions-acp --all-targets -j 2`；`cargo test -p agentscope-extensions-acp -j 2`；ACP 握手冒烟（stdin 喂 `initialize`，校验 stdout 含 `protocolVersion`） |
+| **B1 只读能力** ✅ 已完成（2026-11-03，`ACP-33/34/35/37`） | `ACP-33`（set_title）、`ACP-34`（status）、`ACP-35`（auth/status）、`ACP-37`（additional_directories 广告） | `coding_agent.rs`、`session.rs`、`config.rs`（capabilities 构造） | 新增单测 + `initialize` 能力位断言 |
+| **B2 存储与生命周期** ✅ 已完成（`ACP-36`、`ACP-42`） | `ACP-36`（archive/unarchive + list filter + `archived`）、`ACP-42`（termination 清理） | `session.rs`、`event_queue.rs`、`acp_harness_agent.rs` | 归档 4 条单测；断开连接后无泄漏（`mem.rs` 探针可选） |
+| **B3 提示与取消** ✅ 已完成（`ACP-38`、`ACP-41` 回归、`ACP-45` 原已存在） | `ACP-38`（systemPrompt append）、`ACP-41`（`$/cancel_request`）、`ACP-45`（优雅关闭） | `acp_harness_agent.rs`、`session.rs`、`coding_agent.rs` | cancel 竞态测试（先 prompt 后 cancel）；append 生效测试 |
+| **B4（可选，有前置）** | `ACP-39`（subagents 上报）、`ACP-40`（fork，仍暂缓） | core `event`（回灌）、`session.rs` | 前置阻塞解除后再排期 |
+
+### 6.8 升级坑清单（实测/读码得到，勿踩）
+
+1. **`Agent.builder()` 在 5.0.0 不存在**，换成 `Agent.v1()`；但**裸 `Builder::new(Agent)` 仍能编译**（raw 模式），代价是丢掉 wire guard —— initialize 不校验版本、未初始化请求不被拒。必须用 `Agent.v1()`。
+2. **`stdio` / `process` 不加就是一堆 `cannot find type`**，错误信息不会提示「请开 feature」，容易误判为 SDK 版本不对。
+3. `unstable_session_notices` / `unstable_session_compaction` 两个 feature 名删掉后，代码里**没有任何 `cfg(feature="unstable_")`**（本 crate 实测只有 `alloc-stats`），所以这两个名字只出现在 `Cargo.toml` 注释里 → 记得把注释一起改，否则注释误导后来者。
+4. `schema::v1::X → v1::schema::X` 有 **75 处**；`rg 'schema::v1'` 改完后，`RequestId`/`ProtocolVersion` 这类**版本中立项**仍在 `schema::` 下，不要一起替换。
+5. `Dispatch` / `Handled` / `UntypedMessage` / `Responder` 在根上是泛型默认 `Raw`，v1 语义需显式 `v1::` 别名（`acp_agent_cli.rs:51`、`:962`）。
+6. `MatchDispatch::otherwise_ignore` 语义变化：未匹配请求从「静默丢弃」变成回 `-32601`；我们的 6 处测试用它构造「只关心 elicitation」的场景，升级后客户端可能收到额外错误响应。
+7. responder 被 drop 会自动回错（取消中 `-32800`，否则 `-32603`）——异步 handler 里 `?` 早退不再「静默无响应」，客户端行为可能变化。
+8. `v1::ConnectionTo` 没有 `Deref` 到根 `ConnectionTo`：需要 `terminated()` 的地方只能拿根连接。
+9. MCP 改造后**没有 initialize 握手**（只支持 MCP 2026-07-28）——如果现有 `mcp_over_acp.rs` 里发过 `initialize`，升级后会被服务端当非法方法。
+10. 升级顺序建议：先只改 `Cargo.toml` 跑 `cargo check` 收集全部错误，再一次性改命名空间，最后修 MCP —— 反过来会因为错误量太大淹没有效信息。
+
+### 6.9 执行记录（B0 / B1 / B2 片段 / B3 的 ACP-38，2026-11-03）
+
+| 编号 | 执行状态 | 交接信息（验证结果） |
+|---|---|---|
+| `ACP-U01..U08`（B0） | 已完成 | workspace `rust-version` → `1.88.0`；crate features 加 `stdio`/`process` 与 5 个 `unstable_*`；`schema::v1::X → v1::schema::X` 全量改写（src 10 + tests 9）；`cargo check -p agentscope-extensions-acp --all-targets` exit 0；`cargo test -p agentscope-extensions-acp -j 2` 全绿 |
+| `ACP-37` | 已完成 | `coding_agent.rs` 的 `SessionCapabilities` 增 `additional_directories(SessionAdditionalDirectoriesCapabilities::new())`；测试 `acp_capabilities_test.rs::initialize_advertises_the_new_capabilities_and_they_work` 断言 `session.additional_directories.is_some()` |
+| `ACP-33` | 已完成 | `session/set_title` handler：trim + 空白 → `-32602`，成功后写 `SessionInfo.title` 并广播 `SessionInfoUpdate`；能力位 `session.title`；测试断言 `list_sessions` 可见新标题、空标题报 `INVALID_PARAMS` |
+| `ACP-34` | 已完成 | `session/status` handler + `session_status()`：注册表命中 → `Open`，仅持久化 → `Saved`，否则 `session_not_found`（`-32002`）；能力位 `session.status`；测试 `a_session_that_is_only_persisted_reports_saved`（重启后 `Saved` → `session/load` 后 `Open`） |
+| `ACP-35` | 已完成 | `auth/status` handler 恒返 `AuthState::NotRequired`（无真实凭据，不实现 `auth/status_update`）；能力位 `auth.status`；测试在 `initialize` 后直接断言 |
+| `ACP-36` | 已完成 | 归档状态落 `.agentscope/acp-sessions/<id>.archived` 标记文件（`session.rs::is_archived_on_disk` / `set_archived_on_disk`），不动 harness 侧 journal schema；`session/list` 按 `SessionArchiveFilter`（Exclude 默认 / Only / Include）在**分页前**过滤，且每条结果都带 `archived`；`Other(_)` 过滤值 → `-32602`；活跃会话归档按 `session/close` 语义释放（`close()` + `cancel_and_wait(15s)` + `remove_session`）；持久化-only 会话的 unarchive 靠 `session_workspace()` 探测（cwd 来源＝注册表 + `session/list` 建过的索引 agent）。测试：`archiving_a_live_session_hides_it_until_it_is_unarchived`、`archive_state_survives_a_restart` |
+| `ACP-38` | 已完成 | `coding_agent.rs::system_prompt_text()` 只接受 `SystemPromptMode::Append`（`Override`/其它 → `-32602` + `data.supportedModes`，不降级）；文本块以空行拼接、空白内容报错；`acp_harness_agent.rs::with_client_system_prompt()` 把客户端文本接在默认 system prompt **之后**（编码规则/工具说明保留在前）；能力位 `session.system_prompt` **仅在 `session_factory` 存在时**广告（`model_factory` 无传递通道，故不广告且收到即 `-32602`）；`session/load|resume` 命中**已存活**会话时 `systemPrompt` 无法叠加（会丢掉正在跑的轮次），记 WARN 后忽略。测试：单测 `coding_agent::tests::a_client_system_prompt_is_only_accepted_in_append_mode`、`tests::a_client_system_prompt_is_appended_after_our_instructions`（bin），集成 `acp_capabilities_test` 两条（`model_factory`：能力位 `is_none()` + 带 prompt 的 `session/new` 报 `INVALID_PARAMS`；`session_factory`：能力位 `is_some()` + `SessionBuild.system_prompt` 真的传到工厂 + `override` 被拒且不建会话） |
+| `ACP-42` | 已完成 | `AcpCodingAgent::shutdown_sessions()`：`run_with_transport` 的 `connect_to(...).await` 返回后先停 wakeup 循环，再 drain 会话（`close()` + `cancel_and_wait(5s)`）并清空 `session/load|list` 的 catalog agent 缓存。事件队列不需额外 flush：队列是**每轮**新建的（`session.rs::run_prompt_inner`），轮次返回时 sink 已 drop。`connect_to` 本身就在 termination 时返回，所以没有额外 await `termination()`（避免两套清理路径）。测试：`coding_agent::tests::a_terminated_connection_releases_its_sessions`（反向验证：注释掉 `session.close()` → FAILED） |
+| `ACP-43` | 已完成（现状已满足） | `rg 'debug!'` 审查：本 crate 的 debug 日志只记路径/字节数/规则条数/会话 id，**无** request/response 全量 body；全程未用 `AcpAgent::with_debug`，不存在未脱敏的令牌打印 |
+| `ACP-44` | 已完成（审查结论） | 每个 handler 只做轻量工作：`session/prompt` 一律 `cx.spawn`，`session/request_permission` 只在 spawn 出去的轮次内 await；handler 内没有 await 其它入站请求，不存在单 dispatch loop 死锁风险 |
+| `ACP-45` | 已完成（HEAD 已有，非本批新增） | `acp_harness_agent.rs::spawn_shutdown_handler`（SIGINT/SIGTERM）→ `drain_sessions`：`interrupt()` → 20s 有界等待 `is_running`/`active_request_count` 归零 → `cancel()+close()` → `sleep(250ms)` → `exit(130)`；stdin EOF 路径同样先 drain 再返回。**有意不用** `request_finish()`：信号路径进程即将退出、EOF 路径客户端已走，没有可礼貌告别的对端 |
+
+**验证命令（本轮实测）**
+
+- `cargo check -p agentscope-extensions-acp --all-targets -j 2` → exit 0（本 crate 零警告；harness 侧 4 条 `unused import` 为 HEAD 既有，未纳入本批）
+- `cargo test -p agentscope-extensions-acp -j 2` → 全部 target `ok`（lib **85 passed**，含新增 `mcp_over_acp::tests::unwraps_a_result_and_surfaces_an_inner_error_as_a_tool_failure` / `every_request_gets_its_own_id`；`acp_capabilities_test` **5 passed**；bin `acp_harness_agent` **5 passed**；其余 target 均 0 failed）
+- `cargo fmt --all -- --check` → exit 0
+- 反向验证（均已还原）：①`SessionArchiveFilter::Exclude` 改成不过滤 → `archiving_a_live_session_hides_it_until_it_is_unarchived` / `archive_state_survives_a_restart` 双双 FAILED（`:326:17`、`:440:17`）；②`system_prompt_text` 的 mode 校验短路（`if false && ...`）→ `a_client_system_prompt_is_only_accepted_in_append_mode` + `a_client_system_prompt_reaches_the_session_factory_and_override_is_rejected` FAILED；③`with_client_system_prompt` 改成只返回客户端文本 → `a_client_system_prompt_is_appended_after_our_instructions` FAILED；④`shutdown_sessions` 去掉 `session.close()` → `a_terminated_connection_releases_its_sessions` FAILED；⑤systemPrompt 能力改为无条件广告 → `initialize_advertises_the_new_capabilities_and_they_work` FAILED（`:102`）；⑥`response_payload` 把内层 MCP `Error` 当成功返回 → `unwraps_a_result_and_surfaces_an_inner_error_as_a_tool_failure` FAILED
+
+**已知限制**：`AcpCodingAgent::model_factory` 路径拿不到 `systemPrompt`（该工厂签名只有 cwd + session id）→ 该配置下**不广告**该能力，且带 `systemPrompt` 的 `session/new|load|resume` 直接 `-32602`（不再静默丢弃），已在 rustdoc 注明；生产二进制走 `session_factory`，行为正确。
+
+**本轮收尾清理**：删掉 `AcpAgentSession::mcp_acp_connections`（无握手协议下已无读取点，纯只写 keep-alive）；`is_archived_on_disk`/`set_archived_on_disk` 收为 `pub(crate)`；`shutdown_sessions` 改 `futures::future::join_all` 并发释放（每条仍 5s 有界）；MCP-over-ACP 内层错误改用 `Error::new(INTERNAL_ERROR, msg)`（信息进 `message` 而非 `data`，客户端可见）。
+
+**下一步（B4，可选）**：`ACP-39`（subagents 上报，前置阻塞：core `AgentEventEmitter` 无使用点，需先实现子智能体事件回灌父流）、`ACP-40`（fork，仍暂缓，见 `ACP-D13`）。B0–B3 已全部落地；`ACP-U01..U08` 与 `ACP-33..ACP-38`、`ACP-41..ACP-45` 均有结论。

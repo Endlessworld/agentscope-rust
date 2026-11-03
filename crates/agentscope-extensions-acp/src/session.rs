@@ -7,13 +7,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock, CreateElicitationRequest, CreateElicitationResponse, MessageId, PermissionOption,
     PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption, SessionId,
     SessionMode, SessionModeState, StopReason, ToolCallUpdate,
 };
-use agent_client_protocol::{Client, ConnectionTo};
+use agent_client_protocol::{v1::ConnectionTo, Client};
 use agentscope_core::event::{AgentEvent, ConfirmResult};
 use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
 use agentscope_core::model::catalog::ModelDescriptor;
@@ -93,7 +93,7 @@ impl AcpClientHandle {
     /// Pushes a `session/update` notification to the client.
     pub(crate) fn notify(
         &self,
-        notification: agent_client_protocol::schema::v1::SessionNotification,
+        notification: agent_client_protocol::v1::schema::SessionNotification,
     ) -> Result<(), agent_client_protocol::Error> {
         self.connection.send_notification(notification)
     }
@@ -149,15 +149,17 @@ impl AcpClientHandle {
             Err(_) => Err("elicitation timed out: the client did not answer".to_string()),
         }
     }
-    /// Opens an MCP-over-ACP connection to a client-declared MCP server
-    /// (`mcp/connect`) and returns a handle that can list/call its tools.
-    pub(crate) async fn connect_mcp_acp(
+    /// Binds a handle to a client-declared MCP-over-ACP server.
+    ///
+    /// The stateless protocol has no handshake, so this is purely local; the
+    /// first network round-trip is the `tools/list` issued by
+    /// [`super::mcp_over_acp::McpAcpConnection::bridge_tools`].
+    pub(crate) fn connect_mcp_acp(
         &self,
         name: &str,
-        server_id: agent_client_protocol::schema::v1::McpServerAcpId,
-    ) -> Result<super::mcp_over_acp::McpAcpConnection, agent_client_protocol::Error> {
-        super::mcp_over_acp::McpAcpConnection::connect(self.connection.clone(), name, server_id)
-            .await
+        server_id: agent_client_protocol::v1::schema::McpServerAcpId,
+    ) -> super::mcp_over_acp::McpAcpConnection {
+        super::mcp_over_acp::McpAcpConnection::new(self.connection.clone(), name, server_id)
     }
 }
 
@@ -328,12 +330,12 @@ fn thought_level_params(level: &str) -> GenerateOptions {
 /// Maps a turn's accumulated [`ChatUsage`] to the protocol `Usage` reported in
 /// `PromptResponse`. Returns `None` when the turn saw no usage at all, so an
 /// untouched turn does not report a misleading zero-token payload.
-fn turn_usage_to_response(usage: &ChatUsage) -> Option<agent_client_protocol::schema::v1::Usage> {
+fn turn_usage_to_response(usage: &ChatUsage) -> Option<agent_client_protocol::v1::schema::Usage> {
     if usage.input_tokens == 0 && usage.output_tokens == 0 {
         return None;
     }
     Some(
-        agent_client_protocol::schema::v1::Usage::new(
+        agent_client_protocol::v1::schema::Usage::new(
             usage.total_tokens(),
             usage.input_tokens,
             usage.output_tokens,
@@ -486,10 +488,6 @@ pub struct AcpAgentSession {
     /// `session/update` variants are only legal when the matching capability was
     /// advertised, so every optional update is gated on this.
     support: ClientSupport,
-    /// Live MCP-over-ACP connections (and their bridged tools) for this session,
-    /// so they are released when the session is replaced/dropped. Shared across
-    /// clones because `apply_mcp_servers` takes `&self`.
-    mcp_acp_connections: Arc<Mutex<Vec<super::mcp_over_acp::McpAcpConnection>>>,
     /// Token usage accumulated during the turn that is running (reset per turn),
     /// reported back as `PromptResponse.usage`.
     turn_usage: ChatUsage,
@@ -499,6 +497,9 @@ pub struct AcpAgentSession {
     config_path: PathBuf,
     /// Client-visible session title, if one was set.
     title: Option<String>,
+    /// Whether this session is archived (ACP-36). Persisted as a marker file next to the
+    /// config sidecar, so an archived session stays hidden from `session/list` across restarts.
+    archived: bool,
     /// ISO-8601 timestamp of the last prompt turn.
     ///
     /// Shared: `session/list` and LRU eviction read it through a *clone* taken from the
@@ -521,6 +522,45 @@ fn session_config_path(cwd: &std::path::Path, session_id: &SessionId) -> PathBuf
     cwd.join(".agentscope")
         .join("acp-sessions")
         .join(format!("{safe}.json"))
+}
+
+/// Path of the marker file recording that a session is archived.
+///
+/// A marker (rather than a field in the config sidecar) keeps archive state independent of
+/// the client-selectable config: archiving a session that never had a config still works,
+/// and a later config write cannot clear the flag.
+fn archive_marker_path(cwd: &std::path::Path, session_id: &SessionId) -> PathBuf {
+    session_config_path(cwd, session_id).with_extension("archived")
+}
+
+/// Whether `session_id` is archived on disk under `cwd`.
+pub(crate) fn is_archived_on_disk(cwd: &std::path::Path, session_id: &SessionId) -> bool {
+    archive_marker_path(cwd, session_id).exists()
+}
+
+/// Writes or removes the archive marker for `session_id` under `cwd`.
+///
+/// Failures are logged, not propagated: the in-memory flag is already authoritative for this
+/// process, and an unwritable workspace should not fail the protocol call.
+pub(crate) fn set_archived_on_disk(cwd: &std::path::Path, session_id: &SessionId, archived: bool) {
+    let path = archive_marker_path(cwd, session_id);
+    if !archived {
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), %error, "failed to clear the archive marker");
+            }
+        }
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::warn!(path = %parent.display(), %error, "failed to create the archive marker directory");
+            return;
+        }
+    }
+    if let Err(error) = std::fs::write(&path, b"") {
+        tracing::warn!(path = %path.display(), %error, "failed to write the archive marker");
+    }
 }
 
 fn load_session_config(path: &std::path::Path) -> Option<SessionConfig> {
@@ -641,6 +681,7 @@ impl AcpAgentSession {
         // Resolve the descriptor of the initial model now: the caller is building the model list,
         // so the catalog is resident -- and the host releases it as soon as every session is bound.
         let descriptor = SelectedDescriptor::resolve(&models, &initial_model);
+        let archived = is_archived_on_disk(&cwd, &session_id);
         let mut session = Self {
             session_id,
             cwd,
@@ -665,10 +706,10 @@ impl AcpAgentSession {
             bridged_servers: Arc::new(Mutex::new(Vec::new())),
             support: ClientSupport::new(),
             turn_usage: ChatUsage::default(),
-            mcp_acp_connections: Arc::new(Mutex::new(Vec::new())),
             additional_directories: Vec::new(),
             config_path,
             title: None,
+            archived,
             updated_at: Arc::new(Mutex::new(None)),
         };
         {
@@ -739,12 +780,12 @@ impl AcpAgentSession {
     fn advisory_notification(
         &self,
         message: impl Into<String>,
-    ) -> agent_client_protocol::schema::v1::SessionNotification {
+    ) -> agent_client_protocol::v1::schema::SessionNotification {
         let message = message.into();
         if self.support.supports_notices() {
             event::notice(
                 self.session_id.clone(),
-                agent_client_protocol::schema::v1::NoticeSeverity::Warning,
+                agent_client_protocol::v1::schema::NoticeSeverity::Warning,
                 message,
                 None,
             )
@@ -756,8 +797,10 @@ impl AcpAgentSession {
     /// Builds this session's `SessionInfo` (see [`Self::session_info`]) and
     /// emits it as a `SessionInfoUpdate` so the client's session list stays in
     /// sync with the latest activity time.
-    fn session_info_update(&self) -> agent_client_protocol::schema::v1::SessionNotification {
-        use agent_client_protocol::schema::v1::{
+    pub(crate) fn session_info_update(
+        &self,
+    ) -> agent_client_protocol::v1::schema::SessionNotification {
+        use agent_client_protocol::v1::schema::{
             SessionInfoUpdate, SessionNotification, SessionUpdate,
         };
         let mut update = SessionInfoUpdate::new();
@@ -778,14 +821,26 @@ impl AcpAgentSession {
         self.title = Some(title.into());
     }
 
+    /// Whether this session is archived (hidden from the default `session/list`).
+    pub fn is_archived(&self) -> bool {
+        self.archived
+    }
+
+    /// Sets the archive flag and persists it (ACP-36).
+    pub fn set_archived(&mut self, archived: bool) {
+        self.archived = archived;
+        set_archived_on_disk(&self.cwd, &self.session_id, archived);
+    }
+
     /// Projects this session into the protocol `SessionInfo` returned by
     /// `session/list` (cwd, additional roots, title and last-activity time).
-    pub fn session_info(&self) -> agent_client_protocol::schema::v1::SessionInfo {
-        let mut info = agent_client_protocol::schema::v1::SessionInfo::new(
+    pub fn session_info(&self) -> agent_client_protocol::v1::schema::SessionInfo {
+        let mut info = agent_client_protocol::v1::schema::SessionInfo::new(
             self.session_id.clone(),
             self.cwd.clone(),
         )
-        .additional_directories(self.additional_directories.clone());
+        .additional_directories(self.additional_directories.clone())
+        .archived(self.archived);
         if let Some(title) = &self.title {
             info = info.title(title.clone());
         }
@@ -1082,9 +1137,9 @@ impl AcpAgentSession {
     /// transports. Re-declaring an already bridged server is a no-op.
     pub async fn apply_mcp_servers(
         &self,
-        servers: &[agent_client_protocol::schema::v1::McpServer],
+        servers: &[agent_client_protocol::v1::schema::McpServer],
     ) {
-        use agent_client_protocol::schema::v1::McpServer;
+        use agent_client_protocol::v1::schema::McpServer;
         for server in servers {
             // MCP-over-ACP is driven by a different transport (the ACP channel
             // itself) and needs `&self` interior mutability, so it is handled
@@ -1205,7 +1260,7 @@ impl AcpAgentSession {
     }
 
     /// Connects a client-declared MCP-over-ACP server and bridges its tools.
-    async fn apply_acp_mcp_server(&self, acp: &agent_client_protocol::schema::v1::McpServerAcp) {
+    async fn apply_acp_mcp_server(&self, acp: &agent_client_protocol::v1::schema::McpServerAcp) {
         let name = acp.name.clone();
         // Same rule as the config-based transports: record the name only after the bridge
         // succeeded, so a failed attempt can be retried when the client re-declares it.
@@ -1230,25 +1285,16 @@ impl AcpAgentSession {
             );
             return;
         };
-        let connected = tokio::time::timeout(
+        let connection = client.connect_mcp_acp(&name, acp.server_id.clone());
+        // The stateless protocol has no handshake, so the first round-trip is tool
+        // discovery; keep the same budget around it.
+        match tokio::time::timeout(
             MCP_CONNECT_TIMEOUT,
-            client.connect_mcp_acp(&name, acp.server_id.clone()),
+            connection.bridge_tools(self.agent.toolkit()),
         )
-        .await;
-        match connected {
-            Ok(Ok(connection)) => {
-                if let Err(e) = connection.bridge_tools(self.agent.toolkit()).await {
-                    tracing::warn!(
-                        session = %self.session_id,
-                        server = %name,
-                        %e,
-                        "failed to list MCP-over-ACP tools"
-                    );
-                }
-                self.mcp_acp_connections
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(connection);
+        .await
+        {
+            Ok(Ok(_)) => {
                 self.bridged_servers
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1264,7 +1310,7 @@ impl AcpAgentSession {
                     session = %self.session_id,
                     server = %name,
                     %e,
-                    "failed to connect MCP-over-ACP server"
+                    "failed to list MCP-over-ACP tools"
                 );
             }
             Err(_elapsed) => {
@@ -1272,7 +1318,7 @@ impl AcpAgentSession {
                     session = %self.session_id,
                     server = %name,
                     timeout_secs = MCP_CONNECT_TIMEOUT.as_secs(),
-                    "MCP-over-ACP server did not connect in time"
+                    "MCP-over-ACP server did not answer in time"
                 );
             }
         }
@@ -1376,10 +1422,10 @@ impl AcpAgentSession {
             return;
         };
         let options = self.config_options();
-        let config = agent_client_protocol::schema::v1::SessionNotification::new(
+        let config = agent_client_protocol::v1::schema::SessionNotification::new(
             self.session_id.clone(),
-            agent_client_protocol::schema::v1::SessionUpdate::ConfigOptionUpdate(
-                agent_client_protocol::schema::v1::ConfigOptionUpdate::new(options),
+            agent_client_protocol::v1::schema::SessionUpdate::ConfigOptionUpdate(
+                agent_client_protocol::v1::schema::ConfigOptionUpdate::new(options),
             ),
         );
         let _ = client.notify(config);
@@ -1394,7 +1440,7 @@ impl AcpAgentSession {
     /// would report the previous window. Size the gauge from the catalog
     /// descriptor of the newly selected model instead.
     pub fn push_usage_for_selected_model(&self) {
-        use agent_client_protocol::schema::v1::{SessionNotification, SessionUpdate, UsageUpdate};
+        use agent_client_protocol::v1::schema::{SessionNotification, SessionUpdate, UsageUpdate};
         let Some(client) = self
             .client
             .lock()
@@ -1473,7 +1519,7 @@ impl AcpAgentSession {
         cancellation: Option<agent_client_protocol::RequestCancellation>,
     ) -> StopReason
     where
-        F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
+        F: Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync,
     {
         let stop = self
             .run_prompt_inner(TurnInput::Prompt(content), emit, cancellation)
@@ -1530,8 +1576,8 @@ impl AcpAgentSession {
     /// this very request for a cwd that has no history yet, so the replay is simply empty.
     pub async fn replay_notifications(
         &self,
-    ) -> Vec<agent_client_protocol::schema::v1::SessionNotification> {
-        use agent_client_protocol::schema::v1::{
+    ) -> Vec<agent_client_protocol::v1::schema::SessionNotification> {
+        use agent_client_protocol::v1::schema::{
             ContentChunk, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
         };
         use agentscope_core::message::{ContentBlock as CoreBlock, MsgRole};
@@ -1648,7 +1694,7 @@ impl AcpAgentSession {
     /// back to the client. Returns the `StopReason` for the turn.
     pub async fn run_prompt<F>(&mut self, content: Vec<ContentBlock>, emit: F) -> StopReason
     where
-        F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
+        F: Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync,
     {
         let stop = self
             .run_prompt_inner(TurnInput::Prompt(content), emit, None)
@@ -1764,12 +1810,12 @@ impl AcpAgentSession {
                         TextBlock::new(format!("[{}]({})", link.name, link.uri)),
                     ));
                 }
-                ContentBlock::Resource(resource) => match resource.resource {                    agent_client_protocol::schema::v1::EmbeddedResourceResource::TextResourceContents(text) => {
+                ContentBlock::Resource(resource) => match resource.resource {                    agent_client_protocol::v1::schema::EmbeddedResourceResource::TextResourceContents(text) => {
                         blocks.push(agentscope_core::message::ContentBlock::Text(
                             TextBlock::new(text.text),
                         ));
                     }
-                    agent_client_protocol::schema::v1::EmbeddedResourceResource::BlobResourceContents(blob) => {
+                    agent_client_protocol::v1::schema::EmbeddedResourceResource::BlobResourceContents(blob) => {
                         let mime = blob.mime_type.unwrap_or_default();
                         if mime.starts_with("image/") {
                             if !accepts_image {
@@ -1836,7 +1882,7 @@ impl AcpAgentSession {
         cancellation: Option<agent_client_protocol::RequestCancellation>,
     ) -> StopReason
     where
-        F: Fn(agent_client_protocol::schema::v1::SessionNotification) + Send + Sync,
+        F: Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync,
     {
         // The turn's own cancellation generation, captured *before* the admission wait.
         //
@@ -2589,7 +2635,7 @@ impl AcpAgentSession {
 
     /// Builds the ACP `Usage` for the running turn, or `None` when no model
     /// call contributed usage (so an empty turn does not report a bogus 0).
-    pub fn turn_usage_response(&self) -> Option<agent_client_protocol::schema::v1::Usage> {
+    pub fn turn_usage_response(&self) -> Option<agent_client_protocol::v1::schema::Usage> {
         turn_usage_to_response(&self.turn_usage)
     }
 
@@ -2599,8 +2645,8 @@ impl AcpAgentSession {
     pub(crate) fn usage_notification(
         &self,
         used: u64,
-    ) -> agent_client_protocol::schema::v1::SessionNotification {
-        use agent_client_protocol::schema::v1::{SessionNotification, SessionUpdate, UsageUpdate};
+    ) -> agent_client_protocol::v1::schema::SessionNotification {
+        use agent_client_protocol::v1::schema::{SessionNotification, SessionUpdate, UsageUpdate};
         let size = self
             .agent
             .agent()
