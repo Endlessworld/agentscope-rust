@@ -287,6 +287,39 @@ mod tests {
     }
 
     #[test]
+    fn powershell_select_string_output_is_compacted() {
+        // The obvious Windows search command produces a `> ` / `  ` gutter in front of
+        // every `path:line:text`; the path still repeats, so it must be hoisted.
+        let path = r"crates\agentscope-harness\src\tool\grep_options.rs";
+        let raw = [
+            format!("  {path}:108:"),
+            format!("> {path}:109:pub(crate) fn format_matches("),
+            format!("  {path}:110:    let text = match mode {{"),
+            format!("  {path}:111:        \"count\" => {{"),
+        ]
+        .join("\n");
+        let block = format_execute_output(0, &raw, false, &CompactConfig::default());
+        let text = block
+            .output
+            .iter()
+            .filter_map(|b| match b {
+                agentscope_core::message::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            text.starts_with(&format!(
+                "Exit code: 0\n\n[paths grouped; N:<text> = line N of the path above]\n{path}\n  108:\n> 109:pub(crate) fn format_matches("
+            )),
+            "{text}"
+        );
+        assert_eq!(
+            block.metadata.get("agentscope.output_compact.hoistedLines"),
+            Some(&serde_json::Value::from(4u64))
+        );
+    }
+
+    #[test]
     fn plain_command_output_is_untouched() {
         let block = format_execute_output(0, "hello\nworld", false, &CompactConfig::default());
         let text = block

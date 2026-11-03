@@ -18,6 +18,11 @@
 //! least two consecutive lines that name the same plausible path, never reorders
 //! lines, never rewrites the match text, and returns the input unchanged (byte for
 //! byte) whenever anything is uncertain or the rewrite would not shrink the output.
+//!
+//! A two-character line gutter is tolerated and kept verbatim: PowerShell's
+//! `Select-String -Context` (the obvious Windows spelling of `grep -C`) renders matches
+//! as `> path:line:text` and context lines as `  path:line:text`, so the path is not at
+//! column 0 and the match/context marker must survive the rewrite.
 
 use std::sync::OnceLock;
 
@@ -29,6 +34,10 @@ pub const OUTPUT_COMPACT_ENV: &str = "AGENTSCOPE_OUTPUT_COMPACT";
 
 /// Marker that opens a compacted result; also used for idempotency.
 const NOTE_PREFIX: &str = "[paths grouped";
+
+/// Longest line gutter accepted in front of the path (`> ` for a `Select-String` match
+/// line, `  ` for a context line). Capped so that indented code excerpts stay rejected.
+const MAX_GUTTER_CHARS: usize = 2;
 
 /// Extensionless names a search tool may legitimately report at the workspace root.
 const BARE_NAMES: &[&str] = &[
@@ -206,8 +215,10 @@ struct Body {
     lines: usize,
 }
 
-/// One parsed `path:line:<text>` line; `tail` is `"<line>:<text>"` verbatim.
+/// One parsed `path:line:<text>` line; `tail` is `"<line>:<text>"` verbatim and
+/// `gutter` is the leading `> ` / `  ` marker kept from the input line.
 struct MatchLine<'a> {
+    gutter: &'a str,
     path: &'a str,
     tail: &'a str,
 }
@@ -251,6 +262,7 @@ fn compact_body(source: &str, config: &CompactConfig) -> Option<Body> {
                 // Every slot in the run is `Some` by construction.
                 if let Some(m) = slot {
                     out.push('\n');
+                    out.push_str(m.gutter);
                     out.push_str(m.tail);
                 }
             }
@@ -291,24 +303,32 @@ fn append(out: &mut String, line: &str) {
 /// Only the path and the line number are interpreted: everything after the line
 /// number's colon is copied as-is, so a VIm-style `path:line:col:text` result is
 /// preserved without having to disambiguate a column from text that starts with one.
+///
+/// A [`split_gutter`] prefix is skipped before looking for the path, so
+/// `Select-String` results (`> path:1:text`, `  path:1:text`) parse like `rg` results.
 fn parse_match_line<'a>(line: &'a str, config: &CompactConfig) -> Option<MatchLine<'a>> {
     if line.len() > config.max_line_chars || line.starts_with('[') {
         return None;
     }
+    let (gutter, body) = split_gutter(line);
     let mut search_from = 0usize;
     let mut probes = 0usize;
-    while let Some(offset) = line[search_from..].find(':') {
+    while let Some(offset) = body[search_from..].find(':') {
         let colon = search_from + offset;
         probes += 1;
         if probes > 16 {
             return None;
         }
-        let path = &line[..colon];
+        let path = &body[..colon];
         if is_plausible_path(path, config.max_path_chars) {
-            let rest = &line[colon + 1..];
+            let rest = &body[colon + 1..];
             let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
             if digits > 0 && digits <= 9 && rest[digits..].starts_with(':') {
-                return Some(MatchLine { path, tail: rest });
+                return Some(MatchLine {
+                    gutter,
+                    path,
+                    tail: rest,
+                });
             }
             // The first plausible path is the only candidate worth trying.
             return None;
@@ -316,6 +336,19 @@ fn parse_match_line<'a>(line: &'a str, config: &CompactConfig) -> Option<MatchLi
         search_from = colon + 1;
     }
     None
+}
+
+/// Splits the `Select-String`-style line gutter (`> ` match, `  ` context) off a line.
+///
+/// Returns `("", line)` for every other producer, which keeps `rg` / `grep` parsing
+/// byte-identical to before.
+fn split_gutter(line: &str) -> (&str, &str) {
+    let gutter = line
+        .bytes()
+        .take(MAX_GUTTER_CHARS)
+        .take_while(|b| matches!(b, b' ' | b'>'))
+        .count();
+    line.split_at(gutter)
 }
 
 /// Whether `path` could be the file part of a search result.
@@ -519,6 +552,46 @@ crates/harness/src/agent/session/storage.rs:9:1:2 ratio";
         assert!(out.text.ends_with(
             "crates/harness/src/agent/session/storage.rs\n7:1:2 ratio\n8:1:2 ratio\n9:1:2 ratio"
         ));
+    }
+
+    #[test]
+    fn powershell_select_string_gutter_is_hoisted() {
+        // `Select-String -Context` (the Windows `grep -C`) prints matches as
+        // `> path:line:text` in reverse video and context lines as `  path:line:text`.
+        let path = r"crates\agentscope-extensions-a2a-client\src\model.rs";
+        let input = [
+            format!("\u{1b}[7m\u{1b}[0m  {path}:253:"),
+            format!("  {path}:254:/// A2A message."),
+            format!("> {path}:256:\u{1b}[7mpub struct Message\u{1b}[0m {{\u{1b}[0m"),
+            format!("\u{1b}[7m\u{1b}[0m  {path}:257:    #[serde(rename = \"messageId\")]\u{1b}[0m"),
+            format!("\u{1b}[7m\u{1b}[0m  {path}:258:    pub message_id: String,\u{1b}[0m"),
+        ]
+        .join("\n");
+        let out = compact_grep_like(&input, &cfg());
+        assert!(out.compacted, "{}", out.text);
+        assert_eq!(out.hoisted_files, 1);
+        assert_eq!(out.hoisted_lines, 5);
+        assert_eq!(
+            out.text,
+            [
+                "[paths grouped; N:<text> = line N of the path above]",
+                path,
+                "  253:",
+                "  254:/// A2A message.",
+                "> 256:pub struct Message {",
+                "  257:    #[serde(rename = \"messageId\")]",
+                "  258:    pub message_id: String,",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn quoted_prose_with_a_gutter_is_not_a_path() {
+        let input = "> note: run cargo test\n> todo: fix later";
+        let out = compact_grep_like(input, &cfg());
+        assert!(!out.compacted, "{}", out.text);
+        assert_eq!(out.text, input);
     }
 
     #[test]
