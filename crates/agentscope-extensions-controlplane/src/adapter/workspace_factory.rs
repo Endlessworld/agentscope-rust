@@ -553,7 +553,10 @@ mod tests {
         // Creating a symlink needs privilege on Windows; the check is verified only when the
         // platform allows it.
         let link = root.join("reference");
+        #[cfg(windows)]
         let created = std::os::windows::fs::symlink_dir(&outside, &link).is_ok();
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(&outside, &link).is_ok();
         if created {
             assert!(materialize(&root, &json!({"reference/secret": "overwrite"})).is_err());
             assert!(!outside.join("secret").exists());

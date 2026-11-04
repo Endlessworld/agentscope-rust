@@ -166,16 +166,22 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         command: &str,
         timeout_seconds: u32,
     ) -> Result<ExecuteResponse> {
-        let mut cmd = if cfg!(windows) {
-            let args = build_windows_command(command);
-            let mut c = tokio::process::Command::new(&args[0]);
-            c.args(&args[1..]);
-            c
-        } else {
-            let mut c = tokio::process::Command::new("/bin/sh");
-            c.arg("-c").arg(command);
-            c
-        };
+        // `build_windows_command` 只在 Windows 下存在，所以这里必须用 `#[cfg]` 分支，
+    // 不能用 `if cfg!(windows)`：后者两个分支都会被编译，Windows 专属函数在
+    // 非 Windows 目标上会直接 `cannot find function` 编译失败。
+    #[cfg(windows)]
+    let mut cmd = {
+        let args = build_windows_command(command);
+        let mut c = tokio::process::Command::new(&args[0]);
+        c.args(&args[1..]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("/bin/sh");
+        c.arg("-c").arg(command);
+        c
+    };
         cmd.current_dir(&self.cwd)
             // Never inherit the parent's stdin: when the agent runs over ACP
             // stdio, stdin is a pipe the client keeps open, and an inherited
