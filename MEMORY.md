@@ -770,3 +770,12 @@
 - 本机验证：`cargo +nightly build --locked --profile embedded --config .cargo/config.embedded.toml --target x86_64-pc-windows-msvc ...` 3m47s exit 0，产物 `acp_harness_agent.exe` 9,260,544 B / `acp_agent_cli.exe` 3,571,200 B，握手首行 JSON 且 `authMethods=[{type:terminal,id:setup,args:[--setup]}]`；不带 `--target` 的本机构建路径 2m41s exit 0。
 - 坑：`edit_file`/`write_file` 的参数里写 `${{ ... }}` 或形如 `{{SECRET_xxx}}` 的文本会被占位符机制改写（我把它写进 cache key 时被替换成占位符，正则批量替换还把 `matrix.target` 那行一起冲掉）→ 修改含 `${{ }}` 的 YAML 用 python 拼接（`chr(36)`），改完必须 grep 复核。
 - 待办：推送 `dev` → `gh workflow run release-acp.yml --ref dev`（workflow_dispatch，只上传 artifact 不建 release）验证矩阵 → 打 `v0.1.0` tag 出正式 release → 用 `SHA256SUMS.txt` 填 `.acp-registry/agentscope-rust/agent.json` 的 6 个 sha256 → fork `agentclientprotocol/registry` 提 PR。
+
+- 2026-11-04 多平台发布矩阵首次跑通（run 41842468582，`workflow_dispatch` on dev，全 6 job success，`publish release` 按预期 skipped）：windows-x86_64 / windows-aarch64 / linux-x86_64 / linux-aarch64 / darwin-x86_64 / darwin-aarch64 各产出 `agentscope-acp-<platform>.zip|tar.gz`，artifacts 5.64–6.76 MB。
+- `windows-11-arm` runner 可用（windows-aarch64 原生构建 + 冒烟测试通过），无需交叉。
+- 首次矩阵暴露的 3 个真问题（均已修）：
+  1. `agentscope-harness/src/filesystem/sandbox.rs`：`if cfg!(windows) { build_windows_command(..) }` 里调 `#[cfg(windows)]` 函数 → linux/macOS 全崩 `E0425: cannot find function build_windows_command`（`cfg!` 两个分支都编译）。改为两条 `#[cfg]` 语句。**教训：`cfg!` 只能用于两侧都存在的代码**。
+  2. `crates/agentscope-extensions-controlplane/.../workspace_factory.rs::rejects_symlink_destinations` 无条件用 `std::os::windows::fs::symlink_dir` → unix 上 `cargo test` 编译失败；按平台分别 `symlink_dir`/`symlink`。
+  3. `-Wl,--icf=all` 在 `aarch64-linux-gnu-ld.bfd` 上 `unrecognized option` → linux 两个 target 只保留 `-Wl,--gc-sections`（主机 bfd 较新支持 ICF，交叉 binutils 不支持）。
+- 反复迭代手法：本地 `cargo check`（Windows）→ push dev → REST API `POST /actions/workflows/release-acp.yml/dispatches {"ref":"dev"}`（**`gh` CLI 本机不在 PATH，改用 git credential fill 取 gho_ token + Invoke-RestMethod**；dispatch 偶发 SSL EOF，重试即可）→ 拉 `actions/runs/<id>/jobs` 与 `actions/jobs/<id>/logs` 看失败步骤。
+- 注意：本机构建在 `--target` 与不带 `--target` 两条路径都要验；本机 `rustup target add x86_64-unknown-linux-gnu` 下载极慢（>10 分钟未完成），Linux 侧编译验证实际靠 CI。
