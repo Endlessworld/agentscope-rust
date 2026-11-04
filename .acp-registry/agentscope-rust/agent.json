@@ -12,6 +12,26 @@
   "license_url": "https://github.com/Endlessworld/agentscope-rust/blob/main/LICENSE",
   "distribution": {
     "binary": {
+      "darwin-aarch64": {
+        "archive": "https://github.com/Endlessworld/agentscope-rust/releases/download/v0.1.0/agentscope-acp-darwin-aarch64.tar.gz",
+        "cmd": "./acp_harness_agent"
+      },
+      "darwin-x86_64": {
+        "archive": "https://github.com/Endlessworld/agentscope-rust/releases/download/v0.1.0/agentscope-acp-darwin-x86_64.tar.gz",
+        "cmd": "./acp_harness_agent"
+      },
+      "linux-aarch64": {
+        "archive": "https://github.com/Endlessworld/agentscope-rust/releases/download/v0.1.0/agentscope-acp-linux-aarch64.tar.gz",
+        "cmd": "./acp_harness_agent"
+      },
+      "linux-x86_64": {
+        "archive": "https://github.com/Endlessworld/agentscope-rust/releases/download/v0.1.0/agentscope-acp-linux-x86_64.tar.gz",
+        "cmd": "./acp_harness_agent"
+      },
+      "windows-aarch64": {
+        "archive": "https://github.com/Endlessworld/agentscope-rust/releases/download/v0.1.0/agentscope-acp-windows-aarch64.zip",
+        "cmd": "./acp_harness_agent.exe"
+      },
       "windows-x86_64": {
         "archive": "https://github.com/Endlessworld/agentscope-rust/releases/download/v0.1.0/agentscope-acp-windows-x86_64.zip",
         "cmd": "./acp_harness_agent.exe"

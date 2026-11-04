@@ -1,6 +1,7 @@
 # 极限嵌入构建专用配置。此文件不会被 cargo 自动加载，必须显式指定：
 #
 #   cargo +nightly build --profile embedded --config .cargo/config.embedded.toml
+#   cargo +nightly build --profile embedded --config .cargo/config.embedded.toml --target <triple>
 #
 # 之所以单独成文件：内容含 nightly-only 选项（cargo 的 `-Z` 与 rustc 的 `-Z`），
 # 而 cargo 无法按 profile / toolchain 区分这些设置。若写进 .cargo/config.toml，
@@ -14,15 +15,38 @@ build-std = ["std", "panic_abort"]
 # 注意：不要再写 build-std-features = ["panic_immediate_abort"]。
 # 新版 nightly 已将其废弃，std 里的该 feature 会直接 compile_error。
 
+# 本机构建（不带 `--target`）时用这一组。链接期死代码消除依赖具体链接器，
+# 只能写在各平台自己的 [target.<triple>] 里，所以这里不放。
 [build]
 rustflags = [
     # panic 消息不再携带文件/行号（实测 -260 KB）。
     "-Z", "location-detail=none",
-
-    # 链接期死代码消除（Windows MSVC）；Linux 改用 -Wl,--gc-sections,--icf=all
-    "-C", "link-arg=/OPT:REF",
-    "-C", "link-arg=/OPT:ICF",
-    "-C", "link-arg=/DEBUG:NONE",
     # 可选：本机指令集（不可移植，实测后再开）
     # "-C", "target-cpu=native",
 ]
+
+# 交叉编译 / 显式指定 target 时，cargo 只用 [target.<triple>] 的 rustflags
+# （不与 [build] 合并），因此每个平台都把 `-Z location-detail=none` 重写一遍。
+# 发布矩阵（.github/workflows/release-acp.yml）用的就是下面这 6 个 triple。
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Z", "location-detail=none", "-C", "link-arg=/OPT:REF", "-C", "link-arg=/OPT:ICF", "-C", "link-arg=/DEBUG:NONE"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-Z", "location-detail=none", "-C", "link-arg=/OPT:REF", "-C", "link-arg=/OPT:ICF", "-C", "link-arg=/DEBUG:NONE"]
+
+# GNU ld：`--gc-sections` + 相同内容折叠。交叉到 aarch64 时 runner 需装
+# `gcc-aarch64-linux-gnu`（cc crate 会自动找 `aarch64-linux-gnu-gcc`）。
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Z", "location-detail=none", "-C", "link-arg=-Wl,--gc-sections", "-C", "link-arg=-Wl,--icf=all"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-Z", "location-detail=none", "-C", "link-arg=-Wl,--gc-sections", "-C", "link-arg=-Wl,--icf=all"]
+
+# ld64：`-dead_strip` 是 mach-o 侧的死代码消除。两个架构都在 arm64 runner 上
+# 构建（Apple clang 两个架构共用同一份 SDK），Intel 产物属交叉编译。
+[target.x86_64-apple-darwin]
+rustflags = ["-Z", "location-detail=none", "-C", "link-arg=-Wl,-dead_strip"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-Z", "location-detail=none", "-C", "link-arg=-Wl,-dead_strip"]

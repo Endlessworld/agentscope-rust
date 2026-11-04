@@ -215,9 +215,20 @@ cargo run -p agentscope-extensions-acp --bin acp_agent_cli
 ```
 
 不想自己编译的话，[Releases](https://github.com/Endlessworld/agentscope-rust/releases) 提供
-Windows x64 预编译包（embedded profile + `lite` features，压缩包约 6 MB、解压后约 12 MB）：
-`acp_harness_agent.exe`（agent）与 `acp_agent_cli.exe`（REPL）。产物由
-`.github/workflows/release-acp.yml` 在打 tag 时构建，发布前会跑一次 ACP 握手冒烟测试。
+多平台预编译包（embedded profile + `lite` features，单个压缩包约 4～6 MB、解压后约 12 MB）：
+
+| 平台 | 压缩包 | 二进制 |
+| --- | --- | --- |
+| Windows x64 | `agentscope-acp-windows-x86_64.zip` | `acp_harness_agent.exe` / `acp_agent_cli.exe` |
+| Windows ARM64 | `agentscope-acp-windows-aarch64.zip` | 同上 |
+| Linux x64 | `agentscope-acp-linux-x86_64.tar.gz` | `acp_harness_agent` / `acp_agent_cli` |
+| Linux ARM64 | `agentscope-acp-linux-aarch64.tar.gz` | 同上 |
+| macOS Intel | `agentscope-acp-darwin-x86_64.tar.gz` | 同上 |
+| macOS Apple Silicon | `agentscope-acp-darwin-aarch64.tar.gz` | 同上 |
+
+产物名固定不带版本号（ACP Registry 的自动更新只替换 URL 里的 `/vX.Y.Z/`）。产物由
+`.github/workflows/release-acp.yml` 在打 tag 时构建，发布前会跑一次 ACP 握手冒烟测试，
+并附 `SHA256SUMS.txt`。
 
 模型集中在 `~/.agentscope/models.json`（首次运行自动生成；宽松解析，允许 `//`、`/* */`
 注释与尾随逗号，已存在时不覆写）。最常用的覆盖变量：

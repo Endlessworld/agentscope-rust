@@ -1,16 +1,22 @@
 name: release-acp
 
-# 构建并发布 ACP 智能体的 Windows 可执行产物：
-#   acp_harness_agent.exe  —— ACP agent（stdio 服务端，给 IDE/CLI 客户端接入）
-#   acp_agent_cli.exe      —— 内置 REPL 客户端（会自动拉起上面的 agent）
+# 构建并发布 ACP 智能体的多平台可执行产物：
+#   acp_harness_agent —— ACP agent（stdio 服务端，给 IDE/CLI 客户端接入）
+#   acp_agent_cli     —— 内置 REPL 客户端（会自动拉起上面的 agent）
 #
 # 触发：
-#   - push tag（v*）：构建后创建 GitHub Release，附 zip 下载
+#   - push tag（v*）：构建后创建 GitHub Release，附各平台压缩包 + SHA256SUMS.txt
 #   - workflow_dispatch：只构建并上传 artifact，不动 Release
 #
-# 为什么只出 Windows x64：embedded profile 的 rustflags 用的是 MSVC 链接器参数
-# （/OPT:REF、/OPT:ICF、/DEBUG:NONE，见 .cargo/config.embedded.toml），
-# Linux/macOS 需要另一份 -Wl,--gc-sections,--icf=all 的配置，暂未纳入。
+# 产物名不带版本号（`agentscope-acp-<platform>.zip|tar.gz`）：ACP Registry 的自动更新
+# 只替换 archive URL 里的 `/vX.Y.Z/`，资产名含版本的话下次发版就 404。
+#
+# 平台键与 ACP Registry 的 `distribution.binary` 键一一对应：
+#   windows-x86_64 · windows-aarch64 · linux-x86_64 · linux-aarch64 · darwin-x86_64 · darwin-aarch64
+#
+# 目标 triple 的 rustflags（`-Z location-detail=none` + 各平台链接器死代码消除）在
+# .cargo/config.embedded.toml 里按 [target.<triple>] 分开写；显式带 `--target` 时
+# cargo 只看那一组，不与 [build] 合并。
 
 on:
   push:
@@ -22,14 +28,39 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BIN_AGENT: acp_harness_agent.exe
-  BIN_CLI: acp_agent_cli.exe
+  PROFILE_DIR: embedded
 
 jobs:
   build:
-    name: build embedded binaries (windows x64)
-    runs-on: windows-latest
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            smoke: true
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            smoke: true
+          - platform: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            # 交叉编译：cc crate 自动找 aarch64-linux-gnu-gcc，rustc 链接器靠下面的 env
+            smoke: false
+          - platform: darwin-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            smoke: true
+          - platform: darwin-x86_64
+            # arm64 runner + `--target x86_64-apple-darwin`：Apple clang 两个架构共用同一份 SDK
+            os: macos-latest
+            target: x86_64-apple-darwin
+            smoke: false
     steps:
       - uses: actions/checkout@v4
 
@@ -39,86 +70,213 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: embedded
-          # build-std 的 std 产物在 target/<triple>/<profile> 下，一起缓存
+          key: embedded-${{ matrix.target }}
           workspaces: '. -> target'
 
-      - name: cargo build (embedded profile, lite features)
+      - name: cross linker (linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          cargo +nightly build --locked `
-            --profile embedded `
-            --config .cargo/config.embedded.toml `
-            -p agentscope-extensions-acp `
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+
+      - name: cargo build (embedded profile, lite features)
+        shell: bash
+        run: |
+          cargo +nightly build --locked \
+            --profile $PROFILE_DIR \
+            --config .cargo/config.embedded.toml \
+            --target ${{ matrix.target }} \
+            -p agentscope-extensions-acp \
             --no-default-features --features lite --bins
 
-      - name: smoke test (ACP handshake)
-        shell: pwsh
-        timeout-minutes: 5
+      - name: smoke test (ACP handshake + auth methods)
+        if: matrix.smoke
+        shell: bash
         run: |
-          $req = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}'
-          $out = $req | & "./target/embedded/$env:BIN_AGENT" 2>$null | Out-String
-          Write-Host $out
-          if ($out -notmatch '"protocolVersion"') {
-            throw 'agent did not answer initialize; embedded build is not usable'
-          }
+          exe=acp_harness_agent
+          case '${{ matrix.platform }}' in windows-*) exe=acp_harness_agent.exe ;; esac
+          bin="target/${{ matrix.target }}/$PROFILE_DIR/$exe"
+          req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"terminal":true}}}'
+          out=$(printf '%s\n' "$req" | "$bin" 2>/dev/null)
+          first=$(printf '%s\n' "$out" | head -1)
+          echo "$first"
+          case "$first" in
+            *protocolVersion*) ;;
+            *) echo 'agent did not answer initialize; embedded build is not usable'; exit 1 ;;
+          esac
+          # ACP Registry 的 auth check 要求非空的 authMethods，且至少一条 terminal/agent
+          case "$first" in
+            *authMethods*terminal*) ;;
+            *) echo 'initialize advertises no terminal auth method (registry auth check would fail)'; exit 1 ;;
+          esac
 
-      - name: stage dist
+      - name: check artifact architecture
+        if: ${{ !matrix.smoke }}
+        shell: bash
+        run: |
+          exe=acp_harness_agent
+          case '${{ matrix.platform }}' in windows-*) exe=acp_harness_agent.exe ;; esac
+          file="target/${{ matrix.target }}/$PROFILE_DIR/$exe"
+          ls -l "$file"
+          if command -v file >/dev/null 2>&1; then file "$file"; fi
+
+      - name: stage + zip
+        if: startsWith(matrix.platform, 'windows')
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/embedded/$env:BIN_AGENT" dist/
-          Copy-Item "target/embedded/$env:BIN_CLI" dist/
+          Copy-Item "target/${{ matrix.target }}/$env:PROFILE_DIR/acp_harness_agent.exe" dist/
+          Copy-Item "target/${{ matrix.target }}/$env:PROFILE_DIR/acp_agent_cli.exe" dist/
           Copy-Item crates/agentscope-extensions-acp/README.md dist/README.md
           Copy-Item LICENSE dist/LICENSE
           Get-ChildItem dist | Format-Table Name, Length
+          Compress-Archive -Path dist/* -DestinationPath "agentscope-acp-${{ matrix.platform }}.zip"
+          Get-Item "agentscope-acp-${{ matrix.platform }}.zip" | Format-Table Name, Length
 
-      - name: zip
-        shell: pwsh
+      - name: stage + tar.gz
+        if: ${{ !startsWith(matrix.platform, 'windows') }}
+        shell: bash
         run: |
-          # 文件名不带版本号：ACP Registry 的自动更新只替换 URL 里的 `/vX.Y.Z/`，
-          # 资产名一旦含版本，下次发版后旧链接就会 404。
-          Compress-Archive -Path dist/* -DestinationPath "agentscope-acp-windows-x86_64.zip"
-          Get-Item "agentscope-acp-windows-x86_64.zip" | Format-Table Name, Length
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/$PROFILE_DIR/acp_harness_agent" dist/
+          cp "target/${{ matrix.target }}/$PROFILE_DIR/acp_agent_cli" dist/
+          cp crates/agentscope-extensions-acp/README.md dist/README.md
+          cp LICENSE dist/LICENSE
+          chmod +x dist/acp_harness_agent dist/acp_agent_cli
+          ls -l dist
+          tar -czf "agentscope-acp-${{ matrix.platform }}.tar.gz" -C dist .
+          ls -l "agentscope-acp-${{ matrix.platform }}.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: agentscope-acp-windows-x86_64
-          path: agentscope-acp-windows-x86_64.zip
+          name: agentscope-acp-${{ matrix.platform }}
+          path: agentscope-acp-${{ matrix.platform }}.*
           if-no-files-found: error
 
+  # Windows ARM64 单独成 job：托管 runner 是否带 ARM64 链接器随镜像而变，
+  # 失败时不阻塞其它平台发版（产物缺失即可，Registry 允许平台子集）。
+  build-windows-arm64:
+    name: build (windows-aarch64)
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: aarch64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: embedded-arm64
+          workspaces: '. -> target'
+
+      - name: cargo build (embedded profile, lite features)
+        shell: bash
+        run: |
+          cargo +nightly build --locked \
+            --profile $PROFILE_DIR \
+            --config .cargo/config.embedded.toml \
+            --target aarch64-pc-windows-msvc \
+            -p agentscope-extensions-acp \
+            --no-default-features --features lite --bins
+
+      - name: smoke test (ACP handshake + auth methods)
+        shell: bash
+        run: |
+          bin="target/aarch64-pc-windows-msvc/$PROFILE_DIR/acp_harness_agent.exe"
+          req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"terminal":true}}}'
+          first=$(printf '%s\n' "$req" | "$bin" 2>/dev/null | head -1)
+          echo "$first"
+          case "$first" in
+            *authMethods*terminal*) ;;
+            *) echo 'initialize advertises no terminal auth method'; exit 1 ;;
+          esac
+
+      - name: stage + zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/aarch64-pc-windows-msvc/$env:PROFILE_DIR/acp_harness_agent.exe" dist/
+          Copy-Item "target/aarch64-pc-windows-msvc/$env:PROFILE_DIR/acp_agent_cli.exe" dist/
+          Copy-Item crates/agentscope-extensions-acp/README.md dist/README.md
+          Copy-Item LICENSE dist/LICENSE
+          Compress-Archive -Path dist/* -DestinationPath 'agentscope-acp-windows-aarch64.zip'
+          Get-Item 'agentscope-acp-windows-aarch64.zip' | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentscope-acp-windows-aarch64
+          path: agentscope-acp-windows-aarch64.zip
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [build, build-windows-arm64]
+    # arm64 那条允许失败，所以只要主矩阵成功就发版
+    if: always() && startsWith(github.ref, 'refs/tags/') && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: agentscope-acp-*
+          merge-multiple: true
+
+      - name: checksums
+        run: |
+          cd artifacts
+          ls -l
+          sha256sum *.zip *.tar.gz > /tmp/SHA256SUMS.txt
+          mv /tmp/SHA256SUMS.txt SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          {
+            echo '### ACP 产物校验和'
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+            echo ''
+            echo '填 ACP Registry 的 `agent.json` 时直接用上面的值。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: publish release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: agentscope-acp-windows-x86_64.zip
+          files: artifacts/*
           generate_release_notes: true
           body: |
-            Prebuilt ACP binaries for Windows x64 (embedded profile, `lite` features).
+            ACP binaries built with the `embedded` profile + `lite` features.
 
             下载后解压，包含：
 
             | 文件 | 说明 |
             | --- | --- |
-            | `acp_harness_agent.exe` | ACP agent（stdio 服务端）。在 ACP 客户端里把命令指向它即可 |
-            | `acp_agent_cli.exe` | 内置 REPL 客户端，在当前目录拉起 agent 并开始对话 |
+            | `acp_harness_agent`（Windows 为 `.exe`） | ACP agent（stdio 服务端）。在 ACP 客户端里把命令指向它即可 |
+            | `acp_agent_cli`（Windows 为 `.exe`） | 内置 REPL 客户端，在当前目录拉起 agent 并开始对话 |
             | `README.md` | 安装、会话模式、权限、排障、各语言 SDK 接入 |
+            | `SHA256SUMS.txt`（仅 Release 顶层） | 各平台压缩包的 sha256 |
 
             首次运行会尝试用环境变量里的 provider 密钥（如 `DEEPSEEK_API_KEY`）直接开工；
             什么都没配也能跑，但要先过一遍向导：
 
-            ```powershell
-            .\acp_harness_agent.exe --setup
+            ```bash
+            ./acp_harness_agent --setup
             ```
 
             向导从 models.dev 的模型目录里列出 provider，只要选一个 provider、填一个 API key，
-            不问模型名也不问 base_url。内置 REPL 还需把 `acp_harness_agent.exe`
-            放在 `acp_agent_cli.exe` 同目录（非 Windows 或不同目录时用 `ACP_AGENT_EXE` 指定）。
+            不问模型名也不问 base_url。内置 REPL 还需把 `acp_harness_agent` 放在
+            `acp_agent_cli` 同目录（不同目录时用 `ACP_AGENT_EXE` 指定）。
 
             校验连通性：
 
-            ```powershell
-            echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}' | .\acp_harness_agent.exe
+            ```bash
+            echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}' | ./acp_harness_agent
             ```

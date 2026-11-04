@@ -14,6 +14,19 @@ cargo +nightly build --profile embedded --config .cargo/config.embedded.toml ^
 
 需要 nightly（`build-std`）且已装 `rust-src`；产物在 `target/embedded/`（`.pdb` 不要打包）。
 
+交叉 / 指定平台（发布矩阵走的就是这条，产物在 `target/<triple>/embedded/`）：
+
+```bash
+cargo +nightly build --profile embedded --config .cargo/config.embedded.toml \
+  --target x86_64-unknown-linux-gnu \
+  -p agentscope-extensions-acp --no-default-features --features lite --bins
+```
+
+支持 6 个 triple：`x86_64|aarch64-pc-windows-msvc`、`x86_64|aarch64-unknown-linux-gnu`、
+`x86_64|aarch64-apple-darwin`。交叉到 `aarch64-unknown-linux-gnu` 时还需
+`gcc-aarch64-linux-gnu` 并把 `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc`
+设上（`cc` crate 会自动找同名交叉 gcc 编 C 依赖，如 mimalloc）。
+
 ## 已生效的开关与实测收益
 
 Windows MSVC / nightly，`acp_harness_agent.exe` 实测（同一台机器）：
@@ -38,8 +51,11 @@ Windows MSVC / nightly，`acp_harness_agent.exe` 实测（同一台机器）：
 - `Cargo.toml` `[profile.embedded]`：`opt-level="z"`、`lto=fat`、`codegen-units=1`、
   `panic="abort"`、`strip="symbols"`、`debug=false`，依赖同样 `opt-level="z"`
   （`[profile.embedded.package."*"]`）。
-- `.cargo/config.embedded.toml`：`build-std`（std + panic_abort）、`-Zlocation-detail=none`、
-  MSVC 链接参数 `/OPT:REF`、`/OPT:ICF`、`/DEBUG:NONE`。
+- `.cargo/config.embedded.toml`：`build-std`（std + panic_abort）、`-Zlocation-detail=none`；
+  链接期死代码消除按平台写在各自的 `[target.<triple>]` 里 —— MSVC 用
+  `/OPT:REF`、`/OPT:ICF`、`/DEBUG:NONE`，GNU ld 用 `-Wl,--gc-sections,--icf=all`，
+  ld64（macOS）用 `-Wl,-dead_strip`。`[build]` 只放与链接器无关的
+  `-Zlocation-detail=none`，供不带 `--target` 的本机构建使用。
 - `crates/agentscope-extensions-acp`：`--features lite` 去掉 bundled SQLite。
 
 ## rustls 只保留一个加密后端
