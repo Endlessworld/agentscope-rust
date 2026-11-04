@@ -181,6 +181,7 @@ impl ModelCatalog {
             by_provider: HashMap::new(),
             by_canonical: HashMap::new(),
             provider_api: current.provider_api.clone(),
+            provider_env: current.provider_env.clone(),
             fetched_at: current.fetched_at,
         };
         *self.inner.snapshot.write().unwrap() = Arc::new(released);

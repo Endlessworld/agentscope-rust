@@ -12,16 +12,16 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::v1::schema::{
     AgentAuthCapabilities, AgentCapabilities, ArchiveSessionRequest, ArchiveSessionResponse,
-    AuthState, AuthStatusCapabilities, AuthStatusRequest, AuthStatusResponse, CancelNotification,
-    CloseSessionRequest, CloseSessionResponse, ContentBlock, DeleteSessionRequest,
-    DeleteSessionResponse, DisableProviderRequest, DisableProviderResponse, Implementation,
-    InitializeRequest, InitializeResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
-    SessionAdditionalDirectoriesCapabilities, SessionArchiveCapabilities, SessionArchiveFilter,
-    SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SessionResumeCapabilities, SessionStatus,
+    AuthMethod, AuthMethodTerminal, AuthState, AuthStatusCapabilities, AuthStatusRequest,
+    AuthStatusResponse, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    ContentBlock, DeleteSessionRequest, DeleteSessionResponse, DisableProviderRequest,
+    DisableProviderResponse, Implementation, InitializeRequest, InitializeResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionArchiveCapabilities,
+    SessionArchiveFilter, SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SessionResumeCapabilities, SessionStatus,
     SessionStatusCapabilities, SessionStatusRequest, SessionStatusResponse,
     SessionSystemPromptCapabilities, SessionTitleCapabilities, SetProviderRequest,
     SetProviderResponse, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
@@ -185,6 +185,12 @@ pub struct AcpCodingAgent {
     catalog_agents: Mutex<HashMap<PathBuf, Arc<HarnessAgent>>>,
     /// Advertised `prompt.image` support. See [`ImageSupport`].
     image_support: ImageSupport,
+    /// Answers `auth/status` for the connected client.
+    ///
+    /// The protocol forbids using `auth/status` to *demand* authentication, so the
+    /// default answer is `not_required`; a host that owns the credentials (the ACP
+    /// binary reads `~/.agentscope/models.json`) supplies the honest state.
+    auth_probe: Arc<dyn Fn() -> AuthState + Send + Sync>,
 }
 
 const IMAGE_SUPPORT_NO: u8 = 1;
@@ -283,7 +289,22 @@ impl AcpCodingAgent {
             providers: ProviderRegistry::default(),
             catalog_agents: Mutex::new(HashMap::new()),
             image_support: ImageSupport::default(),
+            auth_probe: Arc::new(|| AuthState::NotRequired),
         }
+    }
+
+    /// Overrides how `auth/status` answers.
+    pub fn with_auth_probe(
+        mut self,
+        probe: impl Fn() -> AuthState + Send + Sync + 'static,
+    ) -> Self {
+        self.auth_probe = Arc::new(probe);
+        self
+    }
+
+    /// The current authentication state reported by `auth/status`.
+    pub fn auth_state(&self) -> AuthState {
+        (self.auth_probe)()
     }
 
     /// Overrides the agent display name.
@@ -819,6 +840,7 @@ impl AcpCodingAgent {
         let a_delete = agent.clone();
         let a_title = agent.clone();
         let a_status = agent.clone();
+        let a_auth = agent.clone();
         let a_archive = agent.clone();
         let a_unarchive = agent.clone();
         let a_respond = agent.clone();
@@ -846,9 +868,23 @@ impl AcpCodingAgent {
                             agent_client_protocol::v1::schema::ProvidersCapabilities::new(),
                         );
                     }
+                    // Always advertised, not gated on `clientCapabilities.auth.terminal`:
+                    // the registry auth check sends `initialize` with empty capabilities and
+                    // requires a non-empty list, and a client that cannot open a terminal
+                    // simply does not offer the method to the user.
+                    let auth_methods = vec![AuthMethod::Terminal(
+                        AuthMethodTerminal::new("setup", "Configure a model provider")
+                            .description(
+                                "Runs `acp_harness_agent --setup` in a terminal: pick a model \
+                                 provider and paste its API key. Providers whose key is already \
+                                 exported need no answers at all.",
+                            )
+                            .args(vec!["--setup".to_string()]),
+                    )];
                     let response = InitializeResponse::new(initialize.protocol_version)
                         .agent_capabilities(caps)
-                        .agent_info(Implementation::new(AGENT_NAME, AGENT_VERSION));
+                        .agent_info(Implementation::new(AGENT_NAME, AGENT_VERSION))
+                        .auth_methods(auth_methods);
                     responder.respond(response)
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -1292,10 +1328,10 @@ impl AcpCodingAgent {
             )
             .on_receive_request(
                 async move |_req: AuthStatusRequest, responder, _cx| {
-                    // Credentials come from the environment and sessions start without a
-                    // sign-in, so the honest answer is `not_required` — the spec explicitly
-                    // forbids using `auth/status` to demand authentication.
-                    responder.respond(AuthStatusResponse::new(AuthState::NotRequired))
+                    // The protocol forbids using `auth/status` to *demand* authentication, so
+                    // this only reports what the host says: credentials present -> `authenticated`,
+                    // none at all -> `unauthenticated` (the client may then offer `--setup`).
+                    responder.respond(AuthStatusResponse::new(a_auth.auth_state()))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -1534,6 +1570,7 @@ pub struct AcpCodingAgentBuilder {
     modes: Vec<ModeChoice>,
     max_sessions: Option<usize>,
     model_builder: Option<Arc<dyn Fn(&str, &str) -> Result<Arc<dyn Model>, String> + Send + Sync>>,
+    auth_probe: Option<Arc<dyn Fn() -> AuthState + Send + Sync>>,
 }
 
 impl AcpCodingAgentBuilder {
@@ -1602,6 +1639,12 @@ impl AcpCodingAgentBuilder {
         self
     }
 
+    /// Installs the answer `auth/status` reports (`not_required` by default).
+    pub fn auth_probe(mut self, probe: impl Fn() -> AuthState + Send + Sync + 'static) -> Self {
+        self.auth_probe = Some(Arc::new(probe));
+        self
+    }
+
     /// Builds the [`AcpCodingAgent`].
     pub fn build(self) -> Result<AcpCodingAgent, Box<dyn std::error::Error>> {
         let factory = self
@@ -1617,6 +1660,9 @@ impl AcpCodingAgentBuilder {
         }
         if let Some(max) = self.max_sessions {
             agent = agent.with_max_sessions(max);
+        }
+        if let Some(probe) = self.auth_probe {
+            agent = agent.with_auth_probe(move || probe());
         }
         Ok(agent)
     }

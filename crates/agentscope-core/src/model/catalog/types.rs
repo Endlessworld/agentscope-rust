@@ -259,6 +259,11 @@ pub struct CatalogSnapshot {
     pub by_canonical: HashMap<String, Vec<Arc<ModelDescriptor>>>,
     #[serde(default)]
     pub provider_api: HashMap<String, String>,
+    /// Environment variables that carry a provider's credentials, from models.dev
+    /// (`providers.<id>.env`). Used to discover already-configured providers at
+    /// startup and to name the variable a `--setup` wizard can fall back to.
+    #[serde(default)]
+    pub provider_env: HashMap<String, Vec<String>>,
     pub fetched_at: DateTime<Utc>,
 }
 
@@ -274,6 +279,7 @@ impl CatalogSnapshot {
             by_provider: HashMap::new(),
             by_canonical: HashMap::new(),
             provider_api: HashMap::new(),
+            provider_env: HashMap::new(),
             fetched_at: Utc::now(),
         }
     }

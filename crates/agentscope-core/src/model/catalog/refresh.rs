@@ -202,6 +202,10 @@ pub(crate) async fn refresh(
         .as_ref()
         .map(|parsed| parsed.provider_api.clone())
         .unwrap_or_default();
+    let provider_env = detailed
+        .as_ref()
+        .map(|parsed| parsed.provider_env.clone())
+        .unwrap_or_default();
     let entries = merge_sources(flat, detailed);
 
     let not_modified = models.not_modified
@@ -216,6 +220,7 @@ pub(crate) async fn refresh(
     let mut snapshot = CatalogSnapshot::empty();
     snapshot.entries = entries;
     snapshot.provider_api = provider_api;
+    snapshot.provider_env = provider_env;
     snapshot.sources = sources;
     snapshot.rebuild_indices();
 
@@ -226,6 +231,13 @@ pub(crate) async fn refresh(
         previous.generation
     };
     if !not_modified {
+        storage.write_snapshot(&snapshot)?;
+    } else if snapshot.provider_env != previous.provider_env
+        || snapshot.provider_api != previous.provider_api
+    {
+        // A `304` normally skips the write, but the derived tables can still gain data
+        // from the raw sources (a new field, e.g. `provider_env`): write then, otherwise
+        // the next process keeps reading a cache that lacks them forever.
         storage.write_snapshot(&snapshot)?;
     }
     Ok(RefreshResult {
@@ -376,6 +388,7 @@ mod tests {
 
     struct MemoryFetcher {
         responses: Mutex<HashMap<String, std::result::Result<(Vec<u8>, Option<String>), String>>>,
+        not_modified: Mutex<std::collections::HashSet<String>>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -383,6 +396,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 responses: Mutex::new(HashMap::new()),
+                not_modified: Mutex::new(std::collections::HashSet::new()),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -400,6 +414,11 @@ mod tests {
                 .unwrap()
                 .insert(url.to_string(), Err("offline".to_string()));
         }
+
+        /// Answers every request for `url` with `304 Not Modified`.
+        fn not_modified(&self, url: &str) {
+            self.not_modified.lock().unwrap().insert(url.to_string());
+        }
     }
 
     #[async_trait]
@@ -411,6 +430,14 @@ mod tests {
             _max_bytes: usize,
         ) -> Result<FetchResponse> {
             self.calls.lock().unwrap().push(url.to_string());
+            if self.not_modified.lock().unwrap().contains(url) {
+                return Ok(FetchResponse {
+                    status: FetchStatus::NotModified,
+                    body: Vec::new(),
+                    etag: None,
+                    last_modified: None,
+                });
+            }
             match self.responses.lock().unwrap().get(url).cloned() {
                 Some(Ok((body, etag))) => Ok(FetchResponse {
                     status: FetchStatus::Ok,
@@ -459,6 +486,50 @@ mod tests {
         assert_eq!(result.snapshot.entries.len(), 1);
         let loaded = storage.read_snapshot().unwrap();
         assert_eq!(loaded.generation, 1);
+        let _ = std::fs::remove_dir_all(storage.root());
+    }
+
+    /// A `304` still re-parses the raw sources, so the derived tables can grow (a new
+    /// normalised field). That growth has to reach the cache, or every later process keeps
+    /// reading a snapshot that lacks it.
+    #[tokio::test]
+    async fn a_not_modified_refresh_persists_newly_derived_tables() {
+        let storage = CatalogStorage::new(
+            std::env::temp_dir().join(format!("agentscope-refresh-test-{}", uuid::Uuid::new_v4())),
+        );
+        let fetcher = MemoryFetcher::new();
+        fetcher.insert(
+            "mem://models",
+            br#"{"p/m": {"limit": {"context": 100000}}}"#.to_vec(),
+            Some("v1"),
+        );
+        fetcher.insert(
+            "mem://api",
+            br#"{"p": {"api": "https://example.test/v1", "env": ["P_API_KEY"], "models": {}}}"#
+                .to_vec(),
+            Some("v1"),
+        );
+        refresh(&config(), &storage, &fetcher, &CatalogSnapshot::empty())
+            .await
+            .unwrap();
+
+        // Simulate a cache written before `provider_env` existed.
+        let mut stale = storage.read_snapshot().unwrap();
+        stale.provider_env.clear();
+        storage.write_snapshot(&stale).unwrap();
+
+        fetcher.not_modified("mem://models");
+        fetcher.not_modified("mem://api");
+        let result = refresh(&config(), &storage, &fetcher, &stale)
+            .await
+            .unwrap();
+        assert_eq!(result.snapshot.provider_env["p"], ["P_API_KEY"]);
+        let persisted = storage.read_snapshot().unwrap();
+        assert_eq!(
+            persisted.provider_env["p"],
+            ["P_API_KEY"],
+            "a 304 must not strand the newly derived table on this process only"
+        );
         let _ = std::fs::remove_dir_all(storage.root());
     }
 

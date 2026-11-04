@@ -44,7 +44,27 @@ cargo install --path crates/agentscope-extensions-acp
 
 ### 1. 配置模型
 
-首次运行会自动生成 `~/.agentscope/models.json`（Windows：`%USERPROFILE%\.agentscope\models.json`），
+**最快的方式**（推荐）：用环境变量，或者跑一次向导 —— 两者都只需要一个 API key。
+
+```bash
+export DEEPSEEK_API_KEY=sk-...            # PowerShell: $env:DEEPSEEK_API_KEY='sk-...'
+acp_harness_agent                         # 直接就能用，无需任何文件配置
+```
+
+或者让向导来问（客户端里有 `--setup` 认证入口时会直接调这个）：
+
+```bash
+acp_harness_agent --setup
+```
+
+向导从 [models.dev](https://models.dev) 的模型目录里列出 200+ 个 provider，**不问你模型名、不问你
+base_url**：选中一个 provider、填一个 API key 即可，写回 `~/.agentscope/models.json`（已存在的其它
+provider 原样保留）。已导出的 provider 密钥会被自动识别，那时一个问题都不用回答。
+
+> 目录表（含每个 provider 的网关地址与环境变量名）随 agent 自动下载；全新安装后第一次
+> 启动只负责下载，密钥探测从下一次启动起生效。
+
+也可以手写配置。首次运行会自动生成 `~/.agentscope/models.json`（Windows：`%USERPROFILE%\.agentscope\models.json`），
 指向一个公开的免费端点。**实际使用建议改成你自己的 provider**：
 
 ```json
@@ -134,7 +154,7 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 | `session/set_title` | 客户端改会话标题（空白标题回 `-32602`） |
 | `session/status` | 会话存活探测：`open`（本进程持有）/ `saved`（仅磁盘有）/ `-32002` |
 | `session/archive` · `session/unarchive` | 归档（默认从 `session/list` 隐藏，`archived` 过滤可选 `only`/`include`） |
-| `auth/status` | 登录态探测，恒为 `not_required`（凭据来自环境变量） |
+| `auth/status` | 真实登录态：有真实凭据（含环境变量）为 `authenticated`，一处也没有为 `unauthenticated` |
 | `providers/list` · `providers/set` · `providers/disable` | 仅在配了多个 provider 时声明（ACP 不稳定特性） |
 | `_agentscope/session/respond` | 私有扩展：回答被挂起的结构化提问 |
 
@@ -142,6 +162,10 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 
 只有在客户端声明了相应能力时才会发送：`session/notice`（会话提示）、压缩进度、plan 操作通知、
 `end_turn` 的 token usage、MCP over ACP。没声明就不会收到，也不会报错。
+
+认证方法不门控：`initialize` 总是返回一条 terminal 类型的认证方法（id `setup`，`args: ["--setup"]`），
+客户端据此在自己的终端里拉起 `acp_harness_agent --setup`。注册表校验发的是空 `clientCapabilities`
+并要求 `authMethods` 非空，所以这里不能按 `auth.terminal` 门控；不支持终端启动的客户端只是不展示它。
 
 ### 客户端 `systemPrompt`（仅 append）
 

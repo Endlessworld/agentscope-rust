@@ -20,6 +20,7 @@ pub mod provider;
 pub mod recording;
 pub mod retention;
 pub mod session;
+pub mod setup;
 pub mod support;
 
 pub use coding_agent::{

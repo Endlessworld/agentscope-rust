@@ -17,6 +17,7 @@ use crate::Result;
 pub(crate) struct ParsedSource {
     pub entries: Vec<ModelDescriptor>,
     pub provider_api: HashMap<String, String>,
+    pub provider_env: HashMap<String, Vec<String>>,
 }
 
 /// Parses `https://models.dev/models.json?type=all`.
@@ -61,6 +62,9 @@ pub(crate) fn parse_api_json(bytes: &[u8]) -> Result<ParsedSource> {
                 .provider_api
                 .insert(provider.clone(), api.to_string());
         }
+        if let Some(env) = provider_value.get("env").and_then(env_names) {
+            parsed.provider_env.insert(provider.clone(), env);
+        }
         let Some(models) = provider_value.get("models").and_then(Value::as_object) else {
             continue;
         };
@@ -74,6 +78,28 @@ pub(crate) fn parse_api_json(bytes: &[u8]) -> Result<ParsedSource> {
         }
     }
     Ok(parsed)
+}
+
+/// Reads a provider's credential environment variables.
+///
+/// models.dev serializes `env` as an array of names for most providers and as a
+/// single string for a few; both shapes are normalized to a non-empty list here.
+fn env_names(value: &Value) -> Option<Vec<String>> {
+    let names: Vec<String> = match value {
+        Value::String(name) => vec![name.clone()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => return None,
+    };
+    let names: Vec<String> = names
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    (!names.is_empty()).then_some(names)
 }
 
 /// Merges the flat source with the detailed source.

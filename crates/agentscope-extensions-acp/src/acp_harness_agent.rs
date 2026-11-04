@@ -7,6 +7,10 @@
 //!   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}' \
 //!     | cargo run -p agentscope-extensions-acp --bin acp_harness_agent
 //!
+//! 配置模型（二选一，都只要一个 API key）：
+//!   - 导出 provider 的密钥（如 `DEEPSEEK_API_KEY`），启动时自动启用对应 provider；
+//!   - 跑 `acp_harness_agent --setup`，从 models.dev 目录里选 provider + 填 key。
+//!
 //! A full interactive ACP client (IDE/CLI) is the intended peer.
 //!
 //! # 子 Agent（subagents）
@@ -108,11 +112,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agentscope_core::model::catalog::CatalogAwareModel;
+use agentscope_core::model::catalog::{CatalogAwareModel, ModelCatalog};
 use agentscope_core::model::provider::{ApiProtocol, ModelCreationContext};
 use agentscope_core::model::{GenerateOptions, Model};
 use agentscope_extensions_acp::compaction_window_tokens;
 use agentscope_extensions_acp::config::ModelChoice;
+use agentscope_extensions_acp::setup::{self, DetectedProvider, SetupIo, SetupPlan};
 use agentscope_extensions_acp::{
     config::default_modes, AcpAgentSession, AcpCodingAgent, ImageSupport,
 };
@@ -123,6 +128,8 @@ use agentscope_harness::agent::{
     ToolResultEvictionConfig,
 };
 use serde::{Deserialize, Serialize};
+
+use agent_client_protocol::v1::schema::AuthState;
 
 // ---------------------------------------------------------------------------
 // 模型配置 (JSON)
@@ -452,10 +459,7 @@ impl ModelConfig {
                             e
                         );
                     } else {
-                        eprintln!(
-                            "[model-config] default config written to {}",
-                            path.display()
-                        );
+                        eprintln!("[model-config] config written to {}", path.display());
                     }
                 }
                 Err(e) => {
@@ -466,6 +470,89 @@ impl ModelConfig {
                 }
             }
         }
+    }
+
+    /// 加载配置，并用已导出的 provider 密钥补齐配置（“0 配置”使用）。
+    ///
+    /// 只补配置里还没有的 provider（用户手写的 base_url / 模型列表优先），且不写盘：
+    /// 环境变量随时可加可删，落盘反而会把一次性密钥写死。默认值仅当当前默认 provider
+    /// 没有真实凭据时才切到检测到的第一个。
+    pub fn load_or_create_with_env() -> Self {
+        let mut config = Self::load_or_create();
+        let catalog = ModelCatalog::global();
+        catalog.ensure_loaded();
+        let providers = setup::catalog_providers(&catalog.snapshot());
+        let detected = setup::detect_env(&providers, |name| std::env::var(name).ok());
+        config.enable_detected_providers(&detected);
+        config
+    }
+
+    /// 把带环境变量密钥的 provider 并入内存配置。
+    fn enable_detected_providers(&mut self, detected: &[DetectedProvider]) {
+        for found in detected {
+            if self.providers.contains_key(&found.provider.id) {
+                continue;
+            }
+            tracing::info!(
+                "model-config: {} is configured via {}; enabling it",
+                found.provider.id,
+                found.var
+            );
+            self.providers.insert(
+                found.provider.id.clone(),
+                ModelProviderConfig {
+                    base_url: found.provider.base_url.clone(),
+                    api_key: found.key.clone(),
+                    models: models_for(&found.provider),
+                },
+            );
+        }
+        let placeholder = self
+            .providers
+            .get(&self.default_provider)
+            .is_none_or(|provider| is_placeholder_key(&provider.api_key));
+        if placeholder {
+            if let Some((provider_id, model)) = detected.first().and_then(|found| {
+                found
+                    .provider
+                    .models
+                    .first()
+                    .map(|model| (found.provider.id.clone(), model.clone()))
+            }) {
+                self.default_provider = provider_id;
+                self.default_model = model;
+            }
+        }
+    }
+
+    /// 把 `--setup` 的结果并入配置：只动被选中的 provider 和两个默认值，其它 provider 原样保留。
+    pub fn apply_plan(&mut self, plan: &SetupPlan) {
+        self.providers.insert(
+            plan.provider.id.clone(),
+            ModelProviderConfig {
+                base_url: plan.provider.base_url.clone(),
+                api_key: plan.api_key.clone(),
+                models: models_for(&plan.provider),
+            },
+        );
+        self.default_provider = plan.provider.id.clone();
+        self.default_model = plan.model.clone();
+    }
+
+    /// 是否配置了任何凭据（只要有非空的 api_key 就算：免费服务的 `"public"` 也是凭据）。
+    pub fn has_credential(&self) -> bool {
+        self.providers
+            .values()
+            .any(|provider| !provider.api_key.trim().is_empty())
+    }
+
+    /// 读取已存在的配置文件；文件不存在或无法解析时返回 `None`。
+    ///
+    /// 与 [`load_or_create`](Self::load_or_create) 的区别：不写盘，也不把“解析失败”
+    /// 当成默认值——`--setup` 要靠这一点避免覆盖用户手写但暂时写错的配置。
+    fn load_existing() -> Option<Self> {
+        let path = Self::default_path()?;
+        path.exists().then(|| Self::try_load(&path)).flatten()
     }
 
     /// 根据 provider 名称和模型 ID 解析出 `(base_url, api_key, model_id)`。
@@ -920,6 +1007,23 @@ fn mask_secret(secret: &str) -> String {
 ///
 /// A globally exported key silently taking precedence over `models.json` is a common
 /// source of confusing 401s, so the override is called out in the log (and stderr).
+/// 把目录里的模型按协议归到 `ModelsSpec` 的对应分组。
+fn models_for(provider: &setup::CatalogProvider) -> ModelsSpec {
+    let mut models = ModelsSpec::default();
+    match provider.protocol {
+        ApiProtocol::Messages => models.messages.extend(provider.models.iter().cloned()),
+        ApiProtocol::Responses => models.responses.extend(provider.models.iter().cloned()),
+        ApiProtocol::ChatCompletions => models.completions.extend(provider.models.iter().cloned()),
+    }
+    models
+}
+
+/// 占位凭据：空值，或免费服务的 `"public"`。
+fn is_placeholder_key(api_key: &str) -> bool {
+    let key = api_key.trim();
+    key.is_empty() || key.eq_ignore_ascii_case("public")
+}
+
 fn resolve_api_key(provider_name: &str, configured: &str) -> String {
     let Some(key) = env_override("OPENAI_API_KEY") else {
         return configured.to_string();
@@ -1185,7 +1289,84 @@ fn init_logging() {
     tracing::info!("logging to {}", log_file.display());
 }
 
+/// `--setup`：交互式写入 `$HOME/.agentscope/models.json` 后退出。
+///
+/// 这是 `initialize` 广告的 terminal auth 方法的可执行部分：客户端用同一个二进制加
+/// `--setup` 开一个终端，用户只需选一个 provider、填一个 API key；若密钥已在环境变量里，
+/// 一个问题都不用回答。
+fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
+    let catalog = ModelCatalog::global();
+    let snapshot = agentscope_extensions_acp::mem::runtime().block_on(async {
+        catalog.ensure_loaded();
+        // Refresh unconditionally: a `304` still re-parses the raw sources, which is what
+        // fills the provider tables (`provider_env`) on an install whose cache predates them.
+        if let Err(error) = catalog.refresh().await {
+            eprintln!("[setup] 无法更新模型目录（{error}）；使用本地缓存");
+        }
+        catalog.ensure_loaded();
+        catalog.snapshot()
+    });
+
+    let providers = setup::catalog_providers(&snapshot);
+    let detected = setup::detect_env(&providers, |name| std::env::var(name).ok());
+    println!(
+        "AgentScope Rust 模型配置：目录中 {} 个 provider，已从环境变量检测到 {} 个",
+        providers.len(),
+        detected.len()
+    );
+
+    let plan = setup::run(&mut TerminalIo, &providers, &detected)?;
+    // `--setup` 是显式写配置，但仍不能默默吞掉一份解析失败的手写文件。
+    let mut config = match ModelConfig::load_existing() {
+        Some(config) => config,
+        None if ModelConfig::default_path().is_some_and(|path| path.exists()) => {
+            return Err(format!(
+                "{} 无法解析；为免覆盖你手写的配置已中止，修好或删掉它再跑 --setup",
+                ModelConfig::default_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            )
+            .into());
+        }
+        None => ModelConfig::default(),
+    };
+    config.apply_plan(&plan);
+    config.save();
+    match (&plan.key_source, plan.api_key.is_empty()) {
+        (Some(var), _) => println!("使用环境变量 {var} 中的密钥"),
+        (None, true) => println!("未写入密钥，稍后可在 models.json 里补上"),
+        (None, false) => println!("已写入密钥"),
+    }
+    println!("默认模型：{}/{}", plan.provider.id, plan.model);
+    println!("重启 agent（或重开会话）后生效。");
+    Ok(())
+}
+
+/// `--setup` 使用的 stdin/stdout 终端。
+struct TerminalIo;
+
+impl SetupIo for TerminalIo {
+    fn say(&mut self, line: &str) {
+        println!("{line}");
+    }
+
+    fn ask(&mut self, prompt: &str) -> Option<String> {
+        use std::io::Write as _;
+        print!("{prompt}");
+        std::io::stdout().flush().ok()?;
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line),
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `--setup` 是纯控制台向导：不能启动 ACP 传输，否则屏幕上会混进 stdout 协议帧。
+    if std::env::args().skip(1).any(|arg| arg == "--setup") {
+        return run_setup();
+    }
     // Worker count is a knobs, not `ncpu`: this agent serves one conversation, and every extra
     // thread also costs a mimalloc heap that keeps its own freed pages resident.
     agentscope_extensions_acp::mem::runtime().block_on(run())
@@ -1204,7 +1385,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let modes = default_modes();
 
     // 模型列表从配置文件动态加载：汇总所有 provider 下的模型 ID（去重后）。
-    let model_config = ModelConfig::load_or_create();
+    // 已导出的 provider 密钥会被一并启用，所以环境变量配好后无需任何文件配置。
+    let model_config = ModelConfig::load_or_create_with_env();
     let models = model_config.all_models();
     // 供转发器在目录常驻时重算 `prompt.image` 能力（见 `ImageSupport`）。
     let image_models = models.clone();
@@ -1218,7 +1400,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // config file (provider lookup + protocol) and build a fresh model.
         // Takes effect on the next prompt; conversation state is preserved.
         .model_builder(move |model_id, session_id| {
-            let cfg = ModelConfig::load_or_create();
+            let cfg = ModelConfig::load_or_create_with_env();
             let resolved = cfg.resolve_model(model_id)?;
             Ok(build_model(
                 &resolved.model_id,
@@ -1231,6 +1413,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .modes(modes)
         .models(models)
         .max_sessions(3)
+        // `auth/status` 报告真实状态：有真实凭据（含环境变量）为 authenticated，
+        // 一处凭据也没有时才是 unauthenticated（客户端据此提示 `--setup`）。
+        .auth_probe(|| {
+            if ModelConfig::load_or_create_with_env().has_credential() {
+                AuthState::Authenticated
+            } else {
+                AuthState::Unauthenticated
+            }
+        })
         .build()?;
 
     // The footprint the process serves at, before any session exists: this is the baseline the
@@ -1509,5 +1700,95 @@ mod tests {
             merged.len() > base.len(),
             "the client text is added, not substituted"
         );
+    }
+
+    fn catalog_provider(
+        id: &str,
+        models: &[&str],
+        protocol: ApiProtocol,
+    ) -> setup::CatalogProvider {
+        setup::CatalogProvider {
+            id: id.to_string(),
+            base_url: format!("https://{id}.example/v1"),
+            env: vec![format!("{}_API_KEY", id.to_ascii_uppercase())],
+            models: models.iter().map(|model| model.to_string()).collect(),
+            protocol,
+        }
+    }
+
+    #[test]
+    fn a_not_yet_configured_provider_is_enabled_from_its_environment_key() {
+        let mut cfg = ModelConfig::default();
+        // The built-in Zen key is the free-endpoint placeholder `"public"`: it counts as a
+        // credential (the agent works out of the box), but it must not block env takeover.
+        assert!(cfg.has_credential());
+        cfg.enable_detected_providers(&[DetectedProvider {
+            provider: catalog_provider(
+                "anthropic",
+                &["claude-sonnet", "claude-haiku"],
+                ApiProtocol::Messages,
+            ),
+            var: "ANTHROPIC_API_KEY".to_string(),
+            key: "sk-ant".to_string(),
+        }]);
+
+        let provider = cfg.providers.get("anthropic").expect("enabled");
+        assert_eq!(provider.base_url, "https://anthropic.example/v1");
+        assert_eq!(provider.api_key, "sk-ant");
+        // The protocol decides the group, so the wire path is `/messages`.
+        assert_eq!(provider.models.messages, ["claude-sonnet", "claude-haiku"]);
+        assert!(provider.models.completions.is_empty());
+        // A placeholder default is replaced; models keep their catalog order.
+        assert_eq!(cfg.default_provider, "anthropic");
+        assert_eq!(cfg.default_model, "claude-sonnet");
+        assert!(cfg.has_credential());
+    }
+
+    #[test]
+    fn a_configured_provider_is_never_overwritten_by_the_environment() {
+        let mut cfg = config();
+        cfg.default_provider = "Gateway".to_string();
+        cfg.default_model = "workbuddy/auto".to_string();
+        cfg.enable_detected_providers(&[DetectedProvider {
+            provider: catalog_provider(
+                "deepseek",
+                &["deepseek-chat"],
+                ApiProtocol::ChatCompletions,
+            ),
+            var: "DEEPSEEK_API_KEY".to_string(),
+            key: "sk-deepseek".to_string(),
+        }]);
+        // New provider available, but the user's defaults stay untouched.
+        assert!(cfg.providers.contains_key("deepseek"));
+        assert_eq!(cfg.default_provider, "Gateway");
+        assert_eq!(cfg.default_model, "workbuddy/auto");
+    }
+
+    #[test]
+    fn setup_merges_the_chosen_provider_and_keeps_the_rest() {
+        let mut cfg = config();
+        let plan = SetupPlan {
+            provider: catalog_provider(
+                "deepseek",
+                &["deepseek-chat"],
+                ApiProtocol::ChatCompletions,
+            ),
+            model: "deepseek-chat".to_string(),
+            api_key: "sk-typed".to_string(),
+            key_source: None,
+        };
+        cfg.apply_plan(&plan);
+
+        // The pre-existing providers are still there.
+        assert!(cfg.providers.contains_key("Gateway"));
+        assert!(cfg.providers.contains_key("Go"));
+        let provider = cfg.providers.get("deepseek").expect("written");
+        assert_eq!(provider.api_key, "sk-typed");
+        assert_eq!(provider.models.completions, ["deepseek-chat"]);
+        assert_eq!(cfg.default_provider, "deepseek");
+        assert_eq!(cfg.default_model, "deepseek-chat");
+        // ... and it resolves without the prefix synthesis the dropdown needs.
+        let resolved = cfg.resolve_model("deepseek-chat").expect("resolves");
+        assert_eq!(resolved.base_url, "https://deepseek.example/v1");
     }
 }
