@@ -1,0 +1,21 @@
+{
+  "id": "agentscope-rust",
+  "name": "AgentScope Rust",
+  "version": "0.1.0",
+  "description": "ACP-native coding agent with multi-provider models, tool permissions, session persistence and subagents.",
+  "repository": "https://github.com/Endlessworld/agentscope-rust",
+  "website": "https://github.com/Endlessworld/agentscope-rust/blob/main/crates/agentscope-extensions-acp/README.md",
+  "authors": [
+    "Endlessworld"
+  ],
+  "license": "Apache-2.0",
+  "license_url": "https://github.com/Endlessworld/agentscope-rust/blob/main/LICENSE",
+  "distribution": {
+    "binary": {
+      "windows-x86_64": {
+        "archive": "https://github.com/Endlessworld/agentscope-rust/releases/download/v0.1.0/agentscope-acp-windows-x86_64.zip",
+        "cmd": "./acp_harness_agent.exe"
+      }
+    }
+  }
+}

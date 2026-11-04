@@ -4,7 +4,7 @@
 任何实现了 ACP 的编辑器 / 客户端都能把它当作编码助手用——读改文件、执行 shell、加载 skills、
 派发子智能体、自动压缩上下文。附带的 REPL 客户端可以在没有 IDE 的情况下直接验证。
 
-> 状态：`0.1.0-alpha.1`（预发布）。协议实现基于 [`agent-client-protocol`](https://crates.io/crates/agent-client-protocol) 2.2。
+> 状态：`0.1.0`。协议实现基于 [`agent-client-protocol`](https://crates.io/crates/agent-client-protocol) 5.0（schema 1.15）。
 
 ## 两个可执行文件
 
@@ -30,8 +30,7 @@
 ## 安装
 
 ```bash
-# 预发布版本必须显式指定
-cargo install agentscope-extensions-acp --version 0.1.0-alpha.1
+cargo install agentscope-extensions-acp --version 0.1.0
 
 # 或从源码（仓库根目录）
 cargo install --path crates/agentscope-extensions-acp

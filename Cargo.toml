@@ -36,7 +36,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 readme = "README.md"
@@ -50,36 +50,36 @@ rust-version = "1.88.0"
 # 内部 crate：`path` 供本地开发，`version` 供 crates.io 发布（发布时 cargo 会丢掉 path）。
 # 注意：成员侧写 `default-features = false` 在继承模式下会被 cargo 忽略，故
 # `agentscope-extensions-acp` 对 `agentscope-harness` 仍用显式 `{ version, path, default-features }`。
-agentscope-rs = { version = "0.1.0-alpha.1", path = "crates/agentscope-rs" }
-agentscope-core = { version = "0.1.0-alpha.1", path = "crates/agentscope-core" }
-agentscope-harness = { version = "0.1.0-alpha.1", path = "crates/agentscope-harness" }
-agentscope-extensions-model = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-model" }
-agentscope-extensions-protocol = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-protocol" }
-agentscope-extensions-a2a-client = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-a2a-client" }
-agentscope-extensions-a2a-server = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-a2a-server" }
-agentscope-extensions-agent-protocol = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-agent-protocol" }
-agentscope-extensions-agui = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-agui" }
-agentscope-extensions-chat-completions-web = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-chat-completions-web" }
-agentscope-extensions-acp = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-acp" }
-agentscope-extensions-rag = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-rag" }
-agentscope-extensions-sandbox = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-sandbox" }
-agentscope-extensions-channel = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-channel" }
-agentscope-extensions-mem = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-mem" }
-agentscope-extensions-jdbc = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-jdbc" }
-agentscope-extensions-redis = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-redis" }
-agentscope-extensions-mongodb = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-mongodb" }
-agentscope-extensions-mysql = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-mysql" }
-agentscope-extensions-postgresql = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-postgresql" }
-agentscope-extensions-cos = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-cos" }
-agentscope-extensions-oss = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-oss" }
-agentscope-extensions-controlplane = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-controlplane" }
-agentscope-extensions-studio = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-studio" }
-agentscope-extensions-skills = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-skills" }
-agentscope-extensions-scheduler = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-scheduler" }
-agentscope-extensions-training = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-training" }
-agentscope-extensions-nacos = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-nacos" }
-agentscope-extensions-higress = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-higress" }
-agentscope-extensions-judge = { version = "0.1.0-alpha.1", path = "crates/agentscope-extensions-judge" }
+agentscope-rs = { version = "0.1.0", path = "crates/agentscope-rs" }
+agentscope-core = { version = "0.1.0", path = "crates/agentscope-core" }
+agentscope-harness = { version = "0.1.0", path = "crates/agentscope-harness" }
+agentscope-extensions-model = { version = "0.1.0", path = "crates/agentscope-extensions-model" }
+agentscope-extensions-protocol = { version = "0.1.0", path = "crates/agentscope-extensions-protocol" }
+agentscope-extensions-a2a-client = { version = "0.1.0", path = "crates/agentscope-extensions-a2a-client" }
+agentscope-extensions-a2a-server = { version = "0.1.0", path = "crates/agentscope-extensions-a2a-server" }
+agentscope-extensions-agent-protocol = { version = "0.1.0", path = "crates/agentscope-extensions-agent-protocol" }
+agentscope-extensions-agui = { version = "0.1.0", path = "crates/agentscope-extensions-agui" }
+agentscope-extensions-chat-completions-web = { version = "0.1.0", path = "crates/agentscope-extensions-chat-completions-web" }
+agentscope-extensions-acp = { version = "0.1.0", path = "crates/agentscope-extensions-acp" }
+agentscope-extensions-rag = { version = "0.1.0", path = "crates/agentscope-extensions-rag" }
+agentscope-extensions-sandbox = { version = "0.1.0", path = "crates/agentscope-extensions-sandbox" }
+agentscope-extensions-channel = { version = "0.1.0", path = "crates/agentscope-extensions-channel" }
+agentscope-extensions-mem = { version = "0.1.0", path = "crates/agentscope-extensions-mem" }
+agentscope-extensions-jdbc = { version = "0.1.0", path = "crates/agentscope-extensions-jdbc" }
+agentscope-extensions-redis = { version = "0.1.0", path = "crates/agentscope-extensions-redis" }
+agentscope-extensions-mongodb = { version = "0.1.0", path = "crates/agentscope-extensions-mongodb" }
+agentscope-extensions-mysql = { version = "0.1.0", path = "crates/agentscope-extensions-mysql" }
+agentscope-extensions-postgresql = { version = "0.1.0", path = "crates/agentscope-extensions-postgresql" }
+agentscope-extensions-cos = { version = "0.1.0", path = "crates/agentscope-extensions-cos" }
+agentscope-extensions-oss = { version = "0.1.0", path = "crates/agentscope-extensions-oss" }
+agentscope-extensions-controlplane = { version = "0.1.0", path = "crates/agentscope-extensions-controlplane" }
+agentscope-extensions-studio = { version = "0.1.0", path = "crates/agentscope-extensions-studio" }
+agentscope-extensions-skills = { version = "0.1.0", path = "crates/agentscope-extensions-skills" }
+agentscope-extensions-scheduler = { version = "0.1.0", path = "crates/agentscope-extensions-scheduler" }
+agentscope-extensions-training = { version = "0.1.0", path = "crates/agentscope-extensions-training" }
+agentscope-extensions-nacos = { version = "0.1.0", path = "crates/agentscope-extensions-nacos" }
+agentscope-extensions-higress = { version = "0.1.0", path = "crates/agentscope-extensions-higress" }
+agentscope-extensions-judge = { version = "0.1.0", path = "crates/agentscope-extensions-judge" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 thiserror = "2"

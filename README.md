@@ -138,12 +138,12 @@ agentscope-rust/
 
 ### 从 crates.io 引入
 
-workspace 已具备发布元数据，首发版本为预发布 `0.1.0-alpha.1`：
+workspace 已具备发布元数据，首发版本为 `0.1.0`：
 
 ```toml
 [dependencies]
-agentscope-core = "0.1.0-alpha.1"
-agentscope-harness = "0.1.0-alpha.1"
+agentscope-core = "0.1.0"
+agentscope-harness = "0.1.0"
 ```
 
 > 预发布版本不会被 `cargo add` 默认选中，需显式写出（或用 `--precise`）。

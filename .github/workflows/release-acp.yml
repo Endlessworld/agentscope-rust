@@ -78,21 +78,22 @@ jobs:
       - name: zip
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          Compress-Archive -Path dist/* -DestinationPath "agentscope-acp-$tag-windows-x86_64.zip"
-          Get-Item "agentscope-acp-$tag-windows-x86_64.zip" | Format-Table Name, Length
+          # 文件名不带版本号：ACP Registry 的自动更新只替换 URL 里的 `/vX.Y.Z/`，
+          # 资产名一旦含版本，下次发版后旧链接就会 404。
+          Compress-Archive -Path dist/* -DestinationPath "agentscope-acp-windows-x86_64.zip"
+          Get-Item "agentscope-acp-windows-x86_64.zip" | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
           name: agentscope-acp-windows-x86_64
-          path: agentscope-acp-*-windows-x86_64.zip
+          path: agentscope-acp-windows-x86_64.zip
           if-no-files-found: error
 
       - name: publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: agentscope-acp-*-windows-x86_64.zip
+          files: agentscope-acp-windows-x86_64.zip
           generate_release_notes: true
           body: |
             Prebuilt ACP binaries for Windows x64 (embedded profile, `lite` features).
@@ -105,8 +106,15 @@ jobs:
             | `acp_agent_cli.exe` | 内置 REPL 客户端，在当前目录拉起 agent 并开始对话 |
             | `README.md` | 安装、会话模式、权限、排障、各语言 SDK 接入 |
 
-            首次运行会在 `%USERPROFILE%\.agentscope\models.json` 生成模型配置模板，填入
-            provider 与 API key 后即可使用。内置 REPL 还需把 `acp_harness_agent.exe`
+            首次运行会尝试用环境变量里的 provider 密钥（如 `DEEPSEEK_API_KEY`）直接开工；
+            什么都没配也能跑，但要先过一遍向导：
+
+            ```powershell
+            .\acp_harness_agent.exe --setup
+            ```
+
+            向导从 models.dev 的模型目录里列出 provider，只要选一个 provider、填一个 API key，
+            不问模型名也不问 base_url。内置 REPL 还需把 `acp_harness_agent.exe`
             放在 `acp_agent_cli.exe` 同目录（非 Windows 或不同目录时用 `ACP_AGENT_EXE` 指定）。
 
             校验连通性：

@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-a2a-client"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "async-trait",
@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-a2a-server"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-extensions-a2a-client",
@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-acp"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "agentscope-core",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-agent-protocol"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-agui"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-channel"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "aes",
  "agentscope-core",
@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-chat-completions-web"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "chrono",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-controlplane"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-cos"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-higress"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-jdbc"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-extensions-skills",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-judge"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-mem"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-model"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "agentscope-core",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-mongodb"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-mysql"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-extensions-jdbc",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-nacos"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-extensions-a2a-client",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-oss"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-postgresql"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-protocol"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-extensions-a2a-client",
  "agentscope-extensions-a2a-server",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-rag"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-extensions-model",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-redis"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-sandbox"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-scheduler"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "async-trait",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-skills"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-harness",
  "base64 0.22.1",
@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-studio"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-extensions-training"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-extensions-model",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-harness"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-extensions-model",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "agentscope-rs"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "agentscope-core",
  "agentscope-extensions-a2a-client",

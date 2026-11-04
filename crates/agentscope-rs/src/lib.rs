@@ -45,7 +45,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! agentscope-rs = { version = "0.1.0-alpha.1", features = ["acp", "rag"] }
+//! agentscope-rs = { version = "0.1.0", features = ["acp", "rag"] }
 //! ```
 //!
 //! ```ignore
