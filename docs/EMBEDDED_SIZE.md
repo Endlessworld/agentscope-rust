@@ -53,9 +53,10 @@ Windows MSVC / nightly，`acp_harness_agent.exe` 实测（同一台机器）：
   （`[profile.embedded.package."*"]`）。
 - `.cargo/config.embedded.toml`：`build-std`（std + panic_abort）、`-Zlocation-detail=none`；
   链接期死代码消除按平台写在各自的 `[target.<triple>]` 里 —— MSVC 用
-  `/OPT:REF`、`/OPT:ICF`、`/DEBUG:NONE`，GNU ld 用 `-Wl,--gc-sections,--icf=all`，
-  ld64（macOS）用 `-Wl,-dead_strip`。`[build]` 只放与链接器无关的
-  `-Zlocation-detail=none`，供不带 `--target` 的本机构建使用。
+  `/OPT:REF`、`/OPT:ICF`、`/DEBUG:NONE`，GNU ld 只用 `-Wl,--gc-sections`
+  （`--icf=all` 需较新 bfd，aarch64 交叉工具链上不支持），ld64（macOS）用
+  `-Wl,-dead_strip`。`[build]` 只放与链接器无关的 `-Zlocation-detail=none`，
+  供不带 `--target` 的本机构建使用。
 - `crates/agentscope-extensions-acp`：`--features lite` 去掉 bundled SQLite。
 
 ## rustls 只保留一个加密后端

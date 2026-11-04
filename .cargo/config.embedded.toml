@@ -35,13 +35,17 @@ rustflags = ["-Z", "location-detail=none", "-C", "link-arg=/OPT:REF", "-C", "lin
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-Z", "location-detail=none", "-C", "link-arg=/OPT:REF", "-C", "link-arg=/OPT:ICF", "-C", "link-arg=/DEBUG:NONE"]
 
-# GNU ld：`--gc-sections` + 相同内容折叠。交叉到 aarch64 时 runner 需装
-# `gcc-aarch64-linux-gnu`（cc crate 会自动找 `aarch64-linux-gnu-gcc`）。
+# GNU ld：`--gc-sections`。**不加 `--icf=all`**：那是较新 bfd 才有的选项，
+# Ubuntu 的 aarch64 交叉 binutils（aarch64-linux-gnu-ld.bfd）会报
+# `unrecognized option '--icf=all'` 直接链接失败；Rust 侧的去重主要靠
+# `--gc-sections` + 单态化，ICF 收益很小，不值得为它分平台写。
+# 交叉到 aarch64 时 runner 需装 `gcc-aarch64-linux-gnu`
+#（cc crate 会自动找 `aarch64-linux-gnu-gcc`）。
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-Z", "location-detail=none", "-C", "link-arg=-Wl,--gc-sections", "-C", "link-arg=-Wl,--icf=all"]
+rustflags = ["-Z", "location-detail=none", "-C", "link-arg=-Wl,--gc-sections"]
 
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-Z", "location-detail=none", "-C", "link-arg=-Wl,--gc-sections", "-C", "link-arg=-Wl,--icf=all"]
+rustflags = ["-Z", "location-detail=none", "-C", "link-arg=-Wl,--gc-sections"]
 
 # ld64：`-dead_strip` 是 mach-o 侧的死代码消除。两个架构都在 arm64 runner 上
 # 构建（Apple clang 两个架构共用同一份 SDK），Intel 产物属交叉编译。
