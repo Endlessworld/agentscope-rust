@@ -183,6 +183,13 @@ pub struct AcpCodingAgent {
     /// Agents built only to read the durable session index per `cwd`, so
     /// `session/list` does not rebuild one on every call.
     catalog_agents: Mutex<HashMap<PathBuf, Arc<HarnessAgent>>>,
+    /// Workspaces this process has seen a session in (created, resumed or listed).
+    ///
+    /// `session/status`, `session/archive` and `session/unarchive` carry no `cwd`, while the
+    /// creation records, archive markers and journals are all per-workspace. Without this set a
+    /// session that is no longer in the registry — archived, or created by a previous process —
+    /// could not be found at all. Only paths are kept, so the growth is negligible.
+    known_workspaces: Mutex<Vec<PathBuf>>,
     /// Advertised `prompt.image` support. See [`ImageSupport`].
     image_support: ImageSupport,
     /// Answers `auth/status` for the connected client.
@@ -288,6 +295,7 @@ impl AcpCodingAgent {
             client_support: ClientSupport::new(),
             providers: ProviderRegistry::default(),
             catalog_agents: Mutex::new(HashMap::new()),
+            known_workspaces: Mutex::new(Vec::new()),
             image_support: ImageSupport::default(),
             auth_probe: Arc::new(|| AuthState::NotRequired),
         }
@@ -457,6 +465,7 @@ impl AcpCodingAgent {
     /// 避免多会话同时持有完整 `HarnessAgent` 成倍放大内存。
     fn register_session(&self, session: AcpAgentSession) {
         let id = session.session_id().to_string();
+        self.note_workspace(session.cwd());
         // A prompt that finishes after `session/close` must not resurrect the session.
         if session.is_closed() {
             self.sessions
@@ -509,6 +518,35 @@ impl AcpCodingAgent {
             .remove(&session_id.to_string());
     }
 
+    /// Records that this process has seen sessions in `cwd`.
+    fn note_workspace(&self, cwd: &std::path::Path) {
+        let mut guard = self
+            .known_workspaces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !guard.iter().any(|known| known == cwd) {
+            guard.push(cwd.to_path_buf());
+        }
+    }
+
+    /// Removes every durable trace of `session_id` under `cwd`: the journal, the creation
+    /// record and the archive marker.
+    ///
+    /// A journal survives the protocol call only when the backend refuses to delete it; that is
+    /// logged rather than failing a `session/delete` whose other effects already landed.
+    async fn forget_session(
+        &self,
+        agent: &HarnessAgent,
+        cwd: &std::path::Path,
+        session_id: &SessionId,
+        context: &agentscope_core::agent::RuntimeContext,
+    ) {
+        if let Err(error) = agent.delete_session(context).await {
+            tracing::warn!(session = %session_id, %error, "could not delete the session journal");
+        }
+        super::session::forget_session_on_disk(cwd, session_id);
+    }
+
     /// Returns a clone of the session (for handlers).
     fn get_session(&self, session_id: &SessionId) -> Option<AcpAgentSession> {
         self.sessions
@@ -554,8 +592,14 @@ impl AcpCodingAgent {
     ///
     /// `session/load` and `session/resume` must not silently create an empty session for a
     /// mistyped or deleted id: the client would see a successful load with no history. The
-    /// journal is the durable authority, so probe it before building anything.
+    /// workspace is the durable authority, so probe it before building anything: the creation
+    /// record covers a session that never ran a turn, the journal one that did.
     async fn session_exists(&self, session_id: &SessionId, cwd: PathBuf) -> bool {
+        // A session created but never prompted has no journal yet: the creation record the
+        // workspace wrote on `session/new` is the durable proof that the id is not a typo.
+        if super::session::is_recorded_on_disk(&cwd, session_id) {
+            return true;
+        }
         let agent = match &self.session_factory {
             Some(factory) => factory(SessionBuild {
                 cwd: cwd.clone(),
@@ -592,11 +636,12 @@ impl AcpCodingAgent {
 
     /// Finds the workspace that knows `session_id` when the registry does not hold it.
     ///
-    /// The journal store and the archive markers are per-workspace, while `session/status` and
-    /// `session/archive` carry no `cwd`. So the persisted probe only covers workspaces this
-    /// process has already seen: the live registry plus the index agents `session/list` built. A
-    /// session persisted somewhere never listed here reads as unknown, which is what a client
-    /// that never listed it should conclude anyway.
+    /// The journal store, the creation records and the archive markers are per-workspace, while
+    /// `session/status` and `session/archive` carry no `cwd`. So the persisted probe only covers
+    /// workspaces this process has already seen: the live registry plus every workspace a
+    /// `session/new`, `session/load`, `session/resume` or `session/list` touched. A session
+    /// persisted somewhere never seen here reads as unknown, which is what a client that never
+    /// named that directory should conclude anyway.
     async fn session_workspace(&self, session_id: &SessionId) -> Option<PathBuf> {
         let mut cwds: Vec<PathBuf> = {
             let guard = self
@@ -609,10 +654,10 @@ impl AcpCodingAgent {
                 .collect()
         };
         cwds.extend(
-            self.catalog_agents
+            self.known_workspaces
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .keys()
+                .iter()
                 .cloned(),
         );
         cwds.sort();
@@ -620,8 +665,12 @@ impl AcpCodingAgent {
         let wanted = session_id.to_string();
         let context = agentscope_core::agent::RuntimeContext::new();
         for cwd in cwds {
-            // A marker without a journal entry is still a session this workspace owns.
-            if super::session::is_archived_on_disk(&cwd, session_id) {
+            // A creation record or an archive marker without a journal entry still names a
+            // session this workspace owns: the record is written on `session/new`, before the
+            // first prompt, and it outlives the marker an unarchive clears.
+            if super::session::is_recorded_on_disk(&cwd, session_id)
+                || super::session::is_archived_on_disk(&cwd, session_id)
+            {
                 return Some(cwd);
             }
             let agent = self.catalog_agent(&cwd);
@@ -680,10 +729,12 @@ impl AcpCodingAgent {
 
     /// Builds the `session/list` response, honouring the request's `cursor`.
     ///
-    /// The in-memory registry only knows sessions this process created. The journal is the
+    /// The in-memory registry only knows sessions this process created. The workspace is the
     /// durable authority, so when the client names a `cwd` the list also includes sessions a
-    /// previous process persisted there — otherwise a restart showed an empty history and the
-    /// client could not offer `session/load`.
+    /// previous process left there — otherwise a restart showed an empty history and the client
+    /// could not offer `session/load`. Two sources are merged: the journal (sessions that ran at
+    /// least one turn) and the creation records (sessions created but never prompted, which have
+    /// no journal yet).
     ///
     /// Sessions are ordered by id (stable) so pagination is deterministic. The archive filter
     /// is applied before pagination, as the spec requires (ACP-36).
@@ -712,24 +763,29 @@ impl AcpCodingAgent {
         if let Some(cwd) = cwd {
             let agent = self.catalog_agent(cwd);
             let context = agentscope_core::agent::RuntimeContext::new();
+            // Journal first, then the creation records: a session that never prompted has no
+            // journal at all, so the records are the only source that knows it exists.
+            let mut discovered: std::collections::BTreeSet<String> =
+                super::session::recorded_session_ids(cwd)
+                    .into_iter()
+                    .collect();
             match agent.list_session_keys(&context).await {
                 Ok(keys) => {
-                    for key in keys {
-                        if known.contains(&key.session_id) {
-                            continue;
-                        }
-                        let session_id = SessionId::new(key.session_id);
-                        // Persisted-only sessions report their archive state from the marker
-                        // file, so `exclude` cannot leak an archived session that is on disk.
-                        let archived = super::session::is_archived_on_disk(cwd, &session_id);
-                        infos.push(
-                            SessionInfo::new(session_id, cwd.to_path_buf()).archived(archived),
-                        );
-                    }
+                    discovered.extend(keys.into_iter().map(|key| key.session_id));
                 }
                 Err(error) => {
                     tracing::warn!(%error, "could not read the persisted session index")
                 }
+            }
+            for id in discovered {
+                if known.contains(&id) {
+                    continue;
+                }
+                let session_id = SessionId::new(id);
+                // Persisted-only sessions report their archive state from the marker file, so
+                // `exclude` cannot leak an archived session that is on disk.
+                let archived = super::session::is_archived_on_disk(cwd, &session_id);
+                infos.push(SessionInfo::new(session_id, cwd.to_path_buf()).archived(archived));
             }
         }
         // Drop duplicates by id *before* sorting: the two orders disagree, so `dedup_by`
@@ -772,6 +828,7 @@ impl AcpCodingAgent {
     /// synthetic session id never reaches the journal: only the store's index is read.
     fn catalog_agent(&self, cwd: &std::path::Path) -> Arc<HarnessAgent> {
         const CATALOG_SESSION_ID: &str = "session-catalog";
+        self.note_workspace(cwd);
         if let Some(agent) = self
             .catalog_agents
             .lock()
@@ -1273,11 +1330,25 @@ impl AcpCodingAgent {
             )
             .on_receive_request(
                 async move |req: DeleteSessionRequest, responder, _cx| {
+                    let context = agentscope_core::agent::RuntimeContext::new()
+                        .with_session_id(req.session_id.to_string());
                     if let Some(session) = a_delete.get_session(&req.session_id) {
                         let _ = session
                             .cancel_and_wait(std::time::Duration::from_secs(10))
                             .await;
                         session.close();
+                        // The live agent is the one that owns the journal: deleting through it
+                        // cannot address a different agent identity than the turn wrote.
+                        a_delete
+                            .forget_session(session.agent(), session.cwd(), &req.session_id, &context)
+                            .await;
+                    } else if let Some(cwd) = a_delete.session_workspace(&req.session_id).await {
+                        // The registry no longer holds the session (restart, or archived): the
+                        // workspace files still have to go, or the next `session/list` shows it.
+                        let agent = a_delete.catalog_agent(&cwd);
+                        a_delete
+                            .forget_session(&agent, &cwd, &req.session_id, &context)
+                            .await;
                     }
                     a_delete.remove_session(&req.session_id);
                     responder.respond(DeleteSessionResponse::new())

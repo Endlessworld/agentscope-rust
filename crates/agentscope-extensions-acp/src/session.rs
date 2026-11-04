@@ -524,6 +524,11 @@ fn session_config_path(cwd: &std::path::Path, session_id: &SessionId) -> PathBuf
         .join(format!("{safe}.json"))
 }
 
+/// Directory holding the per-session creation records (config sidecars) of a workspace.
+fn session_config_dir(cwd: &std::path::Path) -> PathBuf {
+    cwd.join(".agentscope").join("acp-sessions")
+}
+
 /// Path of the marker file recording that a session is archived.
 ///
 /// A marker (rather than a field in the config sidecar) keeps archive state independent of
@@ -560,6 +565,51 @@ pub(crate) fn set_archived_on_disk(cwd: &std::path::Path, session_id: &SessionId
     }
     if let Err(error) = std::fs::write(&path, b"") {
         tracing::warn!(path = %path.display(), %error, "failed to write the archive marker");
+    }
+}
+
+/// Whether `cwd` holds a creation record for `session_id`.
+///
+/// Every session writes its config sidecar when it is created, so the file is the durable proof
+/// that the id belongs to this workspace — even when the journal is still empty (`session/new`
+/// never prompted) or the archive marker was already cleared.
+pub(crate) fn is_recorded_on_disk(cwd: &std::path::Path, session_id: &SessionId) -> bool {
+    session_config_path(cwd, session_id).exists()
+}
+
+/// Every session id `cwd` has a creation record for.
+pub(crate) fn recorded_session_ids(cwd: &std::path::Path) -> Vec<String> {
+    let entries = match std::fs::read_dir(session_config_dir(cwd)) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .filter_map(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Removes the per-session workspace files of `session_id`: the creation record and the archive
+/// marker.
+///
+/// `session/delete` must not leave a record behind that would put the session back into
+/// `session/list` (a session created but never prompted has nothing else on disk). The journal is
+/// not touched here — the harness owns it, and a deleted-but-journaled session reads as it did
+/// before.
+pub(crate) fn forget_session_on_disk(cwd: &std::path::Path, session_id: &SessionId) {
+    let record = session_config_path(cwd, session_id);
+    for path in [record.clone(), record.with_extension("archived")] {
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), %error, "failed to remove the session record");
+            }
+        }
     }
 }
 
@@ -722,6 +772,11 @@ impl AcpAgentSession {
             config.thought_level = initial_thought;
         }
         session.apply_mode();
+        // The config sidecar doubles as the session's creation record: `session/new` writes it
+        // before the first prompt, so a session that never ran a turn still leaves a durable
+        // trace in its workspace (there is no journal yet). `session/list`, `session/status` and
+        // `session/resume` read it back.
+        session.persist_config();
         session
     }
 

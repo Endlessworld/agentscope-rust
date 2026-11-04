@@ -470,6 +470,24 @@ impl SessionLogStore for WorkspaceSessionLogStore {
         keys.dedup();
         Ok(keys)
     }
+
+    /// Deletes the journal of `key` wherever this workspace keeps it.
+    ///
+    /// The legacy `agents/...` tree is included: an older build wrote the session there, and
+    /// leaving it behind would keep the session discoverable after the client deleted it. Both
+    /// locations hold nothing but the session's own subtree, so removing the prefix is the whole
+    /// deletion.
+    async fn delete(&self, key: &SessionKey) -> crate::Result<()> {
+        let ctx = RuntimeContext::new();
+        for prefix in [key.storage_path(), key.legacy_storage_path()] {
+            if !self.storage.fs.exists(&ctx, &prefix).await? {
+                continue;
+            }
+            self.storage.fs.delete(&ctx, &prefix).await?;
+            tracing::debug!(session = %key.session_id, path = %prefix, "deleted a session journal");
+        }
+        Ok(())
+    }
 }
 
 /// Decodes the `s_<base64url>` component produced by [`SessionKey::storage_path`].
@@ -921,6 +939,44 @@ mod tests {
                 .unwrap(),
             "nothing may be written to the legacy location"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_removes_the_journal_and_its_legacy_copy() {
+        let dir = temp_dir("delete_journal");
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
+        let ctx = RuntimeContext::new().with_user_id("alice");
+        let key = SessionKey::new(Some("alice"), "agent", "s1").unwrap();
+
+        // One journal where this build writes, one left behind by an older build.
+        for prefix in [key.storage_path(), key.legacy_storage_path()] {
+            let storage: Arc<dyn AtomicSessionStorage> =
+                Arc::new(WorkspaceSessionStorage::new(Arc::clone(&fs)));
+            let log = JournalSessionLog::new(storage, prefix);
+            let writer = log
+                .acquire("run-1", std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+            log.commit(&writer, "b1", 0, &[event(1, "run/start")])
+                .await
+                .unwrap();
+            log.release(&writer).await.unwrap();
+        }
+
+        let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+        assert_eq!(store.list(&ctx).await.unwrap(), vec![key.clone()]);
+
+        store.delete(&key).await.unwrap();
+        assert!(
+            store.list(&ctx).await.unwrap().is_empty(),
+            "a deleted session must not be discovered again"
+        );
+        assert!(!fs.exists(&ctx, &key.storage_path()).await.unwrap());
+        assert!(!fs.exists(&ctx, &key.legacy_storage_path()).await.unwrap());
+        // Deleting an already deleted session stays a no-op.
+        store.delete(&key).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }

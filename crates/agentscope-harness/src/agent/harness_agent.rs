@@ -427,6 +427,22 @@ impl HarnessAgent {
         store.list(context).await
     }
 
+    /// Deletes the persisted journal of the session bound to `context`.
+    ///
+    /// `session/delete` needs this: a journal that survives the deletion keeps the session
+    /// discoverable (and loadable) after the client asked for it to be gone. A backend without
+    /// deletion reports the error instead of pretending the history is gone.
+    pub async fn delete_session(&self, context: &RuntimeContext) -> crate::Result<()> {
+        let store = self
+            .session_log_store
+            .as_ref()
+            .ok_or_else(|| crate::Error::Session("native session history is not enabled".into()))?;
+        let key = self.session_key(context).ok_or_else(|| {
+            crate::Error::Session("native session history is not enabled for this agent".into())
+        })?;
+        store.delete(&key).await
+    }
+
     /// Reads the replayable transcript of the session bound to `context`. Mirrors Java
     /// `HarnessAgent.sessionTranscript(RuntimeContext)`.
     pub async fn session_transcript(&self, context: &RuntimeContext) -> crate::Result<Transcript> {

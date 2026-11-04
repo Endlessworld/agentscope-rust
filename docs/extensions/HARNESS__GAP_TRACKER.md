@@ -163,6 +163,14 @@
 | `HARNESS-35` | `57faf0fe1` | `SubAgentTool` 子调用改用**子会话** sessionId 读写状态、不覆盖父 `AgentState`，父 user id 继续传给子会话 | 父子状态隔离本已成立（`agent/subagent/materialize.rs::LeafFactory::build` 生成独立 `HarnessAgent` + `derive_child_session_id`，子 agent 有自己的 `Arc<Mutex<AgentState>>`，`run_child_turn` 不继承父 recorder）；补齐缺口：子 agent 现在**继承父 `user_id`**（原先只设 `session_id` → 子 checkpoint/journal 落在 `__anon__`，`Shared` 模式多租户共槽、历史互串） | 已完成（**行为变更**：子会话存储 key 现在带 user 段）；`cargo test -p agentscope-harness --lib agent::subagent::materialize` → **17 passed / 0 failed**（新增 `a_declared_child_inherits_the_parent_user_id`、`a_declared_child_without_a_parent_user_id_stays_anonymous`） |
 | `HARNESS-D09` | `adf2dea27` | 沙箱原生 edit 路径把 heredoc 脚本换成 base64 单行命令；缺 `__RESULT__` 标记时降级到 transfer | 无 | 设计决定（不迁移）：Rust `edit_file` 全程 Rust 侧读写（`filesystem/local.rs:424`、`filesystem/remote/mod.rs:280` 走带 CAS 的 PUT、`filesystem/sandbox.rs:77` 委托）；唯一走沙箱命令的实现 `extensions-sandbox/src/fs_spec.rs:703-729` 用 `printf %s <b64> \| base64 -d`，不调 python、无 heredoc、无 `__RESULT__`（transfer 是提前优先而非失败降级）；`extensions-sandbox/src/workspace.rs:77` 的 heredoc 属 workspace 初始化脚本，另一功能 |
 
+### 3.5.5 2026-11-04 会话删除（`SessionLogStore::delete` 落地）
+
+> 来源：ACP `session/delete` 只清注册表，跑过轮次的会话被删后仍能被 `list_session_keys` 发现、仍能被 `session/load` 读回。
+
+| 编号 | 变更 | Rust 落点 | 状态 / 验证 |
+|---|---|---|---|
+| `HARNESS-36` | 补齐 `SessionLogStore::delete` 的真实实现（core 里此前只有「unsupported」默认） | `agent/session/storage.rs::WorkspaceSessionLogStore::delete`（删 `key.storage_path()` 与 `key.legacy_storage_path()` 两处子树，缺一则跳过、重复删除 no-op）、`agentscope-core/src/session/in_memory.rs::InMemorySessionLogStore::delete`；新增 `HarnessAgent::delete_session(&RuntimeContext)`（`session_key(context)` + `store.delete`，与 `list_session_keys` 同一 key 解析） | 已完成；`cargo test -p agentscope-harness --lib` → **625 passed**（新增 `deleting_a_session_removes_the_journal_and_its_legacy_copy`）、`cargo test -p agentscope-core --lib` → **466 passed / 3 ignored**；反向验证：`WorkspaceSessionLogStore::delete` 写成 no-op → ACP `deleting_a_persisted_session_removes_its_history` FAILED |
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

@@ -141,6 +141,15 @@ impl SessionLogStore for InMemorySessionLogStore {
         });
         Ok(discovered)
     }
+
+    /// Drops the journal of `key`: its storage, and therefore every value under the prefix.
+    async fn delete(&self, key: &SessionKey) -> crate::error::Result<()> {
+        self.stores
+            .lock()
+            .expect("session store poisoned")
+            .remove(key);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

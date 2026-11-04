@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
-    ArchiveSessionRequest, AuthState, AuthStatusRequest, ContentBlock, InitializeRequest,
-    ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    SessionArchiveFilter, SessionId, SessionStatus, SessionStatusRequest, SetSessionTitleRequest,
-    SystemPrompt, SystemPromptMode, TextContent, UnarchiveSessionRequest,
+    ArchiveSessionRequest, AuthState, AuthStatusRequest, ContentBlock, DeleteSessionRequest,
+    InitializeRequest, ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
+    ResumeSessionRequest, SessionArchiveFilter, SessionId, SessionStatus, SessionStatusRequest,
+    SetSessionTitleRequest, SystemPrompt, SystemPromptMode, TextContent, UnarchiveSessionRequest,
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{Agent, Channel, Client, ErrorCode};
@@ -594,5 +594,480 @@ async fn a_client_system_prompt_reaches_the_session_factory_and_override_is_reje
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     assert_eq!(seen, vec![Some("always answer in haiku".to_string())]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn archiving_a_session_that_never_prompted_keeps_it_resolvable() {
+    let root = fresh_root("caps_archive_unprompted");
+    let (agent_channel, client_channel) = Channel::duplex();
+    let agent = AcpCodingAgent::builder()
+        .model_factory(factory(root.clone()))
+        .build()
+        .expect("build AcpCodingAgent");
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+
+    let root_for_client = root.clone();
+    Client
+        .v1()
+        .connect_with(
+            client_channel,
+            |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(root_for_client.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+
+                // No prompt: the journal does not exist yet.
+                connection
+                    .send_request(ArchiveSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+
+                // Archiving released the live session, and `session/status` carries no cwd, so
+                // the workspace must still be reachable without the registry.
+                let status = connection
+                    .send_request(SessionStatusRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+                assert_eq!(status.status, SessionStatus::Saved);
+
+                // The first unarchive clears the marker, so the second call has neither marker
+                // nor journal to find: it must be a no-op, not `session_not_found`.
+                connection
+                    .send_request(UnarchiveSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(UnarchiveSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+
+                let listed = connection
+                    .send_request(ListSessionsRequest::new().cwd(root_for_client.clone()))
+                    .block_task()
+                    .await?;
+                let info = listed
+                    .sessions
+                    .iter()
+                    .find(|info| info.session_id == session_id)
+                    .expect("the unarchived session is listed again");
+                assert_eq!(info.archived, Some(false));
+                Ok(())
+            },
+        )
+        .await
+        .expect("client run");
+    let _ = agent_task.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn a_session_created_without_a_prompt_survives_a_restart() {
+    let root = fresh_root("caps_unprompted_restart");
+
+    // ---- Process 1: create the session, never send a prompt. ----
+    let (agent_channel, client_channel) = Channel::duplex();
+    let agent = AcpCodingAgent::builder()
+        .model_factory(factory(root.clone()))
+        .build()
+        .expect("build AcpCodingAgent");
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+    let root_for_client = root.clone();
+    let session_id = Client
+        .v1()
+        .connect_with(
+            client_channel,
+            |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(root_for_client.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                Ok(session_id)
+            },
+        )
+        .await
+        .expect("client run 1");
+    let _ = agent_task.await;
+
+    // ---- Process 2: only the creation record exists, there is no journal. ----
+    let (agent_channel, client_channel) = Channel::duplex();
+    let agent = AcpCodingAgent::builder()
+        .model_factory(factory(root.clone()))
+        .build()
+        .expect("build AcpCodingAgent");
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+    let root_for_client = root.clone();
+    Client
+        .v1()
+        .connect_with(
+            client_channel,
+            |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let listed = connection
+                    .send_request(ListSessionsRequest::new().cwd(root_for_client.clone()))
+                    .block_task()
+                    .await?;
+                let info = listed
+                    .sessions
+                    .iter()
+                    .find(|info| info.session_id == session_id)
+                    .expect("a session created without a prompt is still listed");
+                assert_eq!(info.archived, Some(false));
+
+                // `include` must not be the only way to see it either: the default filter
+                // already has to keep an unarchived session.
+                let listed = connection
+                    .send_request(
+                        ListSessionsRequest::new()
+                            .cwd(root_for_client.clone())
+                            .archived(SessionArchiveFilter::Include),
+                    )
+                    .block_task()
+                    .await?;
+                assert!(listed
+                    .sessions
+                    .iter()
+                    .any(|info| info.session_id == session_id));
+
+                let status = connection
+                    .send_request(SessionStatusRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+                assert_eq!(status.status, SessionStatus::Saved);
+
+                connection
+                    .send_request(ResumeSessionRequest::new(
+                        session_id.clone(),
+                        root_for_client.clone(),
+                    ))
+                    .block_task()
+                    .await?;
+                let status = connection
+                    .send_request(SessionStatusRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+                assert_eq!(status.status, SessionStatus::Open);
+                Ok(())
+            },
+        )
+        .await
+        .expect("client run 2");
+    let _ = agent_task.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn deleting_a_session_created_without_a_prompt_hides_it_again() {
+    let root = fresh_root("caps_unprompted_delete");
+    let (agent_channel, client_channel) = Channel::duplex();
+    let agent = AcpCodingAgent::builder()
+        .model_factory(factory(root.clone()))
+        .build()
+        .expect("build AcpCodingAgent");
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+
+    let root_for_client = root.clone();
+    Client
+        .v1()
+        .connect_with(
+            client_channel,
+            |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(root_for_client.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let listed = connection
+                    .send_request(ListSessionsRequest::new().cwd(root_for_client.clone()))
+                    .block_task()
+                    .await?;
+                assert!(listed
+                    .sessions
+                    .iter()
+                    .any(|info| info.session_id == session_id));
+
+                connection
+                    .send_request(DeleteSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+
+                // The creation record is the only trace this session had: leaving it behind
+                // would put a deleted session back into the list.
+                let listed = connection
+                    .send_request(ListSessionsRequest::new().cwd(root_for_client.clone()))
+                    .block_task()
+                    .await?;
+                assert!(
+                    listed
+                        .sessions
+                        .iter()
+                        .all(|info| info.session_id != session_id),
+                    "a deleted session must not be listed"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .expect("client run");
+    let _ = agent_task.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn deleting_a_persisted_session_removes_its_history() {
+    let root = fresh_root("caps_delete_history");
+
+    // ---- Process 1: one turn, so the journal is the only trace on disk. ----
+    let (agent_channel, client_channel) = Channel::duplex();
+    let agent = AcpCodingAgent::builder()
+        .model_factory(factory(root.clone()))
+        .build()
+        .expect("build AcpCodingAgent");
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+    let root_for_client = root.clone();
+    let session_id = Client
+        .v1()
+        .connect_with(
+            client_channel,
+            |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(root_for_client.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![ContentBlock::Text(TextContent::new("hello"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(session_id)
+            },
+        )
+        .await
+        .expect("client run 1");
+    let _ = agent_task.await;
+
+    // ---- Process 2: the restart knows the session only through its journal. ----
+    let (agent_channel, client_channel) = Channel::duplex();
+    let agent = AcpCodingAgent::builder()
+        .model_factory(factory(root.clone()))
+        .build()
+        .expect("build AcpCodingAgent");
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+    let root_for_client = root.clone();
+    Client
+        .v1()
+        .connect_with(
+            client_channel,
+            |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let listed = connection
+                    .send_request(ListSessionsRequest::new().cwd(root_for_client.clone()))
+                    .block_task()
+                    .await?;
+                assert!(listed
+                    .sessions
+                    .iter()
+                    .any(|info| info.session_id == session_id));
+
+                connection
+                    .send_request(DeleteSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+
+                // The journal was the only record left: if it survived, the session would be
+                // discovered again and could still be loaded.
+                let listed = connection
+                    .send_request(ListSessionsRequest::new().cwd(root_for_client.clone()))
+                    .block_task()
+                    .await?;
+                assert!(
+                    listed
+                        .sessions
+                        .iter()
+                        .all(|info| info.session_id != session_id),
+                    "a deleted session must not be listed"
+                );
+                let error = connection
+                    .send_request(LoadSessionRequest::new(
+                        session_id.clone(),
+                        root_for_client.clone(),
+                    ))
+                    .block_task()
+                    .await
+                    .expect_err("a deleted session has no history to load");
+                assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
+                Ok(())
+            },
+        )
+        .await
+        .expect("client run 2");
+    let _ = agent_task.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn an_unarchived_session_replays_its_history_and_keeps_going() {
+    let root = fresh_root("caps_unarchive_continue");
+
+    // ---- Process 1: one turn, then archive. ----
+    let (agent_channel, client_channel) = Channel::duplex();
+    let agent = AcpCodingAgent::builder()
+        .model_factory(factory(root.clone()))
+        .build()
+        .expect("build AcpCodingAgent");
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+    let root_for_client = root.clone();
+    let session_id = Client
+        .v1()
+        .connect_with(
+            client_channel,
+            |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(root_for_client.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![ContentBlock::Text(TextContent::new("hello"))],
+                    ))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(ArchiveSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+                Ok(session_id)
+            },
+        )
+        .await
+        .expect("client run 1");
+    let _ = agent_task.await;
+
+    // ---- Process 2: unarchive, load (the transcript replays), then another turn. ----
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_c = Arc::clone(&seen);
+    let (agent_channel, client_channel) = Channel::duplex();
+    let agent = AcpCodingAgent::builder()
+        .model_factory(factory(root.clone()))
+        .build()
+        .expect("build AcpCodingAgent");
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+    let root_for_client = root.clone();
+    Client
+        .v1()
+        .on_receive_notification(
+            async move |notification: agent_client_protocol::v1::schema::SessionNotification,
+                        _cx| {
+                use agent_client_protocol::v1::schema::SessionUpdate;
+                let text = match notification.update {
+                    SessionUpdate::UserMessageChunk(chunk) => match chunk.content {
+                        ContentBlock::Text(text) => format!("USER:{}", text.text),
+                        _ => return Ok(()),
+                    },
+                    SessionUpdate::AgentMessageChunk(chunk) => match chunk.content {
+                        ContentBlock::Text(text) => format!("AGENT:{}", text.text),
+                        _ => return Ok(()),
+                    },
+                    _ => return Ok(()),
+                };
+                seen_c.lock().unwrap().push(text);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            client_channel,
+            |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                // `session/unarchive` carries no cwd, so the client names the workspace with a
+                // listing first (what an IDE does when it restores its history). The archived
+                // session is only visible with the `include` filter.
+                let listed = connection
+                    .send_request(
+                        ListSessionsRequest::new()
+                            .cwd(root_for_client.clone())
+                            .archived(SessionArchiveFilter::Include),
+                    )
+                    .block_task()
+                    .await?;
+                let info = listed
+                    .sessions
+                    .iter()
+                    .find(|info| info.session_id == session_id)
+                    .expect("an archived session is listed by `include`");
+                assert_eq!(info.archived, Some(true));
+                connection
+                    .send_request(UnarchiveSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+                // Loading the unarchived session replays what the first process committed.
+                connection
+                    .send_request(LoadSessionRequest::new(
+                        session_id.clone(),
+                        root_for_client.clone(),
+                    ))
+                    .block_task()
+                    .await?;
+                // ...and the conversation continues in the same journal.
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![ContentBlock::Text(TextContent::new("again"))],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("client run 2");
+    let _ = agent_task.await;
+
+    let texts = seen.lock().unwrap().clone();
+    assert!(
+        texts.iter().any(|text| text == "USER:hello"),
+        "the replayed history is missing: {texts:?}"
+    );
+    assert!(
+        texts.iter().filter(|text| *text == "AGENT:done").count() >= 2,
+        "the continued turn was not streamed: {texts:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

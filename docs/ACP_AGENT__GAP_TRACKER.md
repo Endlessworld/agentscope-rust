@@ -430,7 +430,7 @@ Form 模式用受限 JSON Schema（扁平 `object`）描述请求内容，`Elici
 | `ACP-33` | 已完成 | `session/set_title` handler：trim + 空白 → `-32602`，成功后写 `SessionInfo.title` 并广播 `SessionInfoUpdate`；能力位 `session.title`；测试断言 `list_sessions` 可见新标题、空标题报 `INVALID_PARAMS` |
 | `ACP-34` | 已完成 | `session/status` handler + `session_status()`：注册表命中 → `Open`，仅持久化 → `Saved`，否则 `session_not_found`（`-32002`）；能力位 `session.status`；测试 `a_session_that_is_only_persisted_reports_saved`（重启后 `Saved` → `session/load` 后 `Open`） |
 | `ACP-35` | 已完成 | `auth/status` handler 恒返 `AuthState::NotRequired`（无真实凭据，不实现 `auth/status_update`）；能力位 `auth.status`；测试在 `initialize` 后直接断言 |
-| `ACP-36` | 已完成 | 归档状态落 `.agentscope/acp-sessions/<id>.archived` 标记文件（`session.rs::is_archived_on_disk` / `set_archived_on_disk`），不动 harness 侧 journal schema；`session/list` 按 `SessionArchiveFilter`（Exclude 默认 / Only / Include）在**分页前**过滤，且每条结果都带 `archived`；`Other(_)` 过滤值 → `-32602`；活跃会话归档按 `session/close` 语义释放（`close()` + `cancel_and_wait(15s)` + `remove_session`）；持久化-only 会话的 unarchive 靠 `session_workspace()` 探测（cwd 来源＝注册表 + `session/list` 建过的索引 agent）。测试：`archiving_a_live_session_hides_it_until_it_is_unarchived`、`archive_state_survives_a_restart` |
+| `ACP-36` | 已完成 | 归档状态落 `.agentscope/acp-sessions/<id>.archived` 标记文件（`session.rs::is_archived_on_disk` / `set_archived_on_disk`），不动 harness 侧 journal schema；`session/list` 按 `SessionArchiveFilter`（Exclude 默认 / Only / Include）在**分页前**过滤，且每条结果都带 `archived`；`Other(_)` 过滤值 → `-32602`；活跃会话归档按 `session/close` 语义释放（`close()` + `cancel_and_wait(15s)` + `remove_session`）；持久化-only 会话的 unarchive 靠 `session_workspace()` 探测（cwd 来源＝注册表 + 进程内见过的 workspace 集合 `known_workspaces`，由 `session/new|load|resume|list` 填充）。测试：`archiving_a_live_session_hides_it_until_it_is_unarchived`、`archive_state_survives_a_restart`、`archiving_a_session_that_never_prompted_keeps_it_resolvable` |
 | `ACP-38` | 已完成 | `coding_agent.rs::system_prompt_text()` 只接受 `SystemPromptMode::Append`（`Override`/其它 → `-32602` + `data.supportedModes`，不降级）；文本块以空行拼接、空白内容报错；`acp_harness_agent.rs::with_client_system_prompt()` 把客户端文本接在默认 system prompt **之后**（编码规则/工具说明保留在前）；能力位 `session.system_prompt` **仅在 `session_factory` 存在时**广告（`model_factory` 无传递通道，故不广告且收到即 `-32602`）；`session/load|resume` 命中**已存活**会话时 `systemPrompt` 无法叠加（会丢掉正在跑的轮次），记 WARN 后忽略。测试：单测 `coding_agent::tests::a_client_system_prompt_is_only_accepted_in_append_mode`、`tests::a_client_system_prompt_is_appended_after_our_instructions`（bin），集成 `acp_capabilities_test` 两条（`model_factory`：能力位 `is_none()` + 带 prompt 的 `session/new` 报 `INVALID_PARAMS`；`session_factory`：能力位 `is_some()` + `SessionBuild.system_prompt` 真的传到工厂 + `override` 被拒且不建会话） |
 | `ACP-42` | 已完成 | `AcpCodingAgent::shutdown_sessions()`：`run_with_transport` 的 `connect_to(...).await` 返回后先停 wakeup 循环，再 drain 会话（`close()` + `cancel_and_wait(5s)`）并清空 `session/load|list` 的 catalog agent 缓存。事件队列不需额外 flush：队列是**每轮**新建的（`session.rs::run_prompt_inner`），轮次返回时 sink 已 drop。`connect_to` 本身就在 termination 时返回，所以没有额外 await `termination()`（避免两套清理路径）。测试：`coding_agent::tests::a_terminated_connection_releases_its_sessions`（反向验证：注释掉 `session.close()` → FAILED） |
 | `ACP-43` | 已完成（现状已满足） | `rg 'debug!'` 审查：本 crate 的 debug 日志只记路径/字节数/规则条数/会话 id，**无** request/response 全量 body；全程未用 `AcpAgent::with_debug`，不存在未脱敏的令牌打印 |
@@ -449,3 +449,38 @@ Form 模式用受限 JSON Schema（扁平 `object`）描述请求内容，`Elici
 **本轮收尾清理**：删掉 `AcpAgentSession::mcp_acp_connections`（无握手协议下已无读取点，纯只写 keep-alive）；`is_archived_on_disk`/`set_archived_on_disk` 收为 `pub(crate)`；`shutdown_sessions` 改 `futures::future::join_all` 并发释放（每条仍 5s 有界）；MCP-over-ACP 内层错误改用 `Error::new(INTERNAL_ERROR, msg)`（信息进 `message` 而非 `data`，客户端可见）。
 
 **下一步（B4，可选）**：`ACP-39`（subagents 上报，前置阻塞：core `AgentEventEmitter` 无使用点，需先实现子智能体事件回灌父流）、`ACP-40`（fork，仍暂缓，见 `ACP-D13`）。B0–B3 已全部落地；`ACP-U01..U08` 与 `ACP-33..ACP-38`、`ACP-41..ACP-45` 均有结论。
+
+#### 2026-11-04 会话生命周期修复（creation record + known_workspaces）
+
+三个外部报障的根因都是「会话在磁盘上没有任何痕迹」：`session/new` 不写 journal（没有 prompt 就没有 turn），config sidecar 又只在用户改过 model/mode 时才落盘，归档标记是**唯一**的磁盘痕迹——一删就什么都不剩，而 `session_workspace()` 只能按「注册表 cwd + `session/list` 建过的索引 agent」去猜 cwd。
+
+| 缺陷 | 修复 | 守护测试 |
+|---|---|---|
+| `session/unarchive` 非幂等：磁盘-only 会话首次 unarchive 删掉标记后，第二次 `-32002` | `AcpAgentSession::new` 在创建时即 `persist_config()`，把 config sidecar 当作**creation record**（`session.rs::is_recorded_on_disk` / `recorded_session_ids`）；`session_workspace()` 的探测条件改为「creation record **或** archive marker 或 journal 键」，unarchive 因此天然幂等 | `archiving_a_session_that_never_prompted_keeps_it_resolvable`（连续两次 unarchive） |
+| 归档后 `session/status`/`session/resume` 对「建了但从未 prompt」的会话一律 `-32002` | 新增 `AcpCodingAgent::known_workspaces: Mutex<Vec<PathBuf>>`（只存路径，由 `register_session`/`catalog_agent` 填充），`session_workspace()` 不再只依赖 `catalog_agents.keys()`：归档释放会话后 cwd 仍在集合里；`session_exists()` 先查 creation record，再探 journal head | 同上（归档后 `status == Saved`）+ `a_session_created_without_a_prompt_survives_a_restart` |
+| `session/list` 只列 journal 持久化的会话，`session/new` 后未发消息的会话（含 `archived: include`）不出现 | `session_infos()` 在 journal 键之外合并 `recorded_session_ids(cwd)`（`BTreeSet` 去重），每条仍按 marker 报 `archived`；`session/delete` 新增 `session.rs::forget_session_on_disk`（删 record + marker），否则被删的未 prompt 会话会重新出现在 list 里 | `a_session_created_without_a_prompt_survives_a_restart`（默认过滤 + `Include`）、`deleting_a_session_created_without_a_prompt_hides_it_again` |
+
+反向验证（均已还原）：①注释掉 `session.persist_config()` → 前两个测试 FAILED（`:665`、`:728`）；②去掉 `register_session` 的 `note_workspace()` → `archiving_a_session_that_never_prompted_keeps_it_resolvable` FAILED（`:665`，归档后 status 报 `-32002`）。
+
+**注意（行为变更）**：`session/load|resume` 也会在 workspace 里留下 creation record；`session/delete` 现在会删掉 record 与 archive marker（journal 仍由 harness 拥有，未动）。`known_workspaces` 只增长路径串，不做上限（`catalog_agents` 仍限 `MAX_CATALOG_AGENTS = 4`）。
+
+**验证（2026-11-04）**：`cargo test -p agentscope-extensions-acp -j 2 --no-fail-fast` → **14 targets 全 ok / EXITCODE=0**（lib 85、`acp_capabilities_test` **8**）；`cargo fmt --all -- --check` exit 0；`cargo check -p agentscope-extensions-acp --all-targets` exit 0；`cargo check -p agentscope-extensions-acp --no-default-features --features lite --bins` exit 0。
+
+#### 2026-11-04（续）`session/delete` 真正删除 journal + 归档还原后可续聊
+
+`SessionLogStore::delete` 一直只有「不支持」的默认实现，`session/delete` 因此只清注册表：跑过至少一轮的会话被删后仍能被 `list_session_keys` 发现、仍能被 `session/load` 读回（「删了还在」）。补链条：
+
+| 层 | 变更 |
+|---|---|
+| harness `agent/session/storage.rs` | `WorkspaceSessionLogStore::delete`：对 `key.storage_path()` 与 `key.legacy_storage_path()` 各删一次子树（旧版本写在 `agents/...`，留下会被再次发现）；不存在则跳过，重复删除为 no-op |
+| core `session/in_memory.rs` | `InMemorySessionLogStore::delete`：从 `stores` 移除该 key（原先只有 unsupported 默认） |
+| harness `agent/harness_agent.rs` | 新增 `HarnessAgent::delete_session(&RuntimeContext)`：`session_key(context)` + `store.delete(&key)`，与 `list_session_keys`/`session_log` 用同一 key 解析 |
+| acp `coding_agent.rs` | `session/delete` 新增 `forget_session()`：活跃会话用**该会话自己的** `agent`（turn 写入用的同一 agent 身份），否则用 `catalog_agent(cwd)`；`delete_session` 失败只 WARN（不因后端不支持删除而回滚已完成的协议调用），随后 `forget_session_on_disk`（record + marker） |
+
+新增测试：`deleting_a_persisted_session_removes_its_history`（跨重启：list 可见 → delete → list 消失 + `session/load` 报 `-32002`）、harness 单测 `deleting_a_session_removes_the_journal_and_its_legacy_copy`、`an_unarchived_session_replays_its_history_and_keeps_going`（归档 → 重启 → `list(include)` → unarchive → load 回放出 `USER:hello` → 再发一轮）。
+
+**归档/还原语义（已确认支持）**：归档只写 marker + 按 `session/close` 释放（journal 保留）、unarchive 只删 marker；还原后用 `session/load`（回放全部历史）或 `session/resume`（不重放）重新打开，会话继续写**同一个** journal，历史与后续轮次连续。反向验证（已还原）：把 `WorkspaceSessionLogStore::delete` 临时改成 no-op → `deleting_a_persisted_session_removes_its_history` FAILED（`:911`，删除后仍被 list）。
+
+**前提（协议限制，非缺陷）**：`session/status|archive|unarchive` 都不带 `cwd`，而 record/marker/journal 全是 workspace 内状态；进程重启后必须先有一次带该 `cwd` 的 `session/list`（归档会话要带 `archived: include/only`）才能定位 workspace，否则按「未知会话」返回 `-32002`。IDE 恢复历史列表时天然满足这个顺序。
+
+**验证（续）**：`cargo test -p agentscope-core --lib` → **466 passed / 3 ignored**；`cargo test -p agentscope-harness --lib` → **625 passed**（基线 624）；`cargo test -p agentscope-extensions-acp -j 2 --no-fail-fast` → **14 targets 全 ok**（`acp_capabilities_test` **10**）；`cargo fmt --all -- --check` exit 0；acp `--all-targets` / `--no-default-features --features lite --bins` 均 exit 0。
