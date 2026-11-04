@@ -145,7 +145,7 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 | `initialize` | 协商协议版本与客户端能力，返回 agent 能力与身份 |
 | `session/new` | 新建会话，返回 `modes` 与 `config_options`；同时桥接客户端声明的 MCP server |
 | `session/prompt` | 跑一轮对话；支持图像输入（按所选模型能力）、客户端 `embedded_context` |
-| `session/cancel` | 取消当前 turn（`StopReason::Cancelled`） |
+| `session/cancel` | 取消当前 turn（`StopReason::Cancelled`）；参数是子会话 id 时改为中断该子代理 |
 | `session/set_mode` | 切换 `plan` / `accept_edits` / `yolo` |
 | `session/set_config_option` | 切换 `model` / `thought_level` |
 | `session/load` · `session/resume` | 从 journal 恢复会话 |
@@ -161,6 +161,26 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 
 只有在客户端声明了相应能力时才会发送：`session/notice`（会话提示）、压缩进度、plan 操作通知、
 `end_turn` 的 token usage、MCP over ACP。没声明就不会收到，也不会报错。
+
+### 子代理进度（`subagent_update`，`clientCapabilities.subagents`）
+
+客户端的 `clientCapabilities` 里带 `subagents: {}` 时，本 agent 会把 `agent_spawn` 起的子代理
+运行过程实时上报（不稳定特性，需要 SDK 的 `unstable_subagents`）：
+
+| 帧 | 外层 `sessionId` | 内容 |
+| --- | --- | --- |
+| `subagent_update` | 父会话 | `sessionId`（子会话）、`title`/`description`、`capabilities.cancel: {}`、`state.state = running` |
+| `agent_message_chunk` / `agent_thought_chunk` / `tool_call*` | **子会话** | 子代理的输出，`messageId` 形如 `sub-<child>`，与父 turn 的消息 id 不同 |
+| `subagent_update` | 父会话 | `state.state = idle`（失败时先发一条 `notice`）；子会话随后仍可用 `agent_send` 继续 |
+
+约束：
+
+- **公告先到**：子会话的任何一条 chunk 之前必定先有一条 `subagent_update`（客户端按外层 id 认领子会话）。
+- 非流式的一次性回复会在 `AgentResult` 时补成一条 `agent_message_chunk`（已流式的内容不会重复）。
+- 客户端没声明 `subagents` 时**完全静默**（不发 `subagent_update`，也不发子会话 chunk），退回普通 tool_call 形态。
+- `session/cancel` 发到子会话 id 会中断该子代理（不会改动父 turn）；`session/close` 会中断该会话下所有子代理。
+- 子会话（`sub-*`）不出现在 `session/list` / `session/status` / `session/load` 里：它们不是用户会话。
+- 只支持一层父子，子代理内部再 spawn 的子代理不上报。
 
 认证方法不门控：`initialize` 总是返回一条 terminal 类型的认证方法（id `setup`，`args: ["--setup"]`），
 客户端据此在自己的终端里拉起 `acp_harness_agent --setup`。注册表校验发的是空 `clientCapabilities`

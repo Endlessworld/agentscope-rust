@@ -80,6 +80,15 @@ impl ClientSupport {
         self.capabilities.read().unwrap().plan.is_some()
     }
 
+    /// Whether the client advertised `subagents` (`clientCapabilities.subagents`).
+    ///
+    /// Gates every subagent frame *and* the subagent event channel: a client that did not
+    /// advertise it parses notifications strictly, and an unknown `subagent_update` would end
+    /// the connection instead of being ignored.
+    pub fn supports_subagents(&self) -> bool {
+        self.capabilities.read().unwrap().subagents.is_some()
+    }
+
     /// Whether the client advertised form-based elicitation (`elicitation.form`).
     ///
     /// Per the elicitation spec each mode must be advertised *explicitly*: an
@@ -109,6 +118,17 @@ mod tests {
         let support = ClientSupport::new();
         assert!(!support.supports_notices());
         assert!(!support.supports_compaction());
+        assert!(!support.supports_plan_operations());
+        assert!(!support.supports_subagents());
+    }
+
+    #[test]
+    fn subagents_capability_is_detected() {
+        use agent_client_protocol::v1::schema::SubagentCapabilities;
+
+        let support = ClientSupport::new();
+        support.set_capabilities(ClientCapabilities::new().subagents(SubagentCapabilities::new()));
+        assert!(support.supports_subagents());
         assert!(!support.supports_plan_operations());
     }
 

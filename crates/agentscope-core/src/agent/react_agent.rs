@@ -723,10 +723,15 @@ impl ReActAgent {
 
                 let (stream, slot) =
                     this.run_stream_with_extensions(messages, response_format, extensions);
-                let events: Vec<Result<AgentEvent>> = stream.collect().await;
-                for ev in events.into_iter().flatten() {
-                    if let Some(sink) = this.core.subscriber.lock().unwrap().as_ref() {
-                        sink(ev);
+                // Forward each event to the subscriber as it is produced: a caller that renders
+                // progress (e.g. a background subagent streamed to a client) must not receive the
+                // whole run only after the final reply has been produced.
+                let mut stream = stream;
+                while let Some(item) = stream.next().await {
+                    if let Ok(ev) = item {
+                        if let Some(sink) = this.core.subscriber.lock().unwrap().as_ref() {
+                            sink(ev);
+                        }
                     }
                 }
                 let result = slot.lock().unwrap().take().unwrap_or_else(|| {
@@ -1306,6 +1311,10 @@ impl CallableAgent for ReActAgent {
 impl ObservableAgent for ReActAgent {
     fn subscribe(&self, sink: Box<dyn Fn(AgentEvent) + Send + Sync>) {
         *self.core.subscriber.lock().unwrap() = Some(Arc::new(sink));
+    }
+
+    fn unsubscribe(&self) {
+        *self.core.subscriber.lock().unwrap() = None;
     }
 }
 

@@ -1079,6 +1079,7 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         client_support,
         elicitation_slot,
         system_prompt,
+        subagent_events,
     } = ctx;
     let session_id = session_id.as_str();
     let model_config = ModelConfig::load_or_create();
@@ -1201,6 +1202,13 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         // 被中断/崩溃打断后，把悬挂的 tool_use 补成 error result 再续跑，避免
         // ToolCallPairSanitizer 静默丢弃整条 assistant 消息（对齐 Java maybePatchPendingToolCalls）。
         .enable_pending_tool_recovery(true);
+
+    // Subagent progress: the harness streams each spawned subagent's events out of band (a
+    // child keeps running after the parent's prompt returns), and the session forwards them to
+    // the client as `subagent_update` + child-session updates.
+    if let Some(events) = subagent_events {
+        builder = builder.subagent_events(events);
+    }
 
     // Skill support (Open Agent Skills protocol, mirrors Java commit b906d1b):
     // - global:   $HOME/.agents/skills   (installed via `npx skill` globally)

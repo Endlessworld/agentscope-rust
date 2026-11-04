@@ -4,7 +4,7 @@
 //! `AgiHarnessAgent`: maps text/thinking deltas and tool-call progress into ACP
 //! session updates.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use agent_client_protocol::v1::schema::{
@@ -14,6 +14,8 @@ use agent_client_protocol::v1::schema::{
     ToolCallUpdateFields, ToolKind,
 };
 use agentscope_core::event::{AgentEvent, AgentEventType};
+
+use super::support::ClientSupport;
 
 /// Infers an ACP [`ToolKind`] from a tool name so clients can pick the right
 /// icon / UI treatment for a tool call.
@@ -719,11 +721,242 @@ pub fn map_delta_event(
     }
 }
 
+/// Per-child bookkeeping for the subagent forwarding task.
+///
+/// Every child has its own tool-call mapper (two children running tool calls in parallel must
+/// not share call ids) and its own announced/running bookkeeping, so the frames a client
+/// receives per child are exactly the ones the `subagent_update` contract requires.
+#[derive(Default)]
+pub struct SubagentTracker {
+    mappers: HashMap<String, ToolEventMapper>,
+    /// Children already announced with their title / capabilities.
+    announced: HashSet<String>,
+    /// Children whose last reported state was `running`.
+    running: HashSet<String>,
+    /// Children that streamed text during the current turn, so the final reply is not repeated.
+    emitted_text: HashSet<String>,
+}
+
+impl SubagentTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The `message_id` a child's chunks carry.
+    ///
+    /// It is derived from the child session id, never from the parent turn: reusing the parent
+    /// turn's id would make the client merge two sessions' assistant messages.
+    fn message_id(child: &str) -> Option<MessageId> {
+        Some(MessageId::new(format!("sub-{child}")))
+    }
+}
+
+/// Builds the announcement of a child session: title, description, cancel capability and the
+/// `running` state.
+///
+/// This MUST reach the client before any content of that child (the client otherwise drops the
+/// content: it cannot attribute it to a session it never learned about).
+pub fn subagent_started(
+    parent: &SessionId,
+    child: &str,
+    title: &str,
+    description: &str,
+) -> SessionNotification {
+    use agent_client_protocol::v1::schema::{
+        RunningStateUpdate, SessionCancelCapabilities, StateUpdate, SubagentSessionCapabilities,
+        SubagentUpdate,
+    };
+    // `capabilities` is sent exactly once: the schema defines it as a whole-object replacement,
+    // so repeating it on every frame would re-state (and could clear) the child's capability set.
+    let update = SubagentUpdate::new(SessionId::new(child.to_string()))
+        .title(title.to_string())
+        .description(description.to_string())
+        .capabilities(SubagentSessionCapabilities::new().cancel(SessionCancelCapabilities::new()))
+        .state(StateUpdate::Running(RunningStateUpdate::new()));
+    SessionNotification::new(parent.clone(), SessionUpdate::SubagentUpdate(update))
+}
+
+/// Reports that an already announced child is running again (a follow-up `agent_send` turn).
+pub fn subagent_running(parent: &SessionId, child: &str) -> SessionNotification {
+    use agent_client_protocol::v1::schema::{RunningStateUpdate, StateUpdate, SubagentUpdate};
+    SessionNotification::new(
+        parent.clone(),
+        SessionUpdate::SubagentUpdate(
+            SubagentUpdate::new(SessionId::new(child.to_string()))
+                .state(StateUpdate::Running(RunningStateUpdate::new())),
+        ),
+    )
+}
+
+/// Reports that a child stopped working; its session stays addressable for a later turn.
+pub fn subagent_idle(parent: &SessionId, child: &str) -> SessionNotification {
+    use agent_client_protocol::v1::schema::{IdleStateUpdate, StateUpdate, SubagentUpdate};
+    SessionNotification::new(
+        parent.clone(),
+        SessionUpdate::SubagentUpdate(
+            SubagentUpdate::new(SessionId::new(child.to_string()))
+                .state(StateUpdate::Idle(IdleStateUpdate::new())),
+        ),
+    )
+}
+
+/// Recognizes the `subagent_finished` marker the harness emits when a child turn ends, and
+/// returns its `(outcome, error message)`.
+fn subagent_finished(ev: &AgentEvent) -> Option<(String, Option<String>)> {
+    if ev.event_type() != AgentEventType::Custom {
+        return None;
+    }
+    let fields = &ev.data().fields;
+    if fields.get("kind").and_then(|v| v.as_str()) != Some("subagent_finished") {
+        return None;
+    }
+    let outcome = fields
+        .get("outcome")
+        .and_then(|v| v.as_str())
+        .unwrap_or("success")
+        .to_string();
+    let error = fields
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some((outcome, error))
+}
+
+/// The lifecycle point a subagent frame marks, as far as the parent's child routing table
+/// cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentState {
+    /// The child is (or just became) active.
+    Running,
+    /// The child's turn ended; its session stays addressable for a later `agent_send`.
+    Finished,
+}
+
+/// Classifies a frame from the harness's subagent channel.
+pub fn subagent_state(ev: &AgentEvent) -> Option<SubagentState> {
+    if ev.event_type() == AgentEventType::SubagentExposed {
+        return Some(SubagentState::Running);
+    }
+    if subagent_finished(ev).is_some() {
+        return Some(SubagentState::Finished);
+    }
+    match ev.event_type() {
+        AgentEventType::TextBlockDelta
+        | AgentEventType::ThinkingBlockDelta
+        | AgentEventType::ToolCallStart
+        | AgentEventType::ToolCallDelta
+        | AgentEventType::ToolCallEnd
+        | AgentEventType::ToolResultStart
+        | AgentEventType::ToolResultTextDelta
+        | AgentEventType::ToolResultEnd => Some(SubagentState::Running),
+        _ => None,
+    }
+}
+
+/// Translates one `(child, event)` frame from the harness into the `session/update`s a client
+/// renders for that subagent.
+///
+/// The routing rule is the whole contract:
+/// - `subagent_update` frames carry the **parent** session id (they belong to the parent's
+///   transcript and name the child inside),
+/// - the child's own content carries the **child** session id,
+/// - every child content frame is preceded by a `subagent_update`, including the first one.
+///
+/// Returns nothing at all when the client did not advertise `subagents`: an ACP client parses
+/// notifications strictly, so an unknown update variant can end the connection.
+pub fn subagent_notifications(
+    support: &ClientSupport,
+    parent: &SessionId,
+    child: &str,
+    ev: &AgentEvent,
+    tracker: &mut SubagentTracker,
+) -> Vec<SessionNotification> {
+    if !support.supports_subagents() {
+        return Vec::new();
+    }
+    // ① The exposure announces the child (title / description / cancel capability).
+    if ev.event_type() == AgentEventType::SubagentExposed {
+        let fields = &ev.data().fields;
+        let agent_id = fields
+            .get("agentId")
+            .and_then(|v| v.as_str())
+            .unwrap_or(child)
+            .to_string();
+        let label = fields
+            .get("label")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let title = label.unwrap_or_else(|| agent_id.clone());
+        tracker.announced.insert(child.to_string());
+        tracker.running.insert(child.to_string());
+        return vec![subagent_started(
+            parent,
+            child,
+            &title,
+            &format!("agent: {agent_id}"),
+        )];
+    }
+    // ② The child stopped: optional notice, then `idle`. The child stays addressable.
+    if let Some((outcome, error)) = subagent_finished(ev) {
+        let mut out = Vec::new();
+        if outcome == "error" {
+            if support.supports_notices() {
+                out.push(notice(
+                    SessionId::new(child.to_string()),
+                    NoticeSeverity::Warning,
+                    "Subagent failed",
+                    error,
+                ));
+            }
+        }
+        tracker.running.remove(child);
+        tracker.emitted_text.remove(child);
+        out.push(subagent_idle(parent, child));
+        return out;
+    }
+    // ③ Child content. A frame for a child that is not running means a new turn started
+    // (follow-up `agent_send`), or — if the exposure was filtered upstream — the very first
+    // thing the client would see. Either way the announcement comes first.
+    let mut out = Vec::new();
+    if tracker.running.insert(child.to_string()) {
+        if tracker.announced.contains(child) {
+            out.push(subagent_running(parent, child));
+        } else {
+            tracker.announced.insert(child.to_string());
+            out.push(subagent_started(parent, child, child, "agent: (unknown)"));
+        }
+    }
+    let sid = SessionId::new(child.to_string());
+    // A model that answered without streaming produces no deltas at all: the reply only exists
+    // on the result event. Emit it then (never twice: a streamed answer already reached the
+    // client delta by delta).
+    if ev.event_type() == AgentEventType::AgentResult {
+        if tracker.emitted_text.remove(child) {
+            return out;
+        }
+        if let Some(chunk) = map_result_event(sid, ev, SubagentTracker::message_id(child)) {
+            out.push(chunk);
+        }
+        return out;
+    }
+    if let Some(chunk) = map_delta_event(sid.clone(), ev, SubagentTracker::message_id(child)) {
+        tracker.emitted_text.insert(child.to_string());
+        out.push(chunk);
+        return out;
+    }
+    let mapper = tracker.mappers.entry(child.to_string()).or_insert_with(|| {
+        ToolEventMapper::new().with_message_id(SubagentTracker::message_id(child))
+    });
+    out.extend(mapper.map(sid, ev));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_client_protocol::v1::schema::{SessionId, SessionUpdate};
     use agentscope_core::event::{AgentEvent, EventData};
+    use agentscope_core::message::Msg;
 
     fn sid() -> SessionId {
         SessionId::new("s1")
@@ -1134,5 +1367,259 @@ mod tests {
             }
             _ => panic!("expected AgentThoughtChunk"),
         }
+    }
+
+    // ---- subagents (`subagent_update`, ACP `unstable_subagents`) ----
+
+    fn parent() -> SessionId {
+        SessionId::new("parent")
+    }
+
+    fn subagent_support() -> ClientSupport {
+        use agent_client_protocol::v1::schema::{ClientCapabilities, SubagentCapabilities};
+        let support = ClientSupport::new();
+        support.set_capabilities(ClientCapabilities::new().subagents(SubagentCapabilities::new()));
+        support
+    }
+
+    fn exposure(session: &str, agent_id: &str, label: Option<&str>) -> AgentEvent {
+        let mut fields = serde_json::Map::new();
+        fields.insert("subagentId".to_string(), serde_json::json!("agent:key:1"));
+        fields.insert("agentId".to_string(), serde_json::json!(agent_id));
+        fields.insert("sessionId".to_string(), serde_json::json!(session));
+        if let Some(label) = label {
+            fields.insert("label".to_string(), serde_json::json!(label));
+        }
+        AgentEvent::with_fields(AgentEventType::SubagentExposed, fields)
+    }
+
+    fn finished(outcome: &str, error: Option<&str>) -> AgentEvent {
+        let mut fields = serde_json::Map::new();
+        fields.insert("kind".to_string(), serde_json::json!("subagent_finished"));
+        fields.insert("outcome".to_string(), serde_json::json!(outcome));
+        if let Some(error) = error {
+            fields.insert("error".to_string(), serde_json::json!(error));
+        }
+        AgentEvent::with_fields(AgentEventType::Custom, fields)
+    }
+
+    fn text_delta(text: &str) -> AgentEvent {
+        let mut fields = serde_json::Map::new();
+        fields.insert("delta".to_string(), serde_json::json!(text));
+        AgentEvent::with_fields(AgentEventType::TextBlockDelta, fields)
+    }
+
+    #[test]
+    fn the_announcement_serializes_to_the_documented_frame() {
+        let notification = subagent_started(&parent(), "child", "探索仓库结构", "agent: explorer");
+        let value = serde_json::to_value(&notification).expect("serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "sessionId": "parent",
+                "update": {
+                    "sessionUpdate": "subagent_update",
+                    "sessionId": "child",
+                    "title": "探索仓库结构",
+                    "description": "agent: explorer",
+                    "capabilities": {"cancel": {}},
+                    "state": {"state": "running"},
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn child_content_goes_to_the_child_session_and_the_announcement_to_the_parent() {
+        let support = subagent_support();
+        let mut tracker = SubagentTracker::new();
+        let mut frames = subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &exposure("child", "explorer", Some("探索仓库结构")),
+            &mut tracker,
+        );
+        frames.extend(subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &text_delta("发现 3 个模块"),
+            &mut tracker,
+        ));
+        assert_eq!(frames.len(), 2);
+        // The outer session id is what the client routes on: the announcement belongs to the
+        // parent, the child's own content to the child.
+        assert_eq!(frames[0].session_id.to_string(), "parent");
+        assert_eq!(frames[1].session_id.to_string(), "child");
+        match (&frames[0].update, &frames[1].update) {
+            (SessionUpdate::SubagentUpdate(update), SessionUpdate::AgentMessageChunk(chunk)) => {
+                assert_eq!(update.session_id.to_string(), "child");
+                // Never the parent turn's message id: the client would merge the two sessions.
+                assert_eq!(chunk.message_id.clone(), Some(MessageId::new("sub-child")));
+            }
+            _ => panic!("expected subagent_update followed by agent_message_chunk"),
+        }
+    }
+
+    #[test]
+    fn a_child_frame_is_always_preceded_by_an_announcement() {
+        // The exposure rides the parent's stream and may be filtered or delayed; a host that
+        // renders the first child chunk anyway would paint into a session it never learned
+        // about (the client drops it).
+        let support = subagent_support();
+        let mut tracker = SubagentTracker::new();
+        let frames = subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &text_delta("hello"),
+            &mut tracker,
+        );
+        assert_eq!(frames.len(), 2);
+        assert!(matches!(frames[0].update, SessionUpdate::SubagentUpdate(_)));
+        assert_eq!(frames[0].session_id.to_string(), "parent");
+    }
+
+    #[test]
+    fn a_finished_child_is_reported_idle_with_a_notice_only_on_error() {
+        let support = subagent_support();
+        let mut tracker = subagent_tracker_with_child(&support);
+        let frames = subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &finished("success", None),
+            &mut tracker,
+        );
+        assert_eq!(frames.len(), 1);
+        let value = serde_json::to_value(&frames[0]).expect("serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "sessionId": "parent",
+                "update": {
+                    "sessionUpdate": "subagent_update",
+                    "sessionId": "child",
+                    "state": {"state": "idle"},
+                }
+            })
+        );
+
+        // A failure explains itself first, but only when the client renders notices.
+        let mut tracker = subagent_tracker_with_child(&support);
+        let frames = subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &finished("error", Some("boom")),
+            &mut tracker,
+        );
+        assert_eq!(frames.len(), 1, "no notice when the capability is absent");
+        assert!(matches!(frames[0].update, SessionUpdate::SubagentUpdate(_)));
+    }
+
+    #[test]
+    fn nothing_is_sent_when_the_client_did_not_advertise_subagents() {
+        // An ACP client parses notifications strictly: an unknown `sessionUpdate` can end the
+        // connection, so an unadvertised capability must silence both frame kinds.
+        let support = ClientSupport::new();
+        assert!(!support.supports_subagents());
+        let mut tracker = SubagentTracker::new();
+        assert!(subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &exposure("child", "explorer", None),
+            &mut tracker,
+        )
+        .is_empty());
+        assert!(subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &text_delta("hello"),
+            &mut tracker,
+        )
+        .is_empty());
+        assert!(subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &finished("success", None),
+            &mut tracker,
+        )
+        .is_empty());
+    }
+
+    fn subagent_tracker_with_child(support: &ClientSupport) -> SubagentTracker {
+        let mut tracker = SubagentTracker::new();
+        let frames = subagent_notifications(
+            support,
+            &parent(),
+            "child",
+            &exposure("child", "explorer", Some("探索仓库结构")),
+            &mut tracker,
+        );
+        assert_eq!(frames.len(), 1);
+        tracker
+    }
+
+    #[test]
+    fn a_child_that_did_not_stream_still_reaches_the_client() {
+        // A provider that answers in one shot emits no delta: without the result mapping the
+        // subagent panel would stay empty for its whole run.
+        let support = subagent_support();
+        let mut tracker = subagent_tracker_with_child(&support);
+        let reply = Msg::assistant("no-delta answer");
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "reply".to_string(),
+            serde_json::to_value(&reply).expect("reply serializes"),
+        );
+        let frames = subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &AgentEvent::with_fields(AgentEventType::AgentResult, fields),
+            &mut tracker,
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].session_id.to_string(), "child");
+        match &frames[0].update {
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                assert_eq!(chunk.message_id, Some(MessageId::new("sub-child")));
+            }
+            _ => panic!("expected agent_message_chunk"),
+        }
+    }
+
+    #[test]
+    fn a_streamed_child_answer_is_not_repeated_by_its_result() {
+        let support = subagent_support();
+        let mut tracker = subagent_tracker_with_child(&support);
+        let streamed = subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &text_delta("streamed"),
+            &mut tracker,
+        );
+        assert_eq!(streamed.len(), 1);
+
+        let reply = Msg::assistant("streamed");
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "reply".to_string(),
+            serde_json::to_value(&reply).expect("reply serializes"),
+        );
+        let frames = subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &AgentEvent::with_fields(AgentEventType::AgentResult, fields),
+            &mut tracker,
+        );
+        assert!(frames.is_empty(), "the reply was already streamed");
     }
 }

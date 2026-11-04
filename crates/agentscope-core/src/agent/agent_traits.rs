@@ -1,5 +1,7 @@
 //! Agent abstraction traits, mirroring `io.agentscope.core.agent.Agent`,
 //! `CallableAgent` and `ObservableAgent`.
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::error::Result;
@@ -43,6 +45,21 @@ pub trait CallableAgent: Agent {
         self.call(messages).await
     }
 
+    /// Runs the agent while forwarding each execution event to `sink`.
+    ///
+    /// The default implementation ignores the sink and is exactly [`Self::call`], so an agent
+    /// without an observable event stream stays usable. `HarnessAgent` overrides it: a caller
+    /// that drives a background subagent only sees the final reply through `call`, which leaves
+    /// the subagent's progress unreachable for a host that wants to render it.
+    async fn call_streaming(
+        &self,
+        messages: Vec<Msg>,
+        sink: Arc<dyn Fn(AgentEvent) + Send + Sync>,
+    ) -> Result<Msg> {
+        let _ = sink;
+        self.call(messages).await
+    }
+
     /// Structured output: runs the agent with the given JSON schema and stores the
     /// parsed JSON reply in the returned message's structured-output metadata.
     async fn call_with_schema(&self, messages: Vec<Msg>, schema: JsonSchema) -> Result<Msg>;
@@ -62,4 +79,10 @@ pub trait CallableAgent: Agent {
 pub trait ObservableAgent: Agent {
     /// Registers a sink that receives every event emitted during execution.
     fn subscribe(&self, sink: Box<dyn Fn(AgentEvent) + Send + Sync>);
+
+    /// Removes the sink registered by [`Self::subscribe`], if any.
+    ///
+    /// Default: no-op. An agent whose sink is a single slot (a later `subscribe` replaces it)
+    /// clears it so a finished run cannot keep forwarding into a channel nobody reads.
+    fn unsubscribe(&self) {}
 }

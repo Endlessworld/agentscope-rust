@@ -152,6 +152,13 @@ pub struct SessionBuild {
     /// (`systemPrompt.mode = append`). Already validated: never empty, and only
     /// `append` reaches here — `override` is rejected by the handler.
     pub system_prompt: Option<String>,
+    /// Out-of-band channel the harness streams subagent frames into.
+    ///
+    /// The factory forwards it to the agent builder (`HarnessAgentBuilder::subagent_events`);
+    /// [`AcpAgentSession`] keeps the receiving end and starts the forwarder on the first prompt.
+    /// `None` for the agents built only to probe a workspace (`session/exists`, `session/list`):
+    /// they never spawn a subagent.
+    pub subagent_events: Option<agentscope_harness::tool::SubagentEventSink>,
 }
 
 /// An ACP CodingAgent with a session registry and a factory for building the
@@ -198,6 +205,12 @@ pub struct AcpCodingAgent {
     /// default answer is `not_required`; a host that owns the credentials (the ACP
     /// binary reads `~/.agentscope/models.json`) supplies the honest state.
     auth_probe: Arc<dyn Fn() -> AuthState + Send + Sync>,
+    /// Child session id → the ACP session that spawned it.
+    ///
+    /// A child session is not a registered session: a client cancels it by sending
+    /// `session/cancel` addressed to the child id, which only this map can route to the
+    /// session that owns the subagent.
+    subagent_children: Arc<Mutex<HashMap<String, String>>>,
 }
 
 const IMAGE_SUPPORT_NO: u8 = 1;
@@ -298,6 +311,7 @@ impl AcpCodingAgent {
             known_workspaces: Mutex::new(Vec::new()),
             image_support: ImageSupport::default(),
             auth_probe: Arc::new(|| AuthState::NotRequired),
+            subagent_children: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -416,6 +430,10 @@ impl AcpCodingAgent {
         // tool can be baked into the toolkit at build time — that is what makes
         // subagents inherit it, since the blueprint snapshots the toolkit once.
         let elicitation_slot: ElicitationSlot = Arc::new(Mutex::new(None));
+        // Subagent progress: the harness streams `(child session, event)` frames, the session
+        // forwards them to the client. Only a real session gets the channel -- the agents built
+        // to probe a workspace never run anything.
+        let (subagent_events, subagent_frames) = tokio::sync::mpsc::unbounded_channel();
         let agent = match &self.session_factory {
             Some(factory) => factory(SessionBuild {
                 cwd: cwd.clone(),
@@ -423,6 +441,7 @@ impl AcpCodingAgent {
                 client_support: self.client_support.clone(),
                 elicitation_slot: Arc::clone(&elicitation_slot),
                 system_prompt,
+                subagent_events: Some(subagent_events),
             }),
             None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
         };
@@ -434,6 +453,8 @@ impl AcpCodingAgent {
             self.modes.clone(),
         );
         session.set_elicitation_slot(elicitation_slot);
+        session.set_subagent_events(subagent_frames);
+        session.set_subagent_children(Arc::clone(&self.subagent_children));
         // Clones share the same underlying capability store, so a late
         // `initialize` still gates this session's optional updates correctly.
         session.set_client_support(self.client_support.clone());
@@ -556,6 +577,15 @@ impl AcpCodingAgent {
             .cloned()
     }
 
+    /// The ACP session that owns `child`, for a `session/cancel` addressed to a subagent.
+    fn subagent_parent(&self, child: &SessionId) -> Option<SessionId> {
+        self.subagent_children
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&child.to_string())
+            .map(|parent| SessionId::new(parent.clone()))
+    }
+
     /// Releases every session once the connection is gone (ACP-42).
     ///
     /// A prompt turn runs on a spawned task, so a client that disconnects mid-turn would
@@ -595,6 +625,11 @@ impl AcpCodingAgent {
     /// workspace is the durable authority, so probe it before building anything: the creation
     /// record covers a session that never ran a turn, the journal one that did.
     async fn session_exists(&self, session_id: &SessionId, cwd: PathBuf) -> bool {
+        // A subagent's session journals like a user session, but it is not one: loading it
+        // would open a child transcript as a top-level conversation.
+        if is_subagent_session(session_id) {
+            return false;
+        }
         // A session created but never prompted has no journal yet: the creation record the
         // workspace wrote on `session/new` is the durable proof that the id is not a typo.
         if super::session::is_recorded_on_disk(&cwd, session_id) {
@@ -607,6 +642,7 @@ impl AcpCodingAgent {
                 client_support: self.client_support.clone(),
                 elicitation_slot: Arc::new(Mutex::new(None)),
                 system_prompt: None,
+                subagent_events: None,
             }),
             None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
         };
@@ -643,6 +679,11 @@ impl AcpCodingAgent {
     /// persisted somewhere never seen here reads as unknown, which is what a client that never
     /// named that directory should conclude anyway.
     async fn session_workspace(&self, session_id: &SessionId) -> Option<PathBuf> {
+        // Subagent sessions live in the same journal as their parent but are not user sessions:
+        // `session/status` on one must read as unknown, not as a loadable session.
+        if is_subagent_session(session_id) {
+            return None;
+        }
         let mut cwds: Vec<PathBuf> = {
             let guard = self
                 .sessions
@@ -792,6 +833,9 @@ impl AcpCodingAgent {
         // after the sort would leave a persisted duplicate of an in-memory session in place.
         let mut seen_ids = std::collections::HashSet::new();
         infos.retain(|info| seen_ids.insert(info.session_id.to_string()));
+        // Subagent sessions (`sub-*`) journal like any other agent, but they are not user
+        // sessions: a client must never offer one for load / resume / delete.
+        infos.retain(|info| !is_subagent_session(&info.session_id));
         // Archive filter first: the spec applies it before pagination and combines it with cwd.
         // `Other(_)` is rejected by the handler, so here it falls through as "no filtering".
         match filter {
@@ -844,6 +888,7 @@ impl AcpCodingAgent {
                 client_support: self.client_support.clone(),
                 elicitation_slot: Arc::new(Mutex::new(None)),
                 system_prompt: None,
+                subagent_events: None,
             }),
             None => (self.model_factory)(cwd.to_path_buf(), CATALOG_SESSION_ID),
         });
@@ -1045,6 +1090,12 @@ impl AcpCodingAgent {
                 async move |notif: CancelNotification, _cx| {
                     if let Some(session) = a_cancel.get_session(&notif.session_id) {
                         session.cancel();
+                    } else if let Some(parent) = a_cancel.subagent_parent(&notif.session_id) {
+                        // A child session is not a registered session: the client cancels it by
+                        // naming the child, and the parent owns the agent that must be stopped.
+                        if let Some(session) = a_cancel.get_session(&parent) {
+                            session.cancel_subagent(&notif.session_id);
+                        }
                     }
                     Ok(())
                 },
@@ -1560,6 +1611,16 @@ async fn handle_ext_respond(
             agent_client_protocol::Error::internal_error().data(error.to_string()),
         ),
     }
+}
+
+/// Whether `session_id` names a subagent's session (`sub-<uuid>`, as minted by `agent_spawn`)
+/// rather than a user session.
+///
+/// Subagents journal under their own key, so a workspace's session index contains them. They
+/// are not user-facing sessions: listing one would offer `session/load` on a transcript the
+/// client never opened, and `session/delete` would remove a child a live parent still uses.
+fn is_subagent_session(session_id: &SessionId) -> bool {
+    session_id.to_string().starts_with("sub-")
 }
 
 /// Orders `session/list` entries: most recently active first.

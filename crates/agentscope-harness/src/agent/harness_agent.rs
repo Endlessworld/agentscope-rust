@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agentscope_core::agent::{Agent, CallableAgent, ReActAgent, RuntimeContext, StreamOptions};
+use agentscope_core::agent::{
+    Agent, CallableAgent, ObservableAgent, ReActAgent, RuntimeContext, StreamOptions,
+};
 use agentscope_core::event::AgentEvent;
 use agentscope_core::message::Msg;
 use agentscope_core::middleware::MiddlewareChain;
@@ -71,7 +73,8 @@ use super::workspace::{
 use crate::tool::{
     AgentListTool, AgentSendTool, AgentSpawnTool, ArtifactDeliveryTool, FilesystemTool,
     MemoryGetTool, MemorySaveTool, MemorySearchTool, PlanModeHandle, SessionSearchTool,
-    ShellExecuteTool, SubagentExposureSink, TeamTool, WebFetchTool, WebSearchTool,
+    ShellExecuteTool, SubagentEventSink, SubagentExposureSink, TeamTool, WebFetchTool,
+    WebSearchTool,
 };
 
 /// A harness agent that operates on a filesystem with a configured toolkit and middleware chain.
@@ -137,6 +140,12 @@ pub struct HarnessAgent {
     /// set, [`HarnessAgent::set_model`] publishes the new model through it so
     /// children spawned after the switch are built with it.
     subagent_model_slot: SharedModelSlot,
+    /// The `agent_spawn` tool this agent registered, when subagents are enabled.
+    ///
+    /// Exposed so a host can act on live subagents it did not create itself: an ACP client
+    /// cancels a child by sending `session/cancel` addressed to the child's session id, which
+    /// only this tool can route to the running agent.
+    spawn_tool: Option<Arc<AgentSpawnTool>>,
 }
 
 /// The default maximum reasoning→acting iterations used when none is configured.
@@ -371,6 +380,11 @@ impl HarnessAgent {
     /// The embedded ReAct agent driving the reasoning→acting loop, if a model was configured.
     pub fn agent(&self) -> Option<&ReActAgent> {
         self.agent.as_ref()
+    }
+
+    /// The `agent_spawn` tool this agent registered, when subagents are enabled.
+    pub fn spawn_tool(&self) -> Option<&Arc<AgentSpawnTool>> {
+        self.spawn_tool.as_ref()
     }
 
     /// The native journal identity for `context`, or `None` when history is not
@@ -748,6 +762,26 @@ impl CallableAgent for HarnessAgent {
             None => Err(no_model_error()),
         }
     }
+
+    /// Runs the embedded agent while streaming its events to `sink`.
+    ///
+    /// The sink is the single-slot subscriber of [`ReActAgent`], and it is cleared once the run
+    /// returns: a persistent subagent (`agent_key`) is called once per `agent_send`, so leaving
+    /// the sink registered would forward a later turn's events into a channel the host has
+    /// already retired.
+    async fn call_streaming(
+        &self,
+        messages: Vec<Msg>,
+        sink: Arc<dyn Fn(agentscope_core::event::AgentEvent) + Send + Sync>,
+    ) -> agentscope_core::error::Result<Msg> {
+        let Some(agent) = self.agent.as_ref() else {
+            return Err(no_model_error());
+        };
+        agent.subscribe(Box::new(move |event| sink(event)));
+        let result = agent.call(messages).await;
+        agent.unsubscribe();
+        result
+    }
 }
 
 /// Error returned when a `HarnessAgent` was built without a model.
@@ -833,6 +867,8 @@ pub struct HarnessAgentBuilder {
     disable_compaction: bool,
     disable_subagents: bool,
     disable_dynamic_subagents: bool,
+    /// Out-of-band channel for subagent progress (see [`HarnessAgent::spawn_tool`]).
+    subagent_events: Option<SubagentEventSink>,
     disable_shell_tool: bool,
     /// Compaction of grep-like `execute` output (see [`crate::tool::CompactConfig`]).
     shell_output_compaction: CompactConfig,
@@ -975,6 +1011,7 @@ impl Default for HarnessAgentBuilder {
             disable_compaction: false,
             disable_subagents: false,
             disable_dynamic_subagents: false,
+            subagent_events: None,
             disable_shell_tool: false,
             shell_output_compaction: CompactConfig::from_env(),
             agent_tracing_log_enabled: true,
@@ -1410,6 +1447,16 @@ impl HarnessAgentBuilder {
     /// Uses the static `SubagentsMiddleware` instead of the dynamic variant.
     pub fn disable_dynamic_subagents(mut self) -> Self {
         self.disable_dynamic_subagents = true;
+        self
+    }
+
+    /// Streams each spawned subagent's events to `sink`, tagged with the child's session id.
+    ///
+    /// The subagent middleware already tells the *model* that a subagent exists; this channel
+    /// is for a *host* (an ACP client rendering `subagent_update`): the child keeps running
+    /// after the parent's prompt returns, so the frames cannot ride the parent's event stream.
+    pub fn subagent_events(mut self, sink: SubagentEventSink) -> Self {
+        self.subagent_events = Some(sink);
         self
     }
 
@@ -2497,6 +2544,9 @@ impl HarnessAgentBuilder {
         // build-time snapshot. Created unconditionally; only consumed when the
         // subagent block below assembles the factories.
         let subagent_model_slot = SharedModelSlot::new(self.model.as_ref().map(Arc::clone));
+        // The `agent_spawn` tool is created inside the subagent block but is needed after the
+        // agent exists (a host routes `session/cancel` on a child session through it).
+        let mut spawn_tool: Option<Arc<AgentSpawnTool>> = None;
         if !self.leaf_subagent && !self.disable_subagents && self.model.is_some() {
             let blueprint = Arc::new(SubagentBlueprint {
                 model: subagent_model_slot.clone(),
@@ -2590,11 +2640,15 @@ impl HarnessAgentBuilder {
             // A tool call cannot reach the agent's event stream, so `agent_spawn` records the
             // exposure here and the subagent middleware announces it at the next step.
             let exposure_sink = SubagentExposureSink::new();
-            let spawn_tool = Arc::new(
-                AgentSpawnTool::new(Arc::clone(&manager))
-                    .with_task_repository(Arc::clone(&task_repo))
-                    .with_exposure_sink(exposure_sink.clone()),
-            );
+            let mut spawn_builder = AgentSpawnTool::new(Arc::clone(&manager))
+                .with_task_repository(Arc::clone(&task_repo))
+                .with_exposure_sink(exposure_sink.clone());
+            if let Some(events) = self.subagent_events.clone() {
+                spawn_builder = spawn_builder.with_event_sink(events);
+            }
+            let spawn_tool_arc = Arc::new(spawn_builder);
+            spawn_tool = Some(Arc::clone(&spawn_tool_arc));
+            let spawn_tool = spawn_tool_arc;
             let agent_tools: Vec<Arc<dyn Tool>> = vec![
                 Arc::clone(&spawn_tool) as Arc<dyn Tool>,
                 Arc::new(AgentSendTool::new(Arc::clone(&spawn_tool))) as Arc<dyn Tool>,
@@ -2845,6 +2899,7 @@ impl HarnessAgentBuilder {
             session_log_store,
             shutdown_manager,
             subagent_model_slot,
+            spawn_tool,
         };
 
         // Host/extension attach point: the callback sees the finished agent (post tool

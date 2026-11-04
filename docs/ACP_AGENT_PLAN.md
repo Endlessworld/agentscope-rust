@@ -31,7 +31,7 @@
 - ACP 协议 v2（`unstable_protocol_v2`，后续；注意它**不在**聚合 `unstable` feature 内，需显式开启）
 - proxy chains（`proxy/initialize`、`proxy/successor`）：纯 agent 不必实现（`ACP-D08`）
 - `session/fork`：需会话存储「复制历史」原语，暂缓（`ACP-D13`）
-- `unstable_subagents` 上报：阻塞于「子智能体事件回灌父流」，见 `ACP-39`
+- `unstable_subagents` 上报：✅ 已实现（`ACP-39`，出带通道 + `subagent_update`），见 `docs/ACP_AGENT__GAP_TRACKER.md` §6.9
 
 ## 2. 依赖与 API 映射（Kotlin/Java → Rust）
 
@@ -44,7 +44,7 @@
 | `SessionUpdate.AgentThoughtChunk` | `SessionUpdate::AgentThoughtChunk` | 思考流 |
 | `SessionUpdate.ToolCall/Update` | `SessionUpdate::ToolCall` / `ToolCallUpdate` | 工具进度 |
 | `SessionUpdate.UsageUpdate` | `SessionUpdate::UsageUpdate` | 用量 |
-| `SessionUpdate.SubagentUpdate` | `SessionUpdate::SubagentUpdate`（`unstable_subagents`） | 子会话上报（未接，见 `ACP-39`） |
+| `SessionUpdate.SubagentUpdate` | `SessionUpdate::SubagentUpdate`（`unstable_subagents`） | 子会话上报（已接，见 `ACP-39`） |
 | `PromptResponse(StopReason.END_TURN)` | `v1::schema::PromptResponse::new(StopReason::EndTurn)` | 回合结束 |
 | `ClientSessionOperations.requestPermissions` | `v1::schema::RequestPermissionRequest`（客户端发） | 权限 HITL |
 | `LocalAgent`（ReActAgent 包装） | `agentscope_core::agent::ReActAgent` | 核心循环 |
@@ -162,7 +162,7 @@ ACP Client ──stdio──> AcpCodingAgent (Agent.v1()；2.2.0 口径 Agent.bu
 2. **MCP 协议形态变更**：不只是改名——没有握手、`requestId` 由我们生成且需跨代理稳定、内层错误有自己的 `McpError` 通道。缓解：把 `mcp_over_acp.rs` 当新模块重写，用 `McpRequestId(Uuid)` 每次调用新建，错误转成工具错误文本。
 3. **wire 行为差异**：`otherwise_ignore` 未匹配请求从静默改为回 `-32601`；responder 被 drop 会自动回错。缓解：先跑现有 3 个相关测试文件（`acp_elicitation_test` / `acp_interrupted_turn_test` / `acp_load_replay_test`，共 6 处 `otherwise_ignore`），观察客户端侧是否出现新错误。
 4. **无背压 / 单 dispatch loop**：SDK 每连接一个 dispatch loop，内部全 `unbounded` 队列，parked 队列 1024 上限丢最旧；在 ordered callback 里 await 其它入站请求会死锁。缓解：长任务继续丢我们自己的 `event_queue`，handler 内不 await 其它入站调用。
-5. **子智能体可见性缺口**：`unstable_subagents` 要上报子会话，但 harness 侧「子 agent 事件回灌父流」尚未实现（core `AgentEventEmitter` 无使用点）→ `ACP-39` 阻塞。
+5. **子智能体可见性**：✅ `ACP-39` 已解决。做法是把子代理事件送到**独立出带通道**（`AgentSpawnTool::with_event_sink` + `CallableAgent::call_streaming`），而不是回灌父流——子代理在父 turn 返回后仍在跑，回灌父流只能等到下一次 reasoning 才排队发送。ACP 侧常驻转发任务把它映射成 `subagent_update` + 子会话 chunk。
 6. **fork 缺存储原语**：`session/fork` 需要复制会话历史+元数据，`AcpStore` 目前只有单会话持久化 → `ACP-D13` 暂缓。
 
 ### 7.3 能力增补设计（按可落地性排序）
@@ -187,7 +187,7 @@ ACP Client ──stdio──> AcpCodingAgent (Agent.v1()；2.2.0 口径 Agent.bu
 | **B1 只读能力** | set_title / status / auth-status / additional_directories 广告 | 单测：空标题 `-32602`、未知会话 `-32002`、`initialize` 能力位断言 | ✅ 已完成（`acp_capabilities_test.rs` 4 条） |
 | **B2 存储与生命周期** | archive/unarchive + list 过滤 + termination 清理 | 4 条归档单测；断开后无会话泄漏 | ✅ 已完成（`ACP-36` 2 条测试 + `ACP-42` 1 条单测） |
 | **B3 提示与取消** | systemPrompt append / 取消路径回归 / 优雅关闭 | append 生效测试；`acp_cancel_test` 仍绿 | ✅ 已完成（append 单测 + 集成；`$/cancel_request` 回归绿；优雅关闭 HEAD 已有） |
-| **B4 可选** | subagents 上报 / fork | 前置阻塞解除后再排期 |
+| **B4 可选** | subagents 上报（`ACP-39`）/ fork（`ACP-40`，仍暂缓） | `ACP-39`：出带通道 + `subagent_update` 映射 + 能力门控 + 子会话取消；`cargo test -p agentscope-extensions-acp` 全绿 | ✅ `ACP-39` 已完成（2026-11-04，`tests/acp_subagent_test.rs` 2 条 + 单测 10 条）；`ACP-40` 未做 |
 
 ### 7.5 测试策略增补
 

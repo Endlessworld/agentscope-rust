@@ -3,6 +3,7 @@
 //!
 //! Mirrors `AgiAgentSession` from the Kotlin `AgiHarnessAgent`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -505,6 +506,17 @@ pub struct AcpAgentSession {
     /// Shared: `session/list` and LRU eviction read it through a *clone* taken from the
     /// registry, so a per-clone value would keep reporting the moment the clone was made.
     updated_at: Arc<Mutex<Option<String>>>,
+    /// Out-of-band `(child session, event)` frames from the harness's subagent channel.
+    ///
+    /// Taken exactly once, by the forwarder started on the first prompt (see
+    /// [`Self::start_subagent_forwarder`]): a subagent keeps running after the parent's prompt
+    /// returns, so its frames cannot be consumed by the prompt loop.
+    subagent_events: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(String, AgentEvent)>>>>,
+    /// Child session id → the ACP session that owns it.
+    ///
+    /// Shared with the coding agent: `session/cancel` addressed to a child session has to reach
+    /// the agent that spawned it, and the child is not a registered session of its own.
+    subagent_children: Arc<Mutex<HashMap<String, String>>>,
 }
 
 fn session_config_path(cwd: &std::path::Path, session_id: &SessionId) -> PathBuf {
@@ -761,6 +773,8 @@ impl AcpAgentSession {
             title: None,
             archived,
             updated_at: Arc::new(Mutex::new(None)),
+            subagent_events: Arc::new(Mutex::new(None)),
+            subagent_children: Arc::new(Mutex::new(HashMap::new())),
         };
         {
             let mut config = session
@@ -1143,6 +1157,121 @@ impl AcpAgentSession {
             .client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+        // The connection is the second thing subagent frames need (after the harness channel),
+        // and it exists from the first prompt on: that is the point the forwarder can start.
+        self.start_subagent_forwarder();
+    }
+
+    /// Installs the harness channel carrying `(child session, event)` frames.
+    pub fn set_subagent_events(
+        &mut self,
+        events: tokio::sync::mpsc::UnboundedReceiver<(String, AgentEvent)>,
+    ) {
+        *self
+            .subagent_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(events);
+    }
+
+    /// Shares the child → parent registry with the coding agent (which routes
+    /// `session/cancel` addressed to a child).
+    pub fn set_subagent_children(&mut self, children: Arc<Mutex<HashMap<String, String>>>) {
+        self.subagent_children = children;
+    }
+
+    /// Streams the harness's subagent frames to the client for as long as the session lives.
+    ///
+    /// Started once (the receiver is taken out of its slot): a subagent outlives the prompt that
+    /// spawned it, so its frames cannot be drained by the prompt loop. Nothing is sent when the
+    /// client did not advertise `subagents`; the frames are dropped instead.
+    fn start_subagent_forwarder(&self) {
+        let Some(mut events) = self
+            .subagent_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let Some(client) = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let support = self.support.clone();
+        let parent = self.session_id.clone();
+        let children = Arc::clone(&self.subagent_children);
+        tokio::spawn(async move {
+            let mut tracker = event::SubagentTracker::new();
+            while let Some((child, frame)) = events.recv().await {
+                for notification in
+                    event::subagent_notifications(&support, &parent, &child, &frame, &mut tracker)
+                {
+                    if let Err(error) = client.notify(notification) {
+                        // A dropped connection has nobody left to render subagents.
+                        tracing::debug!(%error, "subagent update could not be delivered");
+                        return;
+                    }
+                }
+                // Keep the routing table in step with what the client was told: a child is
+                // cancellable only while it runs.
+                match event::subagent_state(&frame) {
+                    Some(event::SubagentState::Running) if support.supports_subagents() => {
+                        children
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(child, parent.to_string());
+                    }
+                    Some(event::SubagentState::Finished) => {
+                        children
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&child);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Interrupts the subagent that owns `child` (a client cancel addressed to a child session).
+    ///
+    /// Returns whether a live subagent was found: a child that already finished has nothing to
+    /// cancel, and the client's optimistic state is then corrected by the final
+    /// `subagent_update`.
+    pub fn cancel_subagent(&self, child: &SessionId) -> bool {
+        self.agent
+            .spawn_tool()
+            .is_some_and(|tool| tool.cancel_subagent(&child.to_string()))
+    }
+
+    /// Interrupts every subagent this session spawned and forgot about them.
+    ///
+    /// Called on `session/close`: a closed session must not leave an orphaned child running (it
+    /// would keep billing and writing into the workspace with nobody watching it).
+    pub fn cancel_subagents(&self) {
+        let parent = self.session_id.to_string();
+        let children: Vec<String> = {
+            let mut guard = self
+                .subagent_children
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let owned: Vec<String> = guard
+                .iter()
+                .filter(|(_, owner)| owner.as_str() == parent)
+                .map(|(child, _)| child.clone())
+                .collect();
+            for child in &owned {
+                guard.remove(child);
+            }
+            owned
+        };
+        for child in children {
+            self.cancel_subagent(&SessionId::new(child));
+        }
     }
 
     /// The slot the `ask_user` tool reads the live connection from. Shared with
@@ -1529,6 +1658,9 @@ impl AcpAgentSession {
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.cancel();
+        // Subagents outlive the prompt that spawned them: closing the session must not leave
+        // them running with nobody to render them (or to answer their permission requests).
+        self.cancel_subagents();
         // Release the dispatcher unless a prompt currently holds the handle; dropping the
         // last clone stops it after that prompt unwinds.
         if let Ok(mut runtime) = self.runtime.try_lock() {

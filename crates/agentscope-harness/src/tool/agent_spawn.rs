@@ -13,9 +13,11 @@ use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::CallableAgent;
 use agentscope_core::error::Result;
+use agentscope_core::event::{AgentEvent, AgentEventType};
 use agentscope_core::message::{JsonMap, Msg, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 use async_trait::async_trait;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::subagent::manager::DefaultAgentManager;
 use crate::agent::subagent::task::background::BackgroundTask;
@@ -94,12 +96,22 @@ impl SubagentExposureSink {
     }
 }
 
+/// Out-of-band channel carrying `(child_session_id, event)` frames for a host that renders
+/// subagent progress. Unbounded on purpose: the child runs in a background task and a bounded
+/// channel would either block that task or drop its output.
+pub type SubagentEventSink = UnboundedSender<(String, AgentEvent)>;
+
 /// Spawns registered subagents as tool invocations.
 pub struct AgentSpawnTool {
     manager: Arc<DefaultAgentManager>,
     tasks: Option<Arc<dyn TaskRepository>>,
     /// Where freshly exposed subagents are recorded for the in-band `SubagentExposed` event.
     exposure_sink: Option<SubagentExposureSink>,
+    /// Out-of-band event channel for a host that renders subagent progress (ACP
+    /// `subagent_update`). Every frame is tagged with the child's own session id, so the host
+    /// can route child traffic independently of the parent turn — a subagent keeps running after
+    /// the parent's prompt has returned.
+    event_sink: Option<SubagentEventSink>,
     /// Empty set = every non-PRIMARY agent may be spawned.
     allowed_agents: HashSet<String>,
     propagate_plan_mode: bool,
@@ -118,6 +130,7 @@ impl AgentSpawnTool {
             manager,
             tasks: None,
             exposure_sink: None,
+            event_sink: None,
             allowed_agents: HashSet::new(),
             propagate_plan_mode: true,
             counter: AtomicU64::new(0),
@@ -145,6 +158,15 @@ impl AgentSpawnTool {
     /// in-band `SubagentExposed` event.
     pub fn with_exposure_sink(mut self, sink: SubagentExposureSink) -> Self {
         self.exposure_sink = Some(sink);
+        self
+    }
+
+    /// Streams each subagent's execution events to `sink`, tagged with the child's session id.
+    ///
+    /// This is the out-of-band counterpart of [`Self::with_exposure_sink`]: the exposure tells
+    /// the *model* a subagent exists, the event sink lets a *host* render what it is doing.
+    pub fn with_event_sink(mut self, sink: SubagentEventSink) -> Self {
+        self.event_sink = Some(sink);
         self
     }
 
@@ -245,14 +267,41 @@ impl AgentSpawnTool {
         key: &str,
     ) -> Option<(
         String,
+        String,
         Arc<dyn CallableAgent>,
         Option<Arc<dyn SubagentSessionRepair>>,
     )> {
-        self.live
+        self.live.lock().unwrap().get(key).map(|s| {
+            (
+                s.agent_id.clone(),
+                s.session_id.clone(),
+                Arc::clone(&s.agent),
+                s.repair.clone(),
+            )
+        })
+    }
+
+    /// Interrupts the live subagent that owns `child_session` (a client cancel addressed to the
+    /// child's own session id). Returns whether such a subagent is still live.
+    ///
+    /// Only the agent is interrupted, never its background task: aborting the task would drop
+    /// the child's run mid-tool and leave an unknown tool outcome in its journal, which makes
+    /// every later `agent_send` to that `agent_key` fail until it is repaired.
+    pub fn cancel_subagent(&self, child_session: &str) -> bool {
+        let agent = self
+            .live
             .lock()
             .unwrap()
-            .get(key)
-            .map(|s| (s.agent_id.clone(), Arc::clone(&s.agent), s.repair.clone()))
+            .values()
+            .find(|spawned| spawned.session_id == child_session)
+            .map(|spawned| Arc::clone(&spawned.agent));
+        match agent {
+            Some(agent) => {
+                agent.interrupt();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Next background task id for `kind` (`spawn` / `send`).
@@ -410,17 +459,30 @@ impl Tool for AgentSpawnTool {
             );
             // The subagent is now user-addressable, so announce it in-band (Java
             // `AgentSpawnTool#withSubagentExposedEvent`).
+            let exposure = SubagentExposure {
+                subagent_id: key.clone(),
+                agent_id: agent_id.clone(),
+                session_id: child_session.clone(),
+                label: label.clone(),
+            };
             if let Some(sink) = &self.exposure_sink {
-                sink.record(SubagentExposure {
-                    subagent_id: key.clone(),
-                    agent_id: agent_id.clone(),
-                    session_id: child_session.clone(),
-                    label: label.clone(),
-                });
+                sink.record(exposure.clone());
+            }
+            // A host rendering subagents reads the out-of-band channel, which has no middleware
+            // step to carry the exposure: send it here, before the child task is spawned below,
+            // so the announcement always precedes the child's first event.
+            if let Some(events) = &self.event_sink {
+                let _ = events.send((child_session.clone(), exposure.into_event()));
             }
             header = format!("{}\n", spawn_header(&key, &agent_id, &child_session));
             TaskRunSpec::Adopted {
-                future: tokio::spawn(run_child_turn(exec_agent, repair, effective_prompt)),
+                future: tokio::spawn(run_child_turn(
+                    exec_agent,
+                    repair,
+                    effective_prompt,
+                    child_session.clone(),
+                    self.event_sink.clone(),
+                )),
             }
         };
 
@@ -451,25 +513,85 @@ impl Tool for AgentSpawnTool {
 }
 
 /// Drives one child turn to completion inside its background task.
+///
+/// With an event sink attached, the turn streams the child's events to the host while it runs
+/// and closes the child's activity with a `subagent_finished` marker; without one it is exactly
+/// the previous blocking `call`.
 async fn run_child_turn(
     agent: Arc<dyn CallableAgent>,
     repair: Option<Arc<dyn SubagentSessionRepair>>,
     prompt: String,
+    child_session: String,
+    sink: Option<SubagentEventSink>,
 ) -> Result<String> {
-    match agent.call(vec![Msg::user(prompt.clone())]).await {
-        Ok(msg) => Ok(msg.text_content()),
+    let outcome = match child_turn(&agent, prompt.clone(), &child_session, sink.as_ref()).await {
+        Ok(text) => Ok(text),
         // A turn cancelled mid-tool leaves an unknown outcome in the journal, which makes every
         // later open of that session fail. Settle it (recording `interrupted`, never success)
         // and replay this prompt once instead of leaving the `agent_key` permanently unusable.
+        //
+        // A failed repair is an ordinary error result: the host still has to be told the child
+        // stopped, so the outcome is folded instead of returned with `?`.
         Err(err) => match repair {
-            Some(repair) if is_unreconciled(&err) => {
-                repair.repair().await?;
-                let msg = agent.call(vec![Msg::user(prompt)]).await?;
-                Ok(msg.text_content())
-            }
+            Some(repair) if is_unreconciled(&err) => match repair.repair().await {
+                Ok(_) => child_turn(&agent, prompt, &child_session, sink.as_ref()).await,
+                Err(repair_error) => Err(repair_error),
+            },
             _ => Err(err),
         },
+    };
+    if let Some(events) = &sink {
+        let _ = events.send((child_session, finished_event(&outcome)));
     }
+    outcome
+}
+
+/// Runs one child turn, streaming its events to `sink` when the host asked for them.
+async fn child_turn(
+    agent: &Arc<dyn CallableAgent>,
+    prompt: String,
+    child_session: &str,
+    sink: Option<&SubagentEventSink>,
+) -> Result<String> {
+    let messages = vec![Msg::user(prompt)];
+    match sink {
+        Some(events) => {
+            let events = events.clone();
+            let child = child_session.to_string();
+            let forward = Arc::new(move |event: AgentEvent| {
+                let _ = events.send((child.clone(), event));
+            });
+            agent
+                .call_streaming(messages, forward)
+                .await
+                .map(|m| m.text_content())
+        }
+        None => agent.call(messages).await.map(|m| m.text_content()),
+    }
+}
+
+/// The marker closing a subagent's activity in the out-of-band channel.
+///
+/// A `Custom` event rather than a dedicated [`AgentEventType`](agentscope_core::event::AgentEventType)
+/// variant: the child's events are replayed to a host that already switches on
+/// `fields["kind"]` for other in-band markers (compaction), and a new enum variant would force
+/// every exhaustive event match in the workspace to grow a branch for a frame only this channel
+/// ever carries.
+fn finished_event(outcome: &Result<String>) -> AgentEvent {
+    let mut fields = JsonMap::new();
+    fields.insert("kind".to_string(), serde_json::json!("subagent_finished"));
+    let (state, error) = match outcome {
+        Ok(_) => ("success", None),
+        Err(agentscope_core::Error::Cancelled(_)) | Err(agentscope_core::Error::Interrupted(_)) => {
+            ("cancelled", None)
+        }
+        Err(error) => ("error", Some(error.to_string())),
+    };
+    fields.insert("outcome".to_string(), serde_json::json!(state));
+    if let Some(error) = error {
+        fields.insert("error".to_string(), serde_json::json!(error));
+    }
+    AgentEvent::with_fields(AgentEventType::Custom, fields)
 }
 
 /// Whether a call was refused because the journal still holds an unknown tool outcome.
@@ -567,7 +689,7 @@ impl Tool for AgentSendTool {
             Ok(k) => k,
             Err(e) => return Ok(ToolResultBlock::error(e)),
         };
-        let Some((agent_id, agent, repair)) = self.spawn.live_agent(&key) else {
+        let Some((agent_id, child_session, agent, repair)) = self.spawn.live_agent(&key) else {
             return Ok(ToolResultBlock::error(format!(
                 "Error: Unknown or expired agent_key: {key}. Use agent_list to see active subagents."
             )));
@@ -588,7 +710,13 @@ impl Tool for AgentSendTool {
             &agent_id,
             &session_id,
             TaskRunSpec::Adopted {
-                future: tokio::spawn(run_child_turn(agent, repair, message)),
+                future: tokio::spawn(run_child_turn(
+                    agent,
+                    repair,
+                    message,
+                    child_session,
+                    self.spawn.event_sink.clone(),
+                )),
             },
         )
         .await;
@@ -740,6 +868,8 @@ mod tests {
             agent,
             Some(Arc::new(CountingRepair(Arc::clone(&repairs)))),
             "go".to_string(),
+            "sub-test".to_string(),
+            None,
         )
         .await
         .expect("the replayed turn must succeed");
@@ -792,12 +922,205 @@ mod tests {
             agent,
             Some(Arc::new(CountingRepair(Arc::clone(&repairs)))),
             "go".to_string(),
+            "sub-test".to_string(),
+            None,
         )
         .await
         .expect_err("a non-journal failure must propagate");
 
         assert!(err.to_string().contains("boom"), "{err}");
         assert_eq!(repairs.load(Ordering::SeqCst), 0);
+    }
+
+    /// A child that reports progress through the sink it is handed, like a real agent.
+    struct StreamingChild {
+        streaming_calls: Arc<AtomicUsize>,
+        plain_calls: Arc<AtomicUsize>,
+        toolkit: Toolkit,
+    }
+
+    #[async_trait]
+    impl Agent for StreamingChild {
+        fn agent_id(&self) -> &str {
+            "child"
+        }
+        fn name(&self) -> &str {
+            "child"
+        }
+        fn description(&self) -> &str {
+            "child"
+        }
+        fn interrupt(&self) {}
+        fn agent_state(&self) -> AgentState {
+            AgentState::default()
+        }
+        fn toolkit(&self) -> &Toolkit {
+            &self.toolkit
+        }
+    }
+
+    #[async_trait]
+    impl CallableAgent for StreamingChild {
+        async fn call(&self, _messages: Vec<Msg>) -> Result<Msg> {
+            self.plain_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Msg::assistant("done"))
+        }
+        async fn call_streaming(
+            &self,
+            _messages: Vec<Msg>,
+            sink: Arc<dyn Fn(AgentEvent) + Send + Sync>,
+        ) -> Result<Msg> {
+            self.streaming_calls.fetch_add(1, Ordering::SeqCst);
+            let mut fields = JsonMap::new();
+            fields.insert("delta".to_string(), serde_json::json!("working"));
+            sink(AgentEvent::with_fields(
+                AgentEventType::TextBlockDelta,
+                fields,
+            ));
+            Ok(Msg::assistant("done"))
+        }
+        async fn call_with_schema(&self, messages: Vec<Msg>, _schema: JsonSchema) -> Result<Msg> {
+            self.call(messages).await
+        }
+    }
+
+    fn streaming_child(
+        streaming_calls: Arc<AtomicUsize>,
+        plain_calls: Arc<AtomicUsize>,
+    ) -> Arc<dyn CallableAgent> {
+        Arc::new(StreamingChild {
+            streaming_calls,
+            plain_calls,
+            toolkit: Toolkit::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_child_turn_streams_its_events_and_closes_them_with_a_finished_marker() {
+        // Without the out-of-band channel a host can only see the child's final reply: the
+        // whole point of the sink is that the child's progress arrives while it runs.
+        let streaming_calls = Arc::new(AtomicUsize::new(0));
+        let plain_calls = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let out = run_child_turn(
+            streaming_child(Arc::clone(&streaming_calls), Arc::clone(&plain_calls)),
+            None,
+            "go".to_string(),
+            "sub-1".to_string(),
+            Some(tx),
+        )
+        .await
+        .expect("the child turn succeeds");
+
+        assert_eq!(out, "done");
+        assert_eq!(streaming_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(plain_calls.load(Ordering::SeqCst), 0);
+
+        let (child, first) = rx.recv().await.expect("the child's event");
+        assert_eq!(child, "sub-1");
+        assert_eq!(first.event_type(), AgentEventType::TextBlockDelta);
+
+        // Every turn ends with a terminal marker: a host that only saw the announcement would
+        // otherwise show the child as running forever.
+        let (child, last) = rx.recv().await.expect("the terminal marker");
+        assert_eq!(child, "sub-1");
+        assert_eq!(last.event_type(), AgentEventType::Custom);
+        let fields = &last.data().fields;
+        assert_eq!(
+            fields.get("kind").and_then(|v| v.as_str()),
+            Some("subagent_finished")
+        );
+        assert_eq!(
+            fields.get("outcome").and_then(|v| v.as_str()),
+            Some("success")
+        );
+        assert!(rx.recv().await.is_none(), "nothing follows the marker");
+    }
+
+    #[tokio::test]
+    async fn a_child_turn_without_a_sink_keeps_the_blocking_call() {
+        let streaming_calls = Arc::new(AtomicUsize::new(0));
+        let plain_calls = Arc::new(AtomicUsize::new(0));
+        let out = run_child_turn(
+            streaming_child(Arc::clone(&streaming_calls), Arc::clone(&plain_calls)),
+            None,
+            "go".to_string(),
+            "sub-1".to_string(),
+            None,
+        )
+        .await
+        .expect("the child turn succeeds");
+        assert_eq!(out, "done");
+        assert_eq!(plain_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(streaming_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A child that only records being interrupted.
+    struct Interruptible(Toolkit, Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Agent for Interruptible {
+        fn agent_id(&self) -> &str {
+            "child"
+        }
+        fn name(&self) -> &str {
+            "child"
+        }
+        fn description(&self) -> &str {
+            "child"
+        }
+        fn interrupt(&self) {
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
+        fn agent_state(&self) -> AgentState {
+            AgentState::default()
+        }
+        fn toolkit(&self) -> &Toolkit {
+            &self.0
+        }
+    }
+
+    #[async_trait]
+    impl CallableAgent for Interruptible {
+        async fn call(&self, _messages: Vec<Msg>) -> Result<Msg> {
+            Ok(Msg::assistant("idle"))
+        }
+        async fn call_with_schema(&self, messages: Vec<Msg>, _schema: JsonSchema) -> Result<Msg> {
+            self.call(messages).await
+        }
+    }
+
+    #[test]
+    fn a_child_session_cancel_reaches_that_subagent_only() {
+        // A client cancels a child by naming the *child's* session id, which is not a
+        // registered ACP session: the spawn tool is the only thing that can map it to a live
+        // agent, and it must not touch a sibling.
+        let manager = Arc::new(DefaultAgentManager::new(&[]));
+        let tool = AgentSpawnTool::new(manager);
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let (_, child) = tool.register_live(
+            "explorer",
+            None,
+            Arc::new(Interruptible(Toolkit::new(), Arc::clone(&first))),
+            None,
+        );
+        tool.register_live(
+            "explorer",
+            None,
+            Arc::new(Interruptible(Toolkit::new(), Arc::clone(&second))),
+            None,
+        );
+
+        assert!(tool.cancel_subagent(&child));
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(second.load(Ordering::SeqCst), 0);
+
+        // A child that is not live (already gone) reports "nothing to cancel" instead of
+        // interrupting an unrelated agent.
+        assert!(!tool.cancel_subagent("sub-unknown"));
+        assert_eq!(second.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -24,7 +24,8 @@ pub mod web_tools;
 
 pub use agent_generate::AgentGenerateTool;
 pub use agent_spawn::{
-    AgentListTool, AgentSendTool, AgentSpawnTool, SubagentExposure, SubagentExposureSink,
+    AgentListTool, AgentSendTool, AgentSpawnTool, SubagentEventSink, SubagentExposure,
+    SubagentExposureSink,
 };
 pub use artifact_delivery::ArtifactDeliveryTool;
 pub use filesystem_tools::FilesystemTool;
