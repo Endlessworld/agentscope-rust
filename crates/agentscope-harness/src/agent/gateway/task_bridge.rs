@@ -108,11 +108,25 @@ impl TaskCompletionBridge {
             move |task_id: String, session_id: String, result: Option<String>| {
                 let bus = bus.clone();
                 tokio::spawn(async move {
-                    let mut hint = String::from("<system-reminder>Background subagent task '");
-                    hint.push_str(&task_id);
-                    hint.push_str("' has completed.\n\nResult:\n\n");
-                    hint.push_str(result.as_deref().unwrap_or("(no output)"));
-                    hint.push_str("\n</system-reminder>");
+                    // A pointer, not the payload: `SubagentsMiddleware` already delivers the
+                    // full result on the next reasoning step (and stamps `delivered_at` there).
+                    // Carrying the body here as well made the model read the same long result
+                    // twice in one request. The hint itself is still what survives a process
+                    // restart — the queue lives on the filesystem.
+                    let hint = if result.is_some() {
+                        format!(
+                            "<system-reminder>Background subagent task '{task_id}' has completed. \
+                             Its result is delivered on the next step; call \
+                             task_output(task_id='{task_id}') only if you need it now.\
+                             </system-reminder>"
+                        )
+                    } else {
+                        format!(
+                            "<system-reminder>Background subagent task '{task_id}' has failed. \
+                             Call task_output(task_id='{task_id}') to read the error.\
+                             </system-reminder>"
+                        )
+                    };
                     let payload = serde_json::json!({
                         "type": "hint",
                         "id": new_hex(),
@@ -293,6 +307,44 @@ mod tests {
         // Verify the payload structure
         let payload = &entries[0].payload;
         assert_eq!(payload["sessionId"].as_str(), Some("sess-99"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn the_hint_points_at_the_result_instead_of_copying_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "task_bridge_hint_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+        let bus: Arc<dyn MessageBus> = Arc::new(WorkspaceMessageBus::new(fs.clone(), "/bus"));
+
+        let cb = TaskCompletionBridge::new(bus.clone()).callback();
+        cb(
+            "task-42".to_string(),
+            "sess-99".to_string(),
+            Some("result text".to_string()),
+        );
+        cb("task-43".to_string(), "sess-99".to_string(), None);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let entries = bus.inbox_drain("sess-99", 10).await.unwrap();
+        assert_eq!(entries.len(), 2, "one hint per completion");
+
+        let completed = entries[0].payload["hint"].as_str().unwrap();
+        assert!(completed.contains("task-42"));
+        assert!(completed.contains("task_output"));
+        assert!(
+            !completed.contains("result text"),
+            "the hint must not duplicate the result body: {completed}"
+        );
+
+        let failed = entries[1].payload["hint"].as_str().unwrap();
+        assert!(failed.contains("task-43"));
+        assert!(failed.contains("failed"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

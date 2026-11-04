@@ -599,17 +599,18 @@ impl TaskRepository for WorkspaceTaskRepository {
 
     async fn mark_delivered(&self, ctx: &RuntimeContext, session_id: &str, task_id: &str) {
         let path = self.tasks_path(session_id);
-        let mut map = read_records(self.state.fs.as_ref(), ctx, &path).await;
-        match map.get_mut(task_id) {
+        let outcome = mutate_record(self.state.fs.as_ref(), ctx, &path, task_id, |rec| {
             // Idempotent: the first stamp wins, later calls bail out without touching storage.
-            Some(rec) if rec.delivered_at.is_none() => {
-                rec.delivered_at = Some(now_millis());
-                rec.touch();
-                rec.version = rec.version.wrapping_add(1);
+            if rec.delivered_at.is_some() {
+                return false;
             }
-            _ => return,
+            rec.delivered_at = Some(now_millis());
+            true
+        })
+        .await;
+        if matches!(outcome, RecordMutation::Missing) {
+            tracing::debug!("mark_delivered: task {task_id} is no longer recorded");
         }
-        write_records(self.state.fs.as_ref(), ctx, &path, &map).await;
     }
 
     async fn is_delivered(&self, ctx: &RuntimeContext, session_id: &str, task_id: &str) -> bool {
@@ -928,6 +929,67 @@ async fn write_records(
     }
 }
 
+/// Outcome of one guarded, optimistic-concurrency record mutation.
+enum RecordMutation {
+    /// The mutation was accepted and persisted.
+    Applied,
+    /// A guard rejected it; storage was left untouched.
+    Rejected,
+    /// The record is absent from the map.
+    Missing,
+}
+
+/// Applies `mutate` to one record under optimistic concurrency.
+///
+/// Task records live in a single file per session, so every write for any task rewrites the
+/// whole map. Persisting a snapshot read before a concurrent heartbeat of a *sibling* task
+/// silently dropped that newer state — including a `delivered_at` stamp, which made a
+/// finished result be pushed again on every later reasoning step. Each attempt therefore
+/// re-applies the mutation onto a freshly read map and persists that map only while the
+/// target record still carries the version the attempt started from.
+async fn mutate_record<F>(
+    fs: &dyn Filesystem,
+    ctx: &RuntimeContext,
+    path: &str,
+    task_id: &str,
+    mutate: F,
+) -> RecordMutation
+where
+    F: Fn(&mut TaskRecord) -> bool,
+{
+    for _ in 0..RECORD_CAS_RETRIES {
+        let snapshot = read_records(fs, ctx, path).await;
+        let base_version = match snapshot.get(task_id) {
+            Some(rec) => rec.version,
+            None => return RecordMutation::Missing,
+        };
+        // Run the guards (and the mutation) once on a throwaway copy: a rejected change must
+        // not reach storage at all.
+        {
+            let mut probe = snapshot;
+            if !mutate(probe.get_mut(task_id).expect("checked above")) {
+                return RecordMutation::Rejected;
+            }
+        }
+        // Re-read so the write carries any sibling update that landed in between; a changed
+        // version for this record means someone else wrote it, so start over.
+        let mut latest = read_records(fs, ctx, path).await;
+        match latest.get(task_id) {
+            Some(rec) if rec.version == base_version => {}
+            Some(_) => continue,
+            None => return RecordMutation::Missing,
+        }
+        let rec = latest.get_mut(task_id).expect("checked above");
+        mutate(rec);
+        rec.touch();
+        rec.version = base_version.wrapping_add(1);
+        write_records(fs, ctx, path, &latest).await;
+        return RecordMutation::Applied;
+    }
+    tracing::warn!("mutate_record: CAS retries exhausted for task {task_id}");
+    RecordMutation::Rejected
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn update_record_status(
     fs: &dyn Filesystem,
@@ -940,48 +1002,33 @@ async fn update_record_status(
     error: Option<String>,
 ) {
     let path = tasks_path(parent_agent_id, session_id);
-    // Optimistic-concurrency loop: re-read, re-apply the guards/mutation onto the freshest
-    // record, bump `version`, and only persist when the on-disk version is still the one we
-    // based our mutation on. A concurrent writer bumps `version`, forcing a retry.
-    for _ in 0..RECORD_CAS_RETRIES {
-        let mut map = read_records(fs, ctx, &path).await;
-        let base_version = match map.get(task_id) {
-            Some(rec) => rec.version,
-            None => {
-                write_records(fs, ctx, &path, &map).await;
-                return;
-            }
-        };
-        {
-            let rec = map.get_mut(task_id).expect("checked above");
-            // Guard 1: terminal states are immutable — a late COMPLETED/FAILED write from a
-            // still-running thread must not clobber a CANCELLED status set by `cancel_task`.
-            if rec.status.is_terminal() {
-                return;
-            }
-            // Guard 2: cancellation requested but not yet terminal (heartbeat races cancel) —
-            // refuse non-terminal updates so the record cannot flip back to RUNNING.
-            if !status.is_terminal() && rec.cancel_requested {
-                return;
-            }
-            rec.status = status;
-            // Null fields leave the existing value untouched (Java `updateStatus`).
-            if result.is_some() {
-                rec.result = result.clone();
-            }
-            if error.is_some() {
-                rec.error_message = error.clone();
-            }
-            rec.touch();
-            rec.version = base_version.wrapping_add(1);
+    let outcome = mutate_record(fs, ctx, &path, task_id, |rec| {
+        // Guard 1: terminal states are immutable — a late COMPLETED/FAILED write from a
+        // still-running thread must not clobber a CANCELLED status set by `cancel_task`.
+        if rec.status.is_terminal() {
+            return false;
         }
-        let current = read_records(fs, ctx, &path).await;
-        if current.get(task_id).map(|r| r.version) == Some(base_version) {
-            write_records(fs, ctx, &path, &map).await;
-            return;
+        // Guard 2: cancellation requested but not yet terminal (heartbeat races cancel) —
+        // refuse non-terminal updates so the record cannot flip back to RUNNING.
+        if !status.is_terminal() && rec.cancel_requested {
+            return false;
         }
+        rec.status = status;
+        // Null fields leave the existing value untouched (Java `updateStatus`).
+        if result.is_some() {
+            rec.result = result.clone();
+        }
+        if error.is_some() {
+            rec.error_message = error.clone();
+        }
+        true
+    })
+    .await;
+    if matches!(outcome, RecordMutation::Missing) {
+        // Historical behaviour: materialise the map so a later write can create the record.
+        let map = read_records(fs, ctx, &path).await;
+        write_records(fs, ctx, &path, &map).await;
     }
-    tracing::warn!("update_record_status: CAS retries exhausted for task {task_id}");
 }
 impl Drop for WorkspaceTaskRepository {
     fn drop(&mut self) {
@@ -1175,23 +1222,21 @@ async fn update_awaiting_confirm(
     pending_confirms: Option<Vec<RemotePendingConfirm>>,
 ) {
     let path = tasks_path(&state.parent_agent_id, session_id);
-    let mut map = read_records(state.fs.as_ref(), ctx, &path).await;
     let next_pending = if awaiting { pending_confirms } else { None };
-    match map.get_mut(task_id) {
-        Some(rec) if !rec.status.is_terminal() => {
-            if rec.awaiting_confirm == awaiting
-                && pending_confirms_unchanged(&rec.pending_confirms, &next_pending)
-            {
-                return;
-            }
-            rec.awaiting_confirm = awaiting;
-            rec.pending_confirms = next_pending;
-            rec.touch();
-            rec.version = rec.version.wrapping_add(1);
+    mutate_record(state.fs.as_ref(), ctx, &path, task_id, |rec| {
+        if rec.status.is_terminal() {
+            return false;
         }
-        _ => return,
-    }
-    write_records(state.fs.as_ref(), ctx, &path, &map).await;
+        if rec.awaiting_confirm == awaiting
+            && pending_confirms_unchanged(&rec.pending_confirms, &next_pending)
+        {
+            return false;
+        }
+        rec.awaiting_confirm = awaiting;
+        rec.pending_confirms = next_pending.clone();
+        true
+    })
+    .await;
 }
 
 fn pending_confirms_unchanged(
@@ -1434,6 +1479,193 @@ mod tests {
         // Unknown task ids are a no-op and must not create a record.
         repo.mark_delivered(&ctx, "sess", "nope").await;
         assert_eq!(read_records(fs.as_ref(), &ctx, &path).await.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn delivered_stamp_survives_a_sibling_task_rewrite() {
+        let (dir, fs) = temp_fs("delivered_sibling");
+        let ctx = RuntimeContext::default();
+        let path = tasks_path("parent", "sess");
+        let mut map = BTreeMap::new();
+        let mut done = TaskRecord::new("done", "sub1", "parent", "sess");
+        done.status = TaskStatus::Completed;
+        let mut live = TaskRecord::new("live", "sub1", "parent", "sess");
+        live.status = TaskStatus::Running;
+        map.insert("done".to_string(), done);
+        map.insert("live".to_string(), live);
+        write_records(fs.as_ref(), &ctx, &path, &map).await;
+
+        let repo = WorkspaceTaskRepository::new(fs.clone(), "parent");
+        repo.mark_delivered(&ctx, "sess", "done").await;
+        // The record map is one file per session, so a heartbeat for a sibling task rewrites
+        // it. That write must not resurrect `delivered_at: None` for the delivered task —
+        // otherwise its result is pushed again on every later reasoning step.
+        update_record_status(
+            fs.as_ref(),
+            &ctx,
+            "parent",
+            "sess",
+            "live",
+            TaskStatus::Completed,
+            Some("live result".to_string()),
+            None,
+        )
+        .await;
+
+        let after = read_records(fs.as_ref(), &ctx, &path).await;
+        assert!(
+            after["done"].delivered_at.is_some(),
+            "the delivered stamp must survive a sibling rewrite"
+        );
+        assert_eq!(after["live"].status, TaskStatus::Completed);
+        assert_eq!(after["live"].result.as_deref(), Some("live result"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Filesystem that lands a sibling task's heartbeat between the two reads a record
+    /// mutation performs, i.e. exactly the window the old read-modify-write sequence lost.
+    struct SiblingWriteOnSecondRead {
+        inner: Arc<dyn Filesystem>,
+        task_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Filesystem for SiblingWriteOnSecondRead {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self.inner.as_any()
+        }
+        fn kind(&self) -> crate::filesystem::FilesystemKind {
+            self.inner.kind()
+        }
+        async fn ls(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+        ) -> agentscope_core::error::Result<Vec<FileInfo>> {
+            self.inner.ls(ctx, path).await
+        }
+        async fn read(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+            offset: usize,
+            limit: usize,
+        ) -> agentscope_core::error::Result<FileData> {
+            let data = self.inner.read(ctx, path, offset, limit).await?;
+            if !path.contains("/tasks/") {
+                return Ok(data);
+            }
+            // The second task-map read is the validation read: the sibling heartbeat has
+            // already been committed by then, so the mutation must build on that map.
+            if self
+                .task_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                != 1
+            {
+                return Ok(data);
+            }
+            let mut map: BTreeMap<String, TaskRecord> =
+                serde_json::from_str(&data.content).unwrap_or_default();
+            if let Some(rec) = map.get_mut("live") {
+                rec.status = TaskStatus::Completed;
+                rec.result = Some("live result".to_string());
+                rec.touch();
+                rec.version = rec.version.wrapping_add(1);
+            }
+            let json = serde_json::to_string(&map).expect("serialize task map");
+            self.inner.delete(ctx, path).await?;
+            self.inner.write(ctx, path, &json).await?;
+            self.inner.read(ctx, path, offset, limit).await
+        }
+        async fn write(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+            content: &str,
+        ) -> agentscope_core::error::Result<()> {
+            self.inner.write(ctx, path, content).await
+        }
+        async fn edit(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+            old: &str,
+            new: &str,
+            replace_all: bool,
+        ) -> agentscope_core::error::Result<usize> {
+            self.inner.edit(ctx, path, old, new, replace_all).await
+        }
+        async fn grep(
+            &self,
+            ctx: &RuntimeContext,
+            pattern: &str,
+            path: Option<&str>,
+            glob: Option<&str>,
+        ) -> agentscope_core::error::Result<Vec<GrepMatch>> {
+            self.inner.grep(ctx, pattern, path, glob).await
+        }
+        async fn glob(
+            &self,
+            ctx: &RuntimeContext,
+            pattern: &str,
+            path: &str,
+        ) -> agentscope_core::error::Result<Vec<FileInfo>> {
+            self.inner.glob(ctx, pattern, path).await
+        }
+        async fn delete(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+        ) -> agentscope_core::error::Result<()> {
+            self.inner.delete(ctx, path).await
+        }
+        async fn move_path(
+            &self,
+            ctx: &RuntimeContext,
+            from: &str,
+            to: &str,
+        ) -> agentscope_core::error::Result<()> {
+            self.inner.move_path(ctx, from, to).await
+        }
+        async fn exists(
+            &self,
+            ctx: &RuntimeContext,
+            path: &str,
+        ) -> agentscope_core::error::Result<bool> {
+            self.inner.exists(ctx, path).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_racing_sibling_write_is_merged_into_the_delivery_stamp() {
+        let (dir, fs) = temp_fs("delivered_race");
+        let ctx = RuntimeContext::default();
+        let path = tasks_path("parent", "sess");
+        let mut map = BTreeMap::new();
+        let mut done = TaskRecord::new("done", "sub1", "parent", "sess");
+        done.status = TaskStatus::Completed;
+        let mut live = TaskRecord::new("live", "sub1", "parent", "sess");
+        live.status = TaskStatus::Running;
+        map.insert("done".to_string(), done);
+        map.insert("live".to_string(), live);
+        write_records(fs.as_ref(), &ctx, &path, &map).await;
+
+        let hooked: Arc<dyn Filesystem> = Arc::new(SiblingWriteOnSecondRead {
+            inner: fs.clone(),
+            task_reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let repo = WorkspaceTaskRepository::new(hooked, "parent");
+        repo.mark_delivered(&ctx, "sess", "done").await;
+
+        let after = read_records(fs.as_ref(), &ctx, &path).await;
+        assert!(after["done"].delivered_at.is_some(), "stamp persisted");
+        assert_eq!(
+            after["live"].status,
+            TaskStatus::Completed,
+            "the sibling heartbeat that landed mid-write must not be dropped"
+        );
+        assert_eq!(after["live"].result.as_deref(), Some("live result"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
