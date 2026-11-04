@@ -515,6 +515,11 @@ impl ReActAgent {
         *self.core.generate_options_defaults.lock().unwrap() = options;
     }
 
+    /// Returns the current per-call generation defaults.
+    pub fn generate_options_defaults(&self) -> GenerateOptions {
+        self.core.generate_options_defaults.lock().unwrap().clone()
+    }
+
     /// Replaces the permission engine with one built from `ctx`.
     ///
     /// The engine is consulted on every tool call, so after a mode switch the

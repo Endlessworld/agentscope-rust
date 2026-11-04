@@ -1031,6 +1031,9 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
     let mut builder = HarnessAgent::builder()
         .name("agentscope-coding-agent")
         .model(model)
+        // 仅 Anthropic Messages 端点接受 `cache_control` 断点；OpenAI 兼容网关可能
+        // 拒绝未知字段，因此按解析出的协议闸门开启。
+        .prompt_cache(matches!(protocol, ApiProtocol::Messages))
         // 子 agent 的 front-matter `model:` 覆盖：按 `~/.agentscope/models.json` 解析 provider 后
         // 新建一个模型（对齐 Java `Builder.modelResolver`）。解析失败则回退到父模型。
         .model_resolver(move |model_id: &str| {

@@ -958,7 +958,8 @@ impl AcpAgentSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .thought_level
             .clone();
-        let opts = thought_level_params(&level);
+        let mut opts = self.agent.generate_options_defaults().unwrap_or_default();
+        opts.reasoning_effort = thought_level_params(&level).reasoning_effort;
         self.agent.set_generate_options_defaults(opts);
 
         // Dynamic model switching (next prompt). Failures are returned so the

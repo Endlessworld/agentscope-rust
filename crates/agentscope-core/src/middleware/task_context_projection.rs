@@ -2,21 +2,21 @@
 //! Mirrors `io.agentscope.core.middleware.TaskContextProjection`.
 //!
 //! Nothing here mutates or persists: the projection is recomputed for every model call.
-//! It (a) demotes superseded `todo_write` full receipts to short receipts so the model
-//! cannot mistake a historical status for the live plan, and (b) appends one synthetic
-//! `<TASK_STATE>` message carrying the task scope, requirements and bounded verification
-//! results.
+//! It appends one synthetic `<TASK_STATE>` message carrying the task scope, requirements
+//! and bounded verification results. Historical `todo_write` receipts are kept verbatim:
+//! rewriting them mid-history would invalidate the provider's prompt cache on every todo
+//! update, and the synthetic message already points at the live receipt.
 //!
 //! The synthetic message is *never* appended to durable conversation history: it is added
 //! to the per-call projection only and carries
 //! [`Msg::METADATA_SYNTHETIC`]/[`Msg::METADATA_REMINDER_KIND`] so a replay can drop it.
 
-use crate::message::{ContentBlock, JsonMap, Msg, MsgRole, TextBlock, ToolResultBlock};
+use crate::message::{ContentBlock, JsonMap, Msg, MsgRole, ToolResultBlock};
 use crate::state::context::{TaskContextState, TaskScope};
 use crate::state::requirement::TaskRequirement;
 use crate::tool::todo::{
     render, METADATA_REPRESENTATION, METADATA_STATE_KEY, METADATA_STATE_REVISION,
-    REPRESENTATION_FULL, REPRESENTATION_RECEIPT, STATE_KEY_TASKS_CONTEXT,
+    REPRESENTATION_FULL, STATE_KEY_TASKS_CONTEXT,
 };
 
 /// Message id of the synthetic task-state reminder (stable so replays can dedupe it).
@@ -68,34 +68,15 @@ pub fn project(
     }
     let visible = last_full.is_some();
 
+    // Historical receipts stay verbatim. Demoting them rewrites a message behind the
+    // request tail, which invalidates the provider's prompt-cache prefix on every todo
+    // update; the `<TASK_STATE>` reminder below already marks the live state.
     let mut messages = Vec::with_capacity(input.len() + 1);
-    position = 0;
     for message in input {
         if is_task_state_reminder(&message) {
-            position += message.content().len();
             continue;
         }
-        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(message.content().len());
-        let mut changed = false;
-        for block in message.content() {
-            match block {
-                ContentBlock::ToolResult(result)
-                    if tracked(result)
-                        && representation(result) == Some(REPRESENTATION_FULL)
-                        && Some(position) != last_full =>
-                {
-                    blocks.push(ContentBlock::ToolResult(demote(result)));
-                    changed = true;
-                }
-                other => blocks.push(other.clone()),
-            }
-            position += 1;
-        }
-        messages.push(if changed {
-            message.with_content(blocks)
-        } else {
-            message
-        });
+        messages.push(message);
     }
 
     let render_scope_section = requirements || verification_results;
@@ -199,30 +180,6 @@ fn is_task_state_reminder(message: &Msg) -> bool {
             == Some(TASK_STATE_REMINDER_KIND)
 }
 
-/// Rewrites a superseded full receipt into a short receipt pointing at the live state.
-fn demote(result: &ToolResultBlock) -> ToolResultBlock {
-    let mut metadata = result.metadata.clone();
-    metadata.insert(
-        METADATA_REPRESENTATION.to_string(),
-        serde_json::Value::String(REPRESENTATION_RECEIPT.to_string()),
-    );
-    let revision = result
-        .metadata
-        .get(METADATA_STATE_REVISION)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    ToolResultBlock {
-        id: result.id.clone(),
-        name: result.name.clone(),
-        output: vec![ContentBlock::Text(TextBlock::new(format!(
-            "Todo update recorded at revision {revision}; use the current task state, not this \
-             historical status."
-        )))],
-        metadata,
-        state: result.state,
-    }
-}
-
 fn render_scope(scope: Option<&TaskScope>) -> String {
     match scope {
         None => String::new(),
@@ -306,6 +263,7 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::TextBlock;
     use crate::state::context::Task;
     use crate::state::requirement::{
         RequirementAuthority, RequirementDecision, RequirementKind, RequirementStatus,
@@ -352,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_full_receipts_are_demoted_and_the_live_receipt_is_kept() {
+    fn historical_full_receipts_are_preserved_and_the_live_receipt_is_kept() {
         let mut state = TaskContextState::new();
         state.replace_tasks(vec![task("step one")], 0).unwrap();
         // A requirement keeps the projection interesting: the synthetic message is needed
@@ -374,21 +332,21 @@ mod tests {
         let out = project_all(input, &state);
         assert_eq!(out.len(), 4);
 
-        let stale = tool_results(&out[1]);
-        assert_eq!(stale.len(), 1);
+        let historical = tool_results(&out[1]);
+        assert_eq!(historical.len(), 1);
         assert_eq!(
-            stale[0]
+            historical[0]
                 .metadata
                 .get(METADATA_REPRESENTATION)
                 .and_then(|v| v.as_str()),
-            Some(REPRESENTATION_RECEIPT)
+            Some(REPRESENTATION_FULL)
         );
         assert_eq!(
-            stale[0].text_content(),
-            "Todo update recorded at revision 1; use the current task state, not this historical status."
+            historical[0].text_content(),
+            "1 open todo(s):\n- [ ] step two"
         );
-        assert_eq!(stale[0].id.as_deref(), Some("t1"));
-        assert_eq!(stale[0].name.as_deref(), Some("todo_write"));
+        assert_eq!(historical[0].id.as_deref(), Some("t1"));
+        assert_eq!(historical[0].name.as_deref(), Some("todo_write"));
 
         let live = tool_results(&out[2]);
         assert_eq!(

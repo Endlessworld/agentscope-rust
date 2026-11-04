@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::middleware::Middleware;
@@ -123,6 +123,13 @@ pub struct WorkspaceContextMiddleware {
     disable_memory_hooks: bool,
     artifact_delivery_enabled: bool,
     use_legacy_xml_workspace_context: bool,
+    /// Rendered workspace section frozen for the lifetime of one session.
+    ///
+    /// Re-reading AGENTS.md / MEMORY.md / knowledge on every model call changes the
+    /// system prompt whenever `memory_save` appends to MEMORY.md, which invalidates the
+    /// provider's prompt cache from token 0. The section is therefore built once per
+    /// session; later memory writes stay visible through their tool results.
+    frozen_section: Mutex<Option<(String, String)>>,
 }
 
 impl WorkspaceContextMiddleware {
@@ -167,6 +174,7 @@ impl WorkspaceContextMiddleware {
             disable_memory_hooks: false,
             artifact_delivery_enabled: false,
             use_legacy_xml_workspace_context: false,
+            frozen_section: Mutex::new(None),
         }
     }
 
@@ -199,19 +207,46 @@ impl WorkspaceContextMiddleware {
 #[async_trait::async_trait]
 impl Middleware for WorkspaceContextMiddleware {
     async fn on_system_prompt(&self, ctx: &RuntimeContext, current_prompt: String) -> String {
-        let section = build_workspace_section(
-            &self.workspace_manager,
-            ctx,
-            &self.agent_name,
-            self.environment_memory.as_deref(),
-            self.max_context_tokens,
-            &self.additional_context_files,
-            self.disable_memory_tools,
-            self.disable_memory_hooks,
-            self.artifact_delivery_enabled,
-            self.use_legacy_xml_workspace_context,
-        )
-        .await;
+        // Freeze the section per session so an in-session `memory_save` (or a workspace
+        // file edit) cannot rewrite the system prompt and invalidate the prompt cache.
+        // Without a session id there is nothing to scope the snapshot to, so we rebuild
+        // every call rather than pinning a stale section for the process lifetime.
+        let session_key = ctx.session_id().map(str::to_string);
+        let cached = session_key.as_ref().and_then(|key| {
+            let guard = self
+                .frozen_section
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .as_ref()
+                .filter(|(cached_key, _)| cached_key == key)
+                .map(|(_, section)| section.clone())
+        });
+        let section = match cached {
+            Some(section) => section,
+            None => {
+                let section = build_workspace_section(
+                    &self.workspace_manager,
+                    ctx,
+                    &self.agent_name,
+                    self.environment_memory.as_deref(),
+                    self.max_context_tokens,
+                    &self.additional_context_files,
+                    self.disable_memory_tools,
+                    self.disable_memory_hooks,
+                    self.artifact_delivery_enabled,
+                    self.use_legacy_xml_workspace_context,
+                )
+                .await;
+                if let Some(key) = session_key.clone() {
+                    self.frozen_section
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .replace((key, section.clone()));
+                }
+                section
+            }
+        };
         let separator = if current_prompt.is_empty() || current_prompt.ends_with('\n') {
             ""
         } else {
@@ -1142,5 +1177,37 @@ mod tests {
     fn agents_md_below_the_cap_is_untouched() {
         let small = "keep me";
         assert_eq!(cap_agents_md(small), small);
+    }
+
+    #[tokio::test]
+    async fn workspace_section_is_frozen_within_a_session() {
+        let ws = std::env::temp_dir().join(format!("wctx-freeze-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("MEMORY.md"), "first memory").unwrap();
+        let wm = Arc::new(WorkspaceManager::with_fs(ws.clone(), None));
+        let middleware = WorkspaceContextMiddleware::new(wm);
+        let rc = RuntimeContext::new().with_session_id("sess-freeze");
+
+        let first = middleware.on_system_prompt(&rc, String::new()).await;
+        assert!(first.contains("first memory"), "{first}");
+
+        // A mid-session `memory_save` (or any workspace edit) must not rewrite the system
+        // prompt: that would invalidate the provider's prompt cache from token 0.
+        std::fs::write(ws.join("MEMORY.md"), "second memory").unwrap();
+        let again = middleware.on_system_prompt(&rc, String::new()).await;
+        assert_eq!(
+            again, first,
+            "the section must stay frozen within a session"
+        );
+
+        let other = middleware
+            .on_system_prompt(
+                &RuntimeContext::new().with_session_id("sess-other"),
+                String::new(),
+            )
+            .await;
+        assert!(other.contains("second memory"), "{other}");
+
+        std::fs::remove_dir_all(ws).ok();
     }
 }

@@ -169,6 +169,11 @@ impl Toolkit {
     }
 
     /// Returns the schemas of the tools active for the given group set.
+    ///
+    /// The result is sorted by tool name: the registry is a `HashMap`, whose iteration
+    /// order is unspecified and changes after rehashing or in a new process. The schema
+    /// list renders at the head of every request, so an unstable order would invalidate
+    /// the provider's prompt cache for the whole conversation.
     pub fn tool_schemas_for(&self, active_groups: &[String]) -> Vec<ToolSchema> {
         let tools = self.tools.lock().unwrap();
         let mut out = Vec::new();
@@ -177,6 +182,7 @@ impl Toolkit {
                 out.push(tool.schema());
             }
         }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
@@ -231,6 +237,9 @@ impl Toolkit {
         for tool in config.external_tools().values() {
             out.push(tool.schema());
         }
+        // Same stability requirement as `tool_schemas_for`: backend and external tools are
+        // merged from two maps, so the combined list must be ordered deterministically.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
@@ -539,5 +548,28 @@ impl Toolkit {
         if !orphans.is_empty() {
             self.remove_tools(&orphans);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_schemas_are_sorted_by_name() {
+        let toolkit = Toolkit::new();
+        // Eight deliberately reverse-ordered registrations: a `HashMap` walk would match
+        // the expected order by chance only 1/8! of the time.
+        for name in [
+            "hotel", "golf", "foxtrot", "echo", "delta", "charlie", "bravo", "alpha",
+        ] {
+            toolkit.register_schema(ToolSchema::new(name, "test tool"));
+        }
+        let schemas = toolkit.tool_schemas();
+        let names: Vec<&str> = schemas.iter().map(|schema| schema.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"]
+        );
     }
 }

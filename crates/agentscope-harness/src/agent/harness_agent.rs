@@ -653,6 +653,13 @@ impl HarnessAgent {
         }
     }
 
+    /// Current per-call generation defaults of the embedded agent.
+    pub fn generate_options_defaults(&self) -> Option<agentscope_core::model::GenerateOptions> {
+        self.agent
+            .as_ref()
+            .map(|agent| agent.generate_options_defaults())
+    }
+
     /// 该 agent 的优雅关闭管理器。
     ///
     /// 中间件与 [`HarnessAgent::shutdown`] 共用同一个实例：关闭时新请求被拒绝，
@@ -843,6 +850,9 @@ pub struct HarnessAgentBuilder {
     /// Per-call generation defaults (e.g. additional request headers) applied
     /// to the embedded ReActAgent at build time.
     generate_options_defaults: Option<agentscope_core::model::GenerateOptions>,
+    /// Whether to send explicit prompt-cache breakpoints (Anthropic `cache_control`).
+    /// `None` keeps the provider default.
+    prompt_cache: Option<bool>,
     /// Retry/timeout policy for model calls (Java `modelExecutionConfig`).
     model_execution_config: Option<agentscope_core::model::ExecutionConfig>,
     /// Retry/timeout policy for tool calls (Java `toolExecutionConfig`).
@@ -974,6 +984,7 @@ impl Default for HarnessAgentBuilder {
             confirm_handler: None,
             permission_context: None,
             generate_options_defaults: None,
+            prompt_cache: None,
             model_execution_config: None,
             tool_execution_config: None,
             agent_id: None,
@@ -1572,6 +1583,16 @@ impl HarnessAgentBuilder {
         self
     }
 
+    /// Enables explicit prompt-cache breakpoints for providers that support them.
+    ///
+    /// Only Anthropic Messages endpoints understand the `cache_control` marker;
+    /// OpenAI-compatible gateways either ignore it or reject the unknown field, so
+    /// callers should gate this on the resolved protocol. Off by default.
+    pub fn prompt_cache(mut self, enabled: bool) -> Self {
+        self.prompt_cache = Some(enabled);
+        self
+    }
+
     /// Sets the model-call retry/timeout policy (mirrors Java
     /// `HarnessAgent.Builder.modelExecutionConfig`).
     ///
@@ -1607,7 +1628,13 @@ impl HarnessAgentBuilder {
                 .max_attempts = Some(retries.saturating_add(1));
         }
         match (&self.generate_options_defaults, model_config) {
-            (None, None) => None,
+            (None, None) => {
+                return self.prompt_cache.map(|enabled| {
+                    agentscope_core::model::GenerateOptions::builder()
+                        .cache_control(enabled)
+                        .build()
+                })
+            }
             (Some(options), None) => Some(options.clone()),
             (None, Some(config)) => Some(
                 agentscope_core::model::GenerateOptions::builder()
@@ -1620,6 +1647,12 @@ impl HarnessAgentBuilder {
                 Some(options)
             }
         }
+        .map(|mut options| {
+            if let Some(enabled) = self.prompt_cache {
+                options.cache_control = Some(enabled);
+            }
+            options
+        })
     }
 
     // ---- Java-parity setters (D2) ----
@@ -2832,6 +2865,36 @@ mod tests {
     use super::*;
     use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
     use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
+
+    #[test]
+    fn prompt_cache_reaches_the_generation_defaults() {
+        let on = HarnessAgent::builder()
+            .prompt_cache(true)
+            .effective_generate_options()
+            .expect("defaults");
+        assert_eq!(on.cache_control, Some(true));
+
+        let off = HarnessAgent::builder()
+            .prompt_cache(false)
+            .effective_generate_options()
+            .expect("defaults");
+        assert_eq!(off.cache_control, Some(false));
+
+        // Without the flag the provider default applies: no explicit breakpoints.
+        assert!(HarnessAgent::builder()
+            .effective_generate_options()
+            .is_none());
+    }
+
+    #[test]
+    fn prompt_cache_overrides_the_embedders_defaults() {
+        let merged = HarnessAgent::builder()
+            .generate_options_defaults(GenerateOptions::builder().cache_control(false).build())
+            .prompt_cache(true)
+            .effective_generate_options()
+            .expect("defaults");
+        assert_eq!(merged.cache_control, Some(true));
+    }
 
     /// A model that never gets called; these tests only inspect the built agent.
     struct NoopModel;

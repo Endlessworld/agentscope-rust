@@ -183,12 +183,13 @@ async fn task_projection_runs_inside_the_real_build_path() {
         );
     }
 
-    // The stale receipt is rewritten for the provider: only the latest revision stays `full`.
+    // Historical receipts stay verbatim: rewriting them mid-history would break the
+    // provider's prompt cache on every todo update.
     let rendered: Vec<String> = seen.lock().unwrap().iter().map(|m| render(m)).collect();
     let joined = rendered.join("\n=====\n");
     assert!(
-        joined.contains("Todo update recorded at revision 1"),
-        "stale receipt was not downgraded: {joined}"
+        !joined.contains("Todo update recorded at revision"),
+        "historical receipt was rewritten: {joined}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
