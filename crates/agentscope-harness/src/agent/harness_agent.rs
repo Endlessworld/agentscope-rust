@@ -787,6 +787,10 @@ impl CallableAgent for HarnessAgent {
         HarnessAgent::add_permission_rule(self, rule);
     }
 
+    fn set_permission_context(&self, ctx: agentscope_core::PermissionContextState) {
+        HarnessAgent::set_permission_context(self, ctx);
+    }
+
     fn set_host_session_id(&self, session_id: &str) {
         HarnessAgent::set_host_session_id(self, session_id);
     }

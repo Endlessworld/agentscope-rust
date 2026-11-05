@@ -71,8 +71,14 @@ fn schema_lists_declared_parameters_and_required_marks() {
     let schema = add_tool().schema();
     assert_eq!(schema.name, "add");
     assert_eq!(schema.parameters["type"], json!("object"));
-    assert_eq!(schema.parameters["properties"]["a"]["type"], json!("integer"));
-    assert_eq!(schema.parameters["properties"]["b"]["type"], json!("integer"));
+    assert_eq!(
+        schema.parameters["properties"]["a"]["type"],
+        json!("integer")
+    );
+    assert_eq!(
+        schema.parameters["properties"]["b"]["type"],
+        json!("integer")
+    );
     assert_eq!(schema.parameters["required"], json!(["a", "b"]));
     // 非 strict 工具不注入 additionalProperties。
     assert!(schema.parameters.get("additionalProperties").is_none());
@@ -121,7 +127,10 @@ fn any_value_parameter_has_an_empty_schema() {
 #[test]
 fn borrowed_str_parameter_maps_to_the_string_schema() {
     let schema = shout_tool().schema();
-    assert_eq!(schema.parameters["properties"]["text"]["type"], json!("string"));
+    assert_eq!(
+        schema.parameters["properties"]["text"]["type"],
+        json!("string")
+    );
     assert_eq!(schema.parameters["required"], json!(["text"]));
 }
 
@@ -186,7 +195,10 @@ async fn result_functions_map_err_to_an_error_result() {
     assert_eq!(call(&divide_tool(), json!({"a": 6, "b": 3})).await, "2");
 
     let failure = divide_tool()
-        .call(args(json!({"a": 1, "b": 0})), ToolExecutionContext::default())
+        .call(
+            args(json!({"a": 1, "b": 0})),
+            ToolExecutionContext::default(),
+        )
         .await
         .expect("Err is a tool error result");
     assert_eq!(

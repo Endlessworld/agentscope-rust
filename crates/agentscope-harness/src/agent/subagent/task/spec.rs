@@ -27,6 +27,12 @@ pub enum TaskRunSpec {
     /// execution is promoted to async on timeout).
     Adopted {
         future: tokio::task::JoinHandle<Result<String>>,
+        /// Host-visible session id of the subagent this run belongs to (`sub-<uuid>`).
+        ///
+        /// Persisted so `session/load` can rebuild the exact child the live client saw; without
+        /// it the replay has to invent an id and the card cannot be matched to the original.
+        /// `None` for adopted runs that are not subagent turns.
+        child_session: Option<String>,
     },
 }
 

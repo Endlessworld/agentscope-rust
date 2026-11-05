@@ -1,1 +1,40 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path fill="currentColor" d="M8 1 14.5 4.75v6.5L8 15 1.5 11.25v-6.5L8 1Zm0 2.3L3.3 6.05v4.9L8 12.7l4.7-1.75v-4.9L8 3.3Z"/></svg>
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-150 -150 300 300"
+  width="32" height="32" role="img" aria-label="5倍速旋转的太极阴阳鱼图标">
+  <defs>
+    <radialGradient id="ink" gradientUnits="userSpaceOnUse" cx="-30" cy="-60" r="170">
+      <stop offset="0%"   stop-color="#3a4f72"/>
+      <stop offset="50%"  stop-color="#131c28"/>
+      <stop offset="100%" stop-color="#04070b"/>
+    </radialGradient>
+    <radialGradient id="paper" gradientUnits="userSpaceOnUse" cx="-30" cy="-60" r="170">
+      <stop offset="0%"   stop-color="#ffffff"/>
+      <stop offset="58%"  stop-color="#e8eff9"/>
+      <stop offset="100%" stop-color="#a7b6c9"/>
+    </radialGradient>
+  </defs>
+
+  <g>
+    <!-- 太极主体：5 倍速，1.6s 一圈 -->
+    <animateTransform attributeName="transform" type="rotate"
+      from="0 0 0" to="360 0 0" dur="1.6s" repeatCount="indefinite"/>
+
+    <circle r="100" fill="url(#paper)"/>
+    <path d="M 0,-100 A 100,100 0 0 0 0,100 Z" fill="url(#ink)"/>
+    <circle cy="-50" r="50" fill="url(#ink)"/>
+    <circle cy="50"  r="50" fill="url(#paper)"/>
+
+    <!-- 白眼：呼吸 -->
+    <circle cy="-50" r="15" fill="url(#paper)">
+      <animate attributeName="r" values="15;11.5;15" dur="4.5s" repeatCount="indefinite"/>
+    </circle>
+    <!-- 黑眼：相位错开半周期 -->
+    <circle cy="50" r="15" fill="url(#ink)">
+      <animate attributeName="r" values="15;11.5;15" dur="4.5s"
+        begin="-2.25s" repeatCount="indefinite"/>
+    </circle>
+
+    <!-- 小尺寸加粗外轮廓 -->
+    <circle r="100" fill="none" stroke="#8fb0d8" stroke-width="6" opacity=".6"/>
+  </g>
+</svg>

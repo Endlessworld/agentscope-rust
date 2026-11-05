@@ -287,14 +287,23 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
     if let Some(variadic) = &function.sig.variadic {
-        return syn::Error::new(variadic.span(), "`#[tool]` does not support variadic functions")
-            .to_compile_error()
-            .into();
+        return syn::Error::new(
+            variadic.span(),
+            "`#[tool]` does not support variadic functions",
+        )
+        .to_compile_error()
+        .into();
     }
 
     let function_ident = function.sig.ident.clone();
     let constructor_ident = format_ident!("{}_tool", function_ident);
     let visibility = function.vis.clone();
+
+    // 防御性地去掉函数级的 `#[tool]`：宏展开结果里不能再带上它，
+    // 否则重新展开会再次触发本宏。
+    function
+        .attrs
+        .retain(|attribute| !attribute.path().is_ident("tool"));
 
     // 每个参数：参数类型 → (schema spec, 取值语句, 实参名)。
     let mut specs = Vec::new();
@@ -308,9 +317,12 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .into();
         };
         let Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
-            return syn::Error::new(pat_type.pat.span(), "tool parameters must be plain identifiers")
-                .to_compile_error()
-                .into();
+            return syn::Error::new(
+                pat_type.pat.span(),
+                "tool parameters must be plain identifiers",
+            )
+            .to_compile_error()
+            .into();
         };
         let argument = pat_ident.ident.clone();
         let argument_type = (*pat_type.ty).clone();
@@ -325,7 +337,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                         description = Some(meta.value()?.parse::<LitStr>()?.value());
                         Ok(())
                     } else {
-                        Err(meta.error("tool parameters only accept #[tool(description = \"...\")]"))
+                        Err(meta
+                            .error("tool parameters only accept #[tool(description = \"...\")]"))
                     }
                 });
                 if let Err(error) = parsed {

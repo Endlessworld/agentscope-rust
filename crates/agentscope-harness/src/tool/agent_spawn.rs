@@ -235,12 +235,18 @@ impl AgentSpawnTool {
 
     /// Declares the session this tool's agent runs under (set by a host once it knows the id).
     pub fn set_host_session(&self, session: impl Into<String>) {
-        *self.host_session.lock().unwrap() = Some(session.into());
+        *self
+            .host_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(session.into());
     }
 
     /// The session this tool's agent runs under, when it is a subagent.
     fn host_session(&self) -> Option<String> {
-        self.host_session.lock().unwrap().clone()
+        self.host_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Restricts spawnable agent ids (permission scoping). Empty = allow all.
@@ -570,6 +576,9 @@ impl Tool for AgentSpawnTool {
                     parent,
                     self.event_sink.clone(),
                 )),
+                // Persist the live card id: `session/load` replays this exact child instead of
+                // inventing a different one from the task id.
+                child_session: Some(child_session.clone()),
             }
         };
 
@@ -819,6 +828,7 @@ impl Tool for AgentSendTool {
         let rt = ctx_runtime(&ctx);
         let session_id = task_session_key_from_runtime(&ctx.runtime);
         let task_id = self.spawn.next_task_id("send");
+        let child_for_record = child_session.clone();
         repo.put_task(
             &rt,
             &task_id,
@@ -833,6 +843,7 @@ impl Tool for AgentSendTool {
                     self.spawn.host_session(),
                     self.spawn.event_sink.clone(),
                 )),
+                child_session: Some(child_for_record),
             },
         )
         .await;

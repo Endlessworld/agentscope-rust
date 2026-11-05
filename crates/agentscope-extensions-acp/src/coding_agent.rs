@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use agent_client_protocol::v1::schema::{
     AgentAuthCapabilities, AgentCapabilities, ArchiveSessionRequest, ArchiveSessionResponse,
@@ -174,9 +174,19 @@ pub struct SessionBuild {
     ///
     /// The root's spawn tool knows only its direct children, so a `session/cancel` addressed to
     /// a grandchild is routed here instead. Shared with the session and the permission bridge
-    /// (which is handed every child, nested ones included).
+    /// (which is handed every child, nested ones included). Weak: the owning spawn tool keeps a
+    /// live child alive, so this map must not pin finished subagents for the session's life.
     pub subagent_agents:
-        Option<Arc<Mutex<HashMap<String, Arc<dyn agentscope_core::agent::CallableAgent>>>>>,
+        Option<Arc<Mutex<HashMap<String, Weak<dyn agentscope_core::agent::CallableAgent>>>>>,
+    /// ACP mode slot the subagent permission bridge reads when a child is spawned.
+    ///
+    /// `None` for probing agents. Shared with [`AcpAgentSession::apply_mode`] so a child always
+    /// runs under the mode in force at spawn time.
+    pub subagent_mode: Option<Arc<Mutex<String>>>,
+    /// How many levels below this session a subagent may spawn further subagents.
+    ///
+    /// `0` keeps every child a leaf; `1` allows one intermediate level (the default).
+    pub subagent_nesting: u8,
 }
 
 /// An ACP CodingAgent with a session registry and a factory for building the
@@ -229,6 +239,11 @@ pub struct AcpCodingAgent {
     /// `session/cancel` addressed to the child id, which only this map can route to the
     /// session that owns the subagent.
     subagent_children: Arc<Mutex<HashMap<String, String>>>,
+    /// How many levels below a session a subagent may spawn further subagents (default 1).
+    ///
+    /// Kept configurable because nested delegation multiplies model calls (and the tools a
+    /// child carries); a host that wants flat delegation sets it to `0`.
+    subagent_nesting: u8,
 }
 
 const IMAGE_SUPPORT_NO: u8 = 1;
@@ -330,6 +345,7 @@ impl AcpCodingAgent {
             image_support: ImageSupport::default(),
             auth_probe: Arc::new(|| AuthState::NotRequired),
             subagent_children: Arc::new(Mutex::new(HashMap::new())),
+            subagent_nesting: 1,
         }
     }
 
@@ -350,6 +366,15 @@ impl AcpCodingAgent {
     /// Overrides the agent display name.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self
+    }
+
+    /// Sets how many levels below a session a subagent may spawn further subagents.
+    ///
+    /// `0` makes every child a leaf (flat delegation); `1` (the default) lets a child keep its
+    /// own `agent_spawn` tool so a grandchild is possible; the grandchild is always a leaf.
+    pub fn with_subagent_nesting(mut self, max_depth: u8) -> Self {
+        self.subagent_nesting = max_depth;
         self
     }
 
@@ -460,10 +485,16 @@ impl AcpCodingAgent {
             Arc::new(Mutex::new(None));
         let permission_store = Arc::new(super::permission_store::PermissionRuleStore::at_dir(&cwd));
         // Every child of this session's subagent tree, so a cancel naming a nested child still
-        // reaches its agent (the root tool only owns its direct children).
+        // reaches its agent (the root tool only owns its direct children). Weak: the owning
+        // spawn tool already keeps a live child alive; a strong map here would pin finished
+        // subagents (and their toolkits/models) for the whole session.
         let subagent_agents: Arc<
-            Mutex<HashMap<String, Arc<dyn agentscope_core::agent::CallableAgent>>>,
+            Mutex<HashMap<String, Weak<dyn agentscope_core::agent::CallableAgent>>>,
         > = Arc::new(Mutex::new(HashMap::new()));
+        // The mode a child must inherit. Filled by `AcpAgentSession::apply_mode` (before the
+        // first prompt, and again on every mode switch), read by the permission bridge at spawn.
+        let subagent_mode: Arc<Mutex<String>> =
+            Arc::new(Mutex::new(super::config::default_mode().to_string()));
         let agent = match &self.session_factory {
             Some(factory) => factory(SessionBuild {
                 cwd: cwd.clone(),
@@ -475,6 +506,8 @@ impl AcpCodingAgent {
                 client_slot: Some(Arc::clone(&client_slot)),
                 permission_store: Some(Arc::clone(&permission_store)),
                 subagent_agents: Some(Arc::clone(&subagent_agents)),
+                subagent_mode: Some(Arc::clone(&subagent_mode)),
+                subagent_nesting: self.subagent_nesting,
             }),
             None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
         };
@@ -487,6 +520,7 @@ impl AcpCodingAgent {
         );
         session.set_elicitation_slot(elicitation_slot);
         session.set_client_slot(client_slot);
+        session.set_subagent_mode(subagent_mode);
         session.set_permission_store(permission_store);
         session.set_subagent_events(subagent_frames);
         session.set_subagent_children(Arc::clone(&self.subagent_children));
@@ -682,6 +716,8 @@ impl AcpCodingAgent {
                 client_slot: None,
                 permission_store: None,
                 subagent_agents: None,
+                subagent_mode: None,
+                subagent_nesting: self.subagent_nesting,
             }),
             None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
         };
@@ -943,6 +979,8 @@ impl AcpCodingAgent {
                 client_slot: None,
                 permission_store: None,
                 subagent_agents: None,
+                subagent_mode: None,
+                subagent_nesting: self.subagent_nesting,
             }),
             None => (self.model_factory)(cwd.to_path_buf(), CATALOG_SESSION_ID),
         });

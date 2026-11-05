@@ -1083,6 +1083,8 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         client_slot,
         permission_store,
         subagent_agents,
+        subagent_mode,
+        subagent_nesting,
     } = ctx;
     let session_id = session_id.as_str();
     let model_config = ModelConfig::load_or_create();
@@ -1213,22 +1215,29 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         builder = builder.subagent_events(events);
     }
     // Nested delegation: a subagent may spawn its own worker (and report it as a card of its own
-    // transcript). One level deep — the grandchild is a leaf, which bounds the recursion.
-    builder = builder.subagent_nesting(0, 1);
+    // transcript). The configured depth bounds the recursion; the default of one level makes the
+    // grandchild a leaf. A host that wants flat delegation sets `with_subagent_nesting(0)`.
+    builder = builder.subagent_nesting(0, subagent_nesting);
 
     // A child runs in a background task under its own session id (`sub-<uuid>`): its `ask`
     // tools must raise `session/request_permission` on *that* id, otherwise the approval card
     // cannot be attributed to the subagent and the parent session blocks on it instead.
     // The child id only exists after the spawn tool minted it, so the routing is installed as a
-    // runtime hook rather than baked into the agent factory.
-    if let (Some(slot), Some(store), Some(agents)) =
-        (client_slot, permission_store, subagent_agents)
-    {
+    // runtime hook rather than baked into the agent factory. The mode slot lets the hook install
+    // the *current* permission context on the child (without it every child would fall back to
+    // the trivial context and run tools without asking).
+    if let (Some(slot), Some(store), Some(agents), Some(mode)) = (
+        client_slot,
+        permission_store,
+        subagent_agents,
+        subagent_mode,
+    ) {
         builder = builder.subagent_runtime_hook(Arc::new(
             agentscope_extensions_acp::session::SubagentPermissionHook::new(
                 slot,
                 store,
                 agent_client_protocol::v1::schema::SessionId::new(session_id.to_string()),
+                mode,
                 agents,
             ),
         ));

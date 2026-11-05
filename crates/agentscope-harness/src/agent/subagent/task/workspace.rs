@@ -256,14 +256,19 @@ impl WorkspaceTaskRepository {
     }
 
     fn synthetic_from_record(&self, rec: &TaskRecord) -> Arc<BackgroundTask> {
-        BackgroundTask::from_record(
+        let task = BackgroundTask::from_record(
             rec.task_id.clone(),
             rec.sub_agent_id.clone(),
             rec.created_at,
             rec.status,
             rec.result.clone(),
             rec.error_message.clone(),
-        )
+        );
+        // The live client knew this run as `sub-<uuid>`; a replay that renames it cannot be
+        // matched to the card the user already saw (and would draw a second card).
+        task.set_sub_session_id(rec.sub_session_id.clone());
+        task.set_last_checked_at(rec.last_updated_at);
+        task
     }
 }
 
@@ -302,6 +307,13 @@ impl TaskRepository for WorkspaceTaskRepository {
             session_id,
         );
         record.status = TaskStatus::Pending;
+        if let TaskRunSpec::Adopted {
+            child_session: Some(child),
+            ..
+        } = &spec
+        {
+            record.sub_session_id = Some(child.clone());
+        }
         if let TaskRunSpec::Remote {
             base_url, headers, ..
         } = &spec
@@ -322,7 +334,7 @@ impl TaskRepository for WorkspaceTaskRepository {
         // run executing (dropping the spec drops the handle without aborting it). Capture the
         // abort handle here and abort from the wrapper's own drop, which runs on abort too.
         let adopted_abort = match &spec {
-            TaskRunSpec::Adopted { future } => Some(future.abort_handle()),
+            TaskRunSpec::Adopted { future, .. } => Some(future.abort_handle()),
             _ => None,
         };
 
@@ -394,7 +406,7 @@ impl TaskRepository for WorkspaceTaskRepository {
                     )
                     .await
                 }
-                TaskRunSpec::Adopted { future } => {
+                TaskRunSpec::Adopted { future, .. } => {
                     // `cancel_task` aborts *this* wrapper task. Propagate that abort to the
                     // adopted run, otherwise a cancelled subagent turn keeps executing
                     // detached (and keeps burning tokens after the user cancelled it).

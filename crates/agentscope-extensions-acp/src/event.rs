@@ -1047,6 +1047,10 @@ pub fn subagent_notifications(
         }
         meta.completed_at = Some(now_timestamp());
         let meta = meta.clone();
+        // The card is closed and a later `agent_send` turn announces itself from scratch, so the
+        // gathered metadata (and any tool mapping) would only pile up in a long-lived session.
+        tracker.metas.remove(child);
+        tracker.mappers.remove(child);
         out.push(subagent_idle(
             parent,
             child,

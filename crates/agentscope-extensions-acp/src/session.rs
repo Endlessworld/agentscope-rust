@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use agent_client_protocol::v1::schema::{
     ContentBlock, CreateElicitationRequest, CreateElicitationResponse, MessageId, PermissionOption,
@@ -25,6 +25,7 @@ use agentscope_core::ConfirmHandler;
 use sha2::{Digest, Sha256};
 
 use agentscope_harness::agent::bus::MessageBus;
+use agentscope_harness::agent::subagent::task::{BackgroundTask, TaskStatus};
 use agentscope_harness::agent::HarnessAgent;
 
 use super::config::{self, ModeChoice, ModelChoice};
@@ -273,11 +274,19 @@ pub struct SubagentPermissionHook {
     client: Arc<Mutex<Option<Arc<AcpClientHandle>>>>,
     store: Arc<PermissionRuleStore>,
     parent: SessionId,
+    /// The ACP mode the parent session is currently in.
+    ///
+    /// Read on every spawn: a child must inherit the mode in force when it starts (a session
+    /// can switch from `yolo` to `accept_edits` between two spawns), so a snapshot taken when
+    /// the session was built would be wrong. Shared with [`AcpAgentSession::apply_mode`].
+    mode: Arc<Mutex<String>>,
     /// Every child of this session's tree, keyed by child session id.
     ///
     /// Shared with [`AcpAgentSession`]: a nested child is owned by an intermediate subagent's
-    /// spawn tool, so cancelling it by id has no other route back to the agent.
-    agents: Arc<Mutex<HashMap<String, Arc<dyn CallableAgent>>>>,
+    /// spawn tool, so cancelling it by id has no other route back to the agent. Weak on purpose:
+    /// the owning spawn tool already keeps a live child alive, and a strong map here would pin
+    /// every finished subagent (with its toolkit, model and workspace) for the session's life.
+    agents: Arc<Mutex<HashMap<String, Weak<dyn CallableAgent>>>>,
 }
 
 impl SubagentPermissionHook {
@@ -285,12 +294,14 @@ impl SubagentPermissionHook {
         client: Arc<Mutex<Option<Arc<AcpClientHandle>>>>,
         store: Arc<PermissionRuleStore>,
         parent: SessionId,
-        agents: Arc<Mutex<HashMap<String, Arc<dyn CallableAgent>>>>,
+        mode: Arc<Mutex<String>>,
+        agents: Arc<Mutex<HashMap<String, Weak<dyn CallableAgent>>>>,
     ) -> Self {
         Self {
             client,
             store,
             parent,
+            mode,
             agents,
         }
     }
@@ -308,12 +319,27 @@ impl agentscope_harness::tool::SubagentRuntimeHook for SubagentPermissionHook {
         let parent = parent_session
             .map(|id| SessionId::new(id.to_string()))
             .unwrap_or_else(|| self.parent.clone());
+        // A child starts with the mode the user currently selected, not with the framework's
+        // trivial default (which allows every tool call without asking). This is what makes an
+        // `accept_edits` session ask before the child runs a shell command.
+        let mode = self
+            .mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        agent.set_permission_context(config::permission_context_for_mode(&mode));
+        // "Always allow / always reject" answers survive across children: the rules are
+        // persisted by the same store the parent session uses, so a fresh child would otherwise
+        // ask again for a decision the user already made.
+        for rule in self.store.load() {
+            agent.add_permission_rule(rule);
+        }
         // Let the child tag its own spawns (nested delegation) before it starts working.
         agent.set_host_session_id(child_session);
         self.agents
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(child_session.to_string(), Arc::clone(agent));
+            .insert(child_session.to_string(), Arc::downgrade(agent));
         let Some(client) = self
             .client
             .lock()
@@ -661,7 +687,12 @@ pub struct AcpAgentSession {
     /// Shared with the permission bridge (which is handed each child, whatever spawned it): the
     /// root's spawn tool owns only its direct children, so a cancel naming a grandchild is
     /// resolved here.
-    subagent_agents: Arc<Mutex<HashMap<String, Arc<dyn agentscope_core::agent::CallableAgent>>>>,
+    subagent_agents: Arc<Mutex<HashMap<String, Weak<dyn agentscope_core::agent::CallableAgent>>>>,
+    /// ACP mode the parent session currently runs in, shared with [`SubagentPermissionHook`].
+    ///
+    /// A child spawned mid-turn must inherit the mode in force *then*, not the one the session
+    /// was built with.
+    subagent_mode: Arc<Mutex<String>>,
 }
 
 fn session_config_path(cwd: &std::path::Path, session_id: &SessionId) -> PathBuf {
@@ -921,6 +952,7 @@ impl AcpAgentSession {
             subagent_events: Arc::new(Mutex::new(None)),
             subagent_children: Arc::new(Mutex::new(HashMap::new())),
             subagent_agents: Arc::new(Mutex::new(HashMap::new())),
+            subagent_mode: Arc::new(Mutex::new(config::default_mode().to_string())),
         };
         {
             let mut config = session
@@ -1272,6 +1304,12 @@ impl AcpAgentSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .mode
             .clone();
+        // Publish the mode to the subagent bridge before the next spawn: a child must run under
+        // the same rules as the session that spawns it.
+        *self
+            .subagent_mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = mode.clone();
         let ctx = config::permission_context_for_mode(&mode);
         self.agent.set_permission_context(ctx);
         let persisted = self.permission_store.load();
@@ -1322,9 +1360,27 @@ impl AcpAgentSession {
     /// Shares the tree-wide child registry with the subagent permission bridge.
     pub fn set_subagent_agents(
         &mut self,
-        agents: Arc<Mutex<HashMap<String, Arc<dyn agentscope_core::agent::CallableAgent>>>>,
+        agents: Arc<Mutex<HashMap<String, Weak<dyn agentscope_core::agent::CallableAgent>>>>,
     ) {
         self.subagent_agents = agents;
+    }
+
+    /// Shares the ACP mode slot the subagent permission bridge reads at spawn time.
+    ///
+    /// Must be installed before [`Self::apply_mode`] runs against the shared store so the slot
+    /// carries the session's persisted mode rather than the default.
+    pub fn set_subagent_mode(&mut self, mode: Arc<Mutex<String>>) {
+        self.subagent_mode = mode;
+        let current = self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mode
+            .clone();
+        *self
+            .subagent_mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = current;
     }
 
     /// Shares the child → parent registry with the coding agent (which routes
@@ -1376,6 +1432,7 @@ impl AcpAgentSession {
         let support = self.support.clone();
         let parent = self.session_id.clone();
         let children = Arc::clone(&self.subagent_children);
+        let agents = Arc::clone(&self.subagent_agents);
         tokio::spawn(async move {
             let mut tracker = event::SubagentTracker::new()
                 .with_plan_operations(support.supports_plan_operations());
@@ -1415,6 +1472,13 @@ impl AcpAgentSession {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .remove(&child);
+                        // The weak entry is already dead by now (the spawn tool dropped the
+                        // agent); dropping the key keeps the map from growing for the session's
+                        // whole life.
+                        agents
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&child);
                     }
                     _ => {}
                 }
@@ -1438,12 +1502,14 @@ impl AcpAgentSession {
         }
         // A nested child is owned by the intermediate subagent's spawn tool, which this session
         // cannot reach; the tree-wide registry the permission bridge fills is the way in.
+        // Dropping the entry as we read it matters: a stale `sub-*` id must not resurrect a
+        // finished child (or cancel a later turn that reused the id).
         let agent = self
             .subagent_agents
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&id)
-            .cloned();
+            .remove(&id)
+            .and_then(|weak| weak.upgrade());
         match agent {
             Some(agent) => {
                 agent.interrupt();
@@ -2060,52 +2126,60 @@ impl AcpAgentSession {
     ///
     /// Only terminal tasks are replayed: a task the previous process left pending or running has
     /// no runner and no result, so reporting it as working or as failed would both be invented.
-    /// The child id is derived from the task id, so reopening the session re-renders the same
-    /// cards instead of accumulating new ones.
+    ///
+    /// Two details make the replay match what the client saw live:
+    /// - the child id is the one persisted with the record (`sub-<uuid>`), not one derived from
+    ///   the task id, so a card is not duplicated on every reload;
+    /// - a child that ran several `agent_send` turns has one card, not one per turn (the live
+    ///   client reuses the card it was announced with).
     async fn replay_subagent_cards(
         &self,
     ) -> Vec<agent_client_protocol::v1::schema::SessionNotification> {
-        use agentscope_harness::agent::subagent::task::TaskStatus;
+        /// Guard against a corrupt/cyclic task graph. Nested delegation is bounded by the session
+        /// configuration (one level by default), so this is never reached in practice.
+        const MAX_REPLAY_DEPTH: usize = 4;
 
         let ctx = self.session_context();
-        let tasks = self
-            .agent
-            .task_repository()
-            .list_tasks(&ctx, &self.session_id.to_string(), None)
-            .await;
+        let repo = self.agent.task_repository();
         let mut notifications = Vec::new();
-        for task in tasks {
-            let status = task.get_task_status();
-            if !status.is_terminal() {
-                continue;
+        let mut owners = vec![self.session_id.to_string()];
+        for _ in 0..MAX_REPLAY_DEPTH {
+            let mut children = Vec::new();
+            for owner in std::mem::take(&mut owners) {
+                for card in fold_replay_cards(repo.list_tasks(&ctx, &owner, None).await) {
+                    let meta = event::SubagentMeta {
+                        started_at: Some(rfc3339_millis(card.started_at)),
+                        completed_at: Some(rfc3339_millis(card.completed_at)),
+                        // The model and the label a live spawn reports are not part of the
+                        // record.
+                        model: None,
+                        role: Some(card.title.clone()),
+                    };
+                    notifications.push(event::subagent_started(
+                        &SessionId::new(owner.clone()),
+                        &card.child,
+                        &card.title,
+                        &format!("agent: {}", card.title),
+                        Some(meta.clone()),
+                    ));
+                    let (outcome, error) = match card.status {
+                        TaskStatus::Completed => ("success", None),
+                        TaskStatus::Cancelled => ("cancelled", None),
+                        _ => ("error", card.error),
+                    };
+                    notifications.push(event::subagent_idle(
+                        &SessionId::new(owner.clone()),
+                        &card.child,
+                        Some(event::stop_reason_for(outcome, error.as_deref())),
+                        Some(meta),
+                    ));
+                    children.push(card.child);
+                }
             }
-            let agent_id = task.agent_id().to_string();
-            let child = format!("sub-{}", task.task_id());
-            let meta = event::SubagentMeta {
-                started_at: Some(rfc3339_millis(task.created_at())),
-                completed_at: Some(rfc3339_millis(task.last_checked_at())),
-                // The model and the label a live spawn reports are not part of the record.
-                model: None,
-                role: Some(agent_id.clone()),
-            };
-            notifications.push(event::subagent_started(
-                &self.session_id,
-                &child,
-                &agent_id,
-                &format!("agent: {agent_id}"),
-                Some(meta.clone()),
-            ));
-            let (outcome, error) = match status {
-                TaskStatus::Completed => ("success", None),
-                TaskStatus::Cancelled => ("cancelled", None),
-                _ => ("error", task.get_error()),
-            };
-            notifications.push(event::subagent_idle(
-                &self.session_id,
-                &child,
-                Some(event::stop_reason_for(outcome, error.as_deref())),
-                Some(meta),
-            ));
+            if children.is_empty() {
+                break;
+            }
+            owners = children;
         }
         notifications
     }
@@ -3114,6 +3188,67 @@ impl AcpAgentSession {
     }
 }
 
+/// One subagent card reconstructed from durable task records.
+struct ReplayCard {
+    /// The child session id the live client saw (`sub-<uuid>`), or `sub-<task id>` for records
+    /// written before the id was persisted.
+    child: String,
+    title: String,
+    started_at: u64,
+    completed_at: u64,
+    /// Creation time of the turn whose state the card reports.
+    last_seen: u64,
+    status: TaskStatus,
+    error: Option<String>,
+}
+
+/// Folds terminal task records into one card per child session.
+///
+/// A child that ran several `agent_send` turns leaves one task per turn. The live client reused
+/// the card it was announced with, so the replay must do the same: one card spanning the whole
+/// life, reporting the state of the most recent turn. Non-terminal tasks are dropped — the
+/// previous process left them without a runner or a result, so any state would be invented.
+fn fold_replay_cards(tasks: Vec<Arc<BackgroundTask>>) -> Vec<ReplayCard> {
+    let mut cards: std::collections::BTreeMap<String, ReplayCard> =
+        std::collections::BTreeMap::new();
+    for task in tasks {
+        let status = task.get_task_status();
+        if !status.is_terminal() {
+            continue;
+        }
+        let child = task
+            .sub_session_id()
+            .unwrap_or_else(|| format!("sub-{}", task.task_id()));
+        let created_at = task.created_at();
+        let last_checked_at = task.last_checked_at();
+        match cards.entry(child) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                let child = slot.key().clone();
+                slot.insert(ReplayCard {
+                    child,
+                    title: task.agent_id().to_string(),
+                    started_at: created_at,
+                    completed_at: last_checked_at,
+                    last_seen: created_at,
+                    status,
+                    error: task.get_error(),
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                let card = slot.get_mut();
+                card.started_at = card.started_at.min(created_at);
+                card.completed_at = card.completed_at.max(last_checked_at);
+                if created_at >= card.last_seen {
+                    card.last_seen = created_at;
+                    card.status = status;
+                    card.error = task.get_error();
+                }
+            }
+        }
+    }
+    cards.into_values().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3121,6 +3256,74 @@ mod tests {
         SelectedDescriptor,
     };
     use agentscope_core::message::{ChatUsage, Msg};
+    use agentscope_harness::agent::subagent::task::{BackgroundTask, TaskStatus};
+
+    fn terminal_task(
+        task_id: &str,
+        child: Option<&str>,
+        created_at: u64,
+        last_checked_at: u64,
+        status: TaskStatus,
+        error: Option<&str>,
+    ) -> std::sync::Arc<BackgroundTask> {
+        let task = BackgroundTask::from_record(
+            task_id,
+            "explorer",
+            created_at,
+            status,
+            None,
+            error.map(str::to_string),
+        );
+        task.set_sub_session_id(child.map(str::to_string));
+        task.set_last_checked_at(last_checked_at);
+        task
+    }
+
+    #[test]
+    fn a_replayed_card_spans_every_turn_of_one_child() {
+        // `agent_send` reuses the child's card; replaying one card per task would draw two.
+        let spawn = terminal_task(
+            "spawn-1",
+            Some("sub-live"),
+            1_000,
+            2_000,
+            TaskStatus::Completed,
+            None,
+        );
+        let send = terminal_task(
+            "send-2",
+            Some("sub-live"),
+            5_000,
+            6_000,
+            TaskStatus::Failed,
+            Some("boom"),
+        );
+        let cards = super::fold_replay_cards(vec![spawn, send]);
+        assert_eq!(cards.len(), 1, "one child, one card");
+        assert_eq!(cards[0].child, "sub-live");
+        assert_eq!(
+            cards[0].started_at, 1_000,
+            "the card starts with the first turn"
+        );
+        assert_eq!(cards[0].completed_at, 6_000, "and ends with the last one");
+        assert_eq!(cards[0].status, TaskStatus::Failed);
+        assert_eq!(cards[0].error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn a_record_without_a_child_session_falls_back_to_the_task_id() {
+        let task = terminal_task("spawn-7", None, 10, 20, TaskStatus::Completed, None);
+        let cards = super::fold_replay_cards(vec![task]);
+        assert_eq!(cards[0].child, "sub-spawn-7");
+    }
+
+    #[test]
+    fn a_running_task_is_not_replayed() {
+        // No runner and no result survive a restart: reporting it as working or failed would
+        // both be invented.
+        let task = terminal_task("spawn-9", Some("sub-x"), 10, 20, TaskStatus::Running, None);
+        assert!(super::fold_replay_cards(vec![task]).is_empty());
+    }
 
     #[test]
     fn saving_a_session_config_replaces_it_atomically() {

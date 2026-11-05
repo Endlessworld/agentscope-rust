@@ -545,6 +545,19 @@ impl ReActAgent {
         self.core.permission_engine.lock().unwrap().add_rule(rule);
     }
 
+    /// The permission state every tool call is evaluated against (mode + rule tables).
+    ///
+    /// A host uses it to display what a child actually runs under, and to verify that a freshly
+    /// spawned subagent inherited the session's mode instead of the trivial default.
+    pub fn permission_context(&self) -> PermissionContextState {
+        self.core
+            .permission_engine
+            .lock()
+            .unwrap()
+            .context()
+            .clone()
+    }
+
     /// Clears the current session's model-visible conversation context without
     /// creating a new session, mirroring `ReActAgent#clearContext`. The session id
     /// and persisted state metadata are preserved; only the message history is reset.
@@ -1317,6 +1330,10 @@ impl CallableAgent for ReActAgent {
 
     fn add_permission_rule(&self, rule: crate::permission::PermissionRule) {
         ReActAgent::add_permission_rule(self, rule);
+    }
+
+    fn set_permission_context(&self, ctx: crate::permission::PermissionContextState) {
+        ReActAgent::set_permission_context(self, ctx);
     }
 }
 

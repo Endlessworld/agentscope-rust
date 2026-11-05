@@ -795,7 +795,7 @@ impl TaskRepository for ControlPlaneTaskRepository {
                     context,
                 )
             }
-            TaskRunSpec::Adopted { future } => {
+            TaskRunSpec::Adopted { future, .. } => {
                 let task =
                     BackgroundTask::adopt(task_id.to_string(), sub_agent_id.to_string(), future);
                 let this = Arc::new(ControlPlaneTaskRepository {

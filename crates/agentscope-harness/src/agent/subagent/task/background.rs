@@ -27,6 +27,12 @@ pub struct BackgroundTask {
     last_checked_at: AtomicU64,
     cancelled: AtomicBool,
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Host-visible session id of the subagent this run belongs to (`sub-<uuid>`).
+    ///
+    /// Reconstructed from the durable record so a host replaying a session can name the same
+    /// child the live client saw. `None` for tasks that are not subagent turns (and for records
+    /// written before the field existed).
+    sub_session_id: Mutex<Option<String>>,
     state: Arc<TaskState>,
 }
 
@@ -53,6 +59,7 @@ impl BackgroundTask {
             last_checked_at: AtomicU64::new(now),
             cancelled: AtomicBool::new(false),
             handle: Mutex::new(handle),
+            sub_session_id: Mutex::new(None),
             state: Arc::new(TaskState {
                 status: Mutex::new(TaskInner::Running),
                 condvar: Condvar::new(),
@@ -158,6 +165,7 @@ impl BackgroundTask {
             last_checked_at: AtomicU64::new(now_millis()),
             cancelled: AtomicBool::new(false),
             handle: Mutex::new(Some(handle)),
+            sub_session_id: Mutex::new(None),
             state,
         })
     }
@@ -192,6 +200,7 @@ impl BackgroundTask {
             last_checked_at: AtomicU64::new(now_millis()),
             cancelled: AtomicBool::new(false),
             handle: Mutex::new(Some(handle)),
+            sub_session_id: Mutex::new(None),
             state,
         })
     }
@@ -204,6 +213,22 @@ impl BackgroundTask {
         &self.agent_id
     }
 
+    /// The host-visible `sub-<uuid>` session this run belongs to, when the record carries one.
+    pub fn sub_session_id(&self) -> Option<String> {
+        self.sub_session_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Restores the child session id recorded when the task was created.
+    pub fn set_sub_session_id(&self, session_id: Option<String>) {
+        *self
+            .sub_session_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = session_id;
+    }
+
     pub fn created_at(&self) -> u64 {
         self.created_at
     }
@@ -214,6 +239,14 @@ impl BackgroundTask {
 
     pub fn update_last_checked_at(&self) {
         self.last_checked_at.store(now_millis(), Ordering::Relaxed);
+    }
+
+    /// Restores the last observed timestamp from a durable record.
+    ///
+    /// A reconstructed task otherwise claims it was "checked" at load time, which makes a replay
+    /// report every finished subagent as having completed just now.
+    pub fn set_last_checked_at(&self, ts: u64) {
+        self.last_checked_at.store(ts, Ordering::Relaxed);
     }
 
     pub fn is_completed(&self) -> bool {

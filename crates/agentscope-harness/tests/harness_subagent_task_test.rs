@@ -192,7 +192,10 @@ async fn cancel_task_aborts_an_adopted_run() {
             "t1",
             "sub1",
             "sess",
-            TaskRunSpec::Adopted { future: inner },
+            TaskRunSpec::Adopted {
+                future: inner,
+                child_session: None,
+            },
         )
         .await;
     assert_eq!(bg.get_task_status(), TaskStatus::Running);
@@ -210,5 +213,37 @@ async fn cancel_task_aborts_an_adopted_run() {
         "the cancelled adopted run kept executing"
     );
     assert_eq!(bg.get_task_status(), TaskStatus::Cancelled);
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subagent_child_session_survives_a_reload() {
+    // A replay must name the child the live client already saw (`sub-<uuid>`). Deriving the id
+    // from the task id on load (`sub-spawn-1`) draws a second card the user cannot correlate.
+    let dir = temp_dir("child_session").await;
+    let repo = new_repo(&dir);
+    let bg = repo
+        .put_task(
+            &ctx(),
+            "spawn-1",
+            "explorer",
+            "sess1",
+            TaskRunSpec::Adopted {
+                future: tokio::spawn(async {
+                    Ok::<String, agentscope_core::error::Error>("done".to_string())
+                }),
+                child_session: Some("sub-live-1".to_string()),
+            },
+        )
+        .await;
+    assert!(bg.wait_for_completion(5000));
+
+    let repo2 = new_repo(&dir);
+    let got = repo2.get_task(&ctx(), "sess1", "spawn-1").await.unwrap();
+    assert_eq!(
+        got.sub_session_id().as_deref(),
+        Some("sub-live-1"),
+        "the durable record must carry the live child id"
+    );
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }

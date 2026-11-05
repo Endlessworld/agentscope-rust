@@ -211,6 +211,22 @@ impl PermissionContextBuilder {
     }
 }
 
+/// Adds `rule` to the table its behavior selects (a no-op for `Passthrough`).
+fn push_rule(
+    allow: &mut HashMap<String, Vec<PermissionRule>>,
+    deny: &mut HashMap<String, Vec<PermissionRule>>,
+    ask: &mut HashMap<String, Vec<PermissionRule>>,
+    rule: PermissionRule,
+) {
+    let table = match rule.behavior {
+        PermissionBehavior::Allow => allow,
+        PermissionBehavior::Deny => deny,
+        PermissionBehavior::Ask => ask,
+        PermissionBehavior::Passthrough => return,
+    };
+    table.entry(rule.tool_name.clone()).or_default().push(rule);
+}
+
 /// Evaluates tool execution requests against configured permission rules.
 #[derive(Debug, Clone)]
 pub struct PermissionEngine {
@@ -237,25 +253,23 @@ impl PermissionEngine {
     }
 
     /// Adds a rule to the engine's internal rule set.
+    ///
+    /// The rule lands in the context snapshot too: [`Self::context`] is the state a host reads
+    /// back (and what a newly created engine is seeded with), so leaving it stale would hide a
+    /// just-granted `always allow` from both the host and the next `set_permission_context`.
     pub fn add_rule(&mut self, rule: PermissionRule) {
-        match rule.behavior {
-            PermissionBehavior::Allow => self
-                .allow_rules
-                .entry(rule.tool_name.clone())
-                .or_default()
-                .push(rule),
-            PermissionBehavior::Deny => self
-                .deny_rules
-                .entry(rule.tool_name.clone())
-                .or_default()
-                .push(rule),
-            PermissionBehavior::Ask => self
-                .ask_rules
-                .entry(rule.tool_name.clone())
-                .or_default()
-                .push(rule),
-            PermissionBehavior::Passthrough => {}
-        }
+        push_rule(
+            &mut self.allow_rules,
+            &mut self.deny_rules,
+            &mut self.ask_rules,
+            rule.clone(),
+        );
+        push_rule(
+            &mut self.context.allow_rules,
+            &mut self.context.deny_rules,
+            &mut self.context.ask_rules,
+            rule,
+        );
     }
 
     /// Resolves a permission decision for the given tool invocation.

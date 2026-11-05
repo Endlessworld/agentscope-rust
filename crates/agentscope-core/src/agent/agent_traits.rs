@@ -98,6 +98,15 @@ pub trait CallableAgent: Agent {
         let _ = session_id;
     }
 
+    /// Replaces the permission engine this agent evaluates tool calls with.
+    ///
+    /// A host installs the parent session's context on a freshly spawned child so the child
+    /// inherits the user's mode (e.g. `AcceptEdits`: shell commands ask, edits do not). Without
+    /// it a child falls back to the trivial context, which allows every tool call silently.
+    fn set_permission_context(&self, ctx: crate::permission::PermissionContextState) {
+        let _ = ctx;
+    }
+
     /// Convenience: call with a single message.
     async fn call_single(&self, msg: Msg) -> Result<Msg> {
         self.call(vec![msg]).await

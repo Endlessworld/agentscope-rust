@@ -181,9 +181,10 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 - 客户端没声明 `subagents` 时**完全静默**（不发 `subagent_update`，也不发子会话 chunk），退回普通 tool_call 形态。
 - `session/cancel` 发到子会话 id 会中断该子代理（不会改动父 turn）；`session/close` 会中断该会话下所有子代理。
 - 子代理内的权限询问以**子会话 id** 发起（`session/request_permission.sessionId` = 子会话），客户端据此把审批卡挂到子代理卡片上；答复后立刻回 `running`，终态仍由 turn 结束上报。
+- 子代理在启动前会继承父会话**当前**的权限模式，并加载 `permissions.json` 里已持久化的 always allow / always deny 规则：`accept_edits` 下子代理执行 shell 同样会弹审批，用户在子代理弹窗里选的 “always allow” 对后续子代理同样生效（同一个 store）。
 - 子会话的 `plan`/`plan_update` 外层 `sessionId` 也是子会话 id，与父 turn 形态一致。
-- 嵌套：子代理内部再 spawn 时，`subagent_update` 的外层 `sessionId` 是**直接父会话**（即中间那个子代理）。默认只开一层（`subagent_nesting(0, 1)`），再深的孙代理是叶子；`session/cancel` 用子会话 id 会在整棵树上找到并中断对应子代理。
-- `session/load` 会把历史上**已终态**的子代理回放成 `started` + `idle` 两张卡（子会话 id 由 task id 派生，重开幂等）；挂起中的任务不回放。
+- 嵌套：子代理内部再 spawn 时，`subagent_update` 的外层 `sessionId` 是**直接父会话**（即中间那个子代理）。嵌套层数由 `AcpCodingAgent::with_subagent_nesting(n)` 配置（默认 `1`，经 `SessionBuild.subagent_nesting` 传给 builder）：`0` 时每个子代理都是叶子，`1` 时子代理可再 spawn 一层（孙代理为叶子）；`session/cancel` 用子会话 id 会在整棵树上找到并中断对应子代理。
+- `session/load` 会把历史上**已终态**的子代理回放成 `started` + `idle` 两张卡：子会话 id 用记录里持久化的 `sub_session_id`（即实时的 `sub-<uuid>`，重开幂等、不会与实时卡片错位）；同一子代理的多次 `agent_send` 只回放一张卡（时间跨度取首轮创建到最后一次更新，状态取最近一轮）；嵌套子代理按记录的父会话 id 回放到对应外层；挂起/运行中的任务不回放。
 - 子会话（`sub-*`）不出现在 `session/list` / `session/load` 里；`session/status` 只对进程内仍在运行的子代理返回 `open`，重启后与其他未知 id 一样报错。
 
 认证方法不门控：`initialize` 总是返回一条 terminal 类型的认证方法（id `setup`，`args: ["--setup"]`），
