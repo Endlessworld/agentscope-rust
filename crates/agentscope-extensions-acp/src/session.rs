@@ -15,6 +15,7 @@ use agent_client_protocol::v1::schema::{
     SessionMode, SessionModeState, StopReason, ToolCallUpdate,
 };
 use agent_client_protocol::{v1::ConnectionTo, Client};
+use agentscope_core::agent::CallableAgent;
 use agentscope_core::event::{AgentEvent, ConfirmResult};
 use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
 use agentscope_core::model::catalog::ModelDescriptor;
@@ -218,20 +219,143 @@ fn always_rule_for(call: &ToolUseBlock, allow: bool) -> PermissionRule {
     PermissionRule::new(call.name.clone(), content, behavior, "user-permission")
 }
 
+/// An epoch-millisecond timestamp rendered the way `_meta` timestamps are.
+fn rfc3339_millis(millis: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(millis as i64)
+        .map(|at| at.to_rfc3339())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339())
+}
+
+/// Pairs the two `subagent_update` state notices a permission round-trip owes the client.
+///
+/// A child that blocks on a user decision reports `requires_action` before the request, and
+/// `running` once the answer arrives; without the pair the card would keep claiming it waits
+/// for a decision that was already made.
+#[derive(Clone)]
+pub(crate) struct SubagentStateNotice {
+    parent: SessionId,
+    child: String,
+}
+
+impl SubagentStateNotice {
+    pub(crate) fn new(parent: SessionId, child: impl Into<String>) -> Self {
+        Self {
+            parent,
+            child: child.into(),
+        }
+    }
+
+    /// Reports that the child is waiting for the user.
+    pub(crate) fn requires_action(&self, client: &AcpClientHandle) {
+        if let Err(error) = client.notify(super::event::subagent_requires_action(
+            &self.parent,
+            &self.child,
+        )) {
+            tracing::debug!(%error, "subagent requires_action could not be delivered");
+        }
+    }
+
+    /// Reports that the child resumed after the decision.
+    pub(crate) fn running(&self, client: &AcpClientHandle) {
+        if let Err(error) = client.notify(super::event::subagent_running(&self.parent, &self.child))
+        {
+            tracing::debug!(%error, "subagent running could not be delivered");
+        }
+    }
+}
+
+/// Routes a subagent's `Ask` tool decisions to the ACP client under the **child** session id.
+///
+/// Installed on every freshly spawned child by [`SubagentPermissionHook`]: the harness knows the
+/// child's user-visible id only after the spawn tool minted it, which is why this cannot be baked
+/// into the agent factory.
+pub struct SubagentPermissionHook {
+    client: Arc<Mutex<Option<Arc<AcpClientHandle>>>>,
+    store: Arc<PermissionRuleStore>,
+    parent: SessionId,
+    /// Every child of this session's tree, keyed by child session id.
+    ///
+    /// Shared with [`AcpAgentSession`]: a nested child is owned by an intermediate subagent's
+    /// spawn tool, so cancelling it by id has no other route back to the agent.
+    agents: Arc<Mutex<HashMap<String, Arc<dyn CallableAgent>>>>,
+}
+
+impl SubagentPermissionHook {
+    pub fn new(
+        client: Arc<Mutex<Option<Arc<AcpClientHandle>>>>,
+        store: Arc<PermissionRuleStore>,
+        parent: SessionId,
+        agents: Arc<Mutex<HashMap<String, Arc<dyn CallableAgent>>>>,
+    ) -> Self {
+        Self {
+            client,
+            store,
+            parent,
+            agents,
+        }
+    }
+}
+
+impl agentscope_harness::tool::SubagentRuntimeHook for SubagentPermissionHook {
+    fn on_child_ready(
+        &self,
+        parent_session: Option<&str>,
+        child_session: &str,
+        agent: &Arc<dyn CallableAgent>,
+    ) {
+        // A nested spawn names the intermediate subagent as the parent; a direct child of the
+        // session this hook belongs to has no parent id to report.
+        let parent = parent_session
+            .map(|id| SessionId::new(id.to_string()))
+            .unwrap_or_else(|| self.parent.clone());
+        // Let the child tag its own spawns (nested delegation) before it starts working.
+        agent.set_host_session_id(child_session);
+        self.agents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(child_session.to_string(), Arc::clone(agent));
+        let Some(client) = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            // The child is spawned from a prompt, so a session that reached this point has a
+            // live connection; without one there is nobody to ask, and the default (an error)
+            // is the honest answer.
+            tracing::warn!(
+                child = %child_session,
+                "subagent spawned without a live client connection; its tool prompts will fail"
+            );
+            return;
+        };
+        let handler = acp_confirm_handler(
+            SessionId::new(child_session.to_string()),
+            client,
+            Arc::clone(agent),
+            Arc::clone(&self.store),
+            Some(SubagentStateNotice::new(parent, child_session.to_string())),
+        );
+        agent.set_confirm_handler(Some(handler));
+    }
+}
+
 /// Builds the core `ConfirmHandler` that turns an `Ask` permission decision
 /// into an ACP `session/request_permission` round-trip and maps the outcome
 /// back to a [`ConfirmResult`].
 fn acp_confirm_handler(
     session_id: SessionId,
     client: Arc<AcpClientHandle>,
-    agent: Arc<HarnessAgent>,
+    agent: Arc<dyn CallableAgent>,
     store: Arc<PermissionRuleStore>,
+    notice: Option<SubagentStateNotice>,
 ) -> ConfirmHandler {
     Arc::new(move |call: ToolUseBlock| {
         let client = Arc::clone(&client);
         let agent = Arc::clone(&agent);
         let store = Arc::clone(&store);
         let session_id = session_id.clone();
+        let notice = notice.clone();
         Box::pin(async move {
             let raw_input = if call.input.is_empty() {
                 None
@@ -240,7 +364,18 @@ fn acp_confirm_handler(
             };
             let tool_call =
                 event::tool_call_update_for_permission(call.id.clone(), &call.name, raw_input);
-            match client.request_permission(&session_id, tool_call).await {
+            // The card must show "waiting for you" *before* the prompt arrives: a subagent that
+            // silently blocks reads as working, and the user never learns they are the blocker.
+            if let Some(notice) = &notice {
+                notice.requires_action(&client);
+            }
+            let outcome = client.request_permission(&session_id, tool_call).await;
+            // Whatever the answer, the child is working again (a rejection just makes that tool
+            // call fail); the terminal `idle` of the turn reports the real end.
+            if let Some(notice) = &notice {
+                notice.running(&client);
+            }
+            match outcome {
                 Ok(response) => match response.outcome {
                     RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
                         option_id,
@@ -506,17 +641,27 @@ pub struct AcpAgentSession {
     /// Shared: `session/list` and LRU eviction read it through a *clone* taken from the
     /// registry, so a per-clone value would keep reporting the moment the clone was made.
     updated_at: Arc<Mutex<Option<String>>>,
-    /// Out-of-band `(child session, event)` frames from the harness's subagent channel.
+    /// Out-of-band frames from the harness's subagent channel.
     ///
     /// Taken exactly once, by the forwarder started on the first prompt (see
     /// [`Self::start_subagent_forwarder`]): a subagent keeps running after the parent's prompt
     /// returns, so its frames cannot be consumed by the prompt loop.
-    subagent_events: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(String, AgentEvent)>>>>,
+    subagent_events: Arc<
+        Mutex<
+            Option<tokio::sync::mpsc::UnboundedReceiver<agentscope_harness::tool::SubagentFrame>>,
+        >,
+    >,
     /// Child session id → the ACP session that owns it.
     ///
     /// Shared with the coding agent: `session/cancel` addressed to a child session has to reach
     /// the agent that spawned it, and the child is not a registered session of its own.
     subagent_children: Arc<Mutex<HashMap<String, String>>>,
+    /// Every live child of this session's subagent tree, including nested ones.
+    ///
+    /// Shared with the permission bridge (which is handed each child, whatever spawned it): the
+    /// root's spawn tool owns only its direct children, so a cancel naming a grandchild is
+    /// resolved here.
+    subagent_agents: Arc<Mutex<HashMap<String, Arc<dyn agentscope_core::agent::CallableAgent>>>>,
 }
 
 fn session_config_path(cwd: &std::path::Path, session_id: &SessionId) -> PathBuf {
@@ -775,6 +920,7 @@ impl AcpAgentSession {
             updated_at: Arc::new(Mutex::new(None)),
             subagent_events: Arc::new(Mutex::new(None)),
             subagent_children: Arc::new(Mutex::new(HashMap::new())),
+            subagent_agents: Arc::new(Mutex::new(HashMap::new())),
         };
         {
             let mut config = session
@@ -1162,10 +1308,10 @@ impl AcpAgentSession {
         self.start_subagent_forwarder();
     }
 
-    /// Installs the harness channel carrying `(child session, event)` frames.
+    /// Installs the harness channel carrying subagent frames.
     pub fn set_subagent_events(
         &mut self,
-        events: tokio::sync::mpsc::UnboundedReceiver<(String, AgentEvent)>,
+        events: tokio::sync::mpsc::UnboundedReceiver<agentscope_harness::tool::SubagentFrame>,
     ) {
         *self
             .subagent_events
@@ -1173,10 +1319,36 @@ impl AcpAgentSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(events);
     }
 
+    /// Shares the tree-wide child registry with the subagent permission bridge.
+    pub fn set_subagent_agents(
+        &mut self,
+        agents: Arc<Mutex<HashMap<String, Arc<dyn agentscope_core::agent::CallableAgent>>>>,
+    ) {
+        self.subagent_agents = agents;
+    }
+
     /// Shares the child → parent registry with the coding agent (which routes
     /// `session/cancel` addressed to a child).
     pub fn set_subagent_children(&mut self, children: Arc<Mutex<HashMap<String, String>>>) {
         self.subagent_children = children;
+    }
+
+    /// Uses the client slot the subagent permission bridge was built with.
+    ///
+    /// The bridge is installed on the agent before this session exists (it has to be, or the
+    /// first spawn would already be running), so both must share one slot instead of each
+    /// creating its own.
+    pub fn set_client_slot(&mut self, slot: Arc<Mutex<Option<Arc<AcpClientHandle>>>>) {
+        self.client = slot;
+    }
+
+    /// Uses the permission-rule store the subagent permission bridge was built with.
+    ///
+    /// Rules an "always allow/deny" answer adds from a child are persisted by the bridge; sharing
+    /// the store keeps this session's in-memory context in step with them.
+    pub fn set_permission_store(&mut self, store: Arc<PermissionRuleStore>) {
+        self.permission_store = store;
+        self.apply_mode();
     }
 
     /// Streams the harness's subagent frames to the client for as long as the session lives.
@@ -1205,11 +1377,24 @@ impl AcpAgentSession {
         let parent = self.session_id.clone();
         let children = Arc::clone(&self.subagent_children);
         tokio::spawn(async move {
-            let mut tracker = event::SubagentTracker::new();
-            while let Some((child, frame)) = events.recv().await {
-                for notification in
-                    event::subagent_notifications(&support, &parent, &child, &frame, &mut tracker)
-                {
+            let mut tracker = event::SubagentTracker::new()
+                .with_plan_operations(support.supports_plan_operations());
+            while let Some(frame) = events.recv().await {
+                let child = frame.child_session.clone();
+                // A card belongs to the transcript of whoever spawned the child: for a nested
+                // spawn that is the intermediate subagent, not this session.
+                let owner = frame
+                    .parent_session
+                    .clone()
+                    .map(SessionId::new)
+                    .unwrap_or_else(|| parent.clone());
+                for notification in event::subagent_notifications(
+                    &support,
+                    &owner,
+                    &child,
+                    &frame.event,
+                    &mut tracker,
+                ) {
                     if let Err(error) = client.notify(notification) {
                         // A dropped connection has nobody left to render subagents.
                         tracing::debug!(%error, "subagent update could not be delivered");
@@ -1217,8 +1402,8 @@ impl AcpAgentSession {
                     }
                 }
                 // Keep the routing table in step with what the client was told: a child is
-                // cancellable only while it runs.
-                match event::subagent_state(&frame) {
+                // cancellable only while it runs, whichever session spawned it.
+                match event::subagent_state(&frame.event) {
                     Some(event::SubagentState::Running) if support.supports_subagents() => {
                         children
                             .lock()
@@ -1243,9 +1428,29 @@ impl AcpAgentSession {
     /// cancel, and the client's optimistic state is then corrected by the final
     /// `subagent_update`.
     pub fn cancel_subagent(&self, child: &SessionId) -> bool {
-        self.agent
+        let id = child.to_string();
+        if self
+            .agent
             .spawn_tool()
-            .is_some_and(|tool| tool.cancel_subagent(&child.to_string()))
+            .is_some_and(|tool| tool.cancel_subagent(&id))
+        {
+            return true;
+        }
+        // A nested child is owned by the intermediate subagent's spawn tool, which this session
+        // cannot reach; the tree-wide registry the permission bridge fills is the way in.
+        let agent = self
+            .subagent_agents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&id)
+            .cloned();
+        match agent {
+            Some(agent) => {
+                agent.interrupt();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Interrupts every subagent this session spawned and forgot about them.
@@ -1297,11 +1502,13 @@ impl AcpAgentSession {
             .clone()
         {
             Some(client) => {
+                let agent: Arc<dyn CallableAgent> = self.agent.clone();
                 let handler = acp_confirm_handler(
                     self.session_id.clone(),
                     Arc::clone(&client),
-                    Arc::clone(&self.agent),
+                    agent,
                     Arc::clone(&self.permission_store),
+                    None,
                 );
                 self.agent.set_confirm_handler(Some(handler));
             }
@@ -1839,6 +2046,66 @@ impl AcpAgentSession {
                     _ => {}
                 }
             }
+        }
+        notifications.extend(self.replay_subagent_cards().await);
+        notifications
+    }
+
+    /// Replays the subagent cards of a loaded session.
+    ///
+    /// A client that reconnects has no memory of the subagents the conversation spawned, so the
+    /// transcript would come back with the spawn tool calls and none of the cards they produced.
+    /// The live channel died with the process that ran them; the durable task records are the
+    /// only surviving source, and they carry everything a card needs (role, start, end, outcome).
+    ///
+    /// Only terminal tasks are replayed: a task the previous process left pending or running has
+    /// no runner and no result, so reporting it as working or as failed would both be invented.
+    /// The child id is derived from the task id, so reopening the session re-renders the same
+    /// cards instead of accumulating new ones.
+    async fn replay_subagent_cards(
+        &self,
+    ) -> Vec<agent_client_protocol::v1::schema::SessionNotification> {
+        use agentscope_harness::agent::subagent::task::TaskStatus;
+
+        let ctx = self.session_context();
+        let tasks = self
+            .agent
+            .task_repository()
+            .list_tasks(&ctx, &self.session_id.to_string(), None)
+            .await;
+        let mut notifications = Vec::new();
+        for task in tasks {
+            let status = task.get_task_status();
+            if !status.is_terminal() {
+                continue;
+            }
+            let agent_id = task.agent_id().to_string();
+            let child = format!("sub-{}", task.task_id());
+            let meta = event::SubagentMeta {
+                started_at: Some(rfc3339_millis(task.created_at())),
+                completed_at: Some(rfc3339_millis(task.last_checked_at())),
+                // The model and the label a live spawn reports are not part of the record.
+                model: None,
+                role: Some(agent_id.clone()),
+            };
+            notifications.push(event::subagent_started(
+                &self.session_id,
+                &child,
+                &agent_id,
+                &format!("agent: {agent_id}"),
+                Some(meta.clone()),
+            ));
+            let (outcome, error) = match status {
+                TaskStatus::Completed => ("success", None),
+                TaskStatus::Cancelled => ("cancelled", None),
+                _ => ("error", task.get_error()),
+            };
+            notifications.push(event::subagent_idle(
+                &self.session_id,
+                &child,
+                Some(event::stop_reason_for(outcome, error.as_deref())),
+                Some(meta),
+            ));
         }
         notifications
     }

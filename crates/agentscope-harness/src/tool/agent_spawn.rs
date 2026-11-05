@@ -48,6 +48,13 @@ pub struct SubagentExposure {
     pub agent_id: String,
     pub session_id: String,
     pub label: Option<String>,
+    /// The model the child runs with, when it can name one (`_meta.model`).
+    pub model: Option<String>,
+    /// The role the parent assigned to the child (`_meta.role`); the registered agent id.
+    pub role: Option<String>,
+    /// The session that spawned the child, when it is known (a nested spawn names the
+    /// intermediate subagent, not the root: a card belongs to the transcript that spawned it).
+    pub parent_session: Option<String>,
 }
 
 impl SubagentExposure {
@@ -62,6 +69,15 @@ impl SubagentExposure {
         fields.insert("sessionId".to_string(), serde_json::json!(self.session_id));
         if let Some(label) = self.label {
             fields.insert("label".to_string(), serde_json::json!(label));
+        }
+        if let Some(model) = self.model {
+            fields.insert("model".to_string(), serde_json::json!(model));
+        }
+        if let Some(role) = self.role {
+            fields.insert("role".to_string(), serde_json::json!(role));
+        }
+        if let Some(parent) = self.parent_session {
+            fields.insert("parentSessionId".to_string(), serde_json::json!(parent));
         }
         agentscope_core::event::AgentEvent::with_fields(
             agentscope_core::event::AgentEventType::SubagentExposed,
@@ -96,10 +112,42 @@ impl SubagentExposureSink {
     }
 }
 
-/// Out-of-band channel carrying `(child_session_id, event)` frames for a host that renders
-/// subagent progress. Unbounded on purpose: the child runs in a background task and a bounded
-/// channel would either block that task or drop its output.
-pub type SubagentEventSink = UnboundedSender<(String, AgentEvent)>;
+/// One frame on the subagent channel: which subagent produced `event`, and which session spawned
+/// it.
+///
+/// The parent is carried rather than inferred: with nested spawns the spawning session is an
+/// intermediate subagent, and a host that attributed every frame to the root would render a
+/// grandchild's card in the wrong transcript.
+pub struct SubagentFrame {
+    /// Session that spawned this child (`None` when the root spawned it).
+    pub parent_session: Option<String>,
+    pub child_session: String,
+    pub event: AgentEvent,
+}
+
+/// Out-of-band channel carrying [`SubagentFrame`]s for a host that renders subagent progress.
+/// Unbounded on purpose: the child runs in a background task and a bounded channel would either
+/// block that task or drop its output.
+pub type SubagentEventSink = UnboundedSender<SubagentFrame>;
+
+/// Configures a freshly created subagent before it starts working.
+///
+/// The spawn tool owns the child's user-visible identity (`sub-<uuid>`), which the factory that
+/// built the child could not know. A host that must route the child's own protocol traffic (a
+/// permission prompt belonging to the child session, nested progress) installs a hook instead of
+/// threading that id through the whole subagent blueprint.
+pub trait SubagentRuntimeHook: Send + Sync {
+    /// Called once per spawned subagent, after its id is minted and before its first turn.
+    ///
+    /// `parent_session` is the spawning session's own id when the spawner is itself a subagent,
+    /// `None` when the root session spawned it (a host then knows its own id).
+    fn on_child_ready(
+        &self,
+        parent_session: Option<&str>,
+        child_session: &str,
+        agent: &Arc<dyn CallableAgent>,
+    );
+}
 
 /// Spawns registered subagents as tool invocations.
 pub struct AgentSpawnTool {
@@ -112,6 +160,13 @@ pub struct AgentSpawnTool {
     /// can route child traffic independently of the parent turn — a subagent keeps running after
     /// the parent's prompt has returned.
     event_sink: Option<SubagentEventSink>,
+    /// Configures each freshly created child before it starts (permission routing, nesting).
+    subagent_hook: Option<Arc<dyn SubagentRuntimeHook>>,
+    /// The session this tool's own agent runs under, when that agent is itself a subagent.
+    ///
+    /// A nested spawn must report the intermediate agent as the new child's parent, and a child
+    /// learns its own id only after the host minted it — hence interior mutability.
+    host_session: Mutex<Option<String>>,
     /// Empty set = every non-PRIMARY agent may be spawned.
     allowed_agents: HashSet<String>,
     propagate_plan_mode: bool,
@@ -131,6 +186,8 @@ impl AgentSpawnTool {
             tasks: None,
             exposure_sink: None,
             event_sink: None,
+            subagent_hook: None,
+            host_session: Mutex::new(None),
             allowed_agents: HashSet::new(),
             propagate_plan_mode: true,
             counter: AtomicU64::new(0),
@@ -168,6 +225,22 @@ impl AgentSpawnTool {
     pub fn with_event_sink(mut self, sink: SubagentEventSink) -> Self {
         self.event_sink = Some(sink);
         self
+    }
+
+    /// Configures each freshly created child before its first turn starts.
+    pub fn with_subagent_hook(mut self, hook: Arc<dyn SubagentRuntimeHook>) -> Self {
+        self.subagent_hook = Some(hook);
+        self
+    }
+
+    /// Declares the session this tool's agent runs under (set by a host once it knows the id).
+    pub fn set_host_session(&self, session: impl Into<String>) {
+        *self.host_session.lock().unwrap() = Some(session.into());
+    }
+
+    /// The session this tool's agent runs under, when it is a subagent.
+    fn host_session(&self) -> Option<String> {
+        self.host_session.lock().unwrap().clone()
     }
 
     /// Restricts spawnable agent ids (permission scoping). Empty = allow all.
@@ -457,6 +530,12 @@ impl Tool for AgentSpawnTool {
                 Arc::clone(&exec_agent),
                 repair.clone(),
             );
+            // The child's user-visible id now exists: let the host route its own protocol
+            // traffic (permission prompts, nested progress) before it starts.
+            let parent = self.host_session();
+            if let Some(hook) = &self.subagent_hook {
+                hook.on_child_ready(parent.as_deref(), &child_session, &exec_agent);
+            }
             // The subagent is now user-addressable, so announce it in-band (Java
             // `AgentSpawnTool#withSubagentExposedEvent`).
             let exposure = SubagentExposure {
@@ -464,6 +543,9 @@ impl Tool for AgentSpawnTool {
                 agent_id: agent_id.clone(),
                 session_id: child_session.clone(),
                 label: label.clone(),
+                model: exec_agent.model_name(),
+                role: Some(agent_id.clone()),
+                parent_session: parent.clone(),
             };
             if let Some(sink) = &self.exposure_sink {
                 sink.record(exposure.clone());
@@ -472,7 +554,11 @@ impl Tool for AgentSpawnTool {
             // step to carry the exposure: send it here, before the child task is spawned below,
             // so the announcement always precedes the child's first event.
             if let Some(events) = &self.event_sink {
-                let _ = events.send((child_session.clone(), exposure.into_event()));
+                let _ = events.send(SubagentFrame {
+                    parent_session: parent.clone(),
+                    child_session: child_session.clone(),
+                    event: exposure.into_event(),
+                });
             }
             header = format!("{}\n", spawn_header(&key, &agent_id, &child_session));
             TaskRunSpec::Adopted {
@@ -481,6 +567,7 @@ impl Tool for AgentSpawnTool {
                     repair,
                     effective_prompt,
                     child_session.clone(),
+                    parent,
                     self.event_sink.clone(),
                 )),
             }
@@ -522,9 +609,18 @@ async fn run_child_turn(
     repair: Option<Arc<dyn SubagentSessionRepair>>,
     prompt: String,
     child_session: String,
+    parent: Option<String>,
     sink: Option<SubagentEventSink>,
 ) -> Result<String> {
-    let outcome = match child_turn(&agent, prompt.clone(), &child_session, sink.as_ref()).await {
+    let outcome = match child_turn(
+        &agent,
+        prompt.clone(),
+        &child_session,
+        parent.as_deref(),
+        sink.as_ref(),
+    )
+    .await
+    {
         Ok(text) => Ok(text),
         // A turn cancelled mid-tool leaves an unknown outcome in the journal, which makes every
         // later open of that session fail. Settle it (recording `interrupted`, never success)
@@ -534,14 +630,27 @@ async fn run_child_turn(
         // stopped, so the outcome is folded instead of returned with `?`.
         Err(err) => match repair {
             Some(repair) if is_unreconciled(&err) => match repair.repair().await {
-                Ok(_) => child_turn(&agent, prompt, &child_session, sink.as_ref()).await,
+                Ok(_) => {
+                    child_turn(
+                        &agent,
+                        prompt,
+                        &child_session,
+                        parent.as_deref(),
+                        sink.as_ref(),
+                    )
+                    .await
+                }
                 Err(repair_error) => Err(repair_error),
             },
             _ => Err(err),
         },
     };
     if let Some(events) = &sink {
-        let _ = events.send((child_session, finished_event(&outcome)));
+        let _ = events.send(SubagentFrame {
+            parent_session: parent,
+            child_session,
+            event: finished_event(&outcome),
+        });
     }
     outcome
 }
@@ -551,6 +660,7 @@ async fn child_turn(
     agent: &Arc<dyn CallableAgent>,
     prompt: String,
     child_session: &str,
+    parent: Option<&str>,
     sink: Option<&SubagentEventSink>,
 ) -> Result<String> {
     let messages = vec![Msg::user(prompt)];
@@ -558,8 +668,13 @@ async fn child_turn(
         Some(events) => {
             let events = events.clone();
             let child = child_session.to_string();
+            let parent = parent.map(str::to_string);
             let forward = Arc::new(move |event: AgentEvent| {
-                let _ = events.send((child.clone(), event));
+                let _ = events.send(SubagentFrame {
+                    parent_session: parent.clone(),
+                    child_session: child.clone(),
+                    event,
+                });
             });
             agent
                 .call_streaming(messages, forward)
@@ -715,6 +830,7 @@ impl Tool for AgentSendTool {
                     repair,
                     message,
                     child_session,
+                    self.spawn.host_session(),
                     self.spawn.event_sink.clone(),
                 )),
             },
@@ -870,6 +986,7 @@ mod tests {
             "go".to_string(),
             "sub-test".to_string(),
             None,
+            None,
         )
         .await
         .expect("the replayed turn must succeed");
@@ -923,6 +1040,7 @@ mod tests {
             Some(Arc::new(CountingRepair(Arc::clone(&repairs)))),
             "go".to_string(),
             "sub-test".to_string(),
+            None,
             None,
         )
         .await
@@ -1008,6 +1126,7 @@ mod tests {
             None,
             "go".to_string(),
             "sub-1".to_string(),
+            Some("sub-parent".to_string()),
             Some(tx),
         )
         .await
@@ -1017,16 +1136,20 @@ mod tests {
         assert_eq!(streaming_calls.load(Ordering::SeqCst), 1);
         assert_eq!(plain_calls.load(Ordering::SeqCst), 0);
 
-        let (child, first) = rx.recv().await.expect("the child's event");
-        assert_eq!(child, "sub-1");
-        assert_eq!(first.event_type(), AgentEventType::TextBlockDelta);
+        let first = rx.recv().await.expect("the child's event");
+        assert_eq!(first.child_session, "sub-1");
+        // The spawning session travels with every frame: with nested spawns it is an
+        // intermediate subagent, not the root the host heard from first.
+        assert_eq!(first.parent_session.as_deref(), Some("sub-parent"));
+        assert_eq!(first.event.event_type(), AgentEventType::TextBlockDelta);
 
         // Every turn ends with a terminal marker: a host that only saw the announcement would
         // otherwise show the child as running forever.
-        let (child, last) = rx.recv().await.expect("the terminal marker");
-        assert_eq!(child, "sub-1");
-        assert_eq!(last.event_type(), AgentEventType::Custom);
-        let fields = &last.data().fields;
+        let last = rx.recv().await.expect("the terminal marker");
+        assert_eq!(last.child_session, "sub-1");
+        assert_eq!(last.parent_session.as_deref(), Some("sub-parent"));
+        assert_eq!(last.event.event_type(), AgentEventType::Custom);
+        let fields = &last.event.data().fields;
         assert_eq!(
             fields.get("kind").and_then(|v| v.as_str()),
             Some("subagent_finished")
@@ -1047,6 +1170,7 @@ mod tests {
             None,
             "go".to_string(),
             "sub-1".to_string(),
+            None,
             None,
         )
         .await

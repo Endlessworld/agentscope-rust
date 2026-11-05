@@ -449,7 +449,26 @@ Form 模式用受限 JSON Schema（扁平 `object`）描述请求内容，`Elici
 
 **本轮收尾清理**：删掉 `AcpAgentSession::mcp_acp_connections`（无握手协议下已无读取点，纯只写 keep-alive）；`is_archived_on_disk`/`set_archived_on_disk` 收为 `pub(crate)`；`shutdown_sessions` 改 `futures::future::join_all` 并发释放（每条仍 5s 有界）；MCP-over-ACP 内层错误改用 `Error::new(INTERNAL_ERROR, msg)`（信息进 `message` 而非 `data`，客户端可见）。
 
-**下一步（B4，可选）**：`ACP-39`（subagents 上报，前置阻塞：core `AgentEventEmitter` 无使用点，需先实现子智能体事件回灌父流）、`ACP-40`（fork，仍暂缓，见 `ACP-D13`）。B0–B3 已全部落地；`ACP-U01..U08` 与 `ACP-33..ACP-38`、`ACP-41..ACP-45` 均有结论。
+**下一步（B4，可选）**：`ACP-40`（fork，仍暂缓，见 `ACP-D13`）。`ACP-39` 的收尾项（stop reason / requires_action / 嵌套 / 回放 / `_meta` / 子会话 status）已于 2026-11-05 补齐，见下节。B0–B3 已全部落地；`ACP-U01..U08` 与 `ACP-33..ACP-38`、`ACP-41..ACP-45` 均有结论。
+
+#### 2026-11-05 `ACP-39` 收尾：子代理上报的协议细节
+
+前端 `subagent_update` 已就绪，本轮只补 Rust 侧缺口（不改前端）。协议约束（来自 `agent-client-protocol-schema-1.15.1`）：
+
+| 项 | 结论 | 落地位置 |
+|---|---|---|
+| 结束/失败/取消必须发 `subagent_update` 且带 `stopReason` | ✅ 已完成（原实现只发裸 `idle`，卡片会永远「运行中」） | `event.rs::stop_reason_for`（`success→end_turn`、`cancelled→cancelled`、`error→IdleStopReason::Error{error:{code,message}}`）+ `subagent_idle(..., stop_reason, meta)` |
+| `requires_action` 与 `session/request_permission` 成对 | ✅ 已完成 | `event.rs::subagent_requires_action`；`session.rs::SubagentStateNotice::{requires_action,running}` 在 `acp_confirm_handler` 内包住 `client.request_permission`（答复后无论允许/拒绝都回 `running`，终态由 turn 结束上报） |
+| 子会话 `plan`/`plan_update` 的外层 sessionId = 子会话 id | ✅ 已完成 | 子 `SubagentTracker` 改用 `with_plan_operations(support.supports_plan_operations())`，与父 turn 同一形态（此前子 mapper 走 legacy `Plan`，ID 化计划会丢 id） |
+| `request_permission.sessionId` 必须是子会话 id | ✅ 已完成（原实现子代理 `ask` 无 handler，卡片无法归属） | `SubagentRuntimeHook` 注入链：`SessionBuild.client_slot`/`permission_store` → `build_agent` → 子代理 blueprint → `agent_spawn` 调 `on_child_ready` → 装 `acp_confirm_handler(child_session, ...)` |
+| 嵌套 spawn 的外层 sessionId = 直接父会话 | ✅ 已完成 | harness：`HarnessAgentBuilder::subagent_nesting(depth, max)`；blueprint 携带 `subagent_events`/`subagent_runtime_hook`/`subagent_declarations`/`subagent_depth`/`max_subagent_depth`；`LeafFactory::build` 仅当 `depth > max` 才 `.as_leaf_subagent()`。帧：`SubagentFrame{parent_session, child_session, event}` 取代裸元组；`CallableAgent::set_host_session_id` 让中间子代理给自己的子代理打父标记（ACP 在 `on_child_ready` 里调用）。ACP 侧 `build_agent` 用 `subagent_nesting(0, 1)`（一层嵌套，孙代理是叶子）。取消：`AcpAgentSession.subagent_agents`（`on_child_ready` 登记的树内全部子代理）兜底嵌套子代理的 `session/cancel`——根的 spawn tool 只认直接子代 |
+| `_meta.startedAt/completedAt`、`_meta.model/role` | ✅ 已完成 | `SubagentMeta` 随 `subagent_started`（model/role 来自 exposure 的 `model`/`role`）与 `subagent_idle`（completedAt）下发 |
+| `session/load` 回放历史 `subagent_update` | ✅ 已完成 | `session.rs::replay_subagent_cards`：`replay_notifications` 末尾按 `TaskRepository::list_tasks` 回放**已终态**任务（`agent_id`→role、`created_at`→startedAt、`last_checked_at`→completedAt，`Completed→success`/`Cancelled→cancelled`/其它→`error`），子会话 id 由 task id 派生（`sub-<task_id>`）故重开幂等。挂起/运行中的任务**不回放**（无 runner、无结果，报任一状态都是编的） |
+| `session/status` 支持子会话 id | ✅ 已完成（窄口径） | `coding_agent.rs::session_status`：注册表 → `subagent_children`（仅 running 期登记）→ 持久化；`session/list|load|delete` 仍屏蔽 `sub-*`（子会话转写属于父会话，不应能被单独操作） |
+
+测试：`event.rs` +6（`_meta` model/role、requires_action↔running 配对、cancel/error stop reason、嵌套外层 id、idle 的 `_meta`）、harness +3（`materialize` 嵌套深度两条、`agent_spawn` 帧携带父会话）、`tests/acp_subagent_test.rs` +2（嵌套帧外层 = 中间子代理；存活子会话 `session/status` = `open`）。反向验证：`subagent_children` 判断短路 → `a_live_child_is_reported_as_an_open_session` FAILED；转发器忽略 `parent_session` → `a_nested_child_is_reported_under_the_subagent_that_spawned_it` FAILED；`LeafFactory` 强制 `.as_leaf_subagent()` → `a_child_allowed_to_nest_keeps_its_own_spawn_tool` FAILED。
+
+**已知限制**：①嵌套默认只开一层（`subagent_nesting(0, 1)`），需要更多层由嵌入方自行设置上限；②`session/load` 回放的 role 只有 `agent_id`（模型名不在任务记录里）、无 `capabilities`/`requires_action`（回放时子代理已不在跑）；③子会话 status 只在进程内 running 期可见，重启后 `sub-*` 一律 `-32002`（与 `session/list` 屏蔽一致）。
 
 #### 2026-11-04 会话生命周期修复（creation record + known_workspaces）
 

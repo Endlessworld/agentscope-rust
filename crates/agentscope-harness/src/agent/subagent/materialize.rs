@@ -305,6 +305,16 @@ pub struct SubagentBlueprint {
     pub use_legacy_xml_workspace_context: bool,
     /// Mirrors Java `capturedDisableSessionPersistence`; both child kinds inherit it.
     pub disable_session_persistence: bool,
+    /// Out-of-band subagent channel, handed to children that may spawn their own subagents.
+    pub subagent_events: Option<crate::tool::SubagentEventSink>,
+    /// Runtime hook (permission routing, host session tagging) propagated down the tree.
+    pub subagent_runtime_hook: Option<Arc<dyn crate::tool::SubagentRuntimeHook>>,
+    /// Declarations the children may spawn themselves (nested delegation).
+    pub subagent_declarations: Vec<SubagentDeclaration>,
+    /// Depth of the children this blueprint materialises (parent depth + 1).
+    pub subagent_depth: u8,
+    /// Deepest depth that may still spawn: a child at depth `d` spawns when `d <= max`.
+    pub max_subagent_depth: u8,
 }
 
 impl SubagentBlueprint {
@@ -397,12 +407,34 @@ impl LeafFactory {
         let mut builder = HarnessAgent::builder()
             .name(self.name.clone())
             .description(self.description.clone())
-            .as_leaf_subagent()
+            // Depth decides whether this child is a worker or an intermediate node: only a child
+            // that may still spawn keeps the subagent surface, which is what makes nested
+            // delegation (and a nested `subagent_update`) possible at all.
+            .subagent_nesting(
+                self.blueprint.subagent_depth,
+                self.blueprint.max_subagent_depth,
+            )
             .toolkit(self.toolkit.copy())
             .workspace(self.workspace.clone())
             .sys_prompt(self.sys_prompt.clone())
             .max_iters(self.max_iters)
             .enable_pending_tool_recovery(self.enable_pending_tool_recovery);
+        if self.blueprint.subagent_depth > self.blueprint.max_subagent_depth {
+            builder = builder.as_leaf_subagent();
+        } else {
+            // An intermediate child reports its own children to the same host, under the same
+            // permission routing, and may spawn the same declared agents — otherwise a nested
+            // spawn would be silently invisible to the client that renders it.
+            if let Some(events) = &self.blueprint.subagent_events {
+                builder = builder.subagent_events(events.clone());
+            }
+            if let Some(hook) = &self.blueprint.subagent_runtime_hook {
+                builder = builder.subagent_runtime_hook(Arc::clone(hook));
+            }
+            if !self.blueprint.subagent_declarations.is_empty() {
+                builder = builder.subagents(self.blueprint.subagent_declarations.clone());
+            }
+        }
         let parent_model = self.blueprint.model.get();
         let model = resolve_declared_model(
             self.model_override.as_deref(),
@@ -659,6 +691,11 @@ mod tests {
             environment_memory: None,
             use_legacy_xml_workspace_context: false,
             disable_session_persistence: false,
+            subagent_events: None,
+            subagent_runtime_hook: None,
+            subagent_declarations: Vec::new(),
+            subagent_depth: 1,
+            max_subagent_depth: 0,
         })
     }
 
@@ -673,6 +710,34 @@ mod tests {
             .agent()
             .expect("the child is built with a model")
             .enable_pending_tool_recovery()
+    }
+
+    #[test]
+    fn a_child_at_the_nesting_limit_is_a_leaf() {
+        // The default: a subagent cannot delegate further, so `agent_spawn` is not even
+        // registered for it (that is what keeps the recursion bounded).
+        let child = Arc::new((*blueprint(false)).clone())
+            .general_purpose_leaf()
+            .build(&RuntimeContext::new());
+        assert!(
+            child.spawn_tool().is_none(),
+            "a child at the nesting limit must stay a worker"
+        );
+    }
+
+    #[test]
+    fn a_child_allowed_to_nest_keeps_its_own_spawn_tool() {
+        // One level of nested delegation: the child may spawn its own workers.
+        let mut blueprint = (*blueprint(false)).clone();
+        blueprint.subagent_depth = 1;
+        blueprint.max_subagent_depth = 1;
+        let child = Arc::new(blueprint)
+            .general_purpose_leaf()
+            .build(&RuntimeContext::new());
+        assert!(
+            child.spawn_tool().is_some(),
+            "an intermediate child must be able to spawn"
+        );
     }
 
     #[test]

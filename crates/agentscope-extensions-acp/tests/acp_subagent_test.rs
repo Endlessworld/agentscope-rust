@@ -12,7 +12,8 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     ClientCapabilities, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
-    SessionNotification, SubagentCapabilities, TextContent,
+    SessionId, SessionNotification, SessionStatus, SessionStatusRequest, SubagentCapabilities,
+    TextContent,
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{Agent, Channel, Client};
@@ -21,10 +22,20 @@ use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::{AcpCodingAgent, SessionBuild};
 use agentscope_harness::agent::HarnessAgent;
-use agentscope_harness::tool::SubagentEventSink;
+use agentscope_harness::tool::{SubagentEventSink, SubagentFrame};
 
 /// The child session id the injected frames use.
 const CHILD: &str = "sub-1";
+
+/// One frame on the same channel the harness writes to.
+fn frame(child: &str, event: AgentEvent) -> SubagentFrame {
+    SubagentFrame {
+        // The root session spawned the child directly.
+        parent_session: None,
+        child_session: child.to_string(),
+        event,
+    }
+}
 
 /// A model that always answers "done", so a turn costs exactly one reasoning call.
 struct StubModel;
@@ -201,13 +212,13 @@ async fn subagent_frames_reach_an_advertising_client() {
                     .clone()
                     .expect("the session factory received the subagent channel");
                 events
-                    .send((CHILD.to_string(), exposure(CHILD, "探索仓库结构")))
+                    .send(frame(CHILD, exposure(CHILD, "探索仓库结构")))
                     .expect("frames are accepted");
                 events
-                    .send((CHILD.to_string(), text_delta("发现 3 个模块")))
+                    .send(frame(CHILD, text_delta("发现 3 个模块")))
                     .expect("frames are accepted");
                 events
-                    .send((CHILD.to_string(), finished()))
+                    .send(frame(CHILD, finished()))
                     .expect("frames are accepted");
 
                 // The idle frame closes the sequence.
@@ -300,13 +311,13 @@ async fn nothing_is_sent_when_the_client_does_not_advertise_subagents() {
                     .clone()
                     .expect("the session factory received the subagent channel");
                 events
-                    .send((CHILD.to_string(), exposure(CHILD, "探索仓库结构")))
+                    .send(frame(CHILD, exposure(CHILD, "探索仓库结构")))
                     .expect("frames are accepted");
                 events
-                    .send((CHILD.to_string(), text_delta("发现 3 个模块")))
+                    .send(frame(CHILD, text_delta("发现 3 个模块")))
                     .expect("frames are accepted");
                 events
-                    .send((CHILD.to_string(), finished()))
+                    .send(frame(CHILD, finished()))
                     .expect("frames are accepted");
 
                 // Give the forwarder a chance to (wrongly) emit something.
@@ -319,6 +330,179 @@ async fn nothing_is_sent_when_the_client_does_not_advertise_subagents() {
                     subagent_frames(&frames).is_empty(),
                     "a client without the capability must receive nothing: {frames:#?}"
                 );
+                Ok(())
+            },
+        )
+        .await
+        .expect("client run");
+    let _ = agent_task.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn a_nested_child_is_reported_under_the_subagent_that_spawned_it() {
+    // With nested delegation the spawning session is an intermediate subagent, so the card must
+    // be routed to *that* transcript: `SubagentFrame.parent_session` is what carries it.
+    let root = fresh_root("subagent_nested");
+    let (agent, sink) = agent_with_captured_channel(&root);
+    let (agent_channel, client_channel) = Channel::duplex();
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+
+    let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_notifications = Arc::clone(&seen);
+    let root_for_client = root.clone();
+
+    Client
+        .v1()
+        .on_receive_notification(
+            async move |notification: SessionNotification, _cx| {
+                if let Ok(value) = serde_json::to_value(&notification) {
+                    seen_notifications.lock().unwrap().push(value);
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            client_channel,
+            |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                            ClientCapabilities::new().subagents(SubagentCapabilities::new()),
+                        ),
+                    )
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(root_for_client.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![ContentBlock::Text(TextContent::new("hi"))],
+                    ))
+                    .block_task()
+                    .await?;
+
+                let events = sink
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .expect("the session factory received the subagent channel");
+                for event in [
+                    exposure("sub-grand", "探索仓库结构"),
+                    text_delta("nested work"),
+                ] {
+                    events
+                        .send(SubagentFrame {
+                            parent_session: Some(CHILD.to_string()),
+                            child_session: "sub-grand".to_string(),
+                            event,
+                        })
+                        .expect("frames are accepted");
+                }
+
+                let frames = wait_for(&seen, |frames| {
+                    frames.iter().any(|frame| frame["sessionId"] == "sub-grand")
+                })
+                .await;
+                let card = frames
+                    .iter()
+                    .find(|frame| frame["update"]["sessionUpdate"] == "subagent_update")
+                    .expect("the grandchild is announced");
+                assert_eq!(
+                    card["sessionId"], CHILD,
+                    "the card belongs to its direct parent"
+                );
+                assert_eq!(card["update"]["sessionId"], "sub-grand");
+                let content = frames
+                    .iter()
+                    .find(|frame| frame["sessionId"] == "sub-grand")
+                    .expect("the grandchild's own content");
+                assert_eq!(content["update"]["sessionUpdate"], "agent_message_chunk");
+                Ok(())
+            },
+        )
+        .await
+        .expect("client run");
+    let _ = agent_task.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn a_live_child_is_reported_as_an_open_session() {
+    // A client that renders a subagent card may poll its session status instead of trusting the
+    // card. A child never enters the top-level registry, so the status answer has to come from
+    // the routing table the forwarder fills.
+    let root = fresh_root("subagent_status");
+    let (agent, sink) = agent_with_captured_channel(&root);
+    let (agent_channel, client_channel) = Channel::duplex();
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+
+    let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_notifications = Arc::clone(&seen);
+    let root_for_client = root.clone();
+
+    Client
+        .v1()
+        .on_receive_notification(
+            async move |notification: SessionNotification, _cx| {
+                if let Ok(value) = serde_json::to_value(&notification) {
+                    seen_notifications.lock().unwrap().push(value);
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            client_channel,
+            |connection: ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                            ClientCapabilities::new().subagents(SubagentCapabilities::new()),
+                        ),
+                    )
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new(root_for_client.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![ContentBlock::Text(TextContent::new("hi"))],
+                    ))
+                    .block_task()
+                    .await?;
+
+                let events = sink
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .expect("the session factory received the subagent channel");
+                events
+                    .send(frame(CHILD, exposure(CHILD, "探索仓库结构")))
+                    .expect("frames are accepted");
+                // The forwarder registers the child when it announces it, so the status answer
+                // is only meaningful once the announcement reached the client.
+                wait_for(&seen, |frames| {
+                    frames
+                        .iter()
+                        .any(|frame| frame["update"]["sessionUpdate"] == "subagent_update")
+                })
+                .await;
+
+                let status = connection
+                    .send_request(SessionStatusRequest::new(SessionId::new(CHILD)))
+                    .block_task()
+                    .await?;
+                assert_eq!(status.status, SessionStatus::Open);
                 Ok(())
             },
         )

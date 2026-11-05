@@ -64,6 +64,40 @@ pub trait CallableAgent: Agent {
     /// parsed JSON reply in the returned message's structured-output metadata.
     async fn call_with_schema(&self, messages: Vec<Msg>, schema: JsonSchema) -> Result<Msg>;
 
+    /// The model id this agent runs with, when it can name one.
+    ///
+    /// A host that renders subagent progress reports this as `_meta.model`; an agent without a
+    /// reportable model (assembly-only, or a custom implementation) simply returns `None`.
+    fn model_name(&self) -> Option<String> {
+        None
+    }
+
+    /// Installs (or removes) the handler consulted when a tool call needs user confirmation.
+    ///
+    /// A host that wants a background subagent's `Ask` decisions to reach the user installs one
+    /// right after the child is created. The default is a no-op: an agent without a
+    /// confirmable tool surface has nothing to route.
+    fn set_confirm_handler(&self, handler: Option<super::ConfirmHandler>) {
+        let _ = handler;
+    }
+
+    /// Adds one permission rule to this agent's runtime permission context.
+    ///
+    /// The "always allow/deny" answers of a subagent's permission prompt are recorded here, so a
+    /// repeated identical call inside the same child is decided without asking again.
+    fn add_permission_rule(&self, rule: crate::permission::PermissionRule) {
+        let _ = rule;
+    }
+
+    /// Tells this agent the session id a host minted for it, when the agent is itself a subagent.
+    ///
+    /// A nested spawn must report this id as the new child's parent, but the id exists only after
+    /// the spawn tool created the agent. The default is a no-op: an agent that cannot spawn
+    /// anything has nothing to tag.
+    fn set_host_session_id(&self, session_id: &str) {
+        let _ = session_id;
+    }
+
     /// Convenience: call with a single message.
     async fn call_single(&self, msg: Msg) -> Result<Msg> {
         self.call(vec![msg]).await

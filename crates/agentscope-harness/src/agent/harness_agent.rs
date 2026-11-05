@@ -617,6 +617,16 @@ impl HarnessAgent {
         }
     }
 
+    /// Declares the session id the host minted for this agent when it is itself a subagent.
+    ///
+    /// Only used for tagging nested spawns: this agent's own `agent_spawn` reports the id as its
+    /// children's parent. No-op when this agent cannot spawn anything.
+    pub fn set_host_session_id(&self, session_id: &str) {
+        if let Some(tool) = &self.spawn_tool {
+            tool.set_host_session(session_id);
+        }
+    }
+
     /// Interrupts the current session's execution. No-op without a configured model.
     pub fn interrupt(&self) {
         if let Some(agent) = &self.agent {
@@ -763,6 +773,24 @@ impl CallableAgent for HarnessAgent {
         }
     }
 
+    fn model_name(&self) -> Option<String> {
+        self.model
+            .as_ref()
+            .map(|model| model.model_name().to_string())
+    }
+
+    fn set_confirm_handler(&self, handler: Option<agentscope_core::ConfirmHandler>) {
+        HarnessAgent::set_confirm_handler(self, handler);
+    }
+
+    fn add_permission_rule(&self, rule: agentscope_core::PermissionRule) {
+        HarnessAgent::add_permission_rule(self, rule);
+    }
+
+    fn set_host_session_id(&self, session_id: &str) {
+        HarnessAgent::set_host_session_id(self, session_id);
+    }
+
     /// Runs the embedded agent while streaming its events to `sink`.
     ///
     /// The sink is the single-slot subscriber of [`ReActAgent`], and it is cleared once the run
@@ -882,6 +910,13 @@ pub struct HarnessAgentBuilder {
     /// Caller-supplied subagent factories (`subagent_factory`).
     subagent_factories: Vec<CustomSubagentFactory>,
     leaf_subagent: bool,
+    /// Configures each freshly spawned child (permission routing, nested progress).
+    subagent_runtime_hook: Option<Arc<dyn crate::tool::SubagentRuntimeHook>>,
+    /// Depth of this agent in a subagent tree (0 = the agent of a user session).
+    subagent_depth: u8,
+    /// How deep a `subagent_depth` agent may still spawn: a child at depth `d` may spawn when
+    /// `d <= max_subagent_depth`, so the default of 0 makes every child a leaf.
+    max_subagent_depth: u8,
     /// Explicit base toolkit; harness-registered tools are added on top of it.
     toolkit: Option<Toolkit>,
     // ---- Skill orchestration fields ----
@@ -1022,6 +1057,9 @@ impl Default for HarnessAgentBuilder {
             subagent_declarations: Vec::new(),
             subagent_factories: Vec::new(),
             leaf_subagent: false,
+            subagent_runtime_hook: None,
+            subagent_depth: 0,
+            max_subagent_depth: 0,
             toolkit: None,
             project_global_skills_dir: None,
             skill_repositories: Vec::new(),
@@ -1460,6 +1498,17 @@ impl HarnessAgentBuilder {
         self
     }
 
+    /// Positions this agent in a subagent tree and allows it to spawn `max_depth` levels deeper.
+    ///
+    /// A child of this agent sits at `depth + 1`; it may spawn further children of its own when
+    /// `depth + 1 <= max_depth`. The default (`0, 0`) keeps every child a leaf, which is what a
+    /// host wants unless it deliberately supports nested delegation.
+    pub fn subagent_nesting(mut self, depth: u8, max_depth: u8) -> Self {
+        self.subagent_depth = depth;
+        self.max_subagent_depth = max_depth;
+        self
+    }
+
     /// Enables or disables agent execution trace logging (default `true`).
     pub fn enable_agent_tracing_log(mut self, enabled: bool) -> Self {
         self.agent_tracing_log_enabled = enabled;
@@ -1535,6 +1584,18 @@ impl HarnessAgentBuilder {
     /// Marks this build as a leaf subagent (no nested subagent orchestration).
     pub fn as_leaf_subagent(mut self) -> Self {
         self.leaf_subagent = true;
+        self
+    }
+
+    /// Configures each freshly spawned child before its first turn.
+    ///
+    /// This is how a host routes the child's own identity: the permission prompt a child issues
+    /// must name the child session, and nested progress must name its direct parent.
+    pub fn subagent_runtime_hook(
+        mut self,
+        hook: Arc<dyn crate::tool::SubagentRuntimeHook>,
+    ) -> Self {
+        self.subagent_runtime_hook = Some(hook);
         self
     }
 
@@ -2593,6 +2654,11 @@ impl HarnessAgentBuilder {
                 environment_memory: self.environment_memory.clone(),
                 use_legacy_xml_workspace_context: self.use_legacy_xml_workspace_context,
                 disable_session_persistence: self.disable_session_persistence,
+                subagent_events: self.subagent_events.clone(),
+                subagent_runtime_hook: self.subagent_runtime_hook.clone(),
+                subagent_declarations: self.subagent_declarations.clone(),
+                subagent_depth: self.subagent_depth + 1,
+                max_subagent_depth: self.max_subagent_depth,
             });
             // --- subagent entries ---
             let mut entries: Vec<SubagentEntry> = Vec::new();
@@ -2645,6 +2711,9 @@ impl HarnessAgentBuilder {
                 .with_exposure_sink(exposure_sink.clone());
             if let Some(events) = self.subagent_events.clone() {
                 spawn_builder = spawn_builder.with_event_sink(events);
+            }
+            if let Some(hook) = self.subagent_runtime_hook.clone() {
+                spawn_builder = spawn_builder.with_subagent_hook(hook);
             }
             let spawn_tool_arc = Arc::new(spawn_builder);
             spawn_tool = Some(Arc::clone(&spawn_tool_arc));

@@ -1080,6 +1080,9 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         elicitation_slot,
         system_prompt,
         subagent_events,
+        client_slot,
+        permission_store,
+        subagent_agents,
     } = ctx;
     let session_id = session_id.as_str();
     let model_config = ModelConfig::load_or_create();
@@ -1208,6 +1211,27 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
     // the client as `subagent_update` + child-session updates.
     if let Some(events) = subagent_events {
         builder = builder.subagent_events(events);
+    }
+    // Nested delegation: a subagent may spawn its own worker (and report it as a card of its own
+    // transcript). One level deep — the grandchild is a leaf, which bounds the recursion.
+    builder = builder.subagent_nesting(0, 1);
+
+    // A child runs in a background task under its own session id (`sub-<uuid>`): its `ask`
+    // tools must raise `session/request_permission` on *that* id, otherwise the approval card
+    // cannot be attributed to the subagent and the parent session blocks on it instead.
+    // The child id only exists after the spawn tool minted it, so the routing is installed as a
+    // runtime hook rather than baked into the agent factory.
+    if let (Some(slot), Some(store), Some(agents)) =
+        (client_slot, permission_store, subagent_agents)
+    {
+        builder = builder.subagent_runtime_hook(Arc::new(
+            agentscope_extensions_acp::session::SubagentPermissionHook::new(
+                slot,
+                store,
+                agent_client_protocol::v1::schema::SessionId::new(session_id.to_string()),
+                agents,
+            ),
+        ));
     }
 
     // Skill support (Open Agent Skills protocol, mirrors Java commit b906d1b):

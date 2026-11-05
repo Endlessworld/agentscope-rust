@@ -1306,6 +1306,18 @@ impl CallableAgent for ReActAgent {
     async fn call_with_schema(&self, messages: Vec<Msg>, schema: JsonSchema) -> Result<Msg> {
         ReActAgent::call_with_schema(self, messages, schema).await
     }
+
+    fn model_name(&self) -> Option<String> {
+        Some(self.model().model_name().to_string())
+    }
+
+    fn set_confirm_handler(&self, handler: Option<ConfirmHandler>) {
+        ReActAgent::set_confirm_handler(self, handler);
+    }
+
+    fn add_permission_rule(&self, rule: crate::permission::PermissionRule) {
+        ReActAgent::add_permission_rule(self, rule);
+    }
 }
 
 impl ObservableAgent for ReActAgent {

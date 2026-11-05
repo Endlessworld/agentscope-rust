@@ -169,9 +169,10 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 
 | 帧 | 外层 `sessionId` | 内容 |
 | --- | --- | --- |
-| `subagent_update` | 父会话 | `sessionId`（子会话）、`title`/`description`、`capabilities.cancel: {}`、`state.state = running` |
+| `subagent_update` | 父会话 | `sessionId`（子会话）、`title`/`description`、`capabilities.cancel: {}`、`state.state = running`；`_meta.startedAt`/`_meta.model`/`_meta.role` |
 | `agent_message_chunk` / `agent_thought_chunk` / `tool_call*` | **子会话** | 子代理的输出，`messageId` 形如 `sub-<child>`，与父 turn 的消息 id 不同 |
-| `subagent_update` | 父会话 | `state.state = idle`（失败时先发一条 `notice`）；子会话随后仍可用 `agent_send` 继续 |
+| `subagent_update` | 父会话 | `state.state = requires_action`（子代理要审批时，紧跟一条发往**子会话**的 `session/request_permission`） |
+| `subagent_update` | 父会话 | `state.state = idle` + `stopReason`（`end_turn` / `cancelled` / `error`，失败时先发一条 `notice`）；`_meta.completedAt`；子会话随后仍可用 `agent_send` 继续 |
 
 约束：
 
@@ -179,8 +180,11 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 - 非流式的一次性回复会在 `AgentResult` 时补成一条 `agent_message_chunk`（已流式的内容不会重复）。
 - 客户端没声明 `subagents` 时**完全静默**（不发 `subagent_update`，也不发子会话 chunk），退回普通 tool_call 形态。
 - `session/cancel` 发到子会话 id 会中断该子代理（不会改动父 turn）；`session/close` 会中断该会话下所有子代理。
-- 子会话（`sub-*`）不出现在 `session/list` / `session/status` / `session/load` 里：它们不是用户会话。
-- 只支持一层父子，子代理内部再 spawn 的子代理不上报。
+- 子代理内的权限询问以**子会话 id** 发起（`session/request_permission.sessionId` = 子会话），客户端据此把审批卡挂到子代理卡片上；答复后立刻回 `running`，终态仍由 turn 结束上报。
+- 子会话的 `plan`/`plan_update` 外层 `sessionId` 也是子会话 id，与父 turn 形态一致。
+- 嵌套：子代理内部再 spawn 时，`subagent_update` 的外层 `sessionId` 是**直接父会话**（即中间那个子代理）。默认只开一层（`subagent_nesting(0, 1)`），再深的孙代理是叶子；`session/cancel` 用子会话 id 会在整棵树上找到并中断对应子代理。
+- `session/load` 会把历史上**已终态**的子代理回放成 `started` + `idle` 两张卡（子会话 id 由 task id 派生，重开幂等）；挂起中的任务不回放。
+- 子会话（`sub-*`）不出现在 `session/list` / `session/load` 里；`session/status` 只对进程内仍在运行的子代理返回 `open`，重启后与其他未知 id 一样报错。
 
 认证方法不门控：`initialize` 总是返回一条 terminal 类型的认证方法（id `setup`，`args: ["--setup"]`），
 客户端据此在自己的终端里拉起 `acp_harness_agent --setup`。注册表校验发的是空 `clientCapabilities`

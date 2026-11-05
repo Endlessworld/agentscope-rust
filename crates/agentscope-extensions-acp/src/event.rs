@@ -8,10 +8,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use agent_client_protocol::v1::schema::{
-    Content, ContentBlock, ContentChunk, Diff, MessageId, Notice, NoticeSeverity, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, SessionId, SessionNotification, SessionUpdate, TextContent,
-    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    Content, ContentBlock, ContentChunk, Diff, Error as AcpError, ErrorCode, ErrorStopReason,
+    IdleStopReason, MessageId, Notice, NoticeSeverity, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, SessionId, SessionNotification, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind,
 };
 use agentscope_core::event::{AgentEvent, AgentEventType};
 
@@ -726,6 +727,54 @@ pub fn map_delta_event(
 /// Every child has its own tool-call mapper (two children running tool calls in parallel must
 /// not share call ids) and its own announced/running bookkeeping, so the frames a client
 /// receives per child are exactly the ones the `subagent_update` contract requires.
+/// Extension metadata (`_meta`) reported on a child's `subagent_update` frames.
+///
+/// Every field is optional: a client that ignores `_meta` renders the card exactly as before,
+/// so reporting it never changes what a frame means.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubagentMeta {
+    /// RFC-3339 timestamp of the announcement.
+    pub started_at: Option<String>,
+    /// RFC-3339 timestamp of the terminal report.
+    pub completed_at: Option<String>,
+    /// Model id the child runs on, when the harness reports one.
+    pub model: Option<String>,
+    /// Role the parent assigned to the child (its registered agent id).
+    pub role: Option<String>,
+}
+
+impl SubagentMeta {
+    /// The `_meta` map for a frame, or `None` when nothing is known about this child.
+    fn to_meta(&self) -> Option<agent_client_protocol::v1::schema::Meta> {
+        if self.started_at.is_none()
+            && self.completed_at.is_none()
+            && self.model.is_none()
+            && self.role.is_none()
+        {
+            return None;
+        }
+        let mut meta = agent_client_protocol::v1::schema::Meta::new();
+        if let Some(value) = &self.started_at {
+            meta.insert("startedAt".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = &self.completed_at {
+            meta.insert("completedAt".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = &self.model {
+            meta.insert("model".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = &self.role {
+            meta.insert("role".to_string(), serde_json::json!(value));
+        }
+        Some(meta)
+    }
+}
+
+/// RFC-3339 timestamp of "now", the format `_meta` timestamps use.
+fn now_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
 #[derive(Default)]
 pub struct SubagentTracker {
     mappers: HashMap<String, ToolEventMapper>,
@@ -735,11 +784,22 @@ pub struct SubagentTracker {
     running: HashSet<String>,
     /// Children that streamed text during the current turn, so the final reply is not repeated.
     emitted_text: HashSet<String>,
+    /// Per-child `_meta` values (start time, model, role) gathered from the announcement.
+    metas: HashMap<String, SubagentMeta>,
+    /// Whether the client consumes the ID-addressed `plan_update` operations.
+    plan_operations: bool,
 }
 
 impl SubagentTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mirrors the parent turn's plan form onto the children: a client that asked for
+    /// `plan_update` must not get the legacy `Plan` update from a child's `todo_write`.
+    pub fn with_plan_operations(mut self, enabled: bool) -> Self {
+        self.plan_operations = enabled;
+        self
     }
 
     /// The `message_id` a child's chunks carry.
@@ -761,18 +821,25 @@ pub fn subagent_started(
     child: &str,
     title: &str,
     description: &str,
+    meta: Option<SubagentMeta>,
 ) -> SessionNotification {
+    use agent_client_protocol::schema::MaybeUndefined;
     use agent_client_protocol::v1::schema::{
         RunningStateUpdate, SessionCancelCapabilities, StateUpdate, SubagentSessionCapabilities,
         SubagentUpdate,
     };
     // `capabilities` is sent exactly once: the schema defines it as a whole-object replacement,
     // so repeating it on every frame would re-state (and could clear) the child's capability set.
-    let update = SubagentUpdate::new(SessionId::new(child.to_string()))
+    let mut update = SubagentUpdate::new(SessionId::new(child.to_string()))
         .title(title.to_string())
         .description(description.to_string())
         .capabilities(SubagentSessionCapabilities::new().cancel(SessionCancelCapabilities::new()))
         .state(StateUpdate::Running(RunningStateUpdate::new()));
+    update.meta = match meta.and_then(|meta| meta.to_meta()) {
+        Some(meta) => MaybeUndefined::Value(meta),
+        // Omitting `_meta` means "unchanged"; `null` would clear metadata another frame set.
+        None => MaybeUndefined::Undefined,
+    };
     SessionNotification::new(parent.clone(), SessionUpdate::SubagentUpdate(update))
 }
 
@@ -788,16 +855,62 @@ pub fn subagent_running(parent: &SessionId, child: &str) -> SessionNotification 
     )
 }
 
-/// Reports that a child stopped working; its session stays addressable for a later turn.
-pub fn subagent_idle(parent: &SessionId, child: &str) -> SessionNotification {
-    use agent_client_protocol::v1::schema::{IdleStateUpdate, StateUpdate, SubagentUpdate};
+/// Reports that a child is blocked on a user decision (`session/request_permission`).
+///
+/// Sent right before the permission request and paired with [`subagent_running`] once the
+/// client answered, so a card never keeps claiming "waiting for you" after the decision.
+pub fn subagent_requires_action(parent: &SessionId, child: &str) -> SessionNotification {
+    use agent_client_protocol::v1::schema::{
+        RequiresActionStateUpdate, StateUpdate, SubagentUpdate,
+    };
     SessionNotification::new(
         parent.clone(),
         SessionUpdate::SubagentUpdate(
             SubagentUpdate::new(SessionId::new(child.to_string()))
-                .state(StateUpdate::Idle(IdleStateUpdate::new())),
+                .state(StateUpdate::RequiresAction(RequiresActionStateUpdate::new())),
         ),
     )
+}
+
+/// The idle stop reason for a finished child turn.
+///
+/// `outcome` uses the vocabulary of the harness `subagent_finished` marker: `success`,
+/// `error`, or `cancelled`.
+pub fn stop_reason_for(outcome: &str, error: Option<&str>) -> IdleStopReason {
+    match outcome {
+        "cancelled" => IdleStopReason::Cancelled,
+        "error" => IdleStopReason::Error(ErrorStopReason::new().error(AcpError::new(
+            i32::from(ErrorCode::InternalError),
+            error.unwrap_or("subagent failed").to_string(),
+        ))),
+        // A turn reported without an outcome ended normally.
+        _ => IdleStopReason::EndTurn,
+    }
+}
+
+/// Reports that a child stopped working; its session stays addressable for a later turn.
+///
+/// `stop_reason` distinguishes a normal end from a failure or a cancel — without it a client
+/// has to guess why the card left the `running` state.
+pub fn subagent_idle(
+    parent: &SessionId,
+    child: &str,
+    stop_reason: Option<IdleStopReason>,
+    meta: Option<SubagentMeta>,
+) -> SessionNotification {
+    use agent_client_protocol::schema::MaybeUndefined;
+    use agent_client_protocol::v1::schema::{IdleStateUpdate, StateUpdate, SubagentUpdate};
+    let mut idle = IdleStateUpdate::new();
+    if let Some(reason) = stop_reason {
+        idle = idle.stop_reason(reason);
+    }
+    let mut update =
+        SubagentUpdate::new(SessionId::new(child.to_string())).state(StateUpdate::Idle(idle));
+    update.meta = match meta.and_then(|meta| meta.to_meta()) {
+        Some(meta) => MaybeUndefined::Value(meta),
+        None => MaybeUndefined::Undefined,
+    };
+    SessionNotification::new(parent.clone(), SessionUpdate::SubagentUpdate(update))
 }
 
 /// Recognizes the `subagent_finished` marker the harness emits when a child turn ends, and
@@ -887,6 +1000,19 @@ pub fn subagent_notifications(
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let title = label.unwrap_or_else(|| agent_id.clone());
+        let meta = SubagentMeta {
+            started_at: Some(now_timestamp()),
+            completed_at: None,
+            model: fields
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            role: fields
+                .get("role")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        };
+        tracker.metas.insert(child.to_string(), meta.clone());
         tracker.announced.insert(child.to_string());
         tracker.running.insert(child.to_string());
         return vec![subagent_started(
@@ -894,9 +1020,11 @@ pub fn subagent_notifications(
             child,
             &title,
             &format!("agent: {agent_id}"),
+            Some(meta),
         )];
     }
-    // ② The child stopped: optional notice, then `idle`. The child stays addressable.
+    // ② The child stopped: optional notice, then `idle` with the reason it stopped. The child
+    // stays addressable for a later `agent_send` turn.
     if let Some((outcome, error)) = subagent_finished(ev) {
         let mut out = Vec::new();
         if outcome == "error" {
@@ -905,13 +1033,26 @@ pub fn subagent_notifications(
                     SessionId::new(child.to_string()),
                     NoticeSeverity::Warning,
                     "Subagent failed",
-                    error,
+                    error.clone(),
                 ));
             }
         }
         tracker.running.remove(child);
         tracker.emitted_text.remove(child);
-        out.push(subagent_idle(parent, child));
+        let meta = tracker.metas.entry(child.to_string()).or_default();
+        if meta.started_at.is_none() {
+            // The exposure was filtered upstream (or this is an `agent_send` turn whose
+            // announcement never reached us): report the window we actually observed.
+            meta.started_at = Some(now_timestamp());
+        }
+        meta.completed_at = Some(now_timestamp());
+        let meta = meta.clone();
+        out.push(subagent_idle(
+            parent,
+            child,
+            Some(stop_reason_for(&outcome, error.as_deref())),
+            Some(meta),
+        ));
         return out;
     }
     // ③ Child content. A frame for a child that is not running means a new turn started
@@ -923,7 +1064,14 @@ pub fn subagent_notifications(
             out.push(subagent_running(parent, child));
         } else {
             tracker.announced.insert(child.to_string());
-            out.push(subagent_started(parent, child, child, "agent: (unknown)"));
+            let meta = tracker.metas.get(child).cloned();
+            out.push(subagent_started(
+                parent,
+                child,
+                child,
+                "agent: (unknown)",
+                meta,
+            ));
         }
     }
     let sid = SessionId::new(child.to_string());
@@ -944,8 +1092,11 @@ pub fn subagent_notifications(
         out.push(chunk);
         return out;
     }
+    let plan_operations = tracker.plan_operations;
     let mapper = tracker.mappers.entry(child.to_string()).or_insert_with(|| {
-        ToolEventMapper::new().with_message_id(SubagentTracker::message_id(child))
+        ToolEventMapper::new()
+            .with_plan_operations(plan_operations)
+            .with_message_id(SubagentTracker::message_id(child))
     });
     out.extend(mapper.map(sid, ev));
     out
@@ -1411,7 +1562,8 @@ mod tests {
 
     #[test]
     fn the_announcement_serializes_to_the_documented_frame() {
-        let notification = subagent_started(&parent(), "child", "探索仓库结构", "agent: explorer");
+        let notification =
+            subagent_started(&parent(), "child", "探索仓库结构", "agent: explorer", None);
         let value = serde_json::to_value(&notification).expect("serializes");
         assert_eq!(
             value,
@@ -1494,16 +1646,22 @@ mod tests {
         );
         assert_eq!(frames.len(), 1);
         let value = serde_json::to_value(&frames[0]).expect("serializes");
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "sessionId": "parent",
-                "update": {
-                    "sessionUpdate": "subagent_update",
-                    "sessionId": "child",
-                    "state": {"state": "idle"},
-                }
-            })
+        assert_eq!(value["sessionId"], "parent");
+        let update = &value["update"];
+        assert_eq!(update["sessionUpdate"], "subagent_update");
+        assert_eq!(update["sessionId"], "child");
+        assert_eq!(update["state"]["state"], "idle");
+        // A child has no prompt response of its own: without the stop reason the client has to
+        // guess whether the card finished, failed or was cancelled.
+        assert_eq!(update["state"]["stopReason"], "end_turn");
+        // The card's window: a client that reopens the session still knows how long it ran.
+        assert!(
+            update["_meta"]["startedAt"].is_string(),
+            "the announcement's start time reaches the idle frame: {value}"
+        );
+        assert!(
+            update["_meta"]["completedAt"].is_string(),
+            "the end time is recorded on the idle frame: {value}"
         );
 
         // A failure explains itself first, but only when the client renders notices.
@@ -1516,7 +1674,95 @@ mod tests {
             &mut tracker,
         );
         assert_eq!(frames.len(), 1, "no notice when the capability is absent");
-        assert!(matches!(frames[0].update, SessionUpdate::SubagentUpdate(_)));
+        let value = serde_json::to_value(&frames[0]).expect("serializes");
+        assert_eq!(value["update"]["state"]["stopReason"], "error");
+        assert_eq!(
+            value["update"]["state"]["error"]["message"], "boom",
+            "the failure travels with the stop reason: {value}"
+        );
+    }
+
+    #[test]
+    fn a_requires_action_frame_is_paired_with_running() {
+        // The pair is the contract: the client only stops claiming "working" if it can tell that
+        // the child is blocked on the user, and only resumes when the answer arrives.
+        let asked =
+            serde_json::to_value(subagent_requires_action(&parent(), "child")).expect("serializes");
+        assert_eq!(asked["sessionId"], "parent");
+        assert_eq!(asked["update"]["sessionId"], "child");
+        assert_eq!(asked["update"]["state"]["state"], "requires_action");
+        let resumed =
+            serde_json::to_value(subagent_running(&parent(), "child")).expect("serializes");
+        assert_eq!(resumed["sessionId"], "parent");
+        assert_eq!(resumed["update"]["sessionId"], "child");
+        assert_eq!(resumed["update"]["state"]["state"], "running");
+    }
+
+    #[test]
+    fn a_cancelled_child_reports_the_cancel_stop_reason() {
+        // A cancelled child keeps its card addressable; the reason is what tells the client the
+        // user (or a `session/cancel`) stopped it instead of the model finishing.
+        let support = subagent_support();
+        let mut tracker = subagent_tracker_with_child(&support);
+        let frames = subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &finished("cancelled", None),
+            &mut tracker,
+        );
+        assert_eq!(frames.len(), 1);
+        let value = serde_json::to_value(&frames[0]).expect("serializes");
+        assert_eq!(value["update"]["state"]["state"], "idle");
+        assert_eq!(value["update"]["state"]["stopReason"], "cancelled");
+    }
+
+    #[test]
+    fn the_announcement_reports_the_model_and_role_it_was_spawned_with() {
+        // The card shows which model and role produced the work; both are only known at spawn
+        // time and cannot be recovered from the child's frames.
+        let support = subagent_support();
+        let mut tracker = SubagentTracker::new();
+        let mut fields = serde_json::Map::new();
+        fields.insert("agentId".to_string(), serde_json::json!("explorer"));
+        fields.insert("sessionId".to_string(), serde_json::json!("child"));
+        fields.insert("model".to_string(), serde_json::json!("gpt-5"));
+        fields.insert("role".to_string(), serde_json::json!("explorer"));
+        let frames = subagent_notifications(
+            &support,
+            &parent(),
+            "child",
+            &AgentEvent::with_fields(AgentEventType::SubagentExposed, fields),
+            &mut tracker,
+        );
+        let value = serde_json::to_value(&frames[0]).expect("serializes");
+        assert_eq!(value["update"]["_meta"]["model"], "gpt-5");
+        assert_eq!(value["update"]["_meta"]["role"], "explorer");
+    }
+
+    #[test]
+    fn a_nested_child_is_reported_under_the_session_that_spawned_it() {
+        // The outer session id is the direct parent's, not the root's: a grandchild's card
+        // belongs to the intermediate subagent's transcript, and the client routes on that id.
+        let support = subagent_support();
+        let mut tracker = SubagentTracker::new();
+        let intermediate = SessionId::new("child-1");
+        let frames = subagent_notifications(
+            &support,
+            &intermediate,
+            "grandchild",
+            &text_delta("nested work"),
+            &mut tracker,
+        );
+        assert_eq!(frames.len(), 2, "announcement then content: {frames:#?}");
+        assert_eq!(frames[0].session_id.to_string(), "child-1");
+        assert_eq!(frames[1].session_id.to_string(), "grandchild");
+        match &frames[0].update {
+            SessionUpdate::SubagentUpdate(update) => {
+                assert_eq!(update.session_id.to_string(), "grandchild");
+            }
+            _ => panic!("expected the grandchild's announcement"),
+        }
     }
 
     #[test]

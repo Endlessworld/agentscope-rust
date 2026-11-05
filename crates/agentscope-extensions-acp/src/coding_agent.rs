@@ -159,6 +159,24 @@ pub struct SessionBuild {
     /// `None` for the agents built only to probe a workspace (`session/exists`, `session/list`):
     /// they never spawn a subagent.
     pub subagent_events: Option<agentscope_harness::tool::SubagentEventSink>,
+    /// Slot the live client connection is published to (filled on the first prompt).
+    ///
+    /// Shared with the session and with the subagent permission bridge: a child's
+    /// `session/request_permission` must be pushed over the same connection, under the child's
+    /// own session id. `None` for workspace-probing agents.
+    pub client_slot: Option<Arc<Mutex<Option<Arc<super::session::AcpClientHandle>>>>>,
+    /// Persistent permission-rule store of the session being built.
+    ///
+    /// Shared with the subagent permission bridge so an "always allow" answer given for a child
+    /// is persisted by the same store this session reloads from. `None` for probing agents.
+    pub permission_store: Option<Arc<super::permission_store::PermissionRuleStore>>,
+    /// Every subagent this session's tree spawned, keyed by child session id.
+    ///
+    /// The root's spawn tool knows only its direct children, so a `session/cancel` addressed to
+    /// a grandchild is routed here instead. Shared with the session and the permission bridge
+    /// (which is handed every child, nested ones included).
+    pub subagent_agents:
+        Option<Arc<Mutex<HashMap<String, Arc<dyn agentscope_core::agent::CallableAgent>>>>>,
 }
 
 /// An ACP CodingAgent with a session registry and a factory for building the
@@ -434,6 +452,18 @@ impl AcpCodingAgent {
         // forwards them to the client. Only a real session gets the channel -- the agents built
         // to probe a workspace never run anything.
         let (subagent_events, subagent_frames) = tokio::sync::mpsc::unbounded_channel();
+        // The subagent permission bridge is wired into the agent builder, so the connection slot
+        // and the rule store must exist *before* the agent: a spawned child asks for its
+        // permission under its own session id, over this connection, and persists "always"
+        // answers where this session reloads them from.
+        let client_slot: Arc<Mutex<Option<Arc<super::session::AcpClientHandle>>>> =
+            Arc::new(Mutex::new(None));
+        let permission_store = Arc::new(super::permission_store::PermissionRuleStore::at_dir(&cwd));
+        // Every child of this session's subagent tree, so a cancel naming a nested child still
+        // reaches its agent (the root tool only owns its direct children).
+        let subagent_agents: Arc<
+            Mutex<HashMap<String, Arc<dyn agentscope_core::agent::CallableAgent>>>,
+        > = Arc::new(Mutex::new(HashMap::new()));
         let agent = match &self.session_factory {
             Some(factory) => factory(SessionBuild {
                 cwd: cwd.clone(),
@@ -442,6 +472,9 @@ impl AcpCodingAgent {
                 elicitation_slot: Arc::clone(&elicitation_slot),
                 system_prompt,
                 subagent_events: Some(subagent_events),
+                client_slot: Some(Arc::clone(&client_slot)),
+                permission_store: Some(Arc::clone(&permission_store)),
+                subagent_agents: Some(Arc::clone(&subagent_agents)),
             }),
             None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
         };
@@ -453,8 +486,11 @@ impl AcpCodingAgent {
             self.modes.clone(),
         );
         session.set_elicitation_slot(elicitation_slot);
+        session.set_client_slot(client_slot);
+        session.set_permission_store(permission_store);
         session.set_subagent_events(subagent_frames);
         session.set_subagent_children(Arc::clone(&self.subagent_children));
+        session.set_subagent_agents(subagent_agents);
         // Clones share the same underlying capability store, so a late
         // `initialize` still gates this session's optional updates correctly.
         session.set_client_support(self.client_support.clone());
@@ -643,6 +679,9 @@ impl AcpCodingAgent {
                 elicitation_slot: Arc::new(Mutex::new(None)),
                 system_prompt: None,
                 subagent_events: None,
+                client_slot: None,
+                permission_store: None,
+                subagent_agents: None,
             }),
             None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
         };
@@ -663,6 +702,18 @@ impl AcpCodingAgent {
     /// `None` (→ `session_not_found`) otherwise.
     async fn session_status(&self, session_id: &SessionId) -> Option<SessionStatus> {
         if self.get_session(session_id).is_some() {
+            return Some(SessionStatus::Open);
+        }
+        // A live subagent runs in a background task this process owns, so it is an open session
+        // even though it never enters the top-level registry: a client polling the card it is
+        // rendering learns that its subagent is still working. A finished child stays unknown
+        // (its transcript belongs to the parent's session, not to a conversation of its own).
+        if self
+            .subagent_children
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&session_id.to_string())
+        {
             return Some(SessionStatus::Open);
         }
         self.session_workspace(session_id)
@@ -889,6 +940,9 @@ impl AcpCodingAgent {
                 elicitation_slot: Arc::new(Mutex::new(None)),
                 system_prompt: None,
                 subagent_events: None,
+                client_slot: None,
+                permission_store: None,
+                subagent_agents: None,
             }),
             None => (self.model_factory)(cwd.to_path_buf(), CATALOG_SESSION_ID),
         });
