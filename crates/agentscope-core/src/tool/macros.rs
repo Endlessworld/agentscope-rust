@@ -158,7 +158,10 @@ mod tests {
         ]);
 
         assert_eq!(schema["type"], serde_json::json!("object"));
-        assert_eq!(schema["properties"]["name"]["type"], serde_json::json!("string"));
+        assert_eq!(
+            schema["properties"]["name"]["type"],
+            serde_json::json!("string")
+        );
         assert_eq!(
             schema["properties"]["tags"]["items"]["type"],
             serde_json::json!("string")

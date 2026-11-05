@@ -172,35 +172,11 @@ pub trait Tool: Send + Sync {
     async fn call(&self, args: JsonMap, ctx: ToolExecutionContext) -> Result<ToolResultBlock>;
     /// Returns the full tool schema.
     fn schema(&self) -> ToolSchema {
-        let mut parameters = match self.parameters_schema() {
-            serde_json::Value::Object(map) => map,
-            other => {
-                let mut m = serde_json::Map::new();
-                m.insert("type".into(), serde_json::Value::String("object".into()));
-                m.insert("properties".into(), other);
-                m
-            }
-        };
-        if !parameters.contains_key("type") {
-            parameters.insert("type".into(), serde_json::Value::String("object".into()));
-        }
         // strict 模式：递归注入 `additionalProperties: false`（对齐 Java
         // `ToolSchemaGenerator.generateParameterSchema(..., allowAdditionalProperties)`）。
         // 注入后 `ToolValidator` 用的是同一份 schema，因此未声明的入参会被拒绝。
         let strict = self.is_strict();
-        if strict {
-            let mut parameters_value = serde_json::Value::Object(parameters);
-            super::schema::apply_additional_properties_false(&mut parameters_value);
-            parameters = match parameters_value {
-                serde_json::Value::Object(map) => map,
-                other => {
-                    let mut map = serde_json::Map::new();
-                    map.insert("type".into(), serde_json::Value::String("object".into()));
-                    map.insert("properties".into(), other);
-                    map
-                }
-            };
-        }
+        let parameters = super::schema::effective_parameters(&self.parameters_schema(), strict);
         let schema = ToolSchema::new(self.name(), self.description()).parameters(parameters);
         let schema = if strict { schema.strict(true) } else { schema };
         // Java only sends `defer_loading: true` for explicitly marked tools; an

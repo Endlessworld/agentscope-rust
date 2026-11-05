@@ -85,6 +85,37 @@ pub fn apply_additional_properties_false(schema: &mut Value) {
     }
 }
 
+/// 生成工具对外暴露 / 用于入参校验的参数 schema。
+///
+/// - 根节点统一为 `object`（工具入参总是 JSON 对象）；
+/// - `strict` 为真时递归注入 `additionalProperties: false`（见
+///   [`apply_additional_properties_false`]），从而拒绝 schema 未声明的键。
+///
+/// [`crate::tool::Tool::schema`] 与 [`ToolExecutor`](super::executor::ToolExecutor) 共用本函数，
+/// 保证「发给模型的 schema」与「校验入参用的 schema」始终一致。
+pub fn effective_parameters(schema: &Value, strict: bool) -> serde_json::Map<String, Value> {
+    let mut parameters = match schema {
+        Value::Object(map) => map.clone(),
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("type".into(), Value::String("object".into()));
+            map.insert("properties".into(), other.clone());
+            map
+        }
+    };
+    if !parameters.contains_key("type") {
+        parameters.insert("type".into(), Value::String("object".into()));
+    }
+    if strict {
+        let mut value = Value::Object(std::mem::take(&mut parameters));
+        apply_additional_properties_false(&mut value);
+        if let Value::Object(map) = value {
+            parameters = map;
+        }
+    }
+    parameters
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

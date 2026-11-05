@@ -89,13 +89,13 @@ pub use state::{
     TaskVerification, ToolContextState, ToolkitState, VerificationOutcome,
 };
 pub use tool::{
-    is_dangerous_command, is_dangerous_path, DefaultToolResultConverter, ExtendedModel,
-    FunctionTool, KeywordToolSearchStrategy, MetaToolFactory, RequirementProposeTool,
-    SchemaOnlyTool, SimpleExtendedModel, TodoWriteTool, Tool, ToolCallInterceptor, ToolCallParam,
-    ToolExecutionContext, ToolExecutor, ToolGroup, ToolGroupBuilder, ToolGroupManager,
-    ToolGroupScope, ToolInvocation, ToolRegistration, ToolResultConverter,
-    ToolResultMessageBuilder, ToolSearchMiddleware, ToolSearchRequest, ToolSearchResult,
-    ToolSearchStrategy, ToolSearchTool, ToolSuspendException, ToolValidator, Toolkit,
-    ToolkitConfig, ToolkitConfigBuilder,
+    apply_additional_properties_false, is_dangerous_command, is_dangerous_path,
+    DefaultToolResultConverter, ExtendedModel, FunctionTool, KeywordToolSearchStrategy,
+    MetaToolFactory, RequirementProposeTool, SchemaOnlyTool, SimpleExtendedModel, TodoWriteTool,
+    Tool, ToolCallInterceptor, ToolCallParam, ToolExecutionContext, ToolExecutor, ToolGroup,
+    ToolGroupBuilder, ToolGroupManager, ToolGroupScope, ToolInvocation, ToolRegistration,
+    ToolResultConverter, ToolResultMessageBuilder, ToolSearchMiddleware, ToolSearchRequest,
+    ToolSearchResult, ToolSearchStrategy, ToolSearchTool, ToolSuspendException, ToolValidator,
+    Toolkit, ToolkitConfig, ToolkitConfigBuilder,
 };
 pub use tracing::{init_tracing, init_tracing_with_filter};

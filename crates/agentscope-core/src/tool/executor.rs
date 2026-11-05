@@ -56,8 +56,16 @@ impl ToolExecutor {
             )));
         }
         // 4. Schema validation.
-        let params = tool.parameters_schema();
-        let schema = params.as_object().cloned().unwrap_or_default();
+        // strict 模式用「注入了 additionalProperties:false 的同一份 schema」校验，
+        // 因此 schema 未声明的入参会被拒绝（与发给模型的 schema 保持一致）。
+        let schema = if tool.is_strict() {
+            super::schema::effective_parameters(&tool.parameters_schema(), true)
+        } else {
+            tool.parameters_schema()
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
+        };
         let input_val = serde_json::Value::Object(call.input.clone());
         if let Some(err) = ToolValidator::validate_input(&schema, &input_val) {
             return Err(Error::Tool(format!("Parameter validation failed: {}", err)));
@@ -223,7 +231,7 @@ async fn execute_with_policy(
 mod tests {
     use super::*;
     use crate::message::{JsonMap, ToolResultBlock, ToolUseBlock};
-    use crate::tool::{Tool, ToolExecutionContext, Toolkit};
+    use crate::tool::{FunctionTool, Tool, ToolExecutionContext, Toolkit};
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::time::Duration;
@@ -292,6 +300,64 @@ mod tests {
             Error::Tool(msg) => {
                 assert!(msg.contains("Tool execution timeout after"), "{msg}");
                 assert!(msg.contains("sleepy"), "{msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// 一个声明了必填参数的 strict 工具：strict 模式下未声明的入参必须被拒绝。
+    fn strict_tool() -> Arc<dyn Tool> {
+        Arc::new(
+            FunctionTool::new(
+                "strict",
+                "strict tool",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "required": ["a"]
+                }),
+                Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
+            )
+            .strict(true),
+        )
+    }
+
+    async fn call_strict(input: serde_json::Value) -> Result<ToolResultBlock> {
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(strict_tool());
+        let call = ToolUseBlock::new(
+            "c1",
+            "strict",
+            input.as_object().cloned().unwrap_or_default(),
+        );
+        ToolExecutor::new()
+            .execute(&toolkit, &call, ToolExecutionContext::default(), None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn strict_tool_rejects_arguments_not_declared_in_the_schema() {
+        let err = call_strict(serde_json::json!({"a": "x", "extra": 1}))
+            .await
+            .expect_err("strict 工具必须拒绝 schema 未声明的入参");
+        match err {
+            Error::Tool(msg) => {
+                assert!(msg.contains("Parameter validation failed"), "{msg}");
+                assert!(msg.contains("extra"), "{msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_tool_still_requires_the_declared_arguments() {
+        let err = call_strict(serde_json::json!({}))
+            .await
+            .expect_err("strict 工具必须拒绝缺少必填参数的入参");
+        match err {
+            Error::Tool(msg) => {
+                assert!(msg.contains("Parameter validation failed"), "{msg}");
+                assert!(msg.contains("required"), "{msg}");
             }
             other => panic!("unexpected error: {other:?}"),
         }

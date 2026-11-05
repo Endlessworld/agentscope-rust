@@ -42,6 +42,7 @@ pub use meta::{ExtendedModel, MetaToolFactory, SimpleExtendedModel, ToolCallPara
 pub use registration::ToolRegistration;
 pub use requirement::RequirementProposeTool;
 pub use result::{DefaultToolResultConverter, ToolResultConverter, ToolResultMessageBuilder};
+pub use schema::apply_additional_properties_false;
 pub use schema_only_tool::SchemaOnlyTool;
 pub use search::{
     KeywordToolSearchStrategy, ToolSearchMiddleware, ToolSearchRequest, ToolSearchResult,
