@@ -16,6 +16,15 @@ use agentscope_core::model::Model;
 
 use crate::agent::context::auxiliary_text;
 
+/// Hard cap on the summarization request body.
+///
+/// Compaction is triggered precisely when the history is close to the model window, so a
+/// rendered prefix is a request of the same size. Providers refuse that prefill
+/// (`prefill_cap_refused`, HTTP 429) or stall until the transport read timeout, which turns a
+/// summary into minutes of silence. The summary only needs the gist, so the body is capped and
+/// the oldest turns are dropped from the rendering.
+const SUMMARY_INPUT_MAX_TOKENS: usize = 32_000;
+
 /// ~1 token per 2.5 characters (mixed English/Chinese heuristic).
 const CHARS_PER_TOKEN: f64 = 2.5;
 /// Structural overhead per message (role/name/formatting).
@@ -679,11 +688,12 @@ impl ConversationCompactor {
         &self,
         conversation: Vec<Msg>,
         config: &CompactionConfig,
-        _agent_id: &str,
-        _session_id: &str,
+        agent_id: &str,
+        session_id: &str,
         recorder: Option<&std::sync::Arc<agentscope_core::session::SessionRecorder>>,
         observed_tokens: Option<usize>,
     ) -> agentscope_core::error::Result<(Option<Vec<Msg>>, CompactionMetrics)> {
+        let started = std::time::Instant::now();
         let before_msg_count = conversation.len();
         // Prefer the provider-anchored count for the recorded "before" size; it is the
         // same number that drove the trigger. Without provider usage the local estimate
@@ -745,6 +755,20 @@ impl ConversationCompactor {
                 .await?;
         }
 
+        // One line per attempt: the status, the sizes and the wall-clock cost show whether a
+        // stall was the summarizer (seconds) or the journal (immediate failures).
+        tracing::info!(
+            agent = %agent_id,
+            session = %session_id,
+            status = metrics.status.as_str(),
+            before_messages = before_msg_count,
+            before_tokens = before_token_count,
+            after_messages = metrics.after_msg_count.unwrap_or(0),
+            after_tokens = metrics.after_token_count.unwrap_or(0),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "conversation compaction finished"
+        );
+
         Ok((outcome?, metrics))
     }
 
@@ -800,6 +824,21 @@ impl ConversationCompactor {
             return Ok("(summary unavailable - no model configured)".to_string());
         };
         let formatted = format_messages_for_summary(prefix);
+        // The template travels with the rendered messages, so its instructions must come out of
+        // the same budget or the request overshoots the cap by the prompt body.
+        let reserve = config
+            .summary_prompt
+            .chars()
+            .count()
+            .saturating_sub("{messages}".chars().count());
+        let (formatted, truncated) = clamp_summary_input(prefix, formatted, reserve);
+        if truncated {
+            tracing::info!(
+                prefix_messages = prefix.len(),
+                max_tokens = SUMMARY_INPUT_MAX_TOKENS,
+                "conversation compaction truncated the summary input"
+            );
+        }
         let prompt = config.summary_prompt.replace("{messages}", &formatted);
         let input = vec![Msg::user(prompt)];
         // Compaction summarizes through the budget-only auxiliary path: it cannot re-enter the
@@ -963,6 +1002,38 @@ fn extract_tool_result_text(tr: &ToolResultBlock) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Caps the rendered summary body so the summarizer never receives a near-window request.
+///
+/// The previous summary message is kept even when it sits at the head of the prefix: it is the
+/// only record of the turns dropped by the previous compaction, so trimming it would lose
+/// history cumulatively. Returns the body and whether anything was dropped.
+fn clamp_summary_input(prefix: &[Msg], formatted: String, reserve_chars: usize) -> (String, bool) {
+    let budget_chars = ((SUMMARY_INPUT_MAX_TOKENS as f64 * CHARS_PER_TOKEN) as usize)
+        .saturating_sub(reserve_chars);
+    let total_chars = formatted.chars().count();
+    if total_chars <= budget_chars {
+        return (formatted, false);
+    }
+    let head = prefix
+        .iter()
+        .find(|msg| msg.name.as_deref() == Some(SUMMARY_MSG_NAME))
+        .map(|msg| format!("[earlier summary] {}", render_message_for_summary(msg)))
+        .unwrap_or_default();
+    let head_chars = head.chars().count();
+    let tail_budget = budget_chars.saturating_sub(head_chars + 40);
+    let tail: String = formatted
+        .chars()
+        .skip(total_chars.saturating_sub(tail_budget))
+        .collect();
+    let mut capped = String::with_capacity(head_chars + tail.len() + 64);
+    if !head.is_empty() {
+        capped.push_str(&head);
+        capped.push_str("\n\n[earlier turns omitted]\n");
+    }
+    capped.push_str(&tail);
+    (capped, true)
 }
 
 /// Builds a USER message carrying the compaction summary.
@@ -1225,8 +1296,105 @@ fn build_prune_preview(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    use agentscope_core::message::ChatUsage;
+    use agentscope_core::model::{ChatResponse, GenerateOptions, ToolSchema};
+    use futures::stream::{self, BoxStream};
 
     use super::*;
+
+    /// Records the prompt it was asked to summarize.
+    struct PromptRecordingModel {
+        seen: Arc<Mutex<String>>,
+        window: usize,
+    }
+
+    impl Model for PromptRecordingModel {
+        fn stream(
+            &self,
+            messages: Vec<Msg>,
+            _tools: Vec<ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, crate::Result<ChatResponse>> {
+            *self.seen.lock().unwrap() = messages
+                .iter()
+                .map(Msg::text_content)
+                .collect::<Vec<_>>()
+                .join("\n");
+            Box::pin(stream::once(async {
+                Ok(ChatResponse::new(
+                    "r1",
+                    vec![ContentBlock::Text(TextBlock::new("summary"))],
+                    ChatUsage::default(),
+                    None,
+                    None,
+                ))
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "prompt-recorder"
+        }
+
+        fn context_window_size(&self) -> usize {
+            self.window
+        }
+    }
+
+    #[tokio::test]
+    async fn the_summary_request_is_capped_and_keeps_the_previous_summary() {
+        // ~240k tokens of history is exactly what compaction sees when the trigger fires.
+        // Sending that as the summarizer prompt is what the provider answered with
+        // `prefill_cap_refused` (429) or a 133s stall into the read timeout.
+        let mut conversation = vec![build_summary_message("PREVIOUS SUMMARY MARKER", None)];
+        for i in 0..300 {
+            conversation.push(Msg::user(format!("turn {i}: {}", "x".repeat(2_000))));
+        }
+        let seen = Arc::new(Mutex::new(String::new()));
+        let compactor = ConversationCompactor::with_model(Arc::new(PromptRecordingModel {
+            seen: Arc::clone(&seen),
+            window: 256_000,
+        }));
+        let config = CompactionConfig::builder()
+            .trigger_messages(0)
+            .trigger_tokens(1_000)
+            .keep_messages(1)
+            .build();
+
+        let replacement = compactor
+            .compact_if_needed_with_metrics_observed(
+                conversation,
+                &config,
+                "agent",
+                "session",
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(replacement.is_some());
+
+        let prompt = seen.lock().unwrap().clone();
+        let tokens = estimate_text_tokens(&prompt);
+        assert!(
+            tokens <= SUMMARY_INPUT_MAX_TOKENS + 100,
+            "summary prompt was {tokens} tokens"
+        );
+        assert!(
+            prompt.contains("PREVIOUS SUMMARY MARKER"),
+            "dropping the previous summary would lose history cumulatively"
+        );
+        assert!(
+            prompt.contains("turn 298:"),
+            "the newest summarized turn must survive"
+        );
+        assert!(
+            !prompt.contains("turn 0:"),
+            "the oldest turns must be dropped"
+        );
+    }
 
     #[test]
     fn compaction_triggers_below_the_compiler_limit() {

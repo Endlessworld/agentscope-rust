@@ -8,6 +8,7 @@
 //! reuse) is untouched; only the summarized prefix is replaced.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::message::{Msg, MsgRole};
@@ -22,12 +23,22 @@ use crate::agent::memory::compaction::{
     CompactionConfig, CompactionMetrics, ConversationCompactor,
 };
 
+/// How long a failed summarization suppresses the next attempt.
+///
+/// Compaction runs before every reasoning step. When the summarizer is unavailable (429) or
+/// stalls into the transport read timeout, an immediate per-step retry turns one slow request
+/// into minutes of silence: production traces show 429 retries followed by a 133s timeout, and
+/// the next step paying the same cost again before the history finally shrinks.
+const COMPACTION_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// Middleware that compacts the accumulated conversation history before each
 /// agent call when it exceeds the configured trigger.
 pub struct ConversationCompactionMiddleware {
     compactor: Arc<ConversationCompactor>,
     config: CompactionConfig,
     agent_id: String,
+    /// When the last summarization attempt failed; suppresses retries during downtime.
+    failed_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ConversationCompactionMiddleware {
@@ -41,6 +52,7 @@ impl ConversationCompactionMiddleware {
             compactor,
             config,
             agent_id: agent_id.into(),
+            failed_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -68,11 +80,28 @@ struct CompactedConversation {
     metrics: CompactionMetrics,
 }
 
+/// Whether a failed summarization attempt is still inside the retry cooldown.
+fn cooling_down(failed_at: &Mutex<Option<Instant>>) -> bool {
+    let guard = failed_at
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .map(|at| at.elapsed() < COMPACTION_FAILURE_COOLDOWN)
+        .unwrap_or(false)
+}
+
+fn record_failure(failed_at: &Mutex<Option<Instant>>) {
+    *failed_at
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+}
+
 /// Reads, compacts and rewrites the shared conversation history.
 ///
 /// `history_override` lets the per-iteration path compact exactly the history that is
 /// about to be sent (after earlier `on_reasoning` rewrites) instead of re-reading the
-/// unmodified state. Returns `None` when no compaction was needed or it failed.
+/// unmodified state. `Ok(None)` means nothing was compacted, `Err(())` means the
+/// summarizer failed and the original history was kept.
 async fn compact_conversation(
     state: Arc<Mutex<AgentState>>,
     recorder: Option<Arc<SessionRecorder>>,
@@ -81,7 +110,7 @@ async fn compact_conversation(
     agent_id: String,
     history_override: Option<Vec<Msg>>,
     observed_tokens: Option<usize>,
-) -> Option<CompactedConversation> {
+) -> Result<Option<CompactedConversation>, ()> {
     let (history, system, session_id) = {
         let guard = state.lock().unwrap();
         let history = match history_override {
@@ -102,7 +131,7 @@ async fn compact_conversation(
         (history, system, guard.session_id().to_string())
     };
     if history.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let (replacement, metrics) = match compactor
@@ -117,14 +146,14 @@ async fn compact_conversation(
         .await
     {
         Ok((Some(replacement), metrics)) => (replacement, metrics),
-        Ok((None, _)) => return None,
+        Ok((None, _)) => return Ok(None),
         Err(error) => {
             tracing::warn!(
                 agent = %agent_id,
                 error = %error,
                 "conversation compaction failed; keeping full history"
             );
-            return None;
+            return Err(());
         }
     };
 
@@ -142,11 +171,11 @@ async fn compact_conversation(
         *guard.context_mut() = new_context;
     }
     tracing::debug!(agent = %agent_id, "conversation compacted");
-    Some(CompactedConversation {
+    Ok(Some(CompactedConversation {
         replacement,
         summary,
         metrics,
-    })
+    }))
 }
 
 impl Middleware for ConversationCompactionMiddleware {
@@ -167,8 +196,13 @@ impl Middleware for ConversationCompactionMiddleware {
         // A recorder attached by the session scheduler makes `compaction/start` and
         // `compaction/end` durable session facts instead of only an in-band marker.
         let recorder = ctx.extension::<SessionRecorder>(RECORDER_CONTEXT_KEY);
+        let failed_at = Arc::clone(&self.failed_at);
 
         let fut = async move {
+            // A summarizer outage must not be paid again on every step.
+            if cooling_down(&failed_at) {
+                return next(input);
+            }
             // The provider's latest `input_tokens` is the authority; only the messages
             // appended after that reply are locally estimated.
             let (history, observed_tokens) = {
@@ -200,7 +234,7 @@ impl Middleware for ConversationCompactionMiddleware {
             )
             .await
             {
-                Some(compacted) => {
+                Ok(Some(compacted)) => {
                     // Announce the compaction in-band so the ACP layer can translate it
                     // into a capability-gated `compaction_update` session notification.
                     let event =
@@ -209,7 +243,11 @@ impl Middleware for ConversationCompactionMiddleware {
                         .chain(next(input))
                         .boxed()
                 }
-                None => next(input),
+                Ok(None) => next(input),
+                Err(()) => {
+                    record_failure(&failed_at);
+                    next(input)
+                }
             }
         };
         Box::pin(futures::stream::once(fut).flatten())
@@ -238,8 +276,12 @@ impl Middleware for ConversationCompactionMiddleware {
         // `on_reasoning` events are not forwarded by the core stream; publish the marker
         // through the delta channel so ACP still receives `compaction_update`.
         let delta_tx = ctx.delta_tx.clone();
+        let failed_at = Arc::clone(&self.failed_at);
 
         let fut = async move {
+            if cooling_down(&failed_at) {
+                return next(input);
+            }
             let system: Vec<Msg> = input
                 .messages
                 .iter()
@@ -275,7 +317,7 @@ impl Middleware for ConversationCompactionMiddleware {
             )
             .await
             {
-                Some(compacted) => {
+                Ok(Some(compacted)) => {
                     if let Some(tx) = &delta_tx {
                         let _ = tx.unbounded_send(Ok(compaction_event(
                             &agent_id,
@@ -287,7 +329,11 @@ impl Middleware for ConversationCompactionMiddleware {
                     messages.extend(compacted.replacement);
                     next(ReasoningInput::new(messages, input.tools, input.options))
                 }
-                None => next(input),
+                Ok(None) => next(input),
+                Err(()) => {
+                    record_failure(&failed_at);
+                    next(input)
+                }
             }
         };
         Box::pin(futures::stream::once(fut).flatten())
@@ -353,6 +399,30 @@ mod tests {
     use super::*;
     use agentscope_core::middleware::MiddlewareChain;
     use agentscope_core::model::GenerateOptions;
+
+    /// Fails every summarization call and counts them.
+    struct FailingModel {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl agentscope_core::model::Model for FailingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<agentscope_core::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> futures::stream::BoxStream<'_, crate::Result<agentscope_core::model::ChatResponse>>
+        {
+            *self.calls.lock().unwrap() += 1;
+            Box::pin(futures::stream::once(async {
+                Err(crate::Error::Agent("429 prefill_cap_refused".into()))
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "failing"
+        }
+    }
 
     fn state_with_history() -> Arc<Mutex<AgentState>> {
         let state = Arc::new(Mutex::new(AgentState::default()));
@@ -604,5 +674,61 @@ mod tests {
         assert!(events.iter().all(|event| event.is_ok()), "{events:?}");
         assert_eq!(*captured.lock().unwrap(), 2);
         assert_eq!(state.lock().unwrap().context().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_compaction_is_not_retried_on_the_next_step() {
+        // The summarizer is called once per step when the history is over the trigger. A
+        // failure (429 / 133s read timeout) must not be paid again immediately: production
+        // traces show the retry loop turning one slow summary into minutes of silence.
+        let state = state_with_history();
+        let calls = Arc::new(Mutex::new(0usize));
+        let middleware = ConversationCompactionMiddleware::new(
+            Arc::new(ConversationCompactor::with_model(Arc::new(FailingModel {
+                calls: Arc::clone(&calls),
+            }))),
+            CompactionConfig::builder()
+                .trigger_messages(0)
+                .trigger_tokens(100)
+                .keep_messages(1)
+                .build(),
+            "agent",
+        );
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(middleware));
+
+        for _ in 0..2 {
+            let ctx = RuntimeContext {
+                state: Some(Arc::clone(&state)),
+                ..RuntimeContext::new()
+                    .with_agent_id("agent")
+                    .with_session_id("s1")
+            };
+            let input = ReasoningInput::new(
+                state.lock().unwrap().context().to_vec(),
+                Vec::new(),
+                GenerateOptions::default(),
+            );
+            let core: Next<ReasoningInput> = Box::new(|_input: ReasoningInput| -> EventStream {
+                Box::pin(futures::stream::once(async {
+                    Ok(agentscope_core::event::AgentEvent::ModelCallEnd(
+                        Default::default(),
+                    ))
+                }))
+            });
+            let events: Vec<_> = chain.wrap_reasoning(ctx, input, core).collect().await;
+            assert!(events.iter().all(|event| event.is_ok()), "{events:?}");
+        }
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "the second step must be skipped during the cooldown"
+        );
+        assert_eq!(
+            state.lock().unwrap().context().len(),
+            6,
+            "a failed compaction keeps the full history"
+        );
     }
 }
