@@ -1,0 +1,25 @@
+[package]
+name = "agentscope-macros"
+description = "AgentScope Rust - proc-macros (`#[tool]`)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }
+
+[dev-dependencies]
+agentscope-core = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

@@ -10,6 +10,7 @@ pub mod executor;
 pub mod file;
 pub mod group;
 pub mod interceptor;
+pub mod macros;
 pub mod mcp;
 pub mod meta;
 pub mod registration;

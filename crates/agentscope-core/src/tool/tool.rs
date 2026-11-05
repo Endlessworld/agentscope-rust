@@ -235,6 +235,8 @@ pub struct FunctionTool {
     defer_loading: bool,
     /// Strict schema mode (see [`Tool::is_strict`]).
     strict: bool,
+    /// 是否允许与本工具的其他调用并发执行（见 [`Tool::is_concurrency_safe`]）。
+    concurrency_safe: bool,
     handler: Box<dyn Fn(JsonMap, ToolExecutionContext) -> Result<ToolResultBlock> + Send + Sync>,
     rebind: Option<Box<dyn Fn(&super::toolkit::Toolkit) -> Arc<dyn Tool> + Send + Sync>>,
 }
@@ -258,6 +260,7 @@ impl FunctionTool {
             return_direct: false,
             defer_loading: false,
             strict: false,
+            concurrency_safe: true,
             handler,
             rebind: None,
         }
@@ -286,6 +289,14 @@ impl FunctionTool {
     /// Enables strict schema mode (see [`Tool::is_strict`]).
     pub fn strict(mut self, v: bool) -> Self {
         self.strict = v;
+        self
+    }
+
+    /// 设置是否允许与本工具的其他调用并发执行（见 [`Tool::is_concurrency_safe`]）。
+    ///
+    /// 默认 `true`（对齐 `Tool` trait 默认值）；`false` 时并行批次会把它退化为串行。
+    pub fn concurrency_safe(mut self, v: bool) -> Self {
+        self.concurrency_safe = v;
         self
     }
 
@@ -333,6 +344,9 @@ impl Tool for FunctionTool {
     }
     fn is_strict(&self) -> bool {
         self.strict
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        self.concurrency_safe
     }
     fn parameters_schema(&self) -> serde_json::Value {
         self.parameters.clone()
