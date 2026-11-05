@@ -23,7 +23,14 @@
 //! `Select-String -Context` (the obvious Windows spelling of `grep -C`) renders matches
 //! as `> path:line:text` and context lines as `  path:line:text`, so the path is not at
 //! column 0 and the match/context marker must survive the rewrite.
+//!
+//! PowerShell's formatter also **hard-wraps** any result line wider than the host width,
+//! cutting `  path:line:text` into two physical lines with no marker (`  …\src\v1\clie`
+//! followed by `nt.rs:365:    pub fn meta…`). [`unwrap_wrapped_lines`] rejoins those
+//! segments before parsing; otherwise the second segment looks like a relative
+//! `nt.rs:365:` match and the real path never repeats.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use agentscope_core::message::JsonMap;
@@ -38,6 +45,15 @@ const NOTE_PREFIX: &str = "[paths grouped";
 /// Longest line gutter accepted in front of the path (`> ` for a `Select-String` match
 /// line, `  ` for a context line). Capped so that indented code excerpts stay rejected.
 const MAX_GUTTER_CHARS: usize = 2;
+
+/// Shortest physical segment assumed to be the head of a formatter-wrapped result line.
+///
+/// A wrapped head fills the host's output width, so it is always long; the floor keeps
+/// ordinary short prose (e.g. `> note: …`) out of the joining logic.
+const MIN_WRAPPED_SEGMENT_CHARS: usize = 60;
+
+/// Most physical segments joined back into one logical result line.
+const MAX_WRAP_SEGMENTS: usize = 4;
 
 /// Extensionless names a search tool may legitimately report at the workspace root.
 const BARE_NAMES: &[&str] = &[
@@ -224,10 +240,11 @@ struct MatchLine<'a> {
 }
 
 fn compact_body(source: &str, config: &CompactConfig) -> Option<Body> {
-    let lines: Vec<&str> = source
+    let raw_lines: Vec<&str> = source
         .split('\n')
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .collect();
+    let lines = unwrap_wrapped_lines(&raw_lines, config);
     if lines.len() < config.min_lines {
         return None;
     }
@@ -245,7 +262,7 @@ fn compact_body(source: &str, config: &CompactConfig) -> Option<Body> {
     let mut index = 0usize;
     while index < lines.len() {
         let Some(path) = parsed[index].as_ref().map(|m| m.path) else {
-            append(&mut out, lines[index]);
+            append(&mut out, lines[index].as_ref());
             index += 1;
             continue;
         };
@@ -270,7 +287,7 @@ fn compact_body(source: &str, config: &CompactConfig) -> Option<Body> {
             hoisted += end - index;
         } else {
             for line in &lines[index..end] {
-                append(&mut out, line);
+                append(&mut out, line.as_ref());
             }
         }
         index = end;
@@ -296,6 +313,84 @@ fn append(out: &mut String, line: &str) {
         out.push('\n');
     }
     out.push_str(line);
+}
+
+/// Rejoins the physical lines PowerShell's output formatter wrapped.
+///
+/// `Select-String -Context` prints one line per match; a line wider than the host width is
+/// hard-wrapped into several physical lines with no marker, e.g.
+///
+/// ```text
+///   C:\…\src\v1\clie
+/// nt.rs:365:    pub fn meta(mut self, …)
+/// ```
+///
+/// Parse that verbatim and the second segment reads as a relative `nt.rs:365:` match, so
+/// compaction hoists a bogus `nt.rs` heading and leaves the real prefix untouched. A join
+/// is attempted only when all of the following hold, which keeps ordinary output — and
+/// `rg` / `grep` output, which is never wrapped — byte-identical:
+///
+/// * the first segment does not parse as a result line on its own;
+/// * it starts with a `Select-String` gutter (`> `/`  `) and carries no whitespace after
+///   the gutter, i.e. it looks like a path prefix cut mid-token;
+/// * it is at least [`MIN_WRAPPED_SEGMENT_CHARS`] long, so short prose is left alone;
+/// * the joined text parses as `path:line:text`.
+///
+/// The tail may itself span more segments (a very long match text), so joining continues
+/// up to [`MAX_WRAP_SEGMENTS`] while segments stay long enough to have been wrapped.
+fn unwrap_wrapped_lines<'a>(lines: &[&'a str], config: &CompactConfig) -> Vec<Cow<'a, str>> {
+    let mut out: Vec<Cow<'a, str>> = Vec::with_capacity(lines.len());
+    let mut index = 0usize;
+    while index < lines.len() {
+        match join_wrapped_line(lines, index, config) {
+            Some((joined, next)) => {
+                out.push(Cow::Owned(joined));
+                index = next;
+            }
+            None => {
+                out.push(Cow::Borrowed(lines[index]));
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Joins the wrapped result line starting at `start`; `None` keeps the line verbatim.
+///
+/// Returns the joined text and the index of the first line *after* the joined run.
+fn join_wrapped_line(
+    lines: &[&str],
+    start: usize,
+    config: &CompactConfig,
+) -> Option<(String, usize)> {
+    let first = lines[start];
+    if parse_match_line(first, config).is_some() {
+        return None;
+    }
+    let (gutter, body) = split_gutter(first);
+    if gutter.is_empty()
+        || body.chars().count() < MIN_WRAPPED_SEGMENT_CHARS
+        || body.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    let mut joined = String::from(first);
+    let mut last = start;
+    while last + 1 < lines.len() && last + 1 - start < MAX_WRAP_SEGMENTS {
+        let next = lines[last + 1];
+        joined.push_str(next);
+        last += 1;
+        if parse_match_line(&joined, config).is_some() {
+            return Some((joined, last + 1));
+        }
+        // A short segment cannot itself have been wrapped, so the join must be wrong:
+        // bail out instead of swallowing an unrelated line.
+        if next.chars().count() < MIN_WRAPPED_SEGMENT_CHARS {
+            return None;
+        }
+    }
+    None
 }
 
 /// Parses `path:line:<text>` (or `path:line:col:<text>`), keeping the tail verbatim.
@@ -584,6 +679,72 @@ crates/harness/src/agent/session/storage.rs:9:1:2 ratio";
             ]
             .join("\n")
         );
+    }
+
+    #[test]
+    fn wrapped_select_string_output_is_rejoined_before_hoisting() {
+        // Real PowerShell shape: the output formatter cuts every `Select-String` result
+        // line at the host width (119 chars = `  ` + 117) with no marker, and match lines
+        // carry ANSI reverse-video escapes.
+        let path = r"C:\Users\Endless\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\agent-client-protocol-schema-1.15.1\src\v1\client.rs";
+        let cut = 117;
+        let (head, rest) = path.split_at(cut);
+        let input = [
+            format!("  {head}"),
+            format!("{rest}:87:    /// See protocol docs"),
+            format!("  {head}"),
+            format!("{rest}:88:    #[must_use]"),
+            format!("> {head}"),
+            format!("{rest}:89:    \u{1b}[7mpub fn meta\u{1b}[0m(mut self) -> Self {{"),
+            format!("\u{1b}[7m\u{1b}[0m  {head}"),
+            format!("\u{1b}[7m\u{1b}[0m{rest}:90:        self.meta\u{1b}[0m"),
+        ]
+        .join("\n");
+        let out = compact_grep_like(&input, &cfg());
+        assert!(out.compacted, "{}", out.text);
+        assert_eq!(out.hoisted_files, 1);
+        assert_eq!(out.hoisted_lines, 4);
+        assert_eq!(
+            out.text,
+            [
+                "[paths grouped; N:<text> = line N of the path above]",
+                path,
+                "  87:    /// See protocol docs",
+                "  88:    #[must_use]",
+                "> 89:    pub fn meta(mut self) -> Self {",
+                "  90:        self.meta",
+            ]
+            .join("\n")
+        );
+        // The wrapped tail (`t.rs`) must never become a heading of its own.
+        assert!(!out.text.contains("\nt.rs\n"));
+    }
+
+    #[test]
+    fn a_long_gutterless_line_is_not_joined_to_the_next_result() {
+        // Only gutter-led segments are candidates; `rg` output has no gutter and is never
+        // wrapped, so an unrelated long line must not be glued to the next result.
+        let prose = "x".repeat(80);
+        let path = "crates/agentscope-harness/src/agent/session/storage.rs";
+        let input =
+            format!("{prose}\n{path}:1:alpha\n{path}:2:beta\n{path}:3:gamma\n{path}:4:delta");
+        let out = compact_grep_like(&input, &cfg());
+        assert!(out.compacted, "{}", out.text);
+        assert!(out.text.contains(&format!(
+            "{prose}\n{path}\n1:alpha\n2:beta\n3:gamma\n4:delta"
+        )));
+    }
+
+    #[test]
+    fn a_short_gutter_line_is_not_joined() {
+        let path = "crates/agentscope-harness/src/agent/session/storage.rs";
+        let input = format!("> a.rs\n{path}:1:alpha\n{path}:2:beta\n{path}:3:gamma");
+        let out = compact_grep_like(&input, &cfg());
+        assert!(out.compacted, "{}", out.text);
+        assert!(out.text.contains("> a.rs"));
+        assert!(out
+            .text
+            .contains(&format!("\n{path}\n1:alpha\n2:beta\n3:gamma")));
     }
 
     #[test]

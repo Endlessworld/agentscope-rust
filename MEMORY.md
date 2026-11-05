@@ -807,3 +807,10 @@
 - 基线通知（注册表/接入方需知）：客户端 `initialize` 不带 `clientCapabilities.subagents:{}` 时 agent 完全静默；带则要求 `subagent_update` 外层 sessionId=父会话、且必须先于子会话任何 chunk 到达。
 
 - ACP `subagent_update`（ACP-39）已提交：`d5efcb0 feat(acp): 子代理进度上报 subagent_update（ACP-39）`（分支 `agent/d-ideaprojects-acp-agent-ui-docs`，17 files +1536/-40，含 `tests/acp_subagent_test.rs`、`MEMORY.md`、`memory/2026-11-05.md`）。未 push；合入 `dev` 需 cherry-pick（禁止 merge）。
+
+- 2026-11-05 修复 harness 输出折叠无法处理 PowerShell **折行**的 `Select-String` 输出（`crates/agentscope-harness/src/tool/output_compact.rs`，工作区未提交）。根因：`Select-String -Context` 的匹配行在宿主输出宽度（实测 119 字符 = `  ` + 117）处被格式化器**无标记硬折行**，第 2 段 `nt.rs:365:...` 会被 `parse_match_line` 当成相对路径 `nt.rs`（ext `.rs` 合法）→ hoist 出假路径、真正的 `C:\...\client.rs` 前缀没人认。b389164 只处理了 gutter（`> `/`  `），没处理折行。
+- 修复方式：新增 `unwrap_wrapped_lines`/`join_wrapped_line`，在 `compact_body` 解析前把「逻辑行」重组。拼接条件（全部满足才拼）：该行自身解析失败；`split_gutter` 后有 gutter（`>` 或空格开头）；去 gutter 后无空白；长度 ≥ `MIN_WRAPPED_SEGMENT_CHARS`(60)；拼接后能解析成 `path:line:text`；最多 `MAX_WRAP_SEGMENTS`(4) 段，中途遇到 <60 字符的段就放弃（不吞无关行）。用 `Vec<Cow<'a,str>>` 承接。
+- 真实复现方法（本机可直接跑）：用 `System.Diagnostics.ProcessStartInfo` 重定向捕获 `pwsh -NoProfile -Command "Select-String -Path <file> -Pattern 'pub fn meta' -Context 2,4"` 的 stdout —— 折行只在**进程 stdout 被捕获**时出现，走 PowerShell 管道/`Out-String` 不会折。实测该输出 675 行、含 ESC；折叠后 `compacted=true saved=47347 files=1 lines=336`，完整路径作为唯一 heading。
+- 新增 3 条单测：`wrapped_select_string_output_is_rejoined_before_hoisting`（真实形态：`path.split_at(117)` 切头 + `\x1b[7m\x1b[0m` 前缀）、`a_long_gutterless_line_is_not_joined_to_the_next_result`、`a_short_gutter_line_is_not_joined`。反向验证：把 unwrap 换成直通 → 第一条 FAILED（其余 24 passed）。
+- 验证口径：`cargo test -p agentscope-harness -j 2 --no-fail-fast` → lib 631 passed / EXIT=0；全量 `cargo test --workspace -j 2 --no-fail-fast` → 172 个 `test result: ok.`、**6300 passed / 0 FAILED / 无 `failures:` 段**（注意全量 >300s，工具会超时但子进程继续跑，日志仍完整；日志无 EXITCODE 行）；`cargo fmt --all -- --check` 仍只报 `filesystem/sandbox.rs:167` 的既有问题，我的文件无 diff。
+- 未做（有意）：不兼容「ESC 已丢失、只剩字面 `[7m`」的文本（真实链路 serde 会保留 ESC，`strip_ansi` 足够）；不为 execute 层再加测试（`format_execute_output` 只是透传）。
