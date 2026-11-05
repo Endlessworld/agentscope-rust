@@ -1531,10 +1531,29 @@ async fn launch(
         .prepare_with_baseline(&recorder, Some(&admission))
         .await
     {
-        // An admission failure is not a durable verdict on the command: a writer race, a
-        // transient read error or a just-settled turn must not permanently reject the user's
-        // message. Release and let the dispatcher retry the same accepted command.
         recorder.close().await;
+        // A command that can never be admitted must not stay at the head of the queue.
+        //
+        // The dispatcher launches the first accepted command and returns, so retrying an
+        // admission that can never succeed starves every command behind it. A `resume` whose
+        // turn a later `submit` already superseded is the case seen in the wild: after a
+        // restart, the session sat in `queued` until the host's 300s admission deadline, with
+        // no model request ever sent. Reject the command (the client sees the reason) and let
+        // the next one run.
+        if is_permanent_admission_failure(&error) {
+            tracing::warn!(
+                turn = %turn_id,
+                command = %command.id,
+                kind = %command.kind,
+                %error,
+                "rejecting a command that can never be admitted"
+            );
+            inbox.reject(&command, &error.to_string()).await?;
+            return Ok(());
+        }
+        // Otherwise an admission failure is not a durable verdict on the command: a writer
+        // race, a transient read error or a just-settled turn must not permanently reject the
+        // user's message. Release and let the dispatcher retry the same accepted command.
         tracing::warn!(
             turn = %turn_id,
             %error,
@@ -1841,6 +1860,18 @@ fn freeze(command_id: &str, input: Vec<Msg>) -> Vec<Msg> {
             message
         })
         .collect()
+}
+
+/// Whether an admission error can never become a success on a later dispatcher tick.
+///
+/// A `resume` naming a turn that a later `submit` already superseded is the important case:
+/// the journal only ever continues its *latest* unfinished turn, so the answer cannot change by
+/// retrying. Unknown failures keep being retried — only the verdicts below are final.
+fn is_permanent_admission_failure(error: &agentscope_core::Error) -> bool {
+    let text = error.to_string();
+    text.contains("Only the latest unfinished task can continue")
+        || text.contains("Execution command requires a turn id")
+        || text.contains("Command kind does not start an execution")
 }
 
 fn now_millis() -> i64 {

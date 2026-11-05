@@ -351,6 +351,41 @@ async fn sandbox_executes_shell() {
 }
 
 #[tokio::test]
+async fn a_command_that_exceeds_its_timeout_is_killed_and_returns() {
+    // A timed-out shell command used to be able to hang the caller: the timeout path kills the
+    // process tree synchronously, and a stuck kill left the run (and the session's `active_run`
+    // slot) occupied forever, so every later prompt queued until the host's admission deadline.
+    let dir = temp_dir("sandbox_timeout").await;
+    let inner = LocalFilesystem::sandboxed(&dir);
+    let sandbox = SandboxBackedFilesystem::new(Arc::new(inner), dir);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        sandbox.execute(&ctx(), long_running_command(), 1),
+    )
+    .await
+    .expect("a timed-out command must not hang the caller")
+    .unwrap();
+    assert_eq!(result.exit_code, -1);
+    assert!(result.output.contains("timed out"), "{}", result.output);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "the timeout must return in time, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(windows)]
+fn long_running_command() -> &'static str {
+    "Start-Sleep -Seconds 30"
+}
+
+#[cfg(not(windows))]
+fn long_running_command() -> &'static str {
+    "sleep 30"
+}
+
+#[tokio::test]
 async fn ls_reports_errors_instead_of_silent_empty() {
     let dir = temp_dir("ls_errors").await;
     let fs = LocalFilesystem::sandboxed(&dir);

@@ -448,6 +448,103 @@ async fn an_interrupted_turn_is_closed_before_a_new_submission_runs() {
 }
 
 #[tokio::test]
+async fn a_superseded_resume_does_not_starve_the_queue() {
+    // Regression for "the agent restarted, then every prompt sat in `queued` until the 300s
+    // admission deadline, with no model request sent": a `resume` accepted just before a
+    // submit that opened a newer turn can never be admitted again ("Only the latest unfinished
+    // task can continue"). The dispatcher always launches the first accepted command, so
+    // retrying that one forever meant no later prompt ever started.
+    use agentscope_core::session::{Command, SessionInbox, SessionRecorder};
+    use agentscope_core::state::AgentState;
+
+    let dir = temp_dir("stale-resume");
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("session-agent")
+            .model(Arc::new(ScriptedModel("after the stale resume")))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .build(),
+    );
+    let context = RuntimeContext::new()
+        .with_user_id("alice")
+        .with_session_id("conversation-stale-resume");
+    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-stale-resume").unwrap();
+    let store = InMemorySessionLogStore::new();
+    let log = store.open(&key, &context).await.unwrap();
+
+    // `turn-old` was interrupted mid-run (non-terminal, resumable); `turn-new` is the latest
+    // turn and already finished, so a resume naming `turn-old` can never be admitted.
+    for (turn, text, status) in [
+        ("turn-old", "earlier", "interrupted"),
+        ("turn-new", "later", "completed"),
+    ] {
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some(turn))
+            .await
+            .unwrap();
+        let state = AgentState::builder()
+            .session_id("conversation-stale-resume")
+            .build();
+        let mut message = Msg::user(text);
+        message.id = format!("input-{turn}");
+        recorder.start(&[message], &state).await.unwrap();
+        recorder
+            .append("run/end", &serde_json::json!({ "status": status }))
+            .unwrap();
+        recorder.flush().await.unwrap();
+        recorder.close().await;
+    }
+
+    let inbox = SessionInbox::new(Arc::clone(&log)).unwrap();
+    let stale = Command::new(
+        "cmd-stale-resume",
+        "resume",
+        Some("turn-old".into()),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    inbox.accept(&stale).await.unwrap();
+    let mut message = Msg::user("continue");
+    message.id = "input-cmd-submit-0".into();
+    let submit = Command::new(
+        "cmd-submit",
+        "submit",
+        Some("turn-fresh".into()),
+        vec![message],
+        Vec::new(),
+    )
+    .unwrap();
+    inbox.accept(&submit).await.unwrap();
+
+    let session = AgentSession::open(agent, context, key, log).unwrap();
+    session.start();
+
+    let settled = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        session.await_task("cmd-submit"),
+    )
+    .await
+    .expect("a stale resume must not keep the queue from running")
+    .unwrap();
+    assert_eq!(settled.status, "completed", "{settled:?}");
+
+    // The stale command is rejected with the real reason instead of being silently dropped.
+    let rejected = session.task("cmd-stale-resume").await.unwrap();
+    assert_eq!(rejected.status, "rejected", "{rejected:?}");
+    assert!(
+        rejected
+            .error
+            .unwrap_or_default()
+            .contains("Only the latest unfinished task"),
+        "the rejection must explain why the continuation can never run"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn a_starting_receipt_whose_run_died_reports_interrupted() {
     // Regression for "the turn was never admitted (status starting after 144s)": `starting`
     // comes from the in-memory `active_command` slot, so when a run dies between admission and
