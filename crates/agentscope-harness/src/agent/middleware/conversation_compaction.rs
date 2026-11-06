@@ -170,7 +170,12 @@ async fn compact_conversation(
         new_context.extend(replacement.iter().cloned());
         *guard.context_mut() = new_context;
     }
-    tracing::debug!(agent = %agent_id, "conversation compacted");
+    tracing::debug!(
+        agent = %agent_id,
+        observed_tokens = observed_tokens.unwrap_or(0),
+        trigger_tokens = config.trigger_tokens,
+        "conversation compacted"
+    );
     Ok(Some(CompactedConversation {
         replacement,
         summary,

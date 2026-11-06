@@ -117,13 +117,26 @@ fn last_provider_usage(messages: &[Msg], model: Option<&str>) -> Option<(usize, 
                     .get(Msg::METADATA_USAGE_MODEL)
                     .and_then(|value| value.as_str())
                 {
-                    if recorded != model {
+                    if canonical_model(recorded) != canonical_model(model) {
                         return None;
                     }
                 }
             }
             Some((index, usage))
         })
+}
+
+/// Model identity used to decide whether a recorded usage still describes the current
+/// request.
+///
+/// A model id may carry a provider prefix that names the gateway rather than the tokenizer:
+/// `deepseek-v4.1-flash` and `workbuddy/deepseek-v4.1-flash` are the same model. Comparing
+/// the raw strings would drop a perfectly valid provider anchor after a provider rename, and
+/// the fallback local estimate runs ~20% high — which shows up as a conversation that
+/// compacts *before* the configured trigger (and compacts again right after a session is
+/// resumed).
+fn canonical_model(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name).trim()
 }
 
 /// Removes usage records that no longer describe the current request.
@@ -178,6 +191,20 @@ mod tests {
         // The suffix contains the assistant reply, so the count is above the anchor.
         assert!(usage.tokens > 1_000, "{usage:?}");
         assert_eq!(usage.method(), PROVIDER_METHOD);
+    }
+
+    #[test]
+    fn a_provider_prefix_does_not_invalidate_the_anchor() {
+        // The history was recorded under the bare id; the live model is the same model behind a
+        // provider-prefixed id. Dropping the anchor would fall back to the local estimate, which
+        // runs high and compacts early (e.g. right after a session/load).
+        let messages = vec![
+            Msg::user("hello"),
+            assistant_with_usage("deepseek-v4.1-flash"),
+        ];
+        let usage = context_usage(&messages, &[], Some("workbuddy/deepseek-v4.1-flash"));
+        assert!(usage.is_provider_anchored());
+        assert_eq!(usage.provider_input_tokens, Some(1_000));
     }
 
     #[test]
