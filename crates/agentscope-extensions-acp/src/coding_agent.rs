@@ -53,33 +53,59 @@ const MAX_CATALOG_AGENTS: usize = 4;
 /// Default model id used when `CODING_MODEL_ID` is not set.
 const DEFAULT_MODEL_ID: &str = "gpt-4o";
 
-/// Default context window the ACP agents compact against.
+/// Fallback context window when the selected model's window is unknown.
 ///
-/// Deliberately **independent of the selected model's window**: a model that advertises a
-/// 1M-token window (the measured case: `opencode-go/deepseek-v4.1-flash`) would otherwise
-/// push the trigger to ~878k tokens, so the conversation would be re-sent for hundreds of
-/// thousands of tokens before anything is summarized. Override with
-/// `AGENTSCOPE_ACP_COMPACTION_WINDOW` (tokens; `0`/unset keeps the default).
+/// The trigger follows the model's own `context_window_size()` (the catalog knows e.g.
+/// `opencode-go/deepseek-v4.1-flash` → 1M), so this constant only applies to adapters that
+/// cannot report a window at all. `AGENTSCOPE_ACP_COMPACTION_WINDOW` overrides both, which is
+/// also how a deployment caps the trigger (e.g. `256000`) to keep requests small: without it a
+/// 1M-token model summarizes only at ~878k tokens.
 pub const ACP_CONTEXT_WINDOW_TOKENS: usize = 256_000;
 
-/// The window the conversation compactor sizes itself against.
+/// The explicit override window, or the fallback used when the model reports none.
 pub fn compaction_window_tokens() -> usize {
-    parse_compaction_window(
+    compaction_window_override().unwrap_or(ACP_CONTEXT_WINDOW_TOKENS)
+}
+
+/// The explicit `AGENTSCOPE_ACP_COMPACTION_WINDOW` override, when one was given.
+fn compaction_window_override() -> Option<usize> {
+    parse_compaction_window_value(
         std::env::var("AGENTSCOPE_ACP_COMPACTION_WINDOW")
             .ok()
             .as_deref(),
     )
 }
 
-/// Parses the `AGENTSCOPE_ACP_COMPACTION_WINDOW` override.
+/// Compaction trigger derived from the selected model's window.
 ///
-/// Anything unusable (unset, non-numeric, `0`) falls back to the default so a typo cannot
-/// silently disable compaction.
-fn parse_compaction_window(raw: Option<&str>) -> usize {
+/// `context_window_size()` is what the context compiler budgets against, so the trigger must use
+/// the same number: [`trigger_for_window`] already subtracts the compiler's output reserve and
+/// safety margin. A model whose window is unknown falls back to
+/// [`ACP_CONTEXT_WINDOW_TOKENS`], and `AGENTSCOPE_ACP_COMPACTION_WINDOW` wins over both so a
+/// deployment can still cap (or raise) the trigger explicitly.
+pub fn compaction_trigger_for(model_window: usize) -> usize {
+    compaction_trigger_for_window(model_window, compaction_window_override())
+}
+
+/// [`compaction_trigger_for`] without reading the environment, so it stays testable.
+fn compaction_trigger_for_window(model_window: usize, explicit: Option<usize>) -> usize {
+    trigger_for_window(resolve_compaction_window(model_window, explicit))
+}
+
+/// Picks the window the trigger is derived from (see [`compaction_trigger_for`]).
+fn resolve_compaction_window(model_window: usize, explicit: Option<usize>) -> usize {
+    match explicit {
+        Some(window) => window,
+        None if model_window == 0 => ACP_CONTEXT_WINDOW_TOKENS,
+        None => model_window,
+    }
+}
+
+/// Parses the override value, keeping `None` for "no usable override".
+fn parse_compaction_window_value(raw: Option<&str>) -> Option<usize> {
     raw.map(str::trim)
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(ACP_CONTEXT_WINDOW_TOKENS)
 }
 
 /// Builds an [`OpenAiChatModel`] from the environment (mirrors Java `CodingAgentFactory`).
@@ -102,9 +128,8 @@ fn build_env_model() -> Arc<dyn Model> {
 /// compaction, plan mode). Mirrors the Java `HarnessCodingAgent`/`CodingAgentFactory`.
 fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessAgent {
     let model = build_env_model();
-    // The trigger comes from the ACP's own window attribute, never from the model's
-    // advertised window (see `ACP_CONTEXT_WINDOW_TOKENS`).
-    let trigger = trigger_for_window(compaction_window_tokens());
+    // The trigger follows the model's own window (see `compaction_trigger_for`).
+    let trigger = compaction_trigger_for(model.context_window_size());
     let workspace = cwd.join(".agentscope").join("workspace");
     HarnessAgent::builder()
         .name("agentscope-coding-agent")
@@ -1906,23 +1931,57 @@ mod tests {
     }
 
     #[test]
-    fn the_compaction_window_is_its_own_attribute_not_the_model_window() {
-        // The window a 1M-token model advertises must not set the compaction trigger: the
-        // conversation would grow past ~878k tokens before anything is summarized.
+    fn an_unusable_compaction_window_falls_back_to_the_attribute() {
+        // No usable override must fall back to the attribute, so a typo or a zero cannot
+        // silently disable compaction.
+        let parse = |raw: Option<&str>| {
+            super::parse_compaction_window_value(raw).unwrap_or(super::ACP_CONTEXT_WINDOW_TOKENS)
+        };
+        assert_eq!(parse(None), super::ACP_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(parse(Some(" 300000 ")), 300_000);
+        assert_eq!(parse(Some("0")), super::ACP_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(parse(Some("256k")), super::ACP_CONTEXT_WINDOW_TOKENS);
+    }
+
+    #[test]
+    fn the_compaction_trigger_follows_the_model_window() {
+        // A 1M-window catalog model (`opencode-go/deepseek-v4.1-flash`) must not be summarized at
+        // the 256k fallback's 218k: the compiler budgets against the model's own window.
         assert_eq!(
-            super::parse_compaction_window(None),
+            super::compaction_trigger_for_window(1_000_000, None),
+            super::trigger_for_window(1_000_000)
+        );
+        assert!(
+            super::compaction_trigger_for_window(1_000_000, None) > 800_000,
+            "a 1M window must not compact at the 256k fallback's 218k"
+        );
+        // A 128k-window model (`glm*` in the window table) compacts below the input limit (~114k)
+        // instead of never firing the proactive trigger.
+        let small = super::compaction_trigger_for_window(128_000, None);
+        assert_eq!(small, super::trigger_for_window(128_000));
+        assert!(
+            small < 114_688,
+            "the 128k trigger {small} must stay below the input limit"
+        );
+        // An unknown window falls back to the ACP attribute.
+        assert_eq!(super::compaction_trigger_for_window(0, None), 218_419);
+    }
+
+    #[test]
+    fn an_explicit_compaction_window_wins_over_the_model_window() {
+        assert_eq!(
+            super::resolve_compaction_window(1_000_000, Some(256_000)),
+            256_000
+        );
+        assert_eq!(
+            super::resolve_compaction_window(128_000, Some(400_000)),
+            400_000
+        );
+        assert_eq!(
+            super::resolve_compaction_window(0, None),
             super::ACP_CONTEXT_WINDOW_TOKENS
         );
-        assert_eq!(super::parse_compaction_window(Some(" 300000 ")), 300_000);
-        // A typo or a zero must not silently disable compaction.
-        assert_eq!(
-            super::parse_compaction_window(Some("0")),
-            super::ACP_CONTEXT_WINDOW_TOKENS
-        );
-        assert_eq!(
-            super::parse_compaction_window(Some("256k")),
-            super::ACP_CONTEXT_WINDOW_TOKENS
-        );
+        assert_eq!(super::resolve_compaction_window(128_000, None), 128_000);
     }
 
     #[test]

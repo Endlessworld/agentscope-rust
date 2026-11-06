@@ -115,7 +115,7 @@ use std::time::Duration;
 use agentscope_core::model::catalog::{CatalogAwareModel, ModelCatalog};
 use agentscope_core::model::provider::{ApiProtocol, ModelCreationContext};
 use agentscope_core::model::{GenerateOptions, Model};
-use agentscope_extensions_acp::compaction_window_tokens;
+use agentscope_extensions_acp::compaction_trigger_for;
 use agentscope_extensions_acp::config::ModelChoice;
 use agentscope_extensions_acp::setup::{self, DetectedProvider, SetupIo, SetupPlan};
 use agentscope_extensions_acp::{
@@ -124,8 +124,7 @@ use agentscope_extensions_acp::{
 use agentscope_extensions_acp::{AskUserTool, SessionBuild};
 use agentscope_harness::agent::context::TaskContextOptions;
 use agentscope_harness::agent::{
-    trigger_for_window, CompactionConfig, FileSystemSkillRepository, HarnessAgent,
-    ToolResultEvictionConfig,
+    CompactionConfig, FileSystemSkillRepository, HarnessAgent, ToolResultEvictionConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1114,10 +1113,16 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
     // 初始模型即绑定当前 ACP sessionId（x-opencode-session）。
     let model: Arc<dyn Model> = build_model(&model_id, &base_url, &api_key, protocol, session_id);
     let context_window = model.context_window_size();
-    // 压缩阈值**不跟随所选模型的窗口**：1M 窗口的模型会把触发点推到 ~880k tokens，对话会在毫无
-    // 收缩的情况下被反复重发。改用 ACP 自己的窗口属性（默认 256k，`AGENTSCOPE_ACP_COMPACTION_WINDOW`
-    // 覆盖）；模型窗口仅用于下面工具结果外置的规模缩放。
-    let compaction_trigger = trigger_for_window(compaction_window_tokens());
+    // 压缩阈值跟随模型自己的上下文窗口（catalog 已知 opencode-go/deepseek-v4.1-flash 为 1M），
+    // 与编译器预算同源；`AGENTSCOPE_ACP_COMPACTION_WINDOW` 仍可显式封顶（见
+    // `compaction_trigger_for`）。
+    let compaction_trigger = compaction_trigger_for(context_window);
+    tracing::info!(
+        "compaction-config: model='{}' context_window={} trigger_tokens={}",
+        model_id,
+        context_window,
+        compaction_trigger
+    );
     // 子 agent 的 front-matter `model:` 覆盖：按 `~/.agentscope/models.json` 解析 provider 后
     // 新建一个模型（对齐 Java `Builder.modelResolver`）。解析失败则回退到父模型。
     let resolver_session = session_id.to_string();

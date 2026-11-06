@@ -390,7 +390,7 @@ await acp
 | `LANG` | `zh` | 系统提示语言 |
 | `AGENTSCOPE_LOG_DIR` | `<cwd>/.agentscope/log` | 日志目录（写 `acp-agent.log`） |
 | `RUST_LOG` | `info,acp_harness_agent=debug,agentscope_harness=debug` | tracing 过滤器 |
-| `AGENTSCOPE_ACP_COMPACTION_WINDOW` | `256000` | 压缩窗口（tokens），**与所选模型窗口无关**，实际触发点 `218419` |
+| `AGENTSCOPE_ACP_COMPACTION_WINDOW` | 跟随所选模型 | 强制压缩窗口（tokens），覆盖模型自己的上下文窗口；不设时按模型窗口的 90% 触发（如 1M 窗口 → `888192`），仅模型窗口未知时回落 `256000`（触发点 `218419`） |
 | `AGENTSCOPE_SESSION_RETENTION` | 二进制 `12h`（库默认 30 天） | 会话 journal 保留期；`off` 关闭清理；支持 `m`/`h`/`d` |
 | `AGENTSCOPE_ACP_WORKER_THREADS` | `min(ncpu, 8)` | tokio worker 数 |
 | `AGENTSCOPE_ACP_MEM_TRIM_IDLE` | `3` 秒 | 空闲多久后归还工作集；`0` 关闭 |

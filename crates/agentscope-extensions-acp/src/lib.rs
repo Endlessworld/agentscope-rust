@@ -24,8 +24,8 @@ pub mod setup;
 pub mod support;
 
 pub use coding_agent::{
-    compaction_window_tokens, release_catalog_if_unused, AcpCodingAgent, AcpCodingAgentBuilder,
-    ImageSupport, SessionBuild, ACP_CONTEXT_WINDOW_TOKENS,
+    compaction_trigger_for, compaction_window_tokens, release_catalog_if_unused, AcpCodingAgent,
+    AcpCodingAgentBuilder, ImageSupport, SessionBuild, ACP_CONTEXT_WINDOW_TOKENS,
 };
 pub use elicitation::{AskUserTool, ElicitationClient, ElicitationSlot};
 pub use mcp_over_acp::{McpAcpConnection, McpAcpTool};
