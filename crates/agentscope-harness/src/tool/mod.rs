@@ -7,6 +7,7 @@ use agentscope_core::message::JsonMap;
 pub mod agent_generate;
 pub mod agent_spawn;
 pub mod artifact_delivery;
+pub mod compact_context;
 pub mod filesystem_tools;
 pub mod fuzzy_text_matcher;
 pub mod grep_options;
@@ -28,6 +29,7 @@ pub use agent_spawn::{
     SubagentExposureSink, SubagentFrame, SubagentRuntimeHook,
 };
 pub use artifact_delivery::ArtifactDeliveryTool;
+pub use compact_context::{CompactContextTool, COMPACT_CONTEXT_TOOL_NAME};
 pub use filesystem_tools::FilesystemTool;
 pub use fuzzy_text_matcher::{search, Level, MatchRange, SearchResult};
 pub use memory_get::MemoryGetTool;

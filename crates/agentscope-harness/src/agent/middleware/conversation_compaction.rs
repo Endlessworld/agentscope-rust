@@ -7,6 +7,7 @@
 //! the preserved tail stays verbatim so recent context (and its prefix KV-cache
 //! reuse) is untouched; only the summarized prefix is replaced.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,8 @@ pub struct ConversationCompactionMiddleware {
     agent_id: String,
     /// When the last summarization attempt failed; suppresses retries during downtime.
     failed_at: Arc<Mutex<Option<Instant>>>,
+    /// Set by `compact_context` (or a host shortcut) to bypass the trigger on the next step.
+    requested: Arc<AtomicBool>,
 }
 
 impl ConversationCompactionMiddleware {
@@ -53,7 +56,17 @@ impl ConversationCompactionMiddleware {
             config,
             agent_id: agent_id.into(),
             failed_at: Arc::new(Mutex::new(None)),
+            requested: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Handle a caller (the `compact_context` tool, or a host shortcut such as `/compact`)
+    /// uses to request a compaction that ignores the configured trigger.
+    ///
+    /// The request is consumed by the next step that actually attempts a compaction, so a
+    /// request made during the acting phase survives until the next reasoning step.
+    pub fn request_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.requested)
     }
 
     /// Convenience constructor using the agent's primary model for summarization.
@@ -94,6 +107,18 @@ fn record_failure(failed_at: &Mutex<Option<Instant>>) {
     *failed_at
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+}
+
+/// Turns a requested compaction into an unconditional one.
+///
+/// A request bypasses the token/message trigger but keeps `keep_messages`: the point of a
+/// requested compaction is to shrink the prefix, not to drop the messages the user is
+/// still working with. A history shorter than the preserved tail therefore stays as it is.
+fn forcing_compaction(config: &CompactionConfig) -> CompactionConfig {
+    let mut config = config.clone();
+    config.trigger_messages = 1;
+    config.trigger_tokens = 0;
+    config
 }
 
 /// Reads, compacts and rewrites the shared conversation history.
@@ -202,12 +227,15 @@ impl Middleware for ConversationCompactionMiddleware {
         // `compaction/end` durable session facts instead of only an in-band marker.
         let recorder = ctx.extension::<SessionRecorder>(RECORDER_CONTEXT_KEY);
         let failed_at = Arc::clone(&self.failed_at);
+        let requested = Arc::clone(&self.requested);
 
         let fut = async move {
-            // A summarizer outage must not be paid again on every step.
+            // A summarizer outage must not be paid again on every step. The request is left
+            // set so it survives the cooldown instead of being silently dropped.
             if cooling_down(&failed_at) {
                 return next(input);
             }
+            let forced = requested.swap(false, Ordering::SeqCst);
             // The provider's latest `input_tokens` is the authority; only the messages
             // appended after that reply are locally estimated.
             let (history, observed_tokens) = {
@@ -225,9 +253,15 @@ impl Middleware for ConversationCompactionMiddleware {
             // A history under the trigger is not an attempt: skip it entirely. Invoking the
             // compactor anyway would journal `compaction/start` (whose payload is the whole
             // conversation) on every single step for a compaction that cannot happen.
-            if !compactor.needs_compaction(&history, &config, observed_tokens) {
+            if !forced && !compactor.needs_compaction(&history, &config, observed_tokens) {
                 return next(input);
             }
+            let config = if forced {
+                tracing::debug!(agent = %agent_id, "compaction requested; ignoring the trigger");
+                forcing_compaction(&config)
+            } else {
+                config
+            };
             match compact_conversation(
                 state,
                 recorder,
@@ -282,11 +316,15 @@ impl Middleware for ConversationCompactionMiddleware {
         // through the delta channel so ACP still receives `compaction_update`.
         let delta_tx = ctx.delta_tx.clone();
         let failed_at = Arc::clone(&self.failed_at);
+        let requested = Arc::clone(&self.requested);
 
         let fut = async move {
+            // The request survives a cooldown: a summarizer outage must not swallow the
+            // model's (or the host's) explicit ask.
             if cooling_down(&failed_at) {
                 return next(input);
             }
+            let forced = requested.swap(false, Ordering::SeqCst);
             let system: Vec<Msg> = input
                 .messages
                 .iter()
@@ -308,9 +346,15 @@ impl Middleware for ConversationCompactionMiddleware {
             );
             let observed_tokens = (usage.tokens > 0).then_some(usage.tokens as usize);
             // Same rule per step: never record a compaction fact for a no-op attempt.
-            if !compactor.needs_compaction(&history, &config, observed_tokens) {
+            if !forced && !compactor.needs_compaction(&history, &config, observed_tokens) {
                 return next(input);
             }
+            let config = if forced {
+                tracing::debug!(agent = %agent_id, "compaction requested; ignoring the trigger");
+                forcing_compaction(&config)
+            } else {
+                config
+            };
             match compact_conversation(
                 state,
                 recorder,
@@ -734,6 +778,119 @@ mod tests {
             state.lock().unwrap().context().len(),
             6,
             "a failed compaction keeps the full history"
+        );
+    }
+
+    /// Summarizes with a fixed line and counts the calls.
+    struct SummarizingModel {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl agentscope_core::model::Model for SummarizingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<agentscope_core::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> futures::stream::BoxStream<'_, crate::Result<agentscope_core::model::ChatResponse>>
+        {
+            *self.calls.lock().unwrap() += 1;
+            Box::pin(futures::stream::once(async {
+                Ok(agentscope_core::model::ChatResponse::new(
+                    "r1",
+                    vec![agentscope_core::message::ContentBlock::Text(
+                        agentscope_core::message::TextBlock::new("summary"),
+                    )],
+                    agentscope_core::message::ChatUsage::default(),
+                    None,
+                    None,
+                ))
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "summarizer"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_requested_compaction_ignores_the_trigger() {
+        // The trigger sits far above the history, so only the request can compact it: the
+        // model's `compact_context` call (and the host `/compact` shortcut) must not depend on
+        // the conversation having grown past the window first.
+        let state = state_with_history();
+        let calls = Arc::new(Mutex::new(0));
+        let middleware = ConversationCompactionMiddleware::new(
+            Arc::new(ConversationCompactor::with_model(Arc::new(
+                SummarizingModel {
+                    calls: Arc::clone(&calls),
+                },
+            ))),
+            CompactionConfig::builder()
+                .trigger_messages(0)
+                .trigger_tokens(1_000_000)
+                .keep_messages(1)
+                .build(),
+            "agent",
+        );
+        let request = middleware.request_handle();
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(middleware));
+
+        // Without a request the same history is left alone.
+        let ctx = RuntimeContext {
+            state: Some(Arc::clone(&state)),
+            ..RuntimeContext::new()
+                .with_agent_id("agent")
+                .with_session_id("s1")
+        };
+        let input = ReasoningInput::new(
+            state.lock().unwrap().context().to_vec(),
+            Vec::new(),
+            GenerateOptions::default(),
+        );
+        let core: Next<ReasoningInput> = Box::new(|_input: ReasoningInput| -> EventStream {
+            Box::pin(futures::stream::once(async {
+                Ok(agentscope_core::event::AgentEvent::ModelCallEnd(
+                    Default::default(),
+                ))
+            }))
+        });
+        let _: Vec<_> = chain.wrap_reasoning(ctx, input, core).collect().await;
+        assert_eq!(state.lock().unwrap().context().len(), 6);
+        assert_eq!(*calls.lock().unwrap(), 0);
+
+        request.store(true, Ordering::SeqCst);
+        let ctx = RuntimeContext {
+            state: Some(Arc::clone(&state)),
+            ..RuntimeContext::new()
+                .with_agent_id("agent")
+                .with_session_id("s1")
+        };
+        let input = ReasoningInput::new(
+            state.lock().unwrap().context().to_vec(),
+            Vec::new(),
+            GenerateOptions::default(),
+        );
+        let core: Next<ReasoningInput> = Box::new(|_input: ReasoningInput| -> EventStream {
+            Box::pin(futures::stream::once(async {
+                Ok(agentscope_core::event::AgentEvent::ModelCallEnd(
+                    Default::default(),
+                ))
+            }))
+        });
+        let events: Vec<_> = chain.wrap_reasoning(ctx, input, core).collect().await;
+        assert!(events.iter().all(|event| event.is_ok()), "{events:?}");
+
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(
+            state.lock().unwrap().context().len(),
+            2,
+            "the summary plus the preserved tail"
+        );
+        assert!(
+            !request.load(Ordering::SeqCst),
+            "the request is consumed by the step that honours it"
         );
     }
 }

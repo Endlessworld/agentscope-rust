@@ -22,7 +22,7 @@
 - **权限记忆**：用户选择「总是允许 / 总是拒绝」后写入工作区，跨会话生效
 - **运行时切换**：`model` 与 `thought_level` 作为 ACP config option 暴露，客户端可随时切换
 - **会话持久化**：`session/new|load|resume|list|delete|close`，历史以 journal 为准，重启后恢复
-- **上下文压缩**：超过阈值自动压缩，并在客户端支持时推送进度通知
+- **上下文压缩**：超过阈值自动压缩，并在客户端支持时推送进度通知；也可主动触发——模型调用 `compact_context` 工具（由用户提示词驱动），或直接发送 `/compact`（宿主立即压缩，不占模型回合）
 - **MCP**：支持客户端以 `stdio` / `http` / `sse` 声明的 MCP server，也支持 MCP over ACP
 - **Skills**：用户级与项目级 skill 目录，按需通过 `load_skill_through_path` 读取
 - **子智能体**：内置 `general-purpose`，另可从 `<workspace>/subagents/*.md` 声明

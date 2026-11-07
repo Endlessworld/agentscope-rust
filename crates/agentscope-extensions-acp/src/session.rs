@@ -531,6 +531,17 @@ async fn cancel_epoch_moved(epoch: &std::sync::atomic::AtomicU64, started: u64) 
     }
 }
 
+/// Whether a prompt is the host-level `/compact` shortcut.
+///
+/// Only an exact, single text block counts: a message that merely mentions `/compact` is a
+/// normal prompt, and a mixed-content prompt (text plus images) is not a command.
+fn is_compact_command(content: &[ContentBlock]) -> bool {
+    match content {
+        [ContentBlock::Text(text)] => text.text.trim().eq_ignore_ascii_case("/compact"),
+        _ => false,
+    }
+}
+
 /// What a turn is started from.
 ///
 /// A prompt carries user content; a wakeup carries none and exists only so the middlewares
@@ -1982,11 +1993,77 @@ impl AcpAgentSession {
     where
         F: Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync,
     {
+        if let Some(stop) = self.run_prompt_shortcut(&content, &emit).await {
+            return stop;
+        }
         let stop = self
             .run_prompt_inner(TurnInput::Prompt(content), emit, cancellation)
             .await;
         self.report_turn_memory(stop);
         stop
+    }
+
+    /// Answers a host-level prompt shortcut without starting a model turn.
+    ///
+    /// `/compact` is the user asking for a compaction, not for an answer: routing it through
+    /// a turn would pay a full model request (compacted history included) just to have the
+    /// middleware do the same work one step later. Returns `None` when the prompt is not a
+    /// shortcut.
+    async fn run_prompt_shortcut<F>(
+        &mut self,
+        content: &[ContentBlock],
+        emit: &F,
+    ) -> Option<StopReason>
+    where
+        F: Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync,
+    {
+        if !is_compact_command(content) {
+            return None;
+        }
+        // Serialize with a running turn: rewriting the history under an in-flight request
+        // would make the model answer from a prefix the client already dropped.
+        let _guard = Arc::clone(&self.prompt_lock).lock_owned().await;
+        let report = match self.agent.compact_now().await {
+            Ok(None) => {
+                "Nothing to compact: context compaction is unavailable in this session or the \
+                 history is empty."
+                    .to_string()
+            }
+            Ok(Some(outcome)) => {
+                let metrics = &outcome.metrics;
+                let shrank = metrics
+                    .after_msg_count
+                    .is_some_and(|after| after < metrics.before_msg_count);
+                if shrank && self.support.supports_compaction() {
+                    // The same capability-gated updates the in-turn path sends: a client that
+                    // renders a compaction card sees the summary once here too, instead of only
+                    // a plain message.
+                    for notification in event::compaction_notifications(
+                        self.session_id.clone(),
+                        &metrics.compaction_id,
+                        &outcome.summary,
+                    ) {
+                        emit(notification);
+                    }
+                }
+                match metrics.after_msg_count {
+                    Some(after) if shrank => format!(
+                        "Context compacted: {} → {} messages (~{} → ~{} tokens).",
+                        metrics.before_msg_count,
+                        after,
+                        metrics.before_token_count,
+                        metrics.after_token_count.unwrap_or(0)
+                    ),
+                    _ => format!(
+                        "Nothing to compact yet: all {} messages fit inside the preserved tail.",
+                        metrics.before_msg_count
+                    ),
+                }
+            }
+            Err(error) => format!("Context compaction failed: {error}"),
+        };
+        emit(event::message_chunk(self.session_id.clone(), report, None));
+        Some(StopReason::EndTurn)
     }
 
     /// Runs a **wakeup turn**: no user input, only the context middlewares inject on a
@@ -2225,6 +2302,9 @@ impl AcpAgentSession {
     where
         F: Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync,
     {
+        if let Some(stop) = self.run_prompt_shortcut(&content, &emit).await {
+            return stop;
+        }
         let stop = self
             .run_prompt_inner(TurnInput::Prompt(content), emit, None)
             .await;

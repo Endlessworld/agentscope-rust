@@ -7,6 +7,7 @@
 //! [`HarnessAgentBuilder`] to configure. For plain ReAct usage without any of the above,
 //! use `ReActAgent::builder()` directly.
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,7 +39,7 @@ use super::distributed_store::DistributedStore;
 use super::gateway::create_completion_callback;
 use super::isolation_scope::IsolationScope;
 use super::mcp::Registrar;
-use super::memory::compaction::{CompactionConfig, ConversationCompactor};
+use super::memory::compaction::{CompactionConfig, CompactionMetrics, ConversationCompactor};
 use super::memory::{
     MemoryConfig, MemoryConsolidator, MemoryFlushManager, ToolResultEvictionConfig,
 };
@@ -71,10 +72,10 @@ use super::workspace::{
     PlanModeManager, WorkspaceIndex, WorkspaceManager, WorkspacePathNormalizer,
 };
 use crate::tool::{
-    AgentListTool, AgentSendTool, AgentSpawnTool, ArtifactDeliveryTool, FilesystemTool,
-    MemoryGetTool, MemorySaveTool, MemorySearchTool, PlanModeHandle, SessionSearchTool,
-    ShellExecuteTool, SubagentEventSink, SubagentExposureSink, TeamTool, WebFetchTool,
-    WebSearchTool,
+    AgentListTool, AgentSendTool, AgentSpawnTool, ArtifactDeliveryTool, CompactContextTool,
+    FilesystemTool, MemoryGetTool, MemorySaveTool, MemorySearchTool, PlanModeHandle,
+    SessionSearchTool, ShellExecuteTool, SubagentEventSink, SubagentExposureSink, TeamTool,
+    WebFetchTool, WebSearchTool,
 };
 
 /// A harness agent that operates on a filesystem with a configured toolkit and middleware chain.
@@ -117,6 +118,11 @@ pub struct HarnessAgent {
     plan_mode_manager: Option<Arc<PlanModeManager>>,
     /// The memory configuration used for the flush/consolidation pipeline.
     memory_config: MemoryConfig,
+    /// Handle a prompt shortcut or the `compact_context` tool sets to request an
+    /// out-of-band compaction (`None` when compaction is disabled).
+    compaction_request: Option<Arc<AtomicBool>>,
+    /// Compactor and config kept so a host can compact without starting a turn.
+    compaction: Option<(Arc<ConversationCompactor>, CompactionConfig)>,
     /// The path normalizer used by filesystem tools (workspace-relative projection).
     path_normalizer: Option<WorkspacePathNormalizer>,
     /// Ordered skill repositories bound to this agent (low-to-high priority).
@@ -233,6 +239,15 @@ impl HarnessAgentHandle {
     }
 }
 
+/// Outcome of a host-initiated compaction (see [`HarnessAgent::compact_now`]).
+///
+/// `metrics` mirrors the `compaction/end` payload; `summary` is the retained summary text,
+/// so a host can render the same `CompactionSummaryChunk` the in-turn path sends.
+pub struct CompactedHistory {
+    pub metrics: CompactionMetrics,
+    pub summary: String,
+}
+
 impl HarnessAgent {
     pub fn builder() -> HarnessAgentBuilder {
         HarnessAgentBuilder::default()
@@ -276,6 +291,93 @@ impl HarnessAgent {
     /// The stable agent id (mirrors Java `agentId`); defaults to `name`.
     pub fn agent_id(&self) -> &str {
         &self.agent_id
+    }
+
+    /// Whether this agent can compact its conversation (a compactor was configured).
+    pub fn can_compact(&self) -> bool {
+        self.compaction.is_some()
+    }
+
+    /// Requests a compaction before the next request, bypassing the token trigger.
+    ///
+    /// The `compact_context` tool sets the same flag from inside a turn; a host sets it for
+    /// a prompt-level shortcut such as `/compact`. Returns `false` when compaction is
+    /// disabled, in which case the request would never be honoured.
+    pub fn request_compaction(&self) -> bool {
+        match &self.compaction_request {
+            Some(request) => {
+                request.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Compacts the live conversation immediately, without starting a turn.
+    ///
+    /// This is the host shortcut path (`/compact`): the summarizer runs right away and the
+    /// caller learns the quantified outcome, instead of paying a model turn just to have the
+    /// middleware do the same work one step later. `Ok(None)` means compaction is disabled
+    /// or the conversation is empty. A returned outcome whose `after_msg_count` equals
+    /// `before_msg_count` means nothing could be compacted (the history fits the tail).
+    pub async fn compact_now(&self) -> agentscope_core::error::Result<Option<CompactedHistory>> {
+        let (Some((compactor, config)), Some(agent)) = (&self.compaction, &self.agent) else {
+            return Ok(None);
+        };
+        let state = agent.state_handle();
+        let (history, system, session_id) = {
+            let guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let history: Vec<Msg> = guard
+                .context()
+                .iter()
+                .filter(|message| message.role != agentscope_core::message::MsgRole::System)
+                .cloned()
+                .collect();
+            let system: Vec<Msg> = guard
+                .context()
+                .iter()
+                .filter(|message| message.role == agentscope_core::message::MsgRole::System)
+                .cloned()
+                .collect();
+            (history, system, guard.session_id().to_string())
+        };
+        if history.is_empty() {
+            return Ok(None);
+        }
+        let usage = crate::agent::context::context_usage(&history, &[], compactor.model_name());
+        let observed = (usage.tokens > 0).then_some(usage.tokens as usize);
+        let mut forced = config.clone();
+        forced.trigger_messages = 1;
+        forced.trigger_tokens = 0;
+        let (replacement, metrics) = compactor
+            .compact_if_needed_with_metrics_observed(
+                history,
+                &forced,
+                &self.agent_id,
+                &session_id,
+                None,
+                observed,
+            )
+            .await?;
+        let summary = replacement
+            .as_ref()
+            .and_then(|messages| messages.first())
+            .map(|message| message.text_content())
+            .unwrap_or_default();
+        if let Some(replacement) = replacement {
+            // The retained tail's usage was produced against the old prefix; the next
+            // request must not anchor on it.
+            let replacement = crate::agent::context::strip_provider_usage(replacement);
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut new_context = system;
+            new_context.extend(replacement);
+            *guard.context_mut() = new_context;
+        }
+        Ok(Some(CompactedHistory { metrics, summary }))
     }
 
     /// The human-readable description forwarded to the embedded ReAct agent.
@@ -2262,15 +2364,23 @@ impl HarnessAgentBuilder {
         // threshold drift, a model switch), the request is compacted and retried
         // instead of surfacing a hard error.
         let mut overflow_compaction: Option<(Arc<ConversationCompactor>, CompactionConfig)> = None;
+        let mut compaction_request: Option<Arc<AtomicBool>> = None;
+        let mut compaction: Option<(Arc<ConversationCompactor>, CompactionConfig)> = None;
         if !self.disable_compaction {
             if let Some(cfg) = self.conversation_compaction_config.clone() {
                 if let Some(model) = self.model.clone() {
                     let compactor = Arc::new(ConversationCompactor::with_model(model));
-                    middleware.add(Box::new(ConversationCompactionMiddleware::new(
+                    let compaction_middleware = ConversationCompactionMiddleware::new(
                         Arc::clone(&compactor),
                         cfg.clone(),
                         name.clone(),
-                    )));
+                    );
+                    // The tool (and a host shortcut) request a compaction through this handle;
+                    // the middleware performs it on the next step so the journal and the
+                    // pending TOOL results stay consistent.
+                    compaction_request = Some(compaction_middleware.request_handle());
+                    middleware.add(Box::new(compaction_middleware));
+                    compaction = Some((Arc::clone(&compactor), cfg.clone()));
                     overflow_compaction = Some((compactor, cfg));
                 }
             }
@@ -2575,6 +2685,13 @@ impl HarnessAgentBuilder {
                 );
             }
             ToolFilter::apply(&toolkit, config);
+        }
+
+        // ---- Out-of-band compaction (`compact_context`) ----
+        // Registered after governance so a `tools.json` allow list cannot make the model's
+        // compaction request unanswerable.
+        if let Some(request) = &compaction_request {
+            toolkit.register_tool(Arc::new(CompactContextTool::new(Arc::clone(request))));
         }
 
         // ---- Meta tool (reset_equipped_tools) ----
@@ -2963,6 +3080,8 @@ impl HarnessAgentBuilder {
             workspace_manager: Some(workspace_manager),
             plan_mode_manager,
             memory_config,
+            compaction_request,
+            compaction,
             path_normalizer,
             skill_repositories: ordered_skill_repos,
             skill_promoter: pending_skill_promoter,
@@ -3116,6 +3235,75 @@ mod tests {
             agent.toolkit().config().execution_config.as_ref(),
             Some(&config)
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn compaction_is_reachable_from_the_tool_and_the_host_shortcut() {
+        let root = temp_root("compaction_request");
+        let agent = HarnessAgent::builder()
+            .name("compaction-agent")
+            .model(Arc::new(NoopModel))
+            .compaction(
+                CompactionConfig::builder()
+                    .trigger_tokens(1_000_000)
+                    .keep_messages(2)
+                    .build(),
+            )
+            .cwd(root.clone())
+            .workspace(root.join("workspace"))
+            .disable_web_tools()
+            .build();
+
+        assert!(agent.can_compact());
+        let tool = agent
+            .toolkit()
+            .get_tool("compact_context")
+            .expect("the compaction tool is registered");
+        assert!(!tool.is_read_only(), "compaction rewrites the history");
+        assert!(agent.request_compaction());
+
+        // An empty conversation has nothing to compact, so the immediate path is a no-op.
+        assert!(agent.compact_now().await.unwrap().is_none());
+
+        let state = agent.agent().expect("embedded agent").state_handle();
+        {
+            let mut guard = state.lock().unwrap();
+            for i in 0..6 {
+                guard.context_mut().push(Msg::user(format!("turn {i}")));
+            }
+        }
+        let metrics = agent
+            .compact_now()
+            .await
+            .unwrap()
+            .expect("a compaction ran");
+        assert_eq!(metrics.metrics.before_msg_count, 6);
+        assert_eq!(
+            metrics.metrics.after_msg_count,
+            Some(3),
+            "summary plus the kept tail"
+        );
+        assert!(
+            metrics.summary.contains("summary"),
+            "the retained summary text is reported: {}",
+            metrics.summary
+        );
+        assert_eq!(state.lock().unwrap().context().len(), 3);
+
+        // Without a compaction config neither entry point pretends to work.
+        let plain = HarnessAgent::builder()
+            .name("plain-agent")
+            .model(Arc::new(NoopModel))
+            .cwd(root.clone())
+            .workspace(root.join("workspace-plain"))
+            .disable_web_tools()
+            .build();
+        assert!(!plain.can_compact());
+        assert!(!plain.request_compaction());
+        assert!(plain.toolkit().get_tool("compact_context").is_none());
+        assert!(plain.compact_now().await.unwrap().is_none());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

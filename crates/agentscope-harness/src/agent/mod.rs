@@ -47,7 +47,7 @@ pub use gateway::{
     SubagentRegistry, TaskCompletionBridge, WakeupDispatcher, WakeupTarget,
 };
 pub use harness_agent::{
-    AgentBuiltCallback, HarnessAgent, HarnessAgentBuilder, HarnessAgentHandle,
+    AgentBuiltCallback, CompactedHistory, HarnessAgent, HarnessAgentBuilder, HarnessAgentHandle,
 };
 pub use isolation_scope::IsolationScope;
 pub use mcp::{

@@ -19,10 +19,11 @@ pub const MODE_ACCEPT_EDITS: &str = "accept_edits";
 pub const MODE_YOLO: &str = "yolo";
 
 /// Tools auto-approved in `accept_edits` mode (file writes + the internal
-/// `todo_write` bookkeeping tool). Everything else that is not read-only
+/// `todo_write` / `compact_context` bookkeeping tools). Everything else that is not read-only
 /// (e.g. the `execute` shell tool) falls through to `Ask` and requires human
 /// confirmation.
-const ACCEPT_EDITS_AUTO_ALLOW_TOOLS: &[&str] = &["write_file", "edit_file", "todo_write"];
+const ACCEPT_EDITS_AUTO_ALLOW_TOOLS: &[&str] =
+    &["write_file", "edit_file", "todo_write", "compact_context"];
 
 /// Tools allowed in `accept_edits` mode whose rule_content matches any input.
 const ACCEPT_EDITS_RULE_SOURCE: &str = "accept_edits-default";

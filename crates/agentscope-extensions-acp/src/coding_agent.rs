@@ -142,6 +142,7 @@ fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessA
             CompactionConfig::builder()
                 .trigger_messages(0)
                 .trigger_tokens(trigger)
+                .keep_messages(25)
                 .build(),
         )
         .max_iters(50)

@@ -1191,7 +1191,7 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
             CompactionConfig::builder()
                 .trigger_messages(0)
                 .trigger_tokens(compaction_trigger)
-                .keep_messages(12)
+                .keep_messages(25)
                 .keep_tokens(-1)
                 .keep_tokens_min(2_000)
                 .keep_tokens_max(8_000)
