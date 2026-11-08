@@ -11,7 +11,6 @@ use agentscope_core::message::{
     ContentBlock, DataBlock, HintBlock, JsonMap, Msg, MsgRole, Source, TextBlock, ThinkingBlock,
     ToolResultBlock,
 };
-
 /// Properties about agent execution.
 ///
 /// Mirrors Java `io.agentscope.core.a2a.server.executor.AgentExecuteProperties`.
@@ -19,6 +18,7 @@ use agentscope_core::message::{
 pub struct AgentExecuteProperties {
     complete_with_message: bool,
     require_inner_message: bool,
+    agent_completion_timeout: Option<std::time::Duration>,
 }
 
 impl AgentExecuteProperties {
@@ -33,6 +33,15 @@ impl AgentExecuteProperties {
     /// Whether inner events (tool progress, tool-result deltas, hints) are exposed to the client.
     pub fn require_inner_message(&self) -> bool {
         self.require_inner_message
+    }
+
+    /// How long a blocking `message/send` waits for the agent's own run to end.
+    ///
+    /// Mirrors Java `AgentExecuteProperties#getAgentCompletionTimeoutSeconds`, which the request
+    /// handler passes to the SDK: a runner whose event stream never ends would otherwise hold the
+    /// request forever. `None` waits as long as the run takes.
+    pub fn agent_completion_timeout(&self) -> Option<std::time::Duration> {
+        self.agent_completion_timeout
     }
 
     /// Returns the Java-style fluent builder.
@@ -58,6 +67,12 @@ impl AgentExecutePropertiesBuilder {
         self
     }
 
+    /// Caps how long a blocking `message/send` waits for the agent's run to end.
+    pub fn agent_completion_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.properties.agent_completion_timeout = Some(timeout);
+        self
+    }
+
     pub fn build(self) -> AgentExecuteProperties {
         self.properties
     }
@@ -76,7 +91,8 @@ impl AgentExecutePropertiesBuilder {
 /// [`AgentRunner`](crate::AgentRunner)s may only produce the message-level result (the default
 /// contract), so this projector falls back to `AGENT_RESULT` when nothing was streamed: the
 /// first `AGENT_RESULT` is projected, and any later one is ignored so a runner that emits both
-/// deltas and a result never duplicates its output.
+/// deltas and a result never duplicates its output. The fallback keeps the whole result (media
+/// and documents included), so an attachment-only answer is not lost.
 #[derive(Debug, Clone)]
 pub struct AgentOutputProjector {
     require_inner_message: bool,
@@ -191,6 +207,14 @@ impl AgentOutputProjector {
         !self.accumulated.is_empty()
     }
 
+    /// Whether the projected output came from the `AGENT_RESULT` fallback.
+    ///
+    /// Such a projection is the whole answer, not a delta, so the artifact carrying it is the
+    /// last chunk of that artifact (Java passes `lastChunk = true` there).
+    pub fn result_projected(&self) -> bool {
+        self.result_projected
+    }
+
     /// Projects an `AGENT_RESULT` payload: its `content` block array becomes one assistant `Msg`.
     fn project_result(&self, data: &agentscope_core::event::EventData) -> Option<Msg> {
         let blocks = data.fields.get("content")?.as_array()?;
@@ -216,10 +240,19 @@ impl AgentOutputProjector {
         )
     }
 
-    /// Block kinds the client may see: text and thinking always, inner blocks on request.
+    /// Block kinds the client may see: text, thinking and media always, inner blocks on request.
+    ///
+    /// A final result may carry a document or an image — an attachment-only answer. Dropping
+    /// those here would lose exactly the answer the fallback exists to deliver
+    /// (`4af86c518`).
     fn exposes(&self, block: &ContentBlock) -> bool {
         match block {
-            ContentBlock::Text(_) | ContentBlock::Thinking(_) => true,
+            ContentBlock::Text(_)
+            | ContentBlock::Thinking(_)
+            | ContentBlock::Image(_)
+            | ContentBlock::Audio(_)
+            | ContentBlock::Video(_)
+            | ContentBlock::Document(_) => true,
             ContentBlock::ToolResult(_) | ContentBlock::Hint(_) => self.require_inner_message,
             _ => false,
         }
@@ -411,6 +444,33 @@ mod tests {
         streamed.project(&delta(AgentEventType::TextBlockDelta, "a"));
         assert!(streamed.project(&result_event("final")).is_none());
         assert_eq!(streamed.accumulated().len(), 1);
+    }
+
+    #[test]
+    fn a_final_result_carrying_only_an_attachment_is_projected() {
+        // 4af86c518: a runner that emits only its final result must not lose the answer.
+        let mut data = EventData::default();
+        data.fields.insert(
+            "msg_id".to_string(),
+            serde_json::Value::String("msg-1".to_string()),
+        );
+        data.fields.insert(
+            "content".to_string(),
+            serde_json::json!([{
+                "type": "document",
+                "id": "doc-1",
+                "name": "report.pdf",
+                "mime_type": "application/pdf",
+                "source": { "type": "url", "url": "https://example.com/report.pdf" },
+            }]),
+        );
+        let mut projector = AgentOutputProjector::new(AgentExecuteProperties::default());
+        let msg = projector
+            .project(&AgentEvent::AgentResult(data))
+            .expect("an attachment-only result is still output");
+        assert!(matches!(msg.content[0], ContentBlock::Document(_)));
+        // The projected result is the whole answer, so the artifact it produces is complete.
+        assert!(projector.result_projected());
     }
 
     #[test]

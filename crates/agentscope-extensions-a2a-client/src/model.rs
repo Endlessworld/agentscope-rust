@@ -308,6 +308,14 @@ impl TaskState {
         )
     }
 
+    /// Whether this state waits for the caller (input or authorization required).
+    ///
+    /// A waiting task is not terminal on the remote agent, but a caller has nothing left to
+    /// wait for: mirrors Java `TaskState#isInterrupted`.
+    pub fn is_interrupted(&self) -> bool {
+        matches!(self, TaskState::InputRequired | TaskState::AuthRequired)
+    }
+
     /// The wire name of this state (`"completed"`, `"input-required"`, ...).
     ///
     /// The names match the A2A protocol values this enum serializes to, so diagnostics built

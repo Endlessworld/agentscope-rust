@@ -13,9 +13,12 @@
 //!   never win) — for status updates Java synthesizes `A2A task ended with state: <state>`.
 
 use agentscope_core::message::Msg;
+use serde_json::Value;
 
 use crate::message::{MessageConstants, MessageConvert};
-use crate::model::{Artifact, Part, StreamEvent, Task, TaskState, TaskStatusUpdateEvent};
+use crate::model::{
+    Artifact, Part, StreamEvent, Task, TaskState, TaskStatus, TaskStatusUpdateEvent,
+};
 
 /// Whether a task carries output artifacts, mirroring Java's
 /// `task.artifacts() != null && !task.artifacts().isEmpty()`.
@@ -25,9 +28,14 @@ fn has_artifacts(artifacts: &[Artifact]) -> bool {
 
 /// Terminal reply of a `Task` payload, mirroring Java `TaskEventHandler#handle`.
 ///
-/// Returns `None` while the task is not terminal: the caller keeps waiting for more events.
+/// Returns `None` while the task is not terminal: the caller keeps waiting for more events. A
+/// task that waits for the caller (input or authorization required) is not terminal either, but
+/// it answers with a waiting message instead of leaving the call open (`035153a47`).
 pub fn task_result_message(task: &Task, agent_name: &str) -> Option<Msg> {
     let status = &task.status;
+    if status.state.is_interrupted() {
+        return Some(waiting_task_message(&task.id, status, agent_name));
+    }
     if !status.state.is_terminal() {
         return None;
     }
@@ -49,16 +57,25 @@ pub fn task_result_message(task: &Task, agent_name: &str) -> Option<Msg> {
 /// `TaskUpdateEventHandler.TaskStatusUpdateEventHandler#handle`.
 ///
 /// `artifacts` are the artifacts accumulated so far (Java reads `context.getTask().artifacts()`).
-/// Returns `None` while the update is not final.
+/// Returns `None` while the update is not final, and a waiting message when it parks the task
+/// for the caller.
 pub fn status_update_result_message(
     update: &TaskStatusUpdateEvent,
     artifacts: &[Artifact],
     agent_name: &str,
 ) -> Option<Msg> {
+    let state = update.status.state;
+    if state.is_interrupted() {
+        // The stream may stay open while the task waits, so the call ends here.
+        return Some(waiting_task_message(
+            &update.task_id,
+            &update.status,
+            agent_name,
+        ));
+    }
     if !update.is_final {
         return None;
     }
-    let state = update.status.state;
     if state != TaskState::Completed {
         // Java: "A2A task ended with state: " + state [+ ", message: " + status text].
         let mut text = format!("A2A task ended with state: {}", state.as_str());
@@ -76,6 +93,34 @@ pub fn status_update_result_message(
     Some(MessageConvert::convert_from_artifacts(
         artifacts, agent_name,
     ))
+}
+
+/// Reply of a task that waits for the caller (input or authorization required).
+///
+/// The task stays open on the remote agent, so the reply carries its id and state: a caller can
+/// continue that task instead of polling a task that will never finish on its own. Mirrors Java
+/// `TaskEventHandler#completeWaiting`.
+pub fn waiting_task_message(task_id: &str, status: &TaskStatus, agent_name: &str) -> Msg {
+    let mut msg = match &status.message {
+        Some(message) => MessageConvert::convert_from_message(message, agent_name),
+        None => Msg::builder()
+            .name(agent_name)
+            .role(agentscope_core::message::MsgRole::Assistant)
+            .text_content(format!(
+                "A2A task {task_id} is waiting in state {}.",
+                status.state.as_str()
+            ))
+            .build(),
+    };
+    msg.metadata.insert(
+        MessageConstants::TASK_ID_METADATA_KEY.to_string(),
+        Value::String(task_id.to_string()),
+    );
+    msg.metadata.insert(
+        MessageConstants::TASK_STATE_METADATA_KEY.to_string(),
+        Value::String(status.state.as_str().to_string()),
+    );
+    msg
 }
 
 /// Folds `message/stream` events into the terminal reply of one call.
@@ -243,6 +288,59 @@ mod tests {
     fn non_terminal_tasks_have_no_reply_yet() {
         let task = Task::new("t-1", TaskStatus::new(TaskState::Working));
         assert!(task_result_message(&task, "remote").is_none());
+    }
+
+    // Java 035153a47: a task that waits for the caller ends the call instead of hanging on it.
+    #[test]
+    fn an_input_required_task_answers_with_the_waiting_message() {
+        let mut status = TaskStatus::new(TaskState::InputRequired);
+        status.message = Some(status_message("which date?"));
+        let task = Task::new("t-1", status);
+
+        let msg = task_result_message(&task, "remote").expect("a waiting task yields a reply");
+        assert_eq!(msg.text_content(), "which date?");
+        assert_eq!(
+            msg.metadata[MessageConstants::TASK_ID_METADATA_KEY],
+            Value::String("t-1".to_string())
+        );
+        assert_eq!(
+            msg.metadata[MessageConstants::TASK_STATE_METADATA_KEY],
+            Value::String("input-required".to_string())
+        );
+    }
+
+    #[test]
+    fn an_authorization_required_task_without_a_message_is_described() {
+        let task = Task::new("t-2", TaskStatus::new(TaskState::AuthRequired));
+        let msg = task_result_message(&task, "remote").expect("a waiting task yields a reply");
+        assert_eq!(
+            msg.text_content(),
+            "A2A task t-2 is waiting in state auth-required."
+        );
+        assert_eq!(msg.name.as_deref(), Some("remote"));
+        assert_eq!(
+            msg.metadata[MessageConstants::TASK_STATE_METADATA_KEY],
+            Value::String("auth-required".to_string())
+        );
+    }
+
+    // Java TaskUpdateEventHandler: the stream may stay open while the task waits.
+    #[test]
+    fn a_waiting_status_update_ends_the_call() {
+        let mut status = TaskStatus::new(TaskState::InputRequired);
+        status.message = Some(status_message("pick one"));
+        let update = TaskStatusUpdateEvent::new("t-1", status, false);
+        assert!(!update.is_final);
+
+        let mut accumulator = TaskResultAccumulator::new();
+        let reply = accumulator
+            .observe(&StreamEvent::StatusUpdate(update), "remote")
+            .expect("a waiting update ends the call");
+        assert_eq!(reply.text_content(), "pick one");
+        assert_eq!(
+            reply.metadata[MessageConstants::TASK_ID_METADATA_KEY],
+            Value::String("t-1".to_string())
+        );
     }
 
     // Java: 00e4a66b6 — a completed status update without artifacts keeps its status message.

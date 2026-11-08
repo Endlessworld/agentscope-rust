@@ -212,6 +212,61 @@ impl crate::card::AgentDescriptor for RunnerDescriptor<'_> {
 pub struct A2aTaskRegistry {
     tasks: Mutex<HashMap<String, Task>>,
     event_logs: Mutex<HashMap<String, Arc<TaskEventLog>>>,
+    cancel_signals: Mutex<HashMap<String, Arc<CancelSignal>>>,
+}
+
+/// Tells the run of a task that the task was cancelled.
+///
+/// Java's executor holds a `Sinks.Empty<Void>` per running task and ends the pipeline with
+/// `takeUntilOther`: cancelling the subscription alone would leave the request waiting for a
+/// terminal signal that never comes (`81b109c95`). The signal is sticky, so a cancel that
+/// arrives before the run starts polling is not lost.
+pub struct CancelSignal {
+    sender: tokio::sync::watch::Sender<bool>,
+}
+
+impl std::fmt::Debug for CancelSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelSignal")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl Default for CancelSignal {
+    fn default() -> Self {
+        Self {
+            sender: tokio::sync::watch::channel(false).0,
+        }
+    }
+}
+
+impl CancelSignal {
+    /// Marks the run cancelled and wakes the subscribers.
+    pub fn cancel(&self) {
+        // `send` drops the value when no receiver is subscribed yet, so a cancel that arrives
+        // before the relay polls `wait` would be invisible for ever and the relay would hang.
+        self.sender.send_replace(true);
+    }
+
+    /// Whether the run was cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    /// Completes once the run was cancelled, including a cancel that happened earlier.
+    async fn wait(&self) {
+        let mut receiver = self.sender.subscribe();
+        loop {
+            let cancelled = *receiver.borrow_and_update();
+            if cancelled {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 impl A2aTaskRegistry {
@@ -222,6 +277,7 @@ impl A2aTaskRegistry {
     /// Stores or replaces a task, forgetting the events of a previous run of the same id.
     pub fn put(&self, task: Task) {
         self.event_logs.lock().unwrap().remove(&task.id);
+        self.cancel_signals.lock().unwrap().remove(&task.id);
         self.tasks.lock().unwrap().insert(task.id.clone(), task);
     }
 
@@ -247,13 +303,31 @@ impl A2aTaskRegistry {
     }
 
     /// Cancels a task, mirroring `TaskUpdater#cancel` (never downgrades a terminal task).
+    ///
+    /// Cancelling a live task also ends its run: the streaming handler stops relaying events
+    /// instead of completing a task the caller already cancelled.
     pub fn cancel(&self, task_id: &str) -> Option<Task> {
         let mut guard = self.tasks.lock().unwrap();
         let task = guard.get_mut(task_id)?;
-        if !task.status.state.is_terminal() {
-            task.status = TaskStatus::new(TaskState::Canceled);
+        if task.status.state.is_terminal() {
+            return Some(task.clone());
         }
-        Some(task.clone())
+        task.status = TaskStatus::new(TaskState::Canceled);
+        drop(guard);
+        self.cancel_signal(task_id).cancel();
+        self.get(task_id)
+    }
+
+    /// The cancellation signal of `task_id`, created on demand.
+    ///
+    /// Created before the run opens its stream so a cancel arriving in between is still seen.
+    pub fn cancel_signal(&self, task_id: &str) -> Arc<CancelSignal> {
+        self.cancel_signals
+            .lock()
+            .unwrap()
+            .entry(task_id.to_string())
+            .or_default()
+            .clone()
     }
 
     /// The event log of `task_id`, created on demand for a task that exists.
@@ -937,10 +1011,59 @@ impl A2aRequestHandler {
         )
         .await?;
         let mut projector = AgentOutputProjector::new(self.execute_properties);
-        while let Some(event) = futures::StreamExt::next(&mut events).await {
-            let event = event
-                .map_err(|e| JsonRpcError::new(JsonRpcError::INTERNAL_ERROR, e.to_string()))?;
-            record_artifact_if_any(&self.registry, &task_id, &mut projector, &event);
+        // Opened right after the task is recorded, so a `CancelTask` racing the start is seen.
+        let cancel = self.registry.cancel_signal(&task_id);
+        let drain = async {
+            loop {
+                // `CancelTask` ends a blocking request too (Java `takeUntilOther` on the
+                // blocking pipeline): completing the task here would overwrite the cancelled
+                // state the caller already received.
+                let next = tokio::select! {
+                    biased;
+                    _ = cancel.wait() => None,
+                    item = futures::StreamExt::next(&mut events) => Some(item),
+                };
+                let event = match next {
+                    // Cancelled, or the stream ended: either way nothing more is recorded.
+                    None | Some(None) => break,
+                    Some(Some(event)) => event,
+                };
+                let event = event
+                    .map_err(|e| JsonRpcError::new(JsonRpcError::INTERNAL_ERROR, e.to_string()))?;
+                record_artifact_if_any(&self.registry, &task_id, &mut projector, &event);
+            }
+            Ok::<(), JsonRpcError>(())
+        };
+        // A runner whose event stream never ends would otherwise hold the request forever.
+        if let Some(timeout) = self.execute_properties.agent_completion_timeout() {
+            if tokio::time::timeout(timeout, drain).await.is_err() {
+                self.runner.stop(&task_id);
+                let message = format!("the agent did not finish within {timeout:?}");
+                let status = TaskStatus {
+                    state: TaskState::Failed,
+                    message: Some(Message::new(
+                        uuid::Uuid::new_v4().to_string(),
+                        MessageRole::Agent,
+                        vec![Part::text(message.clone())],
+                    )),
+                    timestamp: None,
+                };
+                let _ = self.registry.update_status(&task_id, status.clone());
+                self.close_task_events(&task_id, status, Some(&context_id));
+                return Err(JsonRpcError::new(JsonRpcError::INTERNAL_ERROR, message));
+            }
+        } else {
+            drain.await?;
+        }
+
+        if cancel.is_cancelled() {
+            // `CancelTask` already recorded the terminal state and closed the log, so the reply
+            // is that task rather than a `completed` one. Java ends the blocking pipeline the
+            // same way, before its handler completes the task.
+            return self
+                .registry
+                .get(&task_id)
+                .ok_or_else(|| JsonRpcError::new(JsonRpcError::TASK_NOT_FOUND, "task vanished"));
         }
 
         let compacted = projector.compacted();
@@ -975,11 +1098,13 @@ impl A2aRequestHandler {
     /// `tasks/cancel`.
     fn tasks_cancel(&self, request: &JsonRpcRequest) -> Result<serde_json::Value, JsonRpcError> {
         let params: TaskIdParams = parse_params(request)?;
+        // Record the terminal state and signal the run *before* interrupting it (Java:
+        // `emitter.cancel()` then `agentRunner.stop`), so a run that ends because of the
+        // interrupt cannot complete the task first and turn the cancel into a no-op.
+        let task = self.registry.cancel(&params.id);
         self.runner.stop(&params.id);
-        let task = self
-            .registry
-            .cancel(&params.id)
-            .ok_or_else(|| JsonRpcError::new(JsonRpcError::TASK_NOT_FOUND, "task not found"))?;
+        let task =
+            task.ok_or_else(|| JsonRpcError::new(JsonRpcError::TASK_NOT_FOUND, "task not found"))?;
         // A cancelled task keeps no live run to follow, so its subscribers learn the terminal
         // state through the event log instead of waiting for an update that will never come.
         if task.status.state == TaskState::Canceled {
@@ -1200,7 +1325,9 @@ fn record_artifact_if_any(
             artifact,
         );
         update.append = Some(true);
-        update.last_chunk = Some(false);
+        // A projected `AGENT_RESULT` is the whole answer rather than a delta, so its artifact is
+        // already complete (Java `addArtifact(finalResult, parts, true)`).
+        update.last_chunk = Some(projector.result_projected());
         if let Ok(value) = serde_json::to_value(&update) {
             registry.publish_event(task_id, value);
         }
@@ -1228,6 +1355,8 @@ enum StreamPhase {
         projector: AgentOutputProjector,
         task_id: String,
         context_id: String,
+        /// Fires when `CancelTask` ends this run, which may be before the agent stops.
+        cancel: Arc<CancelSignal>,
     },
     /// The run finished; one final item was already emitted.
     Done,
@@ -1345,6 +1474,16 @@ async fn next_stream_item(mut state: StreamState) -> Option<(JsonRpcResponse, St
                 .await
                 {
                     Ok((task_id, context_id, events)) => {
+                        // Opened before the first frame, so a cancel racing the start is seen.
+                        let cancel = state.registry.cancel_signal(&task_id);
+                        if cancel.is_cancelled() {
+                            // `CancelTask` arrived while the run was opening: the terminal state
+                            // it recorded must not be undone by the `working` update below.
+                            let _ = state.registry.cancel(&task_id);
+                            state.registry.close_events(&task_id);
+                            state.phase = StreamPhase::Done;
+                            continue;
+                        }
                         let mut status = TaskStatus::new(TaskState::Working);
                         status.timestamp = None;
                         let mut event =
@@ -1360,6 +1499,7 @@ async fn next_stream_item(mut state: StreamState) -> Option<(JsonRpcResponse, St
                             projector: AgentOutputProjector::new(state.execute_properties),
                             task_id,
                             context_id,
+                            cancel,
                         };
                     }
                     Err(error) => {
@@ -1372,38 +1512,53 @@ async fn next_stream_item(mut state: StreamState) -> Option<(JsonRpcResponse, St
                 mut projector,
                 task_id,
                 context_id,
-            } => match futures::StreamExt::next(&mut events).await {
-                Some(Ok(event)) => {
-                    if let Some(msg) = projector.project(&event) {
-                        let parts = ServerMessageConvert::convert_from_content_blocks(&msg, false);
-                        if !parts.is_empty() {
-                            let artifact = Artifact::new(task_id.clone(), parts);
-                            state.registry.add_artifact(&task_id, artifact.clone());
-                            let mut update =
-                                agentscope_extensions_a2a_client::model::TaskArtifactUpdateEvent::new(
-                                    task_id.clone(),
-                                    artifact,
-                                );
-                            update.context_id = Some(context_id.clone());
-                            update.append = Some(true);
-                            update.last_chunk = Some(false);
-                            state.push_task_event(&task_id, &update);
+                cancel,
+            } => {
+                // `CancelTask` must end the execution even when the agent keeps producing: the
+                // signal wins the race against the next event (Java `takeUntilOther`).
+                let next = tokio::select! {
+                    biased;
+                    _ = cancel.wait() => None,
+                    item = futures::StreamExt::next(&mut events) => Some(item),
+                };
+                match next {
+                    // The task is already recorded as cancelled and its event log is closed, so
+                    // the relay only has to stop: completing it here would overwrite that state.
+                    None => state.phase = StreamPhase::Done,
+                    Some(Some(Ok(event))) => {
+                        if let Some(msg) = projector.project(&event) {
+                            let parts =
+                                ServerMessageConvert::convert_from_content_blocks(&msg, false);
+                            if !parts.is_empty() {
+                                let artifact = Artifact::new(task_id.clone(), parts);
+                                state.registry.add_artifact(&task_id, artifact.clone());
+                                let mut update =
+                                    agentscope_extensions_a2a_client::model::TaskArtifactUpdateEvent::new(
+                                        task_id.clone(),
+                                        artifact,
+                                    );
+                                update.context_id = Some(context_id.clone());
+                                update.append = Some(true);
+                                update.last_chunk = Some(projector.result_projected());
+                                state.push_task_event(&task_id, &update);
+                            }
                         }
+                        state.phase = StreamPhase::Running {
+                            events,
+                            projector,
+                            task_id,
+                            context_id,
+                            cancel,
+                        };
                     }
-                    state.phase = StreamPhase::Running {
-                        events,
-                        projector,
-                        task_id,
-                        context_id,
-                    };
+                    Some(Some(Err(error))) => {
+                        state.finish_failed(task_id, context_id, &error.to_string());
+                    }
+                    Some(None) => {
+                        state.finish_succeeded(task_id, context_id, projector);
+                    }
                 }
-                Some(Err(error)) => {
-                    state.finish_failed(task_id, context_id, &error.to_string());
-                }
-                None => {
-                    state.finish_succeeded(task_id, context_id, projector);
-                }
-            },
+            }
             StreamPhase::Resubscribe {
                 task_id,
                 cursor,
@@ -2212,11 +2367,13 @@ mod tests {
         assert!(!first.is_final);
         assert_eq!(first.status.state, TaskState::Working);
 
-        // 2. the agent output arrives as artifact updates.
+        // 2. the agent output arrives as artifact updates. `EchoRunner` only emits
+        //    `AGENT_RESULT`, so the projected artifact is the whole answer (Java
+        //    `addArtifact(finalResult, parts, true)`).
         let artifact: agentscope_extensions_a2a_client::model::TaskArtifactUpdateEvent =
             serde_json::from_value(events[1].clone()).unwrap();
         assert_eq!(artifact.append, Some(true));
-        assert_eq!(artifact.last_chunk, Some(false));
+        assert_eq!(artifact.last_chunk, Some(true));
 
         // 3. the run ends with the final `completed` status update.
         let last: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
@@ -2556,6 +2713,190 @@ mod tests {
         assert_eq!(completed.status.state, TaskState::Completed);
         let again = handler.registry().cancel("t-1").unwrap();
         assert_eq!(again.status.state, TaskState::Completed);
+    }
+
+    /// Runner that emits one delta and then never finishes, so only a cancel can end the relay.
+    struct HangingRunner {
+        stopped: Mutex<Vec<String>>,
+    }
+
+    impl HangingRunner {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                stopped: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn stopped(&self) -> Vec<String> {
+            self.stopped.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRunner for HangingRunner {
+        fn agent_name(&self) -> String {
+            "hanging".to_string()
+        }
+
+        fn agent_description(&self) -> String {
+            "never finishes on its own".to_string()
+        }
+
+        async fn stream_events(
+            &self,
+            _request_messages: Vec<Msg>,
+            _options: AgentRequestOptions,
+        ) -> Result<Vec<AgentEvent>, A2aError> {
+            Ok(vec![text_delta("partial")])
+        }
+
+        fn stream_events_incremental(
+            &self,
+            _request_messages: Vec<Msg>,
+            _options: AgentRequestOptions,
+        ) -> Option<BoxStream<'static, Result<AgentEvent, A2aError>>> {
+            Some(Box::pin(futures::StreamExt::chain(
+                futures::stream::iter(vec![Ok(text_delta("partial"))]),
+                futures::stream::pending::<Result<AgentEvent, A2aError>>(),
+            )))
+        }
+
+        fn stop(&self, task_id: &str) {
+            self.stopped.lock().unwrap().push(task_id.to_string());
+        }
+    }
+
+    fn stream_request(message: Message) -> JsonRpcRequest {
+        let params = MessageSendParams {
+            message,
+            configuration: None,
+            metadata: None,
+        };
+        JsonRpcRequest::new(
+            methods::MESSAGE_STREAM,
+            Some(serde_json::to_value(params).unwrap()),
+            None,
+        )
+    }
+
+    fn task_message(task_id: &str) -> Message {
+        let mut message = Message::new("m1", MessageRole::User, vec![Part::text("ping")]);
+        message.task_id = Some(task_id.to_string());
+        message
+    }
+
+    // 81b109c95: cancelling a task ends its execution instead of letting the relay finish it
+    // with a `completed` status.
+    #[tokio::test]
+    async fn cancelling_a_running_task_ends_the_relay() {
+        use futures::StreamExt;
+
+        let runner = HangingRunner::new();
+        let handler = A2aRequestHandler::new(
+            runner.clone(),
+            AgentCard::new("hanging", "http://localhost"),
+            registry(),
+        );
+        let mut stream = handler
+            .stream_responses(&stream_request(task_message("t-1")))
+            .unwrap();
+
+        // `working`, then the one artifact the runner emits before it goes quiet.
+        assert!(stream.next().await.is_some());
+        let artifact = stream.next().await.unwrap();
+        let artifact: agentscope_extensions_a2a_client::model::TaskArtifactUpdateEvent =
+            serde_json::from_value(artifact.result.unwrap()).unwrap();
+        assert_eq!(artifact.append, Some(true));
+
+        let canceled = handler
+            .handle(&JsonRpcRequest::new(
+                methods::TASKS_CANCEL,
+                Some(serde_json::json!({"id": "t-1"})),
+                None,
+            ))
+            .await;
+        assert!(canceled.error.is_none(), "{:?}", canceled.error);
+
+        // The relay ends without publishing anything else: completing the task here would
+        // overwrite the cancelled state the caller already received.
+        assert!(stream.next().await.is_none());
+        let task = handler.registry().get("t-1").unwrap();
+        assert_eq!(task.status.state, TaskState::Canceled);
+        assert_eq!(runner.stopped(), vec!["t-1".to_string()]);
+    }
+
+    // 81b109c95: a blocking request must not wait for ever on a run that never ends.
+    #[tokio::test]
+    async fn a_blocking_send_honours_the_completion_timeout() {
+        let runner = HangingRunner::new();
+        let handler = A2aRequestHandler::new_with_properties(
+            runner.clone(),
+            AgentCard::new("hanging", "http://localhost"),
+            registry(),
+            AgentExecuteProperties::builder()
+                .agent_completion_timeout(std::time::Duration::from_millis(50))
+                .build(),
+        );
+
+        let response = handler.handle(&send_request(task_message("t-1"))).await;
+        let error = response.error.expect("the request times out");
+        assert_eq!(error.code, JsonRpcError::INTERNAL_ERROR);
+        assert!(
+            error.message.contains("did not finish"),
+            "{}",
+            error.message
+        );
+
+        let task = handler.registry().get("t-1").unwrap();
+        assert_eq!(task.status.state, TaskState::Failed);
+        assert_eq!(runner.stopped(), vec!["t-1".to_string()]);
+    }
+
+    // 81b109c95: `CancelTask` ends a blocking `SendMessage` too, instead of letting the handler
+    // overwrite the cancelled task with `completed` once the interrupted agent stops.
+    #[tokio::test]
+    async fn cancelling_a_blocking_send_keeps_the_task_cancelled() {
+        let runner = HangingRunner::new();
+        let handler = Arc::new(A2aRequestHandler::new(
+            runner.clone(),
+            AgentCard::new("hanging", "http://localhost"),
+            registry(),
+        ));
+
+        let call = {
+            let handler = handler.clone();
+            tokio::spawn(async move { handler.handle(&send_request(task_message("t-1"))).await })
+        };
+
+        // The run is recorded before it starts draining, so this is the point a cancel can hit.
+        let mut started = false;
+        for _ in 0..200 {
+            if handler.registry().get("t-1").is_some() {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(started, "the blocking run must be recorded");
+
+        let canceled = handler
+            .handle(&JsonRpcRequest::new(
+                methods::TASKS_CANCEL,
+                Some(serde_json::json!({"id": "t-1"})),
+                None,
+            ))
+            .await;
+        assert!(canceled.error.is_none(), "{:?}", canceled.error);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .expect("the cancel must release the blocking request")
+            .expect("the request task must not panic");
+        assert!(response.error.is_none(), "{:?}", response.error);
+
+        let task = handler.registry().get("t-1").unwrap();
+        assert_eq!(task.status.state, TaskState::Canceled);
+        assert_eq!(runner.stopped(), vec!["t-1".to_string()]);
     }
 
     #[test]

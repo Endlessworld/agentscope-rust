@@ -26,7 +26,9 @@ pub use card::{AgentCardResolver, FixedAgentCardResolver, WellKnownAgentCardReso
 pub use error::{A2aError, A2aResult};
 pub use message::{MessageConstants, MessageConvert};
 pub use model::*;
-pub use result::{status_update_result_message, task_result_message, TaskResultAccumulator};
+pub use result::{
+    status_update_result_message, task_result_message, waiting_task_message, TaskResultAccumulator,
+};
 pub use transport_properties::{
     format_host_for_url, TransportProperties, TransportPropertiesBuilder,
 };

@@ -59,6 +59,17 @@ pub trait TaskAgent: Send + Sync {
 
     /// Interrupts the run, mirroring Java `ReActAgent#interrupt()`.
     fn interrupt(&self);
+
+    /// Interrupts the run of `session_id` only, mirroring Java `ReActAgent#interrupt(RuntimeContext)`.
+    ///
+    /// A factory may hand out one agent for several tasks, and the no-argument interrupt would
+    /// then stop whichever call is in flight — possibly another caller's. The default has no
+    /// session scope, so it interrupts the whole agent; returns whether it matched.
+    fn interrupt_session(&self, session_id: &str) -> bool {
+        let _ = session_id;
+        self.interrupt();
+        true
+    }
 }
 
 impl TaskAgent for ReActAgent {
@@ -86,6 +97,10 @@ impl TaskAgent for ReActAgent {
 
     fn interrupt(&self) {
         ReActAgent::interrupt(self);
+    }
+
+    fn interrupt_session(&self, session_id: &str) -> bool {
+        ReActAgent::interrupt_session(self, session_id)
     }
 }
 
@@ -120,7 +135,7 @@ pub trait TaskAgentFactory: Send + Sync {
 /// started again with the same id) never evicts its replacement — the race fixed in Java
 /// `431031a7a`.
 struct CacheGuard {
-    agents: Arc<Mutex<HashMap<String, Arc<dyn TaskAgent>>>>,
+    agents: Arc<Mutex<HashMap<String, CachedAgent>>>,
     task_id: String,
     agent: Arc<dyn TaskAgent>,
 }
@@ -130,7 +145,7 @@ impl Drop for CacheGuard {
         if let Ok(mut agents) = self.agents.lock() {
             let owns_entry = agents
                 .get(&self.task_id)
-                .map(|current| Arc::ptr_eq(current, &self.agent))
+                .map(|current| Arc::ptr_eq(&current.agent, &self.agent))
                 .unwrap_or(false);
             if owns_entry {
                 agents.remove(&self.task_id);
@@ -139,10 +154,20 @@ impl Drop for CacheGuard {
     }
 }
 
+/// One cached agent plus the session scope its task runs in.
+///
+/// The scope is what [`AgentRunner::stop`] interrupts, mirroring Java's
+/// `RunningTask(agent, context)`: interrupting the whole agent would also stop a run of another
+/// session that shares the instance (`6b699f3ae`).
+struct CachedAgent {
+    agent: Arc<dyn TaskAgent>,
+    session_id: Option<String>,
+}
+
 /// Runner that keeps one agent per `taskId`, mirroring Java `BaseReActAgentRunner`.
 pub struct BaseReActAgentRunner<F: TaskAgentFactory> {
     factory: F,
-    agents: Arc<Mutex<HashMap<String, Arc<dyn TaskAgent>>>>,
+    agents: Arc<Mutex<HashMap<String, CachedAgent>>>,
 }
 
 impl<F: TaskAgentFactory> fmt::Debug for BaseReActAgentRunner<F> {
@@ -187,7 +212,11 @@ impl<F: TaskAgentFactory> BaseReActAgentRunner<F> {
     /// duplicate when another start won the race. Building outside the lock keeps a slow factory
     /// from serializing every task, and re-checking under the lock keeps the per-task slot
     /// exclusive (the fix from Java `431031a7a`).
-    fn register(&self, task_id: &str) -> Result<Arc<dyn TaskAgent>, A2aError> {
+    fn register(
+        &self,
+        task_id: &str,
+        session_id: Option<String>,
+    ) -> Result<Arc<dyn TaskAgent>, A2aError> {
         if self.is_cached(task_id) {
             return Err(already_started(task_id));
         }
@@ -199,7 +228,13 @@ impl<F: TaskAgentFactory> BaseReActAgentRunner<F> {
         if agents.contains_key(task_id) {
             return Err(already_started(task_id));
         }
-        agents.insert(task_id.to_string(), agent.clone());
+        agents.insert(
+            task_id.to_string(),
+            CachedAgent {
+                agent: agent.clone(),
+                session_id: session_id.filter(|id| !id.trim().is_empty()),
+            },
+        );
         Ok(agent)
     }
 
@@ -228,7 +263,7 @@ impl<F: TaskAgentFactory + 'static> AgentRunner for BaseReActAgentRunner<F> {
         options: AgentRequestOptions,
     ) -> Result<Vec<AgentEvent>, A2aError> {
         let task_id = required_task_id(&options)?;
-        let agent = self.register(&task_id)?;
+        let agent = self.register(&task_id, session_of(&options))?;
         // Dropped on every exit path below, including an erroring event stream.
         let _guard = self.guard(&task_id, &agent);
         apply_identity(&agent, &options);
@@ -248,7 +283,7 @@ impl<F: TaskAgentFactory + 'static> AgentRunner for BaseReActAgentRunner<F> {
         // Without a task id there is nothing to cache, so let the server fall back to the
         // buffered contract, which reports the missing id as an error.
         let task_id = options.task_id().map(str::to_string)?;
-        match self.register(&task_id) {
+        match self.register(&task_id, session_of(&options)) {
             Ok(agent) => {
                 let guard = self.guard(&task_id, &agent);
                 apply_identity(&agent, &options);
@@ -267,15 +302,31 @@ impl<F: TaskAgentFactory + 'static> AgentRunner for BaseReActAgentRunner<F> {
 
     fn stop(&self, task_id: &str) {
         // Java removes before interrupting so a concurrent `stop` cannot interrupt twice.
-        let agent = self
+        let task = self
             .agents
             .lock()
             .ok()
             .and_then(|mut agents| agents.remove(task_id));
-        if let Some(agent) = agent {
-            agent.interrupt();
+        let Some(task) = task else {
+            return;
+        };
+        // Interrupt the session the task runs in: the no-argument interrupt targets whatever call
+        // is in flight, which may belong to another session of a shared agent.
+        match task.session_id.as_deref() {
+            Some(session_id) => {
+                task.agent.interrupt_session(session_id);
+            }
+            None => task.agent.interrupt(),
         }
     }
+}
+
+/// The session scope of one request, or `None` when the caller sent none.
+fn session_of(options: &AgentRequestOptions) -> Option<String> {
+    options
+        .session_id()
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
 }
 
 /// Writes the per-call identity into the agent state before the run starts, so per-user state
@@ -470,6 +521,15 @@ mod tests {
                 .unwrap()
                 .push(self.id.clone());
         }
+
+        fn interrupt_session(&self, session_id: &str) -> bool {
+            self.recorder
+                .interrupted
+                .lock()
+                .unwrap()
+                .push(format!("{}:{session_id}", self.id));
+            true
+        }
     }
 
     /// Factory handing out fresh [`FakeAgent`]s (`a0`, `a1`, ...) and recording every build.
@@ -602,6 +662,43 @@ mod tests {
         assert!(pending.is_cached("t3"));
         drop(stream);
         assert!(!pending.is_cached("t3"));
+    }
+
+    // Java 6b699f3ae: `stop` interrupts the session the task runs in, not the whole agent.
+    #[test]
+    fn stop_interrupts_the_session_of_the_task() {
+        let recorder = Arc::new(Recorder::default());
+        let runner =
+            BaseReActAgentRunner::new(FakeFactory::new(recorder.clone(), FakeOutcome::Pending));
+        let scoped = |task_id: &str, session_id: &str| {
+            AgentRequestOptions::new()
+                .with_task_id(task_id)
+                .with_session_id(session_id)
+        };
+
+        let first = rt().block_on(async {
+            let mut stream = runner
+                .stream_events_incremental(vec![Msg::user("one")], scoped("t1", "s1"))
+                .expect("incremental stream");
+            assert!(stream.next().await.is_some());
+            stream
+        });
+        let second = rt().block_on(async {
+            let mut stream = runner
+                .stream_events_incremental(vec![Msg::user("two")], scoped("t2", "s2"))
+                .expect("incremental stream");
+            assert!(stream.next().await.is_some());
+            stream
+        });
+
+        runner.stop("t1");
+
+        assert_eq!(recorder.interrupted(), vec!["a0:s1".to_string()]);
+        assert!(!runner.is_cached("t1"));
+        assert!(runner.is_cached("t2"));
+
+        drop(first);
+        drop(second);
     }
 
     // Java: `ConcurrentHashMap` keyed by taskId — two live runs never share an agent.
@@ -838,10 +935,10 @@ mod tests {
 
         rt().block_on(async {
             let mut first = handler
-                .stream_responses(&stream_request("t1"))
+                .stream_responses(&stream_request_in_context("t1", Some("c1")))
                 .expect("streaming request");
             let second = handler
-                .stream_responses(&stream_request("t2"))
+                .stream_responses(&stream_request_in_context("t2", Some("c2")))
                 .expect("streaming request");
             assert!(
                 first.next().await.is_some(),
@@ -859,7 +956,8 @@ mod tests {
             let response = handler.handle(&cancel).await;
             assert!(response.error.is_none(), "cancel is served: {response:?}");
 
-            assert_eq!(recorder.interrupted(), vec!["a0"]);
+            // `6b699f3ae`: the interrupt is scoped to the session of the cancelled task.
+            assert_eq!(recorder.interrupted(), vec!["a0:c1"]);
             assert!(!runner.is_cached("t1"));
             assert!(runner.is_cached("t2"));
             drop(first);
@@ -868,8 +966,13 @@ mod tests {
     }
 
     fn stream_request(task_id: &str) -> JsonRpcRequest {
+        stream_request_in_context(task_id, None)
+    }
+
+    fn stream_request_in_context(task_id: &str, context_id: Option<&str>) -> JsonRpcRequest {
         let mut message = Message::new("m1", MessageRole::User, vec![Part::text("ping")]);
         message.task_id = Some(task_id.to_string());
+        message.context_id = context_id.map(str::to_string);
         let params = MessageSendParams {
             message,
             configuration: None,

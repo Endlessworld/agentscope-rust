@@ -10,8 +10,8 @@
 
 use agentscope_core::message::JsonMap;
 use agentscope_core::message::{
-    AudioBlock, Base64Source, ContentBlock, HintBlock, ImageBlock, Msg, MsgRole, Source, TextBlock,
-    ThinkingBlock, ToolResultBlock, ToolUseBlock, URLSource, VideoBlock,
+    AudioBlock, Base64Source, ContentBlock, DocumentBlock, HintBlock, ImageBlock, Msg, MsgRole,
+    Source, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock, URLSource, VideoBlock,
 };
 use serde_json::Value;
 
@@ -48,6 +48,12 @@ impl MessageConstants {
     pub const TOOL_CALL_ID_METADATA_KEY: &'static str = "_agentscope_tool_call_id";
     /// Payload key holding a tool result's output inside its data part.
     pub const TOOL_RESULT_OUTPUT_METADATA_KEY: &'static str = "_agentscope_tool_output";
+    /// Reply metadata key carrying the id of the remote task, set when the task stopped to wait
+    /// for the caller (input or authorization required) so the caller can continue it.
+    pub const TASK_ID_METADATA_KEY: &'static str = "_agentscope_a2a_task_id";
+    /// Reply metadata key carrying the [`TaskState`](crate::model::TaskState) name of the remote
+    /// task, set together with [`Self::TASK_ID_METADATA_KEY`].
+    pub const TASK_STATE_METADATA_KEY: &'static str = "_agentscope_a2a_task_state";
 
     /// Builds a metadata map containing only the content-block type discriminator.
     ///
@@ -82,9 +88,31 @@ pub mod message_constants {
         pub const TYPE_IMAGE: &str = "image";
         pub const TYPE_AUDIO: &str = "audio";
         pub const TYPE_VIDEO: &str = "video";
+        pub const TYPE_DOCUMENT: &str = "document";
         pub const TYPE_TOOL_USE: &str = "tool_use";
         pub const TYPE_TOOL_RESULT: &str = "tool_result";
     }
+
+    /// MIME types the file parser treats as documents rather than arbitrary binaries.
+    ///
+    /// Anything else stays unroutable, so a zip or a database dump is not pushed into a model
+    /// request as content. Mirrors Java `FilePartParser#DOCUMENT_MIME_TYPES`.
+    pub const DOCUMENT_MIME_TYPES: &[&str] = &[
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/epub+zip",
+        "application/json",
+        "application/xml",
+        "text/plain",
+        "text/markdown",
+        "text/csv",
+        "text/xml",
+    ];
 }
 
 /// A2A `Part` -> core [`ContentBlock`].
@@ -122,28 +150,94 @@ pub fn part_to_content_block(part: &Part) -> Option<ContentBlock> {
                 _ => Some(ContentBlock::Text(TextBlock::new(text.text.clone()))),
             }
         }
-        Part::File(file) => file_part_to_block(&file.file),
+        Part::File(file) => file_part_to_block(file),
         Part::Data(data) => data_part_to_block(data),
     }
 }
 
-/// `FilePart` -> media [`ContentBlock`], mirroring Java `FilePartParser`.
-fn file_part_to_block(file: &FileContent) -> Option<ContentBlock> {
-    let mime = file.mime_type.as_deref().unwrap_or("");
+/// `FilePart` -> media or document [`ContentBlock`], mirroring Java `FilePartParser`.
+///
+/// The MIME type is checked **before** the block-type marker: the marker routes the part into
+/// the document branch and used to bypass the untyped-file guard (`d8dfbd77b`).
+fn file_part_to_block(part: &FilePart) -> Option<ContentBlock> {
+    let mime = usable_mime_type(part.file.mime_type.as_deref())?;
+    // An explicit AgentScope block-type marker wins over the MIME type: a scanned page is a
+    // document travelling as image/jpeg, and routing it by MIME alone would rebuild an
+    // ImageBlock where the sender sent a DocumentBlock.
+    if marked_block_type(part.metadata.as_ref()).as_deref()
+        == Some(message_constants::block_content::TYPE_DOCUMENT)
+    {
+        if let Some(document) = document_block_from_part(part) {
+            return Some(document);
+        }
+    }
     let primary = mime.split('/').next().unwrap_or("");
-    let source = file_to_source(file)?;
     match primary {
-        message_constants::block_content::TYPE_IMAGE => {
-            Some(ContentBlock::Image(ImageBlock::new(source)))
+        message_constants::block_content::TYPE_IMAGE
+        | message_constants::block_content::TYPE_AUDIO
+        | message_constants::block_content::TYPE_VIDEO => media_block(part, primary),
+        _ if message_constants::DOCUMENT_MIME_TYPES.contains(&mime.as_str()) => {
+            document_block_from_part(part)
         }
-        message_constants::block_content::TYPE_AUDIO => {
-            Some(ContentBlock::Audio(AudioBlock::new(source)))
-        }
-        message_constants::block_content::TYPE_VIDEO => {
-            Some(ContentBlock::Video(VideoBlock::new(source)))
-        }
+        // Anything else is not routable content: a zip is not pushed into a model request.
         _ => None,
     }
+}
+
+/// A trimmed, parameter-free, lower-cased MIME type, or `None` when there is none.
+fn usable_mime_type(mime_type: Option<&str>) -> Option<String> {
+    let normalized = mime_type?.to_ascii_lowercase();
+    let normalized = normalized.split(';').next().unwrap_or("").trim();
+    (!normalized.is_empty()).then(|| normalized.to_string())
+}
+
+/// The AgentScope block-type marker of a part, mirroring Java `markedBlockType`.
+fn marked_block_type(metadata: Option<&JsonMap>) -> Option<String> {
+    MessageConstants::metadata_value(metadata, MessageConstants::BLOCK_TYPE_METADATA_KEY)
+}
+
+/// Builds a media block from the part's source.
+fn media_block(part: &FilePart, primary: &str) -> Option<ContentBlock> {
+    let source = file_to_source(&part.file)?;
+    Some(match primary {
+        message_constants::block_content::TYPE_IMAGE => {
+            ContentBlock::Image(ImageBlock::new(source))
+        }
+        message_constants::block_content::TYPE_AUDIO => {
+            ContentBlock::Audio(AudioBlock::new(source))
+        }
+        _ => ContentBlock::Video(VideoBlock::new(source)),
+    })
+}
+
+/// `FilePart` -> [`DocumentBlock`], mirroring Java `parseToDocumentBlock`.
+///
+/// The framework block-type marker was consumed by the routing decision, so only the user's
+/// metadata entries are kept.
+fn document_block_from_part(part: &FilePart) -> Option<ContentBlock> {
+    let source = file_to_source(&part.file)?;
+    let mut builder = DocumentBlock::builder().source(source);
+    if let Some(name) = &part.file.name {
+        builder = builder.name(name.clone());
+    }
+    if let Some(mime_type) = usable_mime_type(part.file.mime_type.as_deref()) {
+        builder = builder.mime_type(mime_type);
+    }
+    let user_metadata: JsonMap = part
+        .metadata
+        .as_ref()
+        .map(|metadata| {
+            metadata
+                .iter()
+                .filter(|(key, _)| key.as_str() != MessageConstants::BLOCK_TYPE_METADATA_KEY)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<JsonMap>()
+        })
+        .unwrap_or_default();
+    if !user_metadata.is_empty() {
+        builder = builder.metadata(user_metadata);
+    }
+    Some(ContentBlock::Document(builder.build()))
 }
 
 /// `FileContent` -> core [`Source`], preferring inline bytes over a URI.
@@ -155,7 +249,11 @@ fn file_to_source(file: &FileContent) -> Option<Source> {
         )));
     }
     if let Some(uri) = &file.uri {
-        return Some(Source::Url(URLSource::new(uri.clone())));
+        // Keep the declared type on the source: a DocumentBlock may not repeat it, and the
+        // outbound parser resolves the type from the source before giving up on a file part.
+        let mut source = URLSource::new(uri.clone());
+        source.mime_type = file.mime_type.clone();
+        return Some(Source::Url(source));
     }
     None
 }
@@ -339,10 +437,88 @@ pub fn content_block_to_part(block: &ContentBlock) -> Option<Part> {
             ))
         }
         ContentBlock::Data(_) => None,
-        // Documents have no A2A part either: the protocol carries files, not
-        // provider-side document references.
-        ContentBlock::Document(_) => None,
+        ContentBlock::Document(document) => Some(document_part(document)),
     }
+}
+
+/// [`DocumentBlock`] -> A2A part, mirroring Java `DocumentBlockParser`.
+///
+/// A URL or inline-data source travels as a file part carrying the document name and MIME type.
+/// A provider file id has no A2A representation, and neither does a document whose MIME type
+/// cannot be resolved: the receiving parser drops an untyped file part, so both degrade to a
+/// one-line text reference instead of silently losing the attachment.
+fn document_part(block: &DocumentBlock) -> Part {
+    let name = block.name.clone().unwrap_or_else(|| block.id.clone());
+    let mime_type = document_mime_type(block);
+    match &block.source {
+        Source::Base64(base64) => {
+            let resolved = mime_type
+                .filter(|mime| !mime.trim().is_empty())
+                .unwrap_or_else(|| base64.media_type.clone());
+            if resolved.trim().is_empty() {
+                return document_text_reference(block);
+            }
+            Part::File(FilePart {
+                file: FileContent {
+                    mime_type: Some(resolved),
+                    name: Some(name),
+                    bytes: Some(base64.data.clone()),
+                    uri: None,
+                },
+                metadata: Some(document_metadata(block)),
+            })
+        }
+        Source::Url(url) => {
+            let Some(mime_type) = mime_type.filter(|mime| !mime.trim().is_empty()) else {
+                return document_text_reference(block);
+            };
+            Part::File(FilePart {
+                file: FileContent {
+                    mime_type: Some(mime_type),
+                    name: Some(name),
+                    bytes: None,
+                    uri: Some(url.url.clone()),
+                },
+                metadata: Some(document_metadata(block)),
+            })
+        }
+        Source::FileId(_) => document_text_reference(block),
+    }
+}
+
+/// The document's own MIME type, else the one its source can supply.
+///
+/// Without the fallback a caller that set the type only on the source would send an untyped
+/// file part, which the receiving side drops. Mirrors Java `mimeTypeOf`.
+fn document_mime_type(block: &DocumentBlock) -> Option<String> {
+    match &block.mime_type {
+        Some(mime_type) if !mime_type.trim().is_empty() => Some(mime_type.clone()),
+        _ => agentscope_core::formatter::resolve_mime_type(&block.source).ok(),
+    }
+}
+
+/// File-part metadata: the framework block-type marker first, then the user's entries.
+///
+/// Reserved keys win, so a caller cannot spoof the wire representation (Java `metadataOf`).
+fn document_metadata(block: &DocumentBlock) -> JsonMap {
+    let mut metadata =
+        MessageConstants::build_type_metadata(message_constants::block_content::TYPE_DOCUMENT);
+    if let Some(entries) = &block.metadata {
+        for (key, value) in entries {
+            metadata.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    metadata
+}
+
+/// Degrades a document A2A cannot carry as a file part to a one-line text reference.
+fn document_text_reference(block: &DocumentBlock) -> Part {
+    Part::Text(crate::model::TextPart {
+        text: agentscope_core::formatter::render_document_reference(block),
+        metadata: Some(MessageConstants::build_type_metadata(
+            message_constants::block_content::TYPE_TEXT,
+        )),
+    })
 }
 
 /// Mirrors Java tool-result output serialization: plain text stays a string so the Python
@@ -796,6 +972,170 @@ mod tests {
             },
             other => panic!("unexpected block: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_document_block_travels_as_a_file_part_and_back() {
+        let block = ContentBlock::Document(
+            DocumentBlock::builder()
+                .source(Source::Base64(Base64Source::new(
+                    "application/pdf",
+                    "JVBERi0=",
+                )))
+                .id("doc-1")
+                .name("report.pdf")
+                .mime_type("application/pdf")
+                .build(),
+        );
+        let part = content_block_to_part(&block).unwrap();
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["kind"], "file");
+        assert_eq!(json["metadata"]["_agentscope_block_type"], "document");
+        assert_eq!(json["file"]["mimeType"], "application/pdf");
+        assert_eq!(json["file"]["name"], "report.pdf");
+
+        match part_to_content_block(&part).unwrap() {
+            ContentBlock::Document(document) => {
+                assert_eq!(document.name.as_deref(), Some("report.pdf"));
+                assert_eq!(document.mime_type.as_deref(), Some("application/pdf"));
+                assert!(matches!(document.source, Source::Base64(_)));
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_document_marker_wins_over_a_media_mime_type() {
+        // A scanned page is a document travelling as image/jpeg.
+        let part = Part::File(FilePart {
+            file: FileContent::with_bytes("image/jpeg", "scan.jpg", "AAAA"),
+            metadata: Some(MessageConstants::build_type_metadata(
+                message_constants::block_content::TYPE_DOCUMENT,
+            )),
+        });
+        match part_to_content_block(&part).unwrap() {
+            ContentBlock::Document(document) => {
+                assert_eq!(document.mime_type.as_deref(), Some("image/jpeg"));
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pdf_file_part_parses_as_a_document() {
+        let part = Part::File(FilePart::new(FileContent::with_uri(
+            "application/pdf; charset=binary",
+            "report.pdf",
+            "https://example.com/report.pdf",
+        )));
+        match part_to_content_block(&part).unwrap() {
+            ContentBlock::Document(document) => {
+                // MIME parameters are dropped so a provider can send the type back verbatim.
+                assert_eq!(document.mime_type.as_deref(), Some("application/pdf"));
+                assert_eq!(document.name.as_deref(), Some("report.pdf"));
+                match document.source {
+                    Source::Url(url) => {
+                        assert_eq!(url.url, "https://example.com/report.pdf");
+                        assert_eq!(
+                            url.mime_type.as_deref(),
+                            Some("application/pdf; charset=binary")
+                        );
+                    }
+                    other => panic!("unexpected source: {other:?}"),
+                }
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_file_part_without_a_mime_type_is_not_routed_even_with_a_document_marker() {
+        // `d8dfbd77b`: the marker used to bypass the untyped-file guard.
+        let part = Part::File(FilePart {
+            file: FileContent {
+                mime_type: None,
+                name: Some("report.pdf".to_string()),
+                bytes: Some("JVBERi0=".to_string()),
+                uri: None,
+            },
+            metadata: Some(MessageConstants::build_type_metadata(
+                message_constants::block_content::TYPE_DOCUMENT,
+            )),
+        });
+        assert_eq!(part_to_content_block(&part), None);
+    }
+
+    #[test]
+    fn an_unroutable_binary_file_part_is_dropped() {
+        let part = Part::File(FilePart::new(FileContent::with_bytes(
+            "application/zip",
+            "dump.zip",
+            "AAAA",
+        )));
+        assert_eq!(part_to_content_block(&part), None);
+    }
+
+    #[test]
+    fn a_document_without_a_resolvable_mime_type_degrades_to_a_text_reference() {
+        let block = ContentBlock::Document(
+            DocumentBlock::builder()
+                .source(Source::Url(URLSource::new("https://example.com/unknown")))
+                .id("doc-1")
+                .name("mystery")
+                .build(),
+        );
+        let part = content_block_to_part(&block).unwrap();
+        match &part {
+            Part::Text(text) => {
+                assert!(text.text.starts_with("[document: mystery"), "{}", text.text);
+                assert!(text.text.contains("url: https://example.com/unknown"));
+            }
+            other => panic!("expected a text reference, got {other:?}"),
+        }
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["metadata"]["_agentscope_block_type"], "text");
+    }
+
+    #[test]
+    fn a_provider_file_id_document_degrades_to_a_text_reference() {
+        let block = ContentBlock::Document(
+            DocumentBlock::builder()
+                .source(Source::FileId(agentscope_core::message::FileIdSource::new(
+                    "dashscope",
+                    "file-abc",
+                )))
+                .name("report.pdf")
+                .build(),
+        );
+        match content_block_to_part(&block).unwrap() {
+            Part::Text(text) => {
+                assert!(
+                    text.text.contains("provider file id: file-abc"),
+                    "{}",
+                    text.text
+                );
+            }
+            other => panic!("expected a text reference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn framework_document_metadata_wins_over_user_metadata() {
+        let mut metadata = JsonMap::new();
+        metadata.insert(
+            MessageConstants::BLOCK_TYPE_METADATA_KEY.to_string(),
+            Value::String("text".to_string()),
+        );
+        let block = ContentBlock::Document(
+            DocumentBlock::builder()
+                .source(Source::Base64(Base64Source::new("text/plain", "aGk=")))
+                .name("notes.txt")
+                .metadata(metadata)
+                .build(),
+        );
+        let part = content_block_to_part(&block).unwrap();
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["metadata"]["_agentscope_block_type"], "document");
     }
 
     #[test]

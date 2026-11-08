@@ -1360,6 +1360,42 @@ mod tests {
         );
     }
 
+    // Java 035153a47: a task waiting for the caller must not hold the call open.
+    #[test]
+    fn a_waiting_task_ends_the_call_instead_of_polling() {
+        let mut status = TaskStatus::new(TaskState::InputRequired);
+        status.message = Some(Message::new(
+            "m-status",
+            MessageRole::Agent,
+            vec![Part::text("which date?")],
+        ));
+        let transport = ScriptedTransport::new(
+            JsonRpcResponse::success(
+                serde_json::to_value(Task::new("t-1", status)).unwrap(),
+                Some(1.into()),
+            ),
+            Vec::new(),
+            JsonRpcResponse::success(serde_json::Value::Null, Some(2.into())),
+        );
+        let agent = agent_with(transport.clone());
+
+        let reply = rt()
+            .block_on(agent.call(vec![Msg::user("reset my password")]))
+            .expect("a waiting task yields a reply");
+
+        assert_eq!(reply.text_content(), "which date?");
+        assert_eq!(
+            reply.metadata[crate::message::MessageConstants::TASK_ID_METADATA_KEY],
+            serde_json::json!("t-1")
+        );
+        assert_eq!(
+            reply.metadata[crate::message::MessageConstants::TASK_STATE_METADATA_KEY],
+            serde_json::json!("input-required")
+        );
+        // No polling: the task will never finish on its own.
+        assert_eq!(transport.methods(), vec![methods::MESSAGE_SEND.to_string()]);
+    }
+
     // Java: A2aAgent#doCall blocks until the task is terminal — Rust polls `tasks/get`.
     #[test]
     fn a_working_task_is_settled_by_polling() {
