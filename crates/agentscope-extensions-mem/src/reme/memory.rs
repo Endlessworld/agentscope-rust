@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use agentscope_core::formatter::render_message_text;
 use agentscope_core::message::msg::ContentBlockKind;
 use agentscope_core::{Msg, MsgRole};
 
@@ -41,7 +42,9 @@ pub fn is_recordable(msg: &Msg) -> bool {
         return false;
     }
     // Java: `textContent == null || textContent.isEmpty()` / `contains("<compressed_history>")`.
-    let text = msg.text_content();
+    // An attachment-only turn still carries a document; rendering it keeps the turn from
+    // being dropped before the backend sees it.
+    let text = render_message_text(msg, true);
     !text.is_empty() && !text.contains(COMPRESSED_HISTORY_MARKER)
 }
 
@@ -50,7 +53,7 @@ pub fn convert_to_reme_message(msg: &Msg) -> Option<ReMeMessage> {
     let role = role_to_reme_role(msg.role())?;
     Some(ReMeMessage {
         role: role.to_string(),
-        content: msg.text_content(),
+        content: render_message_text(msg, true),
     })
 }
 
@@ -217,6 +220,27 @@ mod tests {
             "{COMPRESSED_HISTORY_MARKER} summary"
         ))));
         assert!(is_recordable(&Msg::user("   ")));
+    }
+
+    /// `85fa9a602`: an attachment-only turn is not empty — the rendered document reference
+    /// keeps it from being dropped before the backend sees it.
+    #[test]
+    fn a_document_only_turn_stays_recordable() {
+        let mut msg = Msg::builder().role(MsgRole::User).build();
+        msg.content.push(agentscope_core::ContentBlock::Document(
+            agentscope_core::DocumentBlock::builder()
+                .source(agentscope_core::Source::Url(
+                    agentscope_core::URLSource::new("https://example.com/a.pdf"),
+                ))
+                .name("a.pdf")
+                .build(),
+        ));
+        assert!(msg.text_content().is_empty());
+        assert!(is_recordable(&msg));
+        assert_eq!(
+            convert_to_reme_message(&msg).unwrap(),
+            ReMeMessage::new("user", "[document: a.pdf, url: https://example.com/a.pdf]")
+        );
     }
 
     #[test]

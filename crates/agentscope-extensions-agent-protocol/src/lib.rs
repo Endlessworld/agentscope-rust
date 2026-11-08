@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::event::AgentEvent;
+use agentscope_core::formatter::render_message_text;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, ToolCallState, ToolUseBlock};
 use agentscope_harness::agent::subagent::protocol::{
     from_agent_event, matches_detail_event, RemoteAgentEvent, RemoteConfirmDecision,
@@ -1030,7 +1031,7 @@ async fn run_task(
 
     for event in &events {
         if let Some(msg) = agent_result_msg(event) {
-            result_text = msg.text_content();
+            result_text = render_message_text(&msg, true);
             last_result = Some(msg);
         }
         if !properties.streaming_enabled {
@@ -1630,6 +1631,7 @@ fn snapshot_for(store: &Arc<AgentProtocolTaskStore>, task_id: &str) -> Value {
 mod tests {
     use super::*;
     use agentscope_core::event::EventData;
+    use agentscope_core::message::{DocumentBlock, Source};
     use agentscope_harness::agent::subagent::protocol::RemoteEventType;
     use std::collections::BTreeMap;
 
@@ -1869,6 +1871,32 @@ mod tests {
             assert_eq!(snapshot["result"], "done");
             assert_eq!(snapshot["agentId"], "agent-1");
             assert_eq!(snapshot["awaitingConfirm"], false);
+        });
+    }
+
+    /// `85fa9a602`: a task result is a string, so a delivered document is stored as a
+    /// reference instead of an empty reply.
+    #[test]
+    fn a_document_only_reply_is_stored_as_a_reference() {
+        let reply = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Document(
+                DocumentBlock::builder()
+                    .source(Source::Url(agentscope_core::message::URLSource::new(
+                        "https://example.com/a.pdf",
+                    )))
+                    .name("a.pdf")
+                    .build(),
+            )])
+            .build();
+        let store = store_for(Arc::new(ResultAgent { reply }));
+        rt().block_on(async {
+            store.submit("t-1", "agent-1", "ping", None).unwrap();
+            let snapshot = store.wait_for("t-1", 5_000).await.unwrap();
+            assert_eq!(
+                snapshot["result"],
+                "[document: a.pdf, url: https://example.com/a.pdf]"
+            );
         });
     }
 

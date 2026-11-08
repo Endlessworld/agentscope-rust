@@ -4,6 +4,7 @@
 //! Attributes are returned as an ordered `Vec<(String, serde_json::Value)>`
 //! rather than OTel `Attributes`, so the extraction logic is testable without
 //! depending on the `opentelemetry` crate (see tracker §4.2).
+use agentscope_core::formatter::render_document_reference;
 use agentscope_core::message::{ContentBlock, Msg, MsgRole};
 use agentscope_core::model::{ChatResponse, GenerateOptions, ToolSchema};
 use agentscope_core::tool::Toolkit;
@@ -307,7 +308,7 @@ pub fn get_format_request_attributes(format_target: &str, msgs: Option<&[Msg]>) 
         format_target,
     );
     if let Some(msgs) = msgs {
-        if let Ok(v) = serde_json::to_string(msgs) {
+        if let Ok(v) = serde_json::to_string(&redact_message_payloads(msgs)) {
             string_attr(&mut attrs, as_attrs::AGENTSCOPE_FUNCTION_INPUT, v);
         }
     }
@@ -426,21 +427,79 @@ fn get_tool_definitions(tool_schemas: &[ToolSchema]) -> Option<String> {
 }
 
 fn get_tool_call_result(result: &[ContentBlock]) -> Vec<ContentBlock> {
-    result
+    redact_media_payloads(result)
+}
+
+/// Copies a message list with every media payload replaced by a description.
+///
+/// Span attributes are not a data channel: a base64 attachment would bloat or overflow the
+/// attribute and leak content into telemetry backends. A message without media is passed
+/// through untouched so the common case keeps its exact shape.
+fn redact_message_payloads(msgs: &[Msg]) -> Vec<Msg> {
+    if !msgs
         .iter()
-        .map(|block| match block {
-            ContentBlock::Video(_) => ContentBlock::Text(agentscope_core::message::TextBlock::new(
-                "<VideoBlock is not supported>",
-            )),
-            ContentBlock::Audio(_) => ContentBlock::Text(agentscope_core::message::TextBlock::new(
-                "<AudioBlock is not supported>",
-            )),
-            ContentBlock::Image(_) => ContentBlock::Text(agentscope_core::message::TextBlock::new(
-                "<ImageBlock is not supported>",
-            )),
-            other => other.clone(),
-        })
-        .collect()
+        .any(|msg| msg.content().iter().any(is_media_payload))
+    {
+        return msgs.to_vec();
+    }
+    msgs.iter().map(redact_message_payload).collect()
+}
+
+fn redact_message_payload(msg: &Msg) -> Msg {
+    if !msg.content().iter().any(is_media_payload) {
+        return msg.clone();
+    }
+    let mut redacted = msg.clone();
+    redacted.content = redact_media_payloads(msg.content());
+    redacted
+}
+
+fn redact_media_payloads(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
+    blocks.iter().map(redact_media_payload).collect()
+}
+
+fn is_media_payload(block: &ContentBlock) -> bool {
+    match block {
+        // The payload often hides one level down: a tool result reporting a generated file
+        // carries the document among its output blocks.
+        ContentBlock::ToolResult(result) => result.output.iter().any(is_media_payload),
+        ContentBlock::Video(_)
+        | ContentBlock::Audio(_)
+        | ContentBlock::Image(_)
+        | ContentBlock::Document(_)
+        | ContentBlock::Data(_) => true,
+        _ => false,
+    }
+}
+
+/// Media payloads have no place in a span attribute: they would bloat or overflow it, so
+/// only a description is kept.
+fn redact_media_payload(block: &ContentBlock) -> ContentBlock {
+    match block {
+        ContentBlock::ToolResult(result) => {
+            if !result.output.iter().any(is_media_payload) {
+                return block.clone();
+            }
+            let mut redacted = result.clone();
+            redacted.output = redact_media_payloads(&result.output);
+            ContentBlock::ToolResult(redacted)
+        }
+        ContentBlock::Video(_) => description("<VideoBlock is not supported>"),
+        ContentBlock::Audio(_) => description("<AudioBlock is not supported>"),
+        ContentBlock::Image(_) => description("<ImageBlock is not supported>"),
+        // Keep the identity of the document (name, MIME type, location) without any
+        // payload bytes.
+        ContentBlock::Document(document) => description(&render_document_reference(document)),
+        ContentBlock::Data(data) => description(&format!(
+            "<DataBlock {} is not supported>",
+            data.name.as_deref().unwrap_or(data.id.as_str())
+        )),
+        other => other.clone(),
+    }
+}
+
+fn description(text: &str) -> ContentBlock {
+    ContentBlock::Text(agentscope_core::message::TextBlock::new(text))
 }
 
 fn role_of(msg_role: MsgRole) -> Role {
@@ -558,6 +617,83 @@ mod tests {
         assert_eq!(parsed["options"]["temperature"], 0.5);
         assert_eq!(parsed["options"]["max_tokens"], 128);
         assert_eq!(parsed["tools"][0]["name"], "calc");
+    }
+
+    /// Span attributes are not a data channel: an inline document must not carry its bytes
+    /// into telemetry, but the reference stays (`85fa9a602`).
+    #[test]
+    fn format_request_replaces_an_inline_document_with_its_reference() {
+        let mut msg = Msg::builder().role(MsgRole::User).build();
+        msg.content.push(ContentBlock::Document(
+            agentscope_core::message::DocumentBlock::builder()
+                .source(agentscope_core::message::Source::Base64(
+                    agentscope_core::message::Base64Source::new("application/pdf", "aGVsbG8="),
+                ))
+                .name("a.pdf")
+                .build(),
+        ));
+        let attrs = get_format_request_attributes("DashScopeChatFormatter", Some(&[msg]));
+        let raw = attr_str(&attrs, as_attrs::AGENTSCOPE_FUNCTION_INPUT);
+        assert!(!raw.contains("aGVsbG8="), "payload leaked: {raw}");
+        assert!(raw.contains("[document: a.pdf, application/pdf, inline base64 (~5 bytes)]"));
+    }
+
+    /// The redaction also reaches a document hiding in a tool result, one level down, and
+    /// leaves a message without media byte-identical.
+    #[test]
+    fn format_request_redacts_a_tool_result_document_and_keeps_plain_messages() {
+        let plain = Msg::user("hi");
+        let mut with_tool = Msg::builder().role(MsgRole::Tool).build();
+        with_tool.content.push(ContentBlock::ToolResult(
+            agentscope_core::message::ToolResultBlock {
+                id: Some("call-1".into()),
+                name: Some("export".into()),
+                output: vec![ContentBlock::Document(
+                    agentscope_core::message::DocumentBlock::builder()
+                        .source(agentscope_core::message::Source::Url(
+                            agentscope_core::message::URLSource::new("https://example.com/r.pdf"),
+                        ))
+                        .name("r.pdf")
+                        .build(),
+                )],
+                metadata: Default::default(),
+                state: Default::default(),
+            },
+        ));
+
+        let attrs = get_format_request_attributes("DashScopeChatFormatter", Some(&[with_tool]));
+        let raw = attr_str(&attrs, as_attrs::AGENTSCOPE_FUNCTION_INPUT);
+        assert!(raw.contains("[document: r.pdf, url: https://example.com/r.pdf]"));
+
+        let attrs = get_format_request_attributes("DashScopeChatFormatter", Some(&[plain.clone()]));
+        let raw = attr_str(&attrs, as_attrs::AGENTSCOPE_FUNCTION_INPUT);
+        assert_eq!(raw, serde_json::to_string(&[plain]).unwrap());
+    }
+
+    #[test]
+    fn tool_response_keeps_a_document_reference_and_names_a_data_block() {
+        let output = vec![
+            ContentBlock::Document(
+                agentscope_core::message::DocumentBlock::builder()
+                    .source(agentscope_core::message::Source::Url(
+                        agentscope_core::message::URLSource::new("https://example.com/a.pdf"),
+                    ))
+                    .name("a.pdf")
+                    .build(),
+            ),
+            ContentBlock::Data(
+                agentscope_core::message::DataBlock::builder()
+                    .source(agentscope_core::message::Source::Url(
+                        agentscope_core::message::URLSource::new("https://example.com/b.bin"),
+                    ))
+                    .name("b.bin")
+                    .build(),
+            ),
+        ];
+        let attrs = get_tool_response_attributes(&output);
+        let raw = attr_str(&attrs, gen_ai::GEN_AI_TOOL_CALL_RESULT);
+        assert!(raw.contains("[document: a.pdf, url: https://example.com/a.pdf]"));
+        assert!(raw.contains("<DataBlock b.bin is not supported>"));
     }
 
     #[test]

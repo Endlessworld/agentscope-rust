@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use agentscope_core::formatter::render_message_text;
 use agentscope_core::{JsonMap, Msg, MsgRole};
 
 use crate::error::{MemError, Result};
@@ -37,17 +38,19 @@ pub fn role_to_mem0_role(role: MsgRole) -> &'static str {
 pub fn convert_to_mem0_message(msg: &Msg) -> Mem0Message {
     Mem0Message {
         role: role_to_mem0_role(msg.role()).to_string(),
-        content: msg.text_content(),
+        content: render_message_text(msg, true),
         name: None,
     }
 }
 
 /// Converts a slice of messages into Mem0 messages, dropping null / empty /
 /// compressed-history entries exactly like `Mem0LongTermMemory.record`.
+///
+/// A turn carrying only a document is not empty: the rendered reference keeps it.
 pub fn convert_messages(msgs: &[Msg]) -> Vec<Mem0Message> {
     msgs.iter()
         .filter(|msg| {
-            let text = msg.text_content();
+            let text = render_message_text(msg, true);
             !text.is_empty() && !text.contains(COMPRESSED_HISTORY_MARKER)
         })
         .map(convert_to_mem0_message)
@@ -226,7 +229,7 @@ impl Mem0LongTermMemory {
 mod tests {
     use super::*;
     use crate::http::mock::MockTransport;
-    use agentscope_core::{ContentBlock, TextBlock};
+    use agentscope_core::{ContentBlock, DocumentBlock, TextBlock};
 
     fn client(transport: Arc<MockTransport>) -> Arc<Mem0Client> {
         Arc::new(
@@ -271,6 +274,27 @@ mod tests {
             .unwrap()
             .get("name")
             .is_none());
+    }
+
+    /// `85fa9a602`: an attachment-only turn is recorded as a document reference instead
+    /// of being dropped as empty text.
+    #[test]
+    fn convert_messages_keeps_a_document_only_turn() {
+        let mut attachment_only = Msg::builder().role(MsgRole::User).build();
+        attachment_only.content.push(ContentBlock::Document(
+            DocumentBlock::builder()
+                .source(agentscope_core::Source::Url(
+                    agentscope_core::URLSource::new("https://example.com/a.pdf"),
+                ))
+                .name("a.pdf")
+                .build(),
+        ));
+        let converted = convert_messages(&[attachment_only]);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(
+            converted[0].content,
+            "[document: a.pdf, url: https://example.com/a.pdf]"
+        );
     }
 
     #[test]

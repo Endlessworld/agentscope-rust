@@ -19,6 +19,7 @@ use async_trait::async_trait;
 
 use agentscope_core::agent::react_agent::ReActAgent;
 use agentscope_core::agent::CallableAgent;
+use agentscope_core::formatter::{render_document_reference, render_message_text};
 use agentscope_core::message::{ContentBlock, Msg, MsgRole};
 use agentscope_core::state::{AgentState, Task, TaskState};
 use agentscope_core::Agent as _;
@@ -833,20 +834,54 @@ pub(crate) fn message_item(seq: i64, msg: &Msg) -> MessageItem {
     item
 }
 
-/// Concatenates the text blocks of `blocks`.
+/// Concatenates the text blocks of `blocks`, rendering a document as a one-line reference.
+///
+/// A tool result that produced a file carries the document among its output blocks; the
+/// text sinks used by the control plane (session events, history) are strings, so the
+/// attachment would otherwise vanish without a trace.
 fn blocks_text(blocks: &[ContentBlock]) -> String {
     let mut out = String::new();
     for block in blocks {
-        if let ContentBlock::Text(t) = block {
-            out.push_str(&t.text);
+        match block {
+            ContentBlock::Text(text) => push_block_text(&mut out, &text.text),
+            ContentBlock::Document(document) => {
+                push_block_text(&mut out, &render_document_reference(document))
+            }
+            _ => {}
         }
     }
     out
 }
 
-/// The plain-text content of a message.
+fn push_block_text(out: &mut String, rendered: &str) {
+    if rendered.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(rendered);
+}
+
+/// The plain-text content of a message: its text plus one reference per message-level
+/// document, followed by the text and references of its first tool result.
+///
+/// Java `textOf` renders the tool result from its own blocks so the result's text output
+/// survives next to its document references instead of being displaced by them.
 fn text_of(msg: &Msg) -> String {
-    msg.text_content()
+    // `false`: tool results render their own blocks, so a document carried by one is not
+    // reported twice.
+    let text = render_message_text(msg, false);
+    let tool_text = msg
+        .tool_result_blocks()
+        .next()
+        .map(|result| blocks_text(&result.output))
+        .unwrap_or_default();
+    match (text.is_empty(), tool_text.is_empty()) {
+        (_, true) => text,
+        (true, false) => tool_text,
+        (false, false) => format!("{text}\n{tool_text}"),
+    }
 }
 
 /// The wire role name of a message.
@@ -870,6 +905,7 @@ fn parse_timestamp(value: &str) -> i64 {
 mod tests {
     use super::*;
     use agentscope_core::agent::RuntimeContext;
+    use agentscope_core::message::{DocumentBlock, Source};
     use agentscope_core::middleware::{AgentInput, Middleware, Next};
     use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
     use futures::stream::BoxStream;
@@ -1311,5 +1347,76 @@ mod tests {
         assert!(!plan_active(&serde_json::json!({ "active": false })));
         assert!(plan_active(&serde_json::json!({ "mode": "enter" })));
         assert!(!plan_active(&serde_json::json!({ "mode": "EXIT" })));
+    }
+
+    /// `85fa9a602`: a message that carries only a document used to render as an empty
+    /// string, so the attachment vanished from every text sink (context snapshot, history).
+    #[test]
+    fn a_document_only_message_renders_its_reference() {
+        let mut msg = Msg::builder().role(MsgRole::User).build();
+        msg.content.push(ContentBlock::Document(
+            DocumentBlock::builder()
+                .source(Source::Url(agentscope_core::message::URLSource::new(
+                    "https://example.com/a.pdf",
+                )))
+                .name("a.pdf")
+                .mime_type("application/pdf")
+                .build(),
+        ));
+        assert_eq!(
+            text_of(&msg),
+            "[document: a.pdf, application/pdf, url: https://example.com/a.pdf]"
+        );
+    }
+
+    /// Java `textOf` now keeps a tool result's own text next to its document references
+    /// instead of letting the attachment displace it.
+    #[test]
+    fn a_tool_result_keeps_its_text_next_to_its_document() {
+        let mut msg = Msg::builder().role(MsgRole::Tool).build();
+        msg.content.push(ContentBlock::ToolResult(
+            agentscope_core::message::ToolResultBlock {
+                id: Some("call-1".into()),
+                name: Some("export".into()),
+                output: vec![
+                    ContentBlock::Text(agentscope_core::message::TextBlock::new("done")),
+                    ContentBlock::Document(
+                        DocumentBlock::builder()
+                            .source(Source::Url(agentscope_core::message::URLSource::new(
+                                "https://example.com/r.pdf",
+                            )))
+                            .name("r.pdf")
+                            .build(),
+                    ),
+                ],
+                metadata: Default::default(),
+                state: Default::default(),
+            },
+        ));
+        assert_eq!(
+            text_of(&msg),
+            "done\n[document: r.pdf, url: https://example.com/r.pdf]"
+        );
+    }
+
+    /// A message with both text and a tool result keeps both halves, in that order.
+    #[test]
+    fn message_text_and_tool_result_text_are_joined() {
+        let mut msg = Msg::builder().role(MsgRole::Tool).build();
+        msg.content.push(ContentBlock::Text(
+            agentscope_core::message::TextBlock::new("note"),
+        ));
+        msg.content.push(ContentBlock::ToolResult(
+            agentscope_core::message::ToolResultBlock {
+                id: Some("call-1".into()),
+                name: Some("export".into()),
+                output: vec![ContentBlock::Text(
+                    agentscope_core::message::TextBlock::new("done"),
+                )],
+                metadata: Default::default(),
+                state: Default::default(),
+            },
+        ));
+        assert_eq!(text_of(&msg), "note\ndone");
     }
 }
