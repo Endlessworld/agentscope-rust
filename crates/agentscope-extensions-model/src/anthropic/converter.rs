@@ -20,16 +20,17 @@
 
 use agentscope_core::{
     convert_tool_result_to_string, determine_media_type, extract_text_content, file_to_base64,
-    is_local_file, resolve_mime_type, validate_image_extension, ContentBlock, DataBlock, Error,
-    GenerateOptions, HintBlock, ImageBlock, Msg, MsgRole, Result, Source, ToolChoice,
-    ToolResultBlock, ToolResultState, ToolSchema, ToolUseBlock,
+    is_local_file, resolve_mime_type, validate_image_extension, ContentBlock, DataBlock,
+    DocumentBlock, Error, GenerateOptions, HintBlock, ImageBlock, Msg, MsgRole, Result, Source,
+    ToolChoice, ToolResultBlock, ToolResultState, ToolSchema, ToolUseBlock,
 };
 
 use super::dto::{
-    AnthropicCacheControl, AnthropicContentBlock, AnthropicImageBlock, AnthropicImageSource,
-    AnthropicMessage, AnthropicRequest, AnthropicServerToolUseBlock, AnthropicTextBlock,
-    AnthropicThinkingBlock, AnthropicTool, AnthropicToolChoice, AnthropicToolEntry,
-    AnthropicToolResultBlock, AnthropicToolResultContent, AnthropicToolUseBlock, SystemPrompt,
+    AnthropicCacheControl, AnthropicCitationsConfig, AnthropicContentBlock, AnthropicDocumentBlock,
+    AnthropicDocumentSource, AnthropicImageBlock, AnthropicImageSource, AnthropicMessage,
+    AnthropicRequest, AnthropicServerToolUseBlock, AnthropicTextBlock, AnthropicThinkingBlock,
+    AnthropicTool, AnthropicToolChoice, AnthropicToolEntry, AnthropicToolResultBlock,
+    AnthropicToolResultContent, AnthropicToolUseBlock, SystemPrompt,
 };
 use super::parser::{METADATA_SERVER_TOOL_RESULT, METADATA_THINKING_SIGNATURE};
 use super::server_tool::AnthropicServerTool;
@@ -101,6 +102,7 @@ pub fn system_prompt(text: &str, fmt: &ChatFormatOptions) -> SystemPrompt {
         SystemPrompt::Blocks(vec![AnthropicTextBlock {
             text: text.to_string(),
             cache_control: Some(fmt.marker()),
+            citations: None,
         }])
     } else {
         SystemPrompt::Text(text.to_string())
@@ -205,6 +207,163 @@ pub fn data_content_block(block: &DataBlock, fmt: &ChatFormatOptions) -> Anthrop
     }
 }
 
+/// Converts a provider-neutral document block into a native Anthropic PDF
+/// document block with citations enabled, or a text placeholder on a source
+/// Anthropic cannot deliver.
+pub fn document_content_block(
+    block: &DocumentBlock,
+    fmt: &ChatFormatOptions,
+) -> AnthropicContentBlock {
+    match document_source(block) {
+        Ok(source) => AnthropicContentBlock::Document(AnthropicDocumentBlock {
+            source,
+            title: block.name.clone().filter(|title| !title.trim().is_empty()),
+            // The API requires citations to be enabled for every document of a
+            // request or for none of them.
+            citations: Some(AnthropicCitationsConfig { enabled: true }),
+            cache_control: fmt.cache_control.then(|| fmt.marker()),
+        }),
+        Err(e) => {
+            // A document stays in the conversation history, so a source Anthropic
+            // cannot deliver must degrade to a reference instead of failing every
+            // later turn of the session.
+            crate::common::diagnostics::warn(
+                "unsupported_document_source",
+                "content.document",
+                &format!("document part omitted; replaced with text: {e}"),
+            );
+            AnthropicContentBlock::Text(AnthropicTextBlock::new(format!(
+                "[Document - not supported by Anthropic: {e}]"
+            )))
+        }
+    }
+}
+
+/// Resolves an [`AnthropicDocumentSource`] from a provider-neutral document block.
+///
+/// Anthropic only reads PDFs through this integration: a declared or inferred
+/// non-PDF MIME type is rejected (the Java converter throws for the same reason).
+/// Local paths and `file://` URLs are inlined as base64, remote `http(s)` URLs are
+/// forwarded, and only an Anthropic file id can use the Files API source.
+fn document_source(block: &DocumentBlock) -> Result<AnthropicDocumentSource> {
+    if let Source::FileId(file) = &block.source {
+        if file.provider != ANTHROPIC_DOCUMENT_PROVIDER {
+            return Err(Error::Other(format!(
+                "document input requires an Anthropic file id, got provider '{}'",
+                file.provider
+            )));
+        }
+        if let Some(mime) = document_mime(block) {
+            require_pdf(&mime)?;
+        }
+        return Ok(AnthropicDocumentSource::File {
+            file_id: file.file_id.clone(),
+        });
+    }
+
+    let mime = document_mime(block).ok_or_else(|| {
+        Error::Other(
+            "cannot determine the document MIME type; set DocumentBlock.mime_type explicitly"
+                .to_string(),
+        )
+    })?;
+    require_pdf(&mime)?;
+
+    match &block.source {
+        Source::Base64(b64) => Ok(AnthropicDocumentSource::Base64 {
+            media_type: ANTHROPIC_PDF_MEDIA_TYPE.to_string(),
+            data: b64.data.clone(),
+        }),
+        Source::Url(url) => {
+            let url = &url.url;
+            if is_http_url(url) {
+                Ok(AnthropicDocumentSource::Url { url: url.clone() })
+            } else if let Some(path) = local_path_of(url) {
+                Ok(AnthropicDocumentSource::Base64 {
+                    media_type: ANTHROPIC_PDF_MEDIA_TYPE.to_string(),
+                    data: file_to_base64(path)?,
+                })
+            } else {
+                Err(Error::Other(format!(
+                    "PDF URLs must use HTTP(S) or the file scheme: {url}"
+                )))
+            }
+        }
+        Source::FileId(_) => unreachable!("handled above"),
+    }
+}
+
+const ANTHROPIC_PDF_MEDIA_TYPE: &str = "application/pdf";
+const ANTHROPIC_DOCUMENT_PROVIDER: &str = "anthropic";
+
+/// Resolves the document MIME type: declared value, source hint, then the file
+/// extension (core `determine_media_type`, which knows `application/pdf`).
+fn document_mime(block: &DocumentBlock) -> Option<String> {
+    block
+        .mime_type
+        .clone()
+        .filter(|mime| !mime.trim().is_empty())
+        .or_else(|| match &block.source {
+            Source::Base64(b64) => Some(b64.media_type.clone()),
+            Source::Url(url) => url
+                .mime_type
+                .clone()
+                .filter(|mime| !mime.trim().is_empty())
+                .or_else(|| {
+                    let inferred = determine_media_type(&url.url);
+                    (inferred != "application/octet-stream").then_some(inferred)
+                }),
+            Source::FileId(_) => None,
+        })
+        .filter(|mime| !mime.trim().is_empty())
+}
+
+fn require_pdf(mime: &str) -> Result<()> {
+    let normalized = mime
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    if normalized == ANTHROPIC_PDF_MEDIA_TYPE {
+        Ok(())
+    } else {
+        Err(Error::Other(format!(
+            "Anthropic currently supports PDF documents; got MIME type: {mime}"
+        )))
+    }
+}
+
+fn is_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+/// Local path of a `file:` URL or of a plain filesystem path.
+///
+/// `file:///C:/report.pdf` — the form URL libraries produce — keeps the URL's
+/// leading `/` in front of the drive letter, which is not part of the path.
+fn local_path_of(url: &str) -> Option<&str> {
+    if let Some(rest) = strip_file_scheme(url) {
+        let path = rest.strip_prefix("//").unwrap_or(rest);
+        let bytes = path.as_bytes();
+        if bytes.len() > 2 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':'
+        {
+            return Some(&path[1..]);
+        }
+        return Some(path);
+    }
+    if is_local_file(url) {
+        return Some(url);
+    }
+    None
+}
+
+/// Strips a `file:` scheme, which RFC 8089 spells case-insensitively.
+fn strip_file_scheme(url: &str) -> Option<&str> {
+    let scheme = url.get(..5)?;
+    scheme.eq_ignore_ascii_case("file:").then(|| &url[5..])
+}
+
 fn tool_use_block(block: &ToolUseBlock, fmt: &ChatFormatOptions) -> AnthropicContentBlock {
     // Server-tool calls are echoed as `server_tool_use`, not `tool_use`.
     if block.is_server_tool() {
@@ -247,12 +406,14 @@ pub fn message_content_blocks(
                 out.push(AnthropicContentBlock::Text(AnthropicTextBlock {
                     text: t.text.clone(),
                     cache_control: fmt.cache_control.then(|| fmt.marker()),
+                    citations: None,
                 }));
             }
             ContentBlock::Hint(h) => {
                 out.push(AnthropicContentBlock::Text(AnthropicTextBlock {
                     text: h.hint.clone().unwrap_or_default(),
                     cache_control: fmt.cache_control.then(|| fmt.marker()),
+                    citations: None,
                 }));
             }
             ContentBlock::Thinking(t) => match thinking_signature(t) {
@@ -281,22 +442,8 @@ pub fn message_content_blocks(
             ContentBlock::ToolResult(_) => {}
             // Audio/video have no Anthropic request representation.
             ContentBlock::Audio(_) | ContentBlock::Video(_) => {}
-            // Documents are not accepted by Anthropic: report the dropped
-            // content as a text placeholder instead of collapsing the message
-            // to empty (which would drop it entirely).
-            ContentBlock::Document(d) => {
-                let label = d.name.clone().unwrap_or_else(|| d.id.clone());
-                crate::common::diagnostics::warn(
-                    "document_not_supported",
-                    "content.document",
-                    format!(
-                        "DocumentBlock is not supported by Anthropic; sending a text placeholder instead of '{label}'"
-                    ),
-                );
-                out.push(AnthropicContentBlock::Text(AnthropicTextBlock::new(
-                    format!("[Document - not supported by Anthropic: {label}]"),
-                )));
-            }
+            // Documents are native PDF input blocks (base64 / URL / file id).
+            ContentBlock::Document(d) => out.push(document_content_block(d, fmt)),
         }
     }
     out
@@ -331,6 +478,21 @@ pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> 
             ContentBlock::Data(d) => match image_source(&d.source) {
                 Ok(source) => content.push(AnthropicToolResultContent::Image { source }),
                 Err(_) => {}
+            },
+            ContentBlock::Document(d) => match document_source(d) {
+                Ok(source) => content.push(AnthropicToolResultContent::Document(
+                    AnthropicDocumentBlock {
+                        source,
+                        title: d.name.clone().filter(|title| !title.trim().is_empty()),
+                        citations: Some(AnthropicCitationsConfig { enabled: true }),
+                        cache_control: fmt.cache_control.then(|| fmt.marker()),
+                    },
+                )),
+                Err(e) => crate::common::diagnostics::warn(
+                    "unsupported_document_source",
+                    "content.tool_result.document",
+                    &format!("document omitted from the tool result: {e}"),
+                ),
             },
             _ => {}
         }
@@ -807,6 +969,10 @@ pub fn apply_cache_control(messages: &mut [AnthropicMessage], fmt: &ChatFormatOp
                 t.cache_control = Some(marker);
                 return;
             }
+            AnthropicContentBlock::Document(d) => {
+                d.cache_control = Some(marker);
+                return;
+            }
             // Provider-executed blocks carry no cache marker, but keep scanning:
             // an earlier cacheable block may still precede them.
             AnthropicContentBlock::Thinking(_)
@@ -834,6 +1000,8 @@ pub enum ConversationBlock {
     Image(ImageBlock),
     /// A generic data block to be converted later.
     Data(DataBlock),
+    /// A PDF document to be converted later.
+    Document(DocumentBlock),
 }
 
 /// Merges multi-agent messages into a conversation transcript wrapped in
@@ -871,6 +1039,10 @@ pub fn merge_conversation(
                 ContentBlock::Data(d) => {
                     flush(&mut text, &mut blocks);
                     blocks.push(ConversationBlock::Data(d.clone()));
+                }
+                ContentBlock::Document(d) => {
+                    flush(&mut text, &mut blocks);
+                    blocks.push(ConversationBlock::Document(d.clone()));
                 }
                 _ => {}
             }
@@ -1049,6 +1221,7 @@ fn merged_agent_message(
             }
             ConversationBlock::Image(image) => image_content_block(&image, fmt),
             ConversationBlock::Data(data) => data_content_block(&data, fmt),
+            ConversationBlock::Document(document) => document_content_block(&document, fmt),
         })
         .collect();
     if blocks.is_empty() {
@@ -1843,5 +2016,207 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request.tools.as_ref().unwrap().len(), 1);
+    }
+
+    fn pdf_document(source: Source) -> DocumentBlock {
+        DocumentBlock::builder()
+            .source(source)
+            .name("report.pdf")
+            .mime_type("application/pdf")
+            .build()
+    }
+
+    #[test]
+    fn a_pdf_document_becomes_a_native_document_block_with_citations() {
+        let fmt = ChatFormatOptions {
+            cache_control: true,
+            cache_ttl: None,
+        };
+        let messages = vec![Msg::user_blocks(vec![ContentBlock::Document(
+            pdf_document(Source::Base64(agentscope_core::Base64Source::new(
+                "application/pdf",
+                "QUJD",
+            ))),
+        )])];
+        let out = to_anthropic_messages(&messages, &fmt);
+        match &out[0].content[0] {
+            AnthropicContentBlock::Document(document) => {
+                assert_eq!(document.title.as_deref(), Some("report.pdf"));
+                assert_eq!(
+                    document.source,
+                    AnthropicDocumentSource::Base64 {
+                        media_type: "application/pdf".to_string(),
+                        data: "QUJD".to_string(),
+                    }
+                );
+                // Every document of a request carries citations or none does.
+                assert!(document.citations.unwrap().enabled);
+                assert_eq!(document.cache_control.as_ref().unwrap().kind, "ephemeral");
+            }
+            other => panic!("expected Document, got {other:?}"),
+        }
+
+        let remote = to_anthropic_messages(
+            &[Msg::user_blocks(vec![ContentBlock::Document(
+                pdf_document(Source::Url(URLSource::new(
+                    "https://example.com/report.pdf",
+                ))),
+            )])],
+            &plain(),
+        );
+        match &remote[0].content[0] {
+            AnthropicContentBlock::Document(document) => assert_eq!(
+                document.source,
+                AnthropicDocumentSource::Url {
+                    url: "https://example.com/report.pdf".to_string()
+                }
+            ),
+            other => panic!("expected Document, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_an_anthropic_file_id_reaches_the_document_file_source() {
+        let own = to_anthropic_messages(
+            &[Msg::user_blocks(vec![ContentBlock::Document(
+                pdf_document(Source::FileId(agentscope_core::FileIdSource::new(
+                    "anthropic",
+                    "file-1",
+                ))),
+            )])],
+            &plain(),
+        );
+        match &own[0].content[0] {
+            AnthropicContentBlock::Document(document) => assert_eq!(
+                document.source,
+                AnthropicDocumentSource::File {
+                    file_id: "file-1".to_string()
+                }
+            ),
+            other => panic!("expected Document, got {other:?}"),
+        }
+
+        // A file id issued by another provider cannot be resolved here.
+        let foreign = to_anthropic_messages(
+            &[Msg::user_blocks(vec![ContentBlock::Document(
+                pdf_document(Source::FileId(agentscope_core::FileIdSource::new(
+                    "openai", "file-1",
+                ))),
+            )])],
+            &plain(),
+        );
+        match &foreign[0].content[0] {
+            AnthropicContentBlock::Text(text) => {
+                assert!(
+                    text.text.contains("not supported by Anthropic"),
+                    "{}",
+                    text.text
+                )
+            }
+            other => panic!("expected text fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_file_url_yields_the_path_anthropic_can_read() {
+        // URL libraries spell a Windows path `file:///C:/...`; the slash in front
+        // of the drive letter is part of the URL, not of the path.
+        assert_eq!(
+            local_path_of("file:///C:/Users/me/report.pdf"),
+            Some("C:/Users/me/report.pdf")
+        );
+        // RFC 8089 makes the scheme case-insensitive, and `file:/path` is the
+        // short spelling of `file:///path`.
+        assert_eq!(
+            local_path_of("FILE:///tmp/report.pdf"),
+            Some("/tmp/report.pdf")
+        );
+        assert_eq!(
+            local_path_of("file:/tmp/report.pdf"),
+            Some("/tmp/report.pdf")
+        );
+        assert_eq!(
+            local_path_of("C:\\tmp\\report.pdf"),
+            Some("C:\\tmp\\report.pdf")
+        );
+        assert_eq!(local_path_of("https://example.com/report.pdf"), None);
+    }
+
+    #[test]
+    fn a_non_pdf_document_degrades_to_a_reference() {
+        let doc = DocumentBlock::builder()
+            .source(Source::Base64(agentscope_core::Base64Source::new(
+                "text/plain",
+                "QUJD",
+            )))
+            .name("notes.txt")
+            .build();
+        let out = to_anthropic_messages(
+            &[Msg::user_blocks(vec![ContentBlock::Document(doc)])],
+            &plain(),
+        );
+        match &out[0].content[0] {
+            AnthropicContentBlock::Text(text) => assert!(
+                text.text.contains("supports PDF documents"),
+                "{}",
+                text.text
+            ),
+            other => panic!("expected text fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_document_inside_a_tool_result_is_delivered_as_a_document_block() {
+        let tool_result = ToolResultBlock::new(
+            "toolu_1",
+            "render",
+            vec![ContentBlock::Document(pdf_document(Source::Base64(
+                agentscope_core::Base64Source::new("application/pdf", "QUJD"),
+            )))],
+        );
+        let messages = vec![
+            Msg::assistant_blocks(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                "toolu_1",
+                "render",
+                JsonMap::new(),
+            ))]),
+            Msg::builder()
+                .role(MsgRole::Tool)
+                .content(vec![ContentBlock::ToolResult(tool_result)])
+                .build(),
+        ];
+        let out = to_anthropic_messages(&messages, &plain());
+        match &out[1].content[0] {
+            AnthropicContentBlock::ToolResult(result) => match &result.content[0] {
+                AnthropicToolResultContent::Document(document) => {
+                    assert_eq!(document.title.as_deref(), Some("report.pdf"))
+                }
+                other => panic!("expected Document in tool result, got {other:?}"),
+            },
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_document_is_kept_when_a_multi_agent_group_is_merged() {
+        let messages = vec![Msg::builder()
+            .role(MsgRole::User)
+            .name("Alice")
+            .content(vec![
+                ContentBlock::Text(agentscope_core::TextBlock::new("read this")),
+                ContentBlock::Document(pdf_document(Source::Base64(
+                    agentscope_core::Base64Source::new("application/pdf", "QUJD"),
+                ))),
+            ])
+            .build()];
+        let out = to_multi_agent_messages(&messages, DEFAULT_CONVERSATION_HISTORY_PROMPT, &plain());
+        let merged = out.last().expect("merged message");
+        assert!(
+            merged
+                .content
+                .iter()
+                .any(|block| matches!(block, AnthropicContentBlock::Document(_))),
+            "document dropped from the merged history: {merged:?}"
+        );
     }
 }

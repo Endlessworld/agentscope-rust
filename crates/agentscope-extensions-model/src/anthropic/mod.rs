@@ -15,12 +15,14 @@
 //! | `formatter.AnthropicBaseFormatter` / `AnthropicChatFormatter` | [`converter::build_request`] / [`converter::ChatFormatOptions`] |
 //! | `formatter.AnthropicMessageConverter` | [`converter::to_anthropic_messages`] |
 //! | `formatter.AnthropicToolsHelper` | [`converter::to_anthropic_tools`], [`converter::to_tool_choice`] |
-//! | `formatter.AnthropicMediaConverter` | [`converter::image_source`], [`converter::image_content_block`] |
+//! | `formatter.AnthropicMediaConverter` | [`converter::image_source`], [`converter::image_content_block`], [`converter::document_content_block`] |
+//! | `formatter.AnthropicCitationConverter` | [`citation`] |
 //! | `formatter.AnthropicConversationMerger` | [`converter::merge_conversation`] |
 //! | `formatter.AnthropicMultiAgentFormatter` | [`converter::to_multi_agent_messages`] |
 //! | `formatter.AnthropicResponseParser` | [`parser`] |
 //! | SDK wire types (`MessageCreateParams`, `MessageParam`, `Message`) | [`dto`] |
 
+pub mod citation;
 pub mod converter;
 pub mod credential;
 pub mod dto;
@@ -29,6 +31,7 @@ pub mod parser;
 pub mod provider;
 pub mod server_tool;
 
+pub use citation::METADATA_CITATIONS;
 pub use converter::{
     build_request, build_request_with_server_tools, to_anthropic_messages, to_anthropic_tools,
     to_anthropic_tools_with_server, to_multi_agent_messages, to_tool_choice, ChatFormatOptions,

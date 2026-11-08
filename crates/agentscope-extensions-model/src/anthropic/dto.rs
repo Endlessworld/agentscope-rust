@@ -94,6 +94,8 @@ pub enum AnthropicContentBlock {
     Text(AnthropicTextBlock),
     /// An image (base64 or remote URL source).
     Image(AnthropicImageBlock),
+    /// A PDF document (base64, remote URL or Anthropic file id source).
+    Document(AnthropicDocumentBlock),
     /// An extended-thinking block. Only replayed on request when the
     /// signature from the original response is still available.
     Thinking(AnthropicThinkingBlock),
@@ -139,11 +141,17 @@ pub struct AnthropicServerToolResultBlock {
 }
 
 /// Text block with optional prompt-cache marker.
+///
+/// `citations` only ever appears on a response: Anthropic attaches the citations
+/// of a document-grounded answer to the text block they belong to. The parser
+/// moves them into the response metadata (`anthropic.citations`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnthropicTextBlock {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<AnthropicCacheControl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<Vec<AnthropicCitation>>,
 }
 
 impl AnthropicTextBlock {
@@ -152,8 +160,41 @@ impl AnthropicTextBlock {
         Self {
             text: text.into(),
             cache_control: None,
+            citations: None,
         }
     }
+}
+
+/// A citation of the cited document text (`citations` of a response text block).
+///
+/// The location fields are keyed by citation type: `char_location` carries
+/// `start_char_index`/`end_char_index`, `page_location` the page numbers and
+/// `content_block_location` the block indices. Unknown variants are kept with
+/// their type only, so the parser can report and skip them.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AnthropicCitation {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub cited_text: String,
+    #[serde(default)]
+    pub document_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_char_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_char_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_page_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_page_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_block_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_block_index: Option<u64>,
 }
 
 /// Extended-thinking block (`{"type":"thinking","thinking":...,"signature":...}`).
@@ -183,6 +224,38 @@ pub enum AnthropicImageSource {
     Base64 { media_type: String, data: String },
     /// Remote URL fetched by Anthropic.
     Url { url: String },
+}
+
+/// PDF document block (`{"type":"document","source":…}`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnthropicDocumentBlock {
+    pub source: AnthropicDocumentSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Citations are enabled for every document of a request or for none of
+    /// them (an API requirement).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<AnthropicCitationsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<AnthropicCacheControl>,
+}
+
+/// Document source: inline PDF bytes, a remote URL, or a Files API id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicDocumentSource {
+    /// Inline base64 PDF payload.
+    Base64 { media_type: String, data: String },
+    /// Remote PDF URL fetched by Anthropic.
+    Url { url: String },
+    /// File already uploaded to the Anthropic Files API.
+    File { file_id: String },
+}
+
+/// `{"enabled": true}` citation switch of a document block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnthropicCitationsConfig {
+    pub enabled: bool,
 }
 
 /// Tool call emitted by the model.
@@ -218,6 +291,8 @@ pub enum AnthropicToolResultContent {
     Image {
         source: AnthropicImageSource,
     },
+    /// A PDF document produced by the tool (Anthropic accepts it inline).
+    Document(AnthropicDocumentBlock),
     /// Reference to a tool discovered by `tool_search` (deferred loading).
     ToolReference {
         tool_name: String,
@@ -406,6 +481,9 @@ pub struct AnthropicStreamDelta {
     /// `input_json_delta`: the partial JSON of a tool call's arguments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partial_json: Option<String>,
+    /// `citations_delta`: one citation of the text block being streamed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citation: Option<AnthropicCitation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
 }

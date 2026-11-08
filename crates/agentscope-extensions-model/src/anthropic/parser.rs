@@ -65,7 +65,9 @@ pub fn blocks_of(content: &[AnthropicContentBlock]) -> Vec<ContentBlock> {
                 blocks.push(ContentBlock::ToolUse(tool));
             }
             // Images never appear in a response.
-            AnthropicContentBlock::Image(_) | AnthropicContentBlock::ToolResult(_) => {}
+            AnthropicContentBlock::Image(_)
+            | AnthropicContentBlock::Document(_)
+            | AnthropicContentBlock::ToolResult(_) => {}
             AnthropicContentBlock::Thinking(t) => {
                 if !t.thinking.is_empty() {
                     let mut thinking = ThinkingBlock::new(t.thinking.clone());
@@ -175,13 +177,25 @@ fn server_tool_result_block(
 }
 
 /// Parses a non-streaming `Message` response.
+///
+/// Citations attached to a text block become response metadata under
+/// [`METADATA_CITATIONS`]: the block index they point at is its position in the
+/// response content, matching `AnthropicResponseParser#parseMessage`.
 pub fn parse_message(response: &AnthropicMessageResponse) -> ChatResponse {
     let blocks = blocks_of(&response.content);
+    let mut citations: Vec<serde_json::Value> = Vec::new();
+    for (index, block) in response.content.iter().enumerate() {
+        if let AnthropicContentBlock::Text(text) = block {
+            if let Some(list) = &text.citations {
+                citations.extend(super::citation::to_metadata(list, index));
+            }
+        }
+    }
     ChatResponse::new(
         response.id.clone(),
         blocks,
         usage_of(&response.usage),
-        None,
+        super::citation::metadata(citations),
         response.stop_reason.clone(),
     )
 }
@@ -204,6 +218,9 @@ pub struct AnthropicStreamIncrementer {
     position: BTreeMap<usize, usize>,
     /// Accumulated `signature_delta` fragments, keyed by `content_block` index.
     thinking_signatures: BTreeMap<usize, String>,
+    /// Citations accumulated from `citations_delta` events. They travel with the
+    /// terminal response metadata; individual text deltas stay text-only.
+    citations: Vec<serde_json::Value>,
     usage: Option<ChatUsage>,
     stop_reason: Option<String>,
 }
@@ -293,6 +310,12 @@ impl AnthropicStreamIncrementer {
                         let buffer = tool.content.get_or_insert_with(String::new);
                         buffer.push_str(partial);
                     }
+                    if let Some(citation) = &delta.citation {
+                        self.citations.extend(super::citation::to_metadata(
+                            std::slice::from_ref(citation),
+                            event.index.unwrap_or(0),
+                        ));
+                    }
                 }
             }
             "message_delta" => {
@@ -320,7 +343,11 @@ impl AnthropicStreamIncrementer {
 
     /// Flushes buffered tool calls / usage / stop reason at the end of the stream.
     pub fn into_final(mut self) -> Option<ChatResponse> {
-        if self.tool_calls.is_empty() && self.usage.is_none() && self.stop_reason.is_none() {
+        if self.tool_calls.is_empty()
+            && self.usage.is_none()
+            && self.stop_reason.is_none()
+            && self.citations.is_empty()
+        {
             return None;
         }
         // Assign ordinal positions in stream-index order.
@@ -339,7 +366,7 @@ impl AnthropicStreamIncrementer {
             self.id.unwrap_or_default(),
             content,
             self.usage.unwrap_or_default(),
-            None,
+            super::citation::metadata(self.citations),
             self.stop_reason,
         ))
     }
@@ -374,6 +401,95 @@ mod tests {
 
     fn event(value: serde_json::Value) -> AnthropicStreamEvent {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn citations_of_a_non_streaming_reply_become_response_metadata() {
+        let parsed = parse_message(&response(serde_json::json!({
+            "id": "msg_c",
+            "content": [
+                { "type": "text", "text": "grounded" },
+                {
+                    "type": "text",
+                    "text": "quoted",
+                    "citations": [
+                        {
+                            "type": "page_location",
+                            "cited_text": "quoted",
+                            "document_index": 0,
+                            "document_title": "report.pdf",
+                            "start_page_number": 2,
+                            "end_page_number": 3
+                        },
+                        { "type": "search_result_location", "cited_text": "ignored" }
+                    ]
+                }
+            ],
+            "usage": { "input_tokens": 10, "output_tokens": 4 },
+            "stop_reason": "end_turn"
+        })));
+        let citations = &parsed.metadata[crate::anthropic::citation::METADATA_CITATIONS];
+        let entries = citations.as_array().expect("citation list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["type"], serde_json::json!("page_location"));
+        assert_eq!(entries[0]["block_index"], serde_json::json!(1));
+        assert_eq!(entries[0]["document_index"], serde_json::json!(0));
+        assert_eq!(entries[0]["start_page_number"], serde_json::json!(2));
+        assert_eq!(
+            entries[0]["document_title"],
+            serde_json::json!("report.pdf")
+        );
+    }
+
+    #[test]
+    fn a_reply_without_citations_carries_no_metadata() {
+        let parsed = parse_message(&response(serde_json::json!({
+            "id": "msg_p",
+            "content": [{ "type": "text", "text": "plain" }],
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        })));
+        assert!(!parsed
+            .metadata
+            .contains_key(crate::anthropic::citation::METADATA_CITATIONS));
+    }
+
+    #[test]
+    fn streamed_citation_deltas_travel_with_the_terminal_response() {
+        let mut incrementer = AnthropicStreamIncrementer::new();
+        incrementer.accumulate(&event(serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_s", "content": [], "usage": { "input_tokens": 5, "output_tokens": 0 } }
+        })));
+        incrementer.accumulate(&event(serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": { "type": "text", "text": "" }
+        })));
+        let delta = incrementer.accumulate(&event(serde_json::json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {
+                "type": "citations_delta",
+                "citation": {
+                    "type": "char_location",
+                    "cited_text": "abc",
+                    "document_index": 0,
+                    "start_char_index": 1,
+                    "end_char_index": 4
+                }
+            }
+        })));
+        // The individual delta stays text-only.
+        assert!(delta.is_none());
+        let final_response = incrementer.into_final().expect("terminal response");
+        let entries = final_response.metadata[crate::anthropic::citation::METADATA_CITATIONS]
+            .as_array()
+            .expect("citation list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["type"], serde_json::json!("char_location"));
+        assert_eq!(entries[0]["block_index"], serde_json::json!(1));
+        assert_eq!(entries[0]["start_char_index"], serde_json::json!(1));
+        assert_eq!(entries[0]["end_char_index"], serde_json::json!(4));
     }
 
     #[test]
