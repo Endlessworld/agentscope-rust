@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use reqwest::{Client, Response};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
@@ -74,6 +75,19 @@ pub const HEADER_SANDBOX_NAMESPACE: &str = "X-Sandbox-Namespace";
 pub const HEADER_SANDBOX_PORT: &str = "X-Sandbox-Port";
 /// Router header carrying the sandbox pod IP.
 pub const HEADER_SANDBOX_POD_IP: &str = "X-Sandbox-Pod-IP";
+
+/// Sandbox-server endpoint that runs a shell command (Java `CommandExecutor`).
+const EXECUTE_ENDPOINT: &str = "execute";
+/// Sandbox-server endpoint advertising the runtime capabilities (Java
+/// `CommandExecutor#executionRequestTimeout`).
+const CAPABILITIES_ENDPOINT: &str = "capabilities";
+/// Attempts allowed while verifying the runtime execution-timeout contract (Java
+/// `CommandExecutor.CAPABILITY_MAX_ATTEMPTS`).
+const CAPABILITY_MAX_ATTEMPTS: u32 = 3;
+/// Exit code reported when the runtime killed the command at its deadline (Java
+/// `ExecuteResponse.TIMEOUT_EXIT_CODE` / `timeout(1)`). The harness derives "timed out" from it,
+/// so a confirmed runtime timeout must surface as a result carrying this code.
+const TIMEOUT_EXIT_CODE: i32 = 124;
 
 /// How the sandbox HTTP endpoint is discovered (mirrors the Java `ConnectionStrategy` tree).
 ///
@@ -181,6 +195,21 @@ pub trait KubernetesPortForwarder: std::fmt::Debug + Send + Sync {
     ) -> SandboxResult<ForwardedEndpoint>;
 }
 
+/// One entry of `SandboxClaim.spec.env` (Java `SandboxClaimSpec.EnvVar`).
+///
+/// `container_name` targets a specific container; `None` lets the controller inject the value
+/// into the first main container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KubernetesClaimEnv {
+    /// Environment variable name.
+    pub name: String,
+    /// Environment variable value.
+    pub value: String,
+    /// Container to inject into (`containerName`); `None` targets the first container.
+    #[serde(rename = "containerName", skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+}
+
 /// Options for the Kubernetes sandbox client (mirrors `KubernetesSandboxClientOptions`).
 #[derive(Debug, Clone)]
 pub struct KubernetesSandboxClientOptions {
@@ -204,6 +233,11 @@ pub struct KubernetesSandboxClientOptions {
     /// Pod annotations written to `spec.additionalPodMetadata.annotations`
     /// (Java `CreateSandboxOptions#podAnnotations`).
     pub pod_annotations: BTreeMap<String, String>,
+    /// Creation-time container environment written to `spec.env`.
+    ///
+    /// Mirrors the Java `KubernetesSandboxClientOptions#claimEnv` / `CreateSandboxOptions#env`:
+    /// an empty list omits `spec.env` entirely, keeping the legacy claim shape.
+    pub claim_env: Vec<KubernetesClaimEnv>,
     /// Absolute workspace root inside the sandbox.
     pub workspace_root: String,
     /// Base directory used by the sandbox file API.
@@ -271,6 +305,7 @@ impl Default for KubernetesSandboxClientOptions {
             shutdown_after_seconds: None,
             pod_labels: BTreeMap::new(),
             pod_annotations: BTreeMap::new(),
+            claim_env: Vec::new(),
             workspace_root: DEFAULT_WORKSPACE_ROOT.to_string(),
             file_api_base_dir: DEFAULT_WORKSPACE_ROOT.to_string(),
             api_url: None,
@@ -361,6 +396,7 @@ pub fn build_claim_body(namespace: &str, claim_name: &str, warm_pool_name: &str)
         None,
         &BTreeMap::new(),
         &BTreeMap::new(),
+        &[],
     )
 }
 
@@ -369,7 +405,8 @@ pub fn build_claim_body(namespace: &str, claim_name: &str, warm_pool_name: &str)
 /// Mirrors the Java `K8sHelper#createSandboxClaim`: caller labels are merged with
 /// [`CREATED_BY_LABEL`] (which always wins), `lifecycle` is only emitted when a TTL was
 /// configured (see [`claim_lifecycle`]) and `additionalPodMetadata` is only emitted when at least
-/// one pod label or annotation is present, so a plain claim keeps the legacy body.
+/// one pod label or annotation is present, so a plain claim keeps the legacy body. `spec.env` is
+/// likewise omitted while `claim_env` is empty.
 pub fn build_claim_body_with_options(
     namespace: &str,
     claim_name: &str,
@@ -378,6 +415,7 @@ pub fn build_claim_body_with_options(
     lifecycle: Option<&Value>,
     pod_labels: &BTreeMap<String, String>,
     pod_annotations: &BTreeMap<String, String>,
+    claim_env: &[KubernetesClaimEnv],
 ) -> Value {
     let mut labels: BTreeMap<String, Value> = claim_labels
         .iter()
@@ -393,6 +431,9 @@ pub fn build_claim_body_with_options(
     spec.insert("warmPoolRef".to_string(), json!({ "name": warm_pool_name }));
     if let Some(lifecycle) = lifecycle {
         spec.insert("lifecycle".to_string(), lifecycle.clone());
+    }
+    if !claim_env.is_empty() {
+        spec.insert("env".to_string(), json!(claim_env));
     }
     let pod_labels: BTreeMap<String, Value> = pod_labels
         .iter()
@@ -546,14 +587,34 @@ pub fn select_pod_ip(pod_ips: &[String]) -> Option<String> {
 }
 
 /// Builds the sandbox server `POST /execute` request body.
-pub fn build_execute_body(command: &str) -> Value {
-    json!({ "command": command })
+///
+/// `timeout_seconds` is the runtime-enforced deadline (Java `CommandExecutor#run` after #3951):
+/// the runtime queues and runs the command under it and reports `timed_out` when it had to kill
+/// the process.
+pub fn build_execute_body(command: &str, timeout_seconds: u64) -> Value {
+    json!({ "command": command, "timeout_seconds": timeout_seconds })
 }
 
 /// Wraps a command so it runs inside `root` (mirrors Java `KubernetesSandbox#doExec`, which
 /// always sends `cd <workspaceRoot> && ( …command… )`).
 pub fn wrap_workspace_command(root: &str, command: &str) -> String {
     format!("cd {} && ( {command} )", shell_quote(root))
+}
+
+/// Builds the "execution outcome is unknown" error for a submitted command.
+///
+/// Mirrors the Java `SandboxRequestException#isExecutionOutcomeUnknown` classification: once
+/// the `POST /execute` was attempted, a transport failure, a non-2xx answer or an untrustworthy
+/// payload says nothing about whether the remote process ran or exited.
+fn exec_outcome_unknown(message: impl Into<String>) -> SandboxExtensionError {
+    SandboxExtensionError::Runtime(
+        SandboxErrorCode::ExecStatusUnknown,
+        format!(
+            "Execution outcome unknown: the command may still be running; inspect its state \
+             before retrying. {}",
+            message.into()
+        ),
+    )
 }
 
 /// Result of a sandbox-server command execution.
@@ -563,11 +624,23 @@ pub struct KubernetesExecResult {
     pub stdout: String,
     /// Captured standard error.
     pub stderr: String,
-    /// Exit code (defaults to -1 when absent).
-    pub exit_code: i32,
+    /// Exit code; `None` when the response carried no integral exit code (an untrustworthy
+    /// outcome, not an exit).
+    pub exit_code: Option<i32>,
+    /// Whether the runtime confirmed that it killed the command at its deadline
+    /// (Java `ExecutionResult#isTimedOut`, serialized as `timed_out`).
+    pub timed_out: bool,
+}
+
+/// Returns the first present field among `names`.
+fn result_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a Value> {
+    names.iter().find_map(|name| value.get(*name))
 }
 
 /// Parses a sandbox-server `ExecutionResult` response.
+///
+/// The runtime emits `exit_code` / `timed_out` (Java `ExecutionResult`); the camelCase spellings
+/// older fixtures used are accepted too.
 pub fn parse_execute_result(value: &Value) -> KubernetesExecResult {
     KubernetesExecResult {
         stdout: value
@@ -580,7 +653,12 @@ pub fn parse_execute_result(value: &Value) -> KubernetesExecResult {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        exit_code: value.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32,
+        exit_code: result_field(value, &["exit_code", "exitCode"])
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok()),
+        timed_out: result_field(value, &["timed_out", "timedOut"])
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -920,6 +998,9 @@ pub fn connector_router_headers(
 pub struct KubernetesBackend {
     options: KubernetesSandboxClientOptions,
     client: Client,
+    /// Client for command submissions: never follows redirects, because a replayed POST could
+    /// start the command twice (Java `SandboxConnector.commandHttpClient`).
+    command_client: Client,
     retry: RetryPolicy,
     /// Claims this backend created or attached to, as `"{namespace}/{claimName}"` keys.
     ///
@@ -932,16 +1013,23 @@ pub struct KubernetesBackend {
 }
 
 impl KubernetesBackend {
-    /// Builds a backend, wiring up the reqwest client and retry policy.
-    pub fn new(options: KubernetesSandboxClientOptions) -> SandboxResult<Self> {
+    /// Builds an HTTP client for this backend.
+    ///
+    /// `redirect` mirrors Java's split between the ordinary client and
+    /// `SandboxConnector.commandHttpClient`.
+    fn build_client(
+        options: &KubernetesSandboxClientOptions,
+        redirect: reqwest::redirect::Policy,
+    ) -> SandboxResult<Client> {
         // Any of the configured endpoints can be a locally served router (port-forward, local
         // gateway); such traffic must stay off the ambient proxy.
-        let client = bypass_proxy_for_loopback(
+        bypass_proxy_for_loopback(
             Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(
                     options.connect_timeout_seconds,
                 ))
-                .timeout(std::time::Duration::from_secs(options.read_timeout_seconds)),
+                .timeout(std::time::Duration::from_secs(options.read_timeout_seconds))
+                .redirect(redirect),
             &[
                 options.api_url.as_deref().unwrap_or_default(),
                 options.sandbox_api_url.as_deref().unwrap_or_default(),
@@ -949,11 +1037,18 @@ impl KubernetesBackend {
             ],
         )
         .build()
-        .map_err(|e| SandboxExtensionError::Transport(format!("failed to build client: {e}")))?;
+        .map_err(|e| SandboxExtensionError::Transport(format!("failed to build client: {e}")))
+    }
+
+    /// Builds a backend, wiring up the reqwest client and retry policy.
+    pub fn new(options: KubernetesSandboxClientOptions) -> SandboxResult<Self> {
+        let client = Self::build_client(&options, reqwest::redirect::Policy::limited(10))?;
+        let command_client = Self::build_client(&options, reqwest::redirect::Policy::none())?;
         let retry = RetryPolicy::kubernetes(options.max_retries);
         Ok(Self {
             options,
             client,
+            command_client,
             retry,
             active_claims: Arc::new(Mutex::new(BTreeSet::new())),
         })
@@ -1434,6 +1529,94 @@ impl KubernetesBackend {
         extracted
     }
 
+    /// Verifies the runtime execution-timeout contract and returns the whole-exchange budget.
+    ///
+    /// Mirrors the Java `CommandExecutor#executionRequestTimeout`: `GET /capabilities` must
+    /// advertise `execute.timeout_seconds == true`, a positive `max_timeout_seconds` and a
+    /// non-negative `cleanup_timeout_seconds`, otherwise the command is never submitted. The
+    /// budget covers queueing, execution, the runtime's cleanup allowance and one transport
+    /// attempt, and bounds response headers **and** the response body.
+    async fn execute_exchange_budget(
+        &self,
+        base: &str,
+        headers: &[(String, String)],
+        timeout_seconds: u64,
+    ) -> SandboxResult<std::time::Duration> {
+        let url = join_url(base, CAPABILITIES_ENDPOINT);
+        let attempt_timeout = std::time::Duration::from_secs(self.options.read_timeout_seconds);
+        let client = self.client.clone();
+        let headers = headers.to_vec();
+        let value = with_retries(
+            &RetryPolicy::kubernetes(CAPABILITY_MAX_ATTEMPTS),
+            move || {
+                let client = client.clone();
+                let url = url.clone();
+                let headers = headers.clone();
+                async move {
+                    let mut request = client.get(&url).timeout(attempt_timeout);
+                    for (key, value) in &headers {
+                        request = request.header(key, value);
+                    }
+                    let response = request
+                        .send()
+                        .await
+                        .map_err(|e| SandboxExtensionError::Transport(e.to_string()))?;
+                    Self::decode_json(response, &url).await
+                }
+            },
+        )
+        .await
+        .map_err(|e| match e.status() {
+            Some(status) => SandboxExtensionError::Runtime(
+                SandboxErrorCode::CommandExecutionError,
+                format!(
+                    "Runtime does not advertise execution timeout support; command was not \
+                     submitted. Upgrade the sandbox runtime (status={status})."
+                ),
+            ),
+            None => SandboxExtensionError::Runtime(
+                SandboxErrorCode::CommandExecutionError,
+                format!(
+                    "Cannot verify runtime execution timeout support; command was not \
+                     submitted: {e}"
+                ),
+            ),
+        })?;
+
+        let execute = value.get("execute").unwrap_or(&Value::Null);
+        let max = execute.get("max_timeout_seconds").and_then(Value::as_u64);
+        let cleanup = execute
+            .get("cleanup_timeout_seconds")
+            .and_then(Value::as_u64);
+        let advertises = execute.get("timeout_seconds").and_then(Value::as_bool) == Some(true);
+        let invalid = || {
+            SandboxExtensionError::Runtime(
+                SandboxErrorCode::CommandExecutionError,
+                "Runtime execution timeout capabilities are invalid; command was not submitted."
+                    .to_string(),
+            )
+        };
+        let (Some(max), Some(cleanup)) = (max, cleanup) else {
+            return Err(invalid());
+        };
+        if !advertises || max == 0 {
+            return Err(invalid());
+        }
+        if timeout_seconds > max {
+            return Err(SandboxExtensionError::Http {
+                status: 422,
+                body: format!(
+                    "Requested timeout exceeds runtime maximum of {max} seconds; command was \
+                     not submitted."
+                ),
+            });
+        }
+        let budget = timeout_seconds
+            .saturating_add(cleanup)
+            .saturating_add(self.options.read_timeout_seconds);
+        Ok(std::time::Duration::from_secs(budget))
+    }
+
     async fn decode_json(response: Response, url: &str) -> SandboxResult<Value> {
         let status = response.status();
         let text = response
@@ -1595,6 +1778,7 @@ impl RemoteBackend for KubernetesBackend {
             lifecycle.as_ref(),
             &self.options.pod_labels,
             &self.options.pod_annotations,
+            &self.options.claim_env,
         );
         self.k8s_request(reqwest::Method::POST, &collection, Some(body))
             .await?;
@@ -1631,40 +1815,66 @@ impl RemoteBackend for KubernetesBackend {
                 "empty command rejected by KubernetesSandbox".to_string(),
             ));
         }
+        // Java `CommandExecutor#validateTimeout`: only a positive whole number of seconds is a
+        // valid deadline (Rust's `u64` cannot express a fractional one).
+        if timeout_seconds == 0 {
+            return Err(SandboxExtensionError::Configuration(
+                "timeout must be a positive whole number of seconds".to_string(),
+            ));
+        }
         let base = self.connector_base_url(handle).await?;
-        let url = join_url(&base, "execute");
+        let headers = self.router_headers(handle);
+        // The runtime must advertise that it enforces `timeout_seconds` before a command is
+        // submitted, and the returned budget bounds the whole HTTP exchange (headers and body).
+        let budget = self
+            .execute_exchange_budget(&base, &headers, timeout_seconds)
+            .await?;
+        let url = join_url(&base, EXECUTE_ENDPOINT);
         // A caller-supplied cwd is the workspace root: run the command inside it like Java does.
         // Internal archive/hydrate commands pass no cwd and keep their absolute paths.
         let body = match cwd.filter(|c| !c.trim().is_empty()) {
-            Some(root) => build_execute_body(&wrap_workspace_command(root, command)),
-            None => build_execute_body(command),
-        };
-        let headers = self.router_headers(handle);
-        let client = self.client.clone();
-        let retry = self.retry.clone();
-        let _ = timeout_seconds;
-        let value = with_retries(&retry, move || {
-            let client = client.clone();
-            let url = url.clone();
-            let body = body.clone();
-            let headers = headers.clone();
-            async move {
-                let mut request = client.post(&url);
-                for (key, value) in &headers {
-                    request = request.header(key, value);
-                }
-                let response = request
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| SandboxExtensionError::Transport(e.to_string()))?;
-                Self::decode_json(response, &url).await
+            Some(root) => {
+                build_execute_body(&wrap_workspace_command(root, command), timeout_seconds)
             }
-        })
-        .await?;
+            None => build_execute_body(command, timeout_seconds),
+        };
+        // Command submissions are single-attempt and never follow redirects (Java
+        // `SandboxConnector.commandHttpClient`): a replayed POST could start the command twice.
+        // The per-request budget overrides the client-level read timeout, so a long command is
+        // bounded by its own budget rather than `read_timeout_seconds`.
+        let mut request = self.command_client.post(&url).timeout(budget);
+        for (key, value) in &headers {
+            request = request.header(key, value);
+        }
+        let response = request
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| exec_outcome_unknown(e.to_string()))?;
+        let value = Self::decode_json(response, &url)
+            .await
+            .map_err(|e| exec_outcome_unknown(e.to_string()))?;
         let parsed = parse_execute_result(&value);
+        let Some(exit_code) = parsed.exit_code else {
+            return Err(exec_outcome_unknown(
+                "the execute response carried no integral exit code".to_string(),
+            ));
+        };
+        if parsed.timed_out {
+            // A confirmed runtime timeout is an *execution result*, not a transport failure (Java
+            // `ExecutionResult#isTimedOut` → `ExecException(exit, stdout, stderr, timedOut=true)`):
+            // the partial output survives and the deadline travels as the conventional exit code.
+            // A plain exit 124 is *not* a timeout
+            // (Java `KubernetesSandboxTest#exitCode124AloneDoesNotConfirmRuntimeTimeout`).
+            return Ok(RemoteExecOutput {
+                exit_code: TIMEOUT_EXIT_CODE,
+                stdout: parsed.stdout,
+                stderr: parsed.stderr,
+                truncated: false,
+            });
+        }
         Ok(RemoteExecOutput {
-            exit_code: parsed.exit_code,
+            exit_code,
             stdout: parsed.stdout,
             stderr: parsed.stderr,
             truncated: false,
@@ -1786,6 +1996,7 @@ mod tests {
             lifecycle.as_ref(),
             &pod_labels,
             &pod_annotations,
+            &[],
         );
         assert_eq!(body["metadata"]["labels"]["team"], "sandbox");
         assert_eq!(
@@ -1810,10 +2021,44 @@ mod tests {
         let body = build_claim_body("ns", "agentscope-s1", "pool-a");
         assert!(body["spec"].get("lifecycle").is_none());
         assert!(body["spec"].get("additionalPodMetadata").is_none());
+        assert!(body["spec"].get("env").is_none());
         assert_eq!(
             body["metadata"]["labels"].as_object().map(|m| m.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn claim_body_carries_creation_env() {
+        // 对齐 Java `KubernetesClaimEnvTest`：`name`/`value`/`containerName` 进 `spec.env`，
+        // 未指定容器时不发 `containerName` 键。
+        let env = vec![
+            KubernetesClaimEnv {
+                name: "WORKSPACE_SUBPATH".to_string(),
+                value: "users/1001".to_string(),
+                container_name: Some("python-runtime".to_string()),
+            },
+            KubernetesClaimEnv {
+                name: "TZ".to_string(),
+                value: "UTC".to_string(),
+                container_name: None,
+            },
+        ];
+        let body = build_claim_body_with_options(
+            "ns",
+            "agentscope-s1",
+            "pool-a",
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &env,
+        );
+        assert_eq!(body["spec"]["env"][0]["name"], "WORKSPACE_SUBPATH");
+        assert_eq!(body["spec"]["env"][0]["value"], "users/1001");
+        assert_eq!(body["spec"]["env"][0]["containerName"], "python-runtime");
+        assert_eq!(body["spec"]["env"][1]["name"], "TZ");
+        assert!(body["spec"]["env"][1].get("containerName").is_none());
     }
 
     #[test]
@@ -1918,6 +2163,7 @@ mod tests {
                     .path(
                         "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/team-a/sandboxclaims",
                     )
+                    .body_contains("WORKSPACE_SUBPATH")
                     .json_body_partial(
                         json!({
                             "metadata": {"labels": {"team": "blue"}},
@@ -1961,6 +2207,11 @@ mod tests {
             shutdown_after_seconds: Some(600),
             pod_labels,
             pod_annotations,
+            claim_env: vec![KubernetesClaimEnv {
+                name: "WORKSPACE_SUBPATH".to_string(),
+                value: "users/1001".to_string(),
+                container_name: Some("python-runtime".to_string()),
+            }],
             sandbox_ready_timeout_seconds: 30,
             max_retries: 1,
             ..Default::default()
@@ -2042,16 +2293,26 @@ mod tests {
 
     #[test]
     fn execute_body_shape() {
-        assert_eq!(build_execute_body("ls -la"), json!({"command": "ls -la"}));
+        assert_eq!(
+            build_execute_body("ls -la", 30),
+            json!({"command": "ls -la", "timeout_seconds": 30})
+        );
     }
 
     #[test]
     fn parse_execute_result_reads_fields() {
-        let parsed = parse_execute_result(&json!({"stdout": "o", "stderr": "e", "exitCode": 2}));
+        let parsed = parse_execute_result(&json!({ "stdout": "o", "stderr": "e", "exit_code": 2 }));
         assert_eq!(parsed.stdout, "o");
         assert_eq!(parsed.stderr, "e");
-        assert_eq!(parsed.exit_code, 2);
-        assert_eq!(parse_execute_result(&json!({})).exit_code, -1);
+        assert_eq!(parsed.exit_code, Some(2));
+        assert!(!parsed.timed_out);
+        // camelCase spellings from older fixtures still parse.
+        assert_eq!(
+            parse_execute_result(&json!({"exitCode": 3})).exit_code,
+            Some(3)
+        );
+        assert_eq!(parse_execute_result(&json!({})).exit_code, None);
+        assert!(parse_execute_result(&json!({"exit_code": 124, "timed_out": true})).timed_out);
     }
 
     #[test]
@@ -2322,10 +2583,28 @@ mod tests {
         RemoteSandboxHandle::new("agentscope-s1", extra)
     }
 
+    /// Answers `GET /capabilities` with the Java `CommandExecutorTest` fixture values.
+    async fn stub_execute_capabilities(server: &httpmock::MockServer) {
+        use httpmock::prelude::*;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/capabilities");
+                then.status(200).json_body(json!({
+                    "execute": {
+                        "timeout_seconds": true,
+                        "max_timeout_seconds": 900,
+                        "cleanup_timeout_seconds": 6
+                    }
+                }));
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn exec_sends_router_headers_for_router_strategies() {
         use httpmock::prelude::*;
         let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
         let mock = server
             .mock_async(|when, then| {
                 when.method(POST)
@@ -2334,7 +2613,7 @@ mod tests {
                     .header("x-sandbox-namespace", "team-a")
                     .header("x-sandbox-port", "8888")
                     .header("x-sandbox-pod-ip", "10.0.0.5")
-                    .json_body(json!({"command": "ls"}));
+                    .json_body(json!({"command": "ls", "timeout_seconds": 5}));
                 then.status(200)
                     .json_body(json!({"stdout": "o", "stderr": "", "exitCode": 0}));
             })
@@ -2352,10 +2631,12 @@ mod tests {
     async fn exec_runs_inside_the_workspace_root() {
         use httpmock::prelude::*;
         let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
         let mock = server
             .mock_async(|when, then| {
                 when.method(POST).path("/execute").json_body(json!({
                     "command": "cd /workspace && ( ls )",
+                    "timeout_seconds": 5,
                 }));
                 then.status(200)
                     .json_body(json!({"stdout": "o", "stderr": "", "exitCode": 0}));
@@ -2373,6 +2654,313 @@ mod tests {
             .expect("exec succeeds");
         assert_eq!(output.stdout, "o");
         mock.assert_async().await;
+    }
+
+    /// java #3951: a runtime that does not advertise timeout support is never asked to run.
+    #[tokio::test]
+    async fn exec_fails_closed_when_the_runtime_does_not_advertise_timeouts() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/capabilities");
+                then.status(404).body("not found");
+            })
+            .await;
+        let execute = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute");
+                then.status(200).json_body(json!({"exit_code": 0}));
+            })
+            .await;
+        let backend = file_api_backend(&server.base_url(), DEFAULT_WORKSPACE_ROOT);
+        let err = backend
+            .exec_in(&handle_with_pod_ip("10.0.0.5"), "ls", None, 5)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not advertise execution timeout support"),
+            "got {err}"
+        );
+        assert_eq!(execute.hits_async().await, 0);
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_incomplete_capabilities_before_submitting() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/capabilities");
+                then.status(200)
+                    .json_body(json!({"execute": {"timeout_seconds": true}}));
+            })
+            .await;
+        let execute = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute");
+                then.status(200).json_body(json!({"exit_code": 0}));
+            })
+            .await;
+        let backend = file_api_backend(&server.base_url(), DEFAULT_WORKSPACE_ROOT);
+        let err = backend
+            .exec_in(&handle_with_pod_ip("10.0.0.5"), "ls", None, 5)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("capabilities are invalid"),
+            "got {err}"
+        );
+        assert_eq!(execute.hits_async().await, 0);
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_a_timeout_above_the_runtime_maximum() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
+        let execute = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute");
+                then.status(200).json_body(json!({"exit_code": 0}));
+            })
+            .await;
+        let backend = file_api_backend(&server.base_url(), DEFAULT_WORKSPACE_ROOT);
+        let err = backend
+            .exec_in(&handle_with_pod_ip("10.0.0.5"), "ls", None, 901)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exceeds runtime maximum of 900 seconds"),
+            "got {err}"
+        );
+        assert_eq!(err.status(), Some(422));
+        assert_eq!(execute.hits_async().await, 0);
+    }
+
+    /// java #3951: only the runtime's `timed_out` confirms a timeout, and it keeps the output.
+    #[tokio::test]
+    async fn exec_maps_a_confirmed_runtime_timeout_to_the_deadline_exit_code() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute");
+                then.status(200).json_body(json!({
+                    "stdout": "before",
+                    "stderr": "killed",
+                    "exit_code": 137,
+                    "timed_out": true
+                }));
+            })
+            .await;
+        let backend = file_api_backend(&server.base_url(), DEFAULT_WORKSPACE_ROOT);
+        let output = backend
+            .exec_in(&handle_with_pod_ip("10.0.0.5"), "sleep 10", None, 2)
+            .await
+            .expect("a confirmed timeout is a result, not a transport failure");
+        assert_eq!(output.exit_code, TIMEOUT_EXIT_CODE);
+        assert_eq!(output.stdout, "before");
+        assert_eq!(output.stderr, "killed");
+    }
+
+    #[tokio::test]
+    async fn an_exit_code_alone_does_not_confirm_a_runtime_timeout() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute");
+                then.status(200)
+                    .json_body(json!({"stdout": "before", "stderr": "", "exit_code": 124}));
+            })
+            .await;
+        let backend = file_api_backend(&server.base_url(), DEFAULT_WORKSPACE_ROOT);
+        let output = backend
+            .exec_in(&handle_with_pod_ip("10.0.0.5"), "exit 124", None, 2)
+            .await
+            .expect("a plain exit code is a confirmed result");
+        assert_eq!(output.exit_code, 124);
+        assert_eq!(output.stdout, "before");
+    }
+
+    /// java #3951: an unconfirmed submission is an unknown outcome, not a fake exit code.
+    #[tokio::test]
+    async fn exec_reports_an_unknown_outcome_without_an_exit_code() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute");
+                then.status(200).json_body(json!({"stdout": "partial"}));
+            })
+            .await;
+        let backend = file_api_backend(&server.base_url(), DEFAULT_WORKSPACE_ROOT);
+        let err = backend
+            .exec_in(&handle_with_pod_ip("10.0.0.5"), "side-effect", None, 2)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SandboxExtensionError::Runtime(SandboxErrorCode::ExecStatusUnknown, _)
+            ),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_reports_an_unknown_outcome_for_a_failed_response() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute");
+                then.status(500).body("boom");
+            })
+            .await;
+        let backend = file_api_backend(&server.base_url(), DEFAULT_WORKSPACE_ROOT);
+        let err = backend
+            .exec_in(&handle_with_pod_ip("10.0.0.5"), "side-effect", None, 2)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Execution outcome unknown"),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("EXEC_STATUS_UNKNOWN"), "got {err}");
+    }
+
+    /// java #4006: the command budget — not the client read timeout — bounds header waiting.
+    #[tokio::test]
+    async fn a_slow_command_waits_past_the_client_read_timeout() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/capabilities");
+                then.status(200).json_body(json!({
+                    "execute": {
+                        "timeout_seconds": true,
+                        "max_timeout_seconds": 900,
+                        "cleanup_timeout_seconds": 0
+                    }
+                }));
+            })
+            .await;
+        let execute = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute");
+                then.status(200)
+                    .delay(std::time::Duration::from_millis(1500))
+                    .json_body(json!({"stdout": "done", "stderr": "", "exit_code": 0}));
+            })
+            .await;
+        let backend = KubernetesBackend::new(KubernetesSandboxClientOptions {
+            namespace: "team-a".to_string(),
+            sandbox_api_url: Some(server.base_url()),
+            file_api_base_dir: DEFAULT_WORKSPACE_ROOT.to_string(),
+            read_timeout_seconds: 1,
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let output = backend
+            .exec_in(&handle_with_pod_ip("10.0.0.5"), "slow", None, 3)
+            .await
+            .expect("the command budget outlives the client read timeout");
+        assert_eq!(output.stdout, "done");
+        execute.assert_async().await;
+    }
+
+    /// java #3884: a peer that stalls the body cannot block past the exchange budget.
+    #[tokio::test]
+    async fn exec_bounds_a_stalled_exchange_and_reports_unknown() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/capabilities");
+                then.status(200).json_body(json!({
+                    "execute": {
+                        "timeout_seconds": true,
+                        "max_timeout_seconds": 900,
+                        "cleanup_timeout_seconds": 0
+                    }
+                }));
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute");
+                then.status(200)
+                    .delay(std::time::Duration::from_secs(10))
+                    .body("late");
+            })
+            .await;
+        let backend = KubernetesBackend::new(KubernetesSandboxClientOptions {
+            namespace: "team-a".to_string(),
+            sandbox_api_url: Some(server.base_url()),
+            file_api_base_dir: DEFAULT_WORKSPACE_ROOT.to_string(),
+            read_timeout_seconds: 1,
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        let err = backend
+            .exec_in(&handle_with_pod_ip("10.0.0.5"), "sleep 60", None, 1)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(6));
+        assert!(
+            matches!(
+                err,
+                SandboxExtensionError::Runtime(SandboxErrorCode::ExecStatusUnknown, _)
+            ),
+            "got {err}"
+        );
+    }
+
+    /// java #3951: a command submission never follows a redirect, so it cannot run twice.
+    #[tokio::test]
+    async fn a_command_submission_does_not_follow_redirects() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
+        let submit = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute");
+                then.status(307).header("location", "/execute-again");
+            })
+            .await;
+        let replay = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute-again");
+                then.status(200)
+                    .json_body(json!({"stdout": "o", "stderr": "", "exit_code": 0}));
+            })
+            .await;
+        let backend = file_api_backend(&server.base_url(), DEFAULT_WORKSPACE_ROOT);
+        let err = backend
+            .exec_in(&handle_with_pod_ip("10.0.0.5"), "side-effect", None, 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SandboxExtensionError::Runtime(SandboxErrorCode::ExecStatusUnknown, _)
+            ),
+            "a redirect must be reported as an unknown outcome, got {err}"
+        );
+        assert_eq!(submit.hits_async().await, 1);
+        assert_eq!(replay.hits_async().await, 0);
     }
 
     #[test]
@@ -2406,6 +2994,7 @@ mod tests {
     async fn file_transfer_uploads_and_downloads_under_the_base_dir() {
         use httpmock::prelude::*;
         let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
         // `upload_file` creates the parent directory through the exec channel first.
         let mkdir = server
             .mock_async(|when, then| {
@@ -2460,6 +3049,7 @@ mod tests {
     async fn persist_workspace_uses_the_file_api_when_enabled() {
         use httpmock::prelude::*;
         let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
         let tar = server
             .mock_async(|when, then| {
                 when.method(POST)
@@ -2500,6 +3090,7 @@ mod tests {
         use base64::Engine as _;
         use httpmock::prelude::*;
         let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
         let expected = base64::engine::general_purpose::STANDARD.encode(b"PLAIN");
         let mock = server
             .mock_async(|when, then| {
@@ -2527,6 +3118,7 @@ mod tests {
     async fn hydrate_workspace_uploads_the_archive_then_extracts() {
         use httpmock::prelude::*;
         let server = MockServer::start_async().await;
+        stub_execute_capabilities(&server).await;
         let upload = server
             .mock_async(|when, then| {
                 when.method(POST).path("/upload").body_contains("TARDATA");

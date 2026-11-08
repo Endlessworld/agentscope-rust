@@ -20,6 +20,12 @@ pub enum SandboxErrorCode {
     /// Mirrors the Java `SandboxErrorCode.EXEC_TIMEOUT`, raised by
     /// `SandboxException.ExecTimeoutException`.
     ExecTimeout,
+    /// A command submission was attempted but did not produce a trustworthy process result.
+    ///
+    /// Mirrors the Java `SandboxErrorCode.EXEC_STATUS_UNKNOWN`, raised by
+    /// `SandboxException.ExecStatusUnknownException`: the remote process may still be running,
+    /// so the caller must inspect its state before retrying.
+    ExecStatusUnknown,
     /// Failure while reading a workspace archive from the remote sandbox.
     WorkspaceArchiveReadError,
     /// Failure while writing a workspace archive to the remote sandbox.
@@ -43,6 +49,7 @@ impl SandboxErrorCode {
             SandboxErrorCode::WorkspaceStopError => "WORKSPACE_STOP_ERROR",
             SandboxErrorCode::CommandExecutionError => "COMMAND_EXECUTION_ERROR",
             SandboxErrorCode::ExecTimeout => "EXEC_TIMEOUT",
+            SandboxErrorCode::ExecStatusUnknown => "EXEC_STATUS_UNKNOWN",
             SandboxErrorCode::WorkspaceArchiveReadError => "WORKSPACE_ARCHIVE_READ_ERROR",
             SandboxErrorCode::WorkspaceArchiveWriteError => "WORKSPACE_ARCHIVE_WRITE_ERROR",
             SandboxErrorCode::RemoteTransportError => "REMOTE_TRANSPORT_ERROR",

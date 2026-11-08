@@ -616,7 +616,10 @@ impl SandboxFileTransfer for KubernetesFileTransfer {
                 if output.exit_code != 0 {
                     return Err(SandboxExtensionError::Runtime(
                         crate::error::SandboxErrorCode::WorkspaceStartError,
-                        format!("mkdir failed for {absolute_path}: {}", output.stderr),
+                        format!(
+                            "mkdir failed (exit={}) for {absolute_path}: {}",
+                            output.exit_code, output.stderr
+                        ),
                     ));
                 }
             }

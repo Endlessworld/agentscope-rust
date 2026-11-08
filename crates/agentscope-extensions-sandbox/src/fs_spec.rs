@@ -42,7 +42,7 @@ use crate::agentrun::{agentrun_client, AgentRunSandboxClientOptions};
 use crate::daytona::{daytona_client, DaytonaSandboxClientOptions};
 use crate::e2b::{e2b_client, E2bSandboxClientOptions};
 use crate::error::{SandboxErrorCode, SandboxExtensionError, SandboxResult};
-use crate::kubernetes::{kubernetes_client, KubernetesSandboxClientOptions};
+use crate::kubernetes::{kubernetes_client, KubernetesClaimEnv, KubernetesSandboxClientOptions};
 use crate::kubernetes_files::SandboxFileTransfer;
 use crate::remote::RemoteSandbox;
 use crate::workspace::shell_quote;
@@ -494,6 +494,10 @@ impl SandboxFilesystemAdapter {
             output: result.combined_output(),
             exit_code: result.exit_code,
             truncated: result.truncated,
+            // The runtime reports a confirmed timeout with the `timeout(1)` convention (124, see
+            // `kubernetes::TIMEOUT_EXIT_CODE`); an `ExecResult` carries no separate flag. Backends
+            // that report a timeout as `None`/`-1` are upgraded separately.
+            timed_out: result.exit_code == 124,
         })
     }
 
@@ -1076,6 +1080,17 @@ platform_spec!(
     "`SandboxFilesystemSpec` for the agent-sandbox Kubernetes backend."
 );
 
+impl KubernetesFilesystemSpec {
+    /// Registers creation-time claim environment (Java `KubernetesFilesystemSpec#claimEnv`).
+    ///
+    /// The entries land in `SandboxClaim.spec.env`; an empty list clears them and omits the
+    /// field from the claim body.
+    pub fn claim_env(mut self, env: Vec<KubernetesClaimEnv>) -> Self {
+        self.options.claim_env = env;
+        self
+    }
+}
+
 impl E2bFilesystemSpec {
     /// Registers a sandbox-creation environment variable (Java `E2bFilesystemSpec#env`).
     ///
@@ -1256,6 +1271,19 @@ mod tests {
         assert!(context.client().is_some());
         assert_eq!(context.isolation_scope(), Some(&IsolationScope::Agent));
         assert!(context.workspace_spec().is_some());
+    }
+
+    #[test]
+    fn kubernetes_filesystem_spec_forwards_claim_env() {
+        let spec = KubernetesFilesystemSpec::new(KubernetesSandboxClientOptions::default())
+            .claim_env(vec![KubernetesClaimEnv {
+                name: "WORKSPACE_SUBPATH".to_string(),
+                value: "users/1001".to_string(),
+                container_name: None,
+            }]);
+        assert_eq!(spec.options().claim_env.len(), 1);
+        assert_eq!(spec.options().claim_env[0].name, "WORKSPACE_SUBPATH");
+        assert!(spec.claim_env(Vec::new()).options().claim_env.is_empty());
     }
 
     #[test]
