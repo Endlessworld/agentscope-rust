@@ -146,6 +146,15 @@ pub fn normalize_agent_id(agent_id: impl AsRef<str>) -> String {
         .collect()
 }
 
+/// Runtime-context key carrying the per-call model id.
+///
+/// The Rust entry points take messages plus a per-run [`Extensions`] bag instead of a
+/// caller-built [`RuntimeContext`], so this key is how a per-run caller stamps a model
+/// selection: [`RuntimeContext::model_id`] is lifted from it at the start of a run
+/// (`ReActAgent::call_with_model` for one-shot calls,
+/// `ReActAgent::stream_events_with_extensions` for streamed ones).
+pub const MODEL_ID_CONTEXT_KEY: &str = "model_id";
+
 /// Runtime context shared across agent execution, mirroring `RuntimeContext`.
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeContext {
@@ -174,6 +183,13 @@ pub struct RuntimeContext {
     pub agent_id: Option<String>,
     /// Correlation id for this single execution, aligned with [`crate::agent::AgentRun::run_id`].
     pub run_id: Option<String>,
+    /// Per-call model selection: the id of the model that serves this call, resolved by the
+    /// agent through its `model_resolver`. `None` means the agent's default model.
+    ///
+    /// Mirrors Java `RuntimeContext.modelId`: not an attribute, so tools never see it, and not
+    /// persisted in `AgentState` — the choice belongs to the caller, per call. A set-but-blank
+    /// or unresolvable id fails the call instead of silently using the default model.
+    pub model_id: Option<String>,
     /// Optional sender used to forward fine-grained delta events (text/thinking)
     /// from deep inside the model call up to the agent-level event stream, enabling
     /// incremental (token-by-token) rendering.
@@ -239,6 +255,20 @@ impl RuntimeContext {
     /// Returns the run id, or `None` for an ad-hoc context (tool calls, tests).
     pub fn run_id(&self) -> Option<&str> {
         self.run_id.as_deref()
+    }
+
+    /// Sets the per-call model id, stored verbatim.
+    ///
+    /// A blank id is rejected when the call resolves its model rather than being silently
+    /// treated as "no selection": see `ReActAgent::effective_model`.
+    pub fn with_model_id(mut self, model_id: impl Into<String>) -> Self {
+        self.model_id = Some(model_id.into());
+        self
+    }
+
+    /// Returns the per-call model id, if any.
+    pub fn model_id(&self) -> Option<&str> {
+        self.model_id.as_deref()
     }
 }
 

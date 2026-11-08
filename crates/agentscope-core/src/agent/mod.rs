@@ -18,5 +18,6 @@ pub use run::{
 };
 pub use runtime_context::{
     normalize_agent_id, Extensions, RuntimeContext, DEFAULT_AGENT_ID, MAX_AGENT_ID_LENGTH,
+    MODEL_ID_CONTEXT_KEY,
 };
 pub use stream_options::{EventCategory, StreamOptions, StreamOptionsBuilder};

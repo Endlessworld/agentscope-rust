@@ -16,6 +16,7 @@ use futures::StreamExt;
 
 use super::agent_traits::{Agent, CallableAgent, ObservableAgent};
 use super::lifecycle::{CallGate, ExecutionGuard};
+use super::runtime_context::MODEL_ID_CONTEXT_KEY;
 use super::stream_options::StreamOptions;
 use crate::agent::run::{
     AgentRun, CancelSignal, RunControl, RunStatus, CANCEL_SIGNAL_CONTEXT_KEY,
@@ -84,6 +85,13 @@ struct AgentCore {
     /// Observer notified when the fallback takes over. Mirrors Java
     /// `ModelConfig.failoverListener`.
     failover_listener: Option<Arc<dyn crate::agent::FailoverListener>>,
+    /// Resolves a per-call model id to the model that serves the call.
+    ///
+    /// Mirrors Java `ModelRegistry#resolve`, which Rust cannot reproduce: its registry is a
+    /// *provider* registry, not a map of named model instances (CORE-D17). Without a resolver a
+    /// per-call selection cannot be honoured and fails the call instead of silently running the
+    /// agent's default model.
+    model_resolver: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn Model>> + Send + Sync>>,
     /// Per-call generation defaults (reasoning effort, retry policy, ...)
     /// merged into every model request built by this agent.
     generate_options_defaults: Mutex<GenerateOptions>,
@@ -225,13 +233,24 @@ struct ReasoningContext {
     /// `ReasoningContext.finishReason`, which decides whether an empty tool call
     /// start was truncated by the output-token limit.
     finish_reason: Option<String>,
+    /// Provider metadata carried by the response chunks (`anthropic.citations`, `dashscope.skill`,
+    /// ...). It only travels on the streamed chunks, so it has to be merged here or the final
+    /// assistant message never carries it (Java `ReasoningContext#responseMetadata`).
+    metadata: JsonMap,
 }
 
 impl ReasoningContext {
     /// Merges a streamed chunk into this accumulator.
-    fn accumulate(&mut self, chunk: crate::model::ChatResponse) {
+    fn accumulate(&mut self, mut chunk: crate::model::ChatResponse) {
         if self.id.is_empty() {
             self.id = chunk.id.clone();
+        }
+        // A later chunk wins on a conflicting key and an empty map never clears an earlier one:
+        // providers send the payload (citations, skill, reasoning signatures) on the last chunk
+        // only, so dropping it here would make those migrations invisible to the host.
+        if !chunk.metadata.is_empty() {
+            let metadata = std::mem::take(&mut chunk.metadata);
+            self.metadata.extend(metadata);
         }
         if chunk.finish_reason.is_some() {
             self.finish_reason = chunk.finish_reason.clone();
@@ -304,7 +323,12 @@ impl ReasoningContext {
         for tr in self.tool_results {
             blocks.push(ContentBlock::ToolResult(tr));
         }
-        let mut b = Msg::builder().role(MsgRole::Assistant).content(blocks);
+        let mut b = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(blocks)
+            // Provider metadata the response chunks carried (document citations, DashScope
+            // skill, ...): the host needs it on the reply it inspects.
+            .metadata(self.metadata);
         if !self.id.is_empty() {
             b = b.id(self.id);
         }
@@ -509,6 +533,22 @@ impl ReActAgent {
         *self.core.model.lock().unwrap() = model;
     }
 
+    /// The model that serves a call carrying `context`. Mirrors Java
+    /// `ReActAgent#getModel(RuntimeContext)`.
+    ///
+    /// A per-call [`crate::agent::RuntimeContext::model_id`] wins over the default model and is
+    /// resolved through [`ReActAgentBuilder::model_resolver`]; a set-but-blank or unresolvable id
+    /// fails the call rather than silently using the default model (the wrong model — and, in a
+    /// multi-tenant host, the wrong credentials — is worse than a failed call). Callers that
+    /// stamp the selection per run use [`ReActAgent::call_with_model`] or
+    /// [`crate::agent::MODEL_ID_CONTEXT_KEY`].
+    pub fn effective_model(
+        &self,
+        context: &crate::agent::RuntimeContext,
+    ) -> Result<Arc<dyn Model>> {
+        effective_model(&self.core, context)
+    }
+
     /// Sets per-call generation defaults (e.g. reasoning effort, retry policy)
     /// merged into every model request built by this agent.
     pub fn set_generate_options_defaults(&self, options: GenerateOptions) {
@@ -525,8 +565,13 @@ impl ReActAgent {
     /// The engine is consulted on every tool call, so after a mode switch the
     /// *next* tool call is already evaluated against the new rules. State such as
     /// accumulated conversation history is untouched.
+    ///
+    /// The replacement is mirrored into the call-scoped state, which is what a checkpoint
+    /// persists (Java writes it into `AgentState.permissionContext`): a host reading the state
+    /// back — or rebuilding the agent from it — sees the rules that actually ran.
     pub fn set_permission_context(&self, ctx: PermissionContextState) {
-        *self.core.permission_engine.lock().unwrap() = PermissionEngine::new(ctx);
+        *self.core.permission_engine.lock().unwrap() = PermissionEngine::new(ctx.clone());
+        self.core.state.lock().unwrap().set_permission_context(ctx);
     }
 
     /// Installs (or removes, with `None`) the confirmation handler used when a
@@ -542,7 +587,18 @@ impl ReActAgent {
     /// without asking again. The rule is lost when [`set_permission_context`]
     /// (Self::set_permission_context) swaps in a fresh context on mode changes.
     pub fn add_permission_rule(&self, rule: PermissionRule) {
-        self.core.permission_engine.lock().unwrap().add_rule(rule);
+        let context = {
+            let mut engine = self.core.permission_engine.lock().unwrap();
+            engine.add_rule(rule);
+            engine.context().clone()
+        };
+        // Same reason as [`Self::set_permission_context`]: the rule the next call is judged by
+        // has to be the one a checkpoint records.
+        self.core
+            .state
+            .lock()
+            .unwrap()
+            .set_permission_context(context);
     }
 
     /// The permission state every tool call is evaluated against (mode + rule tables).
@@ -649,6 +705,25 @@ impl ReActAgent {
     pub async fn call_with_cancel(&self, messages: Vec<Msg>, signal: CancelSignal) -> Result<Msg> {
         let mut extensions = crate::agent::Extensions::new();
         extensions.insert(CANCEL_SIGNAL_CONTEXT_KEY, signal);
+        self.call_with_format_and_extensions(messages, None, extensions)
+            .await
+    }
+
+    /// Runs the agent with a per-call model selection (mirrors Java
+    /// `RuntimeContext.builder().modelId(...)` for a run).
+    ///
+    /// The id is resolved through [`ReActAgentBuilder::model_resolver`] and applies to this
+    /// call only: the agent's default model is untouched, so the next call without a selection
+    /// uses it again. An unknown id fails the call. A streamed run selects its model with the
+    /// same key ([`crate::agent::MODEL_ID_CONTEXT_KEY`]) through
+    /// [`ReActAgent::stream_events_with_extensions`].
+    pub async fn call_with_model(
+        &self,
+        messages: Vec<Msg>,
+        model_id: impl Into<String>,
+    ) -> Result<Msg> {
+        let mut extensions = crate::agent::Extensions::new();
+        extensions.insert(MODEL_ID_CONTEXT_KEY, model_id.into());
         self.call_with_format_and_extensions(messages, None, extensions)
             .await
     }
@@ -895,6 +970,13 @@ impl ReActAgent {
         // Layer the per-run services on top of the build-time ones: assigning would silently
         // drop everything the agent was configured with (recorders, observers).
         ctx.extensions.extend(&extensions);
+        // Per-call model selection (Java `RuntimeContext.modelId`). A run receives its services
+        // as extensions rather than as a caller-built context, so the selection is lifted onto
+        // the context the middlewares read. Read from the *per-run* bag only: a build-time
+        // extension must not pin every call of a long-lived agent to one model.
+        ctx.model_id = extensions
+            .get::<String>(MODEL_ID_CONTEXT_KEY)
+            .map(|model_id| model_id.as_str().to_string());
         // Every streamed run needs its own interrupt control, exactly like the `call` path
         // does. Without one, `check_interrupted` falls back to the agent-level flag, which
         // `interrupt()` sets when no run is registered and which nothing ever clears: the
@@ -1276,6 +1358,9 @@ impl ReActAgent {
                 .unwrap()
                 .as_ref()
                 .map(|run| run.run_id().to_string()),
+            // Per-call model selection; lifted from the run's extensions by
+            // `run_stream_with_extensions`.
+            model_id: None,
             delta_tx: None,
             // Expose the shared state so context-managing middlewares (e.g.
             // conversation compaction) can read/rewrite the accumulated history.
@@ -1373,6 +1458,7 @@ pub struct ReActAgentBuilder {
     session_history_mode: SessionHistoryMode,
     recording_policy: crate::session::RecordingPolicy,
     event_only_tool_metadata: Vec<String>,
+    model_resolver: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn Model>> + Send + Sync>>,
 }
 
 impl Default for ReActAgentBuilder {
@@ -1402,6 +1488,7 @@ impl Default for ReActAgentBuilder {
             session_history_mode: SessionHistoryMode::EventLog,
             recording_policy: crate::session::RecordingPolicy::default(),
             event_only_tool_metadata: Vec::new(),
+            model_resolver: None,
         }
     }
 }
@@ -1430,6 +1517,21 @@ impl ReActAgentBuilder {
     /// Sets the backing model (required).
     pub fn model(mut self, model: Arc<dyn Model>) -> Self {
         self.model = Some(model);
+        self
+    }
+
+    /// Sets the resolver for a per-call model id (Java `ModelRegistry#resolve`).
+    ///
+    /// The resolver maps an id — typically the value a caller stamps on a run through
+    /// [`crate::agent::MODEL_ID_CONTEXT_KEY`] — to the model that should serve it. The same
+    /// shape the harness uses to resolve a subagent declaration's `model` override. Without a
+    /// resolver, a per-call selection fails the call (it never silently falls back to the
+    /// default model).
+    pub fn model_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&str) -> Option<Arc<dyn Model>> + Send + Sync + 'static,
+    {
+        self.model_resolver = Some(Arc::new(resolver));
         self
     }
     /// Sets the fallback model, invoked once the primary exhausts its retry budget.
@@ -1603,7 +1705,16 @@ impl ReActAgentBuilder {
         } else {
             self.max_iters
         };
-        let initial_state = self.state.unwrap_or_default();
+        let mut initial_state = self.state.unwrap_or_default();
+        // Declared permission rules are authoritative and reach the call-scoped state (Java
+        // `d0ce778cb`): a declared context replaces whatever the state carried, and without one
+        // the persisted context stays the authority. The engine is built from the same value, so
+        // a session restored from storage enforces the rules it was persisted with instead of
+        // silently falling back to the trivial "allow everything" context.
+        let permission_context = self
+            .permission_context
+            .unwrap_or_else(|| initial_state.permission_context().clone());
+        initial_state.set_permission_context(permission_context.clone());
         let tasks: Arc<Mutex<TaskContextState>> =
             Arc::new(Mutex::new(initial_state.tasks_context.clone()));
 
@@ -1626,6 +1737,7 @@ impl ReActAgentBuilder {
             model: Mutex::new(model),
             fallback_model: self.fallback_model,
             failover_listener: self.failover_listener,
+            model_resolver: self.model_resolver,
             generate_options_defaults: Mutex::new(GenerateOptions::default()),
             toolkit,
             sys_prompt: self.sys_prompt,
@@ -1634,9 +1746,7 @@ impl ReActAgentBuilder {
             task_requirements_enabled: self.task_requirements_enabled,
             state: Arc::new(Mutex::new(initial_state)),
             enable_pending_tool_recovery: self.enable_pending_tool_recovery,
-            permission_engine: Mutex::new(PermissionEngine::new(
-                self.permission_context.unwrap_or_default(),
-            )),
+            permission_engine: Mutex::new(PermissionEngine::new(permission_context)),
             interrupt: Arc::new(InterruptControl::new()),
             active_run: Mutex::new(None),
             middleware_chain: Arc::new(chain),
@@ -1648,8 +1758,18 @@ impl ReActAgentBuilder {
             validate_structured_output: self.validate_structured_output,
             extensions: self.extensions,
             session_log_store: self.session_log_store,
-            // Java: `builder.sessionLogAgentId == null ? getName() : builder.sessionLogAgentId`.
-            session_log_agent_id: self.session_log_agent_id.unwrap_or_else(|| name.clone()),
+            // Java: `builder.sessionLogAgentId != null ? builder.sessionLogAgentId
+            //        : (getName() != null && !getName().isBlank() ? getName() : getAgentId())`.
+            // An agent built with only an id has no usable name, and a blank name is not an
+            // identity either: falling back to the framework agent id keeps the journal key
+            // buildable instead of silently disabling the journal.
+            session_log_agent_id: self.session_log_agent_id.unwrap_or_else(|| {
+                if name.trim().is_empty() {
+                    id.clone()
+                } else {
+                    name.clone()
+                }
+            }),
             session_history_mode: self.session_history_mode,
             recording_policy: self.recording_policy,
             event_only_tool_metadata: self.event_only_tool_metadata,
@@ -1806,6 +1926,9 @@ async fn run_agent_loop(
         if shared.plan_mode_context != plan_mode_at_start {
             state.plan_mode_context = shared.plan_mode_context.clone();
         }
+        // Same for the permission state: mode switches and "always allow" answers reach the
+        // shared handle while the turn runs, and the loop's copy predates them.
+        state.permission_context = shared.permission_context.clone();
         *shared = state;
     }
     result
@@ -2133,6 +2256,10 @@ async fn reasoning_phase(
         // otherwise the flip is undone before the next request (no PLAN banner, and core's
         // acting-phase interception reverts to BUILD).
         state.plan_mode_context = shared.plan_mode_context.clone();
+        // Permission state is owned by the engine and the host (mode switches, "always allow"
+        // answers) which write through this same handle; republishing the loop's stale copy
+        // would undo a decision made during the turn.
+        state.permission_context = shared.permission_context.clone();
         *shared = state.clone();
     }
     // The summarizing path is not a step: Java checks `maxIters` before `step(iter)`, so an
@@ -2174,7 +2301,11 @@ async fn reasoning_phase(
     let tools = core
         .toolkit
         .tool_schemas_with(tool_request_config.as_deref());
-    let model = core.model.lock().unwrap().clone();
+    // The model that serves *this* call (Java `getModel(scope.rc)`): a per-call selection may
+    // name a different model than the build-time default, and everything below — the request's
+    // model name, the journaled call and the usage tag — has to describe the model that
+    // actually ran. An unresolvable selection fails here, before any request is built.
+    let model = effective_model(core, ctx)?;
     // `OnFormat` seam: middlewares may rewrite the structured-output request before it is
     // built. It runs for every reasoning step (Java's `callFormat` wraps each formatter
     // invocation), so a rewrite always lands in the provider call it belongs to.
@@ -2204,7 +2335,7 @@ async fn reasoning_phase(
         crate::middleware::TASK_CONTEXT_STATE_CONTEXT_KEY,
         state.tasks_context.clone(),
     );
-    let final_msg = match run_reasoning(core, &call_ctx, input).await {
+    let final_msg = match run_reasoning(core, &call_ctx, input, Arc::clone(&model)).await {
         Ok(msg) => msg,
         Err(e) => {
             // A budget-overflow compaction may have rewritten the shared history before the
@@ -2232,7 +2363,7 @@ async fn reasoning_phase(
     // Tag the usage with the model that reported it. Token accounting anchors on this
     // number, and a model switch changes the tokenizer, so a mismatch must invalidate it.
     if final_msg.usage.is_some() {
-        let model_name = core.model.lock().unwrap().model_name().to_string();
+        let model_name = model.model_name().to_string();
         final_msg.metadata.insert(
             Msg::METADATA_USAGE_MODEL.to_string(),
             serde_json::Value::String(model_name),
@@ -2402,16 +2533,44 @@ async fn model_call_through_chain(
     }
 }
 
+/// The model that serves a call carrying `context`. Mirrors Java
+/// `ReActAgent#getModel(RuntimeContext)`.
+///
+/// A per-call `model_id` is resolved through the builder's `model_resolver`; without one (or
+/// with an unknown id) the call fails instead of silently using the default model. `None` —
+/// the overwhelmingly common case — returns the agent's default model.
+fn effective_model(
+    core: &Arc<AgentCore>,
+    context: &crate::agent::RuntimeContext,
+) -> Result<Arc<dyn Model>> {
+    let Some(model_id) = context.model_id() else {
+        return Ok(core.model.lock().unwrap().clone());
+    };
+    // Java `ModelRegistry#resolve` trims before resolving, so `" specialist "` selects the
+    // same model as `"specialist"`; only the trimmed value is ever sent to the resolver.
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return Err(Error::Agent("per-call model id is blank".into()));
+    }
+    core.model_resolver
+        .as_ref()
+        .and_then(|resolve| resolve(model_id))
+        .ok_or_else(|| Error::Agent(format!("unknown per-call model id: {model_id}")))
+}
+
 /// Runs the reasoning phase through the middleware chain, wrapping the raw model
 /// call, and returns the accumulated assistant message.
+///
+/// `model` is the model that serves this call (see [`effective_model`]); the caller resolves it
+/// once so the request's model name and the dispatched model can never disagree.
 async fn run_reasoning(
     core: &Arc<AgentCore>,
     ctx: &crate::agent::RuntimeContext,
     input: ReasoningInput,
+    model: Arc<dyn Model>,
 ) -> Result<Msg> {
     let slot: Arc<Mutex<Option<Result<Msg>>>> = Arc::new(Mutex::new(None));
     let chain = Arc::clone(&core.middleware_chain);
-    let model = core.model.lock().unwrap().clone();
 
     let delta_tx = ctx.delta_tx.clone();
     let model_core: Next<ModelCallInput> = {
@@ -6013,6 +6172,38 @@ mod tests {
     }
 
     #[test]
+    fn chunk_metadata_reaches_the_final_message() {
+        // `9e98dfa76` / `85fa9a602`: citations and the DashScope skill marker only travel on the
+        // response chunks, so the accumulator must merge them into the reply it builds (Java
+        // `ReasoningContext#responseMetadata`).
+        let mut context = ReasoningContext::default();
+        let mut chunk_metadata = JsonMap::new();
+        chunk_metadata.insert(
+            "anthropic.citations".to_string(),
+            serde_json::json!([{ "cited_text": "a" }]),
+        );
+        context.accumulate(
+            ChatResponse::builder()
+                .content(vec![ContentBlock::Text(TextBlock::new("answer"))])
+                .metadata(chunk_metadata)
+                .build(),
+        );
+        // An empty map on a later chunk must not clear what an earlier one supplied.
+        context.accumulate(
+            ChatResponse::builder()
+                .content(vec![ContentBlock::Text(TextBlock::new("!"))])
+                .build(),
+        );
+
+        let message = context.build_final_message();
+        assert_eq!(message.text_content(), "answer!");
+        assert_eq!(
+            message.metadata().get("anthropic.citations"),
+            Some(&serde_json::json!([{ "cited_text": "a" }]))
+        );
+    }
+
+    #[test]
     fn a_thinking_chunk_without_metadata_does_not_clear_earlier_keys() {
         let mut with_metadata = ThinkingBlock::new("step one");
         with_metadata.metadata = Some(JsonMap::from_iter([(
@@ -9523,6 +9714,171 @@ mod tests {
         assert!(
             !texts.iter().any(|text| text.contains("tick")),
             "the cancelled turn must not appear as an assistant reply: {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_call_model_id_serves_only_that_call() {
+        // Java `cffb72979`: a run can select its model, resolved through the agent's resolver.
+        let primary = Arc::new(MockModel::new(
+            "primary",
+            vec![text_response("from primary")],
+        ));
+        let specialist: Arc<dyn Model> = Arc::new(MockModel::new(
+            "specialist",
+            vec![text_response("from specialist")],
+        ));
+        let resolved: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let resolver = {
+            let specialist: Arc<dyn Model> = Arc::clone(&specialist);
+            let resolved = Arc::clone(&resolved);
+            move |model_id: &str| {
+                resolved.lock().unwrap().push(model_id.to_string());
+                (model_id == "specialist").then(|| Arc::clone(&specialist))
+            }
+        };
+        let agent = ReActAgent::builder()
+            .name("t-per-call-model")
+            .model(primary)
+            .model_resolver(resolver)
+            .build()
+            .unwrap();
+
+        let reply = agent
+            .call_with_model(vec![Msg::user("hi")], "specialist")
+            .await
+            .unwrap();
+        assert_eq!(reply.text_content(), "from specialist");
+        assert_eq!(*resolved.lock().unwrap(), vec!["specialist".to_string()]);
+
+        // The selection was per call: the next call runs the agent's own model again.
+        let reply = agent.call(vec![Msg::user("again")]).await.unwrap();
+        assert_eq!(reply.text_content(), "from primary");
+        assert_eq!(
+            *resolved.lock().unwrap(),
+            vec!["specialist".to_string()],
+            "a call without a selection must not resolve anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_or_blank_per_call_model_id_fails_the_call() {
+        // An explicit per-call choice must fail loudly instead of silently running the default
+        // model (wrong model, and in a multi-tenant host the wrong credentials).
+        let model = Arc::new(MockModel::new("mock", vec![text_response("must not run")]));
+        let agent = ReActAgent::builder()
+            .name("t-per-call-model-unknown")
+            .model(model)
+            .build()
+            .unwrap();
+
+        let error = agent
+            .call_with_model(vec![Msg::user("hi")], "ghost")
+            .await
+            .expect_err("an unknown per-call model must fail the call");
+        assert!(
+            error.to_string().contains("ghost"),
+            "unexpected error: {error}"
+        );
+
+        let error = agent
+            .call_with_model(vec![Msg::user("hi")], "   ")
+            .await
+            .expect_err("a blank per-call model id must fail the call");
+        assert!(
+            error.to_string().contains("blank"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_agent_falls_back_to_its_agent_id_for_the_session_identity() {
+        // Java `d30a6c92f`: without a usable name the journal identity used to be built from a
+        // blank name, which `SessionKey` rejects — the session journal was silently disabled.
+        let store = Arc::new(crate::session::InMemorySessionLogStore::new());
+        let model = Arc::new(MockModel::new("mock", vec![text_response("journaled")]));
+        let agent = ReActAgent::builder()
+            .id("agent-unnamed")
+            .name("   ")
+            .model(model)
+            .state(AgentState::builder().session_id("s-unnamed").build())
+            .session_log_store(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .build()
+            .unwrap();
+
+        let key = agent
+            .session_key(&crate::agent::RuntimeContext::new())
+            .expect("the journal identity must be built from the agent id");
+        assert_eq!(key.agent_id, "agent-unnamed");
+        assert_eq!(key.session_id, "s-unnamed");
+
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "journaled");
+    }
+
+    #[tokio::test]
+    async fn a_declared_permission_context_reaches_the_call_scoped_state() {
+        // Java `d0ce778cb`: the declared rules are authoritative and are what a checkpoint
+        // persists, so a host reading the state back sees the rules that actually ran.
+        let model = Arc::new(MockModel::new("mock", vec![text_response("done")]));
+        let agent = ReActAgent::builder()
+            .name("t-permission-declared")
+            .model(model)
+            .state(
+                AgentState::builder()
+                    .permission_context(
+                        PermissionContextState::builder()
+                            .mode(crate::permission::PermissionMode::Explore)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .permission_context(deny_add())
+            .build()
+            .unwrap();
+
+        let state = agent.state_handle();
+        let persisted = state.lock().unwrap().permission_context().clone();
+        assert!(
+            persisted.deny_rules.contains_key("add"),
+            "the declared rule must reach the persisted state: {persisted:?}"
+        );
+        assert_ne!(
+            persisted.mode,
+            crate::permission::PermissionMode::Explore,
+            "the declared context replaces the persisted one"
+        );
+        assert!(agent.permission_context().deny_rules.contains_key("add"));
+    }
+
+    #[tokio::test]
+    async fn a_persisted_permission_context_is_enforced_without_a_declared_one() {
+        // Java `d0ce778cb`: the context the state carries is authoritative on every call, so a
+        // session restored from storage cannot silently lose its permission rules.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", JsonMap::new()),
+                text_response("done"),
+            ],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-permission-persisted")
+            .model(model)
+            .toolkit(toolkit)
+            .state(AgentState::builder().permission_context(deny_add()).build())
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+        assert_eq!(reply.text_content(), "done");
+        assert_eq!(
+            *counter.lock().unwrap(),
+            0,
+            "the persisted deny rule must be enforced"
         );
     }
 }
