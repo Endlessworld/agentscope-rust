@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use agentscope_core::formatter::render_document_reference;
 use agentscope_core::message::{
     ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock,
 };
@@ -980,8 +981,18 @@ fn render_message_for_summary(msg: &Msg) -> String {
                     };
                     s.push_str(&preview);
                 }
+                // Documents are rendered outside the preview budget on purpose: a long result
+                // would otherwise truncate the reference away and the attachment would
+                // disappear from the summary again.
+                for doc in extract_tool_result_documents(tr) {
+                    if !s.ends_with(char::is_whitespace) {
+                        s.push(' ');
+                    }
+                    s.push_str(&render_document_reference(doc));
+                }
                 parts.push(s.trim().to_string());
             }
+            ContentBlock::Document(doc) => parts.push(render_document_reference(doc)),
             _ => {}
         }
     }
@@ -1002,6 +1013,16 @@ fn extract_tool_result_text(tr: &ToolResultBlock) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Collects the documents of a tool result so their references survive summarization.
+fn extract_tool_result_documents(
+    tr: &ToolResultBlock,
+) -> impl Iterator<Item = &agentscope_core::message::DocumentBlock> {
+    tr.output.iter().filter_map(|b| match b {
+        ContentBlock::Document(doc) => Some(doc),
+        _ => None,
+    })
 }
 
 /// Caps the rendered summary body so the summarizer never receives a near-window request.
@@ -1485,5 +1506,40 @@ mod tests {
             .await
             .unwrap();
         assert!(replacement.is_some(), "pruning must not hide the real size");
+    }
+
+    #[test]
+    fn the_summary_keeps_document_references_outside_the_preview_budget() {
+        use agentscope_core::message::{DocumentBlock, Source, URLSource};
+
+        let document = DocumentBlock::builder()
+            .source(Source::Url(URLSource::new(
+                "https://example.com/report.pdf",
+            )))
+            .name("report.pdf")
+            .mime_type("application/pdf")
+            .build();
+        let messages = vec![
+            Msg::user_blocks(vec![ContentBlock::Document(document.clone())]),
+            Msg::tool_blocks(vec![ToolResultBlock::new(
+                "call-1",
+                "read_file",
+                vec![
+                    ContentBlock::Text(TextBlock::new("x".repeat(2_000))),
+                    ContentBlock::Document(document),
+                ],
+            )]),
+        ];
+
+        let rendered = format_messages_for_summary(&messages);
+
+        // The preview is capped at 500 chars; the reference must survive it anyway.
+        assert_eq!(rendered.matches("[document:").count(), 2, "{rendered}");
+        assert!(
+            rendered.contains(
+                "[document: report.pdf, application/pdf, url: https://example.com/report.pdf]"
+            ),
+            "{rendered}"
+        );
     }
 }

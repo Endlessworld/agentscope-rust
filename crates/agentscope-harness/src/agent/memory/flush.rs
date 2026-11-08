@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
+use agentscope_core::formatter::render_document_reference;
 use agentscope_core::message::{
     ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock,
 };
@@ -244,6 +245,7 @@ fn render_content_blocks(msg: &Msg) -> Option<String> {
             ContentBlock::Text(t) if !t.text.trim().is_empty() => parts.push(t.text.clone()),
             ContentBlock::ToolUse(tu) => parts.push(render_tool_use(tu)),
             ContentBlock::ToolResult(tr) => parts.push(render_tool_result(tr)),
+            ContentBlock::Document(doc) => parts.push(render_document_reference(doc)),
             _ => {}
         }
     }
@@ -283,6 +285,13 @@ fn render_tool_result(tr: &ToolResultBlock) -> String {
                 t.text.clone()
             };
             s.push_str(&text);
+        } else if let ContentBlock::Document(doc) = block {
+            // Documents carry no body here either; the reference keeps the attachment in the
+            // extraction prompt instead of dropping it.
+            if !s.ends_with(char::is_whitespace) {
+                s.push(' ');
+            }
+            s.push_str(&render_document_reference(doc));
         }
     }
     s
@@ -364,6 +373,29 @@ mod tests {
         assert!(!out.contains("sys"));
         assert!(!out.contains("summary"));
         assert!(!out.contains("session_context"));
+    }
+
+    #[test]
+    fn serialization_keeps_document_references() {
+        use agentscope_core::message::{DocumentBlock, Source, URLSource};
+
+        let document = DocumentBlock::builder()
+            .source(Source::Url(URLSource::new(
+                "https://example.com/report.pdf",
+            )))
+            .name("report.pdf")
+            .build();
+        let msgs = vec![
+            Msg::user_blocks(vec![ContentBlock::Document(document.clone())]),
+            Msg::tool_blocks(vec![ToolResultBlock::new(
+                "call-1",
+                "read_file",
+                vec![ContentBlock::Document(document)],
+            )]),
+        ];
+
+        let out = serialize_messages(&msgs);
+        assert_eq!(out.matches("[document: report.pdf").count(), 2, "{out}");
     }
 
     #[tokio::test]

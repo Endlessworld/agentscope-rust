@@ -99,11 +99,25 @@ pub struct ExecuteResponse {
     pub output: String,
     pub exit_code: i32,
     pub truncated: bool,
+    /// Whether the execution path killed the command at its deadline.
+    ///
+    /// A separate flag rather than "`exit_code == 124`": a command that exits with 124 on its own
+    /// (`timeout 30 build`, a script's `exit 124`) is a normal result and must not be reported to
+    /// the model as a confirmed timeout (Java `ExecuteResponse.timedOut`).
+    pub timed_out: bool,
 }
 
 impl ExecuteResponse {
+    /// Exit code reported when the execution path killed the command at its deadline.
+    pub const TIMEOUT_EXIT_CODE: i32 = 124;
+
     pub fn is_success(&self) -> bool {
         self.exit_code == 0
+    }
+
+    /// Whether execution was cut short at its deadline.
+    pub fn timed_out(&self) -> bool {
+        self.timed_out
     }
 }
 

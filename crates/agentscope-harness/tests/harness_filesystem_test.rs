@@ -6,8 +6,8 @@ use agentscope_core::message::{ContentBlock, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 use agentscope_harness::tool::FilesystemTool;
 use agentscope_harness::{
-    CompositeFilesystem, Filesystem, LocalFilesystem, OverlayFilesystem, SandboxBackedFilesystem,
-    SandboxFilesystem,
+    CompositeFilesystem, ExecuteResponse, Filesystem, LocalFilesystem, OverlayFilesystem,
+    SandboxBackedFilesystem, SandboxFilesystem,
 };
 
 fn ctx() -> RuntimeContext {
@@ -366,7 +366,11 @@ async fn a_command_that_exceeds_its_timeout_is_killed_and_returns() {
     .await
     .expect("a timed-out command must not hang the caller")
     .unwrap();
-    assert_eq!(result.exit_code, -1);
+    assert_eq!(result.exit_code, ExecuteResponse::TIMEOUT_EXIT_CODE);
+    assert!(
+        result.timed_out(),
+        "a timeout must be identifiable: {result:?}"
+    );
     assert!(result.output.contains("timed out"), "{}", result.output);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(15),

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use agentscope_core::agent::CallableAgent;
 use agentscope_core::error::Result;
 use agentscope_core::event::{AgentEvent, AgentEventType};
+use agentscope_core::formatter::render_message_text;
 use agentscope_core::message::{JsonMap, Msg, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 use async_trait::async_trait;
@@ -688,9 +689,12 @@ async fn child_turn(
             agent
                 .call_streaming(messages, forward)
                 .await
-                .map(|m| m.text_content())
+                .map(|m| render_message_text(&m, true))
         }
-        None => agent.call(messages).await.map(|m| m.text_content()),
+        None => agent
+            .call(messages)
+            .await
+            .map(|m| render_message_text(&m, true)),
     }
 }
 

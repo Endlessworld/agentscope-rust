@@ -167,21 +167,21 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         timeout_seconds: u32,
     ) -> Result<ExecuteResponse> {
         // `build_windows_command` 只在 Windows 下存在，所以这里必须用 `#[cfg]` 分支，
-    // 不能用 `if cfg!(windows)`：后者两个分支都会被编译，Windows 专属函数在
-    // 非 Windows 目标上会直接 `cannot find function` 编译失败。
-    #[cfg(windows)]
-    let mut cmd = {
-        let args = build_windows_command(command);
-        let mut c = tokio::process::Command::new(&args[0]);
-        c.args(&args[1..]);
-        c
-    };
-    #[cfg(not(windows))]
-    let mut cmd = {
-        let mut c = tokio::process::Command::new("/bin/sh");
-        c.arg("-c").arg(command);
-        c
-    };
+        // 不能用 `if cfg!(windows)`：后者两个分支都会被编译，Windows 专属函数在
+        // 非 Windows 目标上会直接 `cannot find function` 编译失败。
+        #[cfg(windows)]
+        let mut cmd = {
+            let args = build_windows_command(command);
+            let mut c = tokio::process::Command::new(&args[0]);
+            c.args(&args[1..]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new("/bin/sh");
+            c.arg("-c").arg(command);
+            c
+        };
         cmd.current_dir(&self.cwd)
             // Never inherit the parent's stdin: when the agent runs over ACP
             // stdio, stdin is a pipe the client keeps open, and an inherited
@@ -251,9 +251,16 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
                 })
                 .await;
                 return Ok(ExecuteResponse {
-                    output: "Command timed out".into(),
-                    exit_code: -1,
+                    output: format!(
+                        "Command timed out after {} seconds. For long-running commands, re-run \
+                         using the timeout parameter.",
+                        timeout_seconds.max(1)
+                    ),
+                    // A confirmed timeout, not a process result: the flag is what the shell tool
+                    // reports to the model, the exit code only mirrors `timeout(1)`'s convention.
+                    exit_code: ExecuteResponse::TIMEOUT_EXIT_CODE,
                     truncated: true,
+                    timed_out: true,
                 });
             }
         };
@@ -280,6 +287,7 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
             output,
             exit_code: exit_status.code().unwrap_or(-1),
             truncated: false,
+            timed_out: false,
         })
     }
 }
@@ -555,6 +563,20 @@ mod tests {
             Arc::new(LocalFilesystem::sandboxed(dir)),
             dir,
         ))
+    }
+
+    #[test]
+    fn a_command_that_exits_with_124_on_its_own_is_not_a_timeout() {
+        // `timeout 30 build` (or a script's own `exit 124`) is a normal result: only the
+        // execution path's deadline may set the timeout flag.
+        let response = ExecuteResponse {
+            output: "done".to_string(),
+            exit_code: ExecuteResponse::TIMEOUT_EXIT_CODE,
+            truncated: false,
+            timed_out: false,
+        };
+        assert!(!response.timed_out());
+        assert!(!response.is_success());
     }
 
     #[tokio::test]

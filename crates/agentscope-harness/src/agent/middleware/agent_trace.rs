@@ -14,6 +14,7 @@ use std::task::{Context, Poll};
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::event::{AgentEvent, EventData};
+use agentscope_core::formatter::render_message_text;
 use agentscope_core::middleware::{
     ActingInput, AgentInput, EventStream, Middleware, Next, ReasoningInput,
 };
@@ -199,7 +200,9 @@ impl Middleware for AgentTraceMiddleware {
                 tracing::debug!(
                     "  msg: role={:?}, text={}",
                     m.role(),
-                    truncate(&m.text_content(), 200)
+                    // Documents are invisible to `text_content()`; the reference keeps the
+                    // trace showing what the model actually received.
+                    truncate(&render_message_text(m, true), 200)
                 );
             }
         }

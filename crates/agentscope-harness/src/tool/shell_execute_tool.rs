@@ -55,9 +55,13 @@ pub(crate) fn format_execute_output(
     exit_code: i32,
     output: &str,
     truncated: bool,
+    timed_out: bool,
     compact: &CompactConfig,
 ) -> ToolResultBlock {
     let mut text = format!("Exit code: {exit_code}\n");
+    if timed_out {
+        text.push_str("Timed out: true\n");
+    }
     let mut metadata = JsonMap::new();
     if !output.trim().is_empty() {
         text.push('\n');
@@ -73,7 +77,8 @@ pub(crate) fn format_execute_output(
         report.record_metadata(&mut metadata);
         text.push_str(&report.text);
     }
-    if truncated {
+    if truncated && !timed_out {
+        // A timeout already implies the output is incomplete; the timeout line says why.
         text.push_str("\n(output was truncated)");
     }
     // Producer-supplied execution facts (mirrors Java `ShellExecuteTool`): a successful
@@ -94,8 +99,21 @@ pub(crate) fn format_execute_output(
     block
 }
 
-fn int_arg(args: &JsonMap, key: &str) -> Option<u32> {
-    args.get(key).and_then(|v| v.as_u64()).map(|u| u as u32)
+/// Default command timeout in seconds, mirroring Java `ShellExecuteTool`.
+const DEFAULT_TIMEOUT_SECONDS: u32 = 30;
+
+/// Reads the `timeout` argument, rejecting unsupported values before execution.
+///
+/// Mirrors Java: a non-positive timeout used to be silently replaced by the default, which made
+/// an explicit `timeout: 0` look like a 30 second run. It is now an error the model can fix.
+fn timeout_arg(args: &JsonMap) -> std::result::Result<u32, String> {
+    match args.get("timeout") {
+        None | Some(serde_json::Value::Null) => Ok(DEFAULT_TIMEOUT_SECONDS),
+        Some(value) => match value.as_u64() {
+            Some(seconds) if seconds > 0 && seconds <= u32::MAX as u64 => Ok(seconds as u32),
+            _ => Err("timeout must be a positive number of seconds.".to_string()),
+        },
+    }
 }
 
 /// Prefixes `command` with a `cd` into `working_directory`.
@@ -143,7 +161,7 @@ impl Tool for ShellExecuteTool {
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute"},
                 "working_directory": {"type": "string", "description": "Working directory (relative to workspace root, optional)"},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30)"}
+                "timeout": {"type": "integer", "description": "Positive timeout in seconds (default: 30). Unsupported values are rejected before execution."}
             },
             "required": ["command"]
         })
@@ -164,7 +182,10 @@ impl Tool for ShellExecuteTool {
             ));
         }
         let wd = opt_str_arg(&args, "working_directory");
-        let timeout = int_arg(&args, "timeout").unwrap_or(30);
+        let timeout = match timeout_arg(&args) {
+            Ok(seconds) => seconds,
+            Err(message) => return Ok(ToolResultBlock::error(message)),
+        };
 
         let effective_command = if let Some(wd) = wd {
             let wd = wd.trim();
@@ -199,6 +220,7 @@ impl Tool for ShellExecuteTool {
             result.exit_code,
             &result.output,
             result.truncated,
+            result.timed_out(),
             &self.compact,
         ))
     }
@@ -206,7 +228,7 @@ impl Tool for ShellExecuteTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_with_working_directory, format_execute_output};
+    use super::{command_with_working_directory, format_execute_output, timeout_arg};
     use crate::tool::CompactConfig;
 
     #[test]
@@ -245,7 +267,13 @@ mod tests {
 
     #[test]
     fn execute_output_is_compacted_and_counted() {
-        let block = format_execute_output(0, &grep_like_output(), false, &CompactConfig::default());
+        let block = format_execute_output(
+            0,
+            &grep_like_output(),
+            false,
+            false,
+            &CompactConfig::default(),
+        );
         let text = block
             .output
             .iter()
@@ -269,7 +297,7 @@ mod tests {
     #[test]
     fn execute_output_compaction_can_be_switched_off() {
         let raw = grep_like_output();
-        let block = format_execute_output(0, &raw, false, &CompactConfig::disabled());
+        let block = format_execute_output(0, &raw, false, false, &CompactConfig::disabled());
         let text = block
             .output
             .iter()
@@ -298,7 +326,7 @@ mod tests {
             format!("  {path}:111:        \"count\" => {{"),
         ]
         .join("\n");
-        let block = format_execute_output(0, &raw, false, &CompactConfig::default());
+        let block = format_execute_output(0, &raw, false, false, &CompactConfig::default());
         let text = block
             .output
             .iter()
@@ -321,7 +349,8 @@ mod tests {
 
     #[test]
     fn plain_command_output_is_untouched() {
-        let block = format_execute_output(0, "hello\nworld", false, &CompactConfig::default());
+        let block =
+            format_execute_output(0, "hello\nworld", false, false, &CompactConfig::default());
         let text = block
             .output
             .iter()
@@ -342,7 +371,7 @@ mod tests {
     fn a_successful_run_carries_shell_execution_details() {
         use agentscope_core::message::{ToolExecutionDetails, ToolExecutionOutcome};
 
-        let block = format_execute_output(0, "hello", false, &CompactConfig::disabled());
+        let block = format_execute_output(0, "hello", false, false, &CompactConfig::disabled());
         let details = block.execution_details().expect("shell execution details");
         assert_eq!(details.kind, "shell");
         assert_eq!(details.outcome, ToolExecutionOutcome::Succeeded);
@@ -362,7 +391,7 @@ mod tests {
     fn a_nonzero_exit_code_is_a_failed_execution() {
         use agentscope_core::message::ToolExecutionOutcome;
 
-        let block = format_execute_output(2, "boom", true, &CompactConfig::disabled());
+        let block = format_execute_output(2, "boom", true, false, &CompactConfig::disabled());
         let details = block.execution_details().expect("shell execution details");
         assert_eq!(details.kind, "shell");
         assert_eq!(details.outcome, ToolExecutionOutcome::Failed);
@@ -372,7 +401,13 @@ mod tests {
 
     #[test]
     fn truncation_notice_lands_after_the_compacted_body() {
-        let block = format_execute_output(1, &grep_like_output(), true, &CompactConfig::default());
+        let block = format_execute_output(
+            1,
+            &grep_like_output(),
+            true,
+            false,
+            &CompactConfig::default(),
+        );
         let text = block
             .output
             .iter()
@@ -383,5 +418,62 @@ mod tests {
             .collect::<String>();
         assert!(text.starts_with("Exit code: 1\n\n[paths grouped"));
         assert!(text.ends_with("\n(output was truncated)"));
+    }
+
+    #[test]
+    fn a_confirmed_timeout_is_reported_to_the_model() {
+        use agentscope_core::message::ToolExecutionOutcome;
+
+        let block = format_execute_output(
+            124,
+            "Command timed out after 1 seconds.",
+            true,
+            true,
+            &CompactConfig::disabled(),
+        );
+        let text = block
+            .output
+            .iter()
+            .filter_map(|b| match b {
+                agentscope_core::message::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            text.starts_with("Exit code: 124\nTimed out: true\n\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Command timed out after 1 seconds."),
+            "{text}"
+        );
+        // A timeout already explains the missing output; a second notice only adds noise.
+        assert!(!text.contains("output was truncated"), "{text}");
+
+        let details = block.execution_details().expect("shell execution details");
+        assert_eq!(details.outcome, ToolExecutionOutcome::Failed);
+        assert_eq!(details.exit_code, Some(124));
+    }
+
+    #[test]
+    fn timeout_arguments_must_be_positive() {
+        use agentscope_core::message::JsonMap;
+
+        let args = |value: Option<serde_json::Value>| {
+            let mut map = JsonMap::new();
+            if let Some(value) = value {
+                map.insert("timeout".to_string(), value);
+            }
+            map
+        };
+
+        assert_eq!(timeout_arg(&args(None)).unwrap(), 30);
+        assert_eq!(timeout_arg(&args(Some(serde_json::json!(90)))).unwrap(), 90);
+        for rejected in [serde_json::json!(0), serde_json::json!(-1)] {
+            assert_eq!(
+                timeout_arg(&args(Some(rejected))).unwrap_err(),
+                "timeout must be a positive number of seconds."
+            );
+        }
     }
 }
