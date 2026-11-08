@@ -84,7 +84,9 @@ pub fn should_bypass_history(msg: &Msg) -> bool {
 }
 
 /// Converts tool result output blocks to a string representation. Multimodal
-/// blocks are replaced with textual references (URL or temp file path).
+/// blocks are replaced with textual references (URL or temp file path); a document
+/// never reaches that helper, it renders as a one-line reference instead, so no
+/// payload is written to a temporary file.
 pub fn convert_tool_result_to_string(output: &[ContentBlock]) -> String {
     if output.is_empty() {
         return String::new();
@@ -105,6 +107,9 @@ pub fn convert_tool_result_to_string(output: &[ContentBlock]) -> String {
             ContentBlock::Data(db) => {
                 Some(convert_media_block_to_text_reference(&db.source, "data"))
             }
+            // A document is described by name and location. Rendering base64 through the
+            // temp-file path would hand a remote model a path on the local disk.
+            ContentBlock::Document(db) => Some(super::document_reference::render(db)),
             // Other block types (e.g. ThinkingBlock) are ignored.
             _ => None,
         })
@@ -174,8 +179,8 @@ pub fn save_base64_data_to_temp_file(
 mod tests {
     use super::*;
     use crate::message::{
-        Base64Source, HintBlock, ImageBlock, Source, TextBlock, ThinkingBlock, ToolResultBlock,
-        URLSource,
+        Base64Source, DocumentBlock, FileIdSource, HintBlock, ImageBlock, Source, TextBlock,
+        ThinkingBlock, ToolResultBlock, URLSource,
     };
 
     fn user_msg(blocks: Vec<ContentBlock>) -> Msg {
@@ -214,6 +219,45 @@ mod tests {
             URLSource::new("https://x/a.png"),
         )))]);
         assert!(has_media_content(&with_image));
+    }
+
+    /// A document among a tool result's output must reach the model as a one-line reference:
+    /// the temp-file route would hand a remote model a path on the local disk, and an inline
+    /// payload would put the base64 body into the prompt.
+    #[test]
+    fn tool_result_documents_render_as_references() {
+        let url_document = DocumentBlock::builder()
+            .source(Source::Url(URLSource::new(
+                "https://example.com/report.pdf",
+            )))
+            .name("report.pdf")
+            .mime_type("application/pdf")
+            .build();
+        let text = convert_tool_result_to_string(&[ContentBlock::Document(url_document)]);
+        assert_eq!(
+            text,
+            "[document: report.pdf, application/pdf, url: https://example.com/report.pdf]"
+        );
+
+        let file_id_document = DocumentBlock::builder()
+            .source(Source::FileId(FileIdSource::new("dashscope", "file-123")))
+            .name("report.pdf")
+            .mime_type("application/pdf")
+            .build();
+        let text = convert_tool_result_to_string(&[ContentBlock::Document(file_id_document)]);
+        assert!(text.contains("provider file id: file-123"), "{text}");
+
+        let inline_document = DocumentBlock::builder()
+            .source(Source::Base64(Base64Source::new(
+                "application/pdf",
+                "JVBERi0xLjQK",
+            )))
+            .name("report.pdf")
+            .build();
+        let text = convert_tool_result_to_string(&[ContentBlock::Document(inline_document)]);
+        assert!(text.contains("inline base64"), "{text}");
+        assert!(!text.contains("JVBERi0xLjQK"), "{text}");
+        assert!(!text.contains("agentscope_"), "{text}");
     }
 
     #[test]

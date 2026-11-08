@@ -1692,7 +1692,7 @@ mod tests {
     }
 
     async fn commit_history(log: &JournalSessionLog, writer: &Writer, batches: usize, size: u64) {
-        for index in 0..batches {
+        for _ in 0..batches {
             let start = log.head().await.unwrap().seq;
             log.commit(
                 writer,

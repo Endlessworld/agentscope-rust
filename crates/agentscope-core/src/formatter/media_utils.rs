@@ -95,6 +95,8 @@ pub fn determine_media_type(path: &str) -> String {
         "wmv" => "video/x-ms-wmv",
         "flv" => "video/x-flv",
         "3gpp" | "3gp" => "video/3gpp",
+        // Document formats
+        "pdf" => "application/pdf",
         _ => "application/octet-stream",
     }
     .to_string()
@@ -319,6 +321,8 @@ mod tests {
         assert_eq!(determine_media_type("a.mp3"), "audio/mp3");
         assert_eq!(determine_media_type("a.wav"), "audio/wav");
         assert_eq!(determine_media_type("a.mp4"), "video/mp4");
+        // Documents
+        assert_eq!(determine_media_type("document.pdf"), "application/pdf");
         assert_eq!(
             determine_media_type("a.unknown"),
             "application/octet-stream"

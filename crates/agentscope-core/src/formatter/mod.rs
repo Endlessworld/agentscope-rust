@@ -2,6 +2,7 @@
 //! Mirrors `io.agentscope.core.formatter`.
 
 pub mod base_formatter;
+pub mod document_reference;
 pub mod json_schema;
 pub mod media_utils;
 pub mod response_format;
@@ -12,6 +13,7 @@ pub use base_formatter::{
     BYPASS_MULTIAGENT_HISTORY_MERGE,
 };
 
+pub use document_reference::{render as render_document_reference, render_message_text};
 pub use json_schema::{JsonSchema, JsonSchemaBuilder};
 pub use media_utils::{
     determine_audio_format, determine_media_type, download_url_to_base64, file_to_base64,

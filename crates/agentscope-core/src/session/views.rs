@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::message::{ContentBlock, Msg, MsgRole, ToolResultBlock};
+use crate::formatter::document_reference;
+use crate::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock};
 use crate::state::TaskVerification;
 
 use super::{session_error, SessionEvent, SessionLog};
@@ -782,7 +783,8 @@ pub fn transcript_entries(transcript: &Transcript) -> Vec<TranscriptEntry> {
     let mut entries = Vec::new();
     for message in &transcript.messages {
         let timestamp = timestamp_millis(&message.timestamp);
-        let text = message.text_content();
+        // Tool results are exported as their own entries below, so they stay out of the text.
+        let text = document_reference::render_message_text(message, false);
         let has_tools = message
             .content
             .iter()
@@ -811,23 +813,7 @@ pub fn transcript_entries(transcript: &Transcript) -> Vec<TranscriptEntry> {
                     tool_result: None,
                 }),
                 ContentBlock::ToolResult(result) => {
-                    let all_text = result
-                        .output
-                        .iter()
-                        .all(|o| matches!(o, ContentBlock::Text(_)));
-                    let output = if all_text {
-                        result
-                            .output
-                            .iter()
-                            .filter_map(|o| match o {
-                                ContentBlock::Text(t) => Some(t.text.clone()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("")
-                    } else {
-                        serde_json::to_string(&result.output).unwrap_or_default()
-                    };
+                    let output = tool_result_text(&result.output);
                     entries.push(TranscriptEntry {
                         id,
                         role: "TOOL".into(),
@@ -843,6 +829,49 @@ pub fn transcript_entries(transcript: &Transcript) -> Vec<TranscriptEntry> {
         }
     }
     entries
+}
+
+/// Renders a tool result for a flat transcript.
+///
+/// Text and document blocks become readable text. Anything else (images, audio) keeps the
+/// existing JSON representation, because the flat entry has no place for a block — but a
+/// document among them still collapses to its reference, so a mixed result never embeds the
+/// document's base64 payload into the transcript.
+fn tool_result_text(output: &[ContentBlock]) -> String {
+    let textual = output
+        .iter()
+        .all(|block| matches!(block, ContentBlock::Text(_) | ContentBlock::Document(_)));
+    if textual {
+        return output
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(text) => text.text.clone(),
+                ContentBlock::Document(document) => document_reference::render(document),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            // One line per block, like `Msg::text_content` / Java `getTextContent`: a document
+            // reference must not be glued onto the preceding text.
+            .join("\n");
+    }
+    if output
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Document(_)))
+    {
+        let rendered: Vec<ContentBlock> = output.iter().map(reference_or_self).collect();
+        return serde_json::to_string(&rendered).unwrap_or_default();
+    }
+    serde_json::to_string(output).unwrap_or_default()
+}
+
+/// Replaces a document block with its one-line reference, leaving every other block alone.
+fn reference_or_self(block: &ContentBlock) -> ContentBlock {
+    match block {
+        ContentBlock::Document(document) => {
+            ContentBlock::Text(TextBlock::new(document_reference::render(document)))
+        }
+        other => other.clone(),
+    }
 }
 
 /// One JSONL row per transcript entry, mirroring `SessionTranscriptExport.jsonl`.
@@ -1556,6 +1585,72 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1]["toolName"], "read_file");
         assert!(rows[1]["timestamp"].is_f64());
+    }
+
+    /// A turn whose only content is an attachment used to export as an empty string, which
+    /// every consumer then dropped — the document itself vanished from the transcript.
+    #[test]
+    fn transcript_export_keeps_a_document_only_turn() {
+        let user = Msg::builder()
+            .id("u1")
+            .role(MsgRole::User)
+            .content(vec![ContentBlock::Document(
+                crate::message::DocumentBlock::builder()
+                    .source(crate::message::Source::Url(crate::message::URLSource::new(
+                        "https://example.test/report.pdf",
+                    )))
+                    .name("report.pdf")
+                    .mime_type("application/pdf")
+                    .build(),
+            )])
+            .build();
+        let transcript = Transcript {
+            as_of_seq: 1,
+            messages: vec![user],
+        };
+        let entries = transcript_entries(&transcript);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].content,
+            "[document: report.pdf, application/pdf, url: https://example.test/report.pdf]"
+        );
+    }
+
+    /// The flat entry has no place for a block, but it must not carry the base64 payload.
+    #[test]
+    fn transcript_export_renders_a_document_inside_a_tool_result() {
+        let tool = Msg::builder()
+            .id("t1")
+            .role(MsgRole::Tool)
+            .content(vec![ContentBlock::ToolResult(ToolResultBlock::new(
+                "call-1",
+                "fetch_report",
+                vec![
+                    ContentBlock::Text(TextBlock::new("report ready")),
+                    ContentBlock::Document(
+                        crate::message::DocumentBlock::builder()
+                            .source(crate::message::Source::Base64(
+                                crate::message::Base64Source::new(
+                                    "application/pdf",
+                                    "aGVsbG8gd29ybGQ=",
+                                ),
+                            ))
+                            .name("report.pdf")
+                            .build(),
+                    ),
+                ],
+            ))])
+            .build();
+        let transcript = Transcript {
+            as_of_seq: 1,
+            messages: vec![tool],
+        };
+        let entries = transcript_entries(&transcript);
+        assert_eq!(entries.len(), 1);
+        let output = entries[0].tool_result.as_deref().unwrap();
+        assert!(output.contains("report ready"), "{output}");
+        assert!(output.contains("[document: report.pdf"), "{output}");
+        assert!(!output.contains("aGVsbG8gd29ybGQ="), "{output}");
     }
 
     #[test]
