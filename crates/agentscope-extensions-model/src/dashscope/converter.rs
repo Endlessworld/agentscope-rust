@@ -136,12 +136,14 @@ const FILE_ID_SCHEME: &str = "fileid://";
 ///
 /// `qwen-long` reads documents from a `fileid://` reference carried by a system
 /// message placed before the turn that asks about them, not from a content part.
-/// Each document block therefore contributes one system message ahead of its own
-/// message (Java `DashScopeChatFormatter#appendDocumentMessages`).
+/// Each DashScope file-id document therefore contributes one system message
+/// ahead of its own message (Java `DashScopeChatFormatter#appendDocumentMessages`).
 ///
-/// Only a DashScope [`Source::FileId`] is supported: URL and Base64 documents are
-/// rejected here rather than dropped. Blocks on non-`USER` turns are left alone —
-/// documents are user input.
+/// URL documents need no injection: `qwen-doc-turbo` reads them from a `doc_url`
+/// content part inside the user turn itself, which [`multimodal_parts`] emits.
+/// Base64 payloads and file ids issued by another provider have no DashScope
+/// channel: they become a text reference, because a formatter that throws on a
+/// source it cannot deliver would break every later turn of the session.
 fn document_messages(msg: &Msg) -> Result<Vec<DashScopeMessage>> {
     if msg.role != MsgRole::User {
         return Ok(Vec::new());
@@ -152,17 +154,18 @@ fn document_messages(msg: &Msg) -> Result<Vec<DashScopeMessage>> {
             continue;
         };
         let Source::FileId(file) = &document.source else {
-            return Err(agentscope_core::Error::Other(format!(
-                "DashScope document input requires a file id source, got {}; \
-                 upload the document first and pass the DashScope file id",
-                source_kind(&document.source)
-            )));
+            continue;
         };
         if file.provider != DASHSCOPE_PROVIDER {
-            return Err(agentscope_core::Error::Other(format!(
-                "DashScope document input requires a DashScope file id, got provider '{}'",
-                file.provider
-            )));
+            crate::common::diagnostics::warn(
+                "unsupported_document_source",
+                "content.document",
+                &format!(
+                    "file id issued by '{}' cannot reach DashScope; rendered as a text reference",
+                    file.provider
+                ),
+            );
+            continue;
         }
         out.push(DashScopeMessage {
             role: Some("system".to_string()),
@@ -176,11 +179,67 @@ fn document_messages(msg: &Msg) -> Result<Vec<DashScopeMessage>> {
     Ok(out)
 }
 
-fn source_kind(source: &Source) -> &'static str {
-    match source {
-        Source::Url(_) => "URLSource",
-        Source::Base64(_) => "Base64Source",
-        Source::FileId(_) => "FileIdSource",
+/// Metadata key selecting the parsing strategy of a URL document.
+const FILE_PARSING_STRATEGY_KEY: &str = "file_parsing_strategy";
+/// Parsing strategies the DashScope API accepts.
+const FILE_PARSING_STRATEGIES: [&str; 3] = ["auto", "text_only", "text_and_images"];
+/// `qwen-doc-turbo` accepts at most 10 document URLs per request.
+const MAX_DOCUMENT_URLS: usize = 10;
+
+/// Resolves the `file_parsing_strategy` configured on a document block.
+fn file_parsing_strategy(document: &agentscope_core::DocumentBlock) -> Option<String> {
+    let value = document.metadata.as_ref()?.get(FILE_PARSING_STRATEGY_KEY)?;
+    let strategy = match value {
+        serde_json::Value::String(strategy) => strategy.clone(),
+        other => other.to_string(),
+    };
+    if FILE_PARSING_STRATEGIES.contains(&strategy.as_str()) {
+        Some(strategy)
+    } else {
+        crate::common::diagnostics::warn(
+            "unsupported_document_parsing_strategy",
+            "content.document",
+            &format!(
+                "unknown file_parsing_strategy '{strategy}'; expected one of {FILE_PARSING_STRATEGIES:?}"
+            ),
+        );
+        None
+    }
+}
+
+/// Resolves the public URL of a document block for a `doc_url` part.
+///
+/// DashScope fetches the document itself, so the URL must be publicly reachable
+/// over http(s); a local `file://` reference would fail server-side.
+fn document_url(document: &agentscope_core::DocumentBlock) -> Result<String> {
+    let Source::Url(url) = &document.source else {
+        return Err(agentscope_core::Error::Other(
+            "DashScope doc_url requires a URL source".to_string(),
+        ));
+    };
+    let value = url.url.trim();
+    if value.starts_with("http://") || value.starts_with("https://") {
+        Ok(value.to_string())
+    } else {
+        Err(agentscope_core::Error::Other(format!(
+            "DashScope doc_url requires a publicly reachable http(s) URL, got '{value}'"
+        )))
+    }
+}
+
+/// Converts a document block into the content part DashScope can consume for the
+/// given role: a `doc_url` part on a user turn, a text reference otherwise.
+fn document_part(document: &agentscope_core::DocumentBlock) -> DashScopeContentPart {
+    match document_url(document) {
+        Ok(url) => DashScopeContentPart::doc_url(vec![url], file_parsing_strategy(document)),
+        Err(e) => {
+            crate::common::diagnostics::warn(
+                "unsupported_document_source",
+                "content.document",
+                &format!("document part omitted; replaced with a reference: {e}"),
+            );
+            DashScopeContentPart::text(crate::common::document::render(document))
+        }
     }
 }
 
@@ -337,20 +396,29 @@ pub fn to_dashscope_tool_calls(msg: &Msg) -> Vec<DashScopeToolCall> {
         .collect()
 }
 
-/// Concatenates the text found in `TextBlock`/`HintBlock` (newline-joined).
+/// Concatenates the message text (text/hint blocks plus tool-result text) and appends one
+/// reference per document the message carries, so an attachment that DashScope cannot deliver
+/// still stays visible in the history (Java `DashScopeMessageConverter#extractTextContent`).
 fn simple_text(msg: &Msg) -> String {
-    msg.content
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text(t) => Some(t.text.clone()),
-            ContentBlock::Hint(h) => h.hint.clone(),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    crate::common::document::append(&extract_text_content(msg), msg)
 }
 
-fn multimodal_parts(blocks: &[ContentBlock]) -> Vec<DashScopeContentPart> {
+/// Whether the message carries a URL document on a user turn.
+///
+/// DashScope sends URL documents as `doc_url` parts inside the user message, so such a turn needs
+/// the content-part shape even when it holds no other media. File-id documents are excluded: they
+/// ride on the injected `fileid://` system message (Java `DashScopeChatFormatter#hasMediaContent`).
+fn has_url_document_on_user_turn(msg: &Msg) -> bool {
+    msg.role == MsgRole::User
+        && msg.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Document(document) if matches!(document.source, Source::Url(_))
+            )
+        })
+}
+
+fn multimodal_parts(blocks: &[ContentBlock], role: MsgRole) -> Vec<DashScopeContentPart> {
     let mut parts = Vec::new();
     for block in blocks {
         match block {
@@ -371,13 +439,28 @@ fn multimodal_parts(blocks: &[ContentBlock]) -> Vec<DashScopeContentPart> {
             // Thinking blocks are never sent back to the model.
             ContentBlock::Thinking(_) => {}
             ContentBlock::ToolUse(_) => {}
-            // Documents travel as a separate `fileid://` system message, never
-            // as a content part (Java `DashScopeChatFormatter#appendDocumentMessages`).
-            ContentBlock::Document(_) => {}
+            // Documents travel as a `doc_url` part on a user turn (qwen-doc-turbo
+            // reads them there) and as a text reference everywhere else.
+            ContentBlock::Document(document) => parts.push(if role == MsgRole::User {
+                document_part(document)
+            } else {
+                DashScopeContentPart::text(crate::common::document::render(document))
+            }),
         }
     }
     if parts.is_empty() {
         parts.push(DashScopeContentPart::text(""));
+    }
+    // Document-capable models validate the type discriminator of every part of a
+    // turn that carries `doc_url` parts ("User content type must be one of
+    // [doc_url,text]"). Only document turns are touched so other models keep
+    // their exact request shape.
+    if parts.iter().any(|part| part.doc_url.is_some()) {
+        for part in parts.iter_mut() {
+            if part.doc_url.is_none() && part.text.is_some() && part.part_type.is_none() {
+                part.part_type = Some(super::dto::PART_TYPE_TEXT.to_string());
+            }
+        }
     }
     parts
 }
@@ -432,7 +515,7 @@ fn tool_role_multimodal_message(msg: &Msg) -> DashScopeMessage {
                     | ContentBlock::Data(_)
             )
         }) {
-            multimodal_parts(&tr.output)
+            multimodal_parts(&tr.output, MsgRole::Tool)
         } else {
             vec![DashScopeContentPart::text(convert_tool_result_to_string(
                 &tr.output,
@@ -461,7 +544,10 @@ fn multimodal_message(msg: &Msg) -> DashScopeMessage {
     }
     let mut out = DashScopeMessage {
         role: Some(role_str(msg.role).to_string()),
-        content: Some(DashScopeContent::Parts(multimodal_parts(&msg.content))),
+        content: Some(DashScopeContent::Parts(multimodal_parts(
+            &msg.content,
+            msg.role,
+        ))),
         ..Default::default()
     };
     if msg.role == MsgRole::Assistant {
@@ -492,6 +578,9 @@ fn to_dashscope_messages_flagged(
     messages: Vec<Msg>,
     force_multimodal: bool,
 ) -> Result<(Vec<DashScopeMessage>, Vec<bool>)> {
+    if force_multimodal {
+        reject_document_urls_on_multimodal_endpoint(&messages)?;
+    }
     let mut out: Vec<DashScopeMessage> = Vec::new();
     let mut injected: Vec<bool> = Vec::new();
     for msg in messages {
@@ -499,11 +588,12 @@ fn to_dashscope_messages_flagged(
         injected.extend(std::iter::repeat(true).take(documents.len()));
         out.extend(documents);
         let explicit = metadata_cache_directive(&msg) == Some(true);
-        let mut converted = if force_multimodal || has_media_content(&msg) {
-            multimodal_message(&msg)
-        } else {
-            simple_message(&msg)
-        };
+        let mut converted =
+            if force_multimodal || has_media_content(&msg) || has_url_document_on_user_turn(&msg) {
+                multimodal_message(&msg)
+            } else {
+                simple_message(&msg)
+            };
         // Explicit `Msg` metadata markers are emitted as supplied; the
         // automatic pass (if enabled) only fills in unmarked boundaries.
         if explicit {
@@ -512,7 +602,54 @@ fn to_dashscope_messages_flagged(
         out.push(converted);
         injected.push(false);
     }
+    validate_document_url_limit(&out)?;
     Ok((out, injected))
+}
+
+/// Rejects URL documents on the multimodal endpoint: `doc_url` parts are only
+/// accepted by the text-generation endpoint.
+fn reject_document_urls_on_multimodal_endpoint(messages: &[Msg]) -> Result<()> {
+    for msg in messages {
+        if msg.role != MsgRole::User {
+            continue;
+        }
+        for block in &msg.content {
+            if let ContentBlock::Document(document) = block {
+                if matches!(document.source, Source::Url(_)) {
+                    return Err(agentscope_core::Error::Other(
+                        "DashScope doc_url documents are only accepted by the text-generation \
+                         endpoint, but this model routes to the multimodal endpoint; use a \
+                         document-capable text model such as qwen-doc-turbo, or upload the \
+                         document and pass a DashScope file id"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rejects requests that exceed DashScope's document URL budget (10 per request).
+fn validate_document_url_limit(messages: &[DashScopeMessage]) -> Result<()> {
+    let count: usize = messages
+        .iter()
+        .filter_map(|message| message.content.as_ref())
+        .map(|content| match content {
+            DashScopeContent::Text(_) => 0,
+            DashScopeContent::Parts(parts) => parts
+                .iter()
+                .map(|part| part.doc_url.as_ref().map(Vec::len).unwrap_or(0))
+                .sum(),
+        })
+        .sum();
+    if count > MAX_DOCUMENT_URLS {
+        return Err(agentscope_core::Error::Other(format!(
+            "DashScope accepts at most {MAX_DOCUMENT_URLS} document URLs per request, got {count}; \
+             split the documents across requests or upload them and pass DashScope file ids"
+        )));
+    }
+    Ok(())
 }
 
 /// Converts messages and then applies the automatic cache policy from
@@ -674,8 +811,22 @@ fn merge_history_text_and_parts(messages: &[Msg]) -> (String, Vec<DashScopeConte
                     parts.push(data_part(d));
                     text.push_str(&format!("{name}: [Data]\n"));
                 }
-                // Documents travel as separate `fileid://` system messages.
-                ContentBlock::Document(_) => {}
+                // Document-capable models read a URL from a `doc_url` part on the
+                // merged user message; the reference alone would leave the
+                // document unread. Any other source becomes a reference.
+                ContentBlock::Document(document) => match document_url(document) {
+                    Ok(url) => {
+                        parts.push(DashScopeContentPart::doc_url(
+                            vec![url],
+                            file_parsing_strategy(document),
+                        ));
+                        text.push_str(&format!("{name}: [Document]\n"));
+                    }
+                    Err(_) => text.push_str(&format!(
+                        "{name}: {}\n",
+                        crate::common::document::render(document)
+                    )),
+                },
                 // Audio has no textual rendering in the Java text-mode merger.
                 ContentBlock::Audio(_) => {}
                 // Thinking blocks are never sent back to the model.
@@ -713,7 +864,13 @@ pub fn merge_conversation(messages: &[Msg], history_prompt: &str) -> DashScopeMe
         }
     } else {
         let mut content = Vec::with_capacity(parts.len() + 1);
-        content.push(DashScopeContentPart::text(text));
+        let mut history_part = DashScopeContentPart::text(text);
+        // Document-capable models require a type discriminator on every part of a
+        // turn that carries `doc_url` parts.
+        if parts.iter().any(|part| part.doc_url.is_some()) {
+            history_part.part_type = Some(super::dto::PART_TYPE_TEXT.to_string());
+        }
+        content.push(history_part);
         content.extend(parts);
         DashScopeMessage {
             role: Some("user".to_string()),
@@ -775,8 +932,16 @@ pub fn merge_multimodal_conversation(
                     flush(&mut text, &mut content);
                     content.push(data_part(d));
                 }
-                // Documents travel as separate `fileid://` system messages.
-                ContentBlock::Document(_) => {}
+                ContentBlock::Document(document) => {
+                    // URL documents never reach this multimodal merge (the
+                    // multimodal endpoint has no `doc_url` channel); file ids ride
+                    // on the injected `fileid://` message, so a reference keeps
+                    // the transcript in step with what the model receives.
+                    text.push(format!(
+                        "{name}: {}",
+                        crate::common::document::render(document)
+                    ));
+                }
                 ContentBlock::Thinking(_) => {}
                 ContentBlock::ToolResult(tr) => {
                     crate::common::diagnostics::warn(
@@ -836,6 +1001,9 @@ pub fn to_multi_agent_messages(
     // Java picks the merger from the endpoint type, not from media presence:
     // `doFormat` for the text endpoint, `formatMultiModal` for the multimodal one.
     let multimodal = force_multimodal;
+    if multimodal {
+        reject_document_urls_on_multimodal_endpoint(&messages)?;
+    }
 
     if let Some(first) = messages.first() {
         if first.role == MsgRole::System {
@@ -897,6 +1065,7 @@ pub fn to_multi_agent_messages(
     }
 
     apply_automatic_cache_control_excluding(&mut result, options, &injected);
+    validate_document_url_limit(&result)?;
     Ok(result)
 }
 
@@ -1411,6 +1580,138 @@ mod tests {
         ])
     }
 
+    fn url_document_msg(url: &str, strategy: Option<&str>) -> Msg {
+        let mut builder = agentscope_core::DocumentBlock::builder()
+            .source(Source::Url(agentscope_core::URLSource::new(url)))
+            .name("report.pdf")
+            .mime_type("application/pdf");
+        if let Some(strategy) = strategy {
+            let mut metadata = agentscope_core::JsonMap::new();
+            metadata.insert(
+                "file_parsing_strategy".to_string(),
+                serde_json::json!(strategy),
+            );
+            builder = builder.metadata(metadata);
+        }
+        Msg::user_blocks(vec![
+            ContentBlock::Text(TextBlock::new("Summarise this")),
+            ContentBlock::Document(builder.build()),
+        ])
+    }
+
+    #[test]
+    fn a_url_document_becomes_a_doc_url_part_on_the_user_turn() {
+        let msgs = convert(
+            vec![url_document_msg(
+                "https://example.com/report.pdf",
+                Some("text_only"),
+            )],
+            false,
+        );
+        assert_eq!(msgs.len(), 1);
+        let parts = match msgs[0].content.as_ref().unwrap() {
+            DashScopeContent::Parts(parts) => parts,
+            other => panic!("expected content parts, got {other:?}"),
+        };
+        assert_eq!(parts.len(), 2);
+        // A document turn needs a type discriminator on every one of its parts.
+        assert_eq!(parts[0].part_type.as_deref(), Some("text"));
+        assert_eq!(parts[0].text.as_deref(), Some("Summarise this"));
+        assert_eq!(parts[1].part_type.as_deref(), Some("doc_url"));
+        assert_eq!(
+            parts[1].doc_url.as_deref(),
+            Some(["https://example.com/report.pdf".to_string()].as_slice())
+        );
+        assert_eq!(parts[1].file_parsing_strategy.as_deref(), Some("text_only"));
+    }
+
+    #[test]
+    fn a_local_or_foreign_document_degrades_to_a_text_reference() {
+        // `file://` cannot be fetched by DashScope: the turn keeps the content-part shape a URL
+        // document asks for, but the part itself degrades to a reference (Java throws here; a
+        // formatter that throws would break every later turn of the session).
+        let local = convert(
+            vec![url_document_msg("file:///tmp/report.pdf", None)],
+            false,
+        );
+        let parts = match local[0].content.as_ref().unwrap() {
+            DashScopeContent::Parts(parts) => parts,
+            other => panic!("expected content parts, got {other:?}"),
+        };
+        assert_eq!(parts.len(), 2);
+        let reference = parts[1].text.as_deref().expect("degraded reference");
+        assert!(reference.contains("[document: report.pdf"), "{reference}");
+
+        // A file id issued by another provider has no DashScope channel either.
+        let foreign = Msg::user_blocks(vec![ContentBlock::Document(
+            agentscope_core::DocumentBlock::builder()
+                .source(Source::FileId(agentscope_core::FileIdSource::new(
+                    "openai", "file-1",
+                )))
+                .name("report.pdf")
+                .build(),
+        )]);
+        let msgs = convert(vec![foreign], false);
+        assert_eq!(msgs.len(), 1, "no fileid:// directive expected: {msgs:?}");
+        let text = msgs[0].content.as_ref().and_then(|c| c.as_text()).unwrap();
+        assert!(text.contains("provider file id: file-1"), "{text}");
+    }
+
+    #[test]
+    fn more_than_ten_document_urls_are_rejected() {
+        let messages: Vec<Msg> = (0..11)
+            .map(|i| url_document_msg(&format!("https://example.com/{i}.pdf"), None))
+            .collect();
+        let error = to_dashscope_messages(messages, false).unwrap_err();
+        assert!(
+            error.to_string().contains("at most 10 document URLs"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn url_documents_are_rejected_on_the_multimodal_endpoint() {
+        let error = to_dashscope_messages(
+            vec![url_document_msg("https://example.com/report.pdf", None)],
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("text-generation endpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_merged_agent_group_keeps_the_document_as_a_doc_url_part() {
+        let group = vec![Msg::builder()
+            .role(MsgRole::User)
+            .name("Alice")
+            .content(vec![
+                ContentBlock::Text(TextBlock::new("read this")),
+                ContentBlock::Document(
+                    agentscope_core::DocumentBlock::builder()
+                        .source(Source::Url(agentscope_core::URLSource::new(
+                            "https://example.com/report.pdf",
+                        )))
+                        .build(),
+                ),
+            ])
+            .build()];
+        let merged = merge_conversation(&group, "PROMPT\n");
+        let parts = match merged.content.as_ref().unwrap() {
+            DashScopeContent::Parts(parts) => parts,
+            other => panic!("expected content parts, got {other:?}"),
+        };
+        assert!(parts[0].part_type.as_deref() == Some("text"));
+        assert_eq!(parts[1].part_type.as_deref(), Some("doc_url"));
+        assert!(parts[0]
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("Alice: [Document]"));
+    }
+
     #[test]
     fn document_block_emits_file_id_system_message_before_the_turn() {
         let msgs = convert(vec![document_msg("file-abc")], false);
@@ -1421,9 +1722,17 @@ mod tests {
             Some("fileid://file-abc")
         );
         assert_eq!(msgs[1].role.as_deref(), Some("user"));
-        assert_eq!(
-            msgs[1].content.as_ref().and_then(|c| c.as_text()),
-            Some("Summarise this")
+        // The turn stays self-describing: the file-id document is also named as a reference
+        // (Java `DashScopeMessageConverter#extractTextContent`).
+        let text = msgs[1]
+            .content
+            .as_ref()
+            .and_then(|c| c.as_text())
+            .expect("plain text turn");
+        assert!(text.starts_with("Summarise this"), "{text}");
+        assert!(
+            text.contains("provider file id: file-abc (dashscope)"),
+            "{text}"
         );
     }
 
@@ -1464,32 +1773,23 @@ mod tests {
     }
 
     #[test]
-    fn document_block_rejects_non_file_id_source() {
+    fn a_base64_document_degrades_to_a_text_reference() {
+        // A Base64 payload has no DashScope channel: it stays visible as a reference instead of
+        // failing the whole turn (Java `appendDocumentMessages` throws here).
         let msg = Msg::user_blocks(vec![ContentBlock::Document(
-            agentscope_core::DocumentBlock::new(Source::Url(agentscope_core::URLSource::new(
-                "https://example.com/a.pdf",
-            ))),
+            agentscope_core::DocumentBlock::builder()
+                .source(Source::Base64(agentscope_core::Base64Source::new(
+                    "application/pdf",
+                    "QUJD",
+                )))
+                .name("report.pdf")
+                .mime_type("application/pdf")
+                .build(),
         )]);
-        let err = to_dashscope_messages(vec![msg], false).expect_err("URL document rejected");
-        assert!(
-            err.to_string().contains("requires a file id source"),
-            "{err}"
-        );
-        assert!(err.to_string().contains("URLSource"), "{err}");
-    }
-
-    #[test]
-    fn document_block_rejects_foreign_provider() {
-        let msg = Msg::user_blocks(vec![ContentBlock::Document(
-            agentscope_core::DocumentBlock::new(Source::FileId(
-                agentscope_core::FileIdSource::new("openai", "file-abc"),
-            )),
-        )]);
-        let err = to_dashscope_messages(vec![msg], false).expect_err("foreign provider rejected");
-        assert!(
-            err.to_string().contains("requires a DashScope file id"),
-            "{err}"
-        );
+        let msgs = convert(vec![msg], false);
+        assert_eq!(msgs.len(), 1, "no fileid:// directive expected: {msgs:?}");
+        let text = msgs[0].content.as_ref().and_then(|c| c.as_text()).unwrap();
+        assert!(text.contains("inline base64"), "{text}");
     }
 
     #[test]

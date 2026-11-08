@@ -18,15 +18,15 @@
 //! * tool-call replay must carry back the `thoughtSignature` from metadata.
 
 use agentscope_core::{
-    extract_text_content, resolve_mime_type, AudioBlock, ContentBlock, DataBlock, GenerateOptions,
-    HintBlock, ImageBlock, Msg, MsgRole, Result, Source, ToolChoice, ToolSchema, ToolUseBlock,
-    VideoBlock,
+    determine_media_type, extract_text_content, resolve_mime_type, AudioBlock, ContentBlock,
+    DataBlock, DocumentBlock, GenerateOptions, HintBlock, ImageBlock, Msg, MsgRole, Result, Source,
+    ToolChoice, ToolSchema, ToolUseBlock, VideoBlock,
 };
 
 use super::dto::{
-    GeminiContent, GeminiFunctionCall, GeminiFunctionCallingConfig, GeminiFunctionDeclaration,
-    GeminiFunctionResponse, GeminiGenerationConfig, GeminiPart, GeminiRequest,
-    GeminiThinkingConfig, GeminiTool, GeminiToolConfig,
+    GeminiContent, GeminiFileData, GeminiFunctionCall, GeminiFunctionCallingConfig,
+    GeminiFunctionDeclaration, GeminiFunctionResponse, GeminiGenerationConfig, GeminiPart,
+    GeminiRequest, GeminiThinkingConfig, GeminiTool, GeminiToolConfig,
 };
 
 /// Marks the start of the merged history block (shared by merger + formatter).
@@ -118,6 +118,154 @@ fn block_data_part(block: &DataBlock) -> GeminiPart {
         Ok(part) => part,
         Err(e) => media_fallback(&format!("[Data - processing failed: {e}]"), "content.data"),
     }
+}
+
+/// Gemini accepts at most 20 MB of inline data per request.
+const MAX_INLINE_DOCUMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// Files API endpoint used to expand a bare `files/...` name into a URI.
+const DEFAULT_FILES_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/";
+
+/// Document MIME types `generateContent` can read. An unlisted document (a
+/// `.docx`, for example) makes the API reject the whole request, so such
+/// documents degrade to a text placeholder instead.
+const SUPPORTED_DOCUMENT_MIME_TYPES: &[&str] = &[
+    "application/pdf",
+    "text/plain",
+    "text/html",
+    "text/css",
+    "text/javascript",
+    "text/x-typescript",
+    "text/csv",
+    "text/markdown",
+    "text/x-python",
+    "text/xml",
+    "text/rtf",
+    "application/x-javascript",
+    "application/x-typescript",
+    "application/x-python-code",
+    "application/json",
+    "application/x-ipynb+json",
+    "application/rtf",
+    "text/md",
+    "application/xml",
+];
+
+/// Providers whose [`Source::FileId`] values this converter forwards as Gemini
+/// file URIs.
+const FILE_PROVIDER_ALIASES: &[&str] = &["gemini", "google"];
+
+fn is_supported_document_mime(mime: &str) -> bool {
+    let normalized = mime
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    SUPPORTED_DOCUMENT_MIME_TYPES.contains(&normalized.as_str())
+}
+
+/// Expands a Gemini Files API name (`files/abc`) into the URI `fileData` takes.
+/// Values that already are a URI (http/https/gs) pass through.
+fn to_file_uri(file_id: &str) -> Option<String> {
+    let file_id = file_id.trim();
+    if file_id.is_empty() {
+        return None;
+    }
+    if file_id.starts_with("http://")
+        || file_id.starts_with("https://")
+        || file_id.starts_with("gs://")
+    {
+        return Some(file_id.to_string());
+    }
+    file_id
+        .starts_with("files/")
+        .then(|| format!("{DEFAULT_FILES_ENDPOINT}{file_id}"))
+}
+
+/// Resolves the document MIME type: declared value, source hint, then the file
+/// extension (core `determine_media_type`, which knows `application/pdf`).
+fn document_mime(block: &DocumentBlock) -> Option<String> {
+    block
+        .mime_type
+        .clone()
+        .filter(|mime| !mime.trim().is_empty())
+        .or_else(|| match &block.source {
+            Source::Base64(b64) => Some(b64.media_type.clone()),
+            Source::Url(url) => url
+                .mime_type
+                .clone()
+                .filter(|mime| !mime.trim().is_empty())
+                .or_else(|| infer_document_mime(&url.url)),
+            // A Files API id carries no MIME type; the block name is the only hint
+            // (Java `inferMimeTypeFromName`).
+            Source::FileId(_) => block.name.as_deref().and_then(infer_document_mime),
+        })
+        .filter(|mime| !mime.trim().is_empty())
+}
+
+/// Infers a document MIME type from a file name or URL, `None` when the
+/// extension says nothing.
+fn infer_document_mime(path: &str) -> Option<String> {
+    let inferred = determine_media_type(path);
+    (inferred != "application/octet-stream").then_some(inferred)
+}
+
+fn document_placeholder(message: &str, label: &str) -> GeminiPart {
+    media_fallback(
+        &format!("[Document - {message}: {label}]"),
+        "content.document",
+    )
+}
+
+/// Converts a document block into a Gemini part.
+///
+/// Documents already uploaded to the Files API become `fileData`; documents
+/// supplied as bytes or a URL are inlined. Anything Gemini cannot read degrades
+/// to a text placeholder: a document stays in the conversation history, so a
+/// part that makes the API reject the whole request would break every later
+/// turn of the session.
+fn document_part(block: &DocumentBlock) -> GeminiPart {
+    let label = block.name.clone().unwrap_or_else(|| block.id.clone());
+    if let Source::FileId(file) = &block.source {
+        let provider = file.provider.to_lowercase();
+        if !FILE_PROVIDER_ALIASES.contains(&provider.as_str()) {
+            return document_placeholder("not supported by Gemini", &label);
+        }
+        let Some(file_uri) = to_file_uri(&file.file_id) else {
+            return document_placeholder("not supported by Gemini", &label);
+        };
+        let Some(mime) = document_mime(block).filter(|mime| is_supported_document_mime(mime))
+        else {
+            return document_placeholder("unsupported MIME type", &label);
+        };
+        return GeminiPart {
+            file_data: Some(GeminiFileData {
+                file_uri,
+                mime_type: mime,
+            }),
+            ..Default::default()
+        };
+    }
+    let Some(mime) = document_mime(block).filter(|mime| is_supported_document_mime(mime)) else {
+        return document_placeholder("unsupported MIME type", &label);
+    };
+    match crate::common::resolve_media(&block.source, "formatting document for Gemini") {
+        Ok(resolved) => {
+            if decoded_size(&resolved.base64) > MAX_INLINE_DOCUMENT_BYTES {
+                return document_placeholder("not readable", &label);
+            }
+            GeminiPart::inline(mime, resolved.base64)
+        }
+        Err(_) => document_placeholder("not readable", &label),
+    }
+}
+
+/// Estimates the decoded size of a base64 payload (padding excluded).
+fn decoded_size(data: &str) -> usize {
+    let padding = data.bytes().rev().take_while(|b| *b == b'=').count();
+    // A malformed payload (only padding) must not underflow into a huge size.
+    ((data.len() * 3) / 4).saturating_sub(padding)
 }
 
 /// Resolves the JSON argument map of a tool call, preferring the raw `content`
@@ -213,9 +361,15 @@ pub fn to_gemini_contents(messages: &[Msg]) -> Vec<GeminiContent> {
                 ContentBlock::Audio(a) => parts.push(audio_part(a)),
                 ContentBlock::Video(v) => parts.push(video_part(v)),
                 ContentBlock::Data(d) => parts.push(block_data_part(d)),
-                // Thinking blocks never go back to the API; documents have no Gemini part.
+                // Documents travel natively on user turns (the model reads the file
+                // itself); elsewhere they stay in the history as a reference.
+                ContentBlock::Document(doc) => parts.push(if msg.role == MsgRole::User {
+                    document_part(doc)
+                } else {
+                    GeminiPart::text(crate::common::document::render(doc))
+                }),
+                // Thinking blocks never go back to the API.
                 ContentBlock::Thinking(_) => {}
-                ContentBlock::Document(_) => {}
             }
         }
 
@@ -451,8 +605,13 @@ pub fn merge_to_content(messages: &[Msg], history_prompt: &str) -> GeminiContent
                     flush(&mut text, &mut parts);
                     parts.push(block_data_part(d));
                 }
+                // The merged history is always sent as a user message, so the
+                // document travels natively like any other user input.
+                ContentBlock::Document(doc) => {
+                    flush(&mut text, &mut parts);
+                    parts.push(document_part(doc));
+                }
                 ContentBlock::ToolUse(_) => {}
-                ContentBlock::Document(_) => {}
             }
         }
     }
@@ -577,6 +736,78 @@ pub fn to_multi_agent_contents(
 mod tests {
     use super::*;
     use agentscope_core::{Base64Source, JsonMap, TextBlock, ThinkingBlock, URLSource};
+
+    #[test]
+    fn documents_travel_inline_on_user_turns_and_as_references_elsewhere() {
+        let document = DocumentBlock::builder()
+            .source(Source::Base64(Base64Source::new("application/pdf", "QUJD")))
+            .name("report.pdf")
+            .build();
+        let contents = to_gemini_contents(&[
+            Msg::user_blocks(vec![ContentBlock::Document(document.clone())]),
+            Msg::builder()
+                .role(MsgRole::Assistant)
+                .content(vec![ContentBlock::Document(document)])
+                .build(),
+        ]);
+        let blob = contents[0].parts[0]
+            .inline_data
+            .as_ref()
+            .expect("inline document");
+        assert_eq!(blob.mime_type, "application/pdf");
+        assert_eq!(blob.data, "QUJD");
+        // A document outside a user turn keeps a reference in the history.
+        let reference = contents[1].parts[0].text.as_deref().unwrap();
+        assert!(
+            reference.starts_with("[document: report.pdf"),
+            "{reference}"
+        );
+    }
+
+    #[test]
+    fn a_gemini_file_id_becomes_file_data_while_a_foreign_one_degrades() {
+        let own = DocumentBlock::builder()
+            .source(Source::FileId(agentscope_core::FileIdSource::new(
+                "gemini",
+                "files/abc",
+            )))
+            .mime_type("application/pdf")
+            .build();
+        let foreign = DocumentBlock::builder()
+            .source(Source::FileId(agentscope_core::FileIdSource::new(
+                "openai", "file-1",
+            )))
+            .mime_type("application/pdf")
+            .build();
+        let contents = to_gemini_contents(&[Msg::user_blocks(vec![
+            ContentBlock::Document(own),
+            ContentBlock::Document(foreign),
+        ])]);
+        let file_data = contents[0].parts[0].file_data.as_ref().expect("fileData");
+        assert_eq!(
+            file_data.file_uri,
+            "https://generativelanguage.googleapis.com/v1beta/files/abc"
+        );
+        assert_eq!(file_data.mime_type, "application/pdf");
+        let degraded = contents[0].parts[1].text.as_deref().unwrap();
+        assert!(degraded.contains("not supported by Gemini"), "{degraded}");
+    }
+
+    #[test]
+    fn an_unsupported_document_mime_type_degrades_instead_of_failing_the_turn() {
+        let document = DocumentBlock::builder()
+            .source(Source::Base64(Base64Source::new(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "QUJD",
+            )))
+            .name("report.docx")
+            .build();
+        let contents =
+            to_gemini_contents(&[Msg::user_blocks(vec![ContentBlock::Document(document)])]);
+        assert!(contents[0].parts[0].inline_data.is_none());
+        let text = contents[0].parts[0].text.as_deref().unwrap();
+        assert!(text.contains("unsupported MIME type"), "{text}");
+    }
 
     fn tool_schema(name: &str) -> ToolSchema {
         ToolSchema {

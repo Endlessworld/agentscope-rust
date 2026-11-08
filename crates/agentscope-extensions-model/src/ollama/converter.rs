@@ -43,11 +43,13 @@ impl ImageResolver for DefaultImageResolver {
 }
 
 /// Extracts text from a content block, matching the Java `extractTextContent`:
-/// text blocks, hint blocks and text found inside tool-result outputs.
+/// text blocks, hint blocks, text found inside tool-result outputs, and a
+/// one-line reference for documents (which Ollama cannot consume as media).
 fn block_text(block: &ContentBlock) -> Option<String> {
     match block {
         ContentBlock::Text(t) => Some(t.text.clone()),
         ContentBlock::Hint(h) => h.hint.clone(),
+        ContentBlock::Document(d) => Some(crate::common::document::render(d)),
         ContentBlock::ToolResult(tr) => {
             let joined = tr
                 .output
@@ -55,6 +57,7 @@ fn block_text(block: &ContentBlock) -> Option<String> {
                 .filter_map(|b| match b {
                     ContentBlock::Text(t) => Some(t.text.clone()),
                     ContentBlock::Hint(h) => h.hint.clone(),
+                    ContentBlock::Document(d) => Some(crate::common::document::render(d)),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -187,13 +190,24 @@ pub fn to_ollama_messages_with(
         if msg.role == MsgRole::Tool && tool_results.is_empty() {
             out.push(OllamaMessage {
                 role: Some("tool".to_string()),
-                content: Some(extract_text_content(&msg)),
+                content: Some(crate::common::document::append(
+                    &extract_text_content(&msg),
+                    &msg,
+                )),
                 ..Default::default()
             });
             continue;
         }
 
-        let has_main = !text_blocks.is_empty() || !images.is_empty() || !tool_uses.is_empty();
+        // A message carrying only documents still has content: the reference below is what the
+        // model sees, so it must not be dropped (Java always sends the message).
+        let has_main = !text_blocks.is_empty()
+            || !images.is_empty()
+            || !tool_uses.is_empty()
+            || msg
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Document(_)));
         if !has_main {
             continue;
         }
@@ -204,6 +218,9 @@ pub fn to_ollama_messages_with(
                 .cloned()
                 .collect::<Vec<ContentBlock>>(),
         );
+        // Documents have no Ollama representation; they stay in the message as a
+        // one-line reference so the attachment is not lost from the history.
+        let text = crate::common::document::append_blocks(&text, &msg.content);
 
         let mut main = OllamaMessage {
             role: Some(role_str(msg.role).to_string()),
@@ -385,6 +402,12 @@ pub fn merge_conversation(messages: &[Msg], history_prompt: &str) -> OllamaMessa
                     text.push_str(&format!(
                         "{name} ({}): {output}\n",
                         tr.name.clone().unwrap_or_default()
+                    ));
+                }
+                ContentBlock::Document(doc) => {
+                    text.push_str(&format!(
+                        "{name}: {}\n",
+                        crate::common::document::render(doc)
                     ));
                 }
                 // Thinking blocks are never sent back to the model.
@@ -642,6 +665,39 @@ mod tests {
             .name(name)
             .text_content(text)
             .build()
+    }
+
+    #[test]
+    fn a_document_becomes_a_text_reference() {
+        let document = agentscope_core::DocumentBlock::builder()
+            .source(Source::Base64(Base64Source::new("application/pdf", "QUJD")))
+            .name("report.pdf")
+            .build();
+        let messages = to_ollama_messages(vec![Msg::user_blocks(vec![
+            ContentBlock::Text(agentscope_core::TextBlock::new("read this")),
+            ContentBlock::Document(document.clone()),
+        ])])
+        .unwrap();
+        let content = messages[0].content.as_deref().unwrap();
+        assert!(
+            content.starts_with("read this\n[document: report.pdf"),
+            "{content}"
+        );
+
+        // A document carried by a tool result is referenced in the tool message.
+        let tool_messages = to_ollama_messages(vec![Msg::tool_blocks(vec![
+            agentscope_core::ToolResultBlock::new(
+                "call-1",
+                "fetch",
+                vec![ContentBlock::Document(document)],
+            ),
+        ])])
+        .unwrap();
+        let tool_content = tool_messages[0].content.as_deref().unwrap();
+        assert!(
+            tool_content.starts_with("[document: report.pdf"),
+            "{tool_content}"
+        );
     }
 
     #[test]

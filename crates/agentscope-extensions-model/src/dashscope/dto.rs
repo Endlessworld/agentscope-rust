@@ -87,6 +87,11 @@ pub struct DashScopeParameters {
     pub repetition_penalty: Option<f64>,
     #[serde(rename = "response_format", skip_serializing_if = "Option::is_none")]
     pub response_format: Option<serde_json::Value>,
+    /// Skills for document-capable models, e.g. PowerPoint generation on
+    /// `qwen-doc-turbo`. Requires streaming: the API rejects the parameter in
+    /// non-streaming mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill: Option<serde_json::Value>,
 }
 
 fn default_result_format() -> String {
@@ -117,6 +122,7 @@ impl Default for DashScopeParameters {
             presence_penalty: None,
             repetition_penalty: None,
             response_format: None,
+            skill: None,
         }
     }
 }
@@ -153,6 +159,18 @@ pub struct DashScopeSearchOptions {
     #[serde(rename = "agent_max", skip_serializing_if = "Option::is_none")]
     pub agent_max: Option<u32>,
 }
+
+/// Part type value for document URL parts.
+pub const PART_TYPE_DOC_URL: &str = "doc_url";
+
+/// Part type value for plain text parts; required next to a `doc_url` part.
+pub const PART_TYPE_TEXT: &str = "text";
+
+/// Metadata key marking a reply produced with a DashScope skill.
+pub const METADATA_SKILL: &str = "dashscope.skill";
+
+/// Skill type for PowerPoint generation (`qwen-doc-turbo`).
+pub const SKILL_TYPE_PPT: &str = "ppt";
 
 /// Message content: a plain string or a multimodal content-part list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -217,6 +235,20 @@ pub struct DashScopeMessage {
 /// `JsonInclude.Include.NON_NULL` plus the "has content" helper in Java.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DashScopeContentPart {
+    /// Part type discriminator (`text` / `doc_url`). Document-capable models
+    /// require it on every part of a turn that carries `doc_url` parts.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub part_type: Option<String>,
+    /// Document URLs (`qwen-doc-turbo`): at most 10 per request, each publicly reachable.
+    #[serde(rename = "doc_url", skip_serializing_if = "Option::is_none")]
+    pub doc_url: Option<Vec<String>>,
+    /// How the documents of a `doc_url` part are parsed (`auto`, `text_only`,
+    /// `text_and_images`).
+    #[serde(
+        rename = "file_parsing_strategy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub file_parsing_strategy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -277,12 +309,23 @@ impl DashScopeContentPart {
         }
     }
 
+    /// Creates a `doc_url` part for a document-capable model.
+    pub fn doc_url(urls: Vec<String>, file_parsing_strategy: Option<String>) -> Self {
+        Self {
+            part_type: Some(PART_TYPE_DOC_URL.to_string()),
+            doc_url: Some(urls),
+            file_parsing_strategy,
+            ..Default::default()
+        }
+    }
+
     /// Whether this part carries any content.
     pub fn has_content(&self) -> bool {
         self.text.as_deref().map(|t| !t.is_empty()).unwrap_or(false)
             || self.image.is_some()
             || self.audio.is_some()
             || self.video.is_some()
+            || self.doc_url.is_some()
     }
 }
 

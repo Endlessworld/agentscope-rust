@@ -49,6 +49,9 @@ pub struct GeminiPart {
     /// Inline binary payload (image/audio/video/data), base64-encoded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inline_data: Option<GeminiBlob>,
+    /// Reference to a file already uploaded to the Gemini Files API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<GeminiFileData>,
     /// Model-issued tool call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_call: Option<GeminiFunctionCall>,
@@ -103,6 +106,15 @@ pub struct GeminiBlob {
     pub mime_type: String,
     /// Base64-encoded bytes.
     pub data: String,
+}
+
+/// Files API reference (`fileData` part).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiFileData {
+    /// Full Files API URI (`https://…/files/…`) or a `gs://` location.
+    pub file_uri: String,
+    pub mime_type: String,
 }
 
 /// A tool call emitted by the model.
@@ -392,6 +404,7 @@ mod tests {
                 mime_type: "image/png".into(),
                 data: "AAAA".into(),
             }),
+            file_data: None,
             function_call: None,
             function_response: None,
             tool_call: None,

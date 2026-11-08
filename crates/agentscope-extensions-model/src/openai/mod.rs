@@ -1046,21 +1046,11 @@ fn user_message_content(msg: &Msg) -> ChatCompletionRequestUserMessageContent {
                 multipart = true;
                 parts.push(audio_content_part(&audio.source));
             }
-            // Documents are not accepted by OpenAI: report the dropped content as a
-            // text placeholder instead of collapsing the message to empty.
-            ContentBlock::Document(d) => {
-                let label = d.name.clone().unwrap_or_else(|| d.id.clone());
-                diagnostics::warn(
-                    "document_not_supported",
-                    "content.document",
-                    format!(
-                        "DocumentBlock is not supported by OpenAI; sending a text placeholder instead of '{label}'"
-                    ),
-                );
+            // Documents cannot travel as OpenAI content parts: keep the attachment
+            // visible as a one-line reference instead of dropping it.
+            ContentBlock::Document(document) => {
                 multipart = true;
-                parts.push(text_content_part(format!(
-                    "[Document - not supported by OpenAI: {label}]"
-                )));
+                parts.push(text_content_part(crate::common::document::render(document)));
             }
             _ => {}
         }
@@ -1140,7 +1130,9 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
                 // tool_calls. Strict OpenAI-compatible APIs reject such a message with
                 // "content or tool_calls must be set". Always send `content`, using "" as the
                 // fallback �?mirrors Java OpenAIMessageConverter.convertAssistantMessage.
-                let content = Some(ChatCompletionRequestAssistantMessageContent::Text(text));
+                let content = Some(ChatCompletionRequestAssistantMessageContent::Text(
+                    crate::common::document::append(&text, &msg),
+                ));
                 out.push(ChatCompletionRequestMessage::Assistant(
                     ChatCompletionRequestAssistantMessage {
                         content,
@@ -1168,6 +1160,7 @@ fn to_request_messages(messages: Vec<Msg>, reasoning_passback: bool) -> RequestM
             }
             MsgRole::Tool => {
                 for tr in msg.tool_result_blocks() {
+                    // Documents inside a tool result already render as references here.
                     let text = convert_tool_result_to_string(&tr.output);
                     if let Some(id) = &tr.id {
                         out.push(ChatCompletionRequestMessage::Tool(
@@ -1264,9 +1257,38 @@ fn inject_reasoning_details(body: &mut serde_json::Value, details: &[Option<serd
             continue;
         };
         if let Some(object) = messages.get_mut(i).and_then(|m| m.as_object_mut()) {
-            object.insert("reasoning_details".to_string(), details.clone());
+            object.insert(
+                "reasoning_details".to_string(),
+                request_reasoning_details(details),
+            );
         }
     }
+}
+
+/// Copies a provider `reasoning_details` list for a request, dropping the
+/// streaming `index` of every detail.
+///
+/// Strict OpenAI-compatible endpoints reject a replayed streaming index in the
+/// message history, while the block order and the supported payload fields
+/// (`id` / `type` / `data` / `text` / `format`) must survive. The metadata keeps
+/// the index: only the request copy is stripped.
+fn request_reasoning_details(details: &serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(items) = details else {
+        return details.clone();
+    };
+    serde_json::Value::Array(
+        items
+            .iter()
+            .map(|item| match item {
+                serde_json::Value::Object(object) if object.contains_key("index") => {
+                    let mut object = object.clone();
+                    object.remove("index");
+                    serde_json::Value::Object(object)
+                }
+                other => other.clone(),
+            })
+            .collect(),
+    )
 }
 
 /// Replays provider tool signatures on the matching function calls
@@ -2690,6 +2712,91 @@ mod tests {
             body["messages"][1]["tool_calls"][0]["function"]["thought_signature"],
             serde_json::json!("sig-1")
         );
+    }
+
+    #[test]
+    fn replayed_reasoning_details_drop_the_streaming_index() {
+        // Strict OpenAI-compatible endpoints reject a replayed streaming
+        // `reasoning_details[].index`; the metadata keeps it, the request copy
+        // must not.
+        let chunk: OpenAiStreamChunk = serde_json::from_value(serde_json::json!({
+            "id": "x",
+            "choices": [{
+                "delta": {
+                    "reasoning_details": [
+                        {"type": "reasoning.text", "id": "rs_0", "index": 0, "text": "first"},
+                        {"type": "reasoning.text", "id": "rs_1", "index": 1, "text": "second"}
+                    ]
+                }
+            }]
+        }))
+        .unwrap();
+        let mut inc = StreamIncrementer::default();
+        let delta = inc.accumulate(&chunk).expect("reasoning delta");
+        let thinking = match &delta.content[0] {
+            ContentBlock::Thinking(thinking) => thinking.clone(),
+            other => panic!("expected Thinking, got {other:?}"),
+        };
+
+        let ctx = ModelCreationContext::new("openai", "gateway-chat").api_key("sk-test");
+        let model = OpenAiChatModel::from_context(&ctx).expect("model");
+        let assistant = Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Thinking(thinking.clone())])
+            .build();
+        let (body, _) = model.prepare_body(
+            vec![Msg::user("hi"), assistant],
+            vec![],
+            GenerateOptions::default(),
+        );
+        let replay = body["messages"][1]["reasoning_details"].as_array().unwrap();
+        assert_eq!(replay.len(), 2);
+        for detail in replay {
+            assert!(detail.get("index").is_none(), "index replayed: {body}");
+        }
+        // Supported payload fields and block order survive.
+        assert_eq!(replay[0]["text"], serde_json::json!("first"));
+        assert_eq!(replay[1]["id"], serde_json::json!("rs_1"));
+        assert_eq!(replay[0]["type"], serde_json::json!("reasoning.text"));
+        // The recorded block still carries the index for streaming / persistence.
+        assert_eq!(
+            thinking.metadata.as_ref().unwrap()[ThinkingBlock::METADATA_REASONING_DETAILS][1]
+                ["index"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[test]
+    fn documents_become_text_references_instead_of_being_dropped() {
+        let document = agentscope_core::DocumentBlock::builder()
+            .source(Source::Url(agentscope_core::URLSource::new(
+                "https://example.com/report.pdf",
+            )))
+            .name("report.pdf")
+            .mime_type("application/pdf")
+            .build();
+        let ctx = ModelCreationContext::new("openai", "gateway-chat").api_key("sk-test");
+        let model = OpenAiChatModel::from_context(&ctx).expect("model");
+        let (body, _) = model.prepare_body(
+            vec![
+                Msg::user_blocks(vec![
+                    ContentBlock::Text(TextBlock::new("read this")),
+                    ContentBlock::Document(document.clone()),
+                ]),
+                Msg::builder()
+                    .role(MsgRole::Assistant)
+                    .content(vec![ContentBlock::Document(document)])
+                    .build(),
+            ],
+            vec![],
+            GenerateOptions::default(),
+        );
+        let reference =
+            "[document: report.pdf, application/pdf, url: https://example.com/report.pdf]";
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "{body}");
+        assert_eq!(parts[1]["text"], serde_json::json!(reference));
+        assert_eq!(body["messages"][1]["content"], serde_json::json!(reference));
     }
 
     fn json_schema_response_format(strict: Option<bool>) -> ResponseFormat {

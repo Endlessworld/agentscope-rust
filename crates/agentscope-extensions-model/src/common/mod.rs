@@ -16,6 +16,7 @@
 pub mod base_url;
 pub mod capabilities;
 pub mod diagnostics;
+pub mod document;
 pub mod error;
 pub mod media;
 pub mod model_map;

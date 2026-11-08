@@ -12,6 +12,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 
 use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
+use agentscope_core::model::context_windows::resolve_context_window;
 use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, ToolSchema};
 
 use crate::common::error::ModelError;
@@ -77,7 +78,7 @@ impl GeminiChatModel {
         let context_window_size = descriptor
             .as_ref()
             .map(|descriptor| descriptor.context_window)
-            .unwrap_or(0);
+            .unwrap_or_else(|| resolve_context_window(&model_name));
         Self {
             model_name,
             api_key: api_key.into(),

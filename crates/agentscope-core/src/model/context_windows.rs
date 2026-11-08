@@ -39,6 +39,12 @@ pub const CONTEXT_WINDOW_TABLE: &[(&str, usize)] = &[
     ("llama", 131_072),
     // Anthropic
     ("claude", 200_000),
+    // Gemini (the `gemini-3` default is 1M, like 2.5/2.0; 1.5 doubles it)
+    ("gemini-3", 1_048_576),
+    ("gemini-2.5", 1_048_576),
+    ("gemini-2.0", 1_048_576),
+    ("gemini-1.5", 2_097_152),
+    ("gemini", 1_048_576),
     // Mistral
     ("mistral", 32_768),
     // Local / Ollama defaults
@@ -81,6 +87,15 @@ mod tests {
             200_000
         );
         assert_eq!(resolve_context_window("grok-3"), 131_072);
+    }
+
+    #[test]
+    fn gemini_windows_follow_the_family_prefix() {
+        // `gemini-3` is the default model family (see `GeminiChatModel`): a missing
+        // entry would leave it on the unknown-model default of 256k.
+        assert_eq!(resolve_context_window("gemini-3.8-flash"), 1_048_576);
+        assert_eq!(resolve_context_window("gemini-2.5-flash"), 1_048_576);
+        assert_eq!(resolve_context_window("gemini-1.5-pro"), 2_097_152);
     }
 
     #[test]

@@ -10,7 +10,9 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 
 use agentscope_core::model::catalog::{descriptor_for, ModelDescriptor};
-use agentscope_core::{ChatResponse, Error, GenerateOptions, Model, Msg, Result, ToolSchema};
+use agentscope_core::{
+    ChatResponse, ContentBlock, Error, GenerateOptions, Model, Msg, Result, ToolSchema,
+};
 
 use crate::common::{HttpRequestSpec, SharedTransport};
 use crate::dashscope::converter::{
@@ -26,6 +28,12 @@ use crate::dashscope::parser::{parse_response, DashScopeStreamIncrementer};
 
 /// Public keys endpoint used for request encryption.
 pub const PUBLIC_KEYS_ENDPOINT: &str = "/api/v1/public-keys/latest";
+
+/// DashScope rejects a `skill` outside streaming mode; fail with this message
+/// instead of surfacing the opaque provider error.
+pub const SKILL_STREAM_REQUIREMENT: &str =
+    "DashScope `skill` (e.g. PPT generation on qwen-doc-turbo) \
+     is only supported in stream mode; build the model with .stream(true)";
 
 /// A chat model backed by the DashScope (Alibaba Cloud) native API.
 pub struct DashScopeChatModel {
@@ -307,6 +315,14 @@ impl DashScopeChatModel {
         stream: bool,
         config: Option<&EncryptionConfig>,
     ) -> Result<(HttpRequestSpec, Option<EncryptionContext>)> {
+        // A `skill` travels through `additional_body_params` (the Java model
+        // merges them into `parameters`); DashScope only accepts it while streaming.
+        let skill = options.additional_body_params.get("skill").cloned();
+        if skill.is_some() && !stream {
+            return Err(agentscope_core::Error::Model(
+                SKILL_STREAM_REQUIREMENT.to_string(),
+            ));
+        }
         let force_multimodal = self.requires_multimodal_api();
         let ds_messages = match &self.multi_agent_prompt {
             Some(prompt) => super::converter::to_multi_agent_messages(
@@ -339,6 +355,9 @@ impl DashScopeChatModel {
             }
             if self.enable_code_interpreter {
                 params.enable_code_interpreter = Some(true);
+            }
+            if let Some(skill) = skill.as_ref() {
+                params.skill = Some(skill.clone());
             }
         }
         let mut body = serde_json::to_value(&request).unwrap_or(serde_json::Value::Null);
@@ -474,6 +493,35 @@ impl DashScopeChatModel {
     }
 }
 
+/// Marks a streamed chunk whose text content carries skill output.
+///
+/// In skill mode the outline and page content stream through
+/// `reasoning_content` (thinking blocks) while the final download URL arrives in
+/// `content` (text blocks), so a chunk with text content carries the artifact.
+/// The flag reaches the final assistant message metadata under
+/// [`crate::dashscope::dto::METADATA_SKILL`]; the download URL stays in the text.
+fn annotate_skill_output(response: ChatResponse, skill_active: bool) -> ChatResponse {
+    if !skill_active {
+        return response;
+    }
+    let has_text = response
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Text(text) if !text.text.is_empty()));
+    if !has_text {
+        return response;
+    }
+    let mut metadata = response.metadata.clone();
+    metadata.insert(
+        crate::dashscope::dto::METADATA_SKILL.to_string(),
+        serde_json::json!(crate::dashscope::dto::SKILL_TYPE_PPT),
+    );
+    ChatResponse {
+        metadata,
+        ..response
+    }
+}
+
 impl Model for DashScopeChatModel {
     fn stream(
         &self,
@@ -483,6 +531,7 @@ impl Model for DashScopeChatModel {
     ) -> BoxStream<'_, Result<ChatResponse>> {
         let options = crate::common::clamp_max_tokens(options, self.max_output_tokens());
         let stream_enabled = options.stream.unwrap_or(self.stream);
+        let skill_active = options.additional_body_params.contains_key("skill");
         Box::pin(async_stream::stream! {
             let (spec, encryption_context) =
                 match self
@@ -537,11 +586,11 @@ impl Model for DashScopeChatModel {
                         return;
                     }
                     if let Some(chunk) = incrementer.accumulate(&response) {
-                        yield Ok(chunk);
+                        yield Ok(annotate_skill_output(chunk, skill_active));
                     }
                 }
                 if let Some(tail) = incrementer.into_final() {
-                    yield Ok(tail);
+                    yield Ok(annotate_skill_output(tail, skill_active));
                 }
             } else {
                 match self.transport.post_json(spec).await {
@@ -724,6 +773,63 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "X-DashScope-SSE" && v == "enable"));
+    }
+
+    #[tokio::test]
+    async fn a_skill_is_rejected_without_streaming() {
+        let transport = MemoryTransport::with_response(serde_json::json!({
+            "output": { "choices": [{ "message": { "content": "hi" } }] }
+        }));
+        let model = model_with(transport, "qwen-doc-turbo");
+        let options = GenerateOptions::builder()
+            .stream(false)
+            .additional_body_param("skill", serde_json::json!([{ "type": "ppt" }]))
+            .build();
+        let out = collect(&model, options).await;
+        let error = out[0].as_ref().unwrap_err().to_string();
+        assert!(error.contains("only supported in stream mode"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_skill_reaches_parameters_and_marks_text_chunks() {
+        let transport = MemoryTransport::with_stream(vec![
+            serde_json::json!({
+                "output": { "choices": [{ "message": { "reasoning_content": "outline" } }] }
+            }),
+            serde_json::json!({
+                "output": { "choices": [{ "finish_reason": "stop", "message": { "content": "https://example.com/deck.pptx" } }] },
+                "usage": { "input_tokens": 1, "output_tokens": 2 }
+            }),
+        ]);
+        let model = model_with(transport.clone(), "qwen-doc-turbo");
+        let options = GenerateOptions::builder()
+            .stream(true)
+            .additional_body_param("skill", serde_json::json!([{ "type": "ppt" }]))
+            .build();
+        let out = collect(&model, options).await;
+
+        let mut text_chunks = 0;
+        for response in out.iter().filter_map(|r| r.as_ref().ok()) {
+            let has_text = response
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text(text) if !text.text.is_empty()));
+            if has_text {
+                text_chunks += 1;
+                assert_eq!(
+                    response.metadata["dashscope.skill"],
+                    serde_json::json!("ppt")
+                );
+            } else {
+                assert!(!response.metadata.contains_key("dashscope.skill"));
+            }
+        }
+        assert!(text_chunks > 0, "no text chunk in {out:?}");
+        let spec = transport.last_request().unwrap();
+        assert_eq!(
+            spec.body["parameters"]["skill"],
+            serde_json::json!([{ "type": "ppt" }])
+        );
     }
 
     #[tokio::test]
