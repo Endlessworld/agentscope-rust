@@ -444,6 +444,27 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 |---|---|---|---|---|
 | `MODEL-D11` | `960d7e46c` | `unregister(name)` + `evictResolvedCache(context, modelId)`（null 通配、只改映射不关闭实例） | `crates/agentscope-core/src/model/provider.rs:155` | 设计决定（不迁移）：Rust `ModelRegistry` 是 provider 注册表（按 `provider_id` 覆盖），既无命名模型实例映射，也无解析缓存——`resolve`/`resolve_with` 每次新建实例，`rg 'resolve_cache\|cache_identity\|cacheKey'` 零命中；「无解析缓存」已是 `tests/registry_semantics.rs` 固化的不变量（MODEL-13，若加缓存须同时做注册驱逐与单飞）。另：ACP/harness 切模型走每次重建（`acp_harness_agent.rs:1022`、`harness_agent.rs:1028` 的无状态 resolver），不存在陈旧缓存。详见 `CORE__GAP_TRACKER.md` §3.5.5 `CORE-D17` |
 
+### 3.8 2026-11-08 Java 提交批次（`1d8f9dc04` 之后 31 个提交中归本模块的部分，`1d8f9dc04..5baff2613`）
+
+> 来源：用户指定窗口 `1d8f9dc04..5baff2613`（31 提交，2026-11-02~11-08）的迁移批次。core / harness / protocol / sandbox 侧见各自 tracker。行号为改后文件行号，本轮未运行 cargo（由主智能体统一验证）。
+
+| SHA | 摘要（可截断） | 结论 | Rust 落点（文件:行，能省则省） | 说明或遗留 |
+|---|---|---|---|---|
+| `c6f79adb8` | gemini 默认模型改 `gemini-3.8-flash` + 上下文窗口表 | ⚠️部分（默认模型部分不适用） | `core/src/model/context_windows.rs:56-62`；`src/gemini/model.rs:78-82` | Rust 无「Builder 默认 modelName」：`GeminiChatModel::new` 必传模型名、provider 只认 `gemini:<model>`/`gemini-*` → 该半部分不新增默认值。可迁移部分是窗口表：Rust 原**完全没有 gemini 条目**（`gemini-3.8-flash` 落到未知默认 256k），已补 `gemini-3`/`2.5`/`2.0`（1 048 576）与 `gemini-1.5`（2 097 152）+ `gemini` 兜底；附带必要接线：descriptor 缺失时原 `context_window_size = 0`，改为回落 `resolve_context_window`，否则新表无人读取 |
+| `5718663ce` | openai：回放 reasoning 时不带流式 `index` | 🆕本轮落地 | `src/openai/mod.rs:1258-1305`（`inject_reasoning_details` + 新 `request_reasoning_details`） | 原实现把 `ThinkingBlock.metadata.reasoning_details` 原样写回请求体，严格 OpenAI 兼容端点会拒收历史消息；现请求副本逐条剔除 `index`、保留 `id/type/data/text/format` 与顺序，metadata 中的原始条目（含 index）不动（流式与持久化仍可用）。非数组值原样透传（同 Java 只处理对象） |
+| `a73222485` | gemini：生成的 function call id 必须互不相同 | ✅已迁移 | `src/gemini/parser.rs:182/202/233` | 三处兜底 id 均已是 `format!("tool_call_{}", uuid::Uuid::new_v4().simple())`，与 Java 改后的 `"tool_call_" + UUID.randomUUID()` 等价，provider 提供的 id 仍优先。无改动 |
+| `e473edbce` | anthropic：非流式 tool 参数序列化为 JSON 对象 | ✅已迁移 | `src/anthropic/parser.rs:62/89` | `ToolUseBlock.content = serde_json::Value::Object(t.input).to_string()`，天然是 JSON（Rust 无 Java `Map.toString()` 的 `{k=v}` 形式）；既有断言 `content == "{\"city\":\"Paris\"}"`（`parser.rs:401`）已覆盖 |
+| `9e98dfa76` | anthropic：PDF 文档 + citations | 🆕本轮落地 | `anthropic/dto.rs`（`AnthropicDocumentBlock`/`AnthropicDocumentSource`/`AnthropicCitationsConfig`/`AnthropicCitation`/`AnthropicTextBlock.citations`/`AnthropicStreamDelta.citation`/`AnthropicToolResultContent::Document`）、`anthropic/converter.rs:209-353/434/470-486/814-826`、`anthropic/citation.rs`（新增）、`anthropic/parser.rs:176-198/310-316` | `DocumentBlock` → 原生 document 块（Base64 / 远程 http(s) / 本地路径或 `file://` 转 base64 / `FileIdSource` 仅认 `provider == "anthropic"`），只接受 PDF（MIME 非 `application/pdf` 降级），每个文档强制 `citations.enabled = true`，prompt cache 标记可落在 document 块；user 消息、tool result、多智能体合并三条路径均保留文档。响应侧 page/char/content-block 三类 citation 映射为 `anthropic.citations` 元数据，搜索类与未知 variant 跳过；流式 `citations_delta` 只在终止响应 metadata 上输出（同 Java）。core 的 `MediaUtils` pdf 识别见 CORE §3.5.6 |
+| `85fa9a602` | 文档贯穿会话生命周期（**仅 model 部分**） | ⚠️部分 | 新增 `src/common/document.rs`（`render`/`append`/`append_blocks`）+ `common/mod.rs`/`common/multi_agent.rs:171-174`；`openai/mod.rs`（Document 分支改引用）；`gemini/{dto,converter,model}.rs`（`fileData`）；`ollama/converter.rs`；`dashscope/{dto,converter,model}.rs`（`doc_url` + `file_parsing_strategy` + part `type` + `parameters.skill`）；`anthropic/*` | 已落地：dashscope `doc_url` + part `type` 判别符 + 数量/端点校验 + `skill`（流式校验与 `dashscope.skill` 标注）；user 轮的 URL 文档即使无其它媒体也强制走内容分片形态（对齐 Java `DashScopeChatFormatter#hasMediaContent`，否则文档会被降级成纯文本）；gemini 文档 inline/Files API + 非 user 角色引用；ollama/openai/多智能体合并统一渲染单行文档引用（不再丢弃或发占位符）。`common/document.rs` **直接委托** core 的 `render_document_reference`，不重建平行实现。**未迁移**：Java 的类型化 `DashScopeSkill` DTO（Rust 用 JSON 值直传）；其它部分见对应模块 tracker |
+
+**遗留与风险**
+
+1. **未编译验证**：重点确认 `AnthropicContentBlock::Document(...)`/`AnthropicToolResultContent::Document(...)` 的内部标签 newtype 序列化形状为 `{"type":"document", …}`；`AnthropicTextBlock.citations` 新增后已有字面量均已补 `citations: None`。
+2. **远程文档默认降级**：gemini/anthropic 走 `common::resolve_media`（默认拒绝未 prefetch 的远程 URL），远程 PDF 默认变 `[Document - not readable: …]`，需宿主注入 `set_media_resolver`/`RemoteMediaCache::prefetch`；dashscope 的 `doc_url` 相反，直接交服务端拉取。
+3. **与 Java 的一处有意偏离**：`85fa9a602` 中 DashScope 对 Base64 / 跨 provider file id 仍抛 `IllegalArgumentException`，Rust 统一降级为文本引用（同一提交的结论是「格式化器抛错会让该会话后续每个 turn 都失败」）。
+4. **既有缺口未扩大**：DashScope 请求只合并 `additional_headers`，其余 `additional_body_params` 仍丢弃——本批只接通 `skill` 一个键，完整对齐需主 agent 决策后统一实现并补回归。
+5. **anthropic 文档不受角色限制**（与 Java 改后一致）：assistant 轮携带的文档也会作为 document 块发送；若后续发现 Anthropic 拒收非 user 文档，可参照 gemini 在非 user 角色渲染引用。
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

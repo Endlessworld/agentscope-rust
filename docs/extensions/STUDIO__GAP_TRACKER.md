@@ -157,6 +157,19 @@
 
 > 说明：`STUDIO-23` 的「usage 取 max」只覆盖 input/output；cache/reasoning/tool_use 四项未聚合，已单列为 `STUDIO-04`，两者不冲突。
 
+### 3.5.3 2026-11-08 Java 提交批次（`1d8f9dc04` 之后 31 个提交中归本模块的部分，`1d8f9dc04..5baff2613`）
+
+> 来源：用户指定窗口 `1d8f9dc04..5baff2613`（31 提交，2026-11-02~11-08）的迁移批次；本模块只涉及 `85fa9a602` 的追踪属性脱敏部分。行号为改后文件行号，本轮未运行 cargo（由主智能体统一验证）。
+
+| SHA | 摘要（可截断） | 结论 | Rust 落点（文件:行，能省则省） | 说明或遗留 |
+|---|---|---|---|---|
+| `85fa9a602` | studio 追踪属性中的媒体/文档脱敏 | 🆕本轮落地 | `src/telemetry/extractors.rs:311`（format 请求属性）、`:438-500`（redaction） | 新增 `redact_message_payloads`/`is_media_payload`/`redact_media_payload`：工具结果内嵌一层也递归；Document → 一行引用，Data → `<DataBlock <name\|id> is not supported>`，Video/Audio/Image 仍为原占位符；无媒体的消息原样透传（形状不变）。`get_tool_call_result` 改为复用 `redact_media_payloads` |
+
+**遗留与风险**
+
+1. **未接线/未覆盖**：`extractors::get_agent_request_attributes`/`get_llm_request_attributes` 的 `gen_ai.input.messages` 仍丢弃媒体块（`block_to_part` 对非文本返回 `None`），Java 本提交也未改这两处，属既有差异，不在本轮范围。
+2. **跨模块依赖**：复用 `agentscope_core::formatter::render_message_text`（core 路同批落地，见 CORE §3.5.6），core 侧改名需同步。
+
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 - **状态：已完成**（`cargo build` / `cargo test` 全绿；本 crate 0 warning）。

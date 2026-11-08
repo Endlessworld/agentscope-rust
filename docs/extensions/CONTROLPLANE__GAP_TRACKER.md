@@ -177,6 +177,19 @@
 | CP-20 | 协作 / 编排客户端端点对齐 | `CollaborationClient.java`（29 个 public 方法）、`OrchestrationClient.java`（19 个） | `src/transport/collaboration_client.rs`（issue/comments/add_comment/team/request_approval/await/task_context/tools/call_tool/create_child/acknowledge/start/progress/respond/workspace_applied/complete/finish/fail/run/run_graph/complete_run_node/fail_run_node/run_artifacts/replan_run/signal_run/upload_artifact/download_artifact + `X-Agent-Task-Token`）；`src/transport/orchestration_client.rs` 19 个方法逐一对应 | 已完成 |
 | CP-21 | store 六组件常量 / 路径 / env 契约 | `ControlPlaneSessionTurnGate.java` L54-58、`ControlPlaneTaskRepository.java` L68-71、`ControlPlaneStores.java#fromEnv` | `src/store/session_turn_gate.rs:27-37`（60s TTL / 20s 续租 / 3s 获取超时 / 30s 回退 / 500ms 重试）、`src/store/task_repository.rs:33-39`（`agent-protocol` / 30s 心跳）、`src/store/control_plane_stores.rs:19-25`（4 个 env 键）、`src/store/base_store.rs`（404→None、409→false） | 已完成 |
 
+### 3.5.3 2026-11-08 Java 提交批次（`1d8f9dc04` 之后 31 个提交中归本模块的部分，`1d8f9dc04..5baff2613`）
+
+> 来源：用户指定窗口 `1d8f9dc04..5baff2613`（31 提交，2026-11-02~11-08）的迁移批次；本模块只涉及 `85fa9a602` 的适配层文本落点。行号为改后文件行号，本轮未运行 cargo（由主智能体统一验证）。
+
+| SHA | 摘要（可截断） | 结论 | Rust 落点（文件:行，能省则省） | 说明或遗留 |
+|---|---|---|---|---|
+| `85fa9a602` | controlplane 适配层的文本落点（文档不降级为纯文本） | 🆕本轮落地 | `src/adapter/agent_scope_adapter.rs:842`（`blocks_text`）、`:871`（`text_of`） | `text_of`：消息文本 + 消息级文档引用（`render_message_text(msg, false)`），再与其**首个** ToolResult 的 `blocks_text` 用 `\n` 拼接（Java 新逻辑：工具结果文本不再被附件挤掉）；`blocks_text`：Text 与 Document 按 `\n` 连接，Document 渲染为一行引用。影响 context 快照、Level-3 历史、Level-2 工具输出 |
+
+**遗留与风险**
+
+1. **行为可见变化**：`blocks_text`/`text_of` 现在把文本块用 `\n` 连接（原为空串直接拼），同一 ToolResult 有多个 Text 块时控制面历史/事件的 `content`/`toolOutput` 由「无分隔拼接」变为「换行分隔」——与 Java 现行实现一致，但调用方若断言过拼接结果需同步。
+2. **`committed_export.rs` 仍原样转发 message JSON**：`framework_meta.message` 会带上内联 base64 文档；Java 是在 service 层投影时剥掉的，Rust 无对应投影点。若控制面把该 JSON 直接下发客户端，一个内联附件会被复制进每个事件（体积风险），是否处理待裁定（改 harness/core 或在下发层裁剪均超出本模块边界）。
+
 ## 4. 项目状态与下一步
 ### 4.1 当前状态
 **状态：部分完成（P0 + P1 主干已全部落地并通过构建/测试——含 2026-10-22 关闭的 P0-1 native session-log 提交链路；剩余 P2「设计决定」、宿主实现待定与架构级语义差异）**

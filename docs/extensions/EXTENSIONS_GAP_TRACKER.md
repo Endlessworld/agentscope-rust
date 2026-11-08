@@ -583,6 +583,27 @@ Round 2 §3.3.6「剩余 P1/P2」清单整体顺延（MODEL-05~08/10、SANDBOX-0
 - 根 `Cargo.toml` / `Cargo.lock` 未动；源码改动 5 文件 + 6 tracker。
 - 三处反向验证（core 条件注册 / harness 透传 / model 签名拼接）均先 FAILED 后恢复全绿。
 
+### 3.3.11 2026-11-08 Java 次批次（`1d8f9dc04..5baff2613`）
+
+**范围**：`1d8f9dc04..5baff2613`（31 提交，2026-11-02~11-08）按模块分派给 8 路子智能体后逐条回填。**本轮未运行 cargo/rustfmt**（子智能体约束），编译与全量测试由主智能体兜底。
+
+| 模块 | tracker 子节 | 覆盖提交（去重） | 🆕 | ⚠️ | ❌ | ✅/✔️ | 表行 |
+|---|---|---|---|---|---|---|---|
+| core | `CORE__GAP_TRACKER.md` §3.5.6 | 10（`cffb72979`/`d0ce778cb`/`d30a6c92f`/`c2360b347`/`85fa9a602`/`0762957d7`/`674fea686`/`5baff2613`/`9e98dfa76`/`c6f79adb8`） | 4 | 3 | 2 | 1 | 10 |
+| harness | `HARNESS__GAP_TRACKER.md` §3.5.6 | 7（`2b4a1cbe1`/`e40a11a98`/`6fa26e6e7`/`cffb72979`/`7ad4939f4`/`5f1691c2e`/`85fa9a602`） | 2 | 2 | 2 | 1 | 7 |
+| model | `MODEL__GAP_TRACKER.md` §3.8 | 6（`c6f79adb8`/`5718663ce`/`a73222485`/`e473edbce`/`9e98dfa76`/`85fa9a602`） | 2 | 2 | 0 | 2 | 6 |
+| protocol（A2A + AG-UI） | `PROTOCOL__GAP_TRACKER.md` §3.5.4 | 9（`4af86c518`/`81b109c95`/`035153a47`/`6b699f3ae`/`d8dfbd77b`/`3ed55c570`/`dc077e7ab`/`29963a298`/`85fa9a602`） | 4 | 2 | 0 | 3 | 9 |
+| sandbox | `SANDBOX__GAP_TRACKER.md` §3.5.3 | 4（`55013a429`/`f9d717ec5`/`5f1691c2e`/`7ad4939f4`） | 3 | 1 | 0 | 0 | 4 |
+| mem | `MEM__GAP_TRACKER.md` §3.5.3 | 1（`85fa9a602` 的 mem0/bailian/reme 三处） | 3 | 0 | 0 | 0 | 3 |
+| controlplane | `CONTROLPLANE__GAP_TRACKER.md` §3.5.3 | 1（`85fa9a602` 的适配层文本落点） | 1 | 0 | 0 | 0 | 1 |
+| studio | `STUDIO__GAP_TRACKER.md` §3.5.3 | 1（`85fa9a602` 的追踪属性脱敏） | 1 | 0 | 0 | 0 | 1 |
+| nacos | `NACOS__GAP_TRACKER.md` §3.5.4 | 1（`22ae4dd40`） | 0 | 0 | 1 | 0 | 1 |
+| **合计** | — | 31（跨模块重复计入多行） | **20** | **10** | **5** | **7** | **42** |
+
+- **无 Rust 对应组件/纯文档（未入表）**：`aed3e8736`（service-gateway Host 头）、`88324388c`（日文 README）、`85fa9a602`/`9e98dfa76` 的 `docs/v1|v2/**` 部分，以及 `4af86c518`/`81b109c95` 的 `agentscope-*-spring-boot-starter/**` 部分（已在 PROTOCOL 行内注明 ❌）。
+- **仍待裁定/仍未接线**：①harness 侧 per-call 模型（`cffb72979`）与 `read_file` 行/字符分页口径（`e40a11a98`）；②A2A 传输池关闭与 `consumptionCompletionTimeoutSeconds`（`81b109c95`）无对应；③harness 需补 `EXEC_STATUS_UNKNOWN` / `timed_out` 透传（与 sandbox 侧 124 约定配套）；④controlplane `committed_export.rs` 仍原样转发含内联 base64 的 message JSON（体积风险）。
+- **实现共性**：文档引用一律复用 core `agentscope_core::formatter`（无 crate 内平行渲染器）；但 a2a-client / mem / studio / controlplane / harness 多处 import 依赖该 core 改动一起合入。
+
 ## 4. 状态与下一步
 
 ### 4.1 验证命令与实测（2026-10-31，stable **1.97.1**）

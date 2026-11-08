@@ -165,6 +165,18 @@
 | `NACOS-D04` | `1d8f9dc04` | Nacos client / maintainer client 升到 3.3.0 | 无 | 设计决定（不迁移）：Rust 无 Nacos SDK，是自实现 `/v1/ai/*` HTTP 客户端（`src/http.rs`），没有客户端版本可升；只跟随协议语义（上四条） |
 | `NACOS-B02` | `1d8f9dc04` | A2A/RAD discovery 分离（capability 探测、显式 mode 覆盖、RAD 模式清空不可用 Card、按 agent 初始化订阅）与 RAD 原生发布（tenant、per-interface protocolVersion endpoint、canonical URL 去重、歧义拒绝） | `src/a2a/discovery.rs:53`（仅 A2A 缓存+订阅）、`src/a2a/model.rs:137`（`NacosAgentInterface` 只有 url/transport）、`src/a2a/registry/mod.rs:433`（固定 legacy `endpointType=service`） | **阻塞（本轮不做）**：RAD 需要 `NacosAiService` 不具备的 discovery/publication HTTP 接口（capability 探测、`AgentPublishRequest`/`CallInterface`/`EndpointSet`），且本机无 Nacos 3.3.0 实例可验证协议细节；照抄字段名无法验证，故整条挂账（前置：先补 HTTP 接口与集成环境） |
 
+### 3.5.4 2026-11-08 Java 提交批次（`1d8f9dc04` 之后 31 个提交中归本模块的部分，`1d8f9dc04..5baff2613`）
+
+> 来源：用户指定窗口 `1d8f9dc04..5baff2613`（31 提交，2026-11-02~11-08）的迁移批次；本模块只涉及 `22ae4dd40`。本轮未运行 cargo（由主智能体统一验证）。
+
+| SHA | 摘要（可截断） | 结论 | Rust 落点（文件:行，能省则省） | 说明或遗留 |
+|---|---|---|---|---|
+| `22ae4dd40` | nacos-starter：仅当启用 Nacos prompt 时才构建 prompt 版 ReActAgent | ❌不可迁移（无装配层） | 无改动；已核对 `src/prompt.rs`、`src/lib.rs` | 改动本身只是 Spring `@ConditionalOnProperty(matchIfMissing = false)` 的一个默认值翻转。Rust 无 Spring 自动装配层：`NacosPromptListener` 是纯库类型，宿主不构造、不调 `get_prompt*` 就完全不触碰 Nacos；不存在「无条件构建 ReActAgent」的等价路径，缺陷无法复现 |
+
+**遗留与风险**
+
+1. 该提交无 Rust 侧缺口；本模块唯一未开工项仍是 §3.5.3 的 `NACOS-B02`（RAD discovery 分离与原生发布，缺 HTTP 接口与 3.3.0 实例验证环境）。
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

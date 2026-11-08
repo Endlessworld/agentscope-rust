@@ -169,6 +169,21 @@
 | MEM-19 | 吞错双路径：默认严格 + `*_lossy` 复刻 `onErrorReturn("")` / `onErrorComplete()` | `mem0/Mem0LongTermMemory.java#retrieve`、`bailian/BailianLongTermMemory.java#record` / `#retrieve`、`reme/ReMeLongTermMemory.java#retrieve` | `src/lib.rs:36-58`（语义表）；`src/mem0/memory.rs:196-205`、`src/bailian/memory.rs:255-277`、`src/reme/memory.rs:147-157`；测试 `retrieve_lossy_returns_empty_on_http_status_error` / `record_lossy_swallows_http_errors` / `record_surfaces_http_errors_like_java` / `retrieve_lossy_passes_through_memory_list` | 已完成 |
 | MEM-20 | Java 侧本就**没有** delete / clear / update 记忆端点、无分页游标、无异步任务状态轮询（`async_mode` 与 ReMe 的 `update_result` 是服务端行为，客户端只解析响应）→ Rust 无需对应实现 | `mem0/Mem0Client.java`、`bailian/BailianMemoryClient.java`、`reme/ReMeClient.java`（记忆操作只有 `add` + `search`，另有 `shutdown`/`close`） | Java 主代码逐词检索 `delete` / `clear(` / `update` / `pagination` / `page_size` / `cursor`：仅命中 `reme/ReMeAddResponse.java` 的 `deleted_memory_ids` / `update_result`（响应字段）；Rust 侧同组词（含 `update_memory`）在 `src` 零命中（口径一致） | 已完成 |
 
+### 3.5.3 2026-11-08 Java 提交批次（`1d8f9dc04` 之后 31 个提交中归本模块的部分，`1d8f9dc04..5baff2613`）
+
+> 来源：用户指定窗口 `1d8f9dc04..5baff2613`（31 提交，2026-11-02~11-08）的迁移批次；本模块只涉及 `85fa9a602`（文档贯穿会话生命周期）的长期记忆部分。行号为改后文件行号，本轮未运行 cargo（由主智能体统一验证）。
+
+| SHA | 摘要（可截断） | 结论 | Rust 落点（文件:行，能省则省） | 说明或遗留 |
+|---|---|---|---|---|
+| `85fa9a602` | mem0 长期记忆：文档块不降级为纯文本 | 🆕本轮落地 | `src/mem0/memory.rs:41`（`convert_to_mem0_message`）、`:53`（`convert_messages` 过滤） | Java `filter(isRecordable)` + `convertToMem0Message` 都改用 `DocumentReferenceRenderer.renderMessageText(msg)`；Rust 改为 `agentscope_core::formatter::render_message_text(msg, true)`（include tool results = Java 默认重载），仅含文档的轮次不再被当作空文本丢弃 |
+| `85fa9a602` | bailian 长期记忆：同上 | 🆕本轮落地 | `src/bailian/memory.rs:49`（`is_recordable`）、`:58`（`convert_to_bailian_message`） | 保持 Java 的 `isBlank`（trim 后判空）+ `<compressed_history>` 语义不变，只把取文本来源从 `text_content()` 换成渲染文本 |
+| `85fa9a602` | reme 长期记忆：同上 | 🆕本轮落地 | `src/reme/memory.rs:47`（`is_recordable`）、`:56`（`convert_to_reme_message`） | 保持 Java 的 `isEmpty`（不 trim）语义不变 |
+
+**遗留与风险**
+
+1. **跨模块依赖（唯一）**：三处引用 `agentscope_core::formatter::{render_message_text, render_document_reference}`，该实现由 core 路同批落地（见 CORE §3.5.6）；若 core 侧改名或最终不落地，这三处需同步。归属本身正确（Java 也在 core）。
+2. **`unnamed` 语义与 Java 不完全一致（core 侧，未改）**：Rust `DocumentBlock` 总会生成 id，core 渲染器把生成的 uuid 当 label，因此引用里仍可能出现内部 UUID；若要严格对齐 Java「无 name 时优先 `unnamed`」需改 core。
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

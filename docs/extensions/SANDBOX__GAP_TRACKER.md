@@ -255,6 +255,24 @@
 
 
 
+### 3.5.3 2026-11-08 Java 提交批次（`1d8f9dc04` 之后 31 个提交中归本模块的部分，`1d8f9dc04..5baff2613`）
+
+> 来源：用户指定窗口 `1d8f9dc04..5baff2613`（31 提交，2026-11-02~11-08）的迁移批次。行号为改后文件行号，本轮未运行 cargo（由主智能体统一验证）。
+
+| SHA | 摘要（可截断） | 结论 | Rust 落点（文件:行，能省则省） | 说明或遗留 |
+|---|---|---|---|---|
+| `55013a429` | bound complete HTTP exchanges（一次 HTTP 交换连头带体整体有界） | ⚠️部分（核心缺陷在 Rust 不存在；执行路径已按新语义落地） | `kubernetes.rs:1782`（exec 请求级 `.timeout(budget)`）、`:1522`（`execute_exchange_budget`） | Rust 用 `reqwest::Client::timeout`，本就覆盖连接+响应头+读完整 body（不同于 JDK 只约束等头），因此「头到了 body 卡死 → 永久阻塞」不可能发生（`http.rs:39`）。真正缺的是「预算跟命令超时走」：原 `exec_in` 直接 `let _ = timeout_seconds;` 丢弃超时，命令只能受 180s 的 client read timeout 约束，已随 `7ad4939f4` 修正。Java 的 **per-endpoint 预算**（传输 10 分钟、list/exists 60s）未采纳：Rust 所有文件 API 请求共用 `read_timeout_seconds`（默认 180s）整体有界 |
+| `f9d717ec5` | support claim environment variables（`SandboxClaim.spec.env`） | 🆕本轮落地 | `kubernetes.rs:203`（`KubernetesClaimEnv`）、`:240`（options.`claim_env`）、`:398/417/434`（`build_claim_body*` → `spec.env`）、`:1759`；`fs_spec.rs:1079`（`KubernetesFilesystemSpec::claim_env`） | `name`/`value`/`container_name` 三元组（序列化为 `name`/`value`/`containerName`，`container_name=None` 时**不发** `containerName` 键）；空列表时 `spec.env` 整体省略，claim 旧字节形状不变。Java 的「per-call `null` 继承默认、空列表清空」属 `create(base, callOptions)` 合并语义，Rust 无 per-call options 合并（SANDBOX-X12），故只在 options 层提供，`claim_env(vec![])` 即「清空」 |
+| `5f1691c2e` | apply command budget to response headers | 🆕本轮落地（机制合并进 `exec_in`） | `kubernetes.rs:1782-1840` | 命令请求的**响应头等待**改由命令预算（`timeout + cleanup + read_timeout`）约束，而不是更短的 client read timeout；其它请求类型仍用 `read_timeout_seconds`。Java 为此传两个超时参数（exchange / per-attempt），Rust 只需请求级 `.timeout(budget)` 覆盖 client 默认值，语义等价；给 `ExecTimeoutException` 加 cause 的部分属 harness 异常层次（见 HARNESS §3.5.6） |
+| `7ad4939f4` | enforce runtime execution timeout contracts（breaking） | 🆕本轮落地（crate 侧） | `kubernetes.rs:90`（`TIMEOUT_EXIT_CODE=124`）、`:594`（`build_execute_body(cmd, timeout_seconds)`）、`:609`（`exec_outcome_unknown`）、`:622/644`（`KubernetesExecResult{exit_code: Option<i32>, timed_out}`）、`:1522`（能力协商）、`:1782`（单次投递/禁重定向/未知结果分类）；`error.rs:28`（`SandboxErrorCode::ExecStatusUnknown`）；`kubernetes_files.rs:620`（mkdir 失败带 exit 码） | 落地 5 件事：①`POST /execute` 现在**带 `timeout_seconds`**；②投递前 `GET /capabilities` 校验 `execute.timeout_seconds==true` + `max_timeout_seconds>0` + `cleanup_timeout_seconds>=0`，不满足**fail closed 不投递**；③请求超时 = `timeout + cleanup + read_timeout_seconds`；④命令**单次投递、不跟随重定向**（原 `with_retries` 会重放 POST）；⑤结果分类：`timed_out=true` → `exit_code=124` 并保留 stdout/stderr，无整型 `exit_code` / 非 2xx / 传输失败 → `EXEC_STATUS_UNKNOWN` |
+
+**遗留与风险**
+
+1. **breaking：能力协商 fail-closed**。运行时不实现 `GET /capabilities`（或未声明 `execute.timeout_seconds`）时，Kubernetes 后端**不再能执行任何命令**（与 Java #3951 一致，但 Rust 侧**没有 opt-out 开关**，若短期无法升级集群 runtime 需后续补显式「trusted legacy runtime」开关）。
+2. **每条命令多一次 `GET /capabilities`**（Java 同，无缓存），在 base64-over-exec 的 hydrate 路径上被放大（每 4 KB 分片一次 exec → 2 个请求）；能力探测的最坏阻塞为「3 次 × `read_timeout_seconds`（默认 180s）」，略宽于 Java 共享的 60s 总预算。
+3. **harness 侧未知结果未接**：crate 已用 `EXEC_STATUS_UNKNOWN` 表达「已投递但结果不可信」，但 harness `ExecuteResponse.exit_code: i32` 无法表达 null（现状把一切 `Error` 当失败）；且「普通 exit 124」与「确认超时」在 harness 层不可区分（Java 有 `timedOut` 布尔位），需 harness 增 `timed_out: bool` 并透传。
+4. **内部命令超时可能超 runtime 上限**：`TAR_TIMEOUT_SECONDS=300`、hydrate 分片 120s；若集群声明的 `max_timeout_seconds` 小于此值，会在投递前报 422（Java 同理）。
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态

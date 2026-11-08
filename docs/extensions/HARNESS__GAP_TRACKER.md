@@ -171,6 +171,27 @@
 |---|---|---|---|
 | `HARNESS-36` | 补齐 `SessionLogStore::delete` 的真实实现（core 里此前只有「unsupported」默认） | `agent/session/storage.rs::WorkspaceSessionLogStore::delete`（删 `key.storage_path()` 与 `key.legacy_storage_path()` 两处子树，缺一则跳过、重复删除 no-op）、`agentscope-core/src/session/in_memory.rs::InMemorySessionLogStore::delete`；新增 `HarnessAgent::delete_session(&RuntimeContext)`（`session_key(context)` + `store.delete`，与 `list_session_keys` 同一 key 解析） | 已完成；`cargo test -p agentscope-harness --lib` → **625 passed**（新增 `deleting_a_session_removes_the_journal_and_its_legacy_copy`）、`cargo test -p agentscope-core --lib` → **466 passed / 3 ignored**；反向验证：`WorkspaceSessionLogStore::delete` 写成 no-op → ACP `deleting_a_persisted_session_removes_its_history` FAILED |
 
+### 3.5.6 2026-11-08 Java 提交批次（`1d8f9dc04` 之后 31 个提交中归本模块的部分，`1d8f9dc04..5baff2613`）
+
+> 来源：用户指定窗口 `1d8f9dc04..5baff2613`（31 提交，2026-11-02~11-08）的迁移批次。core / model / protocol / sandbox / mem 侧见各自 tracker。行号为改后文件行号，本轮未运行 cargo（由主智能体统一验证）。
+
+| SHA | 摘要（可截断） | 结论 | Rust 落点（文件:行，能省则省） | 说明或遗留 |
+|---|---|---|---|---|
+| `2b4a1cbe1` | 索引初始化失败时关闭连接 | ✔️既有已完成（架构差异） | `agent/workspace/index.rs:79`（`open` 只记路径）、`:105`（`ensure_open`） | Rust 是**惰性开连接**：`open()` 不建连，`ensure_open()` 里 `init_schema_on(&conn)` 失败即 return，局部 `conn` 出作用域即 Drop 关闭，不存在 Java「已取得连接却返回 null」的泄漏窗口 |
+| `e40a11a98` | read_file 单页上限可配置（char 计） | ❌不可迁移（工具契约不同） | `tool/filesystem_tools.rs:83`（`ReadFileParams`）、`:190`（schema） | Java `readFile` 是 **char_offset/max_chars 分页**（默认 16000、硬上限 32000），Rust `read_file` 是**行分页**（`offset`/`limit`，默认 100 行、无硬上限），不是同一参数；强行对齐需改对外工具契约（schema/模型提示/全部调用方），属单独立项 |
+| `6fa26e6e7` | Revert：edit_file native path 由 base64 改回 heredoc | ❌不可迁移（Java 已 revert，Rust 无此路径） | `filesystem/sandbox.rs:77`（`edit` 直接委托 inner FS） | Rust 没有 python heredoc / base64 脚本式 native edit：沙箱的 `read/write/edit` 全部委托底层 `Filesystem`；`base64` 仅用于 Windows `pwsh -EncodedCommand` 与二进制内容编码，与本提交无关 |
+| `cffb72979` | per-call 模型选择（`RuntimeContext.modelId`）的 harness 部分 | ⚠️部分（报告判「受 core 阻塞、本批无可落地改动」；core 同批已落地） | 未改；现状固定模型：`agent/middleware/memory_flush.rs:35`、`agent/memory/compaction.rs`（`ConversationCompactor::with_model`） | core `cffb72979` 已提供 `RuntimeContext.model_id` + `ReActAgent::effective_model`；harness 中间件/子代理仍持 build 期的 `Arc<dyn Model>`，**未接线**（「语义天然成立」的前提已因 core 加字段而失效）。完整落地需：配置模型优先、否则用 per-call 模型；并在 `AgentSession`/`DefaultAgentManager` 构造子上下文时显式清空 model id（Java `stripCallerModel`） |
+| `7ad4939f4` | 执行超时/取消/错误码契约统一到 filesystem + shell 工具层 | 🆕本轮落地（超时部分） | `filesystem/mod.rs:104-120`（`ExecuteResponse::TIMEOUT_EXIT_CODE = 124` + `timed_out()`）、`filesystem/sandbox.rs:253-263`、`tool/shell_execute_tool.rs:54-113/182-187/219-223` | 本地执行超时由 `-1` 改为 `124` 并带秒数说明；shell 工具输出 `Timed out: true` 行，`timeout <= 0` 在**执行前**拒绝（`timeout must be a positive number of seconds.`）。Java 的 `SandboxException.ExecTimeoutException/ExecStatusUnknownException` 在 Rust 无异常体系（统一 `Result<_, Error>`），不迁移 |
+| `5f1691c2e` | 命令预算用到响应头 + 超时异常携带 cause | ⚠️部分（仅报文对齐） | `filesystem/sandbox.rs:253-258` | 该提交的 harness 侧只给 `ExecTimeoutException` 加带 cause 的构造器（供 Kubernetes 侧透传底层原因）；Rust 超时不作为错误返回（返回 `ExecuteResponse`）、无 cause 可带，故只把报文对齐为 Java 风格 `Command timed out after {n} seconds…`。crate 侧的响应头预算见 SANDBOX §3.5.3 |
+| `85fa9a602` | 文档块在会话生命周期中不被降级/丢弃（harness 部分） | 🆕本轮落地 | `agent/memory/flush.rs`（`render_content_blocks`/`render_tool_result`）、`agent/memory/compaction.rs`（`render_message_for_summary` + `extract_tool_result_documents`）、`middleware/agent_trace.rs`（`PRE_CALL` 预览）、`tool/agent_spawn.rs`（子代理回复）；均复用 `agentscope_core::formatter::document_reference` | 四个文本 sink 全部补上文档引用；compaction 的 tool_result 引用追加在 500 字预览**之外**（长结果不会把引用截掉）。core 的 `DocumentReferenceRenderer` 同批由 core 路落地（见 CORE §3.5.6），harness 不重建平行实现 |
+
+**遗留与风险**
+
+1. **超时已改为独立标志**：`ExecuteResponse` 新增 `pub timed_out: bool`，`timed_out()` 读该字段，不再由 `exit_code == 124` 反推（用户命令自身 `exit 124` 不再被误报）。写入点：本地 `SandboxBackedFilesystem` 超时分支置 `true`；`extensions-sandbox/src/fs_spec.rs` 的远端路径因 `ExecResult` 无该字段，仍以 124 映射（e2b/daytona 后端用 `None`/`-1` 表达的仍为 false）。
+2. **两套执行路径的超时表示仍不一致**：仅 `SandboxBackedFilesystem`（本地进程）改用 124；`agent/sandbox/docker.rs` 的 `ExecResult` 仍以 `exit_code = -1` 表达超时（消费方在 extensions 侧）。另外超时分支 `truncated` 保持 `true`（`verification/verifiers.rs` 依赖 `output_truncated`），Java 对应场景为 `false`。
+3. **`e40a11a98` 需产品决策**：read_file 的行分页 vs char 分页是工具契约差异，不是可配置化改造。
+4. **跨 crate 依赖**：本批四处 import `agentscope_core::formatter::{render_message_text, render_document_reference}`（core 侧同批产物）；若 core 侧改名需同步这四处。
+
 ## 4. 项目状态与下一步
 
 ### 4.1 当前状态
