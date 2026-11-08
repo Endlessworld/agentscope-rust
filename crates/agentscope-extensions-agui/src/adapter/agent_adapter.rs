@@ -969,7 +969,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_content_on_a_non_user_message_fails_before_streaming() {
+    async fn structured_content_on_an_assistant_message_is_accepted() {
+        // The outbound converter writes parts for every role, so the adapter has to read them
+        // back or an echoed history fails before the run starts.
         let agent = Arc::new(ScriptedAgent::new(text_run()));
         let adapter = adapter_for(agent, AguiAdapterConfig::default_config());
         let mut input = RunAgentInput::of("t", "r");
@@ -983,13 +985,9 @@ mod tests {
             None,
         ));
         let events = adapter.run(&input).collect_events().await;
-        assert_eq!(wire_types(&events), vec!["RUN_STARTED", "RUN_ERROR"]);
-        match &events[1] {
-            AguiEvent::RunError { message, .. } => {
-                assert!(message.contains("only supported for AG-UI user messages"));
-            }
-            other => panic!("expected RunError, got {other:?}"),
-        }
+        let types = wire_types(&events);
+        assert!(!types.contains(&"RUN_ERROR"), "{types:?}");
+        assert_eq!(types.first().copied(), Some("RUN_STARTED"));
     }
 
     #[tokio::test]

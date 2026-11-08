@@ -3,7 +3,8 @@
 //! * [`AguiMessage`] - a conversation message (`content` is a [`MessageContent`] union).
 //! * [`MessageContent`] - `Text(String)` or `Blocks(Vec<InputContent>)`, untagged on the wire.
 //! * [`InputContent`] - a typed part discriminated by its `type` field.
-//! * [`InputContentSource`] - `data` (inline base64) or `url`, discriminated by `type`.
+//! * [`InputContentSource`] - `data` (inline base64), `url` or `file` (provider handle),
+//!   discriminated by `type`.
 //! * [`AguiToolCall`] / [`AguiFunctionCall`] - tool-call payloads.
 //! * [`RunAgentInput`] - the complete request payload (messages/tools/context/state/resume).
 //! * [`AguiContext`] - one contextual hint (description + value).
@@ -245,8 +246,11 @@ pub enum InputContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<Map<String, Value>>,
     },
-    /// `{"type":"document","source":{...},"metadata":{...}}`
+    /// `{"type":"document","id":"...","source":{...},"metadata":{...}}`
     Document {
+        /// Optional identifier of this part; restored onto the document block.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         /// The document source.
         source: InputContentSource,
         /// Optional metadata.
@@ -272,6 +276,19 @@ pub enum InputContentSource {
         /// The URL.
         value: String,
         /// Optional MIME type hint.
+        #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+    /// `{"type":"file","value":"file-abc","provider":"openai","mimeType":"..."}`
+    ///
+    /// The value is an opaque handle the provider issued; the transport never fetches it.
+    File {
+        /// Provider-issued file handle.
+        value: String,
+        /// Who issued the handle, if known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// Optional MIME type.
         #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
     },
@@ -887,6 +904,53 @@ mod tests {
                 value: "u".to_string(),
                 mime_type: None,
             }
+        );
+    }
+
+    #[test]
+    fn document_parts_carry_an_optional_id_and_a_file_source() {
+        let document = serde_json::from_value::<InputContent>(json!({
+            "type": "document",
+            "id": "doc-1",
+            "source": {
+                "type": "file",
+                "value": "file-abc",
+                "provider": "gemini",
+                "mimeType": "application/pdf"
+            },
+            "metadata": {"sourcePage": 3}
+        }))
+        .unwrap();
+        assert_eq!(
+            document,
+            InputContent::Document {
+                id: Some("doc-1".to_string()),
+                source: InputContentSource::File {
+                    value: "file-abc".to_string(),
+                    provider: Some("gemini".to_string()),
+                    mime_type: Some("application/pdf".to_string()),
+                },
+                metadata: Some(
+                    json!({"sourcePage": 3})
+                        .as_object()
+                        .cloned()
+                        .expect("object"),
+                ),
+            }
+        );
+
+        // Absent optional members stay absent on the wire.
+        let bare = InputContent::Document {
+            id: None,
+            source: InputContentSource::Url {
+                value: "u".to_string(),
+                mime_type: None,
+            },
+            metadata: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({"type": "document", "source": {"type": "url", "value": "u"}})
         );
     }
 

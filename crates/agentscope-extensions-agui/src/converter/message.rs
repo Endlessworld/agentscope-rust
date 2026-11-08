@@ -6,9 +6,9 @@
 use std::collections::{HashMap, HashSet};
 
 use agentscope_core::{
-    AudioBlock, Base64Source, ConfirmResult, ContentBlock, ImageBlock, Msg, MsgRole, Source,
-    TextBlock, ThinkingBlock, ToolResultBlock, ToolResultState, ToolUseBlock, URLSource,
-    VideoBlock,
+    determine_media_type, resolve_mime_type, AudioBlock, Base64Source, ConfirmResult, ContentBlock,
+    DocumentBlock, FileIdSource, ImageBlock, Msg, MsgRole, Source, TextBlock, ThinkingBlock,
+    ToolResultBlock, ToolResultState, ToolUseBlock, URLSource, VideoBlock,
 };
 use serde_json::{Map, Value};
 
@@ -29,6 +29,9 @@ pub const METADATA_INTERRUPT_ID: &str = "agui.interruptId";
 /// Metadata key carried on a resume-produced `ToolResultBlock`: the resume status.
 pub const METADATA_RESUME_STATUS: &str = "agui.resumeStatus";
 
+/// Provider name for a protocol file handle that arrived without one.
+const AGUI_FILE_PROVIDER: &str = "agui";
+
 /// Bidirectional converter between AG-UI messages and AgentScope [`Msg`] values.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AguiMessageConverter;
@@ -44,8 +47,9 @@ impl AguiMessageConverter {
     /// Tool messages always yield a `ToolResultBlock`, even when the frontend returned no
     /// content, so a pending tool call is resolved downstream. A non-blank `error` on a tool
     /// message makes that block an error result, with the error text kept alongside any
-    /// content the frontend also reported. A `reasoning` message becomes an assistant message
-    /// carrying a `ThinkingBlock`.
+    /// content the frontend also reported. A tool message may also answer through structured
+    /// parts, which become the result output. A `reasoning` message becomes an assistant
+    /// message carrying a `ThinkingBlock`.
     pub fn to_msg(&self, agui_message: &AguiMessage) -> AguiResult<Msg> {
         let role = convert_role_in(&agui_message.role);
         let mut blocks: Vec<ContentBlock> = Vec::new();
@@ -59,13 +63,47 @@ impl AguiMessageConverter {
                 }
             }
             Some(MessageContent::Blocks(parts)) => {
-                if !agui_message.is_user_message() {
-                    return Err(AguiError::invalid_input(
-                        "Structured content blocks are only supported for AG-UI user messages",
-                    ));
-                }
-                for input in parts {
-                    blocks.push(to_content_block(input)?);
+                let mut content_blocks: Vec<ContentBlock> = parts
+                    .iter()
+                    .map(to_content_block)
+                    .collect::<AguiResult<Vec<_>>>()?;
+                // A tool message's parts are its result output; the error text, when reported,
+                // comes first and turns the result into an error, exactly like the text path.
+                match agui_message
+                    .tool_call_id
+                    .as_deref()
+                    .filter(|_| agui_message.is_tool_message())
+                {
+                    Some(tool_call_id) => {
+                        let error = agui_message
+                            .error
+                            .as_deref()
+                            .filter(|error| !error.trim().is_empty());
+                        if let Some(error) = error {
+                            // The outbound tool message keeps the same text in `content` and
+                            // `error`, so a client that echoes the history back reports it as a
+                            // part too. Inserting it again would double the text on every round
+                            // trip; the error state is what carries the meaning.
+                            let duplicated = content_blocks
+                                .iter()
+                                .any(|block| matches!(block, ContentBlock::Text(text) if text.text == error));
+                            if !duplicated {
+                                content_blocks.insert(0, ContentBlock::Text(TextBlock::new(error)));
+                            }
+                        }
+                        blocks.push(ContentBlock::ToolResult(
+                            ToolResultBlock::builder()
+                                .id(tool_call_id)
+                                .outputs(content_blocks)
+                                .state(if error.is_some() {
+                                    ToolResultState::Error
+                                } else {
+                                    ToolResultState::Success
+                                })
+                                .build(),
+                        ));
+                    }
+                    None => blocks.extend(content_blocks),
                 }
             }
             None => {
@@ -86,31 +124,31 @@ impl AguiMessageConverter {
             .build())
     }
 
-    /// Converts an AgentScope [`Msg`] into a single AG-UI message.
+    /// Converts an AgentScope [`Msg`] into the standard AG-UI message.
     ///
-    /// Text blocks and tool-result text are joined with `\n`; tool-use blocks become
-    /// `toolCalls`; a tool-result block also sets `toolCallId`. An assistant message that
-    /// carries only reasoning becomes a `reasoning` message. A message that expands into
-    /// several AG-UI messages — reasoning mixed with text or tool calls, or a TOOL message
-    /// with several tool results — has to go through
-    /// [`to_agui_messages`](Self::to_agui_messages), which is what
+    /// This is the last message produced by [`to_agui_messages`](Self::to_agui_messages): a
+    /// message that expands into several AG-UI messages — reasoning mixed with content, or a
+    /// TOOL message carrying tool results — has to go through that method, which is what
     /// [`to_agui_message_list`](Self::to_agui_message_list) uses.
     pub fn to_agui_message(&self, msg: &Msg) -> AguiMessage {
-        self.to_single_agui_message(msg)
+        self.to_agui_messages(msg)
+            .pop()
+            .expect("a message always converts to at least one AG-UI message")
     }
 
     /// Converts an AgentScope [`Msg`] into one or more AG-UI messages.
     ///
-    /// A message mixing reasoning with text or tool calls is split into a reasoning message
-    /// followed by the standard message. A TOOL message carrying several tool results is
-    /// expanded into one AG-UI tool message per result, each keeping its own `toolCallId`,
-    /// content and error. Expanded messages get a distinct, deterministic id derived from the
-    /// source id (`<sourceId>-reasoning`, `<sourceId>-<index>`), so the split is always
-    /// observable.
+    /// Thinking, text, tool calls/results and media are collected in one traversal, so a message
+    /// carrying reasoning next to media keeps both. A message that only reasoned becomes a single
+    /// reasoning message; otherwise the reasoning (if any) is emitted first, followed by the
+    /// standard message. A TOOL message carrying tool results is expanded into one AG-UI tool
+    /// message per result, each keeping its own `toolCallId`, content and error. Expanded messages
+    /// get a distinct, deterministic id derived from the source id (`<sourceId>-reasoning`,
+    /// `<sourceId>-<index>`), so the split is always observable.
     pub fn to_agui_messages(&self, msg: &Msg) -> Vec<AguiMessage> {
         if msg.role() == MsgRole::Tool {
             let tool_results: Vec<&ToolResultBlock> = msg.tool_result_blocks().collect();
-            if tool_results.len() > 1 {
+            if !tool_results.is_empty() {
                 return tool_results
                     .iter()
                     .enumerate()
@@ -119,68 +157,67 @@ impl AguiMessageConverter {
             }
         }
 
-        let standard = self.to_single_agui_message(msg);
-        let reasoning = thinking_content(msg);
-        if reasoning.is_empty() || standard.is_reasoning_message() {
-            return vec![standard];
-        }
-        vec![
-            AguiMessage::reasoning_message(reasoning_message_id(msg), reasoning),
-            standard,
-        ]
-    }
-
-    /// Converts an AgentScope [`Msg`] that maps to exactly one AG-UI message.
-    fn to_single_agui_message(&self, msg: &Msg) -> AguiMessage {
         let role = convert_role_out(msg.role());
         let tool_message = msg.role() == MsgRole::Tool;
         let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut input_contents: Vec<InputContent> = Vec::new();
         let mut tool_calls: Vec<AguiToolCall> = Vec::new();
         let mut tool_call_id: Option<String> = None;
         let mut error: Option<String> = None;
 
         for block in msg.content() {
             match block {
+                ContentBlock::Thinking(tb) => append_content(&mut reasoning, &tb.thinking),
                 ContentBlock::Text(tb) => append_content(&mut content, &tb.text),
                 ContentBlock::ToolUse(tub) => tool_calls.push(to_agui_tool_call(tub)),
                 ContentBlock::ToolResult(trb) => {
                     tool_call_id = trb.id.clone();
-                    // `error` belongs to the protocol's tool message; for any other role the
-                    // result text has to stay in `content`. Mirrors `toSingleAguiMessage`.
+                    let text = tool_result_text(trb);
+                    // `error` belongs to the protocol's tool message; the same text also stays in
+                    // `content` because clients render tool results from there.
                     if tool_message && trb.state == ToolResultState::Error {
-                        error = Some(tool_result_text(trb));
-                    } else {
-                        for output in &trb.output {
-                            if let ContentBlock::Text(tb) = output {
-                                append_content(&mut content, &tb.text);
-                            }
-                        }
+                        error = Some(text.clone());
                     }
+                    append_content(&mut content, &text);
                 }
-                _ => {}
+                block => input_contents.extend(media_input_content(block)),
             }
         }
 
-        // A message that only reasoned has no assistant content to carry the reasoning, so it
-        // becomes a reasoning message instead of losing it.
-        let reasoning = thinking_content(msg);
-        if !reasoning.is_empty()
-            && content.is_empty()
-            && tool_calls.is_empty()
-            && tool_call_id.is_none()
-        {
-            return AguiMessage::reasoning_message(msg.id(), reasoning);
+        // Reasoning alone has no content to carry it, so it becomes the whole message — but media
+        // collected next to the reasoning must still be emitted, so any part blocks the shortcut.
+        let has_content = !content.is_empty()
+            || !input_contents.is_empty()
+            || !tool_calls.is_empty()
+            || tool_call_id.is_some();
+        let mut messages = Vec::new();
+        if !reasoning.is_empty() {
+            let id = if has_content {
+                reasoning_message_id(msg)
+            } else {
+                msg.id().to_string()
+            };
+            messages.push(AguiMessage::reasoning_message(id, reasoning));
+            if !has_content {
+                return messages;
+            }
         }
 
-        let mut message = AguiMessage::new(
-            msg.id(),
-            role,
-            (!content.is_empty()).then(|| MessageContent::Text(content)),
-            tool_calls,
-            tool_call_id,
-        );
+        // The protocol lists `content` as required on a tool message and does not accept null.
+        let wire_content = if input_contents.is_empty() {
+            (!content.is_empty() || tool_message).then_some(MessageContent::Text(content))
+        } else {
+            if !content.is_empty() || tool_message {
+                input_contents.push(InputContent::Text { text: content });
+            }
+            Some(MessageContent::Blocks(input_contents))
+        };
+
+        let mut message = AguiMessage::new(msg.id(), role, wire_content, tool_calls, tool_call_id);
         message.error = error;
-        message
+        messages.push(message);
+        messages
     }
 
     /// Converts a list of AG-UI messages into AgentScope messages.
@@ -191,7 +228,7 @@ impl AguiMessageConverter {
     /// Converts a list of AgentScope messages into AG-UI messages.
     ///
     /// The output can be longer than the input: a message that mixes reasoning with other
-    /// content, or a TOOL message with several results, expands into one AG-UI message per
+    /// content, or a TOOL message carrying tool results, expands into one AG-UI message per
     /// part.
     pub fn to_agui_message_list(&self, msgs: &[Msg]) -> Vec<AguiMessage> {
         msgs.iter().flat_map(|m| self.to_agui_messages(m)).collect()
@@ -338,7 +375,9 @@ fn add_text_block(blocks: &mut Vec<ContentBlock>, text: Option<&str>, agui_messa
                 .filter(|error| !error.trim().is_empty())
             {
                 let output = match text {
-                    Some(text) if !text.is_empty() => format!("{error}\n{text}"),
+                    // An error result keeps the text in `content` too, so a payload identical to
+                    // the error must not be repeated when converting back.
+                    Some(text) if !text.is_empty() && text != error => format!("{error}\n{text}"),
                     _ => error.to_string(),
                 };
                 blocks.push(ContentBlock::ToolResult(
@@ -388,20 +427,39 @@ fn tool_result_text(result: &ToolResultBlock) -> String {
 
 /// Builds one AG-UI tool message from a single AgentScope tool result.
 ///
-/// The first expanded message keeps the source message id; later ones get an index suffix so
-/// every emitted AG-UI message has a distinct id.
+/// The result text stays in `content` — clients render tool results from there — and an error
+/// result repeats it in `error`. Documents keep their structured part. The first expanded message
+/// keeps the source message id; later ones get an index suffix so every emitted AG-UI message has
+/// a distinct id.
 fn tool_result_message(msg: &Msg, result: &ToolResultBlock, index: usize) -> AguiMessage {
     let id = if index == 0 {
         msg.id().to_string()
     } else {
         format!("{}-{}", msg.id(), index)
     };
-    let text = tool_result_text(result);
+    let mut text = String::new();
+    let mut parts: Vec<InputContent> = Vec::new();
+    for output in &result.output {
+        if let ContentBlock::Text(block) = output {
+            append_content(&mut text, &block.text);
+        }
+        if let ContentBlock::Document(document) = output {
+            parts.push(document_input_content(document));
+        }
+    }
+    let content = if parts.is_empty() {
+        MessageContent::Text(text.clone())
+    } else {
+        if !text.is_empty() {
+            parts.push(InputContent::Text { text: text.clone() });
+        }
+        MessageContent::Blocks(parts)
+    };
     let error = result.state == ToolResultState::Error;
     let mut message = AguiMessage::new(
         id,
         convert_role_out(msg.role()),
-        (!error && !text.is_empty()).then(|| MessageContent::Text(text.clone())),
+        Some(content),
         Vec::new(),
         result.id.clone(),
     );
@@ -414,15 +472,136 @@ fn reasoning_message_id(msg: &Msg) -> String {
     format!("{}-reasoning", msg.id())
 }
 
-/// Joins the `ThinkingBlock` texts of a message into a single string.
-fn thinking_content(msg: &Msg) -> String {
-    let mut reasoning = String::new();
-    for block in msg.content() {
-        if let ContentBlock::Thinking(tb) = block {
-            append_content(&mut reasoning, &tb.thinking);
-        }
+/// Maps a media or document content block onto an AG-UI content part.
+///
+/// Only URL media is converted: an inline Base64 image/audio/video has no outbound
+/// representation, mirroring the Java converter. A `DataBlock` is routed by its resolved MIME
+/// type, and a document keeps whichever source the protocol can express.
+fn media_input_content(block: &ContentBlock) -> Option<InputContent> {
+    if let ContentBlock::Document(document) = block {
+        return Some(document_input_content(document));
     }
-    reasoning
+    if let ContentBlock::Data(data) = block {
+        return data_input_content(&data.source);
+    }
+    let media_source = match block {
+        ContentBlock::Image(image) => &image.source,
+        ContentBlock::Audio(audio) => &audio.source,
+        ContentBlock::Video(video) => &video.source,
+        _ => return None,
+    };
+    let Source::Url(url) = media_source else {
+        return None;
+    };
+    let source = InputContentSource::Url {
+        value: url.url.clone(),
+        mime_type: url.mime_type.clone(),
+    };
+    Some(match block {
+        ContentBlock::Image(_) => InputContent::Image {
+            source,
+            metadata: None,
+        },
+        ContentBlock::Audio(_) => InputContent::Audio {
+            source,
+            metadata: None,
+        },
+        ContentBlock::Video(_) => InputContent::Video {
+            source,
+            metadata: None,
+        },
+        _ => return None,
+    })
+}
+
+/// Routes a `DataBlock` by its resolved MIME type, mirroring Java `dataBlockInputContent`.
+///
+/// A URL whose MIME type cannot be resolved is skipped rather than guessed.
+fn data_input_content(source: &Source) -> Option<InputContent> {
+    let Source::Url(url) = source else {
+        return None;
+    };
+    let mime_type = resolve_mime_type(source).ok()?;
+    let source = InputContentSource::Url {
+        value: url.url.clone(),
+        mime_type: Some(mime_type.clone()),
+    };
+    Some(if mime_type.starts_with("image/") {
+        InputContent::Image {
+            source,
+            metadata: None,
+        }
+    } else if mime_type.starts_with("audio/") {
+        InputContent::Audio {
+            source,
+            metadata: None,
+        }
+    } else if mime_type.starts_with("video/") {
+        InputContent::Video {
+            source,
+            metadata: None,
+        }
+    } else {
+        InputContent::Document {
+            id: None,
+            source,
+            metadata: None,
+        }
+    })
+}
+
+/// Maps a document block onto the AG-UI content model.
+///
+/// Every [`Source`] variant has a protocol counterpart (URL, inline data, provider file handle),
+/// so a document always travels structurally; the block id and metadata ride along.
+fn document_input_content(block: &DocumentBlock) -> InputContent {
+    let source = match &block.source {
+        Source::Url(url) => InputContentSource::Url {
+            value: url.url.clone(),
+            mime_type: block.mime_type.clone().or_else(|| url.mime_type.clone()),
+        },
+        Source::Base64(base64) => InputContentSource::Data {
+            value: base64.data.clone(),
+            mime_type: block
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| base64.media_type.clone()),
+        },
+        Source::FileId(file_id) => InputContentSource::File {
+            value: file_id.file_id.clone(),
+            // The protocol's file source carries an opaque provider handle, which is exactly what
+            // a file-id source is; the peer resolves it against the named provider.
+            provider: Some(file_id.provider.clone()),
+            mime_type: file_handle_mime_type(block),
+        },
+    };
+    InputContent::Document {
+        id: Some(block.id.clone()),
+        source,
+        metadata: block.metadata.clone(),
+    }
+}
+
+/// Resolves the MIME type of a provider file handle: the declared one, else the file name's.
+fn file_handle_mime_type(block: &DocumentBlock) -> Option<String> {
+    if let Some(mime_type) = block.mime_type.as_deref().filter(|m| !m.trim().is_empty()) {
+        return Some(mime_type.to_string());
+    }
+    block
+        .name
+        .as_deref()
+        .map(determine_media_type)
+        .filter(|mime_type| mime_type != "application/octet-stream")
+}
+
+/// The MIME type an AG-UI content source declares, if any.
+fn mime_type_of(source: &InputContentSource) -> Option<String> {
+    match source {
+        InputContentSource::Url { mime_type, .. } | InputContentSource::File { mime_type, .. } => {
+            mime_type.clone()
+        }
+        InputContentSource::Data { mime_type, .. } => Some(mime_type.clone()),
+    }
 }
 
 /// Converts an AG-UI [`InputContent`] into a core [`ContentBlock`].
@@ -438,12 +617,22 @@ fn to_content_block(input: &InputContent) -> AguiResult<ContentBlock> {
         InputContent::Video { source, .. } => {
             ContentBlock::Video(VideoBlock::new(to_source(source)?))
         }
-        // Mirrors the Java stub: AgentScope has no native DocumentBlock, and the Java
-        // `toContentBlock` throws for unhandled InputContent subtypes.
-        InputContent::Document { .. } => {
-            return Err(AguiError::IllegalState(
-                "Unhandled InputContent type: document".to_string(),
-            ))
+        InputContent::Document {
+            id,
+            source,
+            metadata,
+        } => {
+            let mut builder = DocumentBlock::builder().source(to_source(source)?);
+            if let Some(id) = id {
+                builder = builder.id(id.clone());
+            }
+            if let Some(mime_type) = mime_type_of(source) {
+                builder = builder.mime_type(mime_type);
+            }
+            if let Some(metadata) = metadata {
+                builder = builder.metadata(metadata.clone());
+            }
+            ContentBlock::Document(builder.build())
         }
     })
 }
@@ -461,6 +650,16 @@ fn to_source(input_source: &InputContentSource) -> AguiResult<Source> {
         InputContentSource::Data { value, mime_type } => {
             Source::Base64(Base64Source::new(mime_type.clone(), value.clone()))
         }
+        // A handle without a provider keeps the round trip with the neutral provider name,
+        // because a core file-id source requires one.
+        InputContentSource::File {
+            value, provider, ..
+        } => Source::FileId(FileIdSource::new(
+            provider
+                .clone()
+                .unwrap_or_else(|| AGUI_FILE_PROVIDER.to_string()),
+            value.clone(),
+        )),
     })
 }
 
@@ -631,6 +830,7 @@ fn resume_content(resume: &AguiResume) -> String {
 mod tests {
     use super::*;
     use crate::constants::RESUME_PAYLOAD_APPROVED;
+    use agentscope_core::DataBlock;
     use serde_json::json;
 
     fn converter() -> AguiMessageConverter {
@@ -761,7 +961,9 @@ mod tests {
         let back = converter.to_agui_message(&msg);
         assert_eq!(back.role, "tool");
         assert_eq!(back.tool_call_id.as_deref(), Some("c9"));
-        assert!(back.content.is_none());
+        // The protocol requires `content` on a tool message, so an empty result still carries it.
+        assert_eq!(back.text_content(), Some(""));
+        assert!(back.error.is_none());
     }
 
     #[test]
@@ -931,7 +1133,8 @@ mod tests {
         assert!(results[0].error.is_none());
         assert_eq!(results[1].tool_call_id.as_deref(), Some("tc-2"));
         assert_eq!(results[1].error.as_deref(), Some("second"));
-        assert_eq!(results[1].text_content(), None);
+        // An error result keeps its output in `content` as well, so clients can render it.
+        assert_eq!(results[1].text_content(), Some("second"));
     }
 
     #[test]
@@ -1023,9 +1226,13 @@ mod tests {
         assert_eq!(round_tripped.tool_call_id.as_deref(), Some("tc-1"));
 
         // The payload sent alongside the error stays part of the error text, so the round trip
-        // carries both rather than dropping the payload.
+        // carries both rather than dropping the payload, and the same text stays in `content`.
         assert_eq!(
             round_tripped.error.as_deref(),
+            Some("sandbox unavailable\npartial output")
+        );
+        assert_eq!(
+            round_tripped.text_content(),
             Some("sandbox unavailable\npartial output")
         );
 
@@ -1037,6 +1244,7 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(result.state, ToolResultState::Error);
+        // Identical content and error text are only included once.
         assert_eq!(result.text_content(), "sandbox unavailable\npartial output");
     }
 
@@ -1135,7 +1343,10 @@ mod tests {
     }
 
     #[test]
-    fn structured_blocks_are_rejected_for_non_user_messages() {
+    fn structured_blocks_on_an_assistant_message_are_read_back() {
+        // Outbound messages carry parts for every role (an attachment on a `returnDirect` tool
+        // delivery lands on an assistant turn), so rejecting them on the way back made an echoed
+        // history fail the whole next run.
         let converter = converter();
         let agui = AguiMessage::new(
             "m7",
@@ -1146,30 +1357,523 @@ mod tests {
             Vec::new(),
             None,
         );
-        let err = converter.to_msg(&agui).unwrap_err();
-        assert!(matches!(err, AguiError::InvalidInput(_)));
-        assert!(err
-            .to_string()
-            .contains("only supported for AG-UI user messages"));
+        let msg = converter
+            .to_msg(&agui)
+            .expect("assistant parts are readable");
+        assert_eq!(msg.role(), MsgRole::Assistant);
+        assert_eq!(msg.text_content(), "x");
+    }
+
+    fn url_source(url: &str, mime_type: Option<&str>) -> Source {
+        Source::Url(URLSource {
+            url: url.to_string(),
+            mime_type: mime_type.map(str::to_string),
+        })
+    }
+
+    fn metadata(value: Value) -> Map<String, Value> {
+        value.as_object().cloned().unwrap_or_default()
+    }
+
+    fn first_document(msg: &Msg) -> &DocumentBlock {
+        msg.content()
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Document(document) => Some(document),
+                _ => None,
+            })
+            .expect("expected a document block")
+    }
+
+    fn blocks(agui: &AguiMessage) -> &[InputContent] {
+        match &agui.content {
+            Some(MessageContent::Blocks(parts)) => parts.as_slice(),
+            other => panic!("expected structured blocks, got {other:?}"),
+        }
+    }
+
+    /// The URL or provider handle a media/document part points at.
+    fn url_of(part: &InputContent) -> Option<&str> {
+        match part {
+            InputContent::Image { source, .. }
+            | InputContent::Audio { source, .. }
+            | InputContent::Video { source, .. }
+            | InputContent::Document { source, .. } => match source {
+                InputContentSource::Url { value, .. } | InputContentSource::File { value, .. } => {
+                    Some(value.as_str())
+                }
+                InputContentSource::Data { .. } => None,
+            },
+            InputContent::Text { .. } => None,
+        }
+    }
+
+    /// The MIME type a media/document part declares.
+    fn mime_of(part: &InputContent) -> Option<&str> {
+        match part {
+            InputContent::Image { source, .. }
+            | InputContent::Audio { source, .. }
+            | InputContent::Video { source, .. }
+            | InputContent::Document { source, .. } => match source {
+                InputContentSource::Url { mime_type, .. }
+                | InputContentSource::File { mime_type, .. } => mime_type.as_deref(),
+                InputContentSource::Data { mime_type, .. } => Some(mime_type.as_str()),
+            },
+            InputContent::Text { .. } => None,
+        }
     }
 
     #[test]
-    fn document_input_content_is_unhandled_like_java() {
+    fn url_media_blocks_become_structured_parts_with_the_text_last() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-media")
+            .role(MsgRole::User)
+            .content(vec![
+                ContentBlock::Text(TextBlock::new("Describe these")),
+                ContentBlock::Image(ImageBlock::new(url_source(
+                    "https://x/img.png",
+                    Some("image/png"),
+                ))),
+                ContentBlock::Audio(AudioBlock::new(url_source(
+                    "https://x/a.mp3",
+                    Some("audio/mpeg"),
+                ))),
+                ContentBlock::Video(VideoBlock::new(url_source(
+                    "https://x/v.mp4",
+                    Some("video/mp4"),
+                ))),
+                ContentBlock::Document(
+                    DocumentBlock::builder()
+                        .source(url_source("https://x/doc.pdf", Some("application/pdf")))
+                        .metadata(metadata(json!({"sourcePage": 3})))
+                        .build(),
+                ),
+            ])
+            .build();
+
+        let messages = converter.to_agui_messages(&msg);
+
+        assert_eq!(messages.len(), 1);
+        let parts = blocks(&messages[0]);
+        assert_eq!(parts.len(), 5);
+        assert!(matches!(parts[0], InputContent::Image { .. }));
+        assert_eq!(url_of(&parts[0]), Some("https://x/img.png"));
+        assert_eq!(mime_of(&parts[0]), Some("image/png"));
+        assert!(matches!(parts[1], InputContent::Audio { .. }));
+        assert_eq!(url_of(&parts[1]), Some("https://x/a.mp3"));
+        assert_eq!(mime_of(&parts[1]), Some("audio/mpeg"));
+        assert!(matches!(parts[2], InputContent::Video { .. }));
+        assert_eq!(url_of(&parts[2]), Some("https://x/v.mp4"));
+        assert_eq!(mime_of(&parts[2]), Some("video/mp4"));
+        assert!(matches!(
+            &parts[3],
+            InputContent::Document { metadata: Some(meta), .. }
+                if meta.get("sourcePage") == Some(&json!(3))
+        ));
+        assert_eq!(url_of(&parts[3]), Some("https://x/doc.pdf"));
+        assert_eq!(mime_of(&parts[3]), Some("application/pdf"));
+        assert!(matches!(&parts[4], InputContent::Text { text } if text == "Describe these"));
+    }
+
+    #[test]
+    fn inline_media_blocks_are_skipped_outbound() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-b64")
+            .role(MsgRole::User)
+            .content(vec![
+                ContentBlock::Text(TextBlock::new("caption")),
+                ContentBlock::Image(ImageBlock::new(Source::Base64(Base64Source::new(
+                    "image/png",
+                    "iVBORw0KGgo=",
+                )))),
+                ContentBlock::Audio(AudioBlock::new(Source::Base64(Base64Source::new(
+                    "audio/wav",
+                    "UklGRg==",
+                )))),
+                ContentBlock::Video(VideoBlock::new(Source::Base64(Base64Source::new(
+                    "video/mp4",
+                    "AAAA",
+                )))),
+            ])
+            .build();
+
+        let messages = converter.to_agui_messages(&msg);
+
+        assert!(!messages[0].has_blocks());
+        assert_eq!(messages[0].text_content(), Some("caption"));
+    }
+
+    #[test]
+    fn a_data_block_is_routed_by_its_mime_type() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-data")
+            .role(MsgRole::User)
+            .content(vec![
+                ContentBlock::Data(DataBlock::new(url_source(
+                    "https://x/generated.png",
+                    Some("image/png"),
+                ))),
+                ContentBlock::Data(DataBlock::new(url_source(
+                    "https://x/report.pdf",
+                    Some("application/pdf"),
+                ))),
+            ])
+            .build();
+
+        let messages = converter.to_agui_messages(&msg);
+        let parts = blocks(&messages[0]);
+
+        assert!(matches!(parts[0], InputContent::Image { .. }));
+        assert_eq!(mime_of(&parts[0]), Some("image/png"));
+        assert!(matches!(parts[1], InputContent::Document { .. }));
+        assert_eq!(mime_of(&parts[1]), Some("application/pdf"));
+    }
+
+    #[test]
+    fn reasoning_next_to_url_media_keeps_both_messages() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-reasoning-media")
+            .role(MsgRole::Assistant)
+            .content(vec![
+                ContentBlock::Thinking(ThinkingBlock::new("Generate the output")),
+                ContentBlock::Image(ImageBlock::new(url_source(
+                    "https://x/out.png",
+                    Some("image/png"),
+                ))),
+            ])
+            .build();
+
+        let results = converter.to_agui_messages(&msg);
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_reasoning_message());
+        assert_eq!(results[0].text_content(), Some("Generate the output"));
+        assert_ne!(results[0].id, results[1].id);
+        assert!(results[1].is_assistant_message());
+        let parts = blocks(&results[1]);
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(&parts[0], InputContent::Image { .. }));
+
+        // Reasoning alone still maps to exactly one reasoning message.
+        let reasoning_only = Msg::builder()
+            .id("msg-reasoning")
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Thinking(ThinkingBlock::new("only"))])
+            .build();
+        let results = converter.to_agui_messages(&reasoning_only);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "msg-reasoning");
+    }
+
+    #[test]
+    fn a_document_travels_as_a_structured_part_and_round_trips() {
+        let converter = converter();
+        let block_metadata = metadata(json!({"file_parsing_strategy": "text_only"}));
+        let original = Msg::builder()
+            .id("msg-doc")
+            .role(MsgRole::User)
+            .content(vec![
+                ContentBlock::Text(TextBlock::new("read this")),
+                ContentBlock::Document(
+                    DocumentBlock::builder()
+                        .id("doc-1")
+                        .name("report.pdf")
+                        .mime_type("application/pdf")
+                        .source(url_source("https://x/report.pdf", Some("application/pdf")))
+                        .metadata(block_metadata.clone())
+                        .build(),
+                ),
+            ])
+            .build();
+
+        let mut messages = converter.to_agui_messages(&original);
+        let wire = messages.remove(0);
+
+        let parts = blocks(&wire);
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(
+            &parts[0],
+            InputContent::Document { id: Some(id), metadata: Some(meta), .. }
+                if id == "doc-1" && meta.get("file_parsing_strategy") == Some(&json!("text_only"))
+        ));
+        assert_eq!(url_of(&parts[0]), Some("https://x/report.pdf"));
+        assert!(matches!(&parts[1], InputContent::Text { text } if text == "read this"));
+
+        let restored = converter.to_msg(&wire).unwrap();
+        let document = first_document(&restored);
+        assert_eq!(document.id, "doc-1");
+        // AG-UI has no document display-name field.
+        assert_eq!(document.name, None);
+        assert_eq!(document.mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(document.metadata, Some(block_metadata));
+        let Source::Url(url) = &document.source else {
+            panic!("expected a url source, got {:?}", document.source)
+        };
+        assert_eq!(url.url, "https://x/report.pdf");
+        assert_eq!(url.mime_type.as_deref(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn a_provider_file_document_travels_as_a_file_source() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-file")
+            .role(MsgRole::User)
+            .content(vec![ContentBlock::Document(
+                DocumentBlock::builder()
+                    .name("report.pdf")
+                    .source(Source::FileId(FileIdSource::new("dashscope", "file-1")))
+                    .build(),
+            )])
+            .build();
+
+        let messages = converter.to_agui_messages(&msg);
+        let parts = blocks(&messages[0]);
+
+        assert!(matches!(parts[0], InputContent::Document { .. }));
+        assert_eq!(url_of(&parts[0]), Some("file-1"));
+        assert_eq!(mime_of(&parts[0]), Some("application/pdf"));
+        assert!(matches!(
+            &parts[0],
+            InputContent::Document {
+                source: InputContentSource::File {
+                    provider: Some(provider),
+                    ..
+                },
+                ..
+            } if provider == "dashscope"
+        ));
+    }
+
+    #[test]
+    fn a_file_source_without_a_provider_gets_the_neutral_one() {
         let converter = converter();
         let agui = AguiMessage::user_message_blocks(
-            "m8",
+            "m-file",
             vec![InputContent::Document {
-                source: InputContentSource::Url {
-                    value: "https://x/d.pdf".into(),
-                    mime_type: None,
+                id: Some("doc-1".into()),
+                source: InputContentSource::File {
+                    value: "file-abc".into(),
+                    provider: None,
+                    mime_type: Some("application/pdf".into()),
                 },
                 metadata: None,
             }],
         );
-        assert!(matches!(
-            converter.to_msg(&agui).unwrap_err(),
-            AguiError::IllegalState(_)
-        ));
+
+        let msg = converter.to_msg(&agui).unwrap();
+
+        let document = first_document(&msg);
+        assert_eq!(document.id, "doc-1");
+        assert_eq!(
+            document.source,
+            Source::FileId(FileIdSource::new("agui", "file-abc"))
+        );
+        assert_eq!(document.mime_type.as_deref(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn document_sources_round_trip_when_they_carry_inline_data() {
+        let converter = converter();
+        let agui = AguiMessage::user_message_blocks(
+            "m-data",
+            vec![InputContent::Document {
+                id: None,
+                source: InputContentSource::Data {
+                    value: "dGVzdA==".into(),
+                    mime_type: "application/pdf".into(),
+                },
+                metadata: None,
+            }],
+        );
+
+        let msg = converter.to_msg(&agui).unwrap();
+
+        let document = first_document(&msg);
+        assert_eq!(document.mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(
+            document.source,
+            Source::Base64(Base64Source::new("application/pdf", "dGVzdA=="))
+        );
+    }
+
+    #[test]
+    fn absent_document_fields_are_omitted_from_the_wire_json() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-no-mime")
+            .role(MsgRole::User)
+            .content(vec![ContentBlock::Document(
+                DocumentBlock::builder()
+                    .source(url_source("https://x/report", None))
+                    .build(),
+            )])
+            .build();
+
+        let json = serde_json::to_string(&converter.to_agui_messages(&msg)[0]).unwrap();
+
+        assert!(!json.contains("\"mimeType\""), "{json}");
+    }
+
+    #[test]
+    fn a_file_source_without_a_provider_omits_it_from_the_wire_json() {
+        let part = InputContent::Document {
+            id: None,
+            source: InputContentSource::File {
+                value: "file-abc".to_string(),
+                provider: None,
+                mime_type: None,
+            },
+            metadata: None,
+        };
+
+        let json = serde_json::to_value(part).unwrap();
+
+        assert_eq!(json["source"]["type"], json!("file"));
+        assert!(json["source"].get("provider").is_none(), "{json}");
+        assert!(json["source"].get("mimeType").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_tool_result_document_is_serialized_as_blocks_and_reads_back() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("msg-t21")
+            .role(MsgRole::Tool)
+            .content(vec![ContentBlock::ToolResult(
+                ToolResultBlock::builder()
+                    .id("tc-1")
+                    .outputs(vec![
+                        ContentBlock::Text(TextBlock::new("generated report")),
+                        ContentBlock::Document(
+                            DocumentBlock::builder()
+                                .id("doc-1")
+                                .mime_type("application/pdf")
+                                .source(url_source("https://x/report.pdf", Some("application/pdf")))
+                                .build(),
+                        ),
+                    ])
+                    .build(),
+            )])
+            .build();
+
+        let mut messages = converter.to_agui_messages(&msg);
+        let wire = messages.remove(0);
+
+        assert_eq!(wire.tool_call_id.as_deref(), Some("tc-1"));
+        assert!(wire.error.is_none());
+        let parts = blocks(&wire);
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[0], InputContent::Document { .. }));
+        assert!(matches!(&parts[1], InputContent::Text { .. }));
+
+        let restored = converter.to_msg(&wire).unwrap();
+        let result = restored.tool_result_blocks().next().unwrap();
+        assert_eq!(result.id.as_deref(), Some("tc-1"));
+        assert_eq!(result.state, ToolResultState::Success);
+        assert_eq!(result.output.len(), 2);
+        assert!(matches!(&result.output[0], ContentBlock::Document(_)));
+        assert_eq!(result.text_content(), "generated report");
+    }
+
+    #[test]
+    fn an_error_tool_result_keeps_its_output_in_content_across_repeated_round_trips() {
+        let converter = converter();
+        let mut msg = Msg::builder()
+            .id("msg-err")
+            .role(MsgRole::Tool)
+            .content(vec![ContentBlock::ToolResult(
+                ToolResultBlock::builder()
+                    .id("tc-1")
+                    .outputs(vec![
+                        ContentBlock::Text(TextBlock::new("sandbox unavailable")),
+                        ContentBlock::Text(TextBlock::new("partial output")),
+                    ])
+                    .state(ToolResultState::Error)
+                    .build(),
+            )])
+            .build();
+
+        for _ in 0..3 {
+            let mut messages = converter.to_agui_messages(&msg);
+            let wire = messages.remove(0);
+            assert_eq!(
+                wire.text_content(),
+                Some("sandbox unavailable\npartial output")
+            );
+            assert_eq!(wire.error.as_deref(), wire.text_content());
+
+            msg = converter.to_msg(&wire).unwrap();
+            let result = msg.tool_result_blocks().next().unwrap();
+            assert_eq!(result.id.as_deref(), Some("tc-1"));
+            assert_eq!(result.state, ToolResultState::Error);
+            assert_eq!(result.text_content(), "sandbox unavailable\npartial output");
+        }
+    }
+
+    #[test]
+    fn an_error_echoed_as_a_part_is_not_duplicated() {
+        // The outbound tool message keeps the same text in `content` and `error`, so a client
+        // echoes it back as a part. Inserting it again would double the text on every round trip.
+        let converter = converter();
+        let agui = AguiMessage::new(
+            "msg-t1",
+            "tool",
+            Some(MessageContent::Blocks(vec![
+                InputContent::Text {
+                    text: "sandbox unavailable".into(),
+                },
+                InputContent::Text {
+                    text: "partial output".into(),
+                },
+            ])),
+            Vec::new(),
+            Some("tc-1".into()),
+        )
+        .with_error("sandbox unavailable");
+
+        let result = converter
+            .to_msg(&agui)
+            .unwrap()
+            .tool_result_blocks()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(result.state, ToolResultState::Error);
+        assert_eq!(result.text_content(), "sandbox unavailable\npartial output");
+    }
+
+    #[test]
+    fn an_assistant_attachment_round_trips_through_both_directions() {
+        let converter = converter();
+        let msg = Msg::builder()
+            .id("m1")
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::Document(
+                DocumentBlock::builder()
+                    .source(Source::Url(URLSource::new(
+                        "https://example.com/report.pdf",
+                    )))
+                    .name("report.pdf")
+                    .build(),
+            )])
+            .build();
+
+        let wire = converter.to_agui_message(&msg);
+        let back = converter
+            .to_msg(&wire)
+            .expect("the history must be readable back");
+        assert_eq!(back.role(), MsgRole::Assistant);
+        // AG-UI's document part carries `id`/`source`/`metadata` only, so the URL is what has to
+        // survive the round trip (the display name is not part of the wire shape, same as Java).
+        match &first_document(&back).source {
+            Source::Url(url) => assert_eq!(url.url, "https://example.com/report.pdf"),
+            other => panic!("expected url source, got {other:?}"),
+        }
     }
 
     #[test]
