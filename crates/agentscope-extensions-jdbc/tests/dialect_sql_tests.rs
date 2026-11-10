@@ -219,6 +219,22 @@ fn h2_store_ddl_uses_clob() {
     assert!(ddl.contains("CLOB"));
 }
 
+#[test]
+fn store_item_key_width_is_widened_for_postgres_and_h2_only() {
+    // Java 7d84cff02 (#3464): session journal keys
+    // (`<storage path>/inbox/writer-seals/<sha256>.json`) exceed 255 characters, so PostgreSQL
+    // and H2 store `item_key` as VARCHAR(2048). MySQL keeps 255 because the composite PK
+    // (namespace_path + item_key) must stay within the 3072-byte InnoDB utf8mb4 limit.
+    for ddl in [
+        PostgresDialect::new().store_create_table_ddls().remove(0),
+        AnsiDialect::new().store_create_table_ddls().remove(0),
+    ] {
+        assert_eq!(varchar_length(&ddl, "item_key"), 2048, "{ddl}");
+    }
+    let mysql = MysqlDialect::new().store_create_table_ddls().remove(0);
+    assert_eq!(varchar_length(&mysql, "item_key"), 255, "{mysql}");
+}
+
 // ---------------------------------------------------------------------------
 //  Secondary indexes
 //  Java: mysqlDdlInlinesIndexes / postgresIndexDdl / h2AndSqliteIndexDdl

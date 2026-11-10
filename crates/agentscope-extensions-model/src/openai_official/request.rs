@@ -6,17 +6,21 @@
 //! body posted to `{base_url}/responses`, keeping the adapter on the shared
 //! [`crate::common::HttpTransport`] seam (and therefore offline-testable).
 
+use std::path::Path;
+
 use agentscope_core::error::{Error, Result};
 use agentscope_core::formatter::ResponseFormat;
 use agentscope_core::message::{
-    ContentBlock, DataBlock, Msg, MsgRole, Source, ThinkingBlock, ToolResultBlock, ToolResultState,
-    ToolUseBlock,
+    ContentBlock, DataBlock, DocumentBlock, Msg, MsgRole, Source, ThinkingBlock, ToolResultBlock,
+    ToolResultState, ToolUseBlock,
 };
 use agentscope_core::model::{GenerateOptions, ToolChoice, ToolSchema};
+use agentscope_core::{determine_media_type, file_to_base64};
 use serde_json::{json, Map, Value};
 
 use super::constants::{
     is_whitelisted_body_param, MD_FUNCTION_CALL_NAMESPACE, MD_REASONING_ENCRYPTED_CONTENT,
+    PROVIDER_ID,
 };
 use super::formatter::ResponsesMultiAgentFormatter;
 use super::server_tool::{OpenAIServerTool, ResponsesServerToolHelper};
@@ -429,6 +433,7 @@ pub fn map_user_message(msg: &Msg, items: &mut Vec<Value>) -> Result<()> {
             ContentBlock::Image(image) => {
                 parts.push(input_image(&resolve_image_url(&image.source)?))
             }
+            ContentBlock::Document(document) => parts.push(map_document(document)?),
             ContentBlock::Data(data) => {
                 parts.push(input_image(&resolve_data_block_image_url(data)?))
             }
@@ -441,6 +446,84 @@ pub fn map_user_message(msg: &Msg, items: &mut Vec<Value>) -> Result<()> {
     }
     items.push(easy_message("user", Value::Array(parts)));
     Ok(())
+}
+
+/// Maps a user [`DocumentBlock`] to a Responses `input_file` item.
+///
+/// Mirrors `ResponsesRequestMapper.mapDocument`: remote HTTP(S) documents are forwarded as
+/// `file_url`, base64 payloads and local files are inlined as `file_data`, and only an OpenAI
+/// file id can use `file_id`. Local files are read synchronously because the formatter API is
+/// synchronous (Java prepares them off the event loop).
+pub fn map_document(document: &DocumentBlock) -> Result<Value> {
+    match &document.source {
+        Source::FileId(file) => {
+            if file.provider != "openai" && file.provider != PROVIDER_ID {
+                return Err(Error::Model(format!(
+                    "OpenAI document input requires an OpenAI file id, got provider '{}'.",
+                    file.provider
+                )));
+            }
+            if file.file_id.trim().is_empty() {
+                return Err(Error::Model(
+                    "Document file id must not be blank.".to_string(),
+                ));
+            }
+            Ok(input_file("file_id", &file.file_id, None))
+        }
+        Source::Base64(base64) => {
+            validate_document_data(&base64.data)?;
+            let mime_type = document_mime_type(
+                document.mime_type.as_deref(),
+                Some(base64.media_type.as_str()),
+                None,
+                "Set the MIME type for Base64 document input; use DocumentBlock.mime_type or \
+                 Base64Source.media_type.",
+            )?;
+            let filename = document_filename(document, None)?;
+            Ok(input_file(
+                "file_data",
+                &format!("data:{mime_type};base64,{}", base64.data),
+                Some(filename.as_str()),
+            ))
+        }
+        Source::Url(url_source) => {
+            let url = url_source.url.as_str();
+            if is_http_url(url) {
+                return Ok(input_file("file_url", url, None));
+            }
+            let path = local_document_path(url).ok_or_else(|| {
+                Error::Model("Document URLs must use HTTP(S), file, or a local path.".to_string())
+            })?;
+            let metadata = std::fs::metadata(path).map_err(|error| {
+                Error::Model(format!("Cannot read local document: {url}: {error}"))
+            })?;
+            if !metadata.is_file() {
+                return Err(Error::Model(format!(
+                    "Local document must be a regular file: {url}"
+                )));
+            }
+            let inferred = determine_media_type(path);
+            let mime_type = document_mime_type(
+                document.mime_type.as_deref(),
+                url_source.mime_type.as_deref(),
+                Some(inferred.as_str()),
+                "Set the MIME type for local document input; use DocumentBlock.mime_type or \
+                 URLSource.mime_type.",
+            )?;
+            let data = file_to_base64(path)?;
+            validate_document_data(&data)?;
+            let file_name = Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let filename = document_filename(document, Some(file_name))?;
+            Ok(input_file(
+                "file_data",
+                &format!("data:{mime_type};base64,{data}"),
+                Some(filename.as_str()),
+            ))
+        }
+    }
 }
 
 /// Maps an assistant message, including reasoning replay and server-tool replay.
@@ -830,6 +913,120 @@ pub(crate) fn input_image(url: &str) -> Value {
     json!({ "type": "input_image", "image_url": url, "detail": "auto" })
 }
 
+/// Builds a Responses `input_file` item from one of `file_url` / `file_data` / `file_id`.
+fn input_file(field: &str, value: &str, filename: Option<&str>) -> Value {
+    let mut item = Map::new();
+    item.insert("type".to_string(), json!("input_file"));
+    item.insert(field.to_string(), json!(value));
+    if let Some(filename) = filename {
+        item.insert("filename".to_string(), json!(filename));
+    }
+    Value::Object(item)
+}
+
+/// Hard limit for one inline document (50 MB decoded), mirroring
+/// `MAX_DOCUMENT_SIZE_BYTES`.
+const MAX_DOCUMENT_SIZE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Rejects empty or oversized inline document data.
+///
+/// The decoded size is derived from the encoded length, so a payload is never
+/// materialised just to be measured (mirrors `validateDocumentData`).
+fn validate_document_data(data: &str) -> Result<()> {
+    if data.trim().is_empty() {
+        return Err(Error::Model("Document data must not be empty.".to_string()));
+    }
+    let padding = if data.ends_with("==") {
+        2
+    } else if data.ends_with('=') {
+        1
+    } else {
+        0
+    };
+    if decoded_base64_len(data.len() as u64, padding) > MAX_DOCUMENT_SIZE_BYTES {
+        return Err(Error::Model(
+            "Document data exceeds the 50 MB decoded-size limit.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Decoded byte length of a base64 payload, computed from its encoded length.
+fn decoded_base64_len(encoded_len: u64, padding: u64) -> u64 {
+    (encoded_len * 3 / 4).saturating_sub(padding)
+}
+
+/// Resolves a document MIME type: declared value, then source hint, then the
+/// extension-derived `inferred` value (`application/octet-stream` means unknown).
+fn document_mime_type(
+    declared: Option<&str>,
+    source_hint: Option<&str>,
+    inferred: Option<&str>,
+    missing_mime_type_message: &str,
+) -> Result<String> {
+    let inferred = inferred.filter(|mime| *mime != "application/octet-stream");
+    declared
+        .into_iter()
+        .chain(source_hint)
+        .chain(inferred)
+        .find(|mime| !mime.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| Error::Model(missing_mime_type_message.to_string()))
+}
+
+/// Picks the document file name: the declared name, else the local file name.
+fn document_filename(document: &DocumentBlock, fallback: Option<&str>) -> Result<String> {
+    document
+        .name
+        .as_deref()
+        .into_iter()
+        .chain(fallback)
+        .find(|name| !name.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| Error::Model("Set DocumentBlock.name for document input.".to_string()))
+}
+
+fn is_http_url(url: &str) -> bool {
+    has_prefix(url, "https://") || has_prefix(url, "http://")
+}
+
+/// Case-insensitive ASCII prefix test (`HTTP://` counts as `http://`).
+fn has_prefix(url: &str, prefix: &str) -> bool {
+    url.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// Local path of a `file:` URL or of a plain filesystem path; `None` for any
+/// other scheme.
+///
+/// `file:///C:/report.pdf` keeps the URL's leading `/` in front of the drive
+/// letter, which is not part of the path.
+fn local_document_path(url: &str) -> Option<&str> {
+    if url.trim().is_empty() {
+        return None;
+    }
+    if let Some(rest) = strip_file_scheme(url) {
+        let path = rest.strip_prefix("//").unwrap_or(rest);
+        let bytes = path.as_bytes();
+        if bytes.len() > 2 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':'
+        {
+            return Some(&path[1..]);
+        }
+        return Some(path);
+    }
+    // `C:\dir\report.pdf` is a Windows drive; every longer prefix is a scheme.
+    match url.split_once(':') {
+        Some((scheme, _)) if scheme.len() > 1 => None,
+        _ => Some(url),
+    }
+}
+
+/// Strips a `file:` scheme, which RFC 8089 spells case-insensitively.
+fn strip_file_scheme(url: &str) -> Option<&str> {
+    let scheme = url.get(..5)?;
+    scheme.eq_ignore_ascii_case("file:").then(|| &url[5..])
+}
+
 /// Resolves an image source to a URL or data URI (no network download).
 pub fn resolve_image_url(source: &Source) -> Result<String> {
     match source {
@@ -892,7 +1089,10 @@ fn join_output_text(result: &ToolResultBlock) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_core::message::{ChatUsage, ImageBlock, JsonMap, TextBlock, ToolResultState};
+    use agentscope_core::message::{
+        Base64Source, ChatUsage, DocumentBlock, FileIdSource, ImageBlock, JsonMap, TextBlock,
+        ToolResultState, URLSource,
+    };
 
     fn options(model: &str) -> GenerateOptions {
         GenerateOptions {
@@ -1238,5 +1438,154 @@ mod tests {
     #[test]
     fn usage_type_is_available_to_tests() {
         let _ = ChatUsage::default();
+    }
+
+    fn document_parts(document: DocumentBlock) -> Vec<Value> {
+        let mut items = Vec::new();
+        map_message(
+            &Msg::user_blocks(vec![ContentBlock::Document(document)]),
+            &mut items,
+        )
+        .unwrap();
+        items[0]["content"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// Writes `abc` to a uniquely named file in the temp directory.
+    fn temp_document(file_name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "agentscope_openai_official_{}_{file_name}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"abc").unwrap();
+        path
+    }
+
+    #[test]
+    fn remote_document_url_becomes_a_file_url() {
+        let url = "https://example.invalid/report.docx?token=x";
+        let parts = document_parts(DocumentBlock::new(Source::Url(URLSource::new(url))));
+        assert_eq!(
+            parts,
+            vec![json!({ "type": "input_file", "file_url": url })]
+        );
+    }
+
+    #[test]
+    fn base64_document_carries_the_filename_and_file_data() {
+        let document = DocumentBlock::builder()
+            .source(Source::Base64(Base64Source::new("text/plain", "YWJj")))
+            .name("report.txt")
+            .build();
+        assert_eq!(
+            document_parts(document),
+            vec![json!({
+                "type": "input_file",
+                "filename": "report.txt",
+                "file_data": "data:text/plain;base64,YWJj",
+            })]
+        );
+    }
+
+    #[test]
+    fn openai_file_id_becomes_a_file_id_reference() {
+        let document = DocumentBlock::new(Source::FileId(FileIdSource::new("openai", "file-123")));
+        assert_eq!(
+            document_parts(document),
+            vec![json!({ "type": "input_file", "file_id": "file-123" })]
+        );
+    }
+
+    #[test]
+    fn a_foreign_file_id_is_rejected() {
+        let document =
+            DocumentBlock::new(Source::FileId(FileIdSource::new("dashscope", "file-123")));
+        let error = map_document(&document).unwrap_err().to_string();
+        assert!(error.contains("requires an OpenAI file id"), "{error}");
+    }
+
+    #[test]
+    fn local_document_is_inlined_with_the_extension_mime_type() {
+        let path = temp_document("report.pdf");
+        let parts = document_parts(DocumentBlock::new(Source::Url(URLSource::new(
+            path.to_string_lossy().to_string(),
+        ))));
+        assert_eq!(
+            parts,
+            vec![json!({
+                "type": "input_file",
+                "filename": path.file_name().unwrap().to_string_lossy(),
+                "file_data": "data:application/pdf;base64,YWJj",
+            })]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_uri_documents_are_read_as_local_files() {
+        let path = temp_document("report.txt");
+        let slashed = path.to_string_lossy().replace('\\', "/");
+        let uri = format!("file:///{}", slashed.trim_start_matches('/'));
+        let document = DocumentBlock::builder()
+            .source(Source::Url(URLSource::new(uri)))
+            .mime_type("text/plain")
+            .build();
+        assert_eq!(
+            document_parts(document),
+            vec![json!({
+                "type": "input_file",
+                "filename": path.file_name().unwrap().to_string_lossy(),
+                "file_data": "data:text/plain;base64,YWJj",
+            })]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_declared_mime_type_wins_over_the_extension() {
+        let path = temp_document("report.docx");
+        let document = DocumentBlock::builder()
+            .source(Source::Url(URLSource::new(
+                path.to_string_lossy().to_string(),
+            )))
+            .mime_type("text/csv")
+            .name("report.csv")
+            .build();
+        let parts = document_parts(document);
+        assert_eq!(parts[0]["file_data"], json!("data:text/csv;base64,YWJj"));
+        assert_eq!(parts[0]["filename"], json!("report.csv"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_local_document_without_a_known_mime_type_is_rejected() {
+        let path = temp_document("report");
+        let document = DocumentBlock::new(Source::Url(URLSource::new(
+            path.to_string_lossy().to_string(),
+        )));
+        let error = map_document(&document).unwrap_err().to_string();
+        assert!(error.contains("DocumentBlock.mime_type"), "{error}");
+        assert!(error.contains("URLSource.mime_type"), "{error}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn empty_document_data_is_rejected() {
+        let document = DocumentBlock::builder()
+            .source(Source::Base64(Base64Source::new("application/pdf", "")))
+            .name("report.pdf")
+            .build();
+        let error = map_document(&document).unwrap_err().to_string();
+        assert!(error.contains("must not be empty"), "{error}");
+    }
+
+    #[test]
+    fn base64_document_size_limit_is_computed_without_decoding() {
+        assert_eq!(decoded_base64_len(4, 0), 3);
+        assert_eq!(decoded_base64_len(4, 1), 2);
+        assert_eq!(decoded_base64_len(4, 2), 1);
+        // `4 * ceil(50 MB / 3)` encoded characters decode to exactly 50 MB.
+        let at_limit = MAX_DOCUMENT_SIZE_BYTES.div_ceil(3) * 4;
+        assert_eq!(decoded_base64_len(at_limit, 1), MAX_DOCUMENT_SIZE_BYTES);
+        assert!(decoded_base64_len(at_limit + 4, 0) > MAX_DOCUMENT_SIZE_BYTES);
     }
 }

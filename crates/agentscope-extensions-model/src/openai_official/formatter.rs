@@ -198,6 +198,20 @@ impl ResponsesMultiAgentFormatter {
                         }
                     }
                 }
+                ContentBlock::Document(document) => {
+                    if msg.role == MsgRole::User {
+                        flush_text(text_buffer, parts);
+                        parts.push(request::map_document(document)?);
+                    } else {
+                        if include_prefix {
+                            append_name_prefix(text_buffer, agent_name);
+                        }
+                        text_buffer.push_str(
+                            &agentscope_core::formatter::render_document_reference(document),
+                        );
+                        text_buffer.push('\n');
+                    }
+                }
                 ContentBlock::Data(data) => {
                     flush_text(text_buffer, parts);
                     match request::resolve_data_block_image_url(data) {
@@ -470,6 +484,31 @@ mod tests {
         assert!(content[0]["text"].as_str().unwrap().contains("before"));
         assert_eq!(content[1]["type"], json!("input_image"));
         assert_eq!(content[1]["image_url"], json!("data:image/png;base64,AAAA"));
+        assert!(content[2]["text"].as_str().unwrap().contains("</history>"));
+    }
+
+    #[test]
+    fn user_document_becomes_an_input_file_part_in_order() {
+        let formatter = ResponsesMultiAgentFormatter::new();
+        let document = agentscope_core::DocumentBlock::builder()
+            .source(agentscope_core::Source::Base64(
+                agentscope_core::Base64Source::new("application/pdf", "YWJj"),
+            ))
+            .name("report.pdf")
+            .build();
+        let msg = Msg::user_blocks(vec![
+            ContentBlock::Text(TextBlock::new("before")),
+            ContentBlock::Document(document),
+        ]);
+        let items = formatter.format_history(&[msg]).unwrap();
+        let content = items[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert!(content[0]["text"].as_str().unwrap().contains("before"));
+        assert_eq!(content[1]["type"], json!("input_file"));
+        assert_eq!(
+            content[1]["file_data"],
+            json!("data:application/pdf;base64,YWJj")
+        );
         assert!(content[2]["text"].as_str().unwrap().contains("</history>"));
     }
 

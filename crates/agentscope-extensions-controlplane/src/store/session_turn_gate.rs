@@ -15,10 +15,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentscope_harness::agent::gateway::{SessionTurnGate, TurnBusyException};
+use agentscope_harness::agent::gateway::{SessionTurnGate, SessionTurnLease, TurnBusyException};
 use reqwest::Method;
 use serde_json::{json, Value};
-use tokio::sync::OwnedMutexGuard;
 
 use crate::error::{ControlPlaneError, ControlPlaneResult};
 use crate::transport::{encode_query, ControlPlaneHttpClient};
@@ -116,7 +115,7 @@ pub struct ControlPlaneTurnLease {
     http: Option<Arc<ControlPlaneHttpClient>>,
     lock_name: String,
     owner_token: Option<String>,
-    _local_guard: Option<OwnedMutexGuard<()>>,
+    _local_guard: Option<SessionTurnLease>,
 }
 
 impl ControlPlaneTurnLease {

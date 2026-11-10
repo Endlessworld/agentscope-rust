@@ -32,7 +32,7 @@ impl StoreDialect for PostgresDialect {
             format!(
                 "CREATE TABLE IF NOT EXISTS {} (\
                  namespace_path VARCHAR(2048) NOT NULL, \
-                 item_key VARCHAR(255) NOT NULL, value_json TEXT NOT NULL, \
+                 item_key VARCHAR(2048) NOT NULL, value_json TEXT NOT NULL, \
                  version BIGINT NOT NULL, updated_at BIGINT NOT NULL, \
                  PRIMARY KEY (namespace_path, item_key))",
                 self.resolved_store_table_name()

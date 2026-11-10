@@ -578,6 +578,11 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 - 不修改 `crates/agentscope-core` / `crates/agentscope-harness`（除非本 tracker 明确授权），不修改其它模块的 crate。
 
 
+## 3.6 2026-11-09 上游迁移（Java `c52d1fc28` / `9ab7a4fab`）
+
+- **MODEL-34（已完成）**：anthropic 并行 tool call 批次保留（Java #4019）——`src/anthropic/converter.rs::to_anthropic_messages` 不再拆分 assistant 的多个 tool_use；连续 client tool results 合并为一条 user 消息、results 排在文本/媒体之前，server tool result 仍内联；删除 `should_split_parallel_tool_calls`/`collect_split_tool_results`/`convert_parallel_tool_calls`，`tool_result_message` 拆为 `tool_result_block`。用例 5 条（`parallel_tool_calls_keep_one_assistant_and_one_user_message` 等），反向验证 `has_client_tool_results` 恒 false → FAILED。
+- **MODEL-35（已完成）**：openai-official Responses 文档输入（Java #4032）——`src/openai_official/request.rs::map_document` + `map_user_message` 的 `ContentBlock::Document` 分支：URL→`file_url`、Base64→`file_data`+`filename`、OpenAI file id→`file_id`；本地路径/`file:` URI 同步读文件内联，MIME 声明优先、否则按扩展名推断、未知报错，非空 + 50MB 解码上限；`formatter.rs::process_message` 的多智能体路径同样支持。用例 11 条（`remote_document_url_becomes_a_file_url` 等），反向验证删除 Document 分支 → FAILED。已知差异：Rust 额外支持扩展名 MIME 推断；`file:` URI 未做百分号解码；assistant/tool_result 中的 Document 仍未支持。
+
 ## 6. 执行历史（已归档）
 
 - 执行记录 / 静态复核 / 勘误 / 反向验证明细：[`history/MODEL__MIGRATION_HISTORY.md`](./history/MODEL__MIGRATION_HISTORY.md)

@@ -14,7 +14,8 @@
 //!
 //! Anthropic has three requirements the OpenAI shape does not:
 //! 1. The system prompt travels in the top-level `system` field, not as a message.
-//! 2. Tool results must be `user` messages, one per [`ToolResultBlock`].
+//! 2. Tool results must be `user` messages; consecutive client tool results are
+//!    merged into a single `user` message so parallel tool batches survive.
 //! 3. A `user`/`assistant` message may not be emitted empty, so every branch
 //!    drops messages whose converted block list came out empty.
 
@@ -438,8 +439,14 @@ pub fn message_content_blocks(
             ContentBlock::Image(i) => out.push(image_content_block(i, fmt)),
             ContentBlock::Data(d) => out.push(data_content_block(d, fmt)),
             ContentBlock::ToolUse(t) => out.push(tool_use_block(t, fmt)),
-            // Tool results are emitted as standalone user messages.
-            ContentBlock::ToolResult(_) => {}
+            // A provider-executed (server) tool result stays inline in the
+            // message that carries it; client tool results are grouped into one
+            // `user` message by [`to_anthropic_messages`].
+            ContentBlock::ToolResult(r) => {
+                if let Some(restored) = server_tool_result_block(r) {
+                    out.push(restored);
+                }
+            }
             // Audio/video have no Anthropic request representation.
             ContentBlock::Audio(_) | ContentBlock::Video(_) => {}
             // Documents are native PDF input blocks (base64 / URL / file id).
@@ -449,20 +456,22 @@ pub fn message_content_blocks(
     out
 }
 
-/// Converts one tool-result block into its standalone `user` message.
-pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> AnthropicMessage {
-    // A provider-executed (server) tool result is echoed back verbatim: the
-    // raw wire block was captured in metadata when the response was parsed.
-    if block.is_server_tool() {
-        if let Some(raw) = block.metadata.get(METADATA_SERVER_TOOL_RESULT) {
-            if let Ok(restored) = serde_json::from_value::<AnthropicContentBlock>(raw.clone()) {
-                return AnthropicMessage {
-                    role: "user".to_string(),
-                    content: vec![restored],
-                };
-            }
-        }
+/// Restores a provider-executed (server) tool result from the raw wire block
+/// captured in metadata when the response was parsed, so it can be echoed back
+/// verbatim inside the message that carries it.
+fn server_tool_result_block(block: &ToolResultBlock) -> Option<AnthropicContentBlock> {
+    if !block.is_server_tool() {
+        return None;
     }
+    let raw = block.metadata.get(METADATA_SERVER_TOOL_RESULT)?;
+    serde_json::from_value::<AnthropicContentBlock>(raw.clone()).ok()
+}
+
+/// Converts one client tool-result block into an Anthropic `tool_result` block.
+pub fn tool_result_block(
+    block: &ToolResultBlock,
+    fmt: &ChatFormatOptions,
+) -> AnthropicContentBlock {
     let mut content: Vec<AnthropicToolResultContent> = Vec::new();
     for output in &block.output {
         match output {
@@ -516,24 +525,19 @@ pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> 
             content.push(AnthropicToolResultContent::ToolReference { tool_name });
         }
     }
-    AnthropicMessage {
-        role: "user".to_string(),
-        content: vec![AnthropicContentBlock::ToolResult(
-            AnthropicToolResultBlock {
-                tool_use_id: block.id.clone().unwrap_or_default(),
-                content,
-                // ERROR / DENIED / INTERRUPTED results are explicitly marked as
-                // failures so the model can react to them (Java maps the same
-                // three states to `is_error: true`).
-                is_error: matches!(
-                    block.state,
-                    ToolResultState::Error | ToolResultState::Denied | ToolResultState::Interrupted
-                )
-                .then_some(true),
-                cache_control: fmt.cache_control.then(|| fmt.marker()),
-            },
-        )],
-    }
+    AnthropicContentBlock::ToolResult(AnthropicToolResultBlock {
+        tool_use_id: block.id.clone().unwrap_or_default(),
+        content,
+        // ERROR / DENIED / INTERRUPTED results are explicitly marked as
+        // failures so the model can react to them (Java maps the same three
+        // states to `is_error: true`).
+        is_error: matches!(
+            block.state,
+            ToolResultState::Error | ToolResultState::Denied | ToolResultState::Interrupted
+        )
+        .then_some(true),
+        cache_control: fmt.cache_control.then(|| fmt.marker()),
+    })
 }
 
 /// Converts a [`Msg`] list into Anthropic messages.
@@ -544,154 +548,90 @@ pub fn tool_result_message(block: &ToolResultBlock, fmt: &ChatFormatOptions) -> 
 /// through the top-level `system` field instead; this function converts whatever
 /// it is given. Messages that convert to no blocks are dropped (Anthropic rejects
 /// empty content).
+///
+/// An assistant message keeps **all** of its `tool_use` blocks in one message,
+/// and the client tool results of the following consecutive messages are merged
+/// into a single `user` message, tool results first, then the text/media those
+/// messages carried (a per-result `user` message makes providers such as DeepSeek
+/// reject the request).
 pub fn to_anthropic_messages(messages: &[Msg], fmt: &ChatFormatOptions) -> Vec<AnthropicMessage> {
     let mut out: Vec<AnthropicMessage> = Vec::new();
     let mut index = 0usize;
     while index < messages.len() {
         let msg = &messages[index];
 
-        // Parallel client tool calls: Anthropic requires a strict
-        // assistant(tool_use) -> user(tool_result) alternation, so an assistant
-        // message with several tool uses is expanded into one
-        // assistant/user pair per call (`AnthropicMessageConverter#convert`).
-        if msg.role == MsgRole::Assistant {
-            let tool_uses = client_tool_uses(msg);
-            if tool_uses.len() > 1 {
-                let split = collect_split_tool_results(messages, index + 1);
-                if should_split_parallel_tool_calls(&tool_uses, &split) {
-                    out.extend(convert_parallel_tool_calls(msg, &tool_uses, &split, fmt));
-                    index += split.consumed + 1;
-                    continue;
-                }
-            }
-        }
-
-        let (tool_results, regular): (Vec<ContentBlock>, Vec<ContentBlock>) = msg
-            .content
-            .iter()
-            .cloned()
-            .partition(|b| matches!(b, ContentBlock::ToolResult(_)));
-
-        if !regular.is_empty() {
-            let blocks = message_content_blocks(&regular, fmt);
+        if !has_client_tool_results(msg) {
+            let blocks = message_content_blocks(&msg.content, fmt);
             if !blocks.is_empty() {
                 out.push(AnthropicMessage {
                     role: role_str(msg.role).to_string(),
                     content: blocks,
                 });
             }
+            index += 1;
+            continue;
         }
 
-        for block in tool_results {
-            if let ContentBlock::ToolResult(tr) = block {
-                out.push(tool_result_message(&tr, fmt));
+        // Group the run of non-assistant messages that carry client tool
+        // results. A server tool result is not a client result: it stays inline
+        // in its own message (`message_content_blocks`) and never joins a group.
+        let mut tool_results: Vec<AnthropicContentBlock> = Vec::new();
+        let mut trailing: Vec<AnthropicContentBlock> = Vec::new();
+        let mut end = index;
+        loop {
+            let msg = &messages[end];
+            for block in &msg.content {
+                if let ContentBlock::ToolResult(result) = block {
+                    if !result.is_server_tool() {
+                        tool_results.push(tool_result_block(result, fmt));
+                    }
+                }
+            }
+            let regular: Vec<ContentBlock> = msg
+                .content
+                .iter()
+                .filter(|block| {
+                    !matches!(block, ContentBlock::ToolResult(result) if !result.is_server_tool())
+                })
+                .cloned()
+                .collect();
+            let blocks = message_content_blocks(&regular, fmt);
+            if !blocks.is_empty() {
+                if msg.role == MsgRole::Assistant {
+                    out.push(AnthropicMessage {
+                        role: role_str(msg.role).to_string(),
+                        content: blocks,
+                    });
+                } else {
+                    trailing.extend(blocks);
+                }
+            }
+            end += 1;
+            // An assistant message, or one without a client tool result, ends
+            // the group and keeps its original position.
+            if !(end < messages.len()
+                && messages[end].role != MsgRole::Assistant
+                && has_client_tool_results(&messages[end]))
+            {
+                break;
             }
         }
-        index += 1;
+        index = end;
+
+        tool_results.extend(trailing);
+        out.push(AnthropicMessage {
+            role: "user".to_string(),
+            content: tool_results,
+        });
     }
     out
 }
 
-/// The consecutive pure tool-result messages that follow an assistant message.
-struct SplitToolResults {
-    by_id: std::collections::BTreeMap<String, ToolResultBlock>,
-    consumed: usize,
-}
-
-/// Client-executed tool calls (server tools are executed by the provider).
-fn client_tool_uses(msg: &Msg) -> Vec<&ToolUseBlock> {
+/// Whether the message carries a client-executed (non-server) tool result.
+fn has_client_tool_results(msg: &Msg) -> bool {
     msg.content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolUse(tool) if !tool.is_server_tool() => Some(tool),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Collects the consecutive messages made up **entirely** of tool results.
-///
-/// The scan stops at the first message with non-tool-result content, because
-/// such a message must stay in its original position instead of being consumed
-/// into the split sequence.
-fn collect_split_tool_results(messages: &[Msg], start: usize) -> SplitToolResults {
-    let mut by_id = std::collections::BTreeMap::new();
-    let mut consumed = 0usize;
-    for msg in &messages[start..] {
-        let results: Vec<&ToolResultBlock> = msg
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolResult(result) => Some(result),
-                _ => None,
-            })
-            .collect();
-        if results.is_empty() || results.len() != msg.content.len() {
-            break;
-        }
-        consumed += 1;
-        for result in results {
-            if let Some(id) = result.id.as_ref().filter(|id| !id.is_empty()) {
-                by_id.entry(id.clone()).or_insert_with(|| result.clone());
-            }
-        }
-    }
-    SplitToolResults { by_id, consumed }
-}
-
-/// Whether the assistant message should be expanded into the anthropic
-/// tool-use/tool-result alternation (Java `shouldSplitParallelToolCalls`).
-fn should_split_parallel_tool_calls(tool_uses: &[&ToolUseBlock], split: &SplitToolResults) -> bool {
-    if split.consumed == 0 || tool_uses.len() <= 1 {
-        return false;
-    }
-    if tool_uses.iter().any(|tool| tool.id.trim().is_empty()) {
-        return false;
-    }
-    split.by_id.len() == tool_uses.len()
-        && tool_uses
-            .iter()
-            .all(|tool| split.by_id.contains_key(&tool.id))
-}
-
-/// Expands one assistant message with parallel tool uses into alternating
-/// messages; leading content is attached only to the first assistant message so
-/// it is not duplicated.
-fn convert_parallel_tool_calls(
-    assistant: &Msg,
-    tool_uses: &[&ToolUseBlock],
-    split: &SplitToolResults,
-    fmt: &ChatFormatOptions,
-) -> Vec<AnthropicMessage> {
-    let leading: Vec<ContentBlock> = assistant
-        .content
-        .iter()
-        .filter(|block| match block {
-            ContentBlock::ToolUse(tool) => tool.is_server_tool(),
-            _ => true,
-        })
-        .cloned()
-        .collect();
-
-    let mut out = Vec::new();
-    for (index, tool_use) in tool_uses.iter().enumerate() {
-        let mut blocks: Vec<ContentBlock> = Vec::new();
-        if index == 0 {
-            blocks.extend(leading.iter().cloned());
-        }
-        blocks.push(ContentBlock::ToolUse((*tool_use).clone()));
-        let converted = message_content_blocks(&blocks, fmt);
-        if !converted.is_empty() {
-            out.push(AnthropicMessage {
-                role: role_str(assistant.role).to_string(),
-                content: converted,
-            });
-        }
-        if let Some(result) = split.by_id.get(&tool_use.id) {
-            out.push(tool_result_message(result, fmt));
-        }
-    }
-    out
+        .any(|block| matches!(block, ContentBlock::ToolResult(result) if !result.is_server_tool()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1367,8 +1307,8 @@ mod tests {
                 vec![ContentBlock::Text(TextBlock::new("boom"))],
             );
             block.state = state;
-            let message = tool_result_message(&block, &plain());
-            match &message.content[0] {
+            let converted = tool_result_block(&block, &plain());
+            match &converted {
                 AnthropicContentBlock::ToolResult(tr) => {
                     assert_eq!(tr.is_error, expected, "state={state:?}");
                     assert_eq!(tr.tool_use_id, "toolu_1");
@@ -1385,10 +1325,11 @@ mod tests {
     }
 
     #[test]
-    fn parallel_tool_uses_split_into_alternating_pairs() {
-        // Anthropic rejects an assistant message whose tool_use blocks are not
-        // answered one-by-one, so two calls become assistant/user pairs (Java
-        // `convertParallelToolCalls`).
+    fn parallel_tool_calls_keep_one_assistant_and_one_user_message() {
+        // A parallel batch must survive as one assistant message carrying both
+        // tool_use blocks plus a single user message carrying both tool results;
+        // splitting them into alternating pairs makes Anthropic-compatible
+        // endpoints such as DeepSeek reject the request.
         let messages = vec![
             Msg::assistant_blocks(vec![
                 ContentBlock::Text(TextBlock::new("checking")),
@@ -1401,38 +1342,141 @@ mod tests {
         let out = to_anthropic_messages(&messages, &plain());
         assert_eq!(
             out.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
-            vec!["assistant", "user", "assistant", "user"]
+            vec!["assistant", "user"]
         );
-        // The leading text is attached once, to the first assistant message.
-        let first: Vec<&str> = out[0]
+        assert_eq!(out[0].content.len(), 3);
+        assert_eq!(out[1].content.len(), 2);
+        let ids: Vec<&str> = out[1]
             .content
             .iter()
             .filter_map(|b| match b {
-                AnthropicContentBlock::Text(t) => Some(t.text.as_str()),
+                AnthropicContentBlock::ToolResult(tr) => Some(tr.tool_use_id.as_str()),
                 _ => None,
             })
             .collect();
-        assert_eq!(first, vec!["checking"]);
-        assert!(out[1].content.iter().all(|b| matches!(
-            b,
-            AnthropicContentBlock::ToolResult(tr) if tr.tool_use_id == "t1"
-        )));
+        assert_eq!(ids, vec!["t1", "t2"]);
     }
 
     #[test]
-    fn parallel_tool_uses_stay_unsplit_when_a_result_is_missing() {
+    fn tool_results_precede_the_text_of_the_same_user_message() {
+        let mixed = Msg::builder()
+            .role(MsgRole::Tool)
+            .content(vec![
+                ContentBlock::Text(TextBlock::new("both checked")),
+                ContentBlock::ToolResult(ToolResultBlock::new(
+                    "t1",
+                    "a",
+                    vec![ContentBlock::Text(TextBlock::new("ra"))],
+                )),
+            ])
+            .build();
         let messages = vec![
-            Msg::assistant_blocks(vec![
-                ContentBlock::ToolUse(ToolUseBlock::new("t1", "a", JsonMap::new())),
-                ContentBlock::ToolUse(ToolUseBlock::new("t2", "b", JsonMap::new())),
-            ]),
-            Msg::tool("t1", "a", "ra"),
+            Msg::assistant_blocks(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                "t1",
+                "a",
+                JsonMap::new(),
+            ))]),
+            mixed,
         ];
         let out = to_anthropic_messages(&messages, &plain());
-        // No split: the assistant message is emitted as one message with both
-        // calls, followed by the single result.
         assert_eq!(out.len(), 2);
+        assert!(matches!(
+            &out[1].content[0],
+            AnthropicContentBlock::ToolResult(_)
+        ));
+        match &out[1].content[1] {
+            AnthropicContentBlock::Text(t) => assert_eq!(t.text, "both checked"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_grouping_stops_at_an_assistant_message() {
+        let messages = vec![
+            Msg::tool("t1", "a", "ra"),
+            Msg::assistant("next"),
+            Msg::tool("t2", "b", "rb"),
+        ];
+        let out = to_anthropic_messages(&messages, &plain());
+        assert_eq!(
+            out.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["user", "assistant", "user"]
+        );
+        assert_eq!(out[0].content.len(), 1);
+        assert_eq!(out[2].content.len(), 1);
+    }
+
+    #[test]
+    fn an_assistant_message_carrying_a_client_tool_result_keeps_its_content() {
+        let assistant = Msg::assistant_blocks(vec![
+            ContentBlock::Text(TextBlock::new("checking sales")),
+            ContentBlock::ToolUse(ToolUseBlock::new("call_sales", "get_sales", JsonMap::new())),
+            ContentBlock::ToolResult(ToolResultBlock::new(
+                "call_sales",
+                "get_sales",
+                vec![ContentBlock::Text(TextBlock::new("100"))],
+            )),
+        ]);
+        let out = to_anthropic_messages(&[assistant, Msg::assistant("sales are 100")], &plain());
+        assert_eq!(
+            out.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["assistant", "user", "assistant"]
+        );
         assert_eq!(out[0].content.len(), 2);
+        assert!(matches!(
+            &out[1].content[0],
+            AnthropicContentBlock::ToolResult(_)
+        ));
+    }
+
+    #[test]
+    fn a_server_tool_result_stays_inline_next_to_a_client_tool_result() {
+        let mut server_use = ToolUseBlock::new("srvtoolu_2", "web_search", JsonMap::new());
+        server_use.metadata.insert(
+            ToolUseBlock::METADATA_SERVER_TOOL.to_string(),
+            serde_json::json!(true),
+        );
+        let mut server_result = ToolResultBlock::new("srvtoolu_2", "web_search", vec![]);
+        server_result.metadata.insert(
+            ToolResultBlock::METADATA_SERVER_TOOL.to_string(),
+            serde_json::json!(true),
+        );
+        server_result.metadata.insert(
+            METADATA_SERVER_TOOL_RESULT.to_string(),
+            serde_json::json!({
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_2",
+                "content": [{"type": "web_search_result", "title": "Rust", "url": "https://rust-lang.org"}]
+            }),
+        );
+        let messages = vec![
+            Msg::assistant_blocks(vec![
+                ContentBlock::ToolUse(server_use),
+                ContentBlock::ToolResult(server_result),
+                ContentBlock::ToolUse(ToolUseBlock::new("call_client", "weather", JsonMap::new())),
+            ]),
+            Msg::tool("call_client", "weather", "sunny"),
+        ];
+        let out = to_anthropic_messages(&messages, &plain());
+        assert_eq!(
+            out.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["assistant", "user"]
+        );
+        // Server blocks keep their place in the assistant message; only the
+        // client result is grouped into the user message.
+        assert!(matches!(
+            &out[0].content[0],
+            AnthropicContentBlock::ServerToolUse(_)
+        ));
+        assert!(matches!(
+            &out[0].content[1],
+            AnthropicContentBlock::WebSearchToolResult(_)
+        ));
+        assert!(matches!(
+            &out[0].content[2],
+            AnthropicContentBlock::ToolUse(t) if t.id == "call_client"
+        ));
+        assert_eq!(out[1].content.len(), 1);
     }
 
     #[test]
@@ -1452,8 +1496,7 @@ mod tests {
             vec![ContentBlock::Text(TextBlock::new("found 1 tool"))],
         );
         block.metadata = metadata.clone();
-        let message = tool_result_message(&block, &plain());
-        match &message.content[0] {
+        match tool_result_block(&block, &plain()) {
             AnthropicContentBlock::ToolResult(tr) => {
                 assert_eq!(tr.content.len(), 2);
                 assert!(tr.content.iter().any(|c| matches!(
@@ -1467,8 +1510,7 @@ mod tests {
 
         // A failed search must not resurrect the deferred tools.
         block.state = ToolResultState::Error;
-        let message = tool_result_message(&block, &plain());
-        match &message.content[0] {
+        match tool_result_block(&block, &plain()) {
             AnthropicContentBlock::ToolResult(tr) => assert_eq!(tr.content.len(), 1),
             other => panic!("expected tool result, got {other:?}"),
         }
@@ -1883,6 +1925,9 @@ mod tests {
         );
         let messages = vec![Msg::assistant_blocks(parsed.content.clone())];
         let out = to_anthropic_messages(&messages, &plain());
+        // Both blocks stay inline in the assistant message; a server tool result
+        // never becomes its own user message nor joins a client result group.
+        assert_eq!(out.len(), 1);
         match &out[0].content[0] {
             AnthropicContentBlock::ServerToolUse(t) => {
                 assert_eq!(t.id, "srvtoolu_1");
@@ -1890,12 +1935,7 @@ mod tests {
             }
             other => panic!("expected server_tool_use, got {other:?}"),
         }
-        // The tool result travels as its own user message and is restored verbatim.
-        let user = out
-            .iter()
-            .find(|m| m.role == "user")
-            .expect("result message");
-        match &user.content[0] {
+        match &out[0].content[1] {
             AnthropicContentBlock::WebSearchToolResult(r) => {
                 assert_eq!(r.tool_use_id, "srvtoolu_1");
                 assert!(r.content.is_some());

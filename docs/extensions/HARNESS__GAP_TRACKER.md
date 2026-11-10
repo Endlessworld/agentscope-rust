@@ -267,6 +267,11 @@
 - 完工后：更新 §3.5 对应行状态 + §4.1/§4.2，并在 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` §1 对应行登记；执行记录写 `docs/extensions/history/HARNESS__MIGRATION_HISTORY.md`。
 - 判绿口径：只看 `^failures:` 段与 `EXITCODE`；`rg` 零命中须 2–3 个同义词交叉验证后才可记为「未实现」。
 
+## 3.6 2026-11-09 上游迁移（Java `a63c62590`）
+
+- **HARNESS-37（已完成）**：`SessionTurnGate` 空闲 key 驱逐（Java #3533 的缺陷 ①）——`gates` 改为 `Arc<Mutex<HashMap<String, Arc<Gate>>>>`，`Gate{mutex, leases}` 以「持有者 + 等待者」计数，`LeaseTicket` 在 await 前登记、Drop 时在同一把锁内递减并在归零时 `remove`；`acquire`/`try_acquire` 返回 `SessionTurnLease`（`controlplane` 的 `ControlPlaneTurnLease` 已同步）。Java 的缺陷 ②（`close()` 非幂等）在 Rust 不适用（`OwnedMutexGuard` drop 幂等）。用例 `idle_keys_are_evicted_from_the_gate_map`、`a_key_is_evicted_only_after_its_last_waiter_leaves`，反向验证去掉 `remove` → FAILED。
+- 已知：`xxl-job` 单次触发双计（Java `98ef4ee87`）在 Rust 不存在（`xxljob/mod.rs` 只调 `task.run`，无额外 increment），无需迁移。
+
 ## 6. 执行记录
 
 - 归档：`docs/extensions/history/HARNESS__MIGRATION_HISTORY.md`（本轮未新建，按 BRIEF 要求历史进程不入本文件）。

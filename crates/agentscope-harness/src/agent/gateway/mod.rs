@@ -76,7 +76,7 @@ pub use harness_gateway::{
     SubagentMaterializer,
 };
 pub use msg_context::{deterministic_hash, MsgContext};
-pub use session_turn_gate::{SessionTurnGate, TurnBusyException};
+pub use session_turn_gate::{SessionTurnGate, SessionTurnLease, TurnBusyException};
 pub use subagent::{
     InMemorySubagentRegistry, StoreBackedSubagentRegistry, SubagentRecord, SubagentRegistry,
 };

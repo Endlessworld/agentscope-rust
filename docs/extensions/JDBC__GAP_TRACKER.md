@@ -318,6 +318,10 @@
 - **仅在本 crate 内改动**；新增依赖写入 `crates/agentscope-extensions-jdbc/Cargo.toml` 的 `[dependencies]`，不要改根 `Cargo.toml` 的 `[workspace.dependencies]`（如需请记入 §4.2 由汇总方处理）。
 - 不修改 `crates/agentscope-core` / `crates/agentscope-harness`（除非本 tracker 明确授权），不修改其它模块的 crate。
 
+## 3.7 2026-11-09 上游迁移（Java `7d84cff02`）
+
+- **JDBC-16（已完成）**：`agentscope_store.item_key` 由 `VARCHAR(255)` 加宽到 `VARCHAR(2048)`，对齐 Java #3464——PostgreSQL（`src/dialect/vendor/postgres.rs:35`）与 ANSI/H2 默认方言（`src/dialect/vendor/ansi.rs:38`）；MySQL 刻意保持 255（InnoDB utf8mb4 3072 字节 PK 上限），SQLite 为 TEXT，均未动。用例 `tests/dialect_sql_tests.rs::store_item_key_width_is_widened_for_postgres_and_h2_only`（反向验证：改回 255 → FAILED）。存量 PG/H2 库需手工 `ALTER TABLE ... ALTER COLUMN item_key TYPE VARCHAR(2048)`（Java 侧同样只改 DDL）。
+
 ## 6. 执行历史（已归档）
 
 - 执行记录 / 静态复核 / 勘误 / 反向验证明细：[`history/JDBC__MIGRATION_HISTORY.md`](./history/JDBC__MIGRATION_HISTORY.md)
