@@ -8,7 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use agent_client_protocol::v1::schema::{
-    Content, ContentBlock, ContentChunk, Diff, Error as AcpError, ErrorCode, ErrorStopReason,
+    AvailableCommand, AvailableCommandsUpdate, Content, ContentBlock, ContentChunk, Diff,
+    Error as AcpError, ErrorCode, ErrorStopReason,
     IdleStopReason, MessageId, Notice, NoticeSeverity, Plan, PlanEntry, PlanEntryPriority,
     PlanEntryStatus, SessionId, SessionNotification, SessionUpdate, TextContent, ToolCall,
     ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
@@ -143,6 +144,23 @@ pub(crate) fn compaction_marker(ev: &AgentEvent) -> Option<(String, String)> {
         .unwrap_or_default()
         .to_string();
     Some((agent_id, summary))
+}
+
+/// Slash commands the agent advertises to the client (`available_commands_update`).
+///
+/// Today there is exactly one: `/compact`. It is a host-level shortcut
+/// (`session.rs::run_prompt_shortcut`) that compacts the conversation without paying a model
+/// turn, so clients have to be told it exists — otherwise their `/` menu stays empty.
+pub fn available_commands(session_id: impl Into<SessionId>) -> SessionNotification {
+    SessionNotification::new(
+        session_id,
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+            AvailableCommand::new(
+                super::session::COMPACT_COMMAND_NAME,
+                "Compact the conversation context and keep a summary",
+            ),
+        ])),
+    )
 }
 
 /// Emits a plain-text agent message chunk update.
@@ -1119,6 +1137,22 @@ mod tests {
 
     fn mid() -> Option<MessageId> {
         Some(MessageId::new("msg-1"))
+    }
+
+    #[test]
+    fn available_commands_advertises_the_compact_shortcut() {
+        let notif = available_commands(sid());
+        assert_eq!(notif.session_id, sid());
+        match notif.update {
+            SessionUpdate::AvailableCommandsUpdate(u) => {
+                assert_eq!(u.available_commands.len(), 1);
+                let cmd = &u.available_commands[0];
+                assert_eq!(cmd.name, "compact");
+                assert!(cmd.description.contains("Compact"));
+                assert!(cmd.input.is_none());
+            }
+            other => panic!("expected AvailableCommandsUpdate, got {other:?}"),
+        }
     }
 
     #[test]

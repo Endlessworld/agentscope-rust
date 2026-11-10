@@ -531,13 +531,19 @@ async fn cancel_epoch_moved(epoch: &std::sync::atomic::AtomicU64, started: u64) 
     }
 }
 
+/// The `/compact` slash command this agent advertises to clients
+/// (`event::available_commands`): a host-level shortcut, not a model turn.
+pub(crate) const COMPACT_COMMAND_NAME: &str = "compact";
+
 /// Whether a prompt is the host-level `/compact` shortcut.
 ///
 /// Only an exact, single text block counts: a message that merely mentions `/compact` is a
 /// normal prompt, and a mixed-content prompt (text plus images) is not a command.
 fn is_compact_command(content: &[ContentBlock]) -> bool {
     match content {
-        [ContentBlock::Text(text)] => text.text.trim().eq_ignore_ascii_case("/compact"),
+        [ContentBlock::Text(text)] => {
+            text.text.trim().eq_ignore_ascii_case(&format!("/{COMPACT_COMMAND_NAME}"))
+        }
         _ => false,
     }
 }

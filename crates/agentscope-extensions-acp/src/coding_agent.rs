@@ -39,6 +39,7 @@ use agentscope_harness::agent::{trigger_for_window, CompactionConfig, HarnessAge
 
 use super::config::{ModeChoice, ModelChoice};
 use super::elicitation::ElicitationSlot;
+use super::event;
 use super::provider::ProviderRegistry;
 use super::session::{AcpAgentSession, AcpClientHandle};
 use super::support::ClientSupport;
@@ -1110,7 +1111,7 @@ impl AcpCodingAgent {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |req: NewSessionRequest, responder, _cx| {
+                async move |req: NewSessionRequest, responder, cx| {
                     let cwd = req.cwd;
                     let system_prompt = match a_new.client_system_prompt(req.system_prompt) {
                         Ok(prompt) => prompt,
@@ -1132,12 +1133,16 @@ impl AcpCodingAgent {
                     let config_options = session.config_options();
                     let modes = session.session_mode_state();
                     a_new.register_session(session);
-                    let response = NewSessionResponse::new(session_id)
+                    let response = NewSessionResponse::new(session_id.clone())
                         .modes(modes)
                         .config_options(config_options);
                     // The model list is out; drop the catalog table unless a session still needs it.
                     release_catalog_if_unused(&a_new.sessions);
-                    responder.respond(response)
+                    responder.respond(response)?;
+                    // Slash-command catalog: sent after the response so the client already has the
+                    // session registered when the update arrives (clients route updates by session id).
+                    let _ = cx.send_notification(event::available_commands(session_id));
+                    Ok(())
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -1440,12 +1445,15 @@ impl AcpCodingAgent {
                         .modes(modes)
                         .config_options(config_options);
                     release_catalog_if_unused(&a_load.sessions);
-                    responder.respond(response)
+                    responder.respond(response)?;
+                    // Same catalog as `session/new`: a loaded session shows the `/` menu too.
+                    let _ = cx.send_notification(event::available_commands(sid));
+                    Ok(())
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |req: ResumeSessionRequest, responder, _cx| {
+                async move |req: ResumeSessionRequest, responder, cx| {
                     let sid = req.session_id;
                     let system_prompt = match a_resume.client_system_prompt(req.system_prompt) {
                         Ok(prompt) => prompt,
@@ -1493,7 +1501,10 @@ impl AcpCodingAgent {
                         .modes(modes)
                         .config_options(config_options);
                     release_catalog_if_unused(&a_resume.sessions);
-                    responder.respond(response)
+                    responder.respond(response)?;
+                    // Same catalog as `session/new`: a resumed session shows the `/` menu too.
+                    let _ = cx.send_notification(event::available_commands(sid));
+                    Ok(())
                 },
                 agent_client_protocol::on_receive_request!(),
             )
