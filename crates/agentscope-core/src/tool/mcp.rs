@@ -213,8 +213,12 @@ impl Tool for McpTool {
         self.output_schema.as_ref()
     }
 
+    /// An MCP tool is executed in this process: the handler performs the client
+    /// round-trip. Reporting `true` here would make the executor short-circuit every
+    /// call with "Tool ... is external and cannot be executed by the framework", which
+    /// is only correct for schema-only tools (`register_schema`).
     fn is_external(&self) -> bool {
-        true
+        false
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

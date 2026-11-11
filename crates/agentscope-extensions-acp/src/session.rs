@@ -663,6 +663,12 @@ pub struct AcpAgentSession {
     mcp_manager: Arc<agentscope_harness::agent::McpClientManager>,
     /// Server names already bridged into the toolkit this session (dedup).
     bridged_servers: Arc<Mutex<Vec<String>>>,
+    /// ACP-transport MCP servers declared by the client before a connection was bound.
+    ///
+    /// `session/new` applies `mcp_servers` while `client` is still `None` (the connection is
+    /// bound on the first prompt), and the MCP-over-ACP bridge needs it. Remembering the
+    /// declaration here lets the bridge retry as soon as the connection exists.
+    pending_acp_servers: Arc<Mutex<Vec<agent_client_protocol::v1::schema::McpServerAcp>>>,
     /// Capabilities the connected client advertised at `initialize`; several
     /// `session/update` variants are only legal when the matching capability was
     /// advertised, so every optional update is gated on this.
@@ -959,6 +965,7 @@ impl AcpAgentSession {
             mcp_manager: Arc::new(agentscope_harness::agent::McpClientManager::new()),
             runtime: Arc::new(tokio::sync::Mutex::new(None)),
             bridged_servers: Arc::new(Mutex::new(Vec::new())),
+            pending_acp_servers: Arc::new(Mutex::new(Vec::new())),
             support: ClientSupport::new(),
             turn_usage: ChatUsage::default(),
             additional_directories: Vec::new(),
@@ -1734,6 +1741,38 @@ impl AcpAgentSession {
         }
     }
 
+    /// Parks a declaration until [`apply_pending_acp_servers`](Self::apply_pending_acp_servers)
+    /// can bridge it (dedup by `server_id`, so repeated `session/new` does not pile up).
+    fn remember_pending_acp_server(&self, acp: &agent_client_protocol::v1::schema::McpServerAcp) {
+        let mut pending = self
+            .pending_acp_servers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.iter().any(|p| p.server_id == acp.server_id) {
+            return;
+        }
+        pending.push(acp.clone());
+    }
+
+    /// Bridges the ACP-transport servers parked at `session/new`, now that a client
+    /// connection is bound. Already-bridged servers are skipped, so calling this on every
+    /// prompt is cheap and idempotent.
+    pub async fn apply_pending_acp_servers(&self) {
+        let pending: Vec<agent_client_protocol::v1::schema::McpServerAcp> = {
+            let mut slot = self
+                .pending_acp_servers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *slot)
+        };
+        for acp in pending {
+            self.apply_acp_mcp_server(&acp).await;
+        }
+    }
+
     /// Connects a client-declared MCP-over-ACP server and bridges its tools.
     async fn apply_acp_mcp_server(&self, acp: &agent_client_protocol::v1::schema::McpServerAcp) {
         let name = acp.name.clone();
@@ -1753,10 +1792,13 @@ impl AcpAgentSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
         else {
-            tracing::warn!(
+            // `session/new` applies declarations before the first prompt binds the client,
+            // so this is the normal path rather than an error: park it and retry later.
+            self.remember_pending_acp_server(acp);
+            tracing::debug!(
                 session = %self.session_id,
                 server = %name,
-                "MCP-over-ACP server declared but no client connection is bound"
+                "MCP-over-ACP server deferred until a client connection is bound"
             );
             return;
         };

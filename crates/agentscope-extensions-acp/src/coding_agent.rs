@@ -1168,6 +1168,11 @@ impl AcpCodingAgent {
                     // otherwise block the dispatch loop, so the SDK could never
                     // process the incoming `$/cancel_request` and update the marker.
                     cx.spawn(async move {
+                        // Declarations arrive at `session/new`, before the client connection
+                        // exists; the MCP-over-ACP bridge needs it, so retry them now. This must
+                        // run on the spawned task: awaiting inside the handler would block the
+                        // dispatch loop that has to route the client's reply (deadlock).
+                        session.apply_pending_acp_servers().await;
                         // A panic inside the agent loop must not leave the client waiting for a
                         // response that will never come: the SDK sends nothing when a responder
                         // is dropped, so the prompt would hang until the client gave up.
