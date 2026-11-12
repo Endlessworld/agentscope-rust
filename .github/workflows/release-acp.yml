@@ -57,7 +57,6 @@ jobs:
             # 交叉编译：cc crate 自动找 aarch64-linux-gnu-gcc，rustc 链接器靠下面的 env
             # smoke 用 qemu-user + 交叉 sysroot 跑（宿主是 x86_64，没有 aarch64 动态链接器）
             smoke: true
-            emulate: aarch64
           - platform: darwin-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
@@ -89,9 +88,17 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          # qemu-user-static 只用于 smoke：交叉产物要在 aarch64 上真的跑一遍
-          # （-L 用的 /usr/aarch64-linux-gnu 交叉 sysroot 由 gcc-aarch64-linux-gnu 一并装上）
-          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          # smoke 要在 aarch64 上真的跑一遍：qemu-user 负责执行，`-L` 指向的
+          # /usr/aarch64-linux-gnu 交叉 sysroot 跟 gcc-aarch64-linux-gnu 一起装上，
+          # 它们的 glibc 与产物严格同源。
+          # 包名跟着发行版变（ubuntu 26.04 起 qemu-user-static 已成虚包），逐个试。
+          for pkg in qemu-user-static qemu-user-binfmt qemu-user; do
+            sudo apt-get install -y "$pkg" && break
+          done
+          qemu=$(command -v qemu-aarch64-static || command -v qemu-aarch64 || true)
+          [ -n "$qemu" ] || { echo 'qemu-aarch64 not available on this runner'; exit 1; }
+          echo "QEMU_AARCH64=$qemu" >> "$GITHUB_ENV"
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
 
       - name: cargo build (embedded profile, lite features)
@@ -116,8 +123,8 @@ jobs:
           #   linux-aarch64 → qemu-user + 交叉 sysroot（/usr/aarch64-linux-gnu）
           #   darwin-x86_64 → arm64 runner 上靠 Rosetta 2 转译
           runner=()
-          if [ '${{ matrix.emulate }}' = 'aarch64' ]; then
-            runner=(qemu-aarch64-static -L /usr/aarch64-linux-gnu)
+          if [ -n "${QEMU_AARCH64:-}" ]; then
+            runner=("$QEMU_AARCH64" -L /usr/aarch64-linux-gnu)
           fi
           if [ '${{ matrix.rosetta }}' = 'true' ]; then
             sudo softwareupdate --install-rosetta --agree-to-license || true
