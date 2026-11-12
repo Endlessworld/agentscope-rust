@@ -43,18 +43,30 @@ pub trait CatalogFetcher: Send + Sync {
 
 /// Reqwest-backed fetcher. The client is shared across refreshes.
 pub struct HttpFetcher {
-    client: reqwest::Client,
+    /// `None` = 客户端构造失败（已打印原因），本次进程不刷新目录
+    client: Option<reqwest::Client>,
 }
 
 impl HttpFetcher {
     pub fn new(timeout: Duration) -> Self {
         crate::tls::ensure_crypto_provider();
-        let client = reqwest::Client::builder()
+        let built = crate::tls::apply_tls_defaults(reqwest::Client::builder())
             .timeout(timeout)
             .user_agent(concat!("agentscope-rust/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+            .build();
+        match built {
+            Ok(client) => Self {
+                client: Some(client),
+            },
+            Err(error) => {
+                // 不能回落到 `Client::new()`：它走默认 TLS 后端，在 Android 上是
+                // rustls-platform-verifier，首次握手就 panic（嵌入式 profile 下直接 abort）。
+                eprintln!(
+                    "[model-catalog] 无法创建 HTTP 客户端：{error:?}；本次不刷新模型目录"
+                );
+                Self { client: None }
+            }
+        }
     }
 }
 
@@ -66,7 +78,12 @@ impl CatalogFetcher for HttpFetcher {
         etag: Option<&str>,
         max_bytes: usize,
     ) -> Result<FetchResponse> {
-        let mut request = self.client.get(url).header(ACCEPT, "application/json");
+        let Some(client) = &self.client else {
+            return Err(crate::Error::Http(
+                "model catalog: HTTP client unavailable".to_string(),
+            ));
+        };
+        let mut request = client.get(url).header(ACCEPT, "application/json");
         if let Some(etag) = etag {
             request = request.header(IF_NONE_MATCH, etag);
         }
@@ -198,15 +215,21 @@ pub(crate) async fn refresh(
         .as_ref()
         .map(|source| parse_api_json(&source.bytes))
         .transpose()?;
-    let provider_api = detailed
-        .as_ref()
-        .map(|parsed| parsed.provider_api.clone())
-        .unwrap_or_default();
-    let provider_env = detailed
-        .as_ref()
-        .map(|parsed| parsed.provider_env.clone())
-        .unwrap_or_default();
-    let entries = merge_sources(flat, detailed);
+    // 详细源不可用时（移动网络下 6 MB 的 api.json 经常超时）必须沿用上一份快照的
+    // provider 表：`catalog_providers` 靠 `provider_api` 才认得出 provider（否则只剩
+    // `FALLBACK_BASE_URLS` 里那几家），靠 `provider_env` 才认得出环境变量里的密钥。
+    // 两张表被清空等于把目录废掉，而且会连累条目：扁平源没有明细字段。
+    let (provider_api, provider_env) = match &detailed {
+        Some(parsed) => (parsed.provider_api.clone(), parsed.provider_env.clone()),
+        None => (
+            previous.provider_api.clone(),
+            previous.provider_env.clone(),
+        ),
+    };
+    let entries = match detailed {
+        Some(detailed) => merge_sources(flat, Some(detailed)),
+        None => merge_with_previous(flat, &previous.entries),
+    };
 
     let not_modified = models.not_modified
         && api
@@ -347,6 +370,37 @@ fn merge_sources(
             if let Some(base) = entries.remove(&enhanced.key) {
                 entries.insert(enhanced.key.clone(), merge_descriptors(base, enhanced));
             } else {
+                entries.insert(enhanced.key.clone(), enhanced);
+            }
+        }
+    }
+    entries
+        .into_iter()
+        .map(|(key, mut descriptor)| {
+            descriptor.recompute_fingerprint();
+            (key, Arc::new(descriptor))
+        })
+        .collect()
+}
+
+/// 只有扁平源可用时，以既有快照为底合并。
+///
+/// 扁平源负责更新它认识的 key，旧快照里其余的条目原样保留；同 key 时把旧条目当 base、
+/// 扁平条目当 enhanced（扁平源没有 context/cost 等明细，不能反过来把旧条目的字段抹掉）。
+fn merge_with_previous(
+    flat: ParsedSource,
+    previous: &HashMap<String, Arc<ModelDescriptor>>,
+) -> HashMap<String, Arc<ModelDescriptor>> {
+    let mut entries: HashMap<String, ModelDescriptor> = previous
+        .iter()
+        .map(|(key, descriptor)| (key.clone(), (**descriptor).clone()))
+        .collect();
+    for enhanced in flat.entries {
+        match entries.remove(&enhanced.key) {
+            Some(base) => {
+                entries.insert(enhanced.key.clone(), merge_descriptors(base, enhanced));
+            }
+            None => {
                 entries.insert(enhanced.key.clone(), enhanced);
             }
         }
@@ -551,6 +605,74 @@ mod tests {
         assert_eq!(result.snapshot.entries.len(), 1);
         assert_eq!(result.snapshot.entries["p/m"].context_window, 100_000);
         let _ = std::fs::remove_dir_all(storage.root());
+    }
+
+    /// 移动网络下 6 MB 的 `api.json` 经常超时。降级到扁平源时**不能**丢掉上一份快照
+    /// 的派表：`provider_api` 空了会让 `catalog_providers` 只剩下 `FALLBACK_BASE_URLS`
+    /// 里那几家，`provider_env` 空了则环境变量里的密钥再也对不上 provider。
+    #[tokio::test]
+    async fn detailed_failure_keeps_provider_tables_and_previous_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "agentscope-refresh-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let fetcher = MemoryFetcher::new();
+        fetcher.insert(
+            "mem://models",
+            br#"{"p/m": {"limit": {"context": 100000}}}"#.to_vec(),
+            Some("v1"),
+        );
+        fetcher.insert(
+            "mem://api",
+            br#"{"p": {"api": "https://example.test/v1", "env": ["P_API_KEY"], "models": {"m": {"reasoning": true}}}}"#
+                .to_vec(),
+            Some("v1"),
+        );
+        let first = refresh(
+            &config(),
+            &CatalogStorage::new(root.join("first")),
+            &fetcher,
+            &CatalogSnapshot::empty(),
+        )
+        .await
+        .unwrap()
+        .snapshot;
+        assert_eq!(first.provider_api["p"], "https://example.test/v1");
+
+        // 新缓存目录：没有可回退的 api raw，详细源这次彻底不可用。
+        fetcher.fail("mem://api");
+        fetcher.insert(
+            "mem://models",
+            br#"{"p/m": {"limit": {"context": 200000}}, "q/n": {"limit": {"context": 8000}}}"#
+                .to_vec(),
+            Some("v2"),
+        );
+        let second = refresh(
+            &config(),
+            &CatalogStorage::new(root.join("second")),
+            &fetcher,
+            &first,
+        )
+        .await
+        .unwrap()
+        .snapshot;
+
+        assert_eq!(
+            second.provider_api["p"], "https://example.test/v1",
+            "provider_api must survive a detailed-source failure"
+        );
+        assert_eq!(second.provider_env["p"], ["P_API_KEY"]);
+        assert!(
+            second.entries.contains_key("q/n"),
+            "new flat entries must still be added"
+        );
+        let pm = &second.entries["p/m"];
+        assert_eq!(pm.context_window, 200_000, "flat source updates the detail");
+        assert!(
+            pm.reasoning,
+            "flat source must not erase an api-only detail"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

@@ -268,7 +268,7 @@ impl ReqwestTransport {
     /// Creates a transport with an explicit config (timeouts + retry policy).
     pub fn with_config(config: TransportConfig) -> Self {
         agentscope_core::tls::ensure_crypto_provider();
-        let client = reqwest::Client::builder()
+        let client = agentscope_core::tls::apply_tls_defaults(reqwest::Client::builder())
             .connect_timeout(config.connect_timeout)
             .read_timeout(config.read_timeout)
             .tcp_keepalive(config.tcp_keepalive)

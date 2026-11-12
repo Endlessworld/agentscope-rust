@@ -74,7 +74,7 @@ const TCP_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(30);
 /// read timeouts turn such a stall into a retryable transport error.
 fn build_http_client() -> reqwest::Client {
     agentscope_core::tls::ensure_crypto_provider();
-    reqwest::Client::builder()
+    agentscope_core::tls::apply_tls_defaults(reqwest::Client::builder())
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(STREAM_READ_TIMEOUT)
         .tcp_keepalive(TCP_KEEPALIVE)

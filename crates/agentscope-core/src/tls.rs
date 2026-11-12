@@ -29,6 +29,33 @@ pub fn ensure_crypto_provider() {
     });
 }
 
+/// 给 `reqwest::ClientBuilder` 套上本平台可用的证书校验。
+///
+/// - Android：内置智能体以**独立进程**运行（`libacp_harness_agent.so` 被 exec，
+///   不是加载进 App 的 JVM），`rustls-platform-verifier` 初始化不了，
+///   一旦校验证书就会 panic（`Expect rustls-platform-verifier to be initialized`）；
+///   改用随二进制打包的 Mozilla 根证书。
+/// - 其他平台：保持 `reqwest` 默认（平台证书库）。
+pub fn apply_tls_defaults(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    #[cfg(target_os = "android")]
+    {
+        // 用 webpki 根证书构建 rustls 配置（见上方注释）。
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        // reqwest 0.13 的 `use_preconfigured_tls` 内部是 `Some(tls)` 后再
+        // downcast 到 `Option<rustls::ClientConfig>`：必须传裸 `ClientConfig`，
+        // 传 `Some(config)` 会变成 `Option<Option<...>>`，陷入 UnknownPreconfigured。
+        return builder.use_preconfigured_tls(config);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        builder
+    }
+}
+
 /// Runs [`ensure_crypto_provider`] as a pre-`main` initializer.
 ///
 /// The static lives in the platform's constructor table, so it cannot be dropped

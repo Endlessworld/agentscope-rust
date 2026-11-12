@@ -236,7 +236,7 @@ pub async fn download_url_to_base64(url: &str) -> Result<String> {
     tracing::debug!("Downloading remote URL for base64 encoding: {url}");
     crate::tls::ensure_crypto_provider();
 
-    let client = reqwest::Client::builder()
+    let client = crate::tls::apply_tls_defaults(reqwest::Client::builder())
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()

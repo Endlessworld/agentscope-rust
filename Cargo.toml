@@ -97,6 +97,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 # （经 rust-mcp-transport / async-anthropic 引入）本来就默认选 `ring`。两边统一后
 # `aws-lc-rs` 不再编译，嵌入产物 -0.8MB。
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Android 上 rustls-platform-verifier 需要 JVM 初始化（内置智能体是独立进程，拿不到），
+# 只能用随二进制打包的 Mozilla 根证书（见 agentscope_core::tls::apply_tls_defaults）。
+webpki-roots = "0.26"
 schemars = "1"
 # 关闭默认特性：默认开启的 `resolve-http` 会拉入 reqwest 0.12，与 workspace 统一的
 # 0.13 冲突。本仓只用内联 schema 校验（`validator_for`），不需要远程 `$ref` 解析。

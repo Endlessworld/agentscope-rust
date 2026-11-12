@@ -227,7 +227,7 @@ impl Default for AgentProtocolTaskClient {
 impl AgentProtocolTaskClient {
     pub fn new() -> Self {
         agentscope_core::tls::ensure_crypto_provider();
-        let http = reqwest::Client::builder()
+        let http = agentscope_core::tls::apply_tls_defaults(reqwest::Client::builder())
             .connect_timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()

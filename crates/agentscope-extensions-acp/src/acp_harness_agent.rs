@@ -1086,7 +1086,7 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         subagent_nesting,
     } = ctx;
     let session_id = session_id.as_str();
-    let model_config = ModelConfig::load_or_create();
+    let model_config = ModelConfig::load_or_create_with_env();
     let resolved = model_config.resolve();
     let (base_url, api_key, model_id, protocol) = (
         resolved.base_url,

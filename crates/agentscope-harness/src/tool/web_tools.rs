@@ -17,7 +17,7 @@ const DEEPSEEK_FETCH_API: &str = "https://api.deepseek.com/v1/tools/fetch";
 
 fn client() -> reqwest::Client {
     agentscope_core::tls::ensure_crypto_provider();
-    reqwest::Client::builder()
+    agentscope_core::tls::apply_tls_defaults(reqwest::Client::builder())
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(30))
         .user_agent(USER_AGENT)
