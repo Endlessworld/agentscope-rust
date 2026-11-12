@@ -541,9 +541,10 @@ pub(crate) const COMPACT_COMMAND_NAME: &str = "compact";
 /// normal prompt, and a mixed-content prompt (text plus images) is not a command.
 fn is_compact_command(content: &[ContentBlock]) -> bool {
     match content {
-        [ContentBlock::Text(text)] => {
-            text.text.trim().eq_ignore_ascii_case(&format!("/{COMPACT_COMMAND_NAME}"))
-        }
+        [ContentBlock::Text(text)] => text
+            .text
+            .trim()
+            .eq_ignore_ascii_case(&format!("/{COMPACT_COMMAND_NAME}")),
         _ => false,
     }
 }

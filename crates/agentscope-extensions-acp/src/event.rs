@@ -9,11 +9,10 @@ use std::path::PathBuf;
 
 use agent_client_protocol::v1::schema::{
     AvailableCommand, AvailableCommandsUpdate, Content, ContentBlock, ContentChunk, Diff,
-    Error as AcpError, ErrorCode, ErrorStopReason,
-    IdleStopReason, MessageId, Notice, NoticeSeverity, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, SessionId, SessionNotification, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind,
+    Error as AcpError, ErrorCode, ErrorStopReason, IdleStopReason, MessageId, Notice,
+    NoticeSeverity, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionId,
+    SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agentscope_core::event::{AgentEvent, AgentEventType};
 

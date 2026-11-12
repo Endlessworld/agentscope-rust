@@ -61,9 +61,7 @@ impl HttpFetcher {
             Err(error) => {
                 // 不能回落到 `Client::new()`：它走默认 TLS 后端，在 Android 上是
                 // rustls-platform-verifier，首次握手就 panic（嵌入式 profile 下直接 abort）。
-                eprintln!(
-                    "[model-catalog] 无法创建 HTTP 客户端：{error:?}；本次不刷新模型目录"
-                );
+                eprintln!("[model-catalog] 无法创建 HTTP 客户端：{error:?}；本次不刷新模型目录");
                 Self { client: None }
             }
         }
@@ -221,10 +219,7 @@ pub(crate) async fn refresh(
     // 两张表被清空等于把目录废掉，而且会连累条目：扁平源没有明细字段。
     let (provider_api, provider_env) = match &detailed {
         Some(parsed) => (parsed.provider_api.clone(), parsed.provider_env.clone()),
-        None => (
-            previous.provider_api.clone(),
-            previous.provider_env.clone(),
-        ),
+        None => (previous.provider_api.clone(), previous.provider_env.clone()),
     };
     let entries = match detailed {
         Some(detailed) => merge_sources(flat, Some(detailed)),
@@ -612,10 +607,8 @@ mod tests {
     /// 里那几家，`provider_env` 空了则环境变量里的密钥再也对不上 provider。
     #[tokio::test]
     async fn detailed_failure_keeps_provider_tables_and_previous_entries() {
-        let root = std::env::temp_dir().join(format!(
-            "agentscope-refresh-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("agentscope-refresh-test-{}", uuid::Uuid::new_v4()));
         let fetcher = MemoryFetcher::new();
         fetcher.insert(
             "mem://models",
