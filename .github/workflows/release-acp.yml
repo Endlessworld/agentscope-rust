@@ -14,6 +14,10 @@ name: release-acp
 # 平台键与 ACP Registry 的 `distribution.binary` 键一一对应：
 #   windows-x86_64 · windows-aarch64 · linux-x86_64 · linux-aarch64 · darwin-x86_64 · darwin-aarch64
 #
+# 另有 android-arm64-v8a / android-x86_64：产物是 `libacp_harness_agent.so`（Android 上
+# targetSdk>=29 只允许 exec nativeLibraryDir 下的 lib*.so），放进 APK 的 jniLibs/<abi>/。
+# 它们不是 ACP Registry 的平台，属于额外附带产物。
+#
 # 目标 triple 的 rustflags（`-Z location-detail=none` + 各平台链接器死代码消除）在
 # .cargo/config.embedded.toml 里按 [target.<triple>] 分开写；显式带 `--target` 时
 # cargo 只看那一组，不与 [build] 合并。
@@ -51,16 +55,20 @@ jobs:
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             # 交叉编译：cc crate 自动找 aarch64-linux-gnu-gcc，rustc 链接器靠下面的 env
-            smoke: false
+            # smoke 用 qemu-user + 交叉 sysroot 跑（宿主是 x86_64，没有 aarch64 动态链接器）
+            smoke: true
+            emulate: aarch64
           - platform: darwin-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
             smoke: true
           - platform: darwin-x86_64
             # arm64 runner + `--target x86_64-apple-darwin`：Apple clang 两个架构共用同一份 SDK
+            # smoke 靠 Rosetta 2 转译（镜像自带，缺了那步会尝试装）
             os: macos-latest
             target: x86_64-apple-darwin
-            smoke: false
+            smoke: true
+            rosetta: true
     steps:
       - uses: actions/checkout@v4
 
@@ -81,7 +89,9 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          # qemu-user-static 只用于 smoke：交叉产物要在 aarch64 上真的跑一遍
+          # （-L 用的 /usr/aarch64-linux-gnu 交叉 sysroot 由 gcc-aarch64-linux-gnu 一并装上）
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
 
       - name: cargo build (embedded profile, lite features)
@@ -102,7 +112,17 @@ jobs:
           case '${{ matrix.platform }}' in windows-*) exe=acp_harness_agent.exe ;; esac
           bin="target/${{ matrix.target }}/$PROFILE_DIR/$exe"
           req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"terminal":true}}}'
-          out=$(printf '%s\n' "$req" | "$bin" 2>/dev/null)
+          # 跨架构产物必须真的跑起来才算 smoke：
+          #   linux-aarch64 → qemu-user + 交叉 sysroot（/usr/aarch64-linux-gnu）
+          #   darwin-x86_64 → arm64 runner 上靠 Rosetta 2 转译
+          runner=()
+          if [ '${{ matrix.emulate }}' = 'aarch64' ]; then
+            runner=(qemu-aarch64-static -L /usr/aarch64-linux-gnu)
+          fi
+          if [ '${{ matrix.rosetta }}' = 'true' ]; then
+            sudo softwareupdate --install-rosetta --agree-to-license || true
+          fi
+          out=$(printf '%s\n' "$req" | "${runner[@]}" "$bin" 2>/dev/null)
           first=$(printf '%s\n' "$out" | head -1)
           echo "$first"
           case "$first" in
@@ -114,16 +134,6 @@ jobs:
             *authMethods*terminal*) ;;
             *) echo 'initialize advertises no terminal auth method (registry auth check would fail)'; exit 1 ;;
           esac
-
-      - name: check artifact architecture
-        if: ${{ !matrix.smoke }}
-        shell: bash
-        run: |
-          exe=acp_harness_agent
-          case '${{ matrix.platform }}' in windows-*) exe=acp_harness_agent.exe ;; esac
-          file="target/${{ matrix.target }}/$PROFILE_DIR/$exe"
-          ls -l "$file"
-          if command -v file >/dev/null 2>&1; then file "$file"; fi
 
       - name: stage + zip
         if: startsWith(matrix.platform, 'windows')
@@ -218,9 +228,106 @@ jobs:
           path: agentscope-acp-windows-aarch64.zip
           if-no-files-found: error
 
+  # Android：产物给 APK 塞进 jniLibs（targetSdk>=29 只允许 exec nativeLibraryDir 下的
+  # lib*.so），所以落盘时重命名为 `libacp_harness_agent.so`。
+  # 构建方式与 `acp-agent-ui/scripts/build-android.mjs` 一致：stable + embedded profile、
+  # 默认 features、NDK clang 当链接器（`-C link-arg=--target=<abi>24`）。
+  # 跑不了 smoke（要 bionic + 设备），改成静态检查 ELF 架构与 bionic 依赖。
+  # 与 windows-aarch64 同理：失败不阻塞其它平台发版。
+  build-android:
+    name: build (android-${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+            clang_target: aarch64-linux-android24
+            machine: AArch64
+          - abi: x86_64
+            target: x86_64-linux-android
+            clang_target: x86_64-linux-android24
+            machine: X86-64
+    steps:
+      - uses: actions/checkout@v4
+
+      # 不走 build-std，所以不需要 nightly；rust-toolchain.toml 钉的 stable 就够
+      - name: rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: embedded-${{ matrix.target }}
+          workspaces: '. -> target'
+
+      - name: NDK toolchain env
+        shell: bash
+        run: |
+          # runner 镜像自带 NDK（ANDROID_NDK_LATEST_HOME）；没有就挑 SDK 下最高版本
+          ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          if [ ! -d "$ndk" ]; then
+            ndk=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)
+          fi
+          [ -d "$ndk" ] || { echo 'no Android NDK on this runner'; exit 1; }
+          llvm="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          [ -d "$llvm" ] || { echo "no llvm toolchain under $ndk"; exit 1; }
+          key=$(printf '%s' '${{ matrix.target }}' | tr '-' '_')
+          upper=$(printf '%s' "$key" | tr 'a-z' 'A-Z')
+          {
+            echo "ANDROID_NDK_HOME=$ndk"
+            # 链接器必须是 clang 本体：NDK 的 *-clang.cmd 在 rustc 下是 os error 193
+            echo "CARGO_TARGET_${upper}_LINKER=$llvm/clang"
+            echo "CARGO_TARGET_${upper}_RUSTFLAGS=-C link-arg=--target=${{ matrix.clang_target }}"
+            # rusqlite(bundled) / ring 的 C 代码走 cc crate，要显式给交叉编译器
+            echo "CC_${key}=$llvm/${{ matrix.clang_target }}-clang"
+            echo "CXX_${key}=$llvm/${{ matrix.clang_target }}-clang++"
+            echo "AR_${key}=$llvm/llvm-ar"
+          } >> "$GITHUB_ENV"
+
+      - name: cargo build (embedded profile, default features)
+        shell: bash
+        run: |
+          cargo build --locked \
+            --profile $PROFILE_DIR \
+            --target ${{ matrix.target }} \
+            -p agentscope-extensions-acp \
+            --bin acp_harness_agent
+
+      - name: check artifact (ELF machine + bionic)
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/$PROFILE_DIR/acp_harness_agent"
+          ls -l "$bin"
+          file "$bin"
+          readelf -h "$bin" | grep -q "Machine:.*${{ matrix.machine }}" \
+            || { echo 'unexpected ELF machine'; exit 1; }
+          # bionic 的 libc 叫 libc.so；出现 libc.so.6 说明链到了 glibc，设备上跑不起来
+          readelf -d "$bin" | grep -q 'Shared library: \[libc.so\]' \
+            || { echo 'not linked against bionic libc.so'; exit 1; }
+
+      - name: stage + tar.gz
+        shell: bash
+        run: |
+          mkdir -p dist
+          # APK 里必须以 lib*.so 命名，否则 targetSdk>=29 的设备不允许 exec
+          cp "target/${{ matrix.target }}/$PROFILE_DIR/acp_harness_agent" dist/libacp_harness_agent.so
+          cp crates/agentscope-extensions-acp/README.md dist/README.md
+          cp LICENSE dist/LICENSE
+          tar -czf "agentscope-acp-android-${{ matrix.abi }}.tar.gz" -C dist .
+          ls -l dist "agentscope-acp-android-${{ matrix.abi }}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentscope-acp-android-${{ matrix.abi }}
+          path: agentscope-acp-android-${{ matrix.abi }}.tar.gz
+          if-no-files-found: error
+
   release:
     name: publish release
-    needs: [build, build-windows-arm64]
+    needs: [build, build-windows-arm64, build-android]
     # arm64 那条允许失败，所以只要主矩阵成功就发版
     if: always() && startsWith(github.ref, 'refs/tags/') && needs.build.result == 'success'
     runs-on: ubuntu-latest
@@ -262,6 +369,7 @@ jobs:
             | `acp_harness_agent`（Windows 为 `.exe`） | ACP agent（stdio 服务端）。在 ACP 客户端里把命令指向它即可 |
             | `acp_agent_cli`（Windows 为 `.exe`） | 内置 REPL 客户端，在当前目录拉起 agent 并开始对话 |
             | `README.md` | 安装、会话模式、权限、排障、各语言 SDK 接入 |
+            | `libacp_harness_agent.so`（`android-*` 压缩包内） | Android 用的 agent，解压后放进 APK 的 `jniLibs/<abi>/`，由宿主进程 exec |
             | `SHA256SUMS.txt`（仅 Release 顶层） | 各平台压缩包的 sha256 |
 
             首次运行会尝试用环境变量里的 provider 密钥（如 `DEEPSEEK_API_KEY`）直接开工；
