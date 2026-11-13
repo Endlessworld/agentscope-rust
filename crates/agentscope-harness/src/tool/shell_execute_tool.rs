@@ -102,6 +102,19 @@ pub(crate) fn format_execute_output(
 /// Default command timeout in seconds, mirroring Java `ShellExecuteTool`.
 const DEFAULT_TIMEOUT_SECONDS: u32 = 30;
 
+/// Longest single command this tool accepts.
+///
+/// A command past this budget used to be accepted (`timeout: 1200`) but was silently cut at
+/// core's 300s tool-execution ceiling, so the model believed it had hours of headroom that
+/// never existed. The host now offloads slow tool calls to the background instead
+/// (`AsyncToolMiddleware`), which needs a bounded ceiling on the command itself.
+const MAX_TIMEOUT_SECONDS: u32 = 1800;
+
+/// The one rejection message, so the model learns both bounds.
+fn invalid_timeout_message() -> String {
+    format!("timeout must be a positive number of seconds no greater than {MAX_TIMEOUT_SECONDS}.")
+}
+
 /// Reads the `timeout` argument, rejecting unsupported values before execution.
 ///
 /// Mirrors Java: a non-positive timeout used to be silently replaced by the default, which made
@@ -110,8 +123,10 @@ fn timeout_arg(args: &JsonMap) -> std::result::Result<u32, String> {
     match args.get("timeout") {
         None | Some(serde_json::Value::Null) => Ok(DEFAULT_TIMEOUT_SECONDS),
         Some(value) => match value.as_u64() {
-            Some(seconds) if seconds > 0 && seconds <= u32::MAX as u64 => Ok(seconds as u32),
-            _ => Err("timeout must be a positive number of seconds.".to_string()),
+            Some(seconds) if (1..=MAX_TIMEOUT_SECONDS as u64).contains(&seconds) => {
+                Ok(seconds as u32)
+            }
+            _ => Err(invalid_timeout_message()),
         },
     }
 }
@@ -161,7 +176,7 @@ impl Tool for ShellExecuteTool {
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute"},
                 "working_directory": {"type": "string", "description": "Working directory (relative to workspace root, optional)"},
-                "timeout": {"type": "integer", "description": "Positive timeout in seconds (default: 30). Unsupported values are rejected before execution."}
+                "timeout": {"type": "integer", "description": "Positive timeout in seconds (default: 30, max: 1800). Values outside that range are rejected before execution."}
             },
             "required": ["command"]
         })
@@ -456,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn timeout_arguments_must_be_positive() {
+    fn timeout_arguments_must_be_positive_and_bounded() {
         use agentscope_core::message::JsonMap;
 
         let args = |value: Option<serde_json::Value>| {
@@ -469,10 +484,21 @@ mod tests {
 
         assert_eq!(timeout_arg(&args(None)).unwrap(), 30);
         assert_eq!(timeout_arg(&args(Some(serde_json::json!(90)))).unwrap(), 90);
-        for rejected in [serde_json::json!(0), serde_json::json!(-1)] {
+        // The longest accepted budget is the host's background-offload ceiling.
+        assert_eq!(
+            timeout_arg(&args(Some(serde_json::json!(1800)))).unwrap(),
+            1800
+        );
+        for rejected in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            // Above the ceiling the old code accepted the value and core cut the run short.
+            serde_json::json!(1801),
+            serde_json::json!(12000),
+        ] {
             assert_eq!(
                 timeout_arg(&args(Some(rejected))).unwrap_err(),
-                "timeout must be a positive number of seconds."
+                "timeout must be a positive number of seconds no greater than 1800."
             );
         }
     }

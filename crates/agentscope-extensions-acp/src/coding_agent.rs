@@ -35,7 +35,9 @@ use agentscope_core::model::Model;
 use agentscope_extensions_model::OpenAiChatModel;
 
 use agentscope_harness::agent::context::TaskContextOptions;
-use agentscope_harness::agent::{trigger_for_window, CompactionConfig, HarnessAgent};
+use agentscope_harness::agent::{
+    trigger_for_window, CompactionConfig, HarnessAgent, HarnessAgentBuilder,
+};
 
 use super::config::{ModeChoice, ModelChoice};
 use super::elicitation::ElicitationSlot;
@@ -124,6 +126,36 @@ fn build_env_model() -> Arc<dyn Model> {
     Arc::new(model)
 }
 
+/// How long a tool call may run before the model is handed a placeholder and the call keeps
+/// running in the background (`AsyncToolMiddleware`).
+///
+/// A coding turn regularly runs a build or a UI test for minutes. Blocking the turn on it kept
+/// the next prompt queued for as long as the command ran (observed: 19 minutes).
+pub const TOOL_OFFLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// Hard ceiling for one tool execution.
+///
+/// Must stay above [`TOOL_OFFLOAD_TIMEOUT`]: an offloaded command keeps running in the
+/// background, and core's own default (300s) would cut it there instead of letting the shell
+/// `timeout` argument decide. Matches the shell tool's own maximum.
+pub const TOOL_EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Applies the host-wide tool execution policy to a builder.
+///
+/// Without it core applies `ExecutionConfig::tool_defaults()` (300s, no retry) to every call,
+/// so a shell command past that point is cancelled and reported as a tool failure no matter
+/// what `timeout` the model asked for.
+pub fn with_tool_execution_policy(builder: HarnessAgentBuilder) -> HarnessAgentBuilder {
+    builder
+        .async_tool_timeout(TOOL_OFFLOAD_TIMEOUT)
+        .tool_execution_config(
+            agentscope_core::model::ExecutionConfig::builder()
+                .timeout(TOOL_EXECUTION_TIMEOUT)
+                .max_attempts(1)
+                .build(),
+        )
+}
+
 /// The default per-session factory: builds a fully-wired [`HarnessAgent`] using the
 /// [`HarnessAgent::builder`]'s complete orchestration (workspace, filesystem tools, shell,
 /// compaction, plan mode). Mirrors the Java `HarnessCodingAgent`/`CodingAgentFactory`.
@@ -132,7 +164,7 @@ fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessA
     // The trigger follows the model's own window (see `compaction_trigger_for`).
     let trigger = compaction_trigger_for(model.context_window_size());
     let workspace = cwd.join(".agentscope").join("workspace");
-    HarnessAgent::builder()
+    let builder = HarnessAgent::builder()
         .name("agentscope-coding-agent")
         .model(model)
         .cwd(cwd)
@@ -156,8 +188,8 @@ fn default_model_factory(cwd: std::path::PathBuf, _session_id: &str) -> HarnessA
             requirements: true,
             verification_results: true,
             requirement_proposals: false,
-        })
-        .build()
+        });
+    with_tool_execution_policy(builder).build()
 }
 
 /// Everything a session factory needs to build a [`HarnessAgent`].
@@ -1938,6 +1970,66 @@ impl AcpCodingAgentBuilder {
 mod tests {
     use super::sort_session_infos;
     use agent_client_protocol::v1::schema::{SessionId, SessionInfo};
+
+    /// A model that is never called: the policy test only inspects the built agent.
+    struct StubModel;
+
+    #[async_trait::async_trait]
+    impl agentscope_core::model::Model for StubModel {
+        fn stream(
+            &self,
+            _messages: Vec<agentscope_core::message::Msg>,
+            _tools: Vec<agentscope_core::model::ToolSchema>,
+            _options: agentscope_core::model::GenerateOptions,
+        ) -> futures::stream::BoxStream<
+            '_,
+            agentscope_core::error::Result<agentscope_core::model::ChatResponse>,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn model_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    #[test]
+    fn slow_tool_calls_are_offloaded_instead_of_cut_at_the_core_default() {
+        // Core's default policy (`ExecutionConfig::tool_defaults`) cancels any tool at 300s,
+        // which made a `timeout: 1200` shell call look like a tool failure. The host policy
+        // must (a) hand the model a placeholder at 240s and keep the call running, and (b) keep
+        // the executor ceiling above that so the background run is not cut.
+        let dir = std::env::temp_dir().join(format!("acp_tool_policy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let builder = super::HarnessAgent::builder()
+            .name("tool-policy")
+            .model(std::sync::Arc::new(StubModel))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"));
+
+        let agent = super::with_tool_execution_policy(builder).build();
+
+        assert_eq!(
+            agent.async_tool_timeout(),
+            Some(super::TOOL_OFFLOAD_TIMEOUT),
+            "without an offload timeout the model waits on the command until it is cut"
+        );
+        let policy = agent
+            .toolkit()
+            .config()
+            .execution_config
+            .clone()
+            .expect("the host must install a tool execution policy");
+        assert_eq!(policy.timeout, Some(super::TOOL_EXECUTION_TIMEOUT));
+        assert_eq!(policy.max_attempts, Some(1), "a command must not be re-run");
+        assert!(
+            super::TOOL_OFFLOAD_TIMEOUT < super::TOOL_EXECUTION_TIMEOUT,
+            "a background run would be cut by the executor before it can finish"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn info(id: &str, updated_at: Option<&str>) -> SessionInfo {
         let info = SessionInfo::new(SessionId::new(id), std::path::PathBuf::from("/tmp"));

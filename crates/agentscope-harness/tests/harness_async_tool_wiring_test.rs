@@ -197,6 +197,81 @@ async fn async_tool_timeout_installs_the_offloading_middleware() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_offloaded_result_reaches_the_next_wakeup_turn() {
+    // The placeholder keeps the loop moving, but the point of the offload is that the real
+    // output comes back on its own: the middleware pushes it to the session inbox and queues a
+    // wakeup, so a turn with no new input still sees the result.
+    let dir = temp_dir("delivery");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen: Arc<Mutex<Vec<Vec<Msg>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let agent = HarnessAgent::builder()
+        .name("async-delivery")
+        .model(Arc::new(ScriptedModel {
+            responses: Mutex::new(vec![slow_tool_call("c1"), text_response("done")]),
+            seen: Arc::clone(&seen),
+        }))
+        .cwd(dir.clone())
+        .workspace(dir.join("ws"))
+        .toolkit(toolkit_with_slow_tool(&calls))
+        .session_id("conversation-async-delivery")
+        .disable_web_tools()
+        .max_iters(4)
+        .async_tool_timeout(Duration::from_millis(100))
+        .build();
+
+    let events: Vec<_> = agent
+        .stream_events(
+            vec![Msg::user("run the slow tool")],
+            StreamOptions::default(),
+        )
+        .collect()
+        .await;
+    assert!(!events.iter().any(|event| event.is_err()));
+
+    // Wait for the background execution to finish and notify the session.
+    let bus = Arc::clone(
+        agent
+            .message_bus()
+            .expect("the harness always installs a message bus"),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !bus
+        .inbox_has_messages("conversation-async-delivery")
+        .await
+        .unwrap()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background result was never delivered to the inbox"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A wakeup turn carries no input; the inbox middleware injects the delivered result.
+    let wakeup: Vec<_> = agent
+        .stream_events(Vec::new(), StreamOptions::default())
+        .collect()
+        .await;
+    assert!(!wakeup.iter().any(|event| event.is_err()));
+
+    let seen = seen.lock().unwrap();
+    let last = render(seen.last().expect("the wakeup turn must call the model"));
+    assert!(
+        last.contains("slow result text"),
+        "the offloaded output must reach the next turn, got: {last}"
+    );
+    assert!(
+        !bus.inbox_has_messages("conversation-async-delivery")
+            .await
+            .unwrap(),
+        "the hint must be drained instead of re-injected on every later turn"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn without_async_tool_timeout_the_tool_result_is_inline() {
     let dir = temp_dir("inline");
     let calls = Arc::new(AtomicUsize::new(0));

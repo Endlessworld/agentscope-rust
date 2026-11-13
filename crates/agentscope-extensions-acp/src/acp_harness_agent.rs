@@ -1213,6 +1213,10 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         // ToolCallPairSanitizer 静默丢弃整条 assistant 消息（对齐 Java maybePatchPendingToolCalls）。
         .enable_pending_tool_recovery(true);
 
+    // 工具执行策略：超过 240s 的调用转后台（给模型占位结果，跑完再回送结果并唤醒），
+    // 单次执行上限 1800s。没有这一步时 core 的 300s 默认会直接取消长命令。
+    builder = agentscope_extensions_acp::coding_agent::with_tool_execution_policy(builder);
+
     // Subagent progress: the harness streams each spawned subagent's events out of band (a
     // child keeps running after the parent's prompt returns), and the session forwards them to
     // the client as `subagent_update` + child-session updates.
