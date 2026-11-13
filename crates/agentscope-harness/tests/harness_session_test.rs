@@ -544,6 +544,137 @@ async fn a_superseded_resume_does_not_starve_the_queue() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Blocks its first model call until it is released, so that run stays in flight.
+struct BlockingModel {
+    release: Arc<tokio::sync::Notify>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Model for BlockingModel {
+    fn stream(
+        &self,
+        _messages: Vec<Msg>,
+        _tools: Vec<ToolSchema>,
+        _options: GenerateOptions,
+    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
+        let block = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let release = Arc::clone(&self.release);
+        Box::pin(futures::stream::once(async move {
+            if block {
+                release.notified().await;
+            }
+            Ok(ChatResponse::builder()
+                .content(vec![CoreBlock::Text(TextBlock::new("finished"))])
+                .build())
+        }))
+    }
+
+    fn model_name(&self) -> &str {
+        "blocking"
+    }
+}
+
+#[tokio::test]
+async fn a_queued_turn_behind_a_running_one_is_not_starving() {
+    // Sessions run one turn at a time, so a long turn legitimately holds every later submit
+    // back. The watchdog asks [`AgentSession::has_active_execution`] before calling that a
+    // stall: otherwise a healthy queue wait is reported as "the turn was never admitted".
+    let dir = temp_dir("queued-behind-run");
+    let release = Arc::new(tokio::sync::Notify::new());
+    let agent = Arc::new(
+        HarnessAgent::builder()
+            .name("session-agent")
+            .model(Arc::new(BlockingModel {
+                release: Arc::clone(&release),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .max_iters(1)
+            .build(),
+    );
+    let context = RuntimeContext::new()
+        .with_user_id("alice")
+        .with_session_id("conversation-behind");
+    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-behind").unwrap();
+    let store = InMemorySessionLogStore::new();
+    let log = store.open(&key, &context).await.unwrap();
+    let session = AgentSession::open(agent, context, key, log).unwrap();
+
+    let first = session.submit("long turn").await.unwrap();
+    // Wait until the run is really executing, so the second submit cannot race admission.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if session.task(&first.command_id).await.unwrap().status == "running" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first run never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let second = session.submit("follow up").await.unwrap();
+    assert_eq!(
+        session.task(&second.command_id).await.unwrap().status,
+        "queued",
+        "a session runs one turn at a time"
+    );
+    assert!(
+        session.has_active_execution().await.unwrap(),
+        "the previous turn is still running, so waiting is not a stall"
+    );
+
+    release.notify_one();
+    let settled = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        session.await_task(&second.command_id),
+    )
+    .await
+    .expect("the queued turn must run once the previous one finishes")
+    .unwrap();
+    assert_eq!(settled.status, "completed", "{settled:?}");
+    assert!(
+        !session.has_active_execution().await.unwrap(),
+        "an idle session has no execution in flight"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_queued_turn_with_nothing_running_is_starving() {
+    // The other half of the watchdog decision: a command nobody dispatches (no handle started
+    // its loop) has no execution in flight, so the stall must still be reported.
+    use agentscope_core::session::{Command, SessionInbox};
+
+    let (session, dir) = open_session("starving", "never reached").await;
+    let inbox = SessionInbox::new(session.log()).unwrap();
+    let command = Command::new(
+        "cmd-orphan",
+        "submit",
+        Some("turn-orphan".into()),
+        vec![Msg::user("nobody dispatches this")],
+        Vec::new(),
+    )
+    .unwrap();
+    inbox.accept(&command).await.unwrap();
+
+    assert_eq!(
+        session.task("cmd-orphan").await.unwrap().status,
+        "queued",
+        "an accepted command nobody launched stays queued"
+    );
+    assert!(
+        !session.has_active_execution().await.unwrap(),
+        "nothing executes a queued command, so the watchdog must report the stall"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn a_starting_receipt_whose_run_died_reports_interrupted() {
     // Regression for "the turn was never admitted (status starting after 144s)": `starting`

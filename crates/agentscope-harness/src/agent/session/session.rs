@@ -945,6 +945,19 @@ impl AgentSession {
         Ok(seen.into_values().collect())
     }
 
+    /// Whether any execution of this session is still in flight.
+    ///
+    /// Sessions run one turn at a time, so a command that is still `queued` is *expected* to
+    /// wait while another execution owns the session. Only a queue with nothing executing means
+    /// no dispatcher will ever pick the command up.
+    pub async fn has_active_execution(&self) -> crate::Result<bool> {
+        Ok(self
+            .tasks()
+            .await?
+            .iter()
+            .any(|task| matches!(task.status.as_str(), "running" | "starting")))
+    }
+
     /// The current receipt of one accepted command.
     pub async fn task(&self, command_id: &str) -> crate::Result<Task> {
         let snapshot = self.inbox.snapshot_shared().await?;

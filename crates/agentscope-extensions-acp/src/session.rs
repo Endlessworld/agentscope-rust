@@ -2810,6 +2810,9 @@ impl AcpAgentSession {
             let mut events_closed = false;
             let mut admission_deadline = std::time::Instant::now() + ADMISSION_TIMEOUT;
             let mut last_status = String::new();
+            // When the current `queued` wait started, so a progress notice can report how long
+            // the prompt has been waiting behind the previous turn.
+            let mut queued_since: Option<std::time::Instant> = None;
             let mut first_poll_failure: Option<std::time::Instant> = None;
             let mut stall: Option<String> = None;
             // A persistent ticker, not a fresh `sleep` per iteration: re-creating the timer every
@@ -2834,19 +2837,45 @@ impl AcpAgentSession {
                                         last_status = current.status.clone();
                                         admission_deadline =
                                             std::time::Instant::now() + ADMISSION_TIMEOUT;
+                                        queued_since = (current.status == "queued")
+                                            .then(std::time::Instant::now);
                                     }
                                     if current.settled() {
                                         settled_task = Some(current);
                                     } else if current.status == "queued"
                                         && std::time::Instant::now() >= admission_deadline
                                     {
-                                        // Still unclaimed after the deadline: no dispatcher will
-                                        // ever run it, so report instead of hanging.
-                                        stall = Some(format!(
-                                            "the turn was never admitted (status `queued` after {}s)",
-                                            ADMISSION_TIMEOUT.as_secs()
-                                        ));
-                                        break;
+                                        // Sessions run one turn at a time, so a queued turn is a
+                                        // *normal* wait while an earlier turn of the same session
+                                        // is still executing (a blocking tool can keep it alive
+                                        // long after the interrupt this prompt sent). Only a
+                                        // queue with nothing executing is a real stall: no
+                                        // dispatcher will ever pick that command up. An
+                                        // unreadable journal is reported by the receipt poll's
+                                        // own timeout, not blamed on admission.
+                                        let nothing_running = matches!(
+                                            session.has_active_execution().await,
+                                            Ok(false)
+                                        );
+                                        if nothing_running {
+                                            stall = Some(format!(
+                                                "the turn was never admitted (status `queued` \
+                                                 after {}s)",
+                                                ADMISSION_TIMEOUT.as_secs()
+                                            ));
+                                            break;
+                                        }
+                                        // Tell the client the prompt is queued rather than lost;
+                                        // it is still waiting on the previous turn.
+                                        let waited = queued_since
+                                            .map(|since| since.elapsed().as_secs())
+                                            .unwrap_or_default();
+                                        emit(self.advisory_notification(format!(
+                                            "Waiting for the previous task in this session to \
+                                             finish ({waited}s so far)."
+                                        )));
+                                        admission_deadline =
+                                            std::time::Instant::now() + ADMISSION_TIMEOUT;
                                     }
                                 }
                                 Err(error) => {
