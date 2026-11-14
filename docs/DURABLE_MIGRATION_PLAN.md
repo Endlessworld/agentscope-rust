@@ -346,3 +346,14 @@ ACP 侧接线已验证可编译、ACP lib 114 条全绿，但集成用例 `sessi
 - **ACP 侧同步（无行为变化）**：`respond` 原先借 harness `SessionAnswer` 折文本，现在 `ExtAnswer::to_answer_text()` 直接产出文本、`ExtRespondParams::to_answers() -> BTreeMap<String, String>`、`AcpAgentSession::respond(BTreeMap<String, String>)`。线上 JSON 不变，发出的 signal 仍是 `{"text": ...}`（`Output` 折叠本来就是恒等，`Approval`/`Confirmation` 分支 ACP 从未构造）。
 - **测试结果**：`cargo check --workspace --all-targets -j 2` EXIT=0；`cargo test -p agentscope-harness` 44 targets / 898 passed / 0 failed / 2 ignored；`cargo test -p agentscope-extensions-acp --lib` 114 passed；ACP 集成 `acp_cancel_test` 2、`acp_session_cancel_test` 2、`acp_interrupted_turn_test` 3、`acp_load_replay_test` 1、`acp_event_flow_test` 4、`acp_compact_test` 2、`acp_catalog_release_test` 3 全绿。`harness_subagent_wiring_test` 的 wakeup 用例改由 `stream_events(Vec::new(), …)`（无输入 turn，与 durable wakeup 同路径）驱动，不再需要会话句柄。
 
+### 2.12 acting 阶段性续跑入口落地（2026-11-15，未提交）
+
+补上 §2.5 记的「core 无 acting 续跑入口」，`AgentExecutionPosition.acting_iteration` 现在有消费者（对齐 Java `ReActAgent.resumeAgent()`，`ReActAgent.java:3172-3177`）。
+
+- **接在哪**：`run_agent_loop` 在 append 输入后判定 `acting_resume`，命中则把 `entry_iter = acting_iteration`、`continue_acting = true` 交给 `execute_iteration`；该函数首轮**跳过 `reasoning_phase`**，直接用 `acting_phase` 执行待办调用，随后 `iter += 1` 照旧进入 reasoning（与 Java `acting(iter)` → `executeIteration(iter+1)` 一致）。`reasoning_iteration` 语义未动（仍只作 `cur_iter` 起点）。
+- **判定「有待办调用」**：复用 `extract_pending_tool_calls`（最后一条 assistant 消息里未被后续 tool 消息应答、非 server tool 的 tool_use）；恢复补丁或调用方自带 tool_result 已解掉时自然为空。
+- **与 Java 的差异**：①Java 只要有 position 就在有待办时进入续跑，Rust 额外要求 `acting_iteration > 0`（默认 0 不算续跑），以便只跟踪推理位置的宿主保持旧行为——durable adapter 对第 1 轮提交的是 `(cur_iter, cur_iter-1)` = acting 0，故三进程验收的模型调用数仍为 2；②没有 reasoning 消息时，续跑轮的消息取 `last_assistant_message_with_reason`（Java 在 suspend/stop 时另行构造）。
+- **新增用例**（`react_agent.rs::tests`）：`an_acting_position_continues_pending_tool_calls_without_asking_the_model`（模型 0 次、工具 1 次、结果按 id 对上）、`without_a_position_pending_tool_calls_still_reason_first`（模型 1 次，现状不变）、`an_acting_position_without_pending_calls_reasons_normally`（无待办 → 仍推理）、`the_acting_iteration_spends_the_max_iterations_budget`（`acting_iteration=2` + `max_iters=2` → 续跑后越预算，`MaxIterations` 且 0 次模型调用）。
+- **验证**：`cargo test -p agentscope-core --lib` 536 passed / 0 failed；`cargo check --workspace --all-targets -j 2` EXIT=0；`cargo test -p agentscope-durable-adapter-agentscope`、`-p agentscope-extensions-acp` 全绿。反向验证：关掉续跑分支后用例 1、4 FAILED。
+- **剩余风险**：Java 的 `recorder.resumeStep(acting_iteration)` 未同步（core 不写 step 边界，durable 侧仍靠 `before_acting` checkpoint）；`acting_iteration >= 1` 且有待办时确实会跳过推理，若某宿主把该字段当「上一轮推理号」无条件填 >0，模型调用数会变少。
+

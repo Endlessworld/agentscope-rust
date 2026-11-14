@@ -1997,29 +1997,56 @@ async fn run_agent_loop(
     }
     // A host that restarts an unfinished invocation supplies its committed position: a process
     // restart is not a fresh iteration budget (Java `AgentExecutionPosition`).
-    let start_iter = crate::agent::execution_position(ctx)
+    let position = crate::agent::execution_position(ctx);
+    let start_iter = position
         .map(|position| position.reasoning_iteration.min(i32::MAX as u32) as i32)
         .unwrap_or(0);
     state.set_cur_iter(start_iter);
+    // Java `resumeAgent`: a position that names an acting iteration says the previous turn
+    // committed tool calls that never ran, so this invocation continues them in the acting phase
+    // instead of asking the model for the same decision again. Zero is the default and never
+    // requests a continuation, and a context that already answers every call has nothing to act
+    // on (recovery patched them, or the caller supplied their results).
+    let acting_resume = position
+        .map(|position| position.acting_iteration)
+        .filter(|iteration| *iteration > 0)
+        .filter(|_| !extract_pending_tool_calls(&state).is_empty())
+        .map(|iteration| iteration.min(i32::MAX as u32) as i32);
+    // The resumed acting *is* the pass at `acting_iteration`; without one the call reasons at
+    // `reasoning_iteration` exactly as before.
+    let (entry_iter, continue_acting) = match acting_resume {
+        Some(acting_iter) => (acting_iter, true),
+        None => (start_iter, false),
+    };
     // Snapshot plan mode so a plan-control tool's direct write to the shared state can
     // be detected and carried over (the loop otherwise runs on a private clone).
     let plan_mode_at_start = state.plan_mode_context.clone();
-    let mut result =
-        match execute_iteration(core, ctx, &mut state, start_iter, system_msg.as_ref()).await {
-            // An interrupt is not a failure: reconcile the dangling tool_use left by
-            // the interrupted turn and append a recovery message, so the caller sees
-            // a normal reply and the next turn continues from a consistent context.
-            // Mirrors Java `handleInterrupt`.
-            Err(Error::Interrupted(_)) => Ok(reconcile_interrupted(&mut state)),
-            other => other,
-        };
+    let mut result = match execute_iteration(
+        core,
+        ctx,
+        &mut state,
+        entry_iter,
+        system_msg.as_ref(),
+        continue_acting,
+    )
+    .await
+    {
+        // An interrupt is not a failure: reconcile the dangling tool_use left by
+        // the interrupted turn and append a recovery message, so the caller sees
+        // a normal reply and the next turn continues from a consistent context.
+        // Mirrors Java `handleInterrupt`.
+        Err(Error::Interrupted(_)) => Ok(reconcile_interrupted(&mut state)),
+        other => other,
+    };
     // Session settle loop (Java `settleSession`): a completed result does not end the turn
     // when guidance accepted during the run has not been consumed yet. Continuing keeps the
     // inbox turn open so the accepted steering is acted on instead of being dropped by the
     // close that follows.
     while session_continues(ctx, &result).await? {
         let next = state.cur_iter() + 1;
-        result = match execute_iteration(core, ctx, &mut state, next, system_msg.as_ref()).await {
+        result = match execute_iteration(core, ctx, &mut state, next, system_msg.as_ref(), false)
+            .await
+        {
             Err(Error::Interrupted(_)) => Ok(reconcile_interrupted(&mut state)),
             other => other,
         };
@@ -2145,18 +2172,39 @@ async fn execute_iteration(
     state: &mut AgentState,
     mut iter: i32,
     system_msg: Option<&Msg>,
+    mut continue_acting: bool,
 ) -> Result<Msg> {
     loop {
-        let msg = reasoning_phase(core, ctx, state, iter, system_msg).await?;
-        let reason = msg.generate_reason();
-        let has_tool_calls = has_actionable_tool_calls(&msg);
-        // The calls this round asked for, captured before the acting phase so the
-        // all-denied check below does not have to re-read the assistant message.
-        let round_calls: Vec<ToolUseBlock> = if has_tool_calls {
-            msg.tool_use_blocks().cloned().collect()
+        // A resumed invocation enters in the acting phase (Java `resumeAgent`): the last
+        // assistant message already carries the calls the previous turn never ran, and the
+        // position's acting iteration is this pass's iteration number. Nothing to act on —
+        // the caller resolved them in the meantime — reasons as usual.
+        let resumed = if std::mem::take(&mut continue_acting) {
+            extract_pending_tool_calls(state)
         } else {
             Vec::new()
         };
+        let (msg, has_tool_calls, round_calls) = if resumed.is_empty() {
+            let msg = reasoning_phase(core, ctx, state, iter, system_msg).await?;
+            let has_tool_calls = has_actionable_tool_calls(&msg);
+            // The calls this round asked for, captured before the acting phase so the
+            // all-denied check below does not have to re-read the assistant message.
+            let round_calls: Vec<ToolUseBlock> = if has_tool_calls {
+                msg.tool_use_blocks().cloned().collect()
+            } else {
+                Vec::new()
+            };
+            (msg, has_tool_calls, round_calls)
+        } else {
+            // No reasoning message was produced, so the pass's message is the assistant message
+            // the calls came from; the calls to act on *are* the pending ones.
+            (
+                last_assistant_message_with_reason(state, GenerateReason::ToolCalls),
+                true,
+                resumed,
+            )
+        };
+        let reason = msg.generate_reason();
         let outcome = match reason {
             GenerateReason::ModelStop | GenerateReason::ToolCalls => {
                 if has_tool_calls {
@@ -10678,5 +10726,238 @@ mod tests {
             grown.allow_rules["add"].len(),
             persisted.allow_rules["add"].len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Acting-phase resume (Java `resumeAgent`)
+    // -----------------------------------------------------------------------
+
+    /// The assistant message a previous turn left behind: a tool call without its result.
+    fn pending_assistant(call_id: &str, tool: &str) -> Msg {
+        Msg::builder()
+            .role(MsgRole::Assistant)
+            .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                call_id,
+                tool,
+                JsonMap::new(),
+            ))])
+            .build()
+    }
+
+    /// A host-supplied iteration position, attached the way a durable host attaches it.
+    fn acting_position(
+        reasoning_iteration: u32,
+        acting_iteration: u32,
+    ) -> crate::agent::Extensions {
+        let mut extensions = crate::agent::Extensions::new();
+        extensions.insert(
+            crate::agent::EXECUTION_POSITION_CONTEXT_KEY,
+            crate::agent::AgentExecutionPosition::new(reasoning_iteration, acting_iteration),
+        );
+        extensions
+    }
+
+    /// A `returnDirect` tool that counts its executions, so a resumed acting pass can end the
+    /// turn without a model call.
+    fn counting_return_direct_tool(
+        name: &'static str,
+        executions: Arc<Mutex<u32>>,
+    ) -> Arc<dyn Tool> {
+        Arc::new(
+            crate::tool::FunctionTool::new(
+                name,
+                "returns the turn's final answer",
+                serde_json::json!({"type": "object"}),
+                Box::new(move |_args: JsonMap, _ctx: ToolExecutionContext| {
+                    *executions.lock().unwrap() += 1;
+                    Ok(ToolResultBlock::success("resumed answer"))
+                }),
+            )
+            .return_direct(true),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_acting_position_continues_pending_tool_calls_without_asking_the_model() {
+        // Java `resumeAgent` (ReActAgent.java:3172-3177): the previous turn already decided
+        // these calls, so continuing them must not ask the model for the same decision.
+        let executions: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(counting_return_direct_tool(
+            "final_answer",
+            Arc::clone(&executions),
+        ));
+        let calls: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let agent = ReActAgent::builder()
+            .name("t-acting-resume")
+            .model(Arc::new(CountingTextModel {
+                name: "counting",
+                text: "reasoned",
+                calls: Arc::clone(&calls),
+            }))
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .context_mut()
+            .push(pending_assistant("c-resume", "final_answer"));
+
+        let reply = agent
+            .call_with_format_and_extensions(vec![], None, acting_position(0, 1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            0,
+            "the resumed acting pass must not call the model"
+        );
+        assert_eq!(
+            *executions.lock().unwrap(),
+            1,
+            "the pending call runs exactly once"
+        );
+        assert_eq!(reply.text_content(), "resumed answer");
+        assert_eq!(reply.generate_reason(), GenerateReason::ToolReturnDirect);
+        let ids: Vec<String> = agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .context()
+            .iter()
+            .flat_map(|message| message.tool_result_blocks())
+            .filter_map(|result| result.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["c-resume".to_string()],
+            "the result answers the pending call by id"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_position_pending_tool_calls_still_reason_first() {
+        // Pre-existing behaviour, unchanged: a call without a host position reasons again and
+        // lets the model decide, even when the context already holds an unanswered call.
+        let executions: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(counting_return_direct_tool(
+            "final_answer",
+            Arc::clone(&executions),
+        ));
+        let calls: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let agent = ReActAgent::builder()
+            .name("t-acting-resume-absent")
+            .model(Arc::new(CountingTextModel {
+                name: "counting",
+                text: "reasoned",
+                calls: Arc::clone(&calls),
+            }))
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .context_mut()
+            .push(pending_assistant("c-resume", "final_answer"));
+
+        let reply = agent.call(vec![]).await.unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "without a position the model still decides"
+        );
+        assert_eq!(
+            *executions.lock().unwrap(),
+            0,
+            "the pending call must not be acted on"
+        );
+        assert_eq!(reply.text_content(), "reasoned");
+    }
+
+    #[tokio::test]
+    async fn an_acting_position_without_pending_calls_reasons_normally() {
+        // Nothing left to continue: the position must not cost the turn its reasoning step.
+        let executions: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(counting_return_direct_tool(
+            "final_answer",
+            Arc::clone(&executions),
+        ));
+        let calls: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let agent = ReActAgent::builder()
+            .name("t-acting-resume-idle")
+            .model(Arc::new(CountingTextModel {
+                name: "counting",
+                text: "reasoned",
+                calls: Arc::clone(&calls),
+            }))
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+
+        let reply = agent
+            .call_with_format_and_extensions(vec![Msg::user("go")], None, acting_position(0, 1))
+            .await
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), 1, "the turn still reasons");
+        assert_eq!(
+            *executions.lock().unwrap(),
+            0,
+            "no pending call exists to act on"
+        );
+        assert_eq!(reply.text_content(), "reasoned");
+    }
+
+    #[tokio::test]
+    async fn the_acting_iteration_spends_the_max_iterations_budget() {
+        // The resumed acting pass *is* iteration `acting_iteration`, so the reasoning step that
+        // would follow it is already over budget. A pass that ignored the supplied number (and
+        // acted at 0) would still have a reasoning step left and would call the model.
+        let executions: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&executions)));
+        let calls: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let agent = ReActAgent::builder()
+            .name("t-acting-resume-budget")
+            .model(Arc::new(CountingTextModel {
+                name: "counting",
+                text: "reasoned",
+                calls: Arc::clone(&calls),
+            }))
+            .toolkit(toolkit)
+            .max_iters(2)
+            .build()
+            .unwrap();
+        agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .context_mut()
+            .push(pending_assistant("c-budget", "add"));
+
+        let reply = agent
+            .call_with_format_and_extensions(vec![], None, acting_position(0, 2))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            0,
+            "acting at 2 leaves no reasoning budget, so the model is never asked"
+        );
+        assert_eq!(
+            *executions.lock().unwrap(),
+            1,
+            "the pending call still runs"
+        );
+        assert_eq!(reply.generate_reason(), GenerateReason::MaxIterations);
     }
 }
