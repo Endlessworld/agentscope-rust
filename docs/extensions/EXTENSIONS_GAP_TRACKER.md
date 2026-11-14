@@ -660,3 +660,33 @@ cargo test --workspace -j 2 --no-fail-fast                # 全量，无 skip
 4. **跨模块契约只认单一实现**：`list_hash`/CAS 语义一律以 core/harness 为准；本地平行实现曾造成两处真实偏离（`needs_full_rewrite` 空列表分支、COS 用 `starts_with` 判追加——全量 SHA-256 无前缀性质）。
 5. **`JoinHandle` drop 是 detach 不是 abort** → 取消/超时必须显式 `abort()` 或带取消令牌。
 6. **测试有效性靠反向验证**：回退实现 → 对应用例 `FAILED` → 恢复全绿；注意排除「无效回退」（改动未被测试路径覆盖）。
+### 2026-11-14 迁移批次（Java 9ab7a4fab..a4306d63d，agui-tests 组）
+
+| Java 提交 | 结论 | Rust 位置 | 测试 | 偏差 |
+|---|---|---|---|---|
+| `39495bcd3` feat(agui): Support custom request processor | 不适用（能力已具备） | `crates/agentscope-extensions-agui/src/processor/request_processor.rs` | `cargo test -p agentscope-extensions-agui --lib`（213 passed） | 该提交仅改 spring-boot-starter 的 `AguiMvcController`/`AguiWebFluxHandler` Builder，允许注入预构建的 `AguiRequestProcessor` 从而摆脱 registry 依赖；Rust 无 starter/HTTP 控制器层，`AguiRequestProcessor` 本就是宿主自行构建并持有的具体类型，其 `builder()` 可注入 `AgentResolver`/`AguiAdapterConfig`/`AguiAgentAdapterFactory`/`runtime_context_resolver`，等价可注入点已存在，无需新增接口。 |
+| `551ebd269` test(core): keep mock model requests iterable while a call is in flight | 不适用 | `crates/agentscope-core/src/agent/react_agent.rs`（`MockModel`/`OptionsRecordingModel` 等测试替身） | — | Java 缺陷源于 `ArrayList` 录制 + 迭代器在追加时失效；Rust 测试替身的录制容器一律为 `Arc<Mutex<Vec<..>>>`（读取须持锁并克隆快照），借用检查器使「迭代期间并发追加」无法表达，同类竞态不存在。 |
+| `2d09b15a2` test: deflake seven single-OS CI failure classes under -T1C contention | 部分迁移（2 处生产代码） | ①`crates/agentscope-core/src/shutdown/mod.rs`（`reset_for_testing`）；②`crates/agentscope-extensions-sandbox/src/kubernetes.rs`（`execute_exchange_budget`） | `shutdown::tests::reset_for_testing_restores_the_default_config`；`kubernetes::tests::the_capability_probe_outlives_a_one_second_transport_budget`（均反向验证：去掉修复即 FAILED） | ①Rust `reset_for_testing` 同样漏重置 `config`（单例进程级、`set_config` 可变），已补 `set_config_now(GracefulShutdownConfig::default())`；②`/capabilities` 预检的传输预算原样沿用 `read_timeout_seconds`，已加 2s 下限 `CAPABILITY_PROBE_MIN_ATTEMPT_TIMEOUT`（仅探测放宽，命令交换保持配置值）；另 Rust `with_retries` 只重试可重试 HTTP 状态、传输超时不重试（既有差异，本次未改）；其余（MockModel 线程安全、AguiMvcControllerTest/SubagentRunIdChainTest/GatewayEventsWebSocketTest/TurnLeaseServiceTest 的等待阈值）属纯 Java 测试基建竞态，不适用。 |
+
+> 注：`53c0649b0`、`874c9cb0f` 为 Go 服务端代码，不在 Rust 迁移范围。
+
+
+## 6. 2026-11-14 迁移批次汇总（Java `9ab7a4fab..a4306d63d`）
+
+上游 43 个提交中排除 `a4306d63d`（durable runtime 重构，单独处理），本批 42 个落在 extensions 的 8 个：
+
+| 模块 | 提交 | 结论 | 落地位置 |
+|---|---|---|---|
+| RAG (haystack) | `865d1dec8` | 已迁移 | `crates/agentscope-extensions-rag/src/haystack/client.rs`：非 2xx 直接 `RagError::Api`，不再解析 body |
+| REDIS | `ca5a2d304` | 不适用 | Rust 无 Jedis/Lettuce 之分；`raw_client.rs` 已支持注入客户端/连接构造，等价能力已具备 |
+| PROTOCOL (agent-protocol) | `9d4f86426` | 已迁移 | `crates/agentscope-extensions-agent-protocol/src/lib.rs`：按 taskId 的 `task_lock`，同 task 只起一次 run |
+| PROTOCOL (a2a) | `a338d520d` | 已迁移 | `a2a-server`：`PermissionAsking` → `RunStart::InputRequired` → `TaskState::InputRequired`；wire 字段名未变 |
+| PROTOCOL (a2a) | `33c3dc5f3` | 已迁移 | `a2a-client`：取消时关闭帧流 + `tasks/cancel`；以丢弃帧流替代 Java 新增的 `StreamTrackingHttpClient` |
+| PROTOCOL (agui) | `39495bcd3` | 不适用 | 无 starter/控制器层；`AguiRequestProcessor::builder()` 已可注入 `AgentResolver`/`adapter_factory`/`runtime_context_resolver` |
+| PROTOCOL (agui 测试) | `551ebd269` | 不适用 | Java 的 `ArrayList` 录制迭代器失效在 Rust 不可表达（录制容器为 `Arc<Mutex<Vec<_>>>`） |
+| CONTROLPLANE / SERVICE | `53c0649b0` `874c9cb0f` | 不适用 | `agentscope-service/service-controlplane` 为 Go，无 Rust 对应组件 |
+| SANDBOX (kubernetes) | `2d09b15a2` | 部分 | `kubernetes.rs`：`/capabilities` 预检新增 2s 预算下限 |
+
+其余提交落在 core / harness / sandbox / model，详见 `docs/MIGRATION_GAP_TRACKER.md` §8。
+
+**本批延用约定**：`agentscope-extensions-a2a-*` 仍无独立 tracker，a2a 条目记入本文件 PROTOCOL 章节。

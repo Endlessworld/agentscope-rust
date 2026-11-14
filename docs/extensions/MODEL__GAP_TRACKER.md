@@ -587,3 +587,8 @@ cargo test  -p agentscope-extensions-model   -> 198 passed（2026-09-21）/ 236 
 
 - 执行记录 / 静态复核 / 勘误 / 反向验证明细：[`history/MODEL__MIGRATION_HISTORY.md`](./history/MODEL__MIGRATION_HISTORY.md)
 - 本文件只保留现行状态（§0–§5）；历史条目一律写进上述归档文件，不再回填本文。
+
+### 2026-11-14 迁移批次（Java c05e4b91f，model-vocab 组）
+
+- 落地位置在 **core**：`ModelRegistry` 属 core 的单实例 provider 表（本 crate 的 `full_registry()` 只是往它注册 provider），因此「词汇统一 + 未命中错误列出已安装 provider id」在 `agentscope-core/src/model/{mod,model,provider}.rs` 完成，本 crate 无需改动。
+- 未迁移的 Java registry 能力（命名实例、creation-context 轮换、解析缓存与驱逐、指纹漂移告警、多 provider 歧义报错）逐条理由见 `CORE__GAP_TRACKER.md` 的同一批次小节；核心不变式仍是「无缓存、`register` 覆盖同 id、`resolve` 每次新建实例」（§4.2 #11）。

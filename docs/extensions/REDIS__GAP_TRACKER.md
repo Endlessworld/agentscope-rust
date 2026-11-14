@@ -311,3 +311,11 @@
 
 - 执行记录 / 静态复核 / 勘误 / 反向验证明细：[`history/REDIS__MIGRATION_HISTORY.md`](./history/REDIS__MIGRATION_HISTORY.md)
 - 本文件只保留现行状态（§0–§5）；历史条目一律写进上述归档文件，不再回填本文。
+
+### 2026-11-14 迁移批次（Java 9ab7a4fab..a4306d63d，extensions 组）
+
+- `ca5a2d304` feat(redis): support Lettuce clients in RedisSnapshotSpec — **不适用**
+  - 理由：Java 该提交只是让 `RedisSnapshotSpec` / `RedisRemoteSnapshotClient` 同时接受 Jedis `UnifiedJedis` 与 Lettuce `RedisClient`（JVM 上是两套互不兼容的客户端库）。Rust 侧不存在 Jedis/Lettuce 之分：快照存储只依赖 crate 内的命令接缝 `crates/agentscope-extensions-redis/src/raw_client.rs`（`RedisStore` / `RedisRemoteSnapshotClient` / `RedisSandboxExecutionGuard` 共用），连接由宿主注入，`src/snapshot.rs` 不出现任何客户端类型。
+  - 语义等价能力：可注入的客户端/连接构造已具备，等价于 Java 的「接受任意客户端」；新增 Lettuce 支持不需要任何 Rust 改动。
+  - 测试：不新增（无代码改动）；既有 `cargo test -p agentscope-extensions-redis --lib` → 195 passed / 0 failed。
+  - 偏差：无。

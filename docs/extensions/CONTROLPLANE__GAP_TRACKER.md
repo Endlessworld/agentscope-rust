@@ -378,3 +378,7 @@
 
 - 执行记录 / 静态复核 / 勘误 / 反向验证明细：[`history/CONTROLPLANE__MIGRATION_HISTORY.md`](./history/CONTROLPLANE__MIGRATION_HISTORY.md)
 - 本文件只保留现行状态（§0–§5）；历史条目一律写进上述归档文件，不再回填本文。
+
+### 2026-11-14 迁移批次（Java c05e4b91f，model-vocab 组）
+
+**不适用**：Java 在该提交里把 `AgentScopeAdapter` 的模型元数据（session describe 的 model 名、provider、context window）从 `react.getModel()` 改成 `react.getModel(null)`，以便 identity 模式（`Builder.model(String)` 懒引用）解析出当前实例、并在解析失败时回退到 identity 字符串。Rust 的 `ReActAgent` 没有 identity 模式（模型是构建期必需的实例，per-call 选择走 `model_resolver` 且不参与元数据），`react.model()` 即构建期实例，与 Java `getModel(null)` 的语义等价；无 identity 字符串可回退，故本 crate 未改。

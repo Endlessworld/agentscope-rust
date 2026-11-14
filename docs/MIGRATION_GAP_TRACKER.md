@@ -609,3 +609,44 @@
 - **达成"完全可用"的标志**：7.4 全部 + 7.5 全部。
 - **判定方法**：新建 `examples/demo.rs`（或 cargo run），人工/脚本执行并确认输出符合预期；不以"编译通过 + 单测通过"替代 e2e。
 - 全部验收项完成后：在本节把对应 `执行状态` 改为 `已完成`，并在 `4.1 上次会话` 记录"框架已基本可用"的验证过程。
+
+
+## 8. 2026-11-14 迁移批次（Java `9ab7a4fab..a4306d63d`）
+
+**范围**：上游 `9ab7a4fab..a4306d63d` 共 43 个提交；`a4306d63d`（durable runtime 重构，见 `durable-handoff-2026-11-14.md`）单独处理，本批迁移其余 **42 个**。
+
+### 8.1 分组结论
+
+| 组 | 提交 | 结论 |
+|---|---|---|
+| core-A（agent/state/hook） | `7095aaad7` `d7021da32` `01eaa2467` `2b4a75ac6` `cf9dc2a5a` `c76e28418` `76a1ff599` | 1 已迁移（结构化输出混合批次压缩，含主 agent 补的「无配对结果的业务调用不保留」）；1 部分（`2b4a75ac6`）；1 已具备（`d7021da32`）；4 不适用（Rust 无 Reactor 异步边界 / 无 state store slotKey / 确认事件由宿主发布 / 无 legacy hook 派发器） |
+| core-B（session/util/tool/state） | `2ec6ec0a8` `2d70942cf` `2e7b59c7a` `0a989c8e4` `a7c6312c3` `dee7a210b` `8437de174` `d9e4f9fda` | 1 已迁移（取消快照保留已完成工具结果）；3 部分（shell 黑名单补 `\n \r ( ) { }` / executor 拒 malformed arguments / state tmp 唯一化+失败清理）；4 不适用（`InflightBatch` 幂等重放、serde_json 默认拒尾部 token、无 `write_text_file` line range） |
+| harness（filesystem/bus/gateway/skill/subagent/memory） | `36cabf4a5` `867c092c4` `3438964bb` `bedf292ad` `55498cf00` `9cdaa81dd` `e6a422900` `e5dd38983` | 6 已迁移（eviction 允许 `session_search`、web tools 共享 client、消息总线 `ready/claim` + `create_new`、staging 目录校验、任务句柄按 storage namespace 隔离）；2 不适用（gateway lease 作用域即订阅、本地 FS 无 namespace 前缀）；`e5dd38983` 由主 agent 补齐 workspace 侧（namespaced runtime data 读取 + root 残留告警） |
+| sandbox | `6ff7590af` `7411e29d3` `c8875287f` | 1 已迁移（remote spec root 优先 + resume rebind）；1 部分（path normalizer + `effective_workspace` + resume 保留执行根）；1 不适用（`Vec<u8>` 快照无泄漏窗口） |
+| extensions | `865d1dec8` `ca5a2d304` `9d4f86426` `a338d520d` `33c3dc5f3` | 4 已迁移（haystack 状态码优先、protocol 按 taskId 串行化、a2a 确认上报 `input-required`、a2a 取消停流停任务）；1 不适用（无 Jedis/Lettuce 之分，`raw_client` 已可注入） |
+| activePoints | `6b9d5840f` | 已迁移（`ActivePointsResolver` + 构造期分组冻结 + 派发前过滤；harness 的 compaction / workspace-context middleware 显式声明位点；Java 的反射式自动推断无对应能力 → 默认全位点，属有意偏差） |
+| agui/tests | `39495bcd3` `551ebd269` `2d09b15a2` | 1 部分（`GracefulShutdownManager::reset_for_testing` 补重置 config；k8s 能力探测 2s 预算下限）；2 不适用（无 starter 层、Rust 录制容器本身线程安全） |
+| capability/permission | `5e1a102f4` `e46890477` `f45820e2a` | 2 部分（能力面 + 执行门 + schema/skill 裁剪；`ConfirmResult` 规则落回 `AgentState.permission_context`）；1 不适用（一实例一会话，已有 `set_permission_context`） |
+| model-vocab | `c05e4b91f` | 部分迁移（per-call 模型钉入 `RuntimeContext` + `effective_model` 优先级 + 压缩摘要跟随实际模型 + registry 错误列出已安装 provider；命名实例注册表 / `contextId@modelId` / creation-context 轮换 / 缓存驱逐不适用） |
+| Go 服务端 | `53c0649b0` `874c9cb0f` | 不适用（`agentscope-service/service-controlplane` 为 Go，无 Rust 对应组件） |
+
+### 8.2 本批遗留（按优先级）
+
+1. `2b4a75ac6`：`session/recorder.rs` 的 `acquire` 成功后、`RunGuard` 构造前仍有丢租约窗口（Java 用 try/finally 关闭 writer）。
+2. `8437de174` 的累加器半边：Rust 流式 tool-call 聚合无 `ToolCallsAccumulator` 对应结构，只在 `ToolExecutor` 前置拒绝 malformed arguments。
+3. `dee7a210b`：Rust `validate_command` 为字符黑名单（不感知引号，`echo '{"a":1}'` 会误拒），且当前无生产调用点（既有偏差）。
+4. `d9e4f9fda`：per-session 锁与 `try_save_if_version` 的 CAS 语义未迁，仅保证单进程并发安全。
+5. sandbox：Docker/K8s 的 layout root（spec 优先）与执行根（options）可能不一致；E2B 文件传输路径归属仍按 options root；harness `sandbox_paragraph` 对远程沙箱回落 host 路径。
+6. capability：无 `isSystem` 注解链、无 `<skillId>_skill_tools` 组约定、`reset_equipped_tools` 描述未按 grant 收窄、skill 预置落盘 / sandbox 投影 / `PreCallEvent` 未按 grant 收窄。
+7. harness：`MemoryGetTool`/`MemorySaveTool` 仍用 `RuntimeContext::default()`（`ToolExecutionContext` 只有 `runtime: JsonMap`）。
+8. activePoints：harness 仍有 13 个 middleware 未显式声明位点（走默认全位点，行为与改动前一致）。
+9. model-vocab：压缩触发预算仍按构建期默认模型窗口计算，per-call 模型窗口未重算；`CompactionConfig` 无「专用压缩模型」字段。
+
+### 8.3 验证
+
+- `cargo check --workspace --all-targets -j 2` → EXIT=0。
+- `cargo test --workspace -j 2 --no-fail-fast` → **195 targets / 6542 passed / 0 failed / 8 ignored**（EXIT=0）。
+- 原唯一的失败 `acp_stdio_thought_test::stdio_agent_streams_thinking_to_client` 已修：该用例按「test 二进制所在 profile 目录」硬推 `acp_harness_agent.exe`，而本仓库 test 二进制落在 `target/debug/build/<crate>/<hash>/out/`。现改为「`CARGO_BIN_EXE_acp_harness_agent` → 沿 `current_exe` 祖先目录查找（含 `EXE_SUFFIX`）→ `ACP_AGENT_EXE` 覆盖」，用例本身（脚本化本地 SSE 模型）与实现均未改动。
+- 8 个 `ignored` 既有且有意：5 个是 ```ignore 文档示例（`agentscope-rs/src/lib.rs`、`extensions-channel/src/gateway.rs`、`extensions-rag/src/hook.rs`、`harness/src/agent/context/conventions.rs`、`harness/src/agent/gateway/platform_channel.rs`），3 个是 `model::catalog` 里依赖已下载 models.dev payload 或真实网络的 `#[ignore]` 用例。
+- `cargo fmt --all -- --check` → exit 0（本批新增/改动引入的 9 处格式差异已由 `cargo fmt --all` 收敛）。
+- 交叉审查（只读子智能体）逐处对照 Java 原实现；无「必须修复」项，两条优先项已处理：结构化输出混合批次里「未执行的业务调用」不再保留（否则成为 dangling `tool_use`）、`CapabilityResolver` 失败时同时写入事件流与 call 结果槽。
