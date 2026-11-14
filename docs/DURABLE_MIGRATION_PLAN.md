@@ -38,6 +38,32 @@ agentscope-harness  ──→  core             # 不得依赖 durable
 
 **执行顺序的理由**：删除（D3/D6）必须排在 durable 落地之后，否则 ACP 与 `agentscope-rs` 断链；重命名（D2）排在一切改动之前，避免同一文件被改两次。
 
+### 2.1 M2 落地情况（2026-11-14，未提交）
+
+新增 `crates/agentscope-durable`（13 单测 + 6 条契约测试，`cargo test -p agentscope-durable` 全绿）：
+
+| 模块 | 内容 |
+|---|---|
+| `types/` | Java `DurableTypes` 全量类型（identity/turn/run/execution/commit/resource 五分）；camelCase 序列化、SCREAMING_SNAKE 枚举 |
+| `store` | `RecordStore`+`Txn` 原语（scope 事务 + 存储权威时钟 + 就绪索引）；`memory`（默认）、`file`（单机持久，临时文件+rename，锁文件自旋） |
+| `backend/` | `TxnBackend`：create/threads/submit/claim/renew/release/frame/record_failure/commit/receipt/journal/prepare_run/runs/steps/execution/begin_dispatch/accept_result/ready/checkpoints/checkpoint/events/snapshot |
+| `runtime` | `DurableRuntime::{tick, scan, cancel, pause, resume, signal}`，单次推进、不 spawn 常驻循环（Q1=A） |
+| `executor` | `Executor` trait + 能力矩阵（lookup_by_execution_id/idempotent_start/cancellation） |
+| `harness_adapter` | `HarnessAdapter`/`HarnessContext`（adapter 通过 backend+lease 自行提交，保证 checkpoint 与工具意图同事务，Q2=A） |
+
+已严格实现的不可退让不变量：范围事务原子性、receipt 先于围栏的重放、revision CAS、thread 级 epoch 围栏、终态不可逆、效果结算前置（`Succeeded` 需全部 applied）、adherence 到 `appliedAt` 不可变、事件按条目递增序号 + eventId 幂等 + 游标绑定 session、checkpoint 不丢弃/相同内容不产生新位置、就绪五分支语义、工具三态（attempted/result/applied）与 `NOT_FOUND` 不可记录。
+
+**M2 有意留下的缺口**（后续里程碑补齐，均已在此登记）：
+
+1. `history()` 返回空页——消息投影由 adapter（M3）写入，backend 暂未存 message part。
+2. `resources`/`delegate`/`restore`/`prune_events` 未入 trait（原语已预留 `resource_position`、`journal_branch`）。
+3. 模型事实（`ModelCall/ModelRequest/TokenUsage`）只有类型，未接线（M3+）。
+4. `Steer`/`Inject` 控制返回 `unavailable`（ACP 不需要；M3 与 adapter 输入队列一起做）。
+5. 大对象外置（>16 KiB → object store）未做：`checkpoint` 全量内联存放。
+6. `settled` 前缀未物化（`current_turn` 每次队列扫描），`receipt`/`tool` 内嵌在 `TurnData` 而非独立 part。
+7. digest 用「键排序 canonical JSON + SHA-256」，与 Java RFC 8785（含 `{"value":…}` 外壳）不等价——两边数据不互通，故不影响正确性；如需跨语言互通再对齐。
+
+
 ## 3. 禁止事项（沿用 Java `agentscope-durable/AGENTS.md`）
 
 - 不做兼容层：不留别名、不保留 deprecated 转发、不写旧格式读取器、不做版本协商/降级回退。
