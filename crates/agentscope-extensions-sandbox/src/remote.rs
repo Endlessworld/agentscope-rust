@@ -13,6 +13,7 @@
 //! tested without any network access.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use agentscope_core::error::{Error, Result};
@@ -866,6 +867,30 @@ impl RemoteSandboxClient {
     }
 }
 
+/// Trims trailing separators while keeping a filesystem root intact (`"/"` stays `"/"`).
+fn trim_root(root: &str) -> String {
+    let mut trimmed = root.replace('\\', "/");
+    while trimmed.len() > 1 && trimmed.ends_with('/') {
+        trimmed.pop();
+    }
+    trimmed
+}
+
+/// Resolves the effective in-sandbox workspace root.
+///
+/// An explicit [`WorkspaceSpec::root`] wins over the backend default, so the shell never runs in
+/// a different directory than the one the manifest was materialized into (Java
+/// `E2bSandboxClient#resolveWorkspaceRoot`, commits `6ff7590af` / `c8875287f`). An unset root
+/// (`""`) keeps the backend root.
+fn resolve_workspace_root(workspace_spec: &WorkspaceSpec, fallback: &str) -> String {
+    let root = trim_root(&workspace_spec.root.to_string_lossy());
+    if root.is_empty() {
+        trim_root(fallback)
+    } else {
+        root
+    }
+}
+
 #[async_trait::async_trait]
 impl SandboxClient for RemoteSandboxClient {
     async fn create(
@@ -880,18 +905,22 @@ impl SandboxClient for RemoteSandboxClient {
             Some(spec) => Some(spec.build(&session_id)?),
             None => None,
         };
+        // Align the manifest with the execution root (a copy: the caller's spec is never mutated).
+        let workspace_root = resolve_workspace_root(workspace_spec, self.backend.workspace_root());
+        let mut aligned_spec = workspace_spec.clone();
+        aligned_spec.root = PathBuf::from(&workspace_root);
         let data = RemoteSandboxStateData {
             session_id,
             backend: self.backend.backend_name().to_string(),
             sandbox_id: None,
             endpoint: self.backend.endpoint_base(),
             token: None,
-            workspace_root: self.backend.workspace_root().to_string(),
+            workspace_root,
             sandbox_owned: true,
             workspace_root_ready: false,
             workspace_projection_hash: None,
             extra: BTreeMap::new(),
-            workspace_spec: Some(workspace_spec.clone()),
+            workspace_spec: Some(aligned_spec),
             // Record the identity so a persisted state can be cascaded back to the snapshot
             // (MONGODB `cascadeDeleteSnapshots` reads exactly this field).
             snapshot: snapshot
@@ -906,7 +935,13 @@ impl SandboxClient for RemoteSandboxClient {
     }
 
     async fn resume(&self, state: &SandboxState) -> Result<Box<dyn Sandbox>> {
-        let data = RemoteSandboxStateData::from_harness_state(state)?;
+        let mut data = RemoteSandboxStateData::from_harness_state(state)?;
+        // The saved execution directory stays authoritative: older states may still carry a
+        // manifest root that disagrees, so align the manifest instead of relocating a live
+        // workspace (Java `E2bSandbox#alignWorkspaceRoot`, commit `6ff7590af`).
+        if let Some(spec) = data.workspace_spec.as_mut() {
+            spec.root = PathBuf::from(&data.workspace_root);
+        }
         // SANDBOX-04: the persisted state only carries the snapshot identity, so the spec has to
         // re-bind it here — otherwise a resumed session silently loses snapshot restore (the
         // Java `deserializeState(json, snapshotSpec)` override exists for the same reason).
@@ -1363,6 +1398,115 @@ mod tests {
         assert!(
             cwds[..cwds.len() - 1].iter().all(Option::is_none),
             "internal projection/archive commands keep absolute paths and no cwd"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_follows_the_workspace_spec_root() {
+        let backend = Arc::new(FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(false),
+            native_transfer: false,
+            creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
+        });
+        let client = RemoteSandboxClient::new(backend.clone());
+        // The backend default root is `/workspace`; the caller's manifest root must win for both
+        // the materialized layout and the shell (Java `E2bSandboxClient#resolveWorkspaceRoot`).
+        let spec = WorkspaceSpec::new("/srv/ws/").with_file("a.txt", "hi");
+        let mut sandbox = client.create(&spec, None, None).await.unwrap();
+        sandbox.start().await.unwrap();
+        sandbox.exec(None, "ls", Some(5)).await.unwrap();
+
+        let commands = backend.commands.lock().unwrap().clone();
+        assert!(
+            commands.iter().any(|c| c.contains("mkdir -p /srv/ws")),
+            "the manifest is materialized under the resolved root: {commands:?}"
+        );
+        let cwds = backend.cwds.lock().unwrap().clone();
+        assert_eq!(
+            cwds.last().cloned().flatten().as_deref(),
+            Some("/srv/ws"),
+            "exec runs inside the caller's workspace root"
+        );
+
+        let data = RemoteSandboxStateData::from_harness_state(sandbox.state()).unwrap();
+        assert_eq!(data.workspace_root, "/srv/ws");
+        assert_eq!(
+            data.workspace_spec.unwrap().root,
+            PathBuf::from("/srv/ws"),
+            "the persisted manifest root is aligned with the execution root"
+        );
+        assert_eq!(
+            spec.root,
+            PathBuf::from("/srv/ws/"),
+            "the caller's spec is copied, never mutated"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_without_a_spec_root_keeps_the_backend_root() {
+        let backend = Arc::new(FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(false),
+            native_transfer: false,
+            creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
+        });
+        let client = RemoteSandboxClient::new(backend.clone());
+        let spec = WorkspaceSpec::default().with_file("a.txt", "hi");
+        let mut sandbox = client.create(&spec, None, None).await.unwrap();
+        sandbox.start().await.unwrap();
+
+        assert!(backend
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("mkdir -p /workspace")));
+        let data = RemoteSandboxStateData::from_harness_state(sandbox.state()).unwrap();
+        assert_eq!(data.workspace_root, "/workspace");
+        assert_eq!(
+            data.workspace_spec.unwrap().root,
+            PathBuf::from("/workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_the_saved_execution_root_and_aligns_the_manifest() {
+        let mut data = sample_data();
+        data.workspace_root = "/saved/exec".to_string();
+        // Legacy manifest still points at the upstream default.
+        data.workspace_spec = Some(WorkspaceSpec::new("/workspace").with_file("a.txt", "hi"));
+        let state = data.to_harness_state();
+
+        let backend = Arc::new(FakeBackend {
+            commands: Mutex::new(Vec::new()),
+            alive: Mutex::new(true),
+            native_transfer: false,
+            creates: Mutex::new(0),
+            cwds: Mutex::new(Vec::new()),
+        });
+        let client = RemoteSandboxClient::new(backend.clone());
+        let mut sandbox = client.resume(&state).await.unwrap();
+        sandbox.start().await.unwrap();
+        sandbox.exec(None, "ls", Some(5)).await.unwrap();
+
+        let commands = backend.commands.lock().unwrap().clone();
+        assert!(
+            commands.iter().any(|c| c.contains("mkdir -p /saved/exec")),
+            "setup happens under the saved execution root: {commands:?}"
+        );
+        let cwds = backend.cwds.lock().unwrap().clone();
+        assert_eq!(
+            cwds.last().cloned().flatten().as_deref(),
+            Some("/saved/exec"),
+            "resuming must not relocate the workspace"
+        );
+        let resumed = RemoteSandboxStateData::from_harness_state(sandbox.state()).unwrap();
+        assert_eq!(
+            resumed.workspace_spec.unwrap().root,
+            PathBuf::from("/saved/exec")
         );
     }
 

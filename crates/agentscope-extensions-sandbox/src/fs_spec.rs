@@ -200,7 +200,7 @@ pub trait SandboxFilesystemSpec: Debug + Send + Sync {
     /// turn it into an archive at sandbox start.
     fn layout_spec(&self, host_workspace_root: Option<&Path>) -> LayoutSpec {
         let root = self
-            .workspace_spec()
+            .effective_workspace_spec()
             .root
             .to_string_lossy()
             .replace('\\', "/");
@@ -877,9 +877,17 @@ impl SpecCommon {
     }
 
     fn effective_workspace(&self, root: &str) -> WorkspaceSpec {
-        self.workspace_override
+        let mut spec = self
+            .workspace_override
             .clone()
-            .unwrap_or_else(|| default_workspace_spec(root))
+            .unwrap_or_else(|| default_workspace_spec(root));
+        // An unset (`""`) manifest root inherits the execution root, so the materialized layout
+        // and the directory commands run in can never disagree (Java
+        // `E2bFilesystemSpec#workspaceSpec`, commit `6ff7590af`).
+        if spec.root.as_os_str().is_empty() {
+            spec.root = PathBuf::from(root);
+        }
+        spec
     }
 }
 
@@ -1236,6 +1244,45 @@ mod tests {
             PathBuf::from("/custom")
         );
         assert!(spec.effective_workspace_spec().directories.is_empty());
+    }
+
+    /// `WorkspaceSpec::root` is `""` when the caller only supplies layout/environment; the
+    /// execution root then has to fill it in (Java `E2bFilesystemSpec#workspaceSpec`, commit
+    /// `6ff7590af`), otherwise the sandbox would advertise an empty workspace root.
+    #[test]
+    fn an_unset_manifest_root_inherits_the_execution_root() {
+        let supplied = WorkspaceSpec::default();
+        let spec = E2bFilesystemSpec::new(E2bSandboxClientOptions::default())
+            .with_workspace_spec(supplied.clone());
+        let context = spec.build_context().expect("context builds");
+        assert_eq!(
+            context.workspace_spec().expect("spec recorded").root,
+            PathBuf::from("/home/user"),
+            "the default E2B root fills an unset manifest root"
+        );
+        assert!(
+            supplied.root.as_os_str().is_empty(),
+            "the caller's spec is copied, never mutated"
+        );
+    }
+
+    /// A manifest root that *is* set also configures the execution root, so the materialized
+    /// layout and the directory commands run in cannot disagree.
+    #[test]
+    fn a_supplied_manifest_root_becomes_the_execution_root() {
+        let spec = E2bFilesystemSpec::new(E2bSandboxClientOptions::default())
+            .with_workspace_spec(WorkspaceSpec::new("/custom/root").with_env("KEEP", "yes"));
+        let context = spec.build_context().expect("context builds");
+        let recorded = context.workspace_spec().expect("spec recorded");
+        assert_eq!(recorded.root, PathBuf::from("/custom/root"));
+        assert_eq!(
+            recorded.environment.get("KEEP").map(String::as_str),
+            Some("yes")
+        );
+        // The client resolves the same root at create time (`RemoteSandboxClient::create`), so the
+        // effective layout root and the shell root are identical.
+        let layout = spec.layout_spec(None);
+        assert_eq!(layout.root, "/custom/root");
     }
 
     #[test]

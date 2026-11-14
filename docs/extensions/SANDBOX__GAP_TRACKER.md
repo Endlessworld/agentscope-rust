@@ -353,3 +353,32 @@
 
 - 执行记录 / 静态复核 / 勘误 / 反向验证明细：[`history/SANDBOX__MIGRATION_HISTORY.md`](./history/SANDBOX__MIGRATION_HISTORY.md)
 - 本文件只保留现行状态（§0–§5）；历史条目一律写进上述归档文件，不再回填本文。
+
+## 7. 迁移批次记录
+
+### 2026-11-14 迁移批次（Java 9ab7a4fab..a4306d63d，sandbox 组）
+
+范围：`9ab7a4fab..main`（`main` HEAD `a4306d63d`，durable 巨型提交不在本组）。本组 3 个提交。
+
+| sha | 结论 | Rust 位置 | 测试 | 偏差 |
+|---|---|---|---|---|
+| `6ff7590af` harness: honor active sandbox workspace roots + E2B 根对齐 | **部分迁移**（见下 5 条） | `crates/agentscope-harness/src/agent/workspace/path_normalizer.rs`；`crates/agentscope-extensions-sandbox/src/fs_spec.rs`；`crates/agentscope-extensions-sandbox/src/remote.rs` | `path_normalizer::tests::filesystem_root_prefix_strips_only_the_leading_separator`；`fs_spec::tests::an_unset_manifest_root_inherits_the_execution_root`、`a_supplied_manifest_root_becomes_the_execution_root`；`remote::tests::resume_keeps_the_saved_execution_root_and_aligns_the_manifest` | ①`SandboxWorkspaceRoot.resolve(rc, fallback)`（按调用从 `RuntimeContext` 里的 `SandboxAcquireResult` 取根、released 拒绝）**不适用**：Rust 不把 acquire 结果写进 `RuntimeContext`（`middleware/sandbox_lifecycle.rs` 只在 `on_agent` 内持有），沙箱文件系统在构建期固定（`SandboxBackedFilesystem::cwd`），无 per-call 绑定。②`WorkspaceSpec.rootExplicitlySet` **不适用**：Rust `root` 未设置即 `""`，本身就区分「未设置」且不参与序列化，不需要额外布尔位。③`workspaceRoot()` 与 `workspaceSpec().root` 冲突 fail-fast **未迁移**：Rust 没有 `workspaceRoot()` setter（`options.workspace_root` 为公开字段，无显式标记），且该策略在 Java 侧自述「未经 maintainer 批准」；Rust 采用「spec root 优先，不报错」。④E2B 根对齐已迁移：`SpecCommon::effective_workspace` 用执行根填未设置的 manifest root（拷贝，不改调用方），`layout_spec` 改用 `effective_workspace_spec()`（原来用平台默认 spec，导致 projection 根与 override 根不一致）。⑤resume 保留已保存执行根、只对齐 manifest 已在 `RemoteSandboxClient::resume` 落地。 |
+| `7411e29d3` harness: close snapshot archives when workspace setup fails | **不适用**（无此资源形态） | — | — | Rust 快照以字节传递：`LocalSandboxSnapshot::restore` / `RemoteSandboxSnapshot::restore` 返回 `Vec<u8>`（内部 `tokio::fs::read` 自关闭），`DockerSandbox::try_restore_snapshot` 先 `snapshot.restore()` 再 `setup_workspace()` + `hydrate_workspace()`，不存在 Java「setup 抛错时 InputStream 未进入 try-with-resources」的窗口。既有差异（未改）：`RemoteSandbox::start` 快照恢复成功时跳过 setup（Java 为先 setup 再 hydrate）。 |
+| `c8875287f` e2b: honor WorkspaceSpec root and rebind remote snapshots（+ agentrun 4 文件） | **迁移（2/3）+ 1 条已由设计规避** | `crates/agentscope-extensions-sandbox/src/remote.rs`（`resolve_workspace_root` / `trim_root` / `create` / `resume`）、`fs_spec.rs` | `remote::tests::create_follows_the_workspace_spec_root`、`create_without_a_spec_root_keeps_the_backend_root`（反向验证均 FAILED） | ①`E2bSandboxClient.create` 忽略 `WorkspaceSpec.root` 已在共享 `RemoteSandboxClient::create` 修复（spec root 优先、去尾斜杠、空则回落 backend 根；exec/persist/hydrate 与 manifest 同根），同时覆盖 agentrun/e2b。②AgentRun `resume` 根变化时重置 `workspace_root_ready`/`projection_hash` **未采用**：与较新的 `6ff7590af`（E2B 保留已保存执行根、不搬迁工作区）冲突；Rust 单一共享 client 采用较新语义。③`deserializeState(json, snapshotSpec)` 回绑 `RemoteSnapshotSpec` 的 client **已由 Rust 设计规避**：持久化只存 `SandboxSnapshotRef`（纯身份，无 client），`resume` 内 `rebind_snapshot` 用 snapshot spec 重建，不存在「client == null」状态。 |
+
+关联 harness 变更（供 HARNESS tracker 合并）：
+
+- `crates/agentscope-harness/src/agent/workspace/path_normalizer.rs`：前缀为文件系统根（`"/"`）时只剥前导分隔符（`"/a.txt"` → `"a.txt"`，`"/"` → `"."`），对齐 Java `WorkspacePathNormalizer#tryStrip`（`6ff7590af`）。
+- **未落地**（需 `crates/agentscope-harness/src/filesystem/**`，属另一子智能体所有权）：`middleware/workspace_context.rs::sandbox_paragraph` 的 `Sandbox root:` 仍取 `SandboxBackedFilesystem::cwd()`；远程沙箱（`FilesystemKind::Sandbox` 但非 `SandboxBackedFilesystem`，如 `extensions-sandbox` 的 `SandboxFilesystemAdapter`）会回落为 host workspace 路径。修复需给 `Filesystem`/`SandboxFilesystem` 增加根访问器。
+- per-call 根解析（`SandboxWorkspaceRoot`）未落地，理由见上表①。
+
+验证（本组）：`cargo check -p agentscope-harness -p agentscope-extensions-sandbox --all-targets` 通过；`cargo test -p agentscope-extensions-sandbox --lib` → 274 passed / 0 failed；`cargo test -p agentscope-harness --lib` → 653 passed / 1 failed（`agent::gateway::task_bridge::tests::the_hint_points_at_the_result_instead_of_copying_it`，属 gateway 并发改动，与本组无关）；`cargo fmt --all -- --check` 在本组文件无 diff。
+
+
+### 2026-11-14 复查补充（sandbox 组改动，主 agent）
+
+| 项 | 结论 | 说明 |
+|---|---|---|
+| Docker/K8s 的 layout root 与执行根可能不一致 | 已记录（未改） | `SandboxFilesystemSpec::layout_spec` 在 `6ff7590af` 后取 `effective_workspace_spec()`（spec root 优先），而 `crates/agentscope-harness/src/agent/sandbox/docker.rs` 的 `workspace_root` 仍来自 `options.workspace_root`。给 Docker/K8s 后端传与 options 不同的 `with_workspace_spec(root)` 时，提示词/layout 指 X 而命令仍跑 options 根。Rust 无 Java `SandboxWorkspaceRoot.resolve(rc)` 的 per-call 根，统一代价高，属架构差异，本轮未改。 |
+| E2B 客户端 options 根未同步 | 已记录（未改） | 文件传输路径归属判定仍按 `E2bOptions.workspace_root`，仅在走 exec 回退时生效；`fs_spec`/`remote` 的 spec 根已生效。 |
+| harness `sandbox_paragraph` 的 `Sandbox root:` | 遗留 | 远程沙箱（`FilesystemKind::Sandbox` 但非 `SandboxBackedFilesystem`）仍回落到 host workspace 路径；需在 `crates/agentscope-harness/src/filesystem/**` 增加根访问器。 |

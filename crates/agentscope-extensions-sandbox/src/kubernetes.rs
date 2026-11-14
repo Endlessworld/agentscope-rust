@@ -84,6 +84,11 @@ const CAPABILITIES_ENDPOINT: &str = "capabilities";
 /// Attempts allowed while verifying the runtime execution-timeout contract (Java
 /// `CommandExecutor.CAPABILITY_MAX_ATTEMPTS`).
 const CAPABILITY_MAX_ATTEMPTS: u32 = 3;
+/// Floor for the capability probe's transport budget (Java
+/// `CommandExecutor#CAPABILITY_PROBE_MIN_ATTEMPT_TIMEOUT`). The probe gates every command, and a
+/// sub-2s read timeout tuned for short exchanges can trip on a loaded host even when the runtime
+/// is healthy; only the probe is widened — command exchanges keep the configured budget.
+const CAPABILITY_PROBE_MIN_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Exit code reported when the runtime killed the command at its deadline (Java
 /// `ExecuteResponse.TIMEOUT_EXIT_CODE` / `timeout(1)`). The harness derives "timed out" from it,
 /// so a confirmed runtime timeout must surface as a result carrying this code.
@@ -1543,7 +1548,8 @@ impl KubernetesBackend {
         timeout_seconds: u64,
     ) -> SandboxResult<std::time::Duration> {
         let url = join_url(base, CAPABILITIES_ENDPOINT);
-        let attempt_timeout = std::time::Duration::from_secs(self.options.read_timeout_seconds);
+        let attempt_timeout = std::time::Duration::from_secs(self.options.read_timeout_seconds)
+            .max(CAPABILITY_PROBE_MIN_ATTEMPT_TIMEOUT);
         let client = self.client.clone();
         let headers = headers.to_vec();
         let value = with_retries(
@@ -2876,6 +2882,51 @@ mod tests {
             .await
             .expect("the command budget outlives the client read timeout");
         assert_eq!(output.stdout, "done");
+        execute.assert_async().await;
+    }
+
+    /// java 2d09b15a2: the `/capabilities` probe must not inherit a sub-2s transport budget — a
+    /// healthy runtime's loopback probe can transiently exceed it on a loaded host, which would
+    /// reject the command before it was ever submitted.
+    #[tokio::test]
+    async fn the_capability_probe_outlives_a_one_second_transport_budget() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/capabilities");
+                then.status(200)
+                    .delay(std::time::Duration::from_millis(1200))
+                    .json_body(json!({
+                        "execute": {
+                            "timeout_seconds": true,
+                            "max_timeout_seconds": 900,
+                            "cleanup_timeout_seconds": 6
+                        }
+                    }));
+            })
+            .await;
+        let execute = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/execute");
+                then.status(200)
+                    .json_body(json!({"stdout": "o", "stderr": "", "exit_code": 0}));
+            })
+            .await;
+        let backend = KubernetesBackend::new(KubernetesSandboxClientOptions {
+            namespace: "team-a".to_string(),
+            sandbox_api_url: Some(server.base_url()),
+            file_api_base_dir: DEFAULT_WORKSPACE_ROOT.to_string(),
+            read_timeout_seconds: 1,
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let output = backend
+            .exec_in(&handle_with_pod_ip("10.0.0.5"), "ls", None, 5)
+            .await
+            .expect("a slow-but-healthy capability probe must not reject the command");
+        assert_eq!(output.stdout, "o");
         execute.assert_async().await;
     }
 
