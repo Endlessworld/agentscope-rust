@@ -55,21 +55,30 @@ fn agent_exe() -> PathBuf {
             return PathBuf::from(exe);
         }
     }
-    // Fall back to the binary built directly under target/{profile}/.
+    let file_name = format!("acp_harness_agent{}", std::env::consts::EXE_SUFFIX);
+    // Cargo exports the built binary of this package to its integration tests.
+    if let Some(exe) = option_env!("CARGO_BIN_EXE_acp_harness_agent") {
+        let candidate = PathBuf::from(exe);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    // The test binary can live under `target/{profile}/deps/` or, in this repository's
+    // build layout, under `target/{profile}/build/<crate>/<hash>/out/`; walk up until a
+    // directory that holds the built agent binary is found.
     let exe = std::env::current_exe().expect("current_exe");
-    // .../target/debug/deps/acp_stdio_thought_test-<hash>.exe
-    let profile_dir = exe
-        .parent() // deps
-        .and_then(|p| p.parent()) // profile dir
-        .expect("profile dir");
-    let candidate = profile_dir.join("acp_harness_agent.exe");
-    assert!(
-        candidate.exists(),
-        "agent executable not found at {}; build it with \
-         `cargo build -p agentscope-extensions-acp --bin acp_harness_agent`",
-        candidate.display()
+    for ancestor in exe.ancestors().skip(1) {
+        let candidate = ancestor.join(&file_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "agent executable not found in any ancestor of {}; build it with \
+         `cargo build -p agentscope-extensions-acp --bin acp_harness_agent` \
+         or set ACP_AGENT_EXE",
+        exe.display()
     );
-    candidate
 }
 
 /// Creates a unique scratch directory under the system temp dir.
