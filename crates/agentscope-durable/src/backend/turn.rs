@@ -107,34 +107,50 @@ pub(super) fn signal(
         if turn.status.terminal() {
             return Err(DurableError::conflict("Turn is terminal"));
         }
-        if let Some(existing) = turn.signals.get(&signal.id) {
-            if *existing == signal {
-                return Ok(());
-            }
-            return Err(DurableError::conflict("Signal identity changed"));
-        }
-        if turn.withdrawn.contains(&signal.id) {
-            return Err(DurableError::conflict("Signal was withdrawn"));
-        }
         let now = txn.now();
-        turn.signals.insert(signal.id.clone(), signal.clone());
-        turn.next_attempt_at = 0;
-        append_event(
-            txn,
-            &mut state,
-            thread_key,
-            turn_id,
-            None,
-            None,
-            &format!("signal.{}", signal.id),
-            "signal.accepted",
-            json!({ "signalId": signal.id, "key": signal.key }),
-        )?;
+        accept_signal(txn, &mut state, thread_key, &mut turn, signal)?;
         schedule_thread(txn, &thread, Some(&turn), now)?;
         save_turn(txn, &turn)?;
         save_state(txn, &state)?;
         Ok(())
     })
+}
+
+/// Records one accepted signal on the turn it was addressed to.
+///
+/// Acceptance is idempotent by signal id: the same signal twice is one record, different content
+/// under a used id is a conflict, and a withdrawn id cannot come back. Delivery is a separate
+/// fact: a commit listing the id in `consumed_signals` marks it applied (see `apply_consumed`).
+fn accept_signal(
+    txn: &mut dyn Txn,
+    state: &mut SessionState,
+    thread_key: &ThreadKey,
+    turn: &mut TurnData,
+    signal: Signal,
+) -> Result<()> {
+    if let Some(existing) = turn.signals.get(&signal.id) {
+        if *existing == signal {
+            return Ok(());
+        }
+        return Err(DurableError::conflict("Signal identity changed"));
+    }
+    if turn.withdrawn.contains(&signal.id) {
+        return Err(DurableError::conflict("Signal was withdrawn"));
+    }
+    turn.signals.insert(signal.id.clone(), signal.clone());
+    // A waiting turn becomes due as soon as its key is satisfied.
+    turn.next_attempt_at = 0;
+    append_event(
+        txn,
+        state,
+        thread_key,
+        &turn.turn_id,
+        None,
+        None,
+        &format!("signal.{}", signal.id),
+        "signal.accepted",
+        json!({ "signalId": signal.id, "key": signal.key }),
+    )
 }
 
 pub(super) fn control(
@@ -143,11 +159,6 @@ pub(super) fn control(
     command: ControlCommand,
 ) -> Result<CommandReceipt> {
     json::text(&command.request_id, "requestId")?;
-    if matches!(command.kind, ControlKind::Steer | ControlKind::Inject) {
-        return Err(DurableError::unavailable(
-            "Steering is not available yet; submit a new turn instead",
-        ));
-    }
     with_session(store, &thread_key.session, |txn| {
         let mut state = require_state(txn)?;
         let thread = require_thread(txn, thread_key)?;
@@ -165,15 +176,6 @@ pub(super) fn control(
                 "Request identity belongs to an admitted turn",
             ));
         }
-        if command.kind == ControlKind::Signal {
-            let pending = Signal::new(
-                command.request_id.clone(),
-                command.target.clone().unwrap_or_default(),
-                command.value.clone(),
-            )?;
-            self::signal(store, thread_key, &command.turn_id, pending)?;
-        }
-        let now = txn.now();
         let mut turn = require_turn(txn, &command.turn_id)?;
         if turn.thread_id != thread_key.thread_id {
             return Err(DurableError::not_found(
@@ -181,7 +183,40 @@ pub(super) fn control(
             ));
         }
         let mut status = "accepted";
+        let now = txn.now();
         match command.kind {
+            // Input adjustment is only meaningful for the turn a worker is executing: it is
+            // folded in before the next reasoning boundary of *that* turn.
+            ControlKind::Steer | ControlKind::Inject => {
+                if turn.status.terminal() {
+                    return Err(DurableError::conflict("Turn is terminal"));
+                }
+                let active = turn.epoch != 0
+                    && current_turn(txn, &thread_key.thread_id)?
+                        .is_some_and(|current| current.turn_id == turn.turn_id);
+                if !active {
+                    return Err(DurableError::conflict(
+                        "Input adjustment requires the active Turn",
+                    ));
+                }
+                let key = match command.kind {
+                    ControlKind::Steer => "input:steer",
+                    _ => "input:inject",
+                };
+                let signal = Signal::new(command.request_id.clone(), key, command.value.clone())?;
+                accept_signal(txn, &mut state, thread_key, &mut turn, signal)?;
+            }
+            ControlKind::Signal => {
+                if turn.status.terminal() {
+                    return Err(DurableError::conflict("Turn is terminal"));
+                }
+                let signal = Signal::new(
+                    command.request_id.clone(),
+                    command.target.clone().unwrap_or_default(),
+                    command.value.clone(),
+                )?;
+                accept_signal(txn, &mut state, thread_key, &mut turn, signal)?;
+            }
             ControlKind::Cancel => {
                 if turn.status.terminal() {
                     status = "settled";
@@ -299,7 +334,6 @@ pub(super) fn control(
                     json!({ "requestId": command.request_id }),
                 )?;
             }
-            ControlKind::Signal | ControlKind::Steer | ControlKind::Inject => {}
         }
         let receipt = CommandReceipt {
             request_id: command.request_id.clone(),

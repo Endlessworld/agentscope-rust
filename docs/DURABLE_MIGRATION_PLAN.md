@@ -175,6 +175,16 @@ M4-a 原定「先删 `AgentSession`，ACP 改持 `Arc<dyn ThreadJournal>`」。�
 
 计划里「关掉 durable 后端 → ACP 用例失败」在当前结构下**不成立**：ACP 不引用 durable，移除/禁用 durable 后端对 ACP 无任何影响，ACP 仍走纯 journal 路径（`AgentSession` + `AtomicThreadJournal`）。这条门禁只能在 M4-b 完成后才有意义，届时写成「把 `DurableRuntime::tick` 换成 no-op / 去掉 durable backend → ACP prompt 不再产生事件且不终止 → 对应用例 FAILED」。当前真实可观测的门禁仍在 durable/harness 层：`agentscope-durable-adapter-agentscope/tests/three_process_test.rs`（去掉 Acting halt 或去掉 settle 即 FAILED，§2.5）与 `harness_session_test.rs` 的 journal 恢复用例。
 
+### 2.7 M4-b durable 侧能力补齐（2026-11-15，未提交；ACP 与 `AgentSession` 均未改）
+
+- **signal 落地**：`control` 不再对 `Steer`/`Inject` 返回 `unavailable`，两者与 `Signal` 共用 `accept_signal`（原先 `Signal` 分支在事务内二次调用 `with_session`，同一 scope 重复加锁会死锁，已合并为单事务）。对齐 Java `TransactionalSessionBackend.control`：两者都只作用于**活跃 turn**（`epoch != 0` 且为队首非终态），否则 `CONFLICT`；写 `input:steer` / `input:inject` 信号。**明确近似**：Java 在 durable 层也不区分生效时机，差别只在 key 与（Java 侧）`inputKind` 审计字段，折叠两种都在下一个 reasoning 边界——Rust 无对应审计事件，故只有 key 与回执 `operation` 可区分。
+- **已交付标记**：`AgentScopeExecutionHost::apply_inputs` 折叠后，把「携带消息的 state」与 `consumed_signals` 放进**同一次 commit**（对齐 Java `log.consuming(ids)` + `checkpointedRecordNow`），此后 `frame.signals` 不再返回该信号；原来的「按消息 ID 去重」已删除，`signal:<id>` 只作消息的稳定 id，不再是投递依据。
+- **suspend vs cancel**：不新增 `TurnStatus`。`DurableRuntime::suspend` = `Pause` 意图 + 完成握手：活跃写者看到 `Pausing` 交还租约后落 `Paused`；写者已死则由 `claim→release` 就地完成（bump thread epoch，fence 语义不变）。`Paused` 非终态，position/checkpoint/工具记录全保留，`resume` 原地续跑；`cancel` 仍写 `Cancelled`，`resume` 被 `CONFLICT` 拒绝。
+- **settle 收编**：`harness_adapter::settle_turn` 先按「`Succeeded` 且未 applied」补 `applied_results`（`appliedAt` = 本 turn 最新 run），再写终态；同终态重复调用为 no-op，终态后换终态为 `CONFLICT`。`HarnessAdapter::settle` 增加 `output` 参数并以它为默认实现，`three_process_test.rs` 的手写 settle 已删除。
+- **门面**：`DurableSession`（`src/session.rs`）只做组合，不含策略：`submit`/`admission`/`tick`/`cancel`/`suspend`/`resume`/`steer`/`inject`/`signal`/`settle`（需调用方自己的 `Lease`）/`turn`/`turns`/`active`/`state`/`events`。
+- **仍未覆盖**（M4-c 前需补）：`wakeup`（空输入 turn）、`respond` 与 pending interaction 记录、`TurnReceipt`→ACP `Task` 投影、事件流实时推送（现只有 `events(cursor)` 读）、`history()` 仍返回空页、`execution_error` 投影；`suspend` 之后 native invocation 的续跑仍受 core「无 acting 阶段续跑」限制。
+- 测试：新增 `agentscope-durable/tests/session_test.rs`（9 条）与 `execution_host_test.rs::a_delivered_signal_is_folded_once_and_marked_consumed`；durable 13+6+9、适配器 4+6+4+4+5 全绿。
+
 ## 3. 禁止事项（沿用 Java `agentscope-durable/AGENTS.md`）
 
 - 不做兼容层：不留别名、不保留 deprecated 转发、不写旧格式读取器、不做版本协商/降级回退。

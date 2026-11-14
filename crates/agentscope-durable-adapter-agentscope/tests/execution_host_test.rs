@@ -402,6 +402,73 @@ async fn input_applied_at_the_reasoning_boundary_reaches_the_model() {
 }
 
 #[tokio::test]
+async fn a_delivered_signal_is_folded_once_and_marked_consumed() {
+    let (backend, thread, lease) = running_turn().await;
+    backend
+        .signal(
+            &thread,
+            &lease.turn_id,
+            Signal::new("sig-1", "input:steer", json!("prefer the tests")).expect("signal"),
+        )
+        .await
+        .expect("accept the steer");
+
+    let agent = fixture("done", 5);
+    let host = AgentScopeExecutionHost::open(
+        Arc::clone(&backend) as Arc<dyn SessionBackend>,
+        thread.clone(),
+        lease.clone(),
+        "run-1",
+    )
+    .await
+    .expect("host");
+    let reply = drive(&agent, with_host(Arc::new(host)))
+        .await
+        .result
+        .expect("reply");
+    assert_eq!(reply.text_content(), "done");
+    assert!(
+        agent.model.saw("prefer the tests"),
+        "the accepted steer is part of the model context"
+    );
+
+    // Delivery is a durable fact: nothing is left to deliver, and the folded message is part of
+    // the same commit as its delivery marker.
+    let frame = backend.frame(&lease).await.expect("frame");
+    assert!(frame.signals.is_empty(), "the signal was delivered");
+    let applied = backend
+        .events(&thread.session, None, 100)
+        .await
+        .expect("events")
+        .events
+        .iter()
+        .filter(|event| event.event_type == "signal.applied")
+        .count();
+    assert_eq!(applied, 1, "one delivery, one fact");
+    let state = backend.thread_state(&thread).await.expect("thread state");
+    let position = state
+        .checkpoint_metadata
+        .expect("the folded state is committed")
+        .position
+        .parse::<u64>()
+        .expect("position");
+    let checkpoint = backend
+        .checkpoint(&thread, position)
+        .await
+        .expect("checkpoint");
+    let saved: AgentState = serde_json::from_value(checkpoint.checkpoint).expect("native state");
+    assert_eq!(
+        saved
+            .context()
+            .iter()
+            .filter(|message| message.id() == "signal:sig-1")
+            .count(),
+        1,
+        "the folded message is committed exactly once"
+    );
+}
+
+#[tokio::test]
 async fn pin_exposes_the_host_and_its_position_on_the_context() {
     let (backend, thread, lease) = running_turn().await;
     seed(

@@ -129,6 +129,11 @@ impl DurableRuntime {
         self.adapters.get(harness).cloned()
     }
 
+    /// The backend the runtime drives, for a façade that reads views the runtime does not expose.
+    pub fn backend(&self) -> &Arc<dyn SessionBackend> {
+        &self.backend
+    }
+
     // ---- identity ----
 
     /// Idempotent session creation: an existing session is read back instead of failing.
@@ -381,6 +386,36 @@ impl DurableRuntime {
         self.backend.turn(thread, turn_id).await
     }
 
+    /// Interrupts the invocation and leaves the turn resumable.
+    ///
+    /// This is the host-facing "abandon": unlike [`Self::cancel`], which ends the turn as
+    /// `Cancelled`, a suspend keeps the position, the checkpoint and the tool records, because
+    /// `Paused` is not terminal and [`Self::resume`] continues the same turn. A live writer
+    /// observes `Pausing` at its next boundary and hands the slot back, which completes the
+    /// pause; the turn of a writer that is already gone is completed here.
+    pub async fn suspend(
+        &self,
+        thread: &ThreadKey,
+        turn_id: &str,
+        request_id: &str,
+    ) -> Result<TurnView> {
+        let mut view = self.pause(thread, turn_id, request_id).await?;
+        if view.status == TurnStatus::Pausing {
+            if let Some(lease) = self
+                .backend
+                .claim(thread, &self.owner, self.lease_ttl)
+                .await?
+            {
+                let ours = lease.turn_id == turn_id;
+                self.release(&lease, Duration::ZERO).await;
+                if ours {
+                    view = self.backend.turn(thread, turn_id).await?;
+                }
+            }
+        }
+        Ok(view)
+    }
+
     /// Continues an observed `Paused` turn; a changed pause revision is a `CONFLICT`.
     pub async fn resume(
         &self,
@@ -403,6 +438,63 @@ impl DurableRuntime {
             )
             .await?;
         self.backend.turn(thread, turn_id).await
+    }
+
+    /// Folds a steer message into the turn a writer is executing.
+    pub async fn steer(
+        &self,
+        thread: &ThreadKey,
+        turn_id: &str,
+        request_id: &str,
+        text: impl Into<String>,
+    ) -> Result<CommandReceipt> {
+        self.input_adjustment(thread, turn_id, request_id, ControlKind::Steer, text.into())
+            .await
+    }
+
+    /// Folds an inject message into the turn a writer is executing.
+    ///
+    /// The durable layer delivers steer and inject the same way (one blended message at the next
+    /// reasoning boundary); only the signal key and the accepted event tell them apart. See
+    /// `docs/DURABLE_MIGRATION_PLAN.md` M4-b for the difference this leaves to the host.
+    pub async fn inject(
+        &self,
+        thread: &ThreadKey,
+        turn_id: &str,
+        request_id: &str,
+        text: impl Into<String>,
+    ) -> Result<CommandReceipt> {
+        self.input_adjustment(
+            thread,
+            turn_id,
+            request_id,
+            ControlKind::Inject,
+            text.into(),
+        )
+        .await
+    }
+
+    async fn input_adjustment(
+        &self,
+        thread: &ThreadKey,
+        turn_id: &str,
+        request_id: &str,
+        kind: ControlKind,
+        text: String,
+    ) -> Result<CommandReceipt> {
+        self.backend
+            .control(
+                thread,
+                ControlCommand {
+                    turn_id: turn_id.to_string(),
+                    request_id: request_id.to_string(),
+                    kind,
+                    target: None,
+                    value: Value::String(text),
+                    expected_revision: 0,
+                },
+            )
+            .await
     }
 
     pub async fn signal(&self, thread: &ThreadKey, turn_id: &str, signal: Signal) -> Result<()> {

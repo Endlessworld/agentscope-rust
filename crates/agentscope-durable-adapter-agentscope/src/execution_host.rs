@@ -7,15 +7,13 @@
 //! rebuilds it, together with the iteration it was taken in, instead of starting from zero.
 //! Two gaps are deliberate and documented in `docs/DURABLE_MIGRATION_PLAN.md`:
 //!
-//! * `input/steer` | `input/inject` signals are folded into the context, but they are **not**
-//!   consumed durably: that needs a commit carrying `consumed_signals` together with the native
-//!   checkpoint, which the journal bridge does not expose yet. Because the injected message id is
-//!   derived from the signal id, re-applying a boundary never duplicates input.
+//! * `input/steer` | `input/inject` signals are folded into the context and marked delivered:
+//!   the `consumed_signals` marker rides the same commit as the state that carries the messages,
+//!   so a signal is folded exactly once and never re-enters the conversation.
 //! * A runtime restart is only resumed up to the committed iteration; the acting continuation
 //!   (`acting_iteration`) has no consumer because core does not implement the pending-tool resume
 //!   branch.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
@@ -199,33 +197,41 @@ impl AgentScopeExecutionHost {
         Ok(())
     }
 
-    /// Folds undelivered `input/steer` | `input/inject` signals into the conversation.
+    /// Folds undelivered `input/steer` | `input/inject` signals into the conversation and marks
+    /// them delivered.
+    ///
+    /// The state that carries the folded messages and the `consumed_signals` marker land in one
+    /// commit, so a crash either loses both (the signal is folded again) or neither (it never
+    /// re-enters the conversation). The durable marker is what makes delivery a fact; the message
+    /// id only keeps the folded message stable for the journal.
     async fn apply_inputs(&self, state: &mut AgentState) -> Result<()> {
         let lease = self.lease()?;
         let frame = self.backend.frame(&lease).await.map_err(convert)?;
-        if frame.signals.is_empty() {
+        let mut delivered = Vec::new();
+        for signal in frame.signals.iter().filter(|signal| is_input(signal)) {
+            if let Some(text) = signal_text(&signal.value) {
+                let message = Msg::builder()
+                    .role(MsgRole::User)
+                    .id(format!("signal:{}", signal.id))
+                    .content(vec![ContentBlock::Text(TextBlock::new(text))])
+                    .build();
+                state.context_mut().push(message);
+            }
+            delivered.push(signal.id.clone());
+        }
+        if delivered.is_empty() {
             return Ok(());
         }
-        let mut known: HashSet<String> = state
-            .context()
-            .iter()
-            .map(|message| message.id().to_string())
-            .collect();
-        for signal in frame.signals.iter().filter(|signal| is_input(signal)) {
-            let id = format!("signal:{}", signal.id);
-            if !known.insert(id.clone()) {
-                continue;
-            }
-            let Some(text) = signal_text(&signal.value) else {
-                continue;
-            };
-            let message = Msg::builder()
-                .role(MsgRole::User)
-                .id(id)
-                .content(vec![ContentBlock::Text(TextBlock::new(text))])
-                .build();
-            state.context_mut().push(message);
-        }
+        let checkpoint = serde_json::to_value(&*state)
+            .map_err(|error| journal_error(format!("Cannot encode agent state: {error}")))?;
+        let mut commit = Commit::new(
+            format!("input:{}:{}", lease.turn_id, frame.turn.revision),
+            frame.turn.revision,
+            TurnStatus::Running,
+        );
+        commit.checkpoint = checkpoint;
+        commit.consumed_signals = delivered;
+        self.backend.commit(&lease, commit).await.map_err(convert)?;
         Ok(())
     }
 

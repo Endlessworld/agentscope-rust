@@ -41,11 +41,12 @@ use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::state::AgentState;
 use agentscope_core::tool::{FunctionTool, Tool, ToolExecutionContext, Toolkit};
 use agentscope_durable::backend::TxnBackend;
+use agentscope_durable::harness_adapter::settle_turn;
 use agentscope_durable::store::file::FileStore;
 use agentscope_durable::store::memory::InMemoryStore;
 use agentscope_durable::store::RecordStore;
 use agentscope_durable::types::*;
-use agentscope_durable::{Commit, SessionBackend};
+use agentscope_durable::SessionBackend;
 use agentscope_durable_adapter_agentscope::{
     AgentScopeExecutionHost, BackendThreadJournal, FINALIZATION_COMPLETED, FINALIZATION_STARTED,
 };
@@ -310,43 +311,18 @@ impl Worker {
         result.unwrap_or_else(|| Err(Error::Agent("the agent produced no result message".into())))
     }
 
-    /// Records the outcome of the effects this run produced and settles the turn.
-    ///
-    /// `HarnessAdapter::settle` has no implementation yet, so the host-side finalization stops
-    /// at "the reply is committed"; applying the results and closing the turn is the step an
-    /// M4 runtime performs here.
+    /// Settles the turn with the crate's own ending logic: the effects this run really produced
+    /// are applied first, then the reply becomes the turn's output.
     async fn settle(&self, reply: &Msg) {
-        let frame = self.backend.frame(&self.lease).await.expect("frame");
-        let applied: Vec<AppliedResult> = frame
-            .tools
-            .iter()
-            .filter(|tool| {
-                !tool.applied
-                    && tool.result.as_ref().map(|result| result.state)
-                        == Some(ExecutionState::Succeeded)
-            })
-            .map(|tool| AppliedResult {
-                execution_id: tool.request.execution_id.clone(),
-                applied_at: RunStepRef::new(self.run.run_id.clone(), None).expect("run step"),
-            })
-            .collect();
-        if !applied.is_empty() {
-            let mut commit = Commit::new("settle:apply", frame.turn.revision, TurnStatus::Running);
-            commit.checkpoint = frame.checkpoint.clone();
-            commit.applied_results = applied;
-            self.backend
-                .commit(&self.lease, commit)
-                .await
-                .expect("apply the tool results");
-        }
-        let frame = self.backend.frame(&self.lease).await.expect("frame");
-        let mut commit = Commit::new("settle", frame.turn.revision, TurnStatus::Succeeded);
-        commit.checkpoint = frame.checkpoint.clone();
-        commit.output = serde_json::to_value(reply).expect("reply json");
-        self.backend
-            .commit(&self.lease, commit)
-            .await
-            .expect("settle the turn");
+        settle_turn(
+            self.backend.as_ref(),
+            &self.lease,
+            TurnStatus::Succeeded,
+            serde_json::to_value(reply).expect("reply json"),
+            None,
+        )
+        .await
+        .expect("settle the turn");
     }
 
     /// Gives the writer slot back. A process that disappears would leave the lease to expire;

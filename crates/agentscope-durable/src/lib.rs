@@ -14,6 +14,7 @@ pub mod executor;
 pub mod harness_adapter;
 mod json;
 pub mod runtime;
+pub mod session;
 pub mod session_backend;
 pub mod store;
 pub mod types;
@@ -21,6 +22,7 @@ pub mod types;
 pub use error::{DurableError, ErrorCode, Result};
 pub use harness_adapter::{AdapterCapabilities, HarnessAdapter, HarnessContext};
 pub use runtime::{DurableRuntime, TickOutcome};
+pub use session::DurableSession;
 pub use session_backend::{BackendCapabilities, SessionBackend};
 pub use types::*;
 
