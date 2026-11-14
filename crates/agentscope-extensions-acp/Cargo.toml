@@ -17,7 +17,7 @@ agentscope-core = { workspace = true }
 agentscope-durable = { workspace = true }
 agentscope-durable-adapter-agentscope = { workspace = true }
 agentscope-extensions-model = { workspace = true }
-agentscope-harness = { version = "0.1.0", path = "../agentscope-harness", default-features = false }
+agentscope-harness = { version = "0.2.0", path = "../agentscope-harness", default-features = false }
 agent-client-protocol = { version = "5.0.0", features = [
     # 5.0.0 起原生传输改为 opt-in（2.2.0 时在非 wasm 平台无条件可用）：
     #   - stdio     `Stdio` transport
