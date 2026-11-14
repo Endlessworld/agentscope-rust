@@ -6,6 +6,7 @@
 
 pub mod backend_thread_journal;
 pub mod execution_host;
+mod tool_facts;
 
 pub use backend_thread_journal::BackendThreadJournal;
 pub use execution_host::{

@@ -81,6 +81,24 @@ core `ReActAgent` 主循环接上 `AgentExecutionHost`；无宿主时行为不�
 遗留缺口：①`input:steer|inject` 只注入 state，未 durable 消费（需与 checkpoint 同事务的 `consumed_signals`，journal 桥未暴露）；②`acting_iteration` 无消费者（core 未迁 pending-tool resume 分支）；③`finish` 需 native recorder，缺则报错；④durable 模型调用 replay（Java `durable/finalization_model`）未迁。
 
 
+### 2.3 M3-c 工具三态落地（2026-11-15，未提交）
+
+工具三态（意图 / 已派发 / 结果 + applied）接进 durable 事务：一次 commit 同时落 journal 与工具事实。
+
+| 位置 | 行为 |
+|---|---|
+| 组合入口 | `Commit` 新增 `dispatches: Vec<String>`、`results: Vec<ToolResultRecord>`；`SessionBackend::commit` 在 `apply_tools`（意图）之后、`derive_status`（终态门禁）之前按「意图 → 派发 → 结果 → applied」顺序应用 |
+| 事务原语 | `tools::apply_dispatch` / `tools::apply_result` 为「已加载 state/turn」形态；public `begin_dispatch` / `accept_result` 改为「开一笔事务 → 调原语」，对外行为不变 |
+| 执行身份 | `ToolCall::execution_id(turn_id)` = `{turnId}:{callId}`，`apply_tools` 改用同一函数（原 `exec_<digest>`），一个 call 只有一条记录 |
+| 桥接推导 | `tool/requested` → 意图（`call` 字段，server tool 跳过）；`tool/dispatch` → 派发（`toolCallId`）；`tool/result` → 结果（`message` 里 `ToolResultBlock.id` + `state`）。无 callId 如实报错；`with_tool_facts(false)` 可关掉推导（退化成纯 journal 写入） |
+| 状态映射 | Success→Succeeded、Error→Failed、Denied→Cancelled、Interrupted→Unknown、Suspended→Pending、Running→Running；**永不**映射 NOT_FOUND（`Commit::validate` 就拒） |
+| log-before-do | `AgentScopeExecutionHost::before_boundary(Acting)` 从最后一个 assistant 消息取未应答 tool_use，先登记意图再派发（commit id = `dispatch:{turn}:{revision}`，重放不新增事实） |
+
+顺带修的真实缺陷：`store::txn` 曾把闭包错误吞成 `Ok`，使任何「写了一半才失败」的事务仍然提交（journal 位置没进、条目却落盘）；现在错误交回 `RecordStore::transaction`，内存/文件两种 store 都真回滚（测试 `a_rejected_tool_fact_rolls_the_journal_batch_back` 守护）。
+
+缺口：①`action/start` / `action/end` 故意不推导（与 `tool/dispatch`/`tool/result` 重复，且 `action/end` 与 returnDirect 占位结果可能不一致）；②core 的 acting continuation 未消费「已派发未完成」事实，恢复时仍会重新执行 pending call（需 core 侧 pending-tool resume 分支）；③转发工具（executor ≠ local）与 delegation 未接；④UNKNOWN 对账（reconcile + evidence）未做。
+
+
 ## 3. 禁止事项（沿用 Java `agentscope-durable/AGENTS.md`）
 
 - 不做兼容层：不留别名、不保留 deprecated 转发、不写旧格式读取器、不做版本协商/降级回退。

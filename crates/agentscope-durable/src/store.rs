@@ -53,24 +53,25 @@ pub trait RecordStore: Send + Sync {
 /// Runs `work` in a transaction and returns its value.
 ///
 /// The closure is `FnOnce`; the store only needs `FnMut`, so the value is moved through an
-/// `Option` and taken exactly once.
+/// `Option` and taken exactly once. A failed closure is handed back to the store as the
+/// transaction outcome: only that makes the store discard the writes it staged.
 pub fn txn<T>(
     store: &dyn RecordStore,
     scope: &str,
     work: impl FnOnce(&mut dyn Txn) -> Result<T>,
 ) -> Result<T> {
-    let mut slot: Option<Result<T>> = None;
+    let mut slot: Option<T> = None;
     let mut pending = Some(work);
     let mut runner = |transaction: &mut dyn Txn| -> Result<()> {
         let work = pending
             .take()
             .ok_or_else(|| crate::DurableError::unavailable("transaction ran twice"))?;
-        slot = Some(work(transaction));
+        slot = Some(work(transaction)?);
         Ok(())
     };
     store.transaction(scope, &mut runner)?;
     match slot {
-        Some(value) => value,
+        Some(value) => Ok(value),
         None => Err(crate::DurableError::unavailable("transaction did not run")),
     }
 }

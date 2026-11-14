@@ -10,6 +10,8 @@ use agentscope_durable::{
 };
 use async_trait::async_trait;
 
+use crate::tool_facts;
+
 /// A durable journal scoped to one thread.
 ///
 /// Core's `expected_seq` is the native journal position, not the turn revision: the bridge
@@ -18,6 +20,8 @@ pub struct BackendThreadJournal {
     backend: Arc<dyn SessionBackend>,
     thread: ThreadKey,
     lease: Mutex<Option<Lease>>,
+    /// Whether the batch's tool facts are recorded in the same commit (see [`crate::tool_facts`]).
+    tool_facts: bool,
 }
 
 impl BackendThreadJournal {
@@ -26,7 +30,17 @@ impl BackendThreadJournal {
             backend,
             thread,
             lease: Mutex::new(None),
+            tool_facts: true,
         }
+    }
+
+    /// Turns tool-fact derivation off, leaving the bridge a pure journal writer.
+    ///
+    /// Only for callers that own tool records themselves; a batch then commits the journal
+    /// alone and no dispatch/result fact is written.
+    pub fn with_tool_facts(mut self, enabled: bool) -> Self {
+        self.tool_facts = enabled;
+        self
     }
 
     pub fn thread(&self) -> &ThreadKey {
@@ -166,6 +180,15 @@ impl ThreadJournal for BackendThreadJournal {
             return Err(journal_error("Turn is already settled"));
         }
         let mut commit = Commit::new(batch_id, turn.revision, TurnStatus::Running);
+        // The batch's tool facts land in the same transaction as the entries that imply them.
+        let facts = if self.tool_facts {
+            tool_facts::from_batch(&turn_id, events)?
+        } else {
+            tool_facts::ToolFacts::default()
+        };
+        commit.tools = facts.intents;
+        commit.dispatches = facts.dispatches;
+        commit.results = facts.results;
         commit.journal = Some(JournalAppend {
             expected_position: expected_seq,
             entries,

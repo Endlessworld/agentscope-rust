@@ -182,52 +182,67 @@ pub(super) fn begin_dispatch(
         let thread = require_thread(txn, &lease.thread)?;
         let mut turn = require_turn(txn, &lease.turn_id)?;
         let now = txn.now();
-        assert_owned(&turn, lease, now)?;
-        if turn.cancel || turn.status == TurnStatus::Pausing {
-            return Err(DurableError::conflict("Turn is stopping"));
-        }
-        if turn.failed_epoch == Some(lease.epoch) {
-            return Err(DurableError::conflict("Turn ownership already failed"));
-        }
-        if let Some(recovery) = &turn.recovery {
-            if !recovery.retry_allowed() {
-                return Err(DurableError::conflict("Recovery has stopped"));
-            }
-        }
-        let Some(tool) = turn.tools.get(execution_id) else {
-            return Err(DurableError::not_found("Execution does not exist"));
-        };
-        if tool.request.turn_id != turn.turn_id {
-            return Err(DurableError::not_found(
-                "Execution does not belong to this turn",
-            ));
-        }
-        let before = tool.view();
-        if let Some(tool) = turn.tools.get_mut(execution_id) {
-            if !tool.attempted {
-                tool.attempted = true;
-                append_event(
-                    txn,
-                    &mut state,
-                    &lease.thread,
-                    &turn.turn_id,
-                    tool.request.call.origin.as_ref().map(|o| o.run_id.as_str()),
-                    tool.request
-                        .call
-                        .origin
-                        .as_ref()
-                        .and_then(|o| o.step_id.as_deref()),
-                    &format!("tool.dispatching.{execution_id}"),
-                    "tool.dispatching",
-                    json!({ "executionId": execution_id }),
-                )?;
-            }
-        }
+        let before = apply_dispatch(txn, &mut state, &mut turn, lease, execution_id)?;
         schedule_thread(txn, &thread, Some(&turn), now)?;
         save_turn(txn, &turn)?;
         save_state(txn, &state)?;
         Ok(before)
     })
+}
+
+/// Marks one registered intent as dispatched inside an open transaction.
+///
+/// Returns the record as it was before the mark, mirroring the public call.
+pub(super) fn apply_dispatch(
+    txn: &mut dyn Txn,
+    state: &mut SessionState,
+    turn: &mut TurnData,
+    lease: &Lease,
+    execution_id: &str,
+) -> Result<ToolExecution> {
+    let now = txn.now();
+    assert_owned(turn, lease, now)?;
+    if turn.cancel || turn.status == TurnStatus::Pausing {
+        return Err(DurableError::conflict("Turn is stopping"));
+    }
+    if turn.failed_epoch == Some(lease.epoch) {
+        return Err(DurableError::conflict("Turn ownership already failed"));
+    }
+    if let Some(recovery) = &turn.recovery {
+        if !recovery.retry_allowed() {
+            return Err(DurableError::conflict("Recovery has stopped"));
+        }
+    }
+    let Some(tool) = turn.tools.get(execution_id) else {
+        return Err(DurableError::not_found("Execution does not exist"));
+    };
+    if tool.request.turn_id != turn.turn_id {
+        return Err(DurableError::not_found(
+            "Execution does not belong to this turn",
+        ));
+    }
+    let before = tool.view();
+    if let Some(tool) = turn.tools.get_mut(execution_id) {
+        if !tool.attempted {
+            tool.attempted = true;
+            append_event(
+                txn,
+                state,
+                &lease.thread,
+                &turn.turn_id,
+                tool.request.call.origin.as_ref().map(|o| o.run_id.as_str()),
+                tool.request
+                    .call
+                    .origin
+                    .as_ref()
+                    .and_then(|o| o.step_id.as_deref()),
+                &format!("tool.dispatching.{execution_id}"),
+                "tool.dispatching",
+                json!({ "executionId": execution_id }),
+            )?;
+        }
+    }
+    Ok(before)
 }
 
 pub(super) fn accept_result(
@@ -250,50 +265,70 @@ pub(super) fn accept_result(
             ));
         }
         let now = txn.now();
-        let Some(tool) = turn.tools.get_mut(execution_id) else {
-            return Err(DurableError::not_found("Execution does not exist"));
-        };
-        if !tool.attempted && result.state != ExecutionState::Cancelled {
-            return Err(DurableError::conflict("Execution has not been dispatched"));
-        }
-        if let Some(existing) = &tool.result {
-            if existing.state.terminal() {
-                if json::hash(&serde_json::to_value(existing)?)
-                    == json::hash(&serde_json::to_value(&result)?)
-                {
-                    return Ok(tool.view());
-                }
-                return Err(DurableError::conflict("Frozen result changed"));
-            }
-        }
-        let terminal = result.state.terminal();
-        tool.result = Some(result.clone());
-        turn.next_attempt_at = 0;
-        append_event(
-            txn,
-            &mut state,
-            thread,
-            &turn.turn_id,
-            turn.tools
-                .get(execution_id)
-                .and_then(|tool| tool.request.call.origin.as_ref())
-                .map(|origin| origin.run_id.as_str()),
-            turn.tools
-                .get(execution_id)
-                .and_then(|tool| tool.request.call.origin.as_ref())
-                .and_then(|origin| origin.step_id.as_deref()),
-            &format!("tool.result.{execution_id}.{now}"),
-            if terminal {
-                "tool.result.accepted"
-            } else {
-                "tool.progress"
-            },
-            json!({ "executionId": execution_id, "state": result.state }),
-        )?;
+        let view = apply_result(txn, &mut state, thread, &mut turn, execution_id, &result)?;
         schedule_thread(txn, &owner, Some(&turn), now)?;
-        let view = turn.tools.get(execution_id).map(ToolData::view);
         save_turn(txn, &turn)?;
         save_state(txn, &state)?;
-        view.ok_or_else(|| DurableError::not_found("Execution does not exist"))
+        Ok(view)
     })
+}
+
+/// Records one tool result inside an open transaction.
+pub(super) fn apply_result(
+    txn: &mut dyn Txn,
+    state: &mut SessionState,
+    thread: &ThreadKey,
+    turn: &mut TurnData,
+    execution_id: &str,
+    result: &ExecutionResult,
+) -> Result<ToolExecution> {
+    if result.state == ExecutionState::NotFound {
+        return Err(DurableError::invalid(
+            "NOT_FOUND is not a recordable execution result",
+        ));
+    }
+    let now = txn.now();
+    let Some(tool) = turn.tools.get_mut(execution_id) else {
+        return Err(DurableError::not_found("Execution does not exist"));
+    };
+    if !tool.attempted && result.state != ExecutionState::Cancelled {
+        return Err(DurableError::conflict("Execution has not been dispatched"));
+    }
+    if let Some(existing) = &tool.result {
+        if existing.state.terminal() {
+            if json::hash(&serde_json::to_value(existing)?)
+                == json::hash(&serde_json::to_value(result)?)
+            {
+                return Ok(tool.view());
+            }
+            return Err(DurableError::conflict("Frozen result changed"));
+        }
+    }
+    let terminal = result.state.terminal();
+    tool.result = Some(result.clone());
+    turn.next_attempt_at = 0;
+    let origin = turn
+        .tools
+        .get(execution_id)
+        .and_then(|tool| tool.request.call.origin.clone());
+    append_event(
+        txn,
+        state,
+        thread,
+        &turn.turn_id,
+        origin.as_ref().map(|origin| origin.run_id.as_str()),
+        origin.as_ref().and_then(|origin| origin.step_id.as_deref()),
+        &format!("tool.result.{execution_id}.{now}"),
+        if terminal {
+            "tool.result.accepted"
+        } else {
+            "tool.progress"
+        },
+        json!({ "executionId": execution_id, "state": result.state }),
+    )?;
+    Ok(turn
+        .tools
+        .get(execution_id)
+        .map(ToolData::view)
+        .ok_or_else(|| DurableError::not_found("Execution does not exist"))?)
 }

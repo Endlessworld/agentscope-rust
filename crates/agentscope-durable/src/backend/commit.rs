@@ -2,6 +2,7 @@
 
 use serde_json::json;
 
+use super::tools::{apply_dispatch, apply_result};
 use super::turn::abandon_runs;
 use super::*;
 
@@ -46,6 +47,19 @@ pub(super) fn commit(
             ));
         }
         apply_tools(txn, &mut state, &mut turn, lease, &command, now)?;
+        for execution_id in &command.dispatches {
+            apply_dispatch(txn, &mut state, &mut turn, lease, execution_id)?;
+        }
+        for record in &command.results {
+            apply_result(
+                txn,
+                &mut state,
+                &lease.thread,
+                &mut turn,
+                &record.execution_id,
+                &record.result,
+            )?;
+        }
         apply_results(txn, &mut state, &mut turn, lease, &command)?;
         apply_consumed(txn, &mut state, &mut turn, lease, &command)?;
         let previous = turn.status;
@@ -236,10 +250,7 @@ fn apply_tools(
         if turn.cancel {
             return Err(DurableError::conflict("Turn is stopping"));
         }
-        let execution_id = format!(
-            "exec_{}",
-            digest_of(&(&lease.thread, &turn.turn_id, &call.call_id))?
-        );
+        let execution_id = call.execution_id(&turn.turn_id);
         if let Some(existing) = turn.tools.get(&execution_id) {
             if existing.request.call != *call {
                 return Err(DurableError::conflict("Tool intent changed"));

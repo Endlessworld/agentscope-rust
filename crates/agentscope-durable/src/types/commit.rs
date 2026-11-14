@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use super::{
     AppliedResult, ResourceValue, RunChange, SessionKey, Signal, StepChange, ThreadSpec, ToolCall,
-    ToolExecution, TurnStatus, TurnView, WaitCondition,
+    ToolExecution, ToolResultRecord, TurnStatus, TurnView, WaitCondition,
 };
 use crate::json;
 use crate::{DurableError, Result};
@@ -159,6 +159,12 @@ pub struct Commit {
     pub checkpoint: Value,
     #[serde(default)]
     pub tools: Vec<ToolCall>,
+    /// Execution ids dispatched by this commit, applied after the intents above.
+    #[serde(default)]
+    pub dispatches: Vec<String>,
+    /// Results observed by this commit, applied after the dispatches.
+    #[serde(default)]
+    pub results: Vec<ToolResultRecord>,
     #[serde(default)]
     pub applied_results: Vec<AppliedResult>,
     #[serde(default)]
@@ -187,6 +193,8 @@ impl Commit {
             expected_revision,
             checkpoint: Value::Null,
             tools: Vec::new(),
+            dispatches: Vec::new(),
+            results: Vec::new(),
             applied_results: Vec::new(),
             consumed_signals: Vec::new(),
             events: Vec::new(),
@@ -210,6 +218,12 @@ impl Commit {
         }
         for tool in &self.tools {
             tool.validate()?;
+        }
+        for execution_id in &self.dispatches {
+            json::text(execution_id, "executionId")?;
+        }
+        for record in &self.results {
+            record.validate()?;
         }
         for event in &self.events {
             event.validate()?;

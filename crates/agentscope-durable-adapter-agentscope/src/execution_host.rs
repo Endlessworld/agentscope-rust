@@ -28,10 +28,12 @@ use agentscope_core::journal::{
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock};
 use agentscope_core::state::AgentState;
 use agentscope_durable::{
-    DurableError, ErrorCode, Lease, SessionBackend, Signal, ThreadKey, TurnStatus,
+    Commit, DurableError, ErrorCode, Lease, SessionBackend, Signal, ThreadKey, TurnStatus,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
+
+use crate::tool_facts;
 
 /// A reply was produced and persisted; finalization has not completed.
 pub const FINALIZATION_STARTED: &str = "durable/finalization_started";
@@ -197,6 +199,36 @@ impl AgentScopeExecutionHost {
         Ok(())
     }
 
+    /// Log-before-do: records every call the next acting phase will run, before any of them
+    /// leaves the runtime.
+    ///
+    /// Without it a process that dies mid-tool leaves no trace at all, and the next run sees
+    /// a plain pending call. With it the durable record says `dispatched` with no result, so
+    /// the effect is recovered as unknown instead of being applied twice.
+    async fn dispatch_calls(&self, state: &AgentState) -> Result<()> {
+        let pending = tool_facts::pending_calls(state);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let lease = self.lease()?;
+        let mut calls = Vec::with_capacity(pending.len());
+        for block in &pending {
+            calls.push(tool_facts::tool_call(block)?);
+        }
+        let dispatches = calls
+            .iter()
+            .map(|call| call.execution_id(&lease.turn_id))
+            .collect();
+        let frame = self.backend.frame(&lease).await.map_err(convert)?;
+        // Deterministic per revision: a replay of the same boundary writes nothing new.
+        let commit_id = format!("dispatch:{}:{}", lease.turn_id, frame.turn.revision);
+        let mut commit = Commit::new(commit_id, frame.turn.revision, TurnStatus::Running);
+        commit.tools = calls;
+        commit.dispatches = dispatches;
+        self.backend.commit(&lease, commit).await.map_err(convert)?;
+        Ok(())
+    }
+
     fn frame_id(&self) -> String {
         if let Ok(guard) = self.frame.lock() {
             if let Some(frame) = guard.as_ref() {
@@ -216,10 +248,12 @@ impl AgentExecutionHost for AgentScopeExecutionHost {
         state: &mut AgentState,
     ) -> Result<()> {
         self.check_control().await?;
-        // Input applied here enters the next model request; the other boundaries only need the
-        // control check.
-        if boundary == ExecutionBoundary::Reasoning {
-            self.apply_inputs(state).await?;
+        match boundary {
+            // Input applied here enters the next model request.
+            ExecutionBoundary::Reasoning => self.apply_inputs(state).await?,
+            // Every tool call this iteration will run is logged before any of them runs.
+            ExecutionBoundary::Acting => self.dispatch_calls(state).await?,
+            _ => {}
         }
         Ok(())
     }

@@ -64,6 +64,14 @@ impl ToolCall {
         }
         Ok(())
     }
+
+    /// The one durable identity of this call inside a turn.
+    ///
+    /// Every writer that derives a tool fact from native events uses this, so a call has
+    /// exactly one execution record no matter which entry registered it.
+    pub fn execution_id(&self, turn_id: &str) -> String {
+        format!("{turn_id}:{}", self.call_id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -152,6 +160,36 @@ impl ExecutionResult {
             result: Value::Null,
             error: None,
         }
+    }
+}
+
+/// A tool result recorded inside the commit that produced it.
+///
+/// `NOT_FOUND` is never a recordable outcome, so a commit carrying one is rejected before
+/// the transaction opens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolResultRecord {
+    pub execution_id: String,
+    pub result: ExecutionResult,
+}
+
+impl ToolResultRecord {
+    pub fn new(execution_id: impl Into<String>, result: ExecutionResult) -> Self {
+        Self {
+            execution_id: execution_id.into(),
+            result,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        json::text(&self.execution_id, "executionId")?;
+        if self.result.state == ExecutionState::NotFound {
+            return Err(DurableError::invalid(
+                "NOT_FOUND is not a recordable execution result",
+            ));
+        }
+        Ok(())
     }
 }
 
