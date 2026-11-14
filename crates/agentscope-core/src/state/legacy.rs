@@ -5,7 +5,7 @@
 //! rebuilds an equivalent [`AgentState`]. The original session data is neither modified nor
 //! migrated in place: this is an **explicit** migration entry point, and normal agent
 //! activation never reads these keys. Persist the result explicitly or import it through
-//! [`import_baseline`](crate::session::migration::import_baseline).
+//! [`import_baseline`](crate::journal::migration::import_baseline).
 //!
 //! The v1 keys carry no 2.0-era [`PermissionContextState`], so callers that need a specific
 //! permission context (for example `BYPASS` for a pre-seeded privileged session) must pass it
@@ -98,11 +98,11 @@ pub async fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permission::PermissionMode;
-    use crate::session::{
-        import_baseline, AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionLog,
-        SessionProjection,
+    use crate::journal::{
+        import_baseline, AtomicJournalStorage, AtomicThreadJournal, JournalProjection,
+        MemoryJournalStorage, ThreadJournal,
     };
+    use crate::permission::PermissionMode;
     use crate::state::InMemoryAgentStateStore;
     use std::sync::Arc;
 
@@ -207,13 +207,13 @@ mod tests {
         seed(&store).await;
         let legacy = load(&store, USER, SESSION, None).await;
 
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let target: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(storage, SESSION));
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        let target: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(storage, SESSION));
         import_baseline(Arc::clone(&target), &legacy.state, "legacy_store", 1)
             .await
             .unwrap();
 
-        let projection = SessionProjection::read(&*target).await.unwrap();
+        let projection = JournalProjection::read(&*target).await.unwrap();
         let restored = projection.restore().unwrap().unwrap();
         assert_eq!(restored.context().len(), 1);
         assert_eq!(restored.context()[0].text_content(), "hello from v1");

@@ -9,18 +9,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::{Extensions, ReActAgent, StreamOptions};
+use agentscope_core::journal::{
+    AtomicJournalStorage, AtomicThreadJournal, Command, InvocationRecorder, MemoryJournalStorage,
+    SessionExecution, SessionInbox, ThreadJournal, EXECUTION_CONTEXT_KEY, RECORDER_CONTEXT_KEY,
+};
 use agentscope_core::message::{ContentBlock, Msg};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
-use agentscope_core::session::{
-    AtomicSessionStorage, Command, JournalSessionLog, MemorySessionStorage, SessionExecution,
-    SessionInbox, SessionLog, SessionRecorder, EXECUTION_CONTEXT_KEY, RECORDER_CONTEXT_KEY,
-};
 use agentscope_core::state::AgentState;
 use futures::StreamExt;
 
-async fn journal() -> Arc<dyn SessionLog> {
-    let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-    Arc::new(JournalSessionLog::new(storage, "settle-loop"))
+async fn journal() -> Arc<dyn ThreadJournal> {
+    let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+    Arc::new(AtomicThreadJournal::new(storage, "settle-loop"))
 }
 
 fn text_reply(text: &str) -> ChatResponse {
@@ -96,7 +96,7 @@ async fn a_completed_turn_continues_while_steering_is_unconsumed() {
     .unwrap();
     let submit = inbox.accept(&submit).await.unwrap();
 
-    let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+    let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
         .await
         .unwrap();
     let mut execution = SessionExecution::new(Arc::clone(&log), submit);
@@ -181,7 +181,7 @@ async fn a_completed_turn_closes_when_no_guidance_is_pending() {
     .unwrap();
     let submit = inbox.accept(&submit).await.unwrap();
 
-    let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+    let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
         .await
         .unwrap();
     let mut execution = SessionExecution::new(Arc::clone(&log), submit);

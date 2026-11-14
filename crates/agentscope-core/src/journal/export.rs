@@ -1,89 +1,89 @@
-//! Acknowledged committed-event export, mirroring `SessionExportSink` and
-//! `SessionLogExporter`.
+//! Acknowledged committed-event export, mirroring `JournalExportSink` and
+//! `JournalExporter`.
 
 use std::sync::Arc;
 
-use super::{SessionEvent, SessionLog};
+use super::{JournalEvent, ThreadJournal};
 
 /// Runtime-context key carrying the committed-event export sink.
 ///
-/// Mirrors Java `SessionExportSink.CONTEXT_KEY`. A host that installs a
-/// [`SessionExportSinkHandle`] under this key makes every recorder the agent opens export
-/// its committed events through [`SessionLogExporter`]; without it, exporting stays off and
+/// Mirrors Java `JournalExportSink.CONTEXT_KEY`. A host that installs a
+/// [`JournalExportSinkHandle`] under this key makes every recorder the agent opens export
+/// its committed events through [`JournalExporter`]; without it, exporting stays off and
 /// the run behaves exactly as before.
-pub const SESSION_EXPORT_SINK_CONTEXT_KEY: &str = "agentscope.session.exportSink";
+pub const JOURNAL_EXPORT_SINK_CONTEXT_KEY: &str = "agentscope.session.exportSink";
 
 /// A committed-event sink. Implementations must deduplicate by native event id.
 ///
 /// A lost acknowledgement re-delivers the same immutable event; it never re-executes it.
-pub trait SessionExportSink: Send + Sync {
+pub trait JournalExportSink: Send + Sync {
     /// Stable sink name; the durable cursor is keyed by it.
     fn name(&self) -> &str;
 
     /// Accepts one committed event.
-    fn accept(&self, event: &SessionEvent) -> crate::error::Result<()>;
+    fn accept(&self, event: &JournalEvent) -> crate::error::Result<()>;
 
     /// Accepts one committed event belonging to `session_id`.
     ///
     /// A sink shared by several sessions (the normal case when it is installed once on an
     /// agent) uses this to key its own dedupe state per session. Sinks bound to a single
-    /// session keep the default, which delegates to [`SessionExportSink::accept`].
-    fn accept_for(&self, _session_id: &str, event: &SessionEvent) -> crate::error::Result<()> {
+    /// session keep the default, which delegates to [`JournalExportSink::accept`].
+    fn accept_for(&self, _session_id: &str, event: &JournalEvent) -> crate::error::Result<()> {
         self.accept(event)
     }
 }
 
-/// A `SessionExportSink` that can travel through the typed
+/// A `JournalExportSink` that can travel through the typed
 /// [`Extensions`](crate::agent::Extensions) bag.
 ///
-/// `Extensions` stores sized `Any` values, so an `Arc<dyn SessionExportSink>` cannot be
+/// `Extensions` stores sized `Any` values, so an `Arc<dyn JournalExportSink>` cannot be
 /// inserted directly. This newtype is the handle hosts put under
-/// [`SESSION_EXPORT_SINK_CONTEXT_KEY`].
+/// [`JOURNAL_EXPORT_SINK_CONTEXT_KEY`].
 #[derive(Clone)]
-pub struct SessionExportSinkHandle {
-    sink: Arc<dyn SessionExportSink>,
+pub struct JournalExportSinkHandle {
+    sink: Arc<dyn JournalExportSink>,
 }
 
-impl std::fmt::Debug for SessionExportSinkHandle {
+impl std::fmt::Debug for JournalExportSinkHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionExportSinkHandle")
+        f.debug_struct("JournalExportSinkHandle")
             .field("name", &self.sink.name())
             .finish()
     }
 }
 
-impl SessionExportSinkHandle {
+impl JournalExportSinkHandle {
     /// Wraps a sink for installation in a runtime context.
-    pub fn new(sink: Arc<dyn SessionExportSink>) -> Self {
+    pub fn new(sink: Arc<dyn JournalExportSink>) -> Self {
         Self { sink }
     }
 
     /// The wrapped sink.
-    pub fn sink(&self) -> Arc<dyn SessionExportSink> {
+    pub fn sink(&self) -> Arc<dyn JournalExportSink> {
         Arc::clone(&self.sink)
     }
 
     /// Builds an exporter for the sink, bound to a logical session.
     pub fn exporter_for_session(
         &self,
-        log: Arc<dyn SessionLog>,
+        log: Arc<dyn ThreadJournal>,
         session_id: impl Into<String>,
-    ) -> SessionLogExporter {
-        SessionLogExporter::for_session(log, Arc::clone(&self.sink), session_id)
+    ) -> JournalExporter {
+        JournalExporter::for_session(log, Arc::clone(&self.sink), session_id)
     }
 }
 
 /// Drains committed events into a sink using a durable outbox cursor.
-pub struct SessionLogExporter {
-    log: Arc<dyn SessionLog>,
-    sink: Arc<dyn SessionExportSink>,
+pub struct JournalExporter {
+    log: Arc<dyn ThreadJournal>,
+    sink: Arc<dyn JournalExportSink>,
     /// Logical session the exported facts belong to; `None` keeps the single-session
-    /// [`SessionExportSink::accept`] contract.
+    /// [`JournalExportSink::accept`] contract.
     session_id: Option<String>,
 }
 
-impl SessionLogExporter {
-    pub fn new(log: Arc<dyn SessionLog>, sink: Arc<dyn SessionExportSink>) -> Self {
+impl JournalExporter {
+    pub fn new(log: Arc<dyn ThreadJournal>, sink: Arc<dyn JournalExportSink>) -> Self {
         Self {
             log,
             sink,
@@ -96,8 +96,8 @@ impl SessionLogExporter {
     /// The recorder that drains a journal knows its session; a sink installed once on an
     /// agent does not, so this is what lets one sink deduplicate per `sourceWatermark`.
     pub fn for_session(
-        log: Arc<dyn SessionLog>,
-        sink: Arc<dyn SessionExportSink>,
+        log: Arc<dyn ThreadJournal>,
+        sink: Arc<dyn JournalExportSink>,
         session_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -171,8 +171,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionEvent, Writer,
+    use crate::journal::{
+        AtomicJournalStorage, AtomicThreadJournal, JournalEvent, MemoryJournalStorage, Writer,
     };
 
     #[derive(Default)]
@@ -198,12 +198,12 @@ mod tests {
         }
     }
 
-    impl SessionExportSink for RecordingSink {
+    impl JournalExportSink for RecordingSink {
         fn name(&self) -> &str {
             &self.name
         }
 
-        fn accept(&self, event: &SessionEvent) -> crate::error::Result<()> {
+        fn accept(&self, event: &JournalEvent) -> crate::error::Result<()> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
             if let Some(limit) = self.fail_after {
                 if attempt >= limit {
@@ -215,12 +215,13 @@ mod tests {
         }
     }
 
-    async fn seeded() -> (Arc<dyn SessionLog>, Arc<dyn AtomicSessionStorage>) {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
+    async fn seeded() -> (Arc<dyn ThreadJournal>, Arc<dyn AtomicJournalStorage>) {
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        let log: Arc<dyn ThreadJournal> =
+            Arc::new(AtomicThreadJournal::new(Arc::clone(&storage), "s1"));
         let writer: Writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
         let events = vec![
-            SessionEvent::new(
+            JournalEvent::new(
                 "e1",
                 1,
                 0,
@@ -231,7 +232,7 @@ mod tests {
                 "{}",
             )
             .unwrap(),
-            SessionEvent::new(
+            JournalEvent::new(
                 "e2",
                 2,
                 0,
@@ -252,7 +253,7 @@ mod tests {
     async fn drain_delivers_each_event_once() {
         let (log, _storage) = seeded().await;
         let sink = Arc::new(RecordingSink::new("sink-a", None));
-        let exporter = SessionLogExporter::new(Arc::clone(&log), sink.clone());
+        let exporter = JournalExporter::new(Arc::clone(&log), sink.clone());
 
         assert_eq!(exporter.drain().await.unwrap(), 2);
         assert_eq!(sink.seen(), vec!["run/start", "turn/start"]);
@@ -266,12 +267,13 @@ mod tests {
         // A per-event watermark cost one head read plus one compare-and-set per event, which
         // dominated a long backlog. The cursor now moves once per batch, and a failure inside
         // a batch still leaves it on the last acknowledged event.
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        let log: Arc<dyn ThreadJournal> =
+            Arc::new(AtomicThreadJournal::new(Arc::clone(&storage), "s1"));
         let writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
-        let events: Vec<SessionEvent> = (1..=300u64)
+        let events: Vec<JournalEvent> = (1..=300u64)
             .map(|seq| {
-                SessionEvent::new(
+                JournalEvent::new(
                     format!("e{seq}"),
                     seq,
                     0,
@@ -288,7 +290,7 @@ mod tests {
         log.release(&writer).await.unwrap();
 
         let sink = Arc::new(RecordingSink::new("sink-batch", None));
-        let exporter = SessionLogExporter::new(Arc::clone(&log), sink.clone());
+        let exporter = JournalExporter::new(Arc::clone(&log), sink.clone());
         assert_eq!(exporter.drain().await.unwrap(), 300);
         assert_eq!(log.export_cursor("sink-batch").await.unwrap(), 300);
         assert_eq!(sink.seen().len(), 300);
@@ -298,12 +300,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_in_a_later_batch_keeps_the_earlier_progress() {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        let log: Arc<dyn ThreadJournal> =
+            Arc::new(AtomicThreadJournal::new(Arc::clone(&storage), "s1"));
         let writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
-        let events: Vec<SessionEvent> = (1..=300u64)
+        let events: Vec<JournalEvent> = (1..=300u64)
             .map(|seq| {
-                SessionEvent::new(
+                JournalEvent::new(
                     format!("e{seq}"),
                     seq,
                     0,
@@ -321,7 +324,7 @@ mod tests {
 
         // Fail on the first event of the second batch: the first batch stays acknowledged.
         let sink = Arc::new(RecordingSink::new("sink-late", Some(256)));
-        let exporter = SessionLogExporter::new(Arc::clone(&log), sink.clone());
+        let exporter = JournalExporter::new(Arc::clone(&log), sink.clone());
         assert!(exporter.drain().await.is_err());
         assert_eq!(log.export_cursor("sink-late").await.unwrap(), 256);
     }
@@ -330,7 +333,7 @@ mod tests {
     async fn cursor_only_advances_after_a_successful_accept() {
         let (log, _storage) = seeded().await;
         let sink = Arc::new(RecordingSink::new("sink-b", Some(1)));
-        let exporter = SessionLogExporter::new(Arc::clone(&log), sink.clone());
+        let exporter = JournalExporter::new(Arc::clone(&log), sink.clone());
 
         // The second event fails, so the cursor stays at the first event.
         assert!(exporter.drain().await.is_err());
@@ -342,7 +345,7 @@ mod tests {
     async fn sinks_keep_independent_cursors() {
         let (log, _storage) = seeded().await;
         let a = Arc::new(RecordingSink::new("sink-a", None));
-        SessionLogExporter::new(Arc::clone(&log), a.clone())
+        JournalExporter::new(Arc::clone(&log), a.clone())
             .drain()
             .await
             .unwrap();
@@ -356,16 +359,16 @@ mod tests {
         seen: Mutex<Vec<(String, String)>>,
     }
 
-    impl SessionExportSink for SessionAwareSink {
+    impl JournalExportSink for SessionAwareSink {
         fn name(&self) -> &str {
             "session-aware"
         }
 
-        fn accept(&self, _event: &SessionEvent) -> crate::error::Result<()> {
+        fn accept(&self, _event: &JournalEvent) -> crate::error::Result<()> {
             panic!("for_session must deliver through accept_for");
         }
 
-        fn accept_for(&self, session_id: &str, event: &SessionEvent) -> crate::error::Result<()> {
+        fn accept_for(&self, session_id: &str, event: &JournalEvent) -> crate::error::Result<()> {
             self.seen
                 .lock()
                 .unwrap()
@@ -378,7 +381,7 @@ mod tests {
     async fn for_session_delivers_the_logical_session_id() {
         let (log, _storage) = seeded().await;
         let sink = Arc::new(SessionAwareSink::default());
-        SessionLogExporter::for_session(Arc::clone(&log), sink.clone(), "s1")
+        JournalExporter::for_session(Arc::clone(&log), sink.clone(), "s1")
             .drain()
             .await
             .unwrap();
@@ -395,23 +398,23 @@ mod tests {
     async fn a_reclaimed_prefix_is_skipped_instead_of_stalling_the_export() {
         // Reclaimed events can never be exported again, but that must not wedge the sink: the
         // cursor jumps to the floor and everything after it is still delivered.
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let log = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
-        let as_log: Arc<dyn SessionLog> = log.clone();
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        let log = Arc::new(AtomicThreadJournal::new(Arc::clone(&storage), "s1"));
+        let as_log: Arc<dyn ThreadJournal> = log.clone();
         let writer = as_log
             .acquire("run-1", Duration::from_secs(60))
             .await
             .unwrap();
-        let retention = crate::session::SessionRetention {
+        let retention = crate::journal::JournalRetention {
             prune: true,
             min_age: Duration::ZERO,
         };
         for batch in 0..6 {
             let start = as_log.head().await.unwrap().seq;
-            let events: Vec<SessionEvent> = (1..=400u64)
+            let events: Vec<JournalEvent> = (1..=400u64)
                 .map(|offset| {
                     let seq = start + offset;
-                    SessionEvent::new(
+                    JournalEvent::new(
                         format!("e{seq}"),
                         seq,
                         0,
@@ -436,7 +439,7 @@ mod tests {
         assert_eq!(as_log.reclaimed_floor().await.unwrap(), Some(1200));
 
         let sink = Arc::new(RecordingSink::new("sink-a", None));
-        let exporter = SessionLogExporter::new(as_log.clone(), sink.clone());
+        let exporter = JournalExporter::new(as_log.clone(), sink.clone());
         assert_eq!(exporter.drain().await.unwrap(), 1200);
         assert_eq!(as_log.export_cursor("sink-a").await.unwrap(), 2400);
         assert_eq!(exporter.drain().await.unwrap(), 0);

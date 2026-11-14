@@ -27,6 +27,8 @@ pub enum GenerateReason {
     StructuredOutput,
     /// Tool execution was suspended, waiting for user results.
     ToolSuspended,
+    /// The execution host paused this invocation at a recoverable boundary.
+    HostPaused,
     /// Reasoning phase was stopped by a hook.
     ReasoningStopRequested,
     /// Acting phase was stopped by a hook.

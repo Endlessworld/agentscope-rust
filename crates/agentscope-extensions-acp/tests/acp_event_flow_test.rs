@@ -13,6 +13,22 @@ use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::AcpAgentSession;
 use agentscope_harness::agent::HarnessAgent;
 
+/// A per-test workspace. `temp_dir()` itself is shared across runs, so a session journal
+/// written by an earlier build (including a pre-v2 format) would be read by this run; the
+/// journal format is version-checked and rejects stale files, so each test owns its directory.
+fn unique_workspace(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "acp-event-flow-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
 /// A scripted model that streams thinking then a tool call.
 struct ScriptedModel {
     responses: std::sync::Mutex<Vec<ChatResponse>>,
@@ -66,20 +82,18 @@ async fn thinking_and_tool_call_reach_client() {
                 .build(),
         ]),
     });
+    let dir = unique_workspace("thinking");
     let agent = HarnessAgent::builder()
         .name("acp-flow")
         .model(model)
+        .cwd(dir.clone())
+        .workspace(dir.join("ws"))
         .register_filesystem_tools(true)
         .max_iters(5)
         .build();
 
-    let mut session = AcpAgentSession::new(
-        SessionId::new("s-flow"),
-        std::env::temp_dir(),
-        agent,
-        vec![],
-        vec![],
-    );
+    let mut session =
+        AcpAgentSession::new(SessionId::new("s-flow"), dir.clone(), agent, vec![], vec![]);
 
     let updates: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let updates_c = Arc::clone(&updates);
@@ -181,16 +195,19 @@ impl Model for FailingModel {
 
 #[tokio::test]
 async fn failed_run_reports_the_actual_error() {
+    let dir = unique_workspace("failure");
     let model: Arc<dyn Model> = Arc::new(FailingModel);
     let agent = HarnessAgent::builder()
         .name("acp-failure")
         .model(model)
+        .cwd(dir.clone())
+        .workspace(dir.join("ws"))
         .max_iters(2)
         .build();
 
     let mut session = AcpAgentSession::new(
         SessionId::new("s-failure"),
-        std::env::temp_dir(),
+        dir.clone(),
         agent,
         vec![],
         vec![],
@@ -243,14 +260,17 @@ async fn a_clone_sees_the_activity_of_a_turn_it_did_not_run() {
             .content(vec![CoreBlock::Text(TextBlock::new("ok"))])
             .build()]),
     });
+    let dir = unique_workspace("shared");
     let agent = HarnessAgent::builder()
         .name("acp-shared")
         .model(model)
+        .cwd(dir.clone())
+        .workspace(dir.join("ws"))
         .max_iters(2)
         .build();
     let mut session = AcpAgentSession::new(
         SessionId::new("s-shared"),
-        std::env::temp_dir(),
+        dir.clone(),
         agent,
         vec![],
         vec![],

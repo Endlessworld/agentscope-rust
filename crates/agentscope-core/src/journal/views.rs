@@ -1,5 +1,5 @@
 //! Read-only projections over one committed session prefix, mirroring
-//! `SessionTurns`, `SessionViews`, `SessionProjection`, `SessionInteractions` and
+//! `TurnViews`, `SessionViews`, `JournalProjection`, `SessionInteractions` and
 //! `SessionTranscriptExport`.
 //!
 //! Inspection never repairs records, never acquires a writer and never invokes a model or a
@@ -13,12 +13,12 @@ use crate::formatter::document_reference;
 use crate::message::{ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock};
 use crate::state::TaskVerification;
 
-use super::{session_error, SessionEvent, SessionLog};
+use super::{journal_error, JournalEvent, ThreadJournal};
 
 /// Read-only task and input projection over one committed execution prefix.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionTurns {
+pub struct TurnViews {
     pub turns: Vec<Turn>,
     pub inputs: HashMap<String, Vec<Msg>>,
     pub started: BTreeSet<String>,
@@ -51,7 +51,7 @@ impl Turn {
     }
 }
 
-impl SessionTurns {
+impl TurnViews {
     /// The most recently recorded turn, if any.
     pub fn latest(&self) -> Option<&Turn> {
         self.turns.last()
@@ -63,7 +63,7 @@ impl SessionTurns {
     }
 
     /// Projects turns, inputs and inbox state from a committed prefix.
-    pub async fn read(log: &dyn SessionLog) -> crate::error::Result<Self> {
+    pub async fn read(log: &dyn ThreadJournal) -> crate::error::Result<Self> {
         let views = replay_views(
             log,
             ViewSelection {
@@ -81,7 +81,7 @@ impl SessionTurns {
     /// A caller that already holds the projection at an earlier head can advance it by
     /// visiting only the events committed since then, instead of replaying the whole
     /// journal.
-    pub fn apply_event(&mut self, event: &SessionEvent) -> crate::error::Result<()> {
+    pub fn apply_event(&mut self, event: &JournalEvent) -> crate::error::Result<()> {
         let data = event.data()?;
         if event.event_type == "state/restored" {
             self.turns.clear();
@@ -190,7 +190,7 @@ impl TranscriptFold {
 
 pub(crate) fn apply_transcript_event(
     fold: &mut TranscriptFold,
-    event: &SessionEvent,
+    event: &JournalEvent,
 ) -> crate::error::Result<()> {
     let TranscriptFold { ordered, messages } = fold;
     match event.event_type.as_str() {
@@ -236,7 +236,7 @@ pub(crate) fn finish_transcript(fold: TranscriptFold, as_of_seq: u64) -> Transcr
 }
 
 /// Rebuilds the committed transcript up to the current head.
-pub async fn transcript(log: &dyn SessionLog) -> crate::error::Result<Transcript> {
+pub async fn transcript(log: &dyn ThreadJournal) -> crate::error::Result<Transcript> {
     let views = replay_views(
         log,
         ViewSelection {
@@ -264,9 +264,9 @@ pub(crate) struct ViewSelection {
 /// The views produced by one replay; only the selected ones are `Some`.
 #[derive(Debug, Default)]
 pub(crate) struct SelectedViews {
-    pub turns: Option<SessionTurns>,
-    pub projection: Option<SessionProjection>,
-    pub pending: Option<BTreeMap<String, SessionEvent>>,
+    pub turns: Option<TurnViews>,
+    pub projection: Option<JournalProjection>,
+    pub pending: Option<BTreeMap<String, JournalEvent>>,
     pub transcript: Option<Transcript>,
 }
 
@@ -282,9 +282,9 @@ pub(crate) struct SelectedViews {
 /// already reclaimed the history below the snapshot, there is no safe way back, so the read
 /// fails loudly instead of returning views that are silently missing their beginning.
 pub(crate) async fn replay_views(
-    log: &dyn SessionLog,
+    log: &dyn ThreadJournal,
     selection: ViewSelection,
-    hook: &mut (dyn for<'a> FnMut(&'a SessionEvent) -> crate::error::Result<()> + Send),
+    hook: &mut (dyn for<'a> FnMut(&'a JournalEvent) -> crate::error::Result<()> + Send),
 ) -> crate::error::Result<SelectedViews> {
     let head = log.head().await?;
     let upper = head.seq;
@@ -312,7 +312,7 @@ pub(crate) async fn replay_views(
         None => {
             if let Some(floor) = log.reclaimed_floor().await? {
                 if floor > 0 {
-                    return Err(session_error(format!(
+                    return Err(journal_error(format!(
                         "Session history before seq {floor} was reclaimed and its snapshot is unusable"
                     )));
                 }
@@ -342,7 +342,7 @@ pub(crate) async fn replay_views(
         Some(snapshot) => TranscriptFold::from_messages(&snapshot.transcript.messages),
         None => TranscriptFold::default(),
     });
-    let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
+    let mut visit = |event: &JournalEvent| -> crate::error::Result<()> {
         let folded = (|| -> crate::error::Result<()> {
             if let Some(turns) = turns.as_mut() {
                 turns.apply_event(event)?;
@@ -387,8 +387,8 @@ pub(crate) async fn replay_views(
 
 /// Turns plus pending interactions: what admitting a command needs, in one replay.
 pub async fn admission_views(
-    log: &dyn SessionLog,
-) -> crate::error::Result<(SessionTurns, BTreeMap<String, SessionEvent>)> {
+    log: &dyn ThreadJournal,
+) -> crate::error::Result<(TurnViews, BTreeMap<String, JournalEvent>)> {
     let views = replay_views(
         log,
         ViewSelection {
@@ -407,12 +407,8 @@ pub async fn admission_views(
 
 /// Turns, projection and pending interactions: what closing an unfinished turn needs.
 pub async fn recovery_views(
-    log: &dyn SessionLog,
-) -> crate::error::Result<(
-    SessionTurns,
-    SessionProjection,
-    BTreeMap<String, SessionEvent>,
-)> {
+    log: &dyn ThreadJournal,
+) -> crate::error::Result<(TurnViews, JournalProjection, BTreeMap<String, JournalEvent>)> {
     let views = replay_views(
         log,
         ViewSelection {
@@ -433,9 +429,9 @@ pub async fn recovery_views(
 
 /// Projection plus transcript: what opening a recorder needs, in one replay.
 pub(crate) async fn open_views(
-    log: &dyn SessionLog,
-    hook: &mut (dyn for<'a> FnMut(&'a SessionEvent) -> crate::error::Result<()> + Send),
-) -> crate::error::Result<(SessionProjection, Transcript)> {
+    log: &dyn ThreadJournal,
+    hook: &mut (dyn for<'a> FnMut(&'a JournalEvent) -> crate::error::Result<()> + Send),
+) -> crate::error::Result<(JournalProjection, Transcript)> {
     let views = replay_views(
         log,
         ViewSelection {
@@ -458,7 +454,7 @@ pub(crate) async fn open_views(
 /// Read-only recovery view. Inspection never repairs records or invokes models/tools.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionProjection {
+pub struct JournalProjection {
     pub as_of_seq: u64,
     pub state_json: Option<String>,
     pub uncertain_tool_calls: BTreeSet<String>,
@@ -480,12 +476,12 @@ pub(crate) struct ProjectionFold {
     runs: BTreeSet<String>,
     results: BTreeMap<String, ToolResultBlock>,
     verifications: Vec<TaskVerification>,
-    extensions: Vec<SessionEvent>,
+    extensions: Vec<JournalEvent>,
 }
 
 pub(crate) fn apply_projection_event(
     fold: &mut ProjectionFold,
-    event: &SessionEvent,
+    event: &JournalEvent,
 ) -> crate::error::Result<()> {
     let ProjectionFold {
         state,
@@ -495,7 +491,7 @@ pub(crate) fn apply_projection_event(
         verifications,
         extensions,
     } = fold;
-    super::SessionEventTypes::validate(event)?;
+    super::JournalEventTypes::validate(event)?;
     let data = event.data()?;
     match event.event_type.as_str() {
         "state/checkpoint" | "migration/baseline" | "state/restored" => {
@@ -593,7 +589,7 @@ pub(crate) fn apply_projection_event(
             }
         }
         other => {
-            if !super::SessionEventTypes::is_builtin(other) {
+            if !super::JournalEventTypes::is_builtin(other) {
                 extensions.push(event.clone());
             }
         }
@@ -606,7 +602,7 @@ pub(crate) fn apply_projection_event(
 pub(crate) fn finish_projection(
     fold: ProjectionFold,
     upper: u64,
-) -> crate::error::Result<SessionProjection> {
+) -> crate::error::Result<JournalProjection> {
     let ProjectionFold {
         mut state,
         uncertain,
@@ -644,7 +640,7 @@ pub(crate) fn finish_projection(
                     );
                 }
                 for extension in &extensions {
-                    super::SessionEventCodecRegistry::default_registry()
+                    super::JournalEventCodecRegistry::default_registry()
                         .apply_extension(&mut restored, extension)?;
                 }
                 state = Some(restored.to_json()?);
@@ -652,7 +648,7 @@ pub(crate) fn finish_projection(
         }
     }
 
-    Ok(SessionProjection {
+    Ok(JournalProjection {
         // The projection is written back after the head, even when an unreadable segment
         // truncated the replay: new facts must continue the committed chain, not refill a
         // hole nobody can read.
@@ -664,9 +660,9 @@ pub(crate) fn finish_projection(
     })
 }
 
-impl SessionProjection {
+impl JournalProjection {
     /// Walks a committed prefix and folds state, tool outcomes and live runs.
-    pub async fn read(log: &dyn SessionLog) -> crate::error::Result<Self> {
+    pub async fn read(log: &dyn ThreadJournal) -> crate::error::Result<Self> {
         let views = replay_views(
             log,
             ViewSelection {
@@ -692,21 +688,21 @@ impl SessionProjection {
 ///
 /// Resolves a tool continuation against committed pending requests.
 pub async fn continuation_turn(
-    log: &dyn SessionLog,
+    log: &dyn ThreadJournal,
     request_ids: &BTreeSet<String>,
 ) -> crate::error::Result<String> {
     if request_ids.is_empty() {
-        return Err(session_error("Tool result IDs are required"));
+        return Err(journal_error("Tool result IDs are required"));
     }
     let requests = pending_interactions(log).await?;
     let mut turn: Option<String> = None;
     for id in request_ids {
         let request = requests
             .get(id)
-            .ok_or_else(|| session_error(format!("No pending external execution request: {id}")))?;
+            .ok_or_else(|| journal_error(format!("No pending external execution request: {id}")))?;
         let data = request.data()?;
         if data.get("kind").and_then(|v| v.as_str()) != Some("external_execution") {
-            return Err(session_error(format!(
+            return Err(journal_error(format!(
                 "No pending external execution request: {id}"
             )));
         }
@@ -714,21 +710,21 @@ pub async fn continuation_turn(
             .turn_id
             .as_deref()
             .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| session_error(format!("Pending request has no logical turn: {id}")))?;
+            .ok_or_else(|| journal_error(format!("Pending request has no logical turn: {id}")))?;
         if let Some(existing) = &turn {
             if existing != request_turn {
-                return Err(session_error("Tool results belong to different turns"));
+                return Err(journal_error("Tool results belong to different turns"));
             }
         }
         turn = Some(request_turn.to_string());
     }
-    turn.ok_or_else(|| session_error("Tool result IDs are required"))
+    turn.ok_or_else(|| journal_error("Tool result IDs are required"))
 }
 
 /// The unresolved interaction requests, keyed by request id.
 pub async fn pending_interactions(
-    log: &dyn SessionLog,
-) -> crate::error::Result<BTreeMap<String, SessionEvent>> {
+    log: &dyn ThreadJournal,
+) -> crate::error::Result<BTreeMap<String, JournalEvent>> {
     let views = replay_views(
         log,
         ViewSelection {
@@ -745,8 +741,8 @@ pub async fn pending_interactions(
 ///
 /// Callers that already hold the map at an earlier head can advance it incrementally.
 pub fn apply_pending_event(
-    pending: &mut BTreeMap<String, SessionEvent>,
-    event: &SessionEvent,
+    pending: &mut BTreeMap<String, JournalEvent>,
+    event: &JournalEvent,
 ) -> crate::error::Result<()> {
     let data = event.data()?;
     if event.event_type == "interaction/requested" {
@@ -928,11 +924,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::journal::{
+        AtomicJournalStorage, AtomicThreadJournal, MemoryJournalStorage, ThreadJournal, Writer,
+    };
     use crate::message::TextBlock;
     use crate::message::ToolResultState;
-    use crate::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionLog, Writer,
-    };
 
     /// Renders a text-only block list for transcript/result fixtures.
     fn text_blocks(text: &str) -> Vec<ContentBlock> {
@@ -945,8 +941,8 @@ mod tests {
         run: Option<&str>,
         turn: Option<&str>,
         payload: serde_json::Value,
-    ) -> SessionEvent {
-        SessionEvent::new(
+    ) -> JournalEvent {
+        JournalEvent::new(
             format!("e{seq}"),
             seq,
             0,
@@ -959,14 +955,24 @@ mod tests {
         .unwrap()
     }
 
-    async fn journal() -> (Arc<dyn AtomicSessionStorage>, Arc<dyn SessionLog>, Writer) {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
+    async fn journal() -> (
+        Arc<dyn AtomicJournalStorage>,
+        Arc<dyn ThreadJournal>,
+        Writer,
+    ) {
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        let log: Arc<dyn ThreadJournal> =
+            Arc::new(AtomicThreadJournal::new(Arc::clone(&storage), "s1"));
         let writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
         (storage, log, writer)
     }
 
-    async fn commit(log: &dyn SessionLog, writer: &Writer, batch: &str, events: &[SessionEvent]) {
+    async fn commit(
+        log: &dyn ThreadJournal,
+        writer: &Writer,
+        batch: &str,
+        events: &[JournalEvent],
+    ) {
         let head = log.head().await.unwrap();
         log.commit(writer, batch, head.seq, events).await.unwrap();
     }
@@ -1017,11 +1023,11 @@ mod tests {
         .await;
 
         let (projection, tx) = open_views(&*log, &mut |_| Ok(())).await.unwrap();
-        assert_eq!(projection, SessionProjection::read(&*log).await.unwrap());
+        assert_eq!(projection, JournalProjection::read(&*log).await.unwrap());
         assert_eq!(tx, super::transcript(&*log).await.unwrap());
 
         let (turns, pending) = admission_views(&*log).await.unwrap();
-        assert_eq!(turns, SessionTurns::read(&*log).await.unwrap());
+        assert_eq!(turns, TurnViews::read(&*log).await.unwrap());
         assert_eq!(pending, pending_interactions(&*log).await.unwrap());
         assert_eq!(pending.len(), 1);
     }
@@ -1052,7 +1058,7 @@ mod tests {
         )
         .await;
 
-        let turns = SessionTurns::read(&*log).await.unwrap();
+        let turns = TurnViews::read(&*log).await.unwrap();
         assert_eq!(turns.turns.len(), 1);
         let turn = turns.latest().unwrap();
         assert_eq!(turn.turn_id, "t1");
@@ -1074,7 +1080,7 @@ mod tests {
             )],
         )
         .await;
-        let turns = SessionTurns::read(&*log).await.unwrap();
+        let turns = TurnViews::read(&*log).await.unwrap();
         // Interrupted turns are not terminal: they can still be resumed.
         assert_eq!(turns.latest().unwrap().status, "interrupted");
         assert!(!turns.latest().unwrap().ended());
@@ -1099,7 +1105,7 @@ mod tests {
             ],
         )
         .await;
-        let turns = SessionTurns::read(&*log).await.unwrap();
+        let turns = TurnViews::read(&*log).await.unwrap();
         assert!(turns.latest().unwrap().ended());
     }
 
@@ -1128,7 +1134,7 @@ mod tests {
             ],
         )
         .await;
-        let turns = SessionTurns::read(&*log).await.unwrap();
+        let turns = TurnViews::read(&*log).await.unwrap();
         assert!(turns.latest().unwrap().ended());
     }
 
@@ -1158,7 +1164,7 @@ mod tests {
             ],
         )
         .await;
-        let turns = SessionTurns::read(&*log).await.unwrap();
+        let turns = TurnViews::read(&*log).await.unwrap();
         assert_eq!(turns.turns.len(), 1);
         assert_eq!(turns.latest().unwrap().turn_id, "t2");
     }
@@ -1243,7 +1249,7 @@ mod tests {
         )
         .await;
 
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert_eq!(projection.as_of_seq, 3);
         assert!(projection.uncertain_tool_calls.contains("call-1"));
         assert!(projection.active_runs.contains("run-1"));
@@ -1290,7 +1296,7 @@ mod tests {
         )
         .await;
 
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert!(projection.uncertain_tool_calls.is_empty());
         assert!(projection.active_runs.is_empty());
         // The recovered state carries a synthetic tool-result message for the committed result.
@@ -1333,7 +1339,7 @@ mod tests {
         )
         .await;
 
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert_eq!(projection.as_of_seq, 2);
         assert!(projection.uncertain_tool_calls.is_empty());
     }
@@ -1367,7 +1373,7 @@ mod tests {
         )
         .await;
 
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert!(
             projection.uncertain_tool_calls.contains("call-crash"),
             "{:?}",
@@ -1421,7 +1427,7 @@ mod tests {
         )
         .await;
 
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert!(
             projection.uncertain_tool_calls.is_empty(),
             "{:?}",
@@ -1457,7 +1463,7 @@ mod tests {
             ],
         )
         .await;
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert!(projection.active_runs.is_empty());
         assert!(projection.uncertain_tool_calls.is_empty());
     }
@@ -1662,9 +1668,9 @@ mod tests {
     /// P1-14: one corrupt segment must not make the whole session unopenable.
     #[tokio::test]
     async fn a_corrupt_segment_still_opens_the_session_from_the_last_checkpoint() {
-        let storage = Arc::new(MemorySessionStorage::new());
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(
-            Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
+        let storage = Arc::new(MemoryJournalStorage::new());
+        let log: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(
+            Arc::clone(&storage) as Arc<dyn AtomicJournalStorage>,
             "s1",
         ));
         let writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
@@ -1738,7 +1744,7 @@ mod tests {
 
         // Recovery replays the readable suffix — which is where the latest checkpoint lives —
         // and the projection still continues the committed chain.
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert_eq!(projection.as_of_seq, head.seq);
         let restored = projection
             .restore()
@@ -1755,7 +1761,7 @@ mod tests {
         let unreadable = serde_json::json!({ "verification": { "not": "a report" } }).to_string();
 
         let (_storage, log, writer) = journal().await;
-        let optional = SessionEvent::new(
+        let optional = JournalEvent::new(
             "e1",
             1,
             0,
@@ -1767,11 +1773,11 @@ mod tests {
         )
         .unwrap();
         commit(&*log, &writer, "b1", &[optional]).await;
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert!(projection.verifications.is_empty());
 
         let (_storage, log, writer) = journal().await;
-        let required = SessionEvent::new(
+        let required = JournalEvent::new(
             "e1",
             1,
             0,
@@ -1783,6 +1789,6 @@ mod tests {
         )
         .unwrap();
         commit(&*log, &writer, "b1", &[required]).await;
-        assert!(SessionProjection::read(&*log).await.is_err());
+        assert!(JournalProjection::read(&*log).await.is_err());
     }
 }

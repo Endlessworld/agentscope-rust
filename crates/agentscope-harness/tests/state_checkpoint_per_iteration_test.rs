@@ -10,9 +10,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use agentscope_core::journal::SessionHistoryMode;
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
-use agentscope_core::session::SessionHistoryMode;
 use agentscope_core::state::AgentStateStore;
 use agentscope_core::tool::Toolkit;
 use agentscope_harness::agent::HarnessAgent;

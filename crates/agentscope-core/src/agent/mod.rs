@@ -2,12 +2,26 @@
 
 pub mod agent_traits;
 pub mod capability;
+pub mod execution_host;
+pub mod execution_position;
 pub mod failover;
 pub mod lifecycle;
 pub mod react_agent;
 pub mod run;
+pub mod run_outcome;
 pub mod runtime_context;
 pub mod stream_options;
+mod thread_key;
+
+pub use execution_host::{
+    execution_host, AgentExecutionHost, ExecutionBoundary, FinishContinuation,
+    EXECUTION_HOST_CONTEXT_KEY,
+};
+pub use execution_position::{
+    execution_position, AgentExecutionPosition, EXECUTION_POSITION_CONTEXT_KEY,
+};
+pub use run_outcome::{RunOutcome, RunOutcomeStatus};
+pub use thread_key::ThreadKey;
 
 pub use agent_traits::{Agent, CallableAgent, ObservableAgent};
 pub use capability::{

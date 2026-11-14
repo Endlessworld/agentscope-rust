@@ -1166,7 +1166,7 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         .workspace(workspace)
         // 会话历史以 **journal 为唯一权威**（对齐 Java native session）：`session_id` 既是
         // journal 的会话键，也是恢复键。进程重启后客户端用同一 sessionId 发
-        // `session/load|resume`，运行时用 `SessionProjection::restore()` 从已提交事实恢复
+        // `session/load|resume`，运行时用 `JournalProjection::restore()` 从已提交事实恢复
         // 对话历史 / task / plan 状态，因此不再需要额外挂 `AgentStateStore`（那是 Java 的
         // legacy 模式和沙箱元数据才用的第二条轨）。
         .session_id(session_id)

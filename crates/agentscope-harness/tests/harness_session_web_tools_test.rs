@@ -2,15 +2,15 @@
 //! and `WebFetchTool` / `WebSearchTool`.
 //!
 //! The session tools read the native journal, so these tests seed an in-memory
-//! `SessionLogStore` directly (no workspace files, no `sessions.json`).
+//! `ThreadJournalStore` directly (no workspace files, no `sessions.json`).
 
 use std::sync::Arc;
 
-use agentscope_core::agent::RuntimeContext;
-use agentscope_core::message::{JsonMap, Msg};
-use agentscope_core::session::{
-    InMemorySessionLogStore, SessionKey, SessionLogStore, SessionRecorder,
+use agentscope_core::agent::{RuntimeContext, ThreadKey};
+use agentscope_core::journal::{
+    InMemoryThreadJournalStore, InvocationRecorder, ThreadJournalStore,
 };
+use agentscope_core::message::{JsonMap, Msg};
 use agentscope_core::state::AgentState;
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 
@@ -39,11 +39,11 @@ fn args(value: serde_json::Value) -> JsonMap {
 }
 
 /// Commits a journal for `researcher`/`s1` holding an example conversation.
-async fn seed_session(store: &InMemorySessionLogStore) {
+async fn seed_session(store: &InMemoryThreadJournalStore) {
     let context = ctx();
-    let key = SessionKey::new(Some(USER), "researcher", "s1").unwrap();
+    let key = ThreadKey::new(Some(USER), "researcher", "s1").unwrap();
     let log = store.open(&key, &context).await.unwrap();
-    let recorder = SessionRecorder::open(log, None).await.unwrap();
+    let recorder = InvocationRecorder::open(log, None).await.unwrap();
     let mut state = AgentState::builder().session_id("s1").user_id(USER).build();
     state
         .context
@@ -55,8 +55,8 @@ async fn seed_session(store: &InMemorySessionLogStore) {
     recorder.finish(&state, "completed").await.unwrap();
 }
 
-async fn seeded_store() -> Arc<dyn SessionLogStore> {
-    let store = InMemorySessionLogStore::new();
+async fn seeded_store() -> Arc<dyn ThreadJournalStore> {
+    let store = InMemoryThreadJournalStore::new();
     seed_session(&store).await;
     Arc::new(store)
 }
@@ -115,11 +115,11 @@ async fn session_history_returns_last_messages() {
 #[tokio::test]
 async fn session_tools_do_not_leak_across_users() {
     // A journal owned by another user must stay invisible to this caller.
-    let store = InMemorySessionLogStore::new();
+    let store = InMemoryThreadJournalStore::new();
     let other = RuntimeContext::new().with_user_id("bob");
-    let key = SessionKey::new(Some("bob"), "researcher", "s1").unwrap();
+    let key = ThreadKey::new(Some("bob"), "researcher", "s1").unwrap();
     let log = store.open(&key, &other).await.unwrap();
-    let recorder = SessionRecorder::open(log, None).await.unwrap();
+    let recorder = InvocationRecorder::open(log, None).await.unwrap();
     let mut state = AgentState::builder()
         .session_id("s1")
         .user_id("bob")
@@ -129,7 +129,7 @@ async fn session_tools_do_not_leak_across_users() {
     recorder.finish(&state, "completed").await.unwrap();
 
     let tool =
-        SessionSearchTool::new(Arc::new(store) as Arc<dyn SessionLogStore>).with_context(ctx());
+        SessionSearchTool::new(Arc::new(store) as Arc<dyn ThreadJournalStore>).with_context(ctx());
     let out = call_text(&tool, args(serde_json::json!({"query": "qubits"}))).await;
     assert!(out.contains("No matches found"), "got: {out}");
 }

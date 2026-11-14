@@ -60,7 +60,7 @@ pub async fn auxiliary(
     // records when the caller supplied a context that carries a session recorder.
     let model = match ctx {
         Some(ctx) => {
-            agentscope_core::session::SessionModels::wrap(Arc::clone(&model), ctx, "SUMMARY")
+            agentscope_core::journal::RecordedModels::wrap(Arc::clone(&model), ctx, "SUMMARY")
         }
         None => model,
     };

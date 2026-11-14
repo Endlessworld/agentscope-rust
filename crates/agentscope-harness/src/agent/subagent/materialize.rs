@@ -608,7 +608,7 @@ impl SubagentSessionRepair for HarnessSessionRepair {
             let Ok(log) = self.agent.session_log(&RuntimeContext::default()).await else {
                 return Ok(false);
             };
-            let turns = agentscope_core::session::SessionTurns::read(&*log).await?;
+            let turns = agentscope_core::journal::TurnViews::read(&*log).await?;
             let Some(latest) = turns.latest() else {
                 return Ok(false);
             };
@@ -616,7 +616,7 @@ impl SubagentSessionRepair for HarnessSessionRepair {
                 return Ok(false);
             }
             let turn_id = latest.turn_id.clone();
-            agentscope_core::session::abandon_turn(log, &turn_id).await
+            agentscope_core::journal::abandon_turn(log, &turn_id).await
         })
     }
 }
@@ -812,13 +812,15 @@ mod tests {
 
     #[tokio::test]
     async fn session_repair_settles_a_turn_aborted_mid_tool() {
-        use agentscope_core::session::{InMemorySessionLogStore, SessionEvent, SessionLogStore};
+        use agentscope_core::journal::{
+            InMemoryThreadJournalStore, JournalEvent, ThreadJournalStore,
+        };
 
         let dir =
             std::env::temp_dir().join(format!("agentscope_subagent_repair_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let store: Arc<dyn SessionLogStore> = Arc::new(InMemorySessionLogStore::new());
+        let store: Arc<dyn ThreadJournalStore> = Arc::new(InMemoryThreadJournalStore::new());
         let agent = Arc::new(
             HarnessAgent::builder()
                 .name("child")
@@ -836,8 +838,8 @@ mod tests {
         // result.
         let state = agentscope_core::state::AgentState::builder().build();
         let checkpoint = serde_json::json!({ "stateJson": state.to_json().unwrap() });
-        let events: Vec<SessionEvent> = vec![
-            SessionEvent::new(
+        let events: Vec<JournalEvent> = vec![
+            JournalEvent::new(
                 "e1",
                 1,
                 0,
@@ -848,7 +850,7 @@ mod tests {
                 checkpoint.to_string(),
             )
             .unwrap(),
-            SessionEvent::new(
+            JournalEvent::new(
                 "e2",
                 2,
                 0,
@@ -859,7 +861,7 @@ mod tests {
                 "{}",
             )
             .unwrap(),
-            SessionEvent::new(
+            JournalEvent::new(
                 "e3",
                 3,
                 0,

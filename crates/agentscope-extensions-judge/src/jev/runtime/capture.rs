@@ -10,7 +10,7 @@
 //! `fix(jev): classify supervision outcomes from agent results` (Java `6ec57d245`) the outcome comes
 //! from the agent's final result:
 //!
-//! * `SessionRecorder.outcome(generateReason)` (ported as [`agentscope_core::session::outcome`])
+//! * `InvocationRecorder.outcome(generateReason)` (ported as [`agentscope_core::journal::outcome`])
 //!   decides `failed` / `interrupted` / `suspended` / `completed`;
 //! * a suspended result keeps `worker_active` true, so a pause while waiting for confirmation or a
 //!   suspended tool can never make the task eligible for completion review;
@@ -23,8 +23,8 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use agentscope_core::event::{AgentEvent, EventData};
+use agentscope_core::journal::outcome;
 use agentscope_core::message::{ContentBlock, Msg};
-use agentscope_core::session::outcome;
 
 use crate::jev::supervision::evidence::SupervisionEvidence;
 use crate::jev::supervision::middleware::append_tail;

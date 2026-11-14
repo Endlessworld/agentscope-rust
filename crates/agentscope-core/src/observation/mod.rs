@@ -13,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::RuntimeContext;
 use crate::error::Result;
+use crate::journal::InvocationRecorder;
 use crate::message::{ToolExecutionDetails, ToolResultBlock, ToolResultState, ToolUseBlock};
-use crate::session::SessionRecorder;
 
 /// Runtime-context key carrying a caller-supplied [`ActionObserver`].
 pub const OBSERVER_CONTEXT_KEY: &str = "agentscope.action.observer";
@@ -175,11 +175,11 @@ impl std::fmt::Debug for ObserverHandle {
 
 /// An observer that records observations into the session journal.
 pub struct SessionActionObserver {
-    recorder: Arc<SessionRecorder>,
+    recorder: Arc<InvocationRecorder>,
 }
 
 impl SessionActionObserver {
-    pub fn new(recorder: Arc<SessionRecorder>) -> Self {
+    pub fn new(recorder: Arc<InvocationRecorder>) -> Self {
         Self { recorder }
     }
 }
@@ -237,7 +237,7 @@ impl ActionObserver for SessionActionObserver {
 /// Resolves the observer for this execution: the session recorder when one is attached,
 /// otherwise a caller-supplied observer from the runtime context.
 fn observer_for(ctx: &RuntimeContext) -> Option<Box<dyn ActionObserver>> {
-    if let Some(recorder) = SessionRecorder::from_context(ctx) {
+    if let Some(recorder) = InvocationRecorder::from_context(ctx) {
         return Some(Box::new(SessionActionObserver::new(recorder)));
     }
     ctx.extension::<ObserverHandle>(OBSERVER_CONTEXT_KEY)
@@ -316,11 +316,12 @@ fn error_kind(error: &crate::error::Error) -> String {
         crate::error::Error::Model(_) => "Model".into(),
         crate::error::Error::Tool(_) => "Tool".into(),
         crate::error::Error::ToolSuspended(_) => "ToolSuspended".into(),
+        crate::error::Error::HostPaused => "HostPaused".into(),
         crate::error::Error::Agent(_) => "Agent".into(),
         crate::error::Error::Interrupted(_) => "Interrupted".into(),
         crate::error::Error::Cancelled(_) => "Cancelled".into(),
         crate::error::Error::ShuttingDown(_) => "ShuttingDown".into(),
-        crate::error::Error::Session(_) => "Session".into(),
+        crate::error::Error::Journal(_) => "Journal".into(),
         crate::error::Error::ActionObservation(_) => "ActionObservation".into(),
         crate::error::Error::ActionDispatch(_) => "ActionDispatch".into(),
         crate::error::Error::ConcurrentSessionModification { .. } => {
@@ -343,10 +344,10 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::message::{ContentBlock, TextBlock};
-    use crate::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionLog,
+    use crate::journal::{
+        AtomicJournalStorage, AtomicThreadJournal, MemoryJournalStorage, ThreadJournal,
     };
+    use crate::message::{ContentBlock, TextBlock};
 
     #[derive(Default)]
     struct RecordingObserver {
@@ -377,7 +378,7 @@ mod tests {
             _observation: &ActionObservation,
             _result: Option<&ToolResultBlock>,
         ) -> Result<()> {
-            Err(crate::error::Error::Session("cannot persist".into()))
+            Err(crate::error::Error::Journal("cannot persist".into()))
         }
     }
 
@@ -395,7 +396,7 @@ mod tests {
             if observation.status == ActionStatus::Started {
                 return Ok(());
             }
-            Err(crate::error::Error::Session("cannot persist".into()))
+            Err(crate::error::Error::Journal("cannot persist".into()))
         }
     }
 
@@ -535,15 +536,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_recorder_backed_observer_writes_action_and_decision_facts() {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(storage, "s1"));
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        let log: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(storage, "s1"));
         let recorder = Arc::new(
-            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            InvocationRecorder::open(Arc::clone(&log), Some("t1"))
                 .await
                 .unwrap(),
         );
         let ctx = RuntimeContext::new()
-            .with_extension_arc(crate::session::RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
+            .with_extension_arc(crate::journal::RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
 
         observe(&ctx, &call(), async {
             Ok(ToolResultBlock::new("x", "y", vec![]).with_state(ToolResultState::Denied))

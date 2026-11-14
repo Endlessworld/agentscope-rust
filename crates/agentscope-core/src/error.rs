@@ -34,6 +34,13 @@ pub enum Error {
     #[error("Tool execution suspended: {0}")]
     ToolSuspended(String),
 
+    /// The execution host paused this invocation at a recoverable boundary.
+    ///
+    /// This is control flow, not a failure: the invocation is recorded as suspended and may be
+    /// resumed from its committed position. Never convert it into a tool error result.
+    #[error("Invocation paused by execution host")]
+    HostPaused,
+
     /// Agent execution error.
     #[error("Agent error: {0}")]
     Agent(String),
@@ -50,12 +57,12 @@ pub enum Error {
     #[error("Cancelled: {0}")]
     Cancelled(String),
 
-    /// Session journal persistence failure.
+    /// Journal persistence failure.
     ///
     /// Persistence failures must propagate and must never become a successful
-    /// model/tool result. Mirrors Java `SessionLogException`.
+    /// model/tool result. Mirrors Java `JournalException`.
     #[error("{0}")]
-    Session(String),
+    Journal(String),
 
     /// An action observation could not be acknowledged.
     ///

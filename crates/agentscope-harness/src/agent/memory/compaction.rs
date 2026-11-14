@@ -666,7 +666,7 @@ impl ConversationCompactor {
         config: &CompactionConfig,
         agent_id: &str,
         session_id: &str,
-        recorder: Option<&std::sync::Arc<agentscope_core::session::SessionRecorder>>,
+        recorder: Option<&std::sync::Arc<agentscope_core::journal::InvocationRecorder>>,
     ) -> agentscope_core::error::Result<(Option<Vec<Msg>>, CompactionMetrics)> {
         self.compact_if_needed_with_metrics_observed(
             conversation,
@@ -691,7 +691,7 @@ impl ConversationCompactor {
         config: &CompactionConfig,
         agent_id: &str,
         session_id: &str,
-        recorder: Option<&std::sync::Arc<agentscope_core::session::SessionRecorder>>,
+        recorder: Option<&std::sync::Arc<agentscope_core::journal::InvocationRecorder>>,
         observed_tokens: Option<usize>,
     ) -> agentscope_core::error::Result<(Option<Vec<Msg>>, CompactionMetrics)> {
         let started = std::time::Instant::now();

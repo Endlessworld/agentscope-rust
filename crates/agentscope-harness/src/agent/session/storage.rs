@@ -1,15 +1,16 @@
-//! Session storage backends, mirroring `LocalSessionStorage` / `StoreSessionStorage`.
+//! Session storage backends, mirroring `LocalSessionStorage` / `StoreJournalStorage`.
 //!
 //! The journal runtime never writes through model-facing filesystem tools: a session log is
 //! runtime state, not workspace material the model may edit. These backends therefore live
-//! under their own namespace and expose only the narrow [`AtomicSessionStorage`] capability.
+//! under their own namespace and expose only the narrow [`AtomicJournalStorage`] capability.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::RuntimeContext;
-use agentscope_core::session::{
-    AtomicSessionStorage, SessionKey, SessionLog, SessionLogStore, StorageValue,
+use agentscope_core::agent::ThreadKey;
+use agentscope_core::journal::{
+    AtomicJournalStorage, StorageValue, ThreadJournal, ThreadJournalStore,
 };
 use async_trait::async_trait;
 
@@ -22,14 +23,14 @@ use crate::filesystem::Filesystem;
 /// within this process: the journal's lease heartbeat renews `head.json` while a run's flush
 /// commits the same head, and without that serialization both writers passed the version
 /// check before either wrote, so the later write resurrected the older sequence number.
-pub struct WorkspaceSessionStorage {
+pub struct WorkspaceJournalStorage {
     fs: Arc<dyn Filesystem>,
     /// One asynchronous lock per value path, so the read-version → write-value → write-version
     /// sequence cannot interleave with another compare-and-set on that path.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
-impl WorkspaceSessionStorage {
+impl WorkspaceJournalStorage {
     pub fn new(fs: Arc<dyn Filesystem>) -> Self {
         Self {
             fs,
@@ -226,7 +227,7 @@ impl WorkspaceSessionStorage {
 }
 
 #[async_trait]
-impl AtomicSessionStorage for WorkspaceSessionStorage {
+impl AtomicJournalStorage for WorkspaceJournalStorage {
     async fn read(&self, path: &str) -> crate::Result<Option<StorageValue>> {
         let ctx = RuntimeContext::new();
         if !self.fs.exists(&ctx, path).await? {
@@ -326,21 +327,21 @@ impl AtomicSessionStorage for WorkspaceSessionStorage {
 
 /// Opens journals under a filesystem root, one sub-tree per logical session.
 #[derive(Clone)]
-pub struct WorkspaceSessionLogStore {
-    storage: Arc<WorkspaceSessionStorage>,
+pub struct WorkspaceThreadJournalStore {
+    storage: Arc<WorkspaceJournalStorage>,
 }
 
-impl std::fmt::Debug for WorkspaceSessionLogStore {
+impl std::fmt::Debug for WorkspaceThreadJournalStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("WorkspaceSessionLogStore")
+        f.write_str("WorkspaceThreadJournalStore")
     }
 }
 
-impl WorkspaceSessionLogStore {
+impl WorkspaceThreadJournalStore {
     /// Creates a store writing under the filesystem's default namespace.
     pub fn new(fs: Arc<dyn Filesystem>) -> Self {
         Self {
-            storage: Arc::new(WorkspaceSessionStorage::new(fs)),
+            storage: Arc::new(WorkspaceJournalStorage::new(fs)),
         }
     }
 
@@ -349,7 +350,7 @@ impl WorkspaceSessionLogStore {
     ///
     /// The fallback is deliberately not a migration: copying a live journal would fork it
     /// (two writers, two heads). A session written by an older build simply stays where it is.
-    async fn journal_prefix(&self, key: &SessionKey) -> String {
+    async fn journal_prefix(&self, key: &ThreadKey) -> String {
         let current = key.storage_path();
         if self.has_journal(&current).await {
             return current;
@@ -382,14 +383,14 @@ impl WorkspaceSessionLogStore {
         user_path: &str,
         agent_id: &str,
         decoded_user: Option<&str>,
-        keys: &mut Vec<SessionKey>,
+        keys: &mut Vec<ThreadKey>,
     ) -> crate::Result<()> {
         for session_path in self.storage.list_dirs(user_path).await? {
             let Some(session_id) = decode_component(session_path.rsplit('/').next().unwrap_or(""))
             else {
                 continue;
             };
-            if let Ok(key) = SessionKey::new(decoded_user.map(str::to_string), agent_id, session_id)
+            if let Ok(key) = ThreadKey::new(decoded_user.map(str::to_string), agent_id, session_id)
             {
                 keys.push(key);
             }
@@ -404,20 +405,22 @@ pub(crate) const SESSION_ROOT: &str = ".agentscope/sessions";
 const LEGACY_SESSION_ROOT: &str = "agents";
 
 #[async_trait]
-impl SessionLogStore for WorkspaceSessionLogStore {
+impl ThreadJournalStore for WorkspaceThreadJournalStore {
     async fn open(
         &self,
-        key: &SessionKey,
+        key: &ThreadKey,
         _context: &RuntimeContext,
-    ) -> crate::Result<Arc<dyn SessionLog>> {
+    ) -> crate::Result<Arc<dyn ThreadJournal>> {
         let prefix = self.journal_prefix(key).await;
-        Ok(Arc::new(agentscope_core::session::JournalSessionLog::new(
-            Arc::clone(&self.storage) as Arc<dyn AtomicSessionStorage>,
-            prefix,
-        )))
+        Ok(Arc::new(
+            agentscope_core::journal::AtomicThreadJournal::new(
+                Arc::clone(&self.storage) as Arc<dyn AtomicJournalStorage>,
+                prefix,
+            ),
+        ))
     }
 
-    async fn list(&self, context: &RuntimeContext) -> crate::Result<Vec<SessionKey>> {
+    async fn list(&self, context: &RuntimeContext) -> crate::Result<Vec<ThreadKey>> {
         let user_id = context.user_id();
         let mut keys = Vec::new();
         // Current layout: `.agentscope/sessions/<agent>/<user>/<session>`.
@@ -477,7 +480,7 @@ impl SessionLogStore for WorkspaceSessionLogStore {
     /// leaving it behind would keep the session discoverable after the client deleted it. Both
     /// locations hold nothing but the session's own subtree, so removing the prefix is the whole
     /// deletion.
-    async fn delete(&self, key: &SessionKey) -> crate::Result<()> {
+    async fn delete(&self, key: &ThreadKey) -> crate::Result<()> {
         let ctx = RuntimeContext::new();
         for prefix in [key.storage_path(), key.legacy_storage_path()] {
             if !self.storage.fs.exists(&ctx, &prefix).await? {
@@ -490,7 +493,7 @@ impl SessionLogStore for WorkspaceSessionLogStore {
     }
 }
 
-/// Decodes the `s_<base64url>` component produced by [`SessionKey::storage_path`].
+/// Decodes the `s_<base64url>` component produced by [`ThreadKey::storage_path`].
 fn decode_component(component: &str) -> Option<String> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
@@ -503,11 +506,11 @@ fn decode_component(component: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::filesystem::LocalFilesystem;
-    use agentscope_core::session::JournalSessionLog;
+    use agentscope_core::journal::AtomicThreadJournal;
 
     /// A minimal committed event for storage tests.
-    fn event(seq: u64, event_type: &str) -> agentscope_core::session::SessionEvent {
-        agentscope_core::session::SessionEvent::new(
+    fn event(seq: u64, event_type: &str) -> agentscope_core::journal::JournalEvent {
+        agentscope_core::journal::JournalEvent::new(
             format!("e{seq}"),
             seq,
             0,
@@ -532,7 +535,7 @@ mod tests {
     async fn storage_round_trips_and_enforces_versions() {
         let dir = temp_dir("cas");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let storage = WorkspaceSessionStorage::new(fs);
+        let storage = WorkspaceJournalStorage::new(fs);
 
         assert!(storage.read("s1/head.json").await.unwrap().is_none());
         // Create-if-absent succeeds, then reports version 1.
@@ -574,7 +577,7 @@ mod tests {
         // second instance stands in for the other process here.
         let dir = temp_dir("xproc");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let storage = Arc::new(WorkspaceSessionStorage::new(Arc::clone(&fs)));
+        let storage = Arc::new(WorkspaceJournalStorage::new(Arc::clone(&fs)));
         let ctx = RuntimeContext::new();
 
         // The other process holds the lock.
@@ -625,7 +628,7 @@ mod tests {
 
         let dir = temp_dir("atomic");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let storage = Arc::new(WorkspaceSessionStorage::new(fs));
+        let storage = Arc::new(WorkspaceJournalStorage::new(fs));
         storage
             .compare_and_set("s1/head.json", 0, b"0")
             .await
@@ -674,7 +677,7 @@ mod tests {
         // `run/end` was lost, and the host auto-resumed a turn that had already finished.
         let dir = temp_dir("cas_race");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let storage = Arc::new(WorkspaceSessionStorage::new(fs));
+        let storage = Arc::new(WorkspaceJournalStorage::new(fs));
 
         for round in 0..32u32 {
             let path = format!("s{round}/head.json");
@@ -719,7 +722,7 @@ mod tests {
         // must still be idempotent when the bytes match.
         let dir = temp_dir("immutable");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let storage = WorkspaceSessionStorage::new(Arc::clone(&fs));
+        let storage = WorkspaceJournalStorage::new(Arc::clone(&fs));
         let ctx = RuntimeContext::new();
 
         assert!(storage
@@ -751,7 +754,7 @@ mod tests {
         // file.)
         let dir = temp_dir("immutable_blobs");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let storage = WorkspaceSessionStorage::new(Arc::clone(&fs));
+        let storage = WorkspaceJournalStorage::new(Arc::clone(&fs));
         let ctx = RuntimeContext::new();
 
         let path = "s1/blobs/deadbeef";
@@ -771,7 +774,7 @@ mod tests {
         // able to delete them again.
         let dir = temp_dir("snapshot_objects");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let storage = WorkspaceSessionStorage::new(Arc::clone(&fs));
+        let storage = WorkspaceJournalStorage::new(Arc::clone(&fs));
         let ctx = RuntimeContext::new();
 
         let object = "s1/snapshots/deadbeef.json";
@@ -805,11 +808,11 @@ mod tests {
         // store instance, read it back through a fresh one.
         let dir = temp_dir("snapshot_reopen");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let key = SessionKey::new(Some("alice"), "agent", "s1").unwrap();
+        let key = ThreadKey::new(Some("alice"), "agent", "s1").unwrap();
         let ctx = RuntimeContext::new().with_user_id("alice");
-        let retention = agentscope_core::session::SessionRetention::OFF;
+        let retention = agentscope_core::journal::JournalRetention::OFF;
         {
-            let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+            let store = WorkspaceThreadJournalStore::new(Arc::clone(&fs));
             let log = store.open(&key, &ctx).await.unwrap();
             let writer = log
                 .acquire("run-1", std::time::Duration::from_secs(60))
@@ -817,7 +820,7 @@ mod tests {
                 .unwrap();
             let mut message = agentscope_core::message::Msg::assistant("hello");
             message.id = "a1".into();
-            let event = agentscope_core::session::SessionEvent::new(
+            let event = agentscope_core::journal::JournalEvent::new(
                 "e1",
                 1,
                 0,
@@ -835,7 +838,7 @@ mod tests {
             );
             log.release(&writer).await.unwrap();
         }
-        let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+        let store = WorkspaceThreadJournalStore::new(Arc::clone(&fs));
         let reopened = store.open(&key, &ctx).await.unwrap();
         let snapshot = reopened
             .snapshot()
@@ -846,7 +849,7 @@ mod tests {
         assert_eq!(snapshot.transcript.messages.len(), 1);
         assert_eq!(snapshot.transcript.messages[0].text_content(), "hello");
         // The same views come out of a cold read, which now starts at the snapshot.
-        let transcript = agentscope_core::session::transcript(&*reopened)
+        let transcript = agentscope_core::journal::transcript(&*reopened)
             .await
             .unwrap();
         assert_eq!(transcript.messages.len(), 1);
@@ -857,17 +860,17 @@ mod tests {
     async fn a_journal_persists_across_store_instances() {
         let dir = temp_dir("reopen");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let key = SessionKey::new(Some("alice"), "agent", "s1").unwrap();
+        let key = ThreadKey::new(Some("alice"), "agent", "s1").unwrap();
         let ctx = RuntimeContext::new().with_user_id("alice");
 
         {
-            let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+            let store = WorkspaceThreadJournalStore::new(Arc::clone(&fs));
             let log = store.open(&key, &ctx).await.unwrap();
             let writer = log
                 .acquire("run-1", std::time::Duration::from_secs(60))
                 .await
                 .unwrap();
-            let event = agentscope_core::session::SessionEvent::new(
+            let event = agentscope_core::journal::JournalEvent::new(
                 "e1",
                 1,
                 0,
@@ -883,7 +886,7 @@ mod tests {
         }
 
         // A fresh process (new store) recovers the committed prefix.
-        let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+        let store = WorkspaceThreadJournalStore::new(Arc::clone(&fs));
         let log = store.open(&key, &ctx).await.unwrap();
         assert_eq!(log.head().await.unwrap().seq, 1);
         assert_eq!(log.scan(0, 1).await.unwrap().len(), 1);
@@ -898,7 +901,7 @@ mod tests {
 
     #[test]
     fn storage_components_round_trip() {
-        let key = SessionKey::new(Some("alice"), "agent/x", "s 1").unwrap();
+        let key = ThreadKey::new(Some("alice"), "agent/x", "s 1").unwrap();
         let path = key.storage_path();
         // `.agentscope/sessions/<agent>/<user>/<session>`
         let agent_component = path.split('/').nth(2).unwrap();
@@ -914,9 +917,9 @@ mod tests {
     async fn a_new_session_is_written_under_the_agentscope_directory() {
         let dir = temp_dir("new_layout");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+        let store = WorkspaceThreadJournalStore::new(Arc::clone(&fs));
         let ctx = RuntimeContext::new().with_user_id("alice");
-        let key = SessionKey::new(Some("alice"), "agent", "s1").unwrap();
+        let key = ThreadKey::new(Some("alice"), "agent", "s1").unwrap();
 
         let log = store.open(&key, &ctx).await.unwrap();
         let writer = log
@@ -948,13 +951,13 @@ mod tests {
         let dir = temp_dir("delete_journal");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
         let ctx = RuntimeContext::new().with_user_id("alice");
-        let key = SessionKey::new(Some("alice"), "agent", "s1").unwrap();
+        let key = ThreadKey::new(Some("alice"), "agent", "s1").unwrap();
 
         // One journal where this build writes, one left behind by an older build.
         for prefix in [key.storage_path(), key.legacy_storage_path()] {
-            let storage: Arc<dyn AtomicSessionStorage> =
-                Arc::new(WorkspaceSessionStorage::new(Arc::clone(&fs)));
-            let log = JournalSessionLog::new(storage, prefix);
+            let storage: Arc<dyn AtomicJournalStorage> =
+                Arc::new(WorkspaceJournalStorage::new(Arc::clone(&fs)));
+            let log = AtomicThreadJournal::new(storage, prefix);
             let writer = log
                 .acquire("run-1", std::time::Duration::from_secs(60))
                 .await
@@ -965,7 +968,7 @@ mod tests {
             log.release(&writer).await.unwrap();
         }
 
-        let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+        let store = WorkspaceThreadJournalStore::new(Arc::clone(&fs));
         assert_eq!(store.list(&ctx).await.unwrap(), vec![key.clone()]);
 
         store.delete(&key).await.unwrap();
@@ -988,13 +991,13 @@ mod tests {
         let dir = temp_dir("legacy_fallback");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
         let ctx = RuntimeContext::new().with_user_id("alice");
-        let key = SessionKey::new(Some("alice"), "agent", "s1").unwrap();
+        let key = ThreadKey::new(Some("alice"), "agent", "s1").unwrap();
 
         let legacy = key.legacy_storage_path();
         {
-            let storage: Arc<dyn AtomicSessionStorage> =
-                Arc::new(WorkspaceSessionStorage::new(Arc::clone(&fs)));
-            let log = JournalSessionLog::new(storage, legacy.clone());
+            let storage: Arc<dyn AtomicJournalStorage> =
+                Arc::new(WorkspaceJournalStorage::new(Arc::clone(&fs)));
+            let log = AtomicThreadJournal::new(storage, legacy.clone());
             let writer = log
                 .acquire("run-1", std::time::Duration::from_secs(60))
                 .await
@@ -1005,7 +1008,7 @@ mod tests {
             log.release(&writer).await.unwrap();
         }
 
-        let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+        let store = WorkspaceThreadJournalStore::new(Arc::clone(&fs));
         let log = store.open(&key, &ctx).await.unwrap();
         assert_eq!(log.head().await.unwrap().seq, 1);
         assert_eq!(log.scan(0, 1).await.unwrap().len(), 1);
@@ -1035,11 +1038,11 @@ mod tests {
         let dir = temp_dir("both_layouts");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
         let ctx = RuntimeContext::new().with_user_id("alice");
-        let current = SessionKey::new(Some("alice"), "agent", "new-one").unwrap();
-        let legacy = SessionKey::new(Some("alice"), "agent", "old-one").unwrap();
+        let current = ThreadKey::new(Some("alice"), "agent", "new-one").unwrap();
+        let legacy = ThreadKey::new(Some("alice"), "agent", "old-one").unwrap();
 
         // One session in the current layout…
-        let store = WorkspaceSessionLogStore::new(Arc::clone(&fs));
+        let store = WorkspaceThreadJournalStore::new(Arc::clone(&fs));
         let log = store.open(&current, &ctx).await.unwrap();
         let writer = log
             .acquire("run-1", std::time::Duration::from_secs(60))
@@ -1052,9 +1055,9 @@ mod tests {
 
         // …and one only in the legacy tree.
         {
-            let storage: Arc<dyn AtomicSessionStorage> =
-                Arc::new(WorkspaceSessionStorage::new(Arc::clone(&fs)));
-            let log = JournalSessionLog::new(storage, legacy.legacy_storage_path());
+            let storage: Arc<dyn AtomicJournalStorage> =
+                Arc::new(WorkspaceJournalStorage::new(Arc::clone(&fs)));
+            let log = AtomicThreadJournal::new(storage, legacy.legacy_storage_path());
             let writer = log
                 .acquire("run-1", std::time::Duration::from_secs(60))
                 .await
@@ -1079,8 +1082,8 @@ mod tests {
         // Compile-time guard: the store must expose the core journal implementation.
         let dir = temp_dir("type");
         let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(dir.clone()));
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(WorkspaceSessionStorage::new(fs));
-        let _journal = JournalSessionLog::new(storage, "agents/x");
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(WorkspaceJournalStorage::new(fs));
+        let _journal = AtomicThreadJournal::new(storage, "agents/x");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

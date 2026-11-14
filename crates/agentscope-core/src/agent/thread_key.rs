@@ -1,19 +1,19 @@
-//! Logical session identity, mirroring `io.agentscope.core.session.SessionKey`.
+//! Logical session identity, mirroring `io.agentscope.core.session.ThreadKey`.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
-use super::session_error;
+use crate::journal::journal_error;
 
 /// Logical identity; storage namespaces remain the responsibility of the workspace backend.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SessionKey {
+pub struct ThreadKey {
     pub user_id: Option<String>,
     pub agent_id: String,
     pub session_id: String,
 }
 
-impl SessionKey {
+impl ThreadKey {
     /// Creates a key, rejecting empty required identities.
     pub fn new(
         user_id: Option<impl Into<String>>,
@@ -23,7 +23,7 @@ impl SessionKey {
         let agent_id = agent_id.into();
         let session_id = session_id.into();
         if agent_id.trim().is_empty() || session_id.trim().is_empty() {
-            return Err(session_error("Empty session identity"));
+            return Err(journal_error("Empty session identity"));
         }
         Ok(Self {
             user_id: user_id.map(Into::into),
@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn storage_path_encodes_each_component() {
-        let key = SessionKey::new(Some("alice"), "cost-assistant", "conversation/001").unwrap();
+        let key = ThreadKey::new(Some("alice"), "cost-assistant", "conversation/001").unwrap();
         // `s_YWxpY2U` is URL-safe base64 of "alice" without padding.
         assert_eq!(
             key.storage_path(),
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn the_legacy_path_keeps_the_old_layout() {
-        let key = SessionKey::new(Some("alice"), "cost-assistant", "conversation/001").unwrap();
+        let key = ThreadKey::new(Some("alice"), "cost-assistant", "conversation/001").unwrap();
         assert_eq!(
             key.legacy_storage_path(),
             "agents/s_Y29zdC1hc3Npc3RhbnQ/sessions/s_YWxpY2U/s_Y29udmVyc2F0aW9uLzAwMQ"
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn anonymous_user_encodes_empty_string() {
-        let key = SessionKey::new(None::<String>, "agent", "s1").unwrap();
+        let key = ThreadKey::new(None::<String>, "agent", "s1").unwrap();
         assert!(key
             .storage_path()
             .starts_with(".agentscope/sessions/s_YWdlbnQ/s_/s_"));
@@ -104,14 +104,14 @@ mod tests {
 
     #[test]
     fn blank_identity_is_rejected() {
-        assert!(SessionKey::new(None::<String>, "  ", "s1").is_err());
-        assert!(SessionKey::new(None::<String>, "agent", "").is_err());
+        assert!(ThreadKey::new(None::<String>, "  ", "s1").is_err());
+        assert!(ThreadKey::new(None::<String>, "agent", "").is_err());
     }
 
     #[test]
     fn distinct_ids_never_collide_on_path() {
-        let a = SessionKey::new(Some("u"), "agent", "a/b").unwrap();
-        let b = SessionKey::new(Some("u"), "agent", "a%2Fb").unwrap();
+        let a = ThreadKey::new(Some("u"), "agent", "a/b").unwrap();
+        let b = ThreadKey::new(Some("u"), "agent", "a%2Fb").unwrap();
         assert_ne!(a.storage_path(), b.storage_path());
     }
 }

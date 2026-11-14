@@ -1,5 +1,5 @@
 //! Immutable commit chain made visible by one fenced CAS of its head, mirroring
-//! `JournalSessionLog`.
+//! `AtomicThreadJournal`.
 //!
 //! Layout under the journal prefix:
 //!
@@ -8,7 +8,7 @@
 //! head.json                 Head   (seq, epoch, owner, lease, commit id)
 //! commits/<hash>.json       Commit (immutable, checksummed event batch)
 //! blobs/<hash>              Payload spilled for very large events
-//! snapshots/<hash>.json     SessionSnapshot (immutable fold of a prefix)
+//! snapshots/<hash>.json     JournalSnapshot (immutable fold of a prefix)
 //! snapshot.json             SnapshotPointer (latest published snapshot)
 //! snapshot.previous.json    SnapshotPointer (previous one: retention floor)
 //! reclaimed.json            Lowest sequence number still readable, once history was deleted
@@ -25,11 +25,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::snapshot::{
-    hash_hex, object_path, SessionRetention, SessionSnapshot, SnapshotPointer, SNAPSHOT_FORMAT,
+    hash_hex, object_path, JournalRetention, JournalSnapshot, SnapshotPointer, SNAPSHOT_FORMAT,
     SNAPSHOT_POINTER, SNAPSHOT_PREVIOUS,
 };
 use super::{
-    session_error, AtomicSessionStorage, Head, SessionEvent, SessionHeader, SessionLog, Writer,
+    journal_error, AtomicJournalStorage, Head, JournalEvent, SessionHeader, ThreadJournal, Writer,
 };
 
 /// Payloads above this size are spilled to an immutable blob so the commit chain stays small.
@@ -69,28 +69,28 @@ struct Commit {
     first_seq: u64,
     last_seq: u64,
     hash: String,
-    events: Vec<SessionEvent>,
+    events: Vec<JournalEvent>,
     #[serde(default)]
     payload_blobs: BTreeMap<String, String>,
 }
 
-/// A journal backed by [`AtomicSessionStorage`].
-pub struct JournalSessionLog {
-    storage: Arc<dyn AtomicSessionStorage>,
+/// A journal backed by [`AtomicJournalStorage`].
+pub struct AtomicThreadJournal {
+    storage: Arc<dyn AtomicJournalStorage>,
     prefix: String,
 }
 
-impl std::fmt::Debug for JournalSessionLog {
+impl std::fmt::Debug for AtomicThreadJournal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JournalSessionLog")
+        f.debug_struct("AtomicThreadJournal")
             .field("prefix", &self.prefix)
             .finish_non_exhaustive()
     }
 }
 
-impl JournalSessionLog {
+impl AtomicThreadJournal {
     /// Creates a journal rooted at `prefix` in `storage`.
-    pub fn new(storage: Arc<dyn AtomicSessionStorage>, prefix: impl Into<String>) -> Self {
+    pub fn new(storage: Arc<dyn AtomicJournalStorage>, prefix: impl Into<String>) -> Self {
         Self {
             storage,
             prefix: prefix.into(),
@@ -150,10 +150,10 @@ impl JournalSessionLog {
     /// stall. Ownership is only lost when the epoch/owner changed, or the writer was sealed.
     async fn ensure_owned(&self, head: &Head, writer: &Writer) -> crate::error::Result<()> {
         if self.is_sealed(&writer.owner).await? {
-            return Err(session_error("Session writer is permanently sealed"));
+            return Err(journal_error("Session writer is permanently sealed"));
         }
         if head.epoch != writer.epoch || head.owner.as_deref() != Some(writer.owner.as_str()) {
-            return Err(session_error("Session writer ownership expired or fenced"));
+            return Err(journal_error("Session writer ownership expired or fenced"));
         }
         Ok(())
     }
@@ -164,7 +164,7 @@ impl JournalSessionLog {
             .storage
             .read(&path)
             .await?
-            .ok_or_else(|| session_error(format!("Missing committed segment: {id}")))?;
+            .ok_or_else(|| journal_error(format!("Missing committed segment: {id}")))?;
         let commit: Commit = serde_json::from_slice(&stored.bytes)?;
         if !commit.payload_blobs.is_empty() {
             let mut hydrated = Vec::with_capacity(commit.events.len());
@@ -190,13 +190,13 @@ impl JournalSessionLog {
                                 hydrated.push(event.clone());
                                 continue;
                             }
-                            return Err(session_error("Missing or corrupt committed payload blob"));
+                            return Err(journal_error("Missing or corrupt committed payload blob"));
                         };
                         if Self::hash(&payload.bytes) != *blob {
-                            return Err(session_error("Missing or corrupt committed payload blob"));
+                            return Err(journal_error("Missing or corrupt committed payload blob"));
                         }
                         let json = String::from_utf8(payload.bytes)
-                            .map_err(|_| session_error("Committed payload is not UTF-8"))?;
+                            .map_err(|_| journal_error("Committed payload is not UTF-8"))?;
                         hydrated.push(with_payload(event, json));
                     }
                 }
@@ -204,7 +204,7 @@ impl JournalSessionLog {
             let checked = Self::hash(&serde_json::to_vec(&hydrated)?);
             if checked != commit.hash {
                 if !reclaimed {
-                    return Err(session_error("Committed segment checksum mismatch"));
+                    return Err(journal_error("Committed segment checksum mismatch"));
                 }
                 tracing::debug!(
                     commit = %id,
@@ -218,7 +218,7 @@ impl JournalSessionLog {
         }
         let verified = Self::hash(&serde_json::to_vec(&commit.events)?);
         if verified != commit.hash {
-            return Err(session_error("Committed segment checksum mismatch"));
+            return Err(journal_error("Committed segment checksum mismatch"));
         }
         Ok(commit)
     }
@@ -255,13 +255,13 @@ impl JournalSessionLog {
                     truncated = true;
                     break;
                 }
-                return Err(session_error("Commit chain cycle"));
+                return Err(journal_error("Commit chain cycle"));
             }
             let path = self.path(&format!("commits/{id}.json"));
             let parsed = match self.storage.read(&path).await? {
                 Some(stored) => serde_json::from_slice::<Commit>(&stored.bytes)
                     .map_err(crate::error::Error::from),
-                None => Err(session_error("Missing committed segment")),
+                None => Err(journal_error("Missing committed segment")),
             };
             let commit = match parsed {
                 Ok(commit) => commit,
@@ -295,7 +295,7 @@ impl JournalSessionLog {
                     truncated = true;
                     break;
                 }
-                return Err(session_error("Broken committed prefix"));
+                return Err(journal_error("Broken committed prefix"));
             }
             if commit.first_seq <= through {
                 ids.push_front(id.clone());
@@ -317,7 +317,7 @@ impl JournalSessionLog {
         if expected > after {
             if reclaimed.is_some() {
                 if !tolerant {
-                    return Err(session_error(format!(
+                    return Err(journal_error(format!(
                         "Session history at or before seq {} was reclaimed",
                         reclaimed.unwrap_or_default()
                     )));
@@ -326,7 +326,7 @@ impl JournalSessionLog {
             } else if tolerant {
                 truncated = true;
             } else {
-                return Err(session_error("Incomplete committed chain"));
+                return Err(journal_error("Incomplete committed chain"));
             }
         }
         Ok((ids.into_iter().collect(), truncated, reclaimed))
@@ -352,21 +352,21 @@ impl JournalSessionLog {
     async fn read_snapshot_object(
         &self,
         pointer: &SnapshotPointer,
-    ) -> crate::error::Result<SessionSnapshot> {
+    ) -> crate::error::Result<JournalSnapshot> {
         let path = object_path(&self.prefix, &pointer.hash);
         let stored = self
             .storage
             .read(&path)
             .await?
-            .ok_or_else(|| session_error("Missing published session snapshot"))?;
+            .ok_or_else(|| journal_error("Missing published session snapshot"))?;
         if hash_hex(&stored.bytes) != pointer.hash {
-            return Err(session_error(
+            return Err(journal_error(
                 "Published session snapshot checksum mismatch",
             ));
         }
-        let snapshot: SessionSnapshot = serde_json::from_slice(&stored.bytes)?;
+        let snapshot: JournalSnapshot = serde_json::from_slice(&stored.bytes)?;
         if snapshot.format != SNAPSHOT_FORMAT || snapshot.as_of_seq != pointer.seq {
-            return Err(session_error(
+            return Err(journal_error(
                 "Published session snapshot does not match its pointer",
             ));
         }
@@ -407,7 +407,7 @@ impl JournalSessionLog {
     async fn publish_snapshot_locked(
         &self,
         writer: &Writer,
-        retention: &SessionRetention,
+        retention: &JournalRetention,
     ) -> crate::error::Result<Option<u64>> {
         let head = self.head().await?;
         self.ensure_owned(&head, writer).await?;
@@ -445,7 +445,7 @@ impl JournalSessionLog {
             .map(|snapshot| snapshot.runs.clone())
             .unwrap_or_default();
         let mut seen_runs: HashSet<String> = runs.iter().cloned().collect();
-        let mut collect = |event: &SessionEvent| -> crate::error::Result<()> {
+        let mut collect = |event: &JournalEvent| -> crate::error::Result<()> {
             if let Some(run) = &event.execution_run_id {
                 if seen_runs.insert(run.clone()) {
                     runs.push(run.clone());
@@ -454,7 +454,7 @@ impl JournalSessionLog {
             Ok(())
         };
         let views = super::views::replay_views(
-            self as &dyn SessionLog,
+            self as &dyn ThreadJournal,
             super::views::ViewSelection {
                 turns: true,
                 projection: true,
@@ -465,9 +465,9 @@ impl JournalSessionLog {
         )
         .await?;
         drop(collect);
-        SessionSnapshot::trim_runs(&mut runs);
+        JournalSnapshot::trim_runs(&mut runs);
 
-        let snapshot = SessionSnapshot {
+        let snapshot = JournalSnapshot {
             format: SNAPSHOT_FORMAT,
             as_of_seq: head.seq,
             as_of_commit_id: commit_id.clone(),
@@ -485,7 +485,7 @@ impl JournalSessionLog {
             let existing = self.storage.read(&object).await?;
             match existing {
                 Some(value) if value.bytes == bytes => {}
-                _ => return Err(session_error("Immutable session snapshot conflict")),
+                _ => return Err(journal_error("Immutable session snapshot conflict")),
             }
         }
 
@@ -553,7 +553,7 @@ impl JournalSessionLog {
     }
 
     /// Deletes commits (and their blobs) that an older published snapshot already covers.
-    async fn reclaim(&self, floor: u64, retention: &SessionRetention) -> crate::error::Result<()> {
+    async fn reclaim(&self, floor: u64, retention: &JournalRetention) -> crate::error::Result<()> {
         if !retention.prune || floor == 0 {
             return Ok(());
         }
@@ -746,7 +746,7 @@ impl JournalSessionLog {
             .storage
             .read(path)
             .await?
-            .ok_or_else(|| session_error("Missing committed segment"))?;
+            .ok_or_else(|| journal_error("Missing committed segment"))?;
         Ok(serde_json::from_slice(&stored.bytes)?)
     }
 }
@@ -803,12 +803,12 @@ struct ReclaimedMarker {
 fn is_unreadable(error: &crate::error::Error) -> bool {
     matches!(
         error,
-        crate::error::Error::Session(_) | crate::error::Error::Json(_)
+        crate::error::Error::Journal(_) | crate::error::Error::Json(_)
     )
 }
 
-fn with_payload(event: &SessionEvent, json: String) -> SessionEvent {
-    SessionEvent {
+fn with_payload(event: &JournalEvent, json: String) -> JournalEvent {
+    JournalEvent {
         schema_version: event.schema_version,
         event_id: event.event_id.clone(),
         seq: event.seq,
@@ -822,9 +822,9 @@ fn with_payload(event: &SessionEvent, json: String) -> SessionEvent {
 }
 
 #[async_trait]
-impl SessionLog for JournalSessionLog {
-    fn inbox(&self) -> crate::error::Result<Arc<dyn SessionLog>> {
-        Ok(Arc::new(JournalSessionLog::new(
+impl ThreadJournal for AtomicThreadJournal {
+    fn inbox(&self) -> crate::error::Result<Arc<dyn ThreadJournal>> {
+        Ok(Arc::new(AtomicThreadJournal::new(
             Arc::clone(&self.storage),
             self.path("inbox"),
         )))
@@ -851,29 +851,29 @@ impl SessionLog for JournalSessionLog {
         let header: SessionHeader = self
             .read_json(&header_path)
             .await?
-            .ok_or_else(|| session_error("Session header disappeared"))?;
+            .ok_or_else(|| journal_error("Session header disappeared"))?;
         header.validate()?;
         if header.authority != desired.authority {
-            return Err(session_error(
+            return Err(journal_error(
                 "Session authority mismatch; migrate into a new session instead of changing \
                  mode in place",
             ));
         }
         if owner.trim().is_empty() {
-            return Err(session_error("Writer owner is required"));
+            return Err(journal_error("Writer owner is required"));
         }
         if lease.is_zero() {
-            return Err(session_error("lease"));
+            return Err(journal_error("lease"));
         }
         let head_path = self.path("head.json");
         for _ in 0..CAS_ATTEMPTS {
             if self.is_sealed(owner).await? {
-                return Err(session_error("Session writer is permanently sealed"));
+                return Err(journal_error("Session writer is permanently sealed"));
             }
             let value = self.storage.read(&head_path).await?;
             let head = self.head_from(value.clone()).await?;
             if head.owner.is_some() && head.lease_until > Self::now_ms() {
-                return Err(session_error("Session already has an active writer"));
+                return Err(journal_error("Session already has an active writer"));
             }
             let next = Head {
                 seq: head.seq,
@@ -893,7 +893,7 @@ impl SessionLog for JournalSessionLog {
                 // a writer until that race is resolved, and release the raced claim.
                 if self.is_sealed(owner).await? {
                     self.seal_writer(owner).await?;
-                    return Err(session_error("Session writer is permanently sealed"));
+                    return Err(journal_error("Session writer is permanently sealed"));
                 }
                 return Ok(Writer {
                     owner: owner.to_string(),
@@ -901,12 +901,12 @@ impl SessionLog for JournalSessionLog {
                 });
             }
         }
-        Err(session_error("Writer acquisition contention"))
+        Err(journal_error("Writer acquisition contention"))
     }
 
     async fn seal_writer(&self, owner: &str) -> crate::error::Result<Head> {
         if owner.trim().is_empty() {
-            return Err(session_error("Writer owner is required"));
+            return Err(journal_error("Writer owner is required"));
         }
         let seal = serde_json::json!({ "owner": owner });
         let _ = self
@@ -940,7 +940,7 @@ impl SessionLog for JournalSessionLog {
                 return Ok(next);
             }
         }
-        Err(session_error("Writer sealing contention"))
+        Err(journal_error("Writer sealing contention"))
     }
 
     async fn renew(&self, writer: &Writer, lease: Duration) -> crate::error::Result<()> {
@@ -956,7 +956,7 @@ impl SessionLog for JournalSessionLog {
         writer: &Writer,
         batch_id: &str,
         expected_seq: u64,
-        events: &[SessionEvent],
+        events: &[JournalEvent],
     ) -> crate::error::Result<Head> {
         if events.is_empty() {
             return self.head().await;
@@ -965,7 +965,7 @@ impl SessionLog for JournalSessionLog {
         for event in events {
             seq += 1;
             if event.seq != seq {
-                return Err(session_error("Non-contiguous event batch"));
+                return Err(journal_error("Non-contiguous event batch"));
             }
         }
         let hash = Self::hash(&serde_json::to_vec(events)?);
@@ -983,7 +983,7 @@ impl SessionLog for JournalSessionLog {
                     let existing = self.read_commit(&id).await?;
                     if existing.batch_id == batch_id {
                         if existing.hash != hash || existing.first_seq != expected_seq + 1 {
-                            return Err(session_error("Batch ID reused with different content"));
+                            return Err(journal_error("Batch ID reused with different content"));
                         }
                         self.ensure_owned(&head, writer).await?;
                         return Ok(head);
@@ -996,7 +996,7 @@ impl SessionLog for JournalSessionLog {
             }
             self.ensure_owned(&head, writer).await?;
             if head.seq != expected_seq {
-                return Err(session_error("Stale committed prefix"));
+                return Err(journal_error("Stale committed prefix"));
             }
 
             let mut blobs = BTreeMap::new();
@@ -1011,7 +1011,7 @@ impl SessionLog for JournalSessionLog {
                         match existing {
                             Some(v) if v.bytes == payload => {}
                             _ => {
-                                return Err(session_error("Immutable payload blob conflict"));
+                                return Err(journal_error("Immutable payload blob conflict"));
                             }
                         }
                     }
@@ -1040,7 +1040,7 @@ impl SessionLog for JournalSessionLog {
                 let existing = self.storage.read(&commit_path).await?;
                 match existing {
                     Some(v) if v.bytes == commit_bytes => {}
-                    _ => return Err(session_error("Immutable commit conflict")),
+                    _ => return Err(journal_error("Immutable commit conflict")),
                 }
             }
 
@@ -1076,26 +1076,26 @@ impl SessionLog for JournalSessionLog {
                 }
             }
         }
-        Err(session_error("Commit contention"))
+        Err(journal_error("Commit contention"))
     }
 
     async fn read_after(
         &self,
         after: u64,
         limit: usize,
-    ) -> crate::error::Result<Vec<SessionEvent>> {
+    ) -> crate::error::Result<Vec<JournalEvent>> {
         if limit < 1 {
-            return Err(session_error("Invalid limit"));
+            return Err(journal_error("Invalid limit"));
         }
         let head = self.head().await?;
         let through = std::cmp::min(head.seq, after + limit as u64);
         self.scan(after, through).await
     }
 
-    async fn scan(&self, after: u64, through: u64) -> crate::error::Result<Vec<SessionEvent>> {
+    async fn scan(&self, after: u64, through: u64) -> crate::error::Result<Vec<JournalEvent>> {
         let head = self.head().await?;
         if through < after || through > head.seq {
-            return Err(session_error("Invalid committed prefix"));
+            return Err(journal_error("Invalid committed prefix"));
         }
         let mut collected = Vec::new();
         let mut cursor = after;
@@ -1109,7 +1109,7 @@ impl SessionLog for JournalSessionLog {
                 // Reclaiming deletes events; a caller that wants them cannot be served from the
                 // journal any more. Saying so beats returning a prefix that silently starts
                 // halfway through the history.
-                return Err(session_error(format!(
+                return Err(journal_error(format!(
                     "Session events at or before seq {floor} were reclaimed and cannot be read"
                 )));
             }
@@ -1121,7 +1121,7 @@ impl SessionLog for JournalSessionLog {
                     continue;
                 }
                 if candidate.seq != cursor + 1 {
-                    return Err(session_error("Non-contiguous event sequence"));
+                    return Err(journal_error("Non-contiguous event sequence"));
                 }
                 cursor = candidate.seq;
                 collected.push(candidate);
@@ -1131,14 +1131,14 @@ impl SessionLog for JournalSessionLog {
             }
         }
         if cursor < through {
-            return Err(session_error("Missing committed events"));
+            return Err(journal_error("Missing committed events"));
         }
         Ok(collected)
     }
 
     /// Replays the readable prefix of `(after, through]`.
     ///
-    /// Unlike [`scan`](SessionLog::scan) this never fails on a corrupt segment: it stops at the
+    /// Unlike [`scan`](ThreadJournal::scan) this never fails on a corrupt segment: it stops at the
     /// first unreadable commit and visits what it could read (normally the newest commits, which
     /// carry the latest checkpoint). Recovery must open a session whose history is damaged; a
     /// reader that refuses to replay at all leaves the user with no way back in.
@@ -1146,11 +1146,11 @@ impl SessionLog for JournalSessionLog {
         &self,
         after: u64,
         through: u64,
-        visitor: &mut (dyn for<'a> FnMut(&'a SessionEvent) -> crate::error::Result<()> + Send),
+        visitor: &mut (dyn for<'a> FnMut(&'a JournalEvent) -> crate::error::Result<()> + Send),
     ) -> crate::error::Result<()> {
         let head = self.head().await?;
         if through < after || through > head.seq {
-            return Err(session_error("Invalid committed prefix"));
+            return Err(journal_error("Invalid committed prefix"));
         }
         if after == through {
             return Ok(());
@@ -1210,7 +1210,7 @@ impl SessionLog for JournalSessionLog {
     ) -> crate::error::Result<()> {
         let head = self.head().await?;
         if next <= expected || next > head.seq {
-            return Err(session_error("Invalid export watermark"));
+            return Err(journal_error("Invalid export watermark"));
         }
         let key = self.path(&format!("exports/{}.json", Self::hash(sink.as_bytes())));
         for _ in 0..CAS_ATTEMPTS {
@@ -1223,7 +1223,7 @@ impl SessionLog for JournalSessionLog {
                 return Ok(());
             }
             if current != expected {
-                return Err(session_error("Export cursor conflict"));
+                return Err(journal_error("Export cursor conflict"));
             }
             let expected_version = value.map(|v| v.version).unwrap_or(0);
             if self
@@ -1234,13 +1234,13 @@ impl SessionLog for JournalSessionLog {
                 return Ok(());
             }
         }
-        Err(session_error("Export cursor contention"))
+        Err(journal_error("Export cursor contention"))
     }
 
     /// Reads the published snapshot, degrading to a full replay when it is unusable.
     ///
     /// Corrupt bytes must not brick a session; a storage failure still surfaces.
-    async fn snapshot(&self) -> crate::error::Result<Option<SessionSnapshot>> {
+    async fn snapshot(&self) -> crate::error::Result<Option<JournalSnapshot>> {
         let Some(pointer) = self.read_pointer(SNAPSHOT_POINTER).await? else {
             return Ok(None);
         };
@@ -1273,7 +1273,7 @@ impl SessionLog for JournalSessionLog {
     async fn publish_snapshot(
         &self,
         writer: &Writer,
-        retention: SessionRetention,
+        retention: JournalRetention,
     ) -> crate::error::Result<Option<u64>> {
         self.publish_snapshot_locked(writer, &retention).await
     }
@@ -1351,7 +1351,7 @@ impl SessionLog for JournalSessionLog {
     }
 }
 
-impl JournalSessionLog {
+impl AtomicThreadJournal {
     async fn update_owner(
         &self,
         writer: &Writer,
@@ -1376,7 +1376,7 @@ impl JournalSessionLog {
             };
             let expected = value
                 .map(|v| v.version)
-                .ok_or_else(|| session_error("Missing session head"))?;
+                .ok_or_else(|| journal_error("Missing session head"))?;
             if self
                 .storage
                 .compare_and_set(&head_path, expected, &serde_json::to_vec(&next)?)
@@ -1385,23 +1385,23 @@ impl JournalSessionLog {
                 return Ok(());
             }
         }
-        Err(session_error("Writer renewal contention"))
+        Err(journal_error("Writer renewal contention"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::MemorySessionStorage;
+    use crate::journal::MemoryJournalStorage;
 
-    fn journal() -> (Arc<dyn AtomicSessionStorage>, JournalSessionLog) {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let log = JournalSessionLog::new(Arc::clone(&storage), "agents/a/sessions/u/s1");
+    fn journal() -> (Arc<dyn AtomicJournalStorage>, AtomicThreadJournal) {
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        let log = AtomicThreadJournal::new(Arc::clone(&storage), "agents/a/sessions/u/s1");
         (storage, log)
     }
 
-    fn event(seq: u64, kind: &str) -> SessionEvent {
-        SessionEvent::new(
+    fn event(seq: u64, kind: &str) -> JournalEvent {
+        JournalEvent::new(
             format!("e{seq}"),
             seq,
             0,
@@ -1414,7 +1414,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn acquired(log: &JournalSessionLog, owner: &str) -> Writer {
+    async fn acquired(log: &AtomicThreadJournal, owner: &str) -> Writer {
         log.acquire(owner, Duration::from_secs(60)).await.unwrap()
     }
 
@@ -1559,7 +1559,7 @@ mod tests {
         let writer = acquired(&log, "run-1").await;
         let big = "x".repeat(MAX_INLINE_PAYLOAD_BYTES + 16);
         let payload = serde_json::json!({ "blob": big }).to_string();
-        let ev = SessionEvent::new("e1", 1, 0, "tool/result", None, None, true, payload.clone())
+        let ev = JournalEvent::new("e1", 1, 0, "tool/result", None, None, true, payload.clone())
             .unwrap();
         log.commit(&writer, "b1", 0, std::slice::from_ref(&ev))
             .await
@@ -1670,13 +1670,13 @@ mod tests {
 
     /// A batch of assistant messages: they show up in the transcript, the turns view folds the
     /// rest, and each one is a separate committed fact.
-    fn history_batch(start_seq: u64, count: u64) -> Vec<SessionEvent> {
+    fn history_batch(start_seq: u64, count: u64) -> Vec<JournalEvent> {
         (1..=count)
             .map(|offset| {
                 let seq = start_seq + offset;
                 let mut message = crate::message::Msg::assistant(format!("m{seq}"));
                 message.id = format!("m{seq}");
-                SessionEvent::new(
+                JournalEvent::new(
                     format!("e{seq}"),
                     seq,
                     0,
@@ -1691,7 +1691,7 @@ mod tests {
             .collect()
     }
 
-    async fn commit_history(log: &JournalSessionLog, writer: &Writer, batches: usize, size: u64) {
+    async fn commit_history(log: &AtomicThreadJournal, writer: &Writer, batches: usize, size: u64) {
         for _ in 0..batches {
             let start = log.head().await.unwrap().seq;
             log.commit(
@@ -1706,16 +1706,16 @@ mod tests {
     }
 
     async fn views_of(
-        log: &JournalSessionLog,
+        log: &AtomicThreadJournal,
     ) -> (
-        crate::session::SessionProjection,
-        crate::session::Transcript,
-        crate::session::SessionTurns,
+        crate::journal::JournalProjection,
+        crate::journal::Transcript,
+        crate::journal::TurnViews,
     ) {
         (
-            crate::session::SessionProjection::read(log).await.unwrap(),
-            crate::session::transcript(log).await.unwrap(),
-            crate::session::SessionTurns::read(log).await.unwrap(),
+            crate::journal::JournalProjection::read(log).await.unwrap(),
+            crate::journal::transcript(log).await.unwrap(),
+            crate::journal::TurnViews::read(log).await.unwrap(),
         )
     }
 
@@ -1727,7 +1727,7 @@ mod tests {
         let before = views_of(&log).await;
 
         let published = log
-            .publish_snapshot(&writer, SessionRetention::OFF)
+            .publish_snapshot(&writer, JournalRetention::OFF)
             .await
             .unwrap();
         assert_eq!(published, Some(120));
@@ -1755,7 +1755,7 @@ mod tests {
         let writer = acquired(&log, "run-1").await;
         commit_history(&log, &writer, 2, 20).await;
         let before = views_of(&log).await;
-        log.publish_snapshot(&writer, SessionRetention::OFF)
+        log.publish_snapshot(&writer, JournalRetention::OFF)
             .await
             .unwrap();
 
@@ -1784,7 +1784,7 @@ mod tests {
         commit_history(&log, &writer, 2, 20).await;
         let before = views_of(&log).await;
         let published = log
-            .publish_snapshot(&writer, SessionRetention::OFF)
+            .publish_snapshot(&writer, JournalRetention::OFF)
             .await
             .unwrap()
             .unwrap();
@@ -1816,7 +1816,7 @@ mod tests {
         let writer = acquired(&log, "run-1").await;
         commit_history(&log, &writer, 6, 200).await;
         let before = views_of(&log).await;
-        let retention = SessionRetention {
+        let retention = JournalRetention {
             prune: true,
             min_age: Duration::ZERO,
         };
@@ -1870,7 +1870,7 @@ mod tests {
         let (storage, log) = journal();
         let writer = acquired(&log, "run-1").await;
         commit_history(&log, &writer, 6, 200).await;
-        let retention = SessionRetention {
+        let retention = JournalRetention {
             prune: true,
             min_age: Duration::ZERO,
         };
@@ -1891,20 +1891,20 @@ mod tests {
         );
     }
 
-    async fn blob_paths(storage: &Arc<dyn AtomicSessionStorage>) -> Vec<String> {
+    async fn blob_paths(storage: &Arc<dyn AtomicJournalStorage>) -> Vec<String> {
         storage
             .list_paths("agents/a/sessions/u/s1/blobs")
             .await
             .unwrap_or_default()
     }
 
-    fn checkpoint_event(seq: u64, turn: &str, marker: &str) -> SessionEvent {
+    fn checkpoint_event(seq: u64, turn: &str, marker: &str) -> JournalEvent {
         let state = serde_json::json!({
             "marker": marker,
             "padding": "x".repeat(MAX_INLINE_PAYLOAD_BYTES),
         })
         .to_string();
-        SessionEvent::new(
+        JournalEvent::new(
             format!("c{seq}"),
             seq,
             0,
@@ -1952,7 +1952,7 @@ mod tests {
             1,
             "only the newest checkpoint of the turn keeps its payload"
         );
-        let projection = crate::session::SessionProjection::read(&log).await.unwrap();
+        let projection = crate::journal::JournalProjection::read(&log).await.unwrap();
         let state = projection.state_json.expect("newest checkpoint restores");
         assert!(state.contains("third"), "{state}");
     }
@@ -2035,7 +2035,7 @@ mod tests {
             .await
             .unwrap()
             .seq;
-        let reclaimed = SessionEvent::new(
+        let reclaimed = JournalEvent::new(
             "c2".to_string(),
             2,
             0,
@@ -2048,7 +2048,7 @@ mod tests {
         .unwrap();
         log.commit(&writer, "b2", head, &[reclaimed]).await.unwrap();
 
-        let projection = crate::session::SessionProjection::read(&log).await.unwrap();
+        let projection = crate::journal::JournalProjection::read(&log).await.unwrap();
         let state = projection
             .state_json
             .expect("a readable checkpoint remains");
@@ -2062,7 +2062,7 @@ mod tests {
         let big = "x".repeat(MAX_INLINE_PAYLOAD_BYTES + 16);
         let payload = serde_json::json!({ "blob": big }).to_string();
         let first =
-            SessionEvent::new("e1", 1, 0, "tool/result", None, None, true, payload).unwrap();
+            JournalEvent::new("e1", 1, 0, "tool/result", None, None, true, payload).unwrap();
         log.commit(&writer, "b1", 0, &[first, event(2, "turn/end")])
             .await
             .unwrap();
@@ -2077,7 +2077,7 @@ mod tests {
         );
         assert!(storage.read(&blob_path).await.unwrap().is_some());
 
-        let retention = SessionRetention {
+        let retention = JournalRetention {
             prune: true,
             min_age: Duration::ZERO,
         };
@@ -2105,7 +2105,7 @@ mod tests {
         let (storage, log) = journal();
         let writer = acquired(&log, "run-1").await;
         commit_history(&log, &writer, 6, 200).await;
-        let retention = SessionRetention {
+        let retention = JournalRetention {
             prune: true,
             min_age: Duration::ZERO,
         };
@@ -2121,7 +2121,7 @@ mod tests {
         storage.remove(pointer_path).await.unwrap();
         assert!(stored.version > 0);
 
-        let err = crate::session::SessionProjection::read(&log)
+        let err = crate::journal::JournalProjection::read(&log)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("reclaimed"), "{err}");

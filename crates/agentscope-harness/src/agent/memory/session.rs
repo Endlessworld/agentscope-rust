@@ -3,7 +3,7 @@
 //!
 //! The retired `SessionEntry` / `SessionTree` JSONL pair was deleted together with the rest of
 //! the old session design: committed history now lives in the native journal
-//! (`agentscope_core::session`). Only the staleness policy survives, because it decides when a
+//! (`agentscope_core::journal`). Only the staleness policy survives, because it decides when a
 //! conversation should be reset rather than how history is stored.
 
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveTime};

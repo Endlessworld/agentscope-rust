@@ -1,15 +1,16 @@
 //! Session transcript tools, mirroring `io.agentscope.harness.agent.tool.SessionSearchTool`.
 //!
-//! All three tools read the **native session journal** through [`SessionLogStore`], exactly
+//! All three tools read the **native session journal** through [`ThreadJournalStore`], exactly
 //! like Java after the session redesign: discovery scans journal headers and history is a
 //! read-time projection of committed events. There is no `sessions.json` index and no
 //! `.log.jsonl` mirror — those belonged to the retired design.
 use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
+use agentscope_core::agent::ThreadKey;
 use agentscope_core::error::Result;
+use agentscope_core::journal::{ThreadJournalStore, Transcript};
 use agentscope_core::message::{JsonMap, Msg, ToolResultBlock};
-use agentscope_core::session::{SessionKey, SessionLogStore, Transcript};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 use async_trait::async_trait;
 
@@ -138,21 +139,21 @@ fn preview(text: &str) -> String {
 
 /// Opens the journal for `key` and rebuilds its committed transcript.
 async fn read_transcript(
-    store: &dyn SessionLogStore,
-    key: &SessionKey,
+    store: &dyn ThreadJournalStore,
+    key: &ThreadKey,
     context: &RuntimeContext,
 ) -> Result<Transcript> {
     let log = store.open(key, context).await?;
-    agentscope_core::session::transcript(&*log).await
+    agentscope_core::journal::transcript(&*log).await
 }
 
 /// Discovers the caller's sessions for `agent_id`, sorted by session id.
 async fn sessions_of(
-    store: &dyn SessionLogStore,
+    store: &dyn ThreadJournalStore,
     context: &RuntimeContext,
     agent_id: &str,
-) -> Result<Vec<SessionKey>> {
-    let mut keys: Vec<SessionKey> = store
+) -> Result<Vec<ThreadKey>> {
+    let mut keys: Vec<ThreadKey> = store
         .list(context)
         .await?
         .into_iter()
@@ -164,12 +165,12 @@ async fn sessions_of(
 
 /// Searches past session journals for a keyword or phrase.
 pub struct SessionSearchTool {
-    store: Arc<dyn SessionLogStore>,
+    store: Arc<dyn ThreadJournalStore>,
     context: RuntimeContext,
 }
 
 impl SessionSearchTool {
-    pub fn new(store: Arc<dyn SessionLogStore>) -> Self {
+    pub fn new(store: Arc<dyn ThreadJournalStore>) -> Self {
         Self {
             store,
             context: RuntimeContext::default(),
@@ -183,7 +184,10 @@ impl SessionSearchTool {
     }
 
     /// Registers all three session tools into a toolkit.
-    pub fn register_all(toolkit: &agentscope_core::tool::Toolkit, store: Arc<dyn SessionLogStore>) {
+    pub fn register_all(
+        toolkit: &agentscope_core::tool::Toolkit,
+        store: Arc<dyn ThreadJournalStore>,
+    ) {
         toolkit.register_tool(Arc::new(SessionSearchTool::new(Arc::clone(&store))));
         toolkit.register_tool(Arc::new(SessionListTool::new(Arc::clone(&store))));
         toolkit.register_tool(Arc::new(SessionHistoryTool::new(store)));
@@ -287,12 +291,12 @@ impl Tool for SessionSearchTool {
 
 /// Lists available sessions for an agent.
 pub struct SessionListTool {
-    store: Arc<dyn SessionLogStore>,
+    store: Arc<dyn ThreadJournalStore>,
     context: RuntimeContext,
 }
 
 impl SessionListTool {
-    pub fn new(store: Arc<dyn SessionLogStore>) -> Self {
+    pub fn new(store: Arc<dyn ThreadJournalStore>) -> Self {
         Self {
             store,
             context: RuntimeContext::default(),
@@ -355,12 +359,12 @@ impl Tool for SessionListTool {
 
 /// Gets the conversation history for a specific session.
 pub struct SessionHistoryTool {
-    store: Arc<dyn SessionLogStore>,
+    store: Arc<dyn ThreadJournalStore>,
     context: RuntimeContext,
 }
 
 impl SessionHistoryTool {
-    pub fn new(store: Arc<dyn SessionLogStore>) -> Self {
+    pub fn new(store: Arc<dyn ThreadJournalStore>) -> Self {
         Self {
             store,
             context: RuntimeContext::default(),
@@ -410,7 +414,7 @@ impl Tool for SessionHistoryTool {
         };
         let limit = capped_limit(int_arg(&args, "lastN"), DEFAULT_HISTORY_LIMIT);
 
-        let key = SessionKey::new(
+        let key = ThreadKey::new(
             self.context.user_id().map(str::to_string),
             agent_id.clone(),
             session_id.clone(),
@@ -443,7 +447,7 @@ impl Tool for SessionHistoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_core::session::{InMemorySessionLogStore, SessionRecorder};
+    use agentscope_core::journal::{InMemoryThreadJournalStore, InvocationRecorder};
     use agentscope_core::state::AgentState;
 
     fn ctx(user: Option<&str>) -> RuntimeContext {
@@ -455,16 +459,16 @@ mod tests {
 
     /// Commits a journal for `session` with `messages` as its persisted context.
     async fn seed(
-        store: &InMemorySessionLogStore,
+        store: &InMemoryThreadJournalStore,
         user: Option<&str>,
         agent: &str,
         session: &str,
         messages: Vec<Msg>,
     ) {
         let context = ctx(user);
-        let key = SessionKey::new(user.map(str::to_string), agent, session).unwrap();
+        let key = ThreadKey::new(user.map(str::to_string), agent, session).unwrap();
         let log = store.open(&key, &context).await.unwrap();
-        let recorder = SessionRecorder::open(log, None).await.unwrap();
+        let recorder = InvocationRecorder::open(log, None).await.unwrap();
         let mut state = AgentState::builder().session_id(session).build();
         if let Some(user) = user {
             state.user_id = Some(user.to_string());
@@ -486,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_reads_committed_journal_events() {
-        let store = Arc::new(InMemorySessionLogStore::new());
+        let store = Arc::new(InMemoryThreadJournalStore::new());
         seed(
             &store,
             Some("alice"),
@@ -495,7 +499,7 @@ mod tests {
             vec![Msg::user("How do quantum computers work?")],
         )
         .await;
-        let tool = SessionSearchTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+        let tool = SessionSearchTool::new(Arc::clone(&store) as Arc<dyn ThreadJournalStore>)
             .with_context(ctx(Some("alice")));
         let out = tool
             .call(
@@ -511,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_does_not_leak_other_users_sessions() {
-        let store = Arc::new(InMemorySessionLogStore::new());
+        let store = Arc::new(InMemoryThreadJournalStore::new());
         seed(
             &store,
             Some("bob"),
@@ -520,7 +524,7 @@ mod tests {
             vec![Msg::user("quantum notes")],
         )
         .await;
-        let tool = SessionSearchTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+        let tool = SessionSearchTool::new(Arc::clone(&store) as Arc<dyn ThreadJournalStore>)
             .with_context(ctx(Some("alice")));
         let out = tool
             .call(
@@ -534,9 +538,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_reports_journal_heads() {
-        let store = Arc::new(InMemorySessionLogStore::new());
+        let store = Arc::new(InMemoryThreadJournalStore::new());
         seed(&store, Some("alice"), "a1", "s1", vec![Msg::user("hi")]).await;
-        let tool = SessionListTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+        let tool = SessionListTool::new(Arc::clone(&store) as Arc<dyn ThreadJournalStore>)
             .with_context(ctx(Some("alice")));
         let out = tool
             .call(
@@ -552,7 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn history_returns_the_last_n_messages() {
-        let store = Arc::new(InMemorySessionLogStore::new());
+        let store = Arc::new(InMemoryThreadJournalStore::new());
         seed(
             &store,
             Some("alice"),
@@ -561,7 +565,7 @@ mod tests {
             vec![Msg::user("one"), Msg::assistant("two"), Msg::user("three")],
         )
         .await;
-        let tool = SessionHistoryTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+        let tool = SessionHistoryTool::new(Arc::clone(&store) as Arc<dyn ThreadJournalStore>)
             .with_context(ctx(Some("alice")));
         let out = tool
             .call(
@@ -582,7 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn limits_are_capped_at_the_ceiling() {
-        let store = Arc::new(InMemorySessionLogStore::new());
+        let store = Arc::new(InMemoryThreadJournalStore::new());
         seed(
             &store,
             Some("alice"),
@@ -591,7 +595,7 @@ mod tests {
             (0..150).map(|i| Msg::user(format!("needle {i}"))).collect(),
         )
         .await;
-        let tool = SessionSearchTool::new(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+        let tool = SessionSearchTool::new(Arc::clone(&store) as Arc<dyn ThreadJournalStore>)
             .with_context(ctx(Some("alice")));
         let out = tool
             .call(

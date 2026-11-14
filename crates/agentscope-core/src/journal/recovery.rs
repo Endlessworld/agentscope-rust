@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    session_error, SessionEvent, SessionInbox, SessionLog, SessionProjection, SessionTurns,
+    journal_error, JournalEvent, JournalProjection, SessionInbox, ThreadJournal, TurnViews,
 };
 use crate::message::{
     ContentBlock, MsgBuilder, MsgRole, TextBlock, ToolCallState, ToolResultBlock, ToolResultState,
@@ -41,7 +41,7 @@ pub const ABANDONED_TOOL_MESSAGE: &str = "This tool call was abandoned when the 
      was closed; external side effects, if any, were not verified.";
 
 /// Acquires the reconciliation writer, retrying while a run still holds the lease.
-async fn acquire_writer(log: &Arc<dyn SessionLog>) -> crate::error::Result<super::Writer> {
+async fn acquire_writer(log: &Arc<dyn ThreadJournal>) -> crate::error::Result<super::Writer> {
     for _ in 0..ACQUIRE_ATTEMPTS {
         match log.acquire(&uuid::Uuid::new_v4().to_string(), LEASE).await {
             Ok(writer) => return Ok(writer),
@@ -54,7 +54,7 @@ async fn acquire_writer(log: &Arc<dyn SessionLog>) -> crate::error::Result<super
             }
         }
     }
-    Err(session_error(
+    Err(journal_error(
         "Session writer is still busy; the interrupted turn could not be closed",
     ))
 }
@@ -66,7 +66,10 @@ async fn acquire_writer(log: &Arc<dyn SessionLog>) -> crate::error::Result<super
 ///
 /// Refuses to run while a tool outcome is unknown: use [`reconcile`] first, or
 /// [`abandon_turn`] when the host explicitly accepts the unknown outcome.
-pub async fn cancel_pending(log: Arc<dyn SessionLog>, turn_id: &str) -> crate::error::Result<()> {
+pub async fn cancel_pending(
+    log: Arc<dyn ThreadJournal>,
+    turn_id: &str,
+) -> crate::error::Result<()> {
     close_turn(log, turn_id, false).await.map(|_| ())
 }
 
@@ -78,12 +81,15 @@ pub async fn cancel_pending(log: Arc<dyn SessionLog>, turn_id: &str) -> crate::e
 ///
 /// This is what a host calls before submitting a new prompt: an interrupted turn is not
 /// terminal, so leaving it open would make every later submission wait forever.
-pub async fn abandon_turn(log: Arc<dyn SessionLog>, turn_id: &str) -> crate::error::Result<bool> {
+pub async fn abandon_turn(
+    log: Arc<dyn ThreadJournal>,
+    turn_id: &str,
+) -> crate::error::Result<bool> {
     close_turn(log, turn_id, true).await
 }
 
 async fn close_turn(
-    log: Arc<dyn SessionLog>,
+    log: Arc<dyn ThreadJournal>,
     turn_id: &str,
     resolve_uncertain: bool,
 ) -> crate::error::Result<bool> {
@@ -94,7 +100,7 @@ async fn close_turn(
 }
 
 async fn close_turn_locked(
-    log: &Arc<dyn SessionLog>,
+    log: &Arc<dyn ThreadJournal>,
     writer: &super::Writer,
     turn_id: &str,
     resolve_uncertain: bool,
@@ -120,7 +126,7 @@ async fn close_turn_locked(
     }
 
     if !projection.uncertain_tool_calls.is_empty() && !resolve_uncertain {
-        return Err(session_error(
+        return Err(journal_error(
             "Reconcile uncertain tool outcomes before cancelling this interrupted turn",
         ));
     }
@@ -134,10 +140,10 @@ async fn close_turn_locked(
     let run = writer.owner.clone();
     let mut push = |event_type: &str,
                     payload: serde_json::Value,
-                    facts: &mut Vec<SessionEvent>|
+                    facts: &mut Vec<JournalEvent>|
      -> crate::error::Result<()> {
         seq += 1;
-        facts.push(SessionEvent::new(
+        facts.push(JournalEvent::new(
             uuid::Uuid::new_v4().to_string(),
             seq,
             chrono::Utc::now().timestamp_millis(),
@@ -279,8 +285,8 @@ async fn close_turn_locked(
 }
 
 /// Rejects unapplied steering bound to a cancelled turn, so it is never silently lost.
-async fn reject_steering(log: &Arc<dyn SessionLog>, turn_id: &str) -> crate::error::Result<()> {
-    let applied = SessionTurns::read(&**log).await?.applied;
+async fn reject_steering(log: &Arc<dyn ThreadJournal>, turn_id: &str) -> crate::error::Result<()> {
+    let applied = TurnViews::read(&**log).await?.applied;
     let inbox = SessionInbox::new(Arc::clone(log))?;
     let snapshot = inbox.snapshot().await?;
     for command in &snapshot.commands {
@@ -299,12 +305,12 @@ async fn reject_steering(log: &Arc<dyn SessionLog>, turn_id: &str) -> crate::err
 ///
 /// Reconciliation never executes the tools again; continuation stays explicit.
 pub async fn reconcile(
-    log: Arc<dyn SessionLog>,
+    log: Arc<dyn ThreadJournal>,
     outcomes: BTreeMap<String, ToolResultBlock>,
     reason: &str,
 ) -> crate::error::Result<()> {
     if reason.trim().is_empty() {
-        return Err(session_error("A reconciliation reason is required"));
+        return Err(journal_error("A reconciliation reason is required"));
     }
     let writer = acquire_writer(&log).await?;
     let result = reconcile_locked(&log, &writer, outcomes, reason).await;
@@ -313,23 +319,23 @@ pub async fn reconcile(
 }
 
 async fn reconcile_locked(
-    log: &Arc<dyn SessionLog>,
+    log: &Arc<dyn ThreadJournal>,
     writer: &super::Writer,
     outcomes: BTreeMap<String, ToolResultBlock>,
     reason: &str,
 ) -> crate::error::Result<()> {
-    let projection = SessionProjection::read(&**log).await?;
+    let projection = JournalProjection::read(&**log).await?;
     let expected: BTreeSet<String> = outcomes.keys().cloned().collect();
     if projection.uncertain_tool_calls != expected {
-        return Err(session_error("Supply exactly the unresolved tool outcomes"));
+        return Err(journal_error("Supply exactly the unresolved tool outcomes"));
     }
     let Some(mut state) = projection.restore()? else {
-        return Err(session_error("No recoverable state baseline"));
+        return Err(journal_error("No recoverable state baseline"));
     };
 
     for (id, outcome) in &outcomes {
         if outcome.id.as_deref() != Some(id.as_str()) || outcome.is_suspended() {
-            return Err(session_error(
+            return Err(journal_error(
                 "Mismatched or suspended reconciliation result",
             ));
         }
@@ -340,10 +346,10 @@ async fn reconcile_locked(
     let mut facts = Vec::new();
     let mut push = |event_type: &str,
                     payload: serde_json::Value,
-                    facts: &mut Vec<SessionEvent>|
+                    facts: &mut Vec<JournalEvent>|
      -> crate::error::Result<()> {
         seq += 1;
-        facts.push(SessionEvent::new(
+        facts.push(JournalEvent::new(
             uuid::Uuid::new_v4().to_string(),
             seq,
             chrono::Utc::now().timestamp_millis(),
@@ -402,15 +408,15 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::message::{Msg, ToolResultBlock};
-    use crate::session::{
-        pending_interactions, AtomicSessionStorage, JournalSessionLog, MemorySessionStorage,
-        SessionRecorder, SessionTurns,
+    use crate::journal::{
+        pending_interactions, AtomicJournalStorage, AtomicThreadJournal, InvocationRecorder,
+        MemoryJournalStorage, TurnViews,
     };
+    use crate::message::{Msg, ToolResultBlock};
 
-    fn journal() -> Arc<dyn SessionLog> {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        Arc::new(JournalSessionLog::new(storage, "s1"))
+    fn journal() -> Arc<dyn ThreadJournal> {
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        Arc::new(AtomicThreadJournal::new(storage, "s1"))
     }
 
     fn state() -> crate::state::AgentState {
@@ -424,8 +430,8 @@ mod tests {
     ///
     /// No `tool/dispatch` is recorded: the call was suspended, not started, so its outcome is
     /// known (suspended) rather than uncertain.
-    async fn suspended(log: &Arc<dyn SessionLog>) -> SessionRecorder {
-        let recorder = SessionRecorder::open(Arc::clone(log), Some("t1"))
+    async fn suspended(log: &Arc<dyn ThreadJournal>) -> InvocationRecorder {
+        let recorder = InvocationRecorder::open(Arc::clone(log), Some("t1"))
             .await
             .unwrap();
         recorder.start(&[], &state()).await.unwrap();
@@ -451,7 +457,7 @@ mod tests {
     }
 
     /// Seeds a turn whose tool call was dispatched but never produced a result.
-    async fn dispatched(log: &Arc<dyn SessionLog>) -> SessionRecorder {
+    async fn dispatched(log: &Arc<dyn ThreadJournal>) -> InvocationRecorder {
         let recorder = suspended(log).await;
         recorder
             .record(
@@ -472,10 +478,10 @@ mod tests {
         cancel_pending(Arc::clone(&log), "t1").await.unwrap();
 
         assert!(pending_interactions(&*log).await.unwrap().is_empty());
-        let turns = SessionTurns::read(&*log).await.unwrap();
+        let turns = TurnViews::read(&*log).await.unwrap();
         assert_eq!(turns.latest().unwrap().status, "cancelled");
 
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert!(projection.active_runs.is_empty());
         let restored = projection.restore().unwrap().unwrap();
         let interrupted: Vec<_> = restored
@@ -518,13 +524,13 @@ mod tests {
         let closed = abandon_turn(Arc::clone(&log), "t1").await.unwrap();
         assert!(closed, "an open turn must report that it was closed");
 
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert!(
             projection.uncertain_tool_calls.is_empty(),
             "{:?}",
             projection.uncertain_tool_calls
         );
-        let turns = SessionTurns::read(&*log).await.unwrap();
+        let turns = TurnViews::read(&*log).await.unwrap();
         assert_eq!(turns.latest().unwrap().status, "cancelled");
         assert!(turns.latest().unwrap().ended());
 
@@ -542,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn abandoning_a_settled_turn_is_a_no_op() {
         let log = journal();
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         recorder.start(&[], &state()).await.unwrap();
@@ -550,7 +556,7 @@ mod tests {
 
         let closed = abandon_turn(Arc::clone(&log), "t1").await.unwrap();
         assert!(!closed, "a completed turn must not be cancelled");
-        let turns = SessionTurns::read(&*log).await.unwrap();
+        let turns = TurnViews::read(&*log).await.unwrap();
         assert_eq!(turns.latest().unwrap().status, "completed");
     }
 
@@ -644,7 +650,7 @@ mod tests {
             .await
             .unwrap();
 
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert!(projection.uncertain_tool_calls.is_empty());
         let restored = projection.restore().unwrap().unwrap();
         assert!(restored

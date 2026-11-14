@@ -3,14 +3,16 @@
 //! These assertions go through the **real** `HarnessAgent::build()` + call path, because the
 //! bug class they guard against is a missing assembly step: a journal backend that exists but
 //! is never injected, or a recorder that is only created when a host happens to build an
-//! `AgentSession`. A unit test on `SessionRecorder` cannot catch either.
+//! `AgentSession`. A unit test on `InvocationRecorder` cannot catch either.
 
 use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::{CallableAgent, RuntimeContext};
+use agentscope_core::journal::{
+    InMemoryThreadJournalStore, SessionHistoryMode, ThreadJournalStore,
+};
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
-use agentscope_core::session::{InMemorySessionLogStore, SessionHistoryMode, SessionLogStore};
 
 use agentscope_harness::agent::HarnessAgent;
 
@@ -127,7 +129,7 @@ async fn the_request_payload_switch_decides_what_the_journal_records() {
         } else {
             "requests-off"
         });
-        let store = Arc::new(InMemorySessionLogStore::new());
+        let store = Arc::new(InMemoryThreadJournalStore::new());
         let agent = HarnessAgent::builder()
             .name("request-payload")
             .model(Arc::new(FixedModel {
@@ -140,7 +142,7 @@ async fn the_request_payload_switch_decides_what_the_journal_records() {
             .user_id("alice")
             .max_iters(1)
             .record_model_requests(record)
-            .session_log_store(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .session_log_store(Arc::clone(&store) as Arc<dyn ThreadJournalStore>)
             .build();
 
         CallableAgent::call(&agent, vec![Msg::user("hello")])
@@ -166,7 +168,7 @@ async fn the_request_payload_switch_decides_what_the_journal_records() {
 #[tokio::test]
 async fn a_caller_supplied_store_is_used_instead_of_the_workspace_default() {
     let dir = temp_dir("explicit");
-    let store = Arc::new(InMemorySessionLogStore::new());
+    let store = Arc::new(InMemoryThreadJournalStore::new());
     let agent = HarnessAgent::builder()
         .name("explicit-store")
         .model(Arc::new(FixedModel {
@@ -178,7 +180,7 @@ async fn a_caller_supplied_store_is_used_instead_of_the_workspace_default() {
         .session_id("s-explicit")
         .user_id("alice")
         .max_iters(1)
-        .session_log_store(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+        .session_log_store(Arc::clone(&store) as Arc<dyn ThreadJournalStore>)
         .build();
 
     CallableAgent::call(&agent, vec![Msg::user("in memory")])

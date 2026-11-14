@@ -157,8 +157,8 @@ impl Middleware for ContextMiddleware {
         let session_id = ctx.session_id().unwrap_or_default().to_string();
         // A recorder attached by the session scheduler makes the fallback compaction's
         // `compaction/start` and `compaction/end` durable session facts.
-        let recorder = ctx.extension::<agentscope_core::session::SessionRecorder>(
-            agentscope_core::session::RECORDER_CONTEXT_KEY,
+        let recorder = ctx.extension::<agentscope_core::journal::InvocationRecorder>(
+            agentscope_core::journal::RECORDER_CONTEXT_KEY,
         );
         // The agent-level stream merges fine-grained events from this channel, so the
         // fallback can announce its compaction to the ACP client just like the
@@ -372,7 +372,7 @@ async fn compact_overflow(
     overflow: &ContextOverflowCompaction,
     agent_id: &str,
     session_id: &str,
-    recorder: Option<&Arc<agentscope_core::session::SessionRecorder>>,
+    recorder: Option<&Arc<agentscope_core::journal::InvocationRecorder>>,
     summary_only: bool,
 ) -> Option<OverflowCompacted> {
     let history: Vec<Msg> = messages

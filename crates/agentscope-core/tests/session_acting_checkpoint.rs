@@ -9,19 +9,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use agentscope_core::agent::{Extensions, ReActAgent, StreamOptions};
+use agentscope_core::journal::{
+    AtomicJournalStorage, AtomicThreadJournal, Command, InvocationRecorder, MemoryJournalStorage,
+    SessionExecution, SessionInbox, ThreadJournal, EXECUTION_CONTEXT_KEY, RECORDER_CONTEXT_KEY,
+};
 use agentscope_core::message::{ContentBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
-use agentscope_core::session::{
-    AtomicSessionStorage, Command, JournalSessionLog, MemorySessionStorage, SessionExecution,
-    SessionInbox, SessionLog, SessionRecorder, EXECUTION_CONTEXT_KEY, RECORDER_CONTEXT_KEY,
-};
 use agentscope_core::state::AgentState;
 use agentscope_core::{FunctionTool, ToolResultBlock, ToolUseBlock, Toolkit};
 use futures::StreamExt;
 
-async fn journal() -> Arc<dyn SessionLog> {
-    let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-    Arc::new(JournalSessionLog::new(storage, "acting-checkpoint"))
+async fn journal() -> Arc<dyn ThreadJournal> {
+    let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+    Arc::new(AtomicThreadJournal::new(storage, "acting-checkpoint"))
 }
 
 /// First step asks for a tool call, second step answers with text.
@@ -81,7 +81,7 @@ async fn settled_tool_results_are_checkpointed_before_the_next_model_step() {
     .unwrap();
     let submit = inbox.accept(&submit).await.unwrap();
 
-    let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+    let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
         .await
         .unwrap();
     let mut execution = SessionExecution::new(Arc::clone(&log), submit);

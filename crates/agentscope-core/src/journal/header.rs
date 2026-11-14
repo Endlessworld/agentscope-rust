@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::session_error;
+use super::journal_error;
 
 /// Exactly one authority: standalone state-store persistence or native committed history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,10 +25,13 @@ pub struct SessionHeader {
 }
 
 impl SessionHeader {
+    /// The only accepted journal format version.
+    pub const FORMAT_VERSION: i32 = 2;
+
     /// The header written for a new native session.
     pub fn current() -> Self {
         Self {
-            format_version: 1,
+            format_version: Self::FORMAT_VERSION,
             authority: "event_log".to_string(),
             replay_coverage: "adapter_chunks".to_string(),
             created_at: chrono::Utc::now().timestamp_millis(),
@@ -37,8 +40,8 @@ impl SessionHeader {
 
     /// Rejects an unsupported format/authority instead of silently rewriting history.
     pub fn validate(&self) -> crate::error::Result<()> {
-        if self.format_version != 1 || self.authority != "event_log" {
-            return Err(session_error("Unsupported session format/authority"));
+        if self.format_version != Self::FORMAT_VERSION || self.authority != "event_log" {
+            return Err(journal_error("Unsupported session format/authority"));
         }
         Ok(())
     }
@@ -52,7 +55,7 @@ mod tests {
     fn current_header_round_trips_camel_case() {
         let header = SessionHeader::current();
         let json = serde_json::to_value(&header).unwrap();
-        assert_eq!(json["formatVersion"], 1);
+        assert_eq!(json["formatVersion"], 2);
         assert_eq!(json["authority"], "event_log");
         assert_eq!(json["replayCoverage"], "adapter_chunks");
         let back: SessionHeader = serde_json::from_value(json).unwrap();
@@ -63,7 +66,7 @@ mod tests {
     #[test]
     fn unsupported_format_or_authority_is_rejected() {
         let mut header = SessionHeader::current();
-        header.format_version = 2;
+        header.format_version = 1;
         assert!(header.validate().is_err());
         let mut header = SessionHeader::current();
         header.authority = "state_store".into();

@@ -1,7 +1,7 @@
 //! Bounded task-verification facts, mirroring `io.agentscope.core.state.TaskVerification`
 //! and `io.agentscope.core.state.EvidenceBinding`.
 //!
-//! These are pure data records plus their wire codec: [`crate::session::SessionProjection`]
+//! These are pure data records plus their wire codec: [`crate::journal::JournalProjection`]
 //! replays committed `verification/result` facts into this shape. Nothing here decides *when*
 //! a check runs or *what* it asserts — that orchestration belongs to the caller.
 //!

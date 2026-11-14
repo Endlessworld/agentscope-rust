@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    session_error, Command, SessionEvent, SessionInbox, SessionLog, SessionRecorder, SessionTurns,
+    journal_error, Command, InvocationRecorder, JournalEvent, SessionInbox, ThreadJournal,
+    TurnViews,
 };
 use crate::agent::RuntimeContext;
 use crate::message::Msg;
@@ -25,15 +26,15 @@ pub const EXECUTION_CONTEXT_KEY: &str = "agentscope.session.execution";
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionBaseline {
     /// Committed turns, inputs and applied command ids.
-    pub turns: SessionTurns,
+    pub turns: TurnViews,
     /// Interactions that were still pending at the same head.
-    pub pending: BTreeMap<String, SessionEvent>,
+    pub pending: BTreeMap<String, JournalEvent>,
 }
 
 /// Execution-side inbox consumer.
 #[derive(Clone)]
 pub struct SessionExecution {
-    log: Arc<dyn SessionLog>,
+    log: Arc<dyn ThreadJournal>,
     command: Command,
     inputs: Vec<Msg>,
     // Shared so every clone of one execution agrees on whether the inbox turn is still open:
@@ -61,7 +62,7 @@ impl std::fmt::Debug for SessionExecution {
 
 impl SessionExecution {
     /// Creates an execution for one accepted command.
-    pub fn new(log: Arc<dyn SessionLog>, command: Command) -> Self {
+    pub fn new(log: Arc<dyn ThreadJournal>, command: Command) -> Self {
         Self {
             log,
             command,
@@ -102,7 +103,7 @@ impl SessionExecution {
     /// Rejects a command that already ran, a second submit while a turn is unfinished, a
     /// continuation of anything other than the latest unfinished turn, and an answer to an
     /// interaction that is no longer pending.
-    pub async fn prepare(&mut self, recorder: &SessionRecorder) -> crate::error::Result<()> {
+    pub async fn prepare(&mut self, recorder: &InvocationRecorder) -> crate::error::Result<()> {
         self.prepare_with_baseline(recorder, None).await
     }
 
@@ -112,7 +113,7 @@ impl SessionExecution {
     /// that cannot guarantee that should pass `None` and let this method read the journal.
     pub async fn prepare_with_baseline(
         &mut self,
-        recorder: &SessionRecorder,
+        recorder: &InvocationRecorder,
         baseline: Option<&ExecutionBaseline>,
     ) -> crate::error::Result<()> {
         let (view, pending) = match baseline {
@@ -125,26 +126,26 @@ impl SessionExecution {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = view.applied.clone();
         if view.started.contains(&self.command.id) {
-            return Err(session_error("Command already executed"));
+            return Err(journal_error("Command already executed"));
         }
         let latest = view.latest().cloned();
 
         match self.command.kind.as_str() {
             "submit" => {
                 if latest.as_ref().is_some_and(|turn| !turn.ended()) {
-                    return Err(session_error(
+                    return Err(journal_error(
                         "Continue the unfinished task before starting another task",
                     ));
                 }
                 if !pending.is_empty() {
-                    return Err(session_error("Answer pending interactions first"));
+                    return Err(journal_error("Answer pending interactions first"));
                 }
                 self.inputs = self.command.messages.clone();
             }
             "resume" => {
                 self.require_latest_unfinished(latest.as_ref())?;
                 if !pending.is_empty() {
-                    return Err(session_error("Answer pending interactions first"));
+                    return Err(journal_error("Answer pending interactions first"));
                 }
                 // Confirmations change tool/permission state rather than becoming chat
                 // messages; resolved answers must not be replayed as a blank user message.
@@ -159,13 +160,13 @@ impl SessionExecution {
                 self.require_latest_unfinished(latest.as_ref())?;
                 for id in &self.command.request_ids {
                     let request = pending.get(id).ok_or_else(|| {
-                        session_error(format!("Interaction is no longer pending: {id}"))
+                        journal_error(format!("Interaction is no longer pending: {id}"))
                     })?;
                     let turn_matches = request.turn_id.as_deref()
                         == self.command.turn_id.as_deref()
                         && request.turn_id.is_some();
                     if !turn_matches {
-                        return Err(session_error(format!(
+                        return Err(journal_error(format!(
                             "Interaction is no longer pending: {id}"
                         )));
                     }
@@ -173,7 +174,7 @@ impl SessionExecution {
                 self.inputs = self.command.messages.clone();
             }
             other => {
-                return Err(session_error(format!(
+                return Err(journal_error(format!(
                     "Command kind does not start an execution: {other}"
                 )));
             }
@@ -198,7 +199,7 @@ impl SessionExecution {
             !turn.ended() && Some(turn.turn_id.as_str()) == self.command.turn_id.as_deref()
         });
         if !matches {
-            return Err(session_error(
+            return Err(journal_error(
                 "Only the latest unfinished task can continue",
             ));
         }
@@ -210,7 +211,7 @@ impl SessionExecution {
             .turn_id
             .clone()
             .filter(|turn| !turn.trim().is_empty())
-            .ok_or_else(|| session_error("Execution command requires a turn id"))
+            .ok_or_else(|| journal_error("Execution command requires a turn id"))
     }
 
     /// Applies pending `inject`/`steer` input to the working state before a step.
@@ -219,7 +220,7 @@ impl SessionExecution {
     /// retried step never loses or duplicates the input.
     pub async fn before_step(
         &self,
-        recorder: &SessionRecorder,
+        recorder: &InvocationRecorder,
         state: &mut AgentState,
     ) -> crate::error::Result<()> {
         let inbox = self.inbox()?;
@@ -275,7 +276,7 @@ impl SessionExecution {
     /// consuming instead of closing and losing the accepted guidance.
     pub async fn continue_or_close(
         &self,
-        recorder: &SessionRecorder,
+        recorder: &InvocationRecorder,
     ) -> crate::error::Result<bool> {
         let inbox = self.inbox()?;
         let applied = self
@@ -296,7 +297,7 @@ impl SessionExecution {
     }
 
     /// Closes the inbox turn once.
-    pub async fn close(&self, recorder: &SessionRecorder) -> crate::error::Result<()> {
+    pub async fn close(&self, recorder: &InvocationRecorder) -> crate::error::Result<()> {
         if !self.opened.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -325,24 +326,24 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::message::Msg;
-    use crate::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionEvent, StorageValue,
+    use crate::journal::{
+        AtomicJournalStorage, AtomicThreadJournal, JournalEvent, MemoryJournalStorage, StorageValue,
     };
+    use crate::message::Msg;
 
-    async fn journal() -> Arc<dyn SessionLog> {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        Arc::new(JournalSessionLog::new(storage, "s1"))
+    async fn journal() -> Arc<dyn ThreadJournal> {
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        Arc::new(AtomicThreadJournal::new(storage, "s1"))
     }
 
     /// Storage that counts reads, so a test can prove a step reused a cached fold.
     struct CountingStorage {
-        inner: MemorySessionStorage,
+        inner: MemoryJournalStorage,
         reads: Arc<AtomicUsize>,
     }
 
     #[async_trait]
-    impl AtomicSessionStorage for CountingStorage {
+    impl AtomicJournalStorage for CountingStorage {
         async fn read(&self, path: &str) -> crate::error::Result<Option<StorageValue>> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.inner.read(path).await
@@ -360,7 +361,7 @@ mod tests {
         }
     }
 
-    async fn seed(log: &dyn SessionLog, events: Vec<SessionEvent>) {
+    async fn seed(log: &dyn ThreadJournal, events: Vec<JournalEvent>) {
         let writer = log.acquire("seed", Duration::from_secs(60)).await.unwrap();
         log.commit(&writer, "seed", 0, &events).await.unwrap();
         log.release(&writer).await.unwrap();
@@ -372,8 +373,8 @@ mod tests {
         run: Option<&str>,
         turn: Option<&str>,
         payload: String,
-    ) -> SessionEvent {
-        SessionEvent::new(
+    ) -> JournalEvent {
+        JournalEvent::new(
             format!("e{seq}"),
             seq,
             0,
@@ -400,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn submit_is_admitted_and_opens_the_turn() {
         let log = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));
@@ -422,7 +423,7 @@ mod tests {
             vec![raw(1, "run/start", Some("run-0"), Some("t1"), "{}".into())],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t2"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t2"))
             .await
             .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c2", "t2"));
@@ -449,7 +450,7 @@ mod tests {
             )],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t2"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t2"))
             .await
             .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c2", "t2"));
@@ -490,7 +491,7 @@ mod tests {
             ],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let command =
@@ -529,7 +530,7 @@ mod tests {
             ],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t2"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t2"))
             .await
             .unwrap();
         let command =
@@ -567,7 +568,7 @@ mod tests {
             ],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
 
@@ -603,7 +604,7 @@ mod tests {
     #[tokio::test]
     async fn steer_and_inject_are_applied_once_before_a_step() {
         let log = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));
@@ -642,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn steering_for_another_turn_is_not_applied() {
         let log = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));
@@ -670,7 +671,7 @@ mod tests {
     #[tokio::test]
     async fn continue_or_close_keeps_the_turn_open_for_unapplied_steering() {
         let log = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));
@@ -705,12 +706,12 @@ mod tests {
         // fresh `SessionInbox`, throwing away the snapshot cache it carries: each step
         // re-read and re-decoded every accepted command of the session.
         let reads = Arc::new(AtomicUsize::new(0));
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(CountingStorage {
-            inner: MemorySessionStorage::new(),
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(CountingStorage {
+            inner: MemoryJournalStorage::new(),
             reads: Arc::clone(&reads),
         });
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(storage, "s1"));
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let log: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(storage, "s1"));
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));
@@ -731,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn close_is_idempotent_and_clears_the_active_run() {
         let log = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let mut execution = SessionExecution::new(Arc::clone(&log), submit("c1", "t1"));

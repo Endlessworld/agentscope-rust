@@ -1279,7 +1279,7 @@ impl AcpAgentSession {
             match runtime.as_ref() {
                 Some(session) => Arc::clone(session),
                 None => {
-                    return Err(agentscope_core::Error::Session(
+                    return Err(agentscope_core::Error::Journal(
                         "the session runtime is not open".into(),
                     ))
                 }
@@ -3107,7 +3107,7 @@ impl AcpAgentSession {
                 // the close is attempted with a short bound instead of waiting out the lease, so
                 // `session/close` cannot hang on the very turn it is tearing down.
                 let closed_now = closed.load(Ordering::SeqCst);
-                let close = agentscope_core::session::abandon_turn(session.log(), &task.turn_id);
+                let close = agentscope_core::journal::abandon_turn(session.log(), &task.turn_id);
                 let close = async {
                     if closed_now {
                         tokio::time::timeout(CLOSED_TURN_CLOSE_GRACE, close)
@@ -3134,7 +3134,7 @@ impl AcpAgentSession {
             if let Some(reason) = stall {
                 // Try to release whatever the abandoned attempt left open so the next prompt can
                 // start; failures here must not hide the original problem.
-                let _ = agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await;
+                let _ = agentscope_core::journal::abandon_turn(session.log(), &task.turn_id).await;
                 emit(super::event::message_chunk(
                     self.session_id.clone(),
                     format!("Agent error: {reason}"),
@@ -3146,7 +3146,7 @@ impl AcpAgentSession {
             // The inner loop can only exit without a receipt on cancel/stall (both handled
             // above). Never report success for a run whose outcome is unknown.
             let Some(current) = settled_task else {
-                let _ = agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await;
+                let _ = agentscope_core::journal::abandon_turn(session.log(), &task.turn_id).await;
                 emit(super::event::message_chunk(
                     self.session_id.clone(),
                     "Agent error: the run stopped without reporting a result; the turn was \
@@ -3219,7 +3219,7 @@ impl AcpAgentSession {
                             continue;
                         }
                         Err(error) => {
-                            let _ = agentscope_core::session::abandon_turn(
+                            let _ = agentscope_core::journal::abandon_turn(
                                 session.log(),
                                 &task.turn_id,
                             )
@@ -3242,7 +3242,7 @@ impl AcpAgentSession {
                     // failing; close the turn so the session stays usable and say so without
                     // refusing the turn at the protocol level.
                     let _ =
-                        agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await;
+                        agentscope_core::journal::abandon_turn(session.log(), &task.turn_id).await;
                     emit(super::event::message_chunk(
                         self.session_id.clone(),
                         "Agent error: the run kept being interrupted before it finished. The \
@@ -3262,7 +3262,7 @@ impl AcpAgentSession {
                         )
                     });
                     let _ =
-                        agentscope_core::session::abandon_turn(session.log(), &task.turn_id).await;
+                        agentscope_core::journal::abandon_turn(session.log(), &task.turn_id).await;
                     emit(super::event::message_chunk(
                         self.session_id.clone(),
                         format!("Agent error: {detail}"),

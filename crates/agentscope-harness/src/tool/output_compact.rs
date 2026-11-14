@@ -541,8 +541,8 @@ crates/harness/src/agent/tool/grep.rs
 crates/harness/src/agent/session/storage.rs:10:alpha
 crates/harness/src/agent/session/storage.rs:12:beta
 crates/harness/src/agent/session/storage.rs:14:gamma
-crates/harness/src/agent/session/sqlite.rs:25:pub struct SqliteSessionStorage {
-crates/harness/src/agent/session/sqlite.rs:75:impl AtomicSessionStorage for SqliteSessionStorage {
+crates/harness/src/agent/session/sqlite.rs:25:pub struct SqliteJournalStorage {
+crates/harness/src/agent/session/sqlite.rs:75:impl AtomicJournalStorage for SqliteJournalStorage {
 crates/harness/src/agent/tool/grep.rs:7:delta";
         let out = compact_grep_like(input, &cfg());
         assert!(out.compacted, "{}", out.text);
@@ -550,8 +550,8 @@ crates/harness/src/agent/tool/grep.rs:7:delta";
         assert_eq!(out.hoisted_lines, 5);
         assert!(out.text.ends_with(
             "crates/harness/src/agent/session/storage.rs\n10:alpha\n12:beta\n14:gamma\n\
-crates/harness/src/agent/session/sqlite.rs\n25:pub struct SqliteSessionStorage {\n\
-75:impl AtomicSessionStorage for SqliteSessionStorage {\n\
+crates/harness/src/agent/session/sqlite.rs\n25:pub struct SqliteJournalStorage {\n\
+75:impl AtomicJournalStorage for SqliteJournalStorage {\n\
 crates/harness/src/agent/tool/grep.rs:7:delta"
         ));
     }
@@ -575,23 +575,23 @@ c/x.rs:11:zeta";
     #[test]
     fn real_workspace_paths_with_mixed_separators() {
         let input = "\
-crates/agentscope-harness/src/agent/session\\store.rs:25:pub struct StoreSessionStorage {
-crates/agentscope-harness/src/agent/session\\storage.rs:25:pub struct WorkspaceSessionStorage {
+crates/agentscope-harness/src/agent/session\\store.rs:25:pub struct StoreJournalStorage {
+crates/agentscope-harness/src/agent/session\\storage.rs:25:pub struct WorkspaceJournalStorage {
 crates/agentscope-harness/src/agent/session\\storage.rs:85:        let temp = format!(\"{path}.tmp-{}\", uuid::Uuid::new_v4());
 crates/agentscope-harness/src/agent/session\\storage.rs:86:        self.fs.write(ctx, &temp, content).await?;
-crates/agentscope-harness/src/agent/session\\storage.rs:122:impl AtomicSessionStorage for WorkspaceSessionStorage {
+crates/agentscope-harness/src/agent/session\\storage.rs:122:impl AtomicJournalStorage for WorkspaceJournalStorage {
 crates/agentscope-harness/src/agent/session\\storage.rs:298:    fn temp_dir(tag: &str) -> std::path::PathBuf {";
         let out = compact_grep_like(input, &cfg());
         assert!(out.compacted);
         assert!(out.text.contains(
-            "\ncrates/agentscope-harness/src/agent/session\\storage.rs\n25:pub struct WorkspaceSessionStorage {"
+            "\ncrates/agentscope-harness/src/agent/session\\storage.rs\n25:pub struct WorkspaceJournalStorage {"
         ));
         assert!(out
             .text
-            .contains("\n122:impl AtomicSessionStorage for WorkspaceSessionStorage {"));
+            .contains("\n122:impl AtomicJournalStorage for WorkspaceJournalStorage {"));
         // The run of one stays inline.
         assert!(out.text.contains(
-            "\ncrates/agentscope-harness/src/agent/session\\store.rs:25:pub struct StoreSessionStorage {"
+            "\ncrates/agentscope-harness/src/agent/session\\store.rs:25:pub struct StoreJournalStorage {"
         ));
     }
 

@@ -1,4 +1,4 @@
-//! Blocking-equivalent persistence SPI, mirroring `SessionLog` / `SessionLogStore`.
+//! Blocking-equivalent persistence SPI, mirroring `ThreadJournal` / `ThreadJournalStore`.
 //!
 //! Rust call sites are already async, so the seam is expressed with `async_trait` instead of
 //! the Java `boundedElastic` scheduler hop.
@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::{session_error, SessionEvent, SessionKey};
+use super::{journal_error, JournalEvent};
 use crate::agent::RuntimeContext;
+use crate::agent::ThreadKey;
 
 /// The visible committed head of a journal.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,10 +47,10 @@ pub struct Writer {
 
 /// Durable session journal.
 #[async_trait]
-pub trait SessionLog: Send + Sync {
+pub trait ThreadJournal: Send + Sync {
     /// Durable input journal, independent of the execution writer and its event sequence.
-    fn inbox(&self) -> crate::error::Result<Arc<dyn SessionLog>> {
-        Err(session_error(
+    fn inbox(&self) -> crate::error::Result<Arc<dyn ThreadJournal>> {
+        Err(journal_error(
             "This session backend does not support a durable inbox",
         ))
     }
@@ -63,7 +64,7 @@ pub trait SessionLog: Send + Sync {
     /// Permanently fences this writer identity, including an acquisition that has not
     /// started yet. Other identities may continue this session.
     async fn seal_writer(&self, _owner: &str) -> crate::error::Result<Head> {
-        Err(session_error("This session backend cannot seal a writer"))
+        Err(journal_error("This session backend cannot seal a writer"))
     }
 
     /// Extends a writer lease.
@@ -78,17 +79,17 @@ pub trait SessionLog: Send + Sync {
         writer: &Writer,
         batch_id: &str,
         expected_seq: u64,
-        events: &[SessionEvent],
+        events: &[JournalEvent],
     ) -> crate::error::Result<Head>;
 
     /// Reads up to `limit` committed events strictly after `after`.
     async fn read_after(&self, after: u64, limit: usize)
-        -> crate::error::Result<Vec<SessionEvent>>;
+        -> crate::error::Result<Vec<JournalEvent>>;
 
     /// Stable-prefix scan of `(after, through]`.
-    async fn scan(&self, after: u64, through: u64) -> crate::error::Result<Vec<SessionEvent>> {
+    async fn scan(&self, after: u64, through: u64) -> crate::error::Result<Vec<JournalEvent>> {
         if through < after {
-            return Err(session_error("Invalid committed prefix"));
+            return Err(journal_error("Invalid committed prefix"));
         }
         let mut collected = Vec::new();
         let mut cursor = after;
@@ -96,14 +97,14 @@ pub trait SessionLog: Send + Sync {
             let limit = std::cmp::min(256, (through - cursor) as usize);
             let batch = self.read_after(cursor, limit).await?;
             if batch.is_empty() {
-                return Err(session_error("Missing committed prefix"));
+                return Err(journal_error("Missing committed prefix"));
             }
             for event in batch {
                 if event.seq > through {
                     break;
                 }
                 if event.seq != cursor + 1 {
-                    return Err(session_error("Non-contiguous event sequence"));
+                    return Err(journal_error("Non-contiguous event sequence"));
                 }
                 cursor = event.seq;
                 collected.push(event);
@@ -121,7 +122,7 @@ pub trait SessionLog: Send + Sync {
         &self,
         after: u64,
         through: u64,
-        visitor: &mut (dyn for<'a> FnMut(&'a SessionEvent) -> crate::error::Result<()> + Send),
+        visitor: &mut (dyn for<'a> FnMut(&'a JournalEvent) -> crate::error::Result<()> + Send),
     ) -> crate::error::Result<()> {
         for event in self.scan(after, through).await? {
             visitor(&event)?;
@@ -140,15 +141,15 @@ pub trait SessionLog: Send + Sync {
         _expected: u64,
         _next: u64,
     ) -> crate::error::Result<()> {
-        Err(session_error("Export cursor persistence not implemented"))
+        Err(journal_error("Export cursor persistence not implemented"))
     }
 
     /// The published view snapshot of this journal, if the backend keeps one.
     ///
     /// Readers may start from it instead of replaying the whole chain; the returned snapshot is
     /// only a *candidate* — callers must still check it against the chain (see
-    /// [`commit_at`](SessionLog::commit_at)).
-    async fn snapshot(&self) -> crate::error::Result<Option<super::SessionSnapshot>> {
+    /// [`commit_at`](ThreadJournal::commit_at)).
+    async fn snapshot(&self) -> crate::error::Result<Option<super::JournalSnapshot>> {
         Ok(None)
     }
 
@@ -172,7 +173,7 @@ pub trait SessionLog: Send + Sync {
     async fn publish_snapshot(
         &self,
         _writer: &Writer,
-        _retention: super::SessionRetention,
+        _retention: super::JournalRetention,
     ) -> crate::error::Result<Option<u64>> {
         Ok(None)
     }
@@ -196,18 +197,18 @@ pub trait SessionLog: Send + Sync {
 /// Extensible session log backend. Opening a reader must not acquire a writer or repair
 /// history.
 #[async_trait]
-pub trait SessionLogStore: Send + Sync {
+pub trait ThreadJournalStore: Send + Sync {
     /// Opens (never creates-and-repairs) the journal for a logical key.
     async fn open(
         &self,
-        key: &SessionKey,
+        key: &ThreadKey,
         context: &RuntimeContext,
-    ) -> crate::error::Result<Arc<dyn SessionLog>>;
+    ) -> crate::error::Result<Arc<dyn ThreadJournal>>;
 
     /// Discovers native sessions in the caller's storage namespace, without acquiring
     /// writers.
-    async fn list(&self, _context: &RuntimeContext) -> crate::error::Result<Vec<SessionKey>> {
-        Err(session_error(
+    async fn list(&self, _context: &RuntimeContext) -> crate::error::Result<Vec<ThreadKey>> {
+        Err(journal_error(
             "This session log store does not support discovery",
         ))
     }
@@ -218,8 +219,8 @@ pub trait SessionLogStore: Send + Sync {
     /// Backends that cannot delete the journal must fail visibly: a caller that believes a
     /// session is gone while its history is still readable would keep leaking it. The default
     /// therefore reports unsupported instead of pretending success.
-    async fn delete(&self, _key: &SessionKey) -> crate::error::Result<()> {
-        Err(session_error(
+    async fn delete(&self, _key: &ThreadKey) -> crate::error::Result<()> {
+        Err(journal_error(
             "This session log store does not support deletion",
         ))
     }
@@ -233,26 +234,26 @@ mod tests {
     struct OpenOnlyStore;
 
     #[async_trait]
-    impl SessionLogStore for OpenOnlyStore {
+    impl ThreadJournalStore for OpenOnlyStore {
         async fn open(
             &self,
-            _key: &SessionKey,
+            _key: &ThreadKey,
             _context: &RuntimeContext,
-        ) -> crate::error::Result<Arc<dyn SessionLog>> {
-            Err(session_error("open is not implemented by this test store"))
+        ) -> crate::error::Result<Arc<dyn ThreadJournal>> {
+            Err(journal_error("open is not implemented by this test store"))
         }
     }
 
     #[tokio::test]
     async fn default_delete_reports_unsupported_instead_of_succeeding() {
         let store = OpenOnlyStore;
-        let key = SessionKey::new(None::<String>, "agent", "session").unwrap();
+        let key = ThreadKey::new(None::<String>, "agent", "session").unwrap();
         let error = store
             .delete(&key)
             .await
             .expect_err("an unsupported delete must not report success");
         assert!(
-            matches!(error, crate::error::Error::Session(_)),
+            matches!(error, crate::error::Error::Journal(_)),
             "unexpected error kind: {error:?}"
         );
         assert!(error.to_string().contains("does not support deletion"));

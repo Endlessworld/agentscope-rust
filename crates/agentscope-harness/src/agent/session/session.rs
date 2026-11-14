@@ -12,17 +12,18 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use agentscope_core::agent::ThreadKey;
 use agentscope_core::agent::{Extensions, RuntimeContext, StreamOptions};
 use agentscope_core::event::AgentEvent;
+use agentscope_core::journal::{
+    apply_pending_event, journal_error, outcome, pending_interactions, transcript, Command,
+    ExecutionBaseline, Head, InboxSnapshot, InvocationRecorder, JournalEvent,
+    JournalExportSinkHandle, JournalProjection, RecorderBaseline, SessionExecution, SessionInbox,
+    ThreadJournal, Transcript, TurnViews, EXECUTION_CONTEXT_KEY, JOURNAL_EXPORT_SINK_CONTEXT_KEY,
+    RECORDER_CONTEXT_KEY,
+};
 use agentscope_core::message::{
     ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolUseBlock,
-};
-use agentscope_core::session::{
-    apply_pending_event, outcome, pending_interactions, session_error, transcript, Command,
-    ExecutionBaseline, Head, InboxSnapshot, RecorderBaseline, SessionEvent, SessionExecution,
-    SessionExportSinkHandle, SessionInbox, SessionKey, SessionLog, SessionProjection,
-    SessionRecorder, SessionTurns, Transcript, EXECUTION_CONTEXT_KEY, RECORDER_CONTEXT_KEY,
-    SESSION_EXPORT_SINK_CONTEXT_KEY,
 };
 use agentscope_core::state::AgentState;
 use futures::StreamExt;
@@ -104,38 +105,38 @@ struct SessionState {
     /// The last dispatch projection and the committed head it was derived from.
     ///
     /// The dispatcher ticks every 50ms even while a session is idle. Re-reading
-    /// `SessionTurns` from the whole journal on every tick re-deserialized every state
+    /// `TurnViews` from the whole journal on every tick re-deserialized every state
     /// checkpoint; a long session then burned CPU and churned memory without any new work.
     dispatch_view: Option<(u64, Option<String>, DispatchView)>,
     /// The committed head the live agent state corresponds to.
     ///
     /// A matching head means the agent's in-memory `AgentState` *is* the committed
-    /// history, so the next turn can skip `SessionProjection::read`. That projection
+    /// history, so the next turn can skip `JournalProjection::read`. That projection
     /// walks every event and hydrates every checkpoint/request blob; after the page cache
     /// goes cold this made the first prompt after an idle period take minutes and churn
     /// the disk. A mismatch (another writer, a restart) falls back to the full replay.
     restored_head: Option<(u64, Option<String>)>,
     /// Cached admission view (turns, inputs, applied ids, pending interactions) and the
     /// head it was derived from. Advanced incrementally per turn instead of re-reading
-    /// the whole journal for `SessionTurns`/`pending_interactions`.
+    /// the whole journal for `TurnViews`/`pending_interactions`.
     execution_view: Option<(
         u64,
         Option<String>,
-        SessionTurns,
-        BTreeMap<String, SessionEvent>,
+        TurnViews,
+        BTreeMap<String, JournalEvent>,
     )>,
 }
 
 impl SessionState {
     /// Whether the live agent state is the committed history at `head`.
-    fn restored_head_matches(&self, head: &agentscope_core::session::Head) -> bool {
+    fn restored_head_matches(&self, head: &agentscope_core::journal::Head) -> bool {
         self.restored_head.as_ref().is_some_and(|(seq, commit)| {
             *seq == head.seq && commit.as_deref() == head.commit_id.as_deref()
         })
     }
 }
 
-/// The small part of [`SessionTurns`] the dispatcher needs, without the input messages.
+/// The small part of [`TurnViews`] the dispatcher needs, without the input messages.
 #[derive(Debug, Clone, Default)]
 struct DispatchView {
     started: BTreeSet<String>,
@@ -188,7 +189,7 @@ impl ReceiptCache {
         };
     }
 
-    async fn rebuild(&mut self, log: &dyn SessionLog, head: &Head) -> crate::Result<()> {
+    async fn rebuild(&mut self, log: &dyn ThreadJournal, head: &Head) -> crate::Result<()> {
         *self = Self::default();
         self.sync(log, head).await?;
         self.complete = true;
@@ -196,7 +197,7 @@ impl ReceiptCache {
     }
 
     /// Applies the events committed since `through`, up to `head`.
-    async fn sync(&mut self, log: &dyn SessionLog, head: &Head) -> crate::Result<()> {
+    async fn sync(&mut self, log: &dyn ThreadJournal, head: &Head) -> crate::Result<()> {
         // A rewritten or rolled-back head invalidates the fold: rebuild from the start.
         if head.seq < self.through
             || (head.seq == self.through && self.commit.as_deref() != head.commit_id.as_deref())
@@ -224,7 +225,7 @@ impl ReceiptCache {
         Ok(())
     }
 
-    fn apply(&mut self, event: &SessionEvent) {
+    fn apply(&mut self, event: &JournalEvent) {
         if event.event_type == "turn/cancelled" {
             if let Some(turn) = &event.turn_id {
                 self.cancelled_turns.insert(turn.clone());
@@ -283,8 +284,8 @@ impl ReceiptCache {
 pub struct AgentSession {
     agent: Arc<HarnessAgent>,
     context: RuntimeContext,
-    key: SessionKey,
-    log: Arc<dyn SessionLog>,
+    key: ThreadKey,
+    log: Arc<dyn ThreadJournal>,
     inbox: SessionInbox,
     state: Arc<Mutex<SessionState>>,
     /// Serializes receipt polls and keeps their incremental fold across ticks.
@@ -310,8 +311,8 @@ impl AgentSession {
     pub fn open(
         agent: Arc<HarnessAgent>,
         context: RuntimeContext,
-        key: SessionKey,
-        log: Arc<dyn SessionLog>,
+        key: ThreadKey,
+        log: Arc<dyn ThreadJournal>,
     ) -> crate::Result<Self> {
         let inbox = SessionInbox::new(Arc::clone(&log))?;
         Ok(Self {
@@ -332,7 +333,7 @@ impl AgentSession {
     }
 
     /// The native journal behind this session.
-    pub fn log(&self) -> Arc<dyn SessionLog> {
+    pub fn log(&self) -> Arc<dyn ThreadJournal> {
         Arc::clone(&self.log)
     }
 
@@ -342,12 +343,12 @@ impl AgentSession {
     }
 
     /// Read-only recovery view (uncertain tool calls, active runs, state).
-    pub async fn inspect(&self) -> crate::Result<SessionProjection> {
-        SessionProjection::read(&*self.log).await
+    pub async fn inspect(&self) -> crate::Result<JournalProjection> {
+        JournalProjection::read(&*self.log).await
     }
 
     /// Outstanding interaction requests at the current prefix.
-    pub async fn pending(&self) -> crate::Result<BTreeMap<String, SessionEvent>> {
+    pub async fn pending(&self) -> crate::Result<BTreeMap<String, JournalEvent>> {
         pending_interactions(&*self.log).await
     }
 
@@ -366,7 +367,7 @@ impl AgentSession {
     }
 
     /// The committed head of the journal (sequence, writer lease, commit id).
-    pub async fn head(&self) -> crate::Result<agentscope_core::session::Head> {
+    pub async fn head(&self) -> crate::Result<agentscope_core::journal::Head> {
         self.log.head().await
     }
 
@@ -427,16 +428,16 @@ impl AgentSession {
     ) -> crate::Result<Task> {
         self.ensure_open()?;
         if message.content.is_empty() {
-            return Err(session_error("A new task requires input"));
+            return Err(journal_error("A new task requires input"));
         }
         if matches!(
             message.content.as_slice(),
             [ContentBlock::Text(text)] if text.text.is_empty()
         ) {
-            return Err(session_error("A new task requires input"));
+            return Err(journal_error("A new task requires input"));
         }
         if idempotency_key.trim().is_empty() || idempotency_key.len() > 200 {
-            return Err(session_error("Invalid idempotency key"));
+            return Err(journal_error("Invalid idempotency key"));
         }
         // A previous run may have left a non-terminal turn (crash, interrupt, a finish that
         // could not commit). The caller has clearly moved on when it submits new input, so
@@ -519,7 +520,7 @@ impl AgentSession {
                 }
             }
         }
-        match agentscope_core::session::abandon_turn(Arc::clone(&self.log), &open_turn).await {
+        match agentscope_core::journal::abandon_turn(Arc::clone(&self.log), &open_turn).await {
             Ok(closed) => {
                 if closed {
                     tracing::info!(
@@ -545,20 +546,20 @@ impl AgentSession {
     /// Continues the latest unfinished task with a new run.
     pub async fn resume(&self, turn_id: &str) -> crate::Result<Task> {
         self.ensure_open()?;
-        let turns = SessionTurns::read(&*self.log).await?;
+        let turns = TurnViews::read(&*self.log).await?;
         let continue_allowed = turns
             .latest()
             .is_some_and(|turn| turn.turn_id == turn_id && !turn.ended());
         if !continue_allowed {
-            return Err(session_error(
+            return Err(journal_error(
                 "Only the latest unfinished task can continue",
             ));
         }
         if !self.pending().await?.is_empty() {
-            return Err(session_error("Answer pending interactions first"));
+            return Err(journal_error("Answer pending interactions first"));
         }
         if !self.inspect().await?.uncertain_tool_calls.is_empty() {
-            return Err(session_error("Reconcile uncertain tool outcomes first"));
+            return Err(journal_error("Reconcile uncertain tool outcomes first"));
         }
         self.wait_idle().await?;
 
@@ -570,7 +571,7 @@ impl AgentSession {
                 && !snapshot.rejected.contains_key(&existing.id)
         });
         if already_queued {
-            return Err(session_error("Continuation already queued"));
+            return Err(journal_error("Continuation already queued"));
         }
         let command = Command::new(
             uuid::Uuid::new_v4().to_string(),
@@ -623,14 +624,14 @@ impl AgentSession {
             }
             while lock_state(&self.state).active_run.is_some() {
                 if std::time::Instant::now() >= deadline {
-                    return Err(session_error("Wait for the current execution to stop"));
+                    return Err(journal_error("Wait for the current execution to stop"));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
             let Some(latest) = self.open_turn().await? else {
                 return Ok(None);
             };
-            match agentscope_core::session::abandon_turn(Arc::clone(&self.log), &latest).await {
+            match agentscope_core::journal::abandon_turn(Arc::clone(&self.log), &latest).await {
                 Ok(closed) => {
                     if closed {
                         return Ok(Some(latest));
@@ -669,7 +670,7 @@ impl AgentSession {
         self.ensure_open()?;
         self.require_idle()?;
         if answers.is_empty() {
-            return Err(session_error("An answer is required"));
+            return Err(journal_error("An answer is required"));
         }
         let requests = self.pending().await?;
         let mut turn: Option<String> = None;
@@ -679,13 +680,13 @@ impl AgentSession {
         for (id, answer) in &answers {
             let request = requests
                 .get(id)
-                .ok_or_else(|| session_error(format!("No pending interaction: {id}")))?;
+                .ok_or_else(|| journal_error(format!("No pending interaction: {id}")))?;
             let request_turn = request.turn_id.clone().ok_or_else(|| {
-                session_error(format!("Pending request has no logical turn: {id}"))
+                journal_error(format!("Pending request has no logical turn: {id}"))
             })?;
             if let Some(existing) = &turn {
                 if *existing != request_turn {
-                    return Err(session_error("Answers belong to different tasks"));
+                    return Err(journal_error("Answers belong to different tasks"));
                 }
             }
             let data = request.data()?;
@@ -697,7 +698,7 @@ impl AgentSession {
             let call: ToolUseBlock = match data.get("call") {
                 Some(value) => serde_json::from_value(value.clone())?,
                 None => {
-                    return Err(session_error(format!(
+                    return Err(journal_error(format!(
                         "Pending interaction has no tool call: {id}"
                     )))
                 }
@@ -705,21 +706,21 @@ impl AgentSession {
             match kind.as_str() {
                 "external_execution" => {
                     let result = answer.to_tool_result(&call.id, &call.name).ok_or_else(|| {
-                        session_error(format!("Answer type does not match interaction: {id}"))
+                        journal_error(format!("Answer type does not match interaction: {id}"))
                     })?;
                     results.push(result);
                 }
                 "confirmation" => {
                     let result = answer.to_confirm_result(&call).ok_or_else(|| {
-                        session_error(format!("Answer type does not match interaction: {id}"))
+                        journal_error(format!("Answer type does not match interaction: {id}"))
                     })?;
                     if result.tool_call.as_ref().is_some_and(|c| c.id != call.id) {
-                        return Err(session_error("Confirmation tool ID mismatch"));
+                        return Err(journal_error("Confirmation tool ID mismatch"));
                     }
                     confirmations.push(result);
                 }
                 _ => {
-                    return Err(session_error(format!(
+                    return Err(journal_error(format!(
                         "Reply through the interaction's owning service: {id}"
                     )))
                 }
@@ -778,14 +779,14 @@ impl AgentSession {
             .as_deref()
             .filter(|run| Some(*run) == head.owner.as_deref() && head.lease_until > now_millis());
         if running.is_none() {
-            return Err(session_error(
+            return Err(journal_error(
                 "No running task accepts steering; submit or resume explicitly",
             ));
         }
         let turn_id = snapshot.turn_id.clone();
         if let Some(expected) = expected_turn {
             if Some(expected) != turn_id.as_deref() {
-                return Err(session_error("Task is no longer running"));
+                return Err(journal_error("Task is no longer running"));
             }
         }
         let command = Command::new(
@@ -964,7 +965,7 @@ impl AgentSession {
         let command = snapshot
             .command(command_id)
             .filter(|command| command.execution())
-            .ok_or_else(|| session_error("Unknown task submission"))?;
+            .ok_or_else(|| journal_error("Unknown task submission"))?;
         self.receipt_with_snapshot(command, &snapshot).await
     }
 
@@ -981,14 +982,14 @@ impl AgentSession {
 
     fn ensure_open(&self) -> crate::Result<()> {
         if lock_state(&self.state).closed {
-            return Err(session_error("Session runtime is closed"));
+            return Err(journal_error("Session runtime is closed"));
         }
         Ok(())
     }
 
     fn require_idle(&self) -> crate::Result<()> {
         if lock_state(&self.state).active_run.is_some() {
-            return Err(session_error("Wait for the current execution to stop"));
+            return Err(journal_error("Wait for the current execution to stop"));
         }
         Ok(())
     }
@@ -1150,7 +1151,7 @@ impl Drop for AgentSession {
 /// Returns the cached dispatch projection for `head`, re-reading the journal only when the
 /// committed head changed.
 async fn dispatch_view(
-    log: &dyn SessionLog,
+    log: &dyn ThreadJournal,
     state: &Arc<Mutex<SessionState>>,
     head: &Head,
 ) -> crate::Result<DispatchView> {
@@ -1216,7 +1217,7 @@ fn next_idle_backoff(current: std::time::Duration, busy: bool) -> std::time::Dur
 
 async fn dispatch_once(
     agent: &Arc<HarnessAgent>,
-    log: &Arc<dyn SessionLog>,
+    log: &Arc<dyn ThreadJournal>,
     inbox: &SessionInbox,
     context: &RuntimeContext,
     state: &Arc<Mutex<SessionState>>,
@@ -1258,7 +1259,7 @@ async fn dispatch_once(
         // submit run on the next tick instead of rejecting the user's message outright.
         if view.open_turn.is_some() && command.kind == "submit" {
             if let Some(turn_id) = view.open_turn.as_deref() {
-                match agentscope_core::session::abandon_turn(Arc::clone(log), turn_id).await {
+                match agentscope_core::journal::abandon_turn(Arc::clone(log), turn_id).await {
                     Ok(_) => return Ok(()),
                     Err(error) => {
                         // A transient busy writer: leave the command queued and retry on a
@@ -1282,11 +1283,11 @@ async fn dispatch_once(
 
 /// Returns the admission view for `head`, advancing the cached projection incrementally.
 ///
-/// A cold process pays one full `SessionTurns`/`pending_interactions` read. Subsequent
+/// A cold process pays one full `TurnViews`/`pending_interactions` read. Subsequent
 /// turns only visit the events committed since the cached head, instead of re-reading
 /// every model chunk, checkpoint and request in the session's history.
 async fn execution_baseline(
-    log: &dyn SessionLog,
+    log: &dyn ThreadJournal,
     state: &Arc<Mutex<SessionState>>,
     head: &Head,
 ) -> crate::Result<ExecutionBaseline> {
@@ -1321,7 +1322,7 @@ async fn execution_baseline(
         }
     }
     let started = std::time::Instant::now();
-    let turns = SessionTurns::read(log).await?;
+    let turns = TurnViews::read(log).await?;
     let pending = pending_interactions(log).await?;
     tracing::info!(
         head_seq = head.seq,
@@ -1344,7 +1345,7 @@ async fn execution_baseline(
 /// the caller then opens the recorder without a baseline, which replays the journal. Cheap
 /// enough to call again after a failed open -- it costs one `to_json()`, not a replay.
 async fn live_baseline(
-    log: &Arc<dyn SessionLog>,
+    log: &Arc<dyn ThreadJournal>,
     state: &Arc<Mutex<SessionState>>,
     agent: &Arc<HarnessAgent>,
     command: &Command,
@@ -1388,7 +1389,7 @@ async fn live_baseline(
 /// Opens a recorder, admits the command and runs the agent to completion.
 async fn launch(
     agent: &Arc<HarnessAgent>,
-    log: &Arc<dyn SessionLog>,
+    log: &Arc<dyn ThreadJournal>,
     inbox: &SessionInbox,
     context: &RuntimeContext,
     state: &Arc<Mutex<SessionState>>,
@@ -1397,18 +1398,18 @@ async fn launch(
     let turn_id = command
         .turn_id
         .clone()
-        .ok_or_else(|| session_error("Execution command requires a turn id"))?;
+        .ok_or_else(|| journal_error("Execution command requires a turn id"))?;
     // A host opts into committed-event export by installing a sink in the session context
-    // (Java `SessionExportSink.CONTEXT_KEY`). Without one the recorder is opened exactly as
+    // (Java `JournalExportSink.CONTEXT_KEY`). Without one the recorder is opened exactly as
     // before, so unrelated harness tests and hosts are unaffected.
-    let sink = context.extension::<SessionExportSinkHandle>(SESSION_EXPORT_SINK_CONTEXT_KEY);
+    let sink = context.extension::<JournalExportSinkHandle>(JOURNAL_EXPORT_SINK_CONTEXT_KEY);
     let session_id = agent
         .session_key(context)
         .map(|key| key.session_id)
         .unwrap_or_default();
     let exporter = sink
         .map(|handle| Arc::new(handle.exporter_for_session(Arc::clone(log), session_id.clone())));
-    // A long session pays for `SessionProjection::read` on every new turn: it hydrates every
+    // A long session pays for `JournalProjection::read` on every new turn: it hydrates every
     // state checkpoint and every request/prepared blob. When the live agent state still
     // matches the committed head, hand it to the recorder as a baseline instead. The
     // recorder re-checks the head under the writer lease and falls back to the full replay
@@ -1432,7 +1433,7 @@ async fn launch(
         };
         let opened = match attempt_baseline {
             Some(baseline) => {
-                SessionRecorder::open_with_baseline_and_policy(
+                InvocationRecorder::open_with_baseline_and_policy(
                     Arc::clone(log),
                     Some(&turn_id),
                     exporter.clone(),
@@ -1442,7 +1443,7 @@ async fn launch(
                 .await
             }
             None => {
-                SessionRecorder::open_with_exporter_and_policy(
+                InvocationRecorder::open_with_exporter_and_policy(
                     Arc::clone(log),
                     Some(&turn_id),
                     exporter.clone(),
@@ -1502,7 +1503,7 @@ async fn launch(
     // the partial text must be the last message. Only a `resume` can carry one: a fresh
     // submit starts a new turn with nothing to continue.
     if command.kind == "resume" {
-        match agentscope_core::session::interrupted_model_output(log.as_ref()).await {
+        match agentscope_core::journal::interrupted_model_output(log.as_ref()).await {
             Ok(Some(partial)) if !partial.text.is_empty() => {
                 while restored
                     .context
@@ -1597,7 +1598,7 @@ async fn launch(
         .collect();
     // Bookkeeping works on a copy that already carries the admitted input: `input/received`
     // is journal metadata, while `message/user` facts come from the state snapshot (Java
-    // `SessionRecorder.captureState` does the same). The agent itself gets the state
+    // `InvocationRecorder.captureState` does the same). The agent itself gets the state
     // *without* the input, because the loop appends the input when it runs — handing it both
     // would put every admitted message into the context twice.
     let mut working = restored.clone();
@@ -1761,10 +1762,7 @@ async fn launch(
 
     // A run that never started must not leave a phantom `queued` receipt forever.
     if let Err(error) = &result {
-        let started = SessionTurns::read(&**log)
-            .await?
-            .started
-            .contains(&command.id);
+        let started = TurnViews::read(&**log).await?.started.contains(&command.id);
         if !started {
             inbox.reject(&command, &error.to_string()).await?;
         }
@@ -1773,7 +1771,7 @@ async fn launch(
     // terminal facts through the recovery path (which also settles unknown tool outcomes).
     // Without this the next prompt sees an open turn and is rejected as `turn_unfinished`.
     if finish.is_err() {
-        if let Err(error) = agentscope_core::session::abandon_turn(Arc::clone(log), &turn_id).await
+        if let Err(error) = agentscope_core::journal::abandon_turn(Arc::clone(log), &turn_id).await
         {
             tracing::warn!(
                 %error,
@@ -1907,7 +1905,7 @@ async fn wait_for_idle(
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err(session_error("Wait for the current execution to stop"));
+            return Err(journal_error("Wait for the current execution to stop"));
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -1916,20 +1914,20 @@ async fn wait_for_idle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_core::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, StorageValue,
+    use agentscope_core::journal::{
+        AtomicJournalStorage, AtomicThreadJournal, MemoryJournalStorage, StorageValue,
     };
     use async_trait::async_trait;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     struct CountingStorage {
-        inner: MemorySessionStorage,
+        inner: MemoryJournalStorage,
         reads: Arc<AtomicUsize>,
     }
 
     #[async_trait]
-    impl AtomicSessionStorage for CountingStorage {
+    impl AtomicJournalStorage for CountingStorage {
         async fn read(&self, path: &str) -> crate::Result<Option<StorageValue>> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.inner.read(path).await
@@ -1958,16 +1956,16 @@ mod tests {
         // grow with the undrained delta backlog. Only the events committed since the last
         // poll may be read.
         let reads = Arc::new(AtomicUsize::new(0));
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(CountingStorage {
-            inner: MemorySessionStorage::new(),
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(CountingStorage {
+            inner: MemoryJournalStorage::new(),
             reads: Arc::clone(&reads),
         });
-        let log = JournalSessionLog::new(storage, "s");
+        let log = AtomicThreadJournal::new(storage, "s");
         let writer = log.acquire("run", Duration::from_secs(60)).await.unwrap();
 
         let mut seq = 0u64;
         for i in 0..40u64 {
-            let event = SessionEvent::new(
+            let event = JournalEvent::new(
                 format!("e{i}"),
                 seq + 1,
                 0,
@@ -1983,7 +1981,7 @@ mod tests {
                 .unwrap();
             seq += 1;
         }
-        let started = SessionEvent::new(
+        let started = JournalEvent::new(
             "started",
             seq + 1,
             0,
@@ -2023,7 +2021,7 @@ mod tests {
         );
 
         // A new terminal fact reads only its own commit, not the whole prefix again.
-        let ended = SessionEvent::new(
+        let ended = JournalEvent::new(
             "ended",
             seq + 1,
             0,
@@ -2091,7 +2089,7 @@ mod tests {
     fn the_live_state_cache_matches_only_the_exact_committed_head() {
         let mut state = SessionState::default();
         state.restored_head = Some((7, Some("commit-a".into())));
-        let head = |seq, commit: Option<&str>| agentscope_core::session::Head {
+        let head = |seq, commit: Option<&str>| agentscope_core::journal::Head {
             seq,
             epoch: 1,
             owner: None,
@@ -2107,15 +2105,15 @@ mod tests {
     #[tokio::test]
     async fn the_execution_view_advances_incrementally() {
         let reads = Arc::new(AtomicUsize::new(0));
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(CountingStorage {
-            inner: MemorySessionStorage::new(),
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(CountingStorage {
+            inner: MemoryJournalStorage::new(),
             reads: Arc::clone(&reads),
         });
-        let log = JournalSessionLog::new(storage, "s");
+        let log = AtomicThreadJournal::new(storage, "s");
         let writer = log.acquire("run", Duration::from_secs(60)).await.unwrap();
         let mut seq = 0u64;
         for i in 0..40u64 {
-            let event = SessionEvent::new(
+            let event = JournalEvent::new(
                 format!("chunk-{i}"),
                 seq + 1,
                 0,
@@ -2131,7 +2129,7 @@ mod tests {
                 .unwrap();
             seq += 1;
         }
-        let started = SessionEvent::new(
+        let started = JournalEvent::new(
             "started",
             seq + 1,
             0,
@@ -2158,7 +2156,7 @@ mod tests {
         assert!(cold.turns.started.contains("cmd-1"));
 
         // One new terminal fact: advancing the cached view must not re-read the prefix.
-        let ended = SessionEvent::new(
+        let ended = JournalEvent::new(
             "ended",
             seq + 1,
             0,
@@ -2186,16 +2184,16 @@ mod tests {
     #[tokio::test]
     async fn a_seeded_receipt_does_not_read_the_history_before_submit() {
         let reads = Arc::new(AtomicUsize::new(0));
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(CountingStorage {
-            inner: MemorySessionStorage::new(),
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(CountingStorage {
+            inner: MemoryJournalStorage::new(),
             reads: Arc::clone(&reads),
         });
-        let log = JournalSessionLog::new(storage, "s");
+        let log = AtomicThreadJournal::new(storage, "s");
         let writer = log.acquire("run", Duration::from_secs(60)).await.unwrap();
 
         let mut seq = 0u64;
         for i in 0..40u64 {
-            let event = SessionEvent::new(
+            let event = JournalEvent::new(
                 format!("old{i}"),
                 seq + 1,
                 0,
@@ -2216,7 +2214,7 @@ mod tests {
         let mut cache = ReceiptCache::default();
         cache.seed(&seeded, "cmd-new");
 
-        let started = SessionEvent::new(
+        let started = JournalEvent::new(
             "started-new",
             seq + 1,
             0,

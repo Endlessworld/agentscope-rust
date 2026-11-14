@@ -9,11 +9,11 @@
 use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::StreamOptions;
+use agentscope_core::journal::SessionHistoryMode;
 use agentscope_core::message::{
     ContentBlock as CoreBlock, Msg, TextBlock, ToolResultBlock, ToolUseBlock,
 };
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
-use agentscope_core::session::SessionHistoryMode;
 use agentscope_core::state::{AgentState, AgentStateStore, JsonFileAgentStateStore};
 use agentscope_harness::agent::HarnessAgent;
 use futures::StreamExt;

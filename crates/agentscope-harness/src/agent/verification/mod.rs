@@ -30,13 +30,13 @@
 //!   identities only, not evidence), so the caller must supply the evidence and own its
 //!   durability. Introducing a store here would create a parallel persistence path next to the
 //!   session journal.
-//! - **`recorder.findLast("action/end", ...)`.** Rust `SessionRecorder` has no read-back of
+//! - **`recorder.findLast("action/end", ...)`.** Rust `InvocationRecorder` has no read-back of
 //!   buffered/committed facts, and the Rust `action/end` payload has no `evidenceBindings`, so
 //!   the evidence is passed in instead of re-read. See [`SettledAction::evidence_binding`].
 //! - **`CustomEvent("task_verification")` emission.** Not wired: no in-band observer consumes it
 //!   yet, and the durable `verification/result` fact is the source of truth for projections.
 //! - **`VerificationService::load(userId, sessionId, id)`.** Loading a *stored report* requires
-//!   the state-store key space above; `SessionProjection::verifications` already replays
+//!   the state-store key space above; `JournalProjection::verifications` already replays
 //!   committed facts. The name-keyed verifier registry is ported as [`load`].
 //! - **`recorder.captureState(...)` / `flushNow()`.** A checkpoint after recording needs the
 //!   whole `AgentState`; this module only receives the task context, so the owning agent loop
@@ -51,9 +51,9 @@ pub use verifiers::{
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use agentscope_core::journal::InvocationRecorder;
 use agentscope_core::message::ToolResultBlock;
 use agentscope_core::observation::ActionObservation;
-use agentscope_core::session::SessionRecorder;
 use agentscope_core::state::{
     EvidenceBinding, RequirementKind, RequirementStatus, TaskContextState, TaskVerification,
     VerificationOutcome,
@@ -130,7 +130,7 @@ pub async fn verify(
     action_id: &str,
     evidence: &SettledAction,
     verifier: &dyn DeterministicVerifier,
-    recorder: Option<&SessionRecorder>,
+    recorder: Option<&InvocationRecorder>,
 ) -> Result<TaskVerification> {
     // Snapshot first: every check below must see one revision, and `record_verification` below
     // must fail rather than apply on top of a concurrent change.
@@ -200,11 +200,12 @@ pub async fn verify(
 mod tests {
     use std::sync::Arc;
 
+    use agentscope_core::journal::{
+        AtomicJournalStorage, AtomicThreadJournal, InvocationRecorder, MemoryJournalStorage,
+        ThreadJournal,
+    };
     use agentscope_core::message::ToolResultBlock;
     use agentscope_core::observation::ActionStatus;
-    use agentscope_core::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionLog, SessionRecorder,
-    };
     use agentscope_core::state::{
         RequirementAuthority, RequirementDecision, TaskContextState, TaskScope,
     };
@@ -288,9 +289,9 @@ mod tests {
         }
     }
 
-    fn journal() -> Arc<dyn SessionLog> {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        Arc::new(JournalSessionLog::new(storage, "s1"))
+    fn journal() -> Arc<dyn ThreadJournal> {
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        Arc::new(AtomicThreadJournal::new(storage, "s1"))
     }
 
     #[tokio::test]
@@ -491,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn recorder_journals_the_fact_and_a_failed_commit_keeps_state_unchanged() {
         let log = journal();
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let (mut task, requirement_id) = task();

@@ -14,14 +14,14 @@ mod common;
 
 use std::sync::Arc;
 
-use agentscope_core::session::AtomicSessionStorage;
+use agentscope_core::journal::AtomicJournalStorage;
 use agentscope_core::state::store::AgentStateStore;
 use agentscope_core::state::UNVERSIONED;
 use agentscope_extensions_oss::{
     InMemoryOssClient, OssAgentStateStore, OssClient, OssListPage, OssResult, OssStore,
     PutCondition, PutOutcome,
 };
-use agentscope_harness::agent::session::StoreSessionStorage;
+use agentscope_harness::agent::session::StoreJournalStorage;
 use agentscope_harness::filesystem::remote::store::{BaseStore, StoreValue};
 
 fn ns() -> Vec<String> {
@@ -219,7 +219,7 @@ async fn oss_store_declares_atomic_session_storage_and_backs_the_journal() {
     assert!(store.supports_atomic_session_storage());
 
     // The harness journal refuses non-atomic stores, so constructing it is the assertion.
-    let journal = StoreSessionStorage::new(store, vec!["ws".to_string()]).unwrap();
+    let journal = StoreJournalStorage::new(store, vec!["ws".to_string()]).unwrap();
     assert!(journal.compare_and_set("k", 0, b"one").await.unwrap());
     let read = journal.read("k").await.unwrap().expect("value");
     assert_eq!(read.bytes, b"one".to_vec());

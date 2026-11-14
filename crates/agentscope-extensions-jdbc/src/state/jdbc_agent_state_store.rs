@@ -910,7 +910,7 @@ impl AgentStateStore for JdbcAgentStateStore {
 
 /// Maps a backend failure onto core's error type for the `try_*` channel.
 fn state_error(error: JdbcError) -> agentscope_core::Error {
-    agentscope_core::Error::Session(format!("jdbc state store: {error}"))
+    agentscope_core::Error::Journal(format!("jdbc state store: {error}"))
 }
 
 /// Length of `value` in UTF-16 code units — the unit Java's `String.length()` (and therefore

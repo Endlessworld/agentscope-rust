@@ -7,7 +7,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{session_error, SessionEvent, SessionKey, SessionLog, SessionProjection};
+use super::{journal_error, JournalEvent, JournalProjection, ThreadJournal};
+use crate::agent::ThreadKey;
 use crate::state::AgentState;
 
 /// The migration writer lease.
@@ -25,13 +26,13 @@ pub struct ExportedState {
 /// Re-importing the identical baseline is a no-op; importing into a non-empty destination is
 /// rejected instead of merging unrelated histories.
 pub async fn import_baseline(
-    target: Arc<dyn SessionLog>,
+    target: Arc<dyn ThreadJournal>,
     state: &AgentState,
     source: &str,
     source_version: u64,
 ) -> crate::error::Result<()> {
     let json = state.to_json()?;
-    let hash = super::JournalSessionLog::hash(json.as_bytes());
+    let hash = super::AtomicThreadJournal::hash(json.as_bytes());
     let batch = format!("baseline-{hash}");
     let writer = target
         .acquire(&uuid::Uuid::new_v4().to_string(), LEASE)
@@ -56,7 +57,7 @@ pub async fn import_baseline(
             if is_identical {
                 return Ok(());
             }
-            return Err(session_error("Migration destination is not empty"));
+            return Err(journal_error("Migration destination is not empty"));
         }
         let payload = serde_json::json!({
             "stateJson": json,
@@ -65,7 +66,7 @@ pub async fn import_baseline(
             "sourceVersion": source_version,
             "sourceHash": hash,
         });
-        let event = SessionEvent::new(
+        let event = JournalEvent::new(
             uuid::Uuid::new_v4().to_string(),
             1,
             chrono::Utc::now().timestamp_millis(),
@@ -84,7 +85,7 @@ pub async fn import_baseline(
 }
 
 /// Exports the recoverable state of a paused source journal.
-pub async fn export_state(source: &dyn SessionLog) -> crate::error::Result<AgentState> {
+pub async fn export_state(source: &dyn ThreadJournal) -> crate::error::Result<AgentState> {
     Ok(export_snapshot(source).await?.state)
 }
 
@@ -92,28 +93,28 @@ pub async fn export_state(source: &dyn SessionLog) -> crate::error::Result<Agent
 ///
 /// Refuses a source with an active writer, an uncertain tool outcome, a live run or a pending
 /// interaction: exporting such a session would fork an execution that never finished.
-pub async fn export_snapshot(source: &dyn SessionLog) -> crate::error::Result<ExportedState> {
+pub async fn export_snapshot(source: &dyn ThreadJournal) -> crate::error::Result<ExportedState> {
     if source.head().await?.owner.is_some() {
-        return Err(session_error("Pause the source session before migration"));
+        return Err(journal_error("Pause the source session before migration"));
     }
     let writer = source
         .acquire(&uuid::Uuid::new_v4().to_string(), LEASE)
         .await?;
     let result = async {
-        let projection = SessionProjection::read(source).await?;
+        let projection = JournalProjection::read(source).await?;
         if !projection.uncertain_tool_calls.is_empty() || !projection.active_runs.is_empty() {
-            return Err(session_error(
+            return Err(journal_error(
                 "Reconcile interrupted execution before exporting",
             ));
         }
         if !super::pending_interactions(source).await?.is_empty() {
-            return Err(session_error(
+            return Err(journal_error(
                 "Resolve pending interactions before exporting or forking",
             ));
         }
         let state = projection
             .restore()?
-            .ok_or_else(|| session_error("No recoverable baseline"))?;
+            .ok_or_else(|| journal_error("No recoverable baseline"))?;
         Ok(ExportedState {
             state,
             as_of_seq: projection.as_of_seq,
@@ -126,9 +127,9 @@ pub async fn export_snapshot(source: &dyn SessionLog) -> crate::error::Result<Ex
 
 /// Forks a paused source into a destination key with a new logical identity.
 pub async fn fork(
-    source: &dyn SessionLog,
-    destination: Arc<dyn SessionLog>,
-    destination_key: &SessionKey,
+    source: &dyn ThreadJournal,
+    destination: Arc<dyn ThreadJournal>,
+    destination_key: &ThreadKey,
     source_reference: &str,
 ) -> crate::error::Result<ExportedState> {
     let snapshot = export_snapshot(source).await?;
@@ -154,14 +155,14 @@ pub async fn fork(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Msg;
-    use crate::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionRecorder,
+    use crate::journal::{
+        AtomicJournalStorage, AtomicThreadJournal, InvocationRecorder, MemoryJournalStorage,
     };
+    use crate::message::Msg;
 
-    fn journal() -> Arc<dyn SessionLog> {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        Arc::new(JournalSessionLog::new(storage, "s1"))
+    fn journal() -> Arc<dyn ThreadJournal> {
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        Arc::new(AtomicThreadJournal::new(storage, "s1"))
     }
 
     fn state() -> AgentState {
@@ -172,9 +173,9 @@ mod tests {
             .build()
     }
 
-    async fn paused_source() -> Arc<dyn SessionLog> {
+    async fn paused_source() -> Arc<dyn ThreadJournal> {
         let log = journal();
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         recorder.start(&[], &state()).await.unwrap();
@@ -203,7 +204,7 @@ mod tests {
             .unwrap();
         assert_eq!(target.head().await.unwrap().seq, 1);
 
-        let projection = SessionProjection::read(&*target).await.unwrap();
+        let projection = JournalProjection::read(&*target).await.unwrap();
         let restored = projection.restore().unwrap().unwrap();
         assert_eq!(restored.user_id.as_deref(), Some("alice"));
     }
@@ -249,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn export_refuses_pending_interactions() {
         let source = journal();
-        let recorder = SessionRecorder::open(Arc::clone(&source), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&source), Some("t1"))
             .await
             .unwrap();
         recorder.start(&[], &state()).await.unwrap();
@@ -289,7 +290,7 @@ mod tests {
     async fn fork_rewrites_the_logical_identity() {
         let source = paused_source().await;
         let destination = journal();
-        let key = SessionKey::new(Some("bob"), "agent", "forked").unwrap();
+        let key = ThreadKey::new(Some("bob"), "agent", "forked").unwrap();
         fork(&*source, Arc::clone(&destination), &key, "s1@t1")
             .await
             .unwrap();

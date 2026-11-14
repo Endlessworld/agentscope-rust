@@ -1,13 +1,13 @@
 //! Durable command acceptance, mirroring `SessionInbox`.
 //!
 //! The inbox is its own journal: accepting input uses a short writer lease and never takes
-//! the execution writer's lease. Both are committed through the same [`SessionLog`] seam.
+//! the execution writer's lease. Both are committed through the same [`ThreadJournal`] seam.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::{session_error, Head, SessionEvent, SessionLog, Writer};
+use super::{journal_error, Head, JournalEvent, ThreadJournal, Writer};
 use crate::message::Msg;
 
 /// The inbox lease is short: acceptance never blocks on execution progress.
@@ -42,11 +42,11 @@ impl Command {
     ) -> crate::error::Result<Self> {
         let id = id.into();
         if id.trim().is_empty() || id.len() > 200 {
-            return Err(session_error("Invalid command id"));
+            return Err(journal_error("Invalid command id"));
         }
         let kind = kind.into();
         if kind.trim().is_empty() {
-            return Err(session_error("Invalid command kind"));
+            return Err(journal_error("Invalid command kind"));
         }
         Ok(Self {
             id,
@@ -106,7 +106,7 @@ impl InboxSnapshot {
 /// Durable command acceptance against the inbox journal.
 #[derive(Clone)]
 pub struct SessionInbox {
-    journal: Arc<dyn SessionLog>,
+    journal: Arc<dyn ThreadJournal>,
     /// The folded snapshot and the committed head it was derived from.
     ///
     /// Receipt readers poll `snapshot()` every few tens of milliseconds. Re-reading the whole
@@ -123,7 +123,7 @@ impl std::fmt::Debug for SessionInbox {
 
 impl SessionInbox {
     /// Wraps a journal, addressing its `inbox` sub-journal.
-    pub fn new(log: Arc<dyn SessionLog>) -> crate::error::Result<Self> {
+    pub fn new(log: Arc<dyn ThreadJournal>) -> crate::error::Result<Self> {
         Ok(Self {
             journal: log.inbox()?,
             cache: Arc::new(Mutex::new(None)),
@@ -168,7 +168,7 @@ impl SessionInbox {
         let mut turn_id = None;
         let mut run_id = None;
 
-        let mut fold = |event: &SessionEvent| -> crate::error::Result<()> {
+        let mut fold = |event: &JournalEvent| -> crate::error::Result<()> {
             let data = event.data()?;
             match event.event_type.as_str() {
                 "inbox/accepted" => commands.push(event.payload::<Command>()?),
@@ -224,7 +224,7 @@ impl SessionInbox {
             let snapshot = self.snapshot().await?;
             if let Some(existing) = snapshot.command(command.id.as_str()) {
                 if existing.comparable()? != command.comparable()? {
-                    return Err(session_error(
+                    return Err(journal_error(
                         "Idempotency key already used for different input",
                     ));
                 }
@@ -339,7 +339,7 @@ impl SessionInbox {
                 }
             }
         }
-        Err(session_error("Interrupted while accepting session input"))
+        Err(journal_error("Interrupted while accepting session input"))
     }
 
     /// Commits one inbox fact under the held lease.
@@ -353,7 +353,7 @@ impl SessionInbox {
     ) -> crate::error::Result<u64> {
         let head = self.journal.head().await?;
         let seq = head.seq + 1;
-        let event = SessionEvent::from_payload(
+        let event = JournalEvent::from_payload(
             uuid::Uuid::new_v4().to_string(),
             seq,
             chrono::Utc::now().timestamp_millis(),
@@ -378,12 +378,12 @@ impl SessionInbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::{AtomicJournalStorage, AtomicThreadJournal, MemoryJournalStorage};
     use crate::message::Msg;
-    use crate::session::{AtomicSessionStorage, JournalSessionLog, MemorySessionStorage};
 
-    fn inbox() -> (SessionInbox, Arc<dyn SessionLog>) {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(storage, "s1"));
+    fn inbox() -> (SessionInbox, Arc<dyn ThreadJournal>) {
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        let log: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(storage, "s1"));
         (SessionInbox::new(Arc::clone(&log)).unwrap(), log)
     }
 
@@ -416,7 +416,7 @@ mod tests {
             .acquire("run-1", Duration::from_secs(60))
             .await
             .unwrap();
-        let unknown = SessionEvent::new(
+        let unknown = JournalEvent::new(
             "e1",
             head.seq + 1,
             0,

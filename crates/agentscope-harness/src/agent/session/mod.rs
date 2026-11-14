@@ -14,6 +14,6 @@ pub mod store;
 pub use answer::{SessionAnswer, SessionConfirm};
 pub use session::{AgentSession, InputReceipt, Task};
 #[cfg(feature = "rusqlite")]
-pub use sqlite::SqliteSessionStorage;
-pub use storage::{WorkspaceSessionLogStore, WorkspaceSessionStorage};
-pub use store::StoreSessionStorage;
+pub use sqlite::SqliteJournalStorage;
+pub use storage::{WorkspaceJournalStorage, WorkspaceThreadJournalStore};
+pub use store::StoreJournalStorage;

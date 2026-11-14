@@ -26,7 +26,7 @@ fn normalize_user(user_id: Option<&str>) -> String {
 }
 
 /// Identity of a session row group.
-type SessionKey = (String, String);
+type ThreadKey = (String, String);
 
 /// In-memory model of the MySQL schema: `database -> table -> columns`.
 #[derive(Default)]
@@ -38,9 +38,9 @@ struct SchemaState {
 #[derive(Default)]
 pub struct InMemoryStateBackend {
     /// `(user, session) -> state_key -> (item_index -> json)`.
-    rows: Mutex<HashMap<SessionKey, HashMap<String, BTreeMap<i64, String>>>>,
+    rows: Mutex<HashMap<ThreadKey, HashMap<String, BTreeMap<i64, String>>>>,
     /// `(user, session) -> state_key -> version` of the `item_index = 0` row.
-    versions: Mutex<HashMap<SessionKey, HashMap<String, i64>>>,
+    versions: Mutex<HashMap<ThreadKey, HashMap<String, i64>>>,
     /// Number of `save_list` calls, so tests can assert that an unchanged list is skipped.
     list_writes: AtomicUsize,
     /// Modelled `INFORMATION_SCHEMA` (databases / tables / columns).
@@ -63,7 +63,7 @@ pub struct InMemoryStateBackend {
 }
 
 impl InMemoryStateBackend {
-    fn key(user_id: Option<&str>, session_id: &str) -> SessionKey {
+    fn key(user_id: Option<&str>, session_id: &str) -> ThreadKey {
         (normalize_user(user_id), session_id.to_string())
     }
 

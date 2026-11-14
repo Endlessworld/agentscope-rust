@@ -11,16 +11,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agentscope_core::agent::ThreadKey;
 use agentscope_core::agent::{
     Agent, CallableAgent, ObservableAgent, ReActAgent, RuntimeContext, StreamOptions,
 };
 use agentscope_core::event::AgentEvent;
+use agentscope_core::journal::{
+    JournalProjection, SessionHistoryMode, ThreadJournal, ThreadJournalStore, Transcript,
+};
 use agentscope_core::message::Msg;
 use agentscope_core::middleware::MiddlewareChain;
 use agentscope_core::model::Model;
-use agentscope_core::session::{
-    SessionHistoryMode, SessionKey, SessionLog, SessionLogStore, SessionProjection, Transcript,
-};
 use agentscope_core::shutdown::{GracefulShutdownManager, ShutdownStateSaver};
 use agentscope_core::state::AgentState;
 use agentscope_core::state::AgentStateStore;
@@ -139,7 +140,7 @@ pub struct HarnessAgent {
     ///
     /// The core agent owns the recorder/persistence path; this handle is only used by read
     /// APIs (`session/list`) that need to enumerate sessions from the same backend.
-    session_log_store: Option<Arc<dyn SessionLogStore>>,
+    session_log_store: Option<Arc<dyn ThreadJournalStore>>,
     /// 该 agent 的优雅关闭管理器（默认每个 agent 一个独立实例）。
     shutdown_manager: Arc<GracefulShutdownManager>,
     /// Shared slot bridging runtime model switches to subagent factories: when
@@ -412,7 +413,7 @@ impl HarnessAgent {
     }
 
     /// The recording policy this agent opens session recorders with.
-    pub fn recording_policy(&self) -> agentscope_core::session::RecordingPolicy {
+    pub fn recording_policy(&self) -> agentscope_core::journal::RecordingPolicy {
         recording_policy_for(self.record_model_requests)
     }
 
@@ -493,7 +494,7 @@ impl HarnessAgent {
     /// journal-backed (no model, legacy mode, or no session id yet).
     ///
     /// Mirrors Java `HarnessAgent.sessionKey(RuntimeContext)`.
-    pub fn session_key(&self, context: &RuntimeContext) -> Option<SessionKey> {
+    pub fn session_key(&self, context: &RuntimeContext) -> Option<ThreadKey> {
         self.agent
             .as_ref()
             .filter(|agent| agent.session_log_enabled())
@@ -508,10 +509,10 @@ impl HarnessAgent {
     pub async fn session_log(
         &self,
         context: &RuntimeContext,
-    ) -> crate::Result<Arc<dyn SessionLog>> {
+    ) -> crate::Result<Arc<dyn ThreadJournal>> {
         match self.agent.as_ref() {
             Some(agent) if agent.session_log_enabled() => agent.session_log(context).await,
-            _ => Err(crate::Error::Session(
+            _ => Err(crate::Error::Journal(
                 "native session history is not enabled for this agent".into(),
             )),
         }
@@ -522,9 +523,9 @@ impl HarnessAgent {
     pub async fn inspect_session(
         &self,
         context: &RuntimeContext,
-    ) -> crate::Result<SessionProjection> {
+    ) -> crate::Result<JournalProjection> {
         let log = self.session_log(context).await?;
-        SessionProjection::read(&*log).await
+        JournalProjection::read(&*log).await
     }
 
     /// Lists every persisted session for the caller's user, newest first.
@@ -535,11 +536,11 @@ impl HarnessAgent {
     pub async fn list_session_keys(
         &self,
         context: &RuntimeContext,
-    ) -> crate::Result<Vec<SessionKey>> {
+    ) -> crate::Result<Vec<ThreadKey>> {
         let store = self
             .session_log_store
             .as_ref()
-            .ok_or_else(|| crate::Error::Session("native session history is not enabled".into()))?;
+            .ok_or_else(|| crate::Error::Journal("native session history is not enabled".into()))?;
         store.list(context).await
     }
 
@@ -552,9 +553,9 @@ impl HarnessAgent {
         let store = self
             .session_log_store
             .as_ref()
-            .ok_or_else(|| crate::Error::Session("native session history is not enabled".into()))?;
+            .ok_or_else(|| crate::Error::Journal("native session history is not enabled".into()))?;
         let key = self.session_key(context).ok_or_else(|| {
-            crate::Error::Session("native session history is not enabled for this agent".into())
+            crate::Error::Journal("native session history is not enabled for this agent".into())
         })?;
         store.delete(&key).await
     }
@@ -563,7 +564,7 @@ impl HarnessAgent {
     /// `HarnessAgent.sessionTranscript(RuntimeContext)`.
     pub async fn session_transcript(&self, context: &RuntimeContext) -> crate::Result<Transcript> {
         let log = self.session_log(context).await?;
-        agentscope_core::session::transcript(&*log).await
+        agentscope_core::journal::transcript(&*log).await
     }
 
     /// Binds a conversation's commands and read views. Obtaining this handle never starts
@@ -576,7 +577,7 @@ impl HarnessAgent {
         context: RuntimeContext,
     ) -> crate::Result<super::session::AgentSession> {
         let key = self.session_key(&context).ok_or_else(|| {
-            crate::Error::Session("native session history is not enabled for this agent".into())
+            crate::Error::Journal("native session history is not enabled for this agent".into())
         })?;
         let log = self.session_log(&context).await?;
         super::session::AgentSession::open(Arc::clone(self), context, key, log)
@@ -928,11 +929,11 @@ fn no_model_error() -> agentscope_core::error::Error {
 ///
 /// Both recorder paths (the session scheduler's and the one a `ReActAgent` opens for itself)
 /// resolve the policy here, so the switch cannot mean two different things.
-fn recording_policy_for(record_model_requests: bool) -> agentscope_core::session::RecordingPolicy {
+fn recording_policy_for(record_model_requests: bool) -> agentscope_core::journal::RecordingPolicy {
     if record_model_requests {
-        agentscope_core::session::RecordingPolicy::journaling_requests()
+        agentscope_core::journal::RecordingPolicy::journaling_requests()
     } else {
-        agentscope_core::session::RecordingPolicy::without_request_payloads()
+        agentscope_core::journal::RecordingPolicy::without_request_payloads()
     }
 }
 
@@ -1078,7 +1079,7 @@ pub struct HarnessAgentBuilder {
     /// Native session journal backend. `None` means "use the workspace default", which
     /// `build()` materialises when history is journal-backed. Mirrors Java
     /// `HarnessAgent.Builder.sessionLogStore`.
-    session_log_store: Option<Arc<dyn SessionLogStore>>,
+    session_log_store: Option<Arc<dyn ThreadJournalStore>>,
     /// Exactly one history authority (default [`SessionHistoryMode::EventLog`]). Mirrors
     /// Java `HarnessAgent.Builder.sessionHistoryMode`.
     session_history_mode: SessionHistoryMode,
@@ -2050,9 +2051,9 @@ impl HarnessAgentBuilder {
     /// `HarnessAgent.Builder.sessionLogStore`.
     ///
     /// Leaving this unset is the common case: `build()` falls back to a
-    /// [`WorkspaceSessionLogStore`](crate::agent::session::WorkspaceSessionLogStore) over the
+    /// [`WorkspaceThreadJournalStore`](crate::agent::session::WorkspaceThreadJournalStore) over the
     /// configured filesystem, so journaling is on by default (Java does the same).
-    pub fn session_log_store(mut self, store: Arc<dyn SessionLogStore>) -> Self {
+    pub fn session_log_store(mut self, store: Arc<dyn ThreadJournalStore>) -> Self {
         self.session_log_store = Some(store);
         self
     }
@@ -2213,12 +2214,12 @@ impl HarnessAgentBuilder {
         // History is journal-backed by default. Resolving the store once keeps the ReAct
         // agent and the session tools on the exact same backend, so a tool can never read a
         // different store than the one the agent wrote (Java `HarnessAgent.build()`).
-        let session_log_store: Option<Arc<dyn SessionLogStore>> =
+        let session_log_store: Option<Arc<dyn ThreadJournalStore>> =
             if self.session_history_mode == SessionHistoryMode::EventLog {
                 Some(self.session_log_store.clone().unwrap_or_else(|| {
-                    Arc::new(super::session::WorkspaceSessionLogStore::new(Arc::clone(
-                        &filesystem,
-                    ))) as Arc<dyn SessionLogStore>
+                    Arc::new(super::session::WorkspaceThreadJournalStore::new(
+                        Arc::clone(&filesystem),
+                    )) as Arc<dyn ThreadJournalStore>
                 }))
             } else {
                 None

@@ -1,6 +1,6 @@
 //! Session journal backed by the workspace's distributed [`BaseStore`].
 //!
-//! Mirrors `StoreSessionStorage`: the workspace store already owns a resolved namespace, so
+//! Mirrors `StoreJournalStorage`: the workspace store already owns a resolved namespace, so
 //! the journal appends a private partition to it and reuses the store's conditional write.
 //! Only stores that declare [`BaseStore::supports_atomic_session_storage`] may back a
 //! journal — the fencing guarantee is the whole point of the narrow storage capability.
@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use agentscope_core::session::{session_error, AtomicSessionStorage, StorageValue};
+use agentscope_core::journal::{journal_error, AtomicJournalStorage, StorageValue};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -22,27 +22,27 @@ const JOURNAL_NAMESPACE: &str = "__agentscope_session_log_v1__";
 const LIST_PAGE_SIZE: usize = 256;
 
 /// Atomic session storage over a workspace store.
-pub struct StoreSessionStorage {
+pub struct StoreJournalStorage {
     store: Arc<dyn BaseStore>,
     namespace: Vec<String>,
 }
 
-impl std::fmt::Debug for StoreSessionStorage {
+impl std::fmt::Debug for StoreJournalStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StoreSessionStorage")
+        f.debug_struct("StoreJournalStorage")
             .field("namespace", &self.namespace)
             .finish_non_exhaustive()
     }
 }
 
-impl StoreSessionStorage {
+impl StoreJournalStorage {
     /// Creates journal storage under `namespace`, appending the private journal partition.
     ///
     /// Fails when the store does not declare an atomic compare-and-set: journal fencing
     /// cannot be emulated on top of a last-write-wins store.
     pub fn new(store: Arc<dyn BaseStore>, namespace: Vec<String>) -> crate::Result<Self> {
         if !store.supports_atomic_session_storage() {
-            return Err(session_error(format!(
+            return Err(journal_error(format!(
                 "Workspace store does not declare atomic session storage: {}",
                 std::any::type_name_of_val(store.as_ref())
             )));
@@ -62,22 +62,22 @@ impl StoreSessionStorage {
 }
 
 #[async_trait]
-impl AtomicSessionStorage for StoreSessionStorage {
+impl AtomicJournalStorage for StoreJournalStorage {
     async fn read(&self, path: &str) -> crate::Result<Option<StorageValue>> {
         let Some(item) = self.store.get(&self.namespace, path) else {
             return Ok(None);
         };
         if item.version < 1 {
-            return Err(session_error(
+            return Err(journal_error(
                 "Workspace store returned an unversioned journal object",
             ));
         }
         let Some(serde_json::Value::String(encoded)) = item.value.get("bytes") else {
-            return Err(session_error("Invalid journal object"));
+            return Err(journal_error("Invalid journal object"));
         };
         let bytes = BASE64
             .decode(encoded)
-            .map_err(|_| session_error("Invalid journal object"))?;
+            .map_err(|_| journal_error("Invalid journal object"))?;
         Ok(Some(StorageValue::new(item.version, bytes)))
     }
 
@@ -168,8 +168,8 @@ mod tests {
         }
     }
 
-    fn storage(store: Arc<InMemoryStore>) -> StoreSessionStorage {
-        StoreSessionStorage::new(store, namespace()).unwrap()
+    fn storage(store: Arc<InMemoryStore>) -> StoreJournalStorage {
+        StoreJournalStorage::new(store, namespace()).unwrap()
     }
 
     #[test]
@@ -189,7 +189,7 @@ mod tests {
     fn a_store_without_the_declaration_is_rejected() {
         let store: Arc<dyn BaseStore> = Arc::new(UndeclaredStore::new());
         assert!(!store.supports_atomic_session_storage());
-        let error = StoreSessionStorage::new(store, namespace()).unwrap_err();
+        let error = StoreJournalStorage::new(store, namespace()).unwrap_err();
         let message = error.to_string();
         assert!(
             message.contains("does not declare atomic session storage"),

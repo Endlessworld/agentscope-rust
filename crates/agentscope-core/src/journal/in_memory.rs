@@ -1,4 +1,4 @@
-//! Explicit ephemeral backend, mirroring `InMemorySessionLogStore`.
+//! Explicit ephemeral backend, mirroring `InMemoryThreadJournalStore`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -6,24 +6,24 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::{
-    AtomicSessionStorage, JournalSessionLog, SessionKey, SessionLog, SessionLogStore, StorageValue,
+    AtomicJournalStorage, AtomicThreadJournal, StorageValue, ThreadJournal, ThreadJournalStore,
 };
-use crate::agent::RuntimeContext;
+use crate::agent::{RuntimeContext, ThreadKey};
 
 /// Process-local atomic storage for tests and non-persistent embedded applications.
 #[derive(Debug, Default)]
-pub struct MemorySessionStorage {
+pub struct MemoryJournalStorage {
     values: Mutex<HashMap<String, StorageValue>>,
 }
 
-impl MemorySessionStorage {
+impl MemoryJournalStorage {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
 #[async_trait]
-impl AtomicSessionStorage for MemorySessionStorage {
+impl AtomicJournalStorage for MemoryJournalStorage {
     async fn read(&self, path: &str) -> crate::error::Result<Option<StorageValue>> {
         Ok(self
             .values
@@ -76,40 +76,40 @@ impl AtomicSessionStorage for MemorySessionStorage {
 
 /// In-memory session log store keyed by logical identity.
 #[derive(Debug, Default)]
-pub struct InMemorySessionLogStore {
-    stores: Mutex<HashMap<SessionKey, Arc<MemorySessionStorage>>>,
+pub struct InMemoryThreadJournalStore {
+    stores: Mutex<HashMap<ThreadKey, Arc<MemoryJournalStorage>>>,
 }
 
-impl InMemorySessionLogStore {
+impl InMemoryThreadJournalStore {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
 #[async_trait]
-impl SessionLogStore for InMemorySessionLogStore {
+impl ThreadJournalStore for InMemoryThreadJournalStore {
     async fn open(
         &self,
-        key: &SessionKey,
+        key: &ThreadKey,
         _context: &RuntimeContext,
-    ) -> crate::error::Result<Arc<dyn SessionLog>> {
+    ) -> crate::error::Result<Arc<dyn ThreadJournal>> {
         let storage = {
             let mut guard = self.stores.lock().expect("session store poisoned");
             Arc::clone(
                 guard
                     .entry(key.clone())
-                    .or_insert_with(|| Arc::new(MemorySessionStorage::new())),
+                    .or_insert_with(|| Arc::new(MemoryJournalStorage::new())),
             )
         };
-        Ok(Arc::new(JournalSessionLog::new(
+        Ok(Arc::new(AtomicThreadJournal::new(
             storage,
             key.storage_path(),
         )))
     }
 
-    async fn list(&self, context: &RuntimeContext) -> crate::error::Result<Vec<SessionKey>> {
+    async fn list(&self, context: &RuntimeContext) -> crate::error::Result<Vec<ThreadKey>> {
         let user_id = context.user_id().map(str::to_string);
-        let entries: Vec<(SessionKey, Arc<MemorySessionStorage>)> = {
+        let entries: Vec<(ThreadKey, Arc<MemoryJournalStorage>)> = {
             let guard = self.stores.lock().expect("session store poisoned");
             guard
                 .iter()
@@ -143,7 +143,7 @@ impl SessionLogStore for InMemorySessionLogStore {
     }
 
     /// Drops the journal of `key`: its storage, and therefore every value under the prefix.
-    async fn delete(&self, key: &SessionKey) -> crate::error::Result<()> {
+    async fn delete(&self, key: &ThreadKey) -> crate::error::Result<()> {
         self.stores
             .lock()
             .expect("session store poisoned")
@@ -155,13 +155,13 @@ impl SessionLogStore for InMemorySessionLogStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{SessionEvent, SessionLogStore};
+    use crate::journal::{JournalEvent, ThreadJournalStore};
 
     #[tokio::test]
     async fn store_creates_journals_and_lists_only_committed_sessions() {
-        let store = InMemorySessionLogStore::new();
+        let store = InMemoryThreadJournalStore::new();
         let ctx = RuntimeContext::new().with_user_id("alice");
-        let key = SessionKey::new(Some("alice"), "agent", "s1").unwrap();
+        let key = ThreadKey::new(Some("alice"), "agent", "s1").unwrap();
         let log = store.open(&key, &ctx).await.unwrap();
         // Opening a reader never creates durable state.
         assert!(store.list(&ctx).await.unwrap().is_empty());
@@ -170,7 +170,7 @@ mod tests {
             .acquire("run-1", std::time::Duration::from_secs(60))
             .await
             .unwrap();
-        let event = SessionEvent::new(
+        let event = JournalEvent::new(
             "e1",
             1,
             0,

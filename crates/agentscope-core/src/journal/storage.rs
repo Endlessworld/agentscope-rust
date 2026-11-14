@@ -1,4 +1,4 @@
-//! Narrow atomic storage capability, mirroring `AtomicSessionStorage`.
+//! Narrow atomic storage capability, mirroring `AtomicJournalStorage`.
 //!
 //! Compare-and-set must be atomic across all writers sharing this namespace. A missing value
 //! is `Ok(None)`; read/write failures are errors. Implementations must durably store bytes
@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 
-use super::session_error;
+use super::journal_error;
 
 /// A stored value paired with its storage version.
 ///
@@ -29,7 +29,7 @@ impl StorageValue {
 /// Atomic session storage. Runtime journal storage must not be writable through model
 /// filesystem tools.
 #[async_trait]
-pub trait AtomicSessionStorage: Send + Sync {
+pub trait AtomicJournalStorage: Send + Sync {
     /// Reads a value; `Ok(None)` when absent.
     async fn read(&self, path: &str) -> crate::error::Result<Option<StorageValue>>;
 
@@ -43,7 +43,7 @@ pub trait AtomicSessionStorage: Send + Sync {
 
     /// Optional read-only discovery under a prefix. Recovery never uses listing.
     async fn list_paths(&self, _prefix: &str) -> crate::error::Result<Vec<String>> {
-        Err(session_error(
+        Err(journal_error(
             "This session storage does not support discovery",
         ))
     }
@@ -53,7 +53,7 @@ pub trait AtomicSessionStorage: Send + Sync {
     /// Only reclaimed history uses this. A backend without deletion reports an error, and the
     /// journal then keeps the commits a snapshot already covers.
     async fn remove(&self, _path: &str) -> crate::error::Result<bool> {
-        Err(session_error(
+        Err(journal_error(
             "This session storage does not support deletion",
         ))
     }

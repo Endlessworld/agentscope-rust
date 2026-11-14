@@ -1192,7 +1192,7 @@ async fn try_get_versioned_reports_a_corrupt_payload() {
         .expect_err("a corrupt payload must surface as an error, not as an absent key");
     assert!(err.to_string().contains("deserialize state"), "{err}");
     assert!(
-        matches!(err, agentscope_core::Error::Session(_)),
+        matches!(err, agentscope_core::Error::Journal(_)),
         "state-store failures travel on core's session error channel: {err:?}"
     );
 
@@ -1494,7 +1494,7 @@ async fn try_save_reports_a_backend_failure_and_an_invalid_id() {
         .await
         .expect_err("a failed write must not be reported as success");
     assert!(err.to_string().contains("injected write failure"), "{err}");
-    assert!(matches!(err, agentscope_core::Error::Session(_)), "{err:?}");
+    assert!(matches!(err, agentscope_core::Error::Journal(_)), "{err:?}");
 
     let err = AgentStateStore::try_save_list(&store, Some("u"), "s", "l", &[text("a")])
         .await
@@ -1542,7 +1542,7 @@ async fn try_get_reports_a_corrupt_payload_instead_of_an_absent_key() {
         .await
         .expect_err("a corrupt payload must be an error");
     assert!(err.to_string().contains("deserialize state"), "{err}");
-    assert!(matches!(err, agentscope_core::Error::Session(_)), "{err:?}");
+    assert!(matches!(err, agentscope_core::Error::Journal(_)), "{err:?}");
 
     let err = AgentStateStore::try_get(&store, Some("u"), "s", "blob")
         .await
@@ -1620,7 +1620,7 @@ async fn try_delete_reports_a_backend_failure() {
         .await
         .expect_err("a failed delete must not report success");
     assert!(err.to_string().contains("injected write failure"), "{err}");
-    assert!(matches!(err, agentscope_core::Error::Session(_)), "{err:?}");
+    assert!(matches!(err, agentscope_core::Error::Journal(_)), "{err:?}");
 
     assert!(
         AgentStateStore::try_get(&store, Some("u"), "s", "k")

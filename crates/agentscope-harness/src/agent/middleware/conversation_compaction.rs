@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentscope_core::agent::RuntimeContext;
+use agentscope_core::journal::{InvocationRecorder, RECORDER_CONTEXT_KEY};
 use agentscope_core::message::{Msg, MsgRole};
 use agentscope_core::middleware::{
     AgentInput, EventStream, ExtensionPoint, Middleware, Next, ReasoningInput,
 };
-use agentscope_core::session::{SessionRecorder, RECORDER_CONTEXT_KEY};
 use agentscope_core::state::AgentState;
 use futures::StreamExt;
 
@@ -144,7 +144,7 @@ fn forcing_compaction(config: &CompactionConfig) -> CompactionConfig {
 /// summarizer failed and the original history was kept.
 async fn compact_conversation(
     state: Arc<Mutex<AgentState>>,
-    recorder: Option<Arc<SessionRecorder>>,
+    recorder: Option<Arc<InvocationRecorder>>,
     compactor: Arc<ConversationCompactor>,
     config: CompactionConfig,
     agent_id: String,
@@ -240,7 +240,7 @@ impl Middleware for ConversationCompactionMiddleware {
         let model_name = compactor.model_name().map(str::to_string);
         // A recorder attached by the session scheduler makes `compaction/start` and
         // `compaction/end` durable session facts instead of only an in-band marker.
-        let recorder = ctx.extension::<SessionRecorder>(RECORDER_CONTEXT_KEY);
+        let recorder = ctx.extension::<InvocationRecorder>(RECORDER_CONTEXT_KEY);
         let failed_at = Arc::clone(&self.failed_at);
         let requested = Arc::clone(&self.requested);
 
@@ -326,7 +326,7 @@ impl Middleware for ConversationCompactionMiddleware {
         let config = self.config.clone();
         let agent_id = self.agent_id.clone();
         let model_name = compactor.model_name().map(str::to_string);
-        let recorder = ctx.extension::<SessionRecorder>(RECORDER_CONTEXT_KEY);
+        let recorder = ctx.extension::<InvocationRecorder>(RECORDER_CONTEXT_KEY);
         // `on_reasoning` events are not forwarded by the core stream; publish the marker
         // through the delta channel so ACP still receives `compaction_update`.
         let delta_tx = ctx.delta_tx.clone();
@@ -505,13 +505,13 @@ mod tests {
         // A step under budget must not journal `compaction/start`: that payload carries the
         // whole conversation, so a no-op attempt writes megabytes for nothing (observed in
         // production: 17 attempts / 155 MB in three minutes, every one before == after).
-        let store = agentscope_core::session::InMemorySessionLogStore::new();
-        use agentscope_core::session::SessionLogStore;
-        let key = agentscope_core::session::SessionKey::new(Some("u"), "agent", "s1").unwrap();
+        let store = agentscope_core::journal::InMemoryThreadJournalStore::new();
+        use agentscope_core::journal::ThreadJournalStore;
+        let key = agentscope_core::agent::ThreadKey::new(Some("u"), "agent", "s1").unwrap();
         let base = RuntimeContext::new().with_user_id("u");
         let log = store.open(&key, &base).await.unwrap();
         let recorder = Arc::new(
-            agentscope_core::session::SessionRecorder::open(Arc::clone(&log), Some("turn"))
+            agentscope_core::journal::InvocationRecorder::open(Arc::clone(&log), Some("turn"))
                 .await
                 .unwrap(),
         );
@@ -525,7 +525,7 @@ mod tests {
         ctx.state = Some(Arc::clone(&state));
         ctx.delta_tx = Some(delta_tx);
         ctx.set_extension_arc(
-            agentscope_core::session::RECORDER_CONTEXT_KEY,
+            agentscope_core::journal::RECORDER_CONTEXT_KEY,
             Arc::clone(&recorder),
         );
 

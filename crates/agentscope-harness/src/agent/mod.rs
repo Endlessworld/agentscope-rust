@@ -89,7 +89,7 @@ pub use sandbox::{
 };
 pub use session::{
     AgentSession, InputReceipt, SessionAnswer, SessionConfirm, Task as SessionTask,
-    WorkspaceSessionLogStore, WorkspaceSessionStorage,
+    WorkspaceJournalStorage, WorkspaceThreadJournalStore,
 };
 pub use shutdown::{
     json_file_saver_in, GracefulShutdownController, JsonFileShutdownStateSaver,

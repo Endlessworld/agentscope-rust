@@ -9,21 +9,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agentscope_core::agent::{Extensions, ReActAgent, RuntimeContext, StreamOptions};
+use agentscope_core::journal::{
+    AtomicJournalStorage, AtomicThreadJournal, Command, InvocationRecorder, MemoryJournalStorage,
+    SessionExecution, SessionInbox, ThreadJournal, EXECUTION_CONTEXT_KEY, RECORDER_CONTEXT_KEY,
+};
 use agentscope_core::message::{ContentBlock, Msg, ToolUseBlock};
 use agentscope_core::middleware::{
     EventStream, ExtensionPoint, Middleware, MiddlewareChain, ModelCallInput, Next,
 };
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
-use agentscope_core::session::{
-    AtomicSessionStorage, Command, JournalSessionLog, MemorySessionStorage, SessionExecution,
-    SessionInbox, SessionLog, SessionRecorder, EXECUTION_CONTEXT_KEY, RECORDER_CONTEXT_KEY,
-};
 use agentscope_core::state::AgentState;
 use futures::StreamExt;
 
-async fn journal() -> Arc<dyn SessionLog> {
-    let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-    Arc::new(JournalSessionLog::new(storage, "step-boundary"))
+async fn journal() -> Arc<dyn ThreadJournal> {
+    let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+    Arc::new(AtomicThreadJournal::new(storage, "step-boundary"))
 }
 
 fn text_of(message: &Msg) -> String {
@@ -109,7 +109,7 @@ impl Model for QuietModel {
     }
 }
 
-async fn submit_turn(log: &Arc<dyn SessionLog>) -> SessionInbox {
+async fn submit_turn(log: &Arc<dyn ThreadJournal>) -> SessionInbox {
     let inbox = SessionInbox::new(Arc::clone(log)).unwrap();
     let submit = Command::new(
         "c1",
@@ -131,7 +131,7 @@ async fn drain(agent: &ReActAgent, inputs: Vec<Msg>, extensions: Extensions) {
     }
 }
 
-fn count(events: &[agentscope_core::session::SessionEvent], kind: &str) -> usize {
+fn count(events: &[agentscope_core::journal::JournalEvent], kind: &str) -> usize {
     events
         .iter()
         .filter(|event| event.event_type == kind)
@@ -142,7 +142,7 @@ fn count(events: &[agentscope_core::session::SessionEvent], kind: &str) -> usize
 async fn every_reasoning_iteration_opens_one_step_and_summarizing_opens_none() {
     let log = journal().await;
     let inbox = submit_turn(&log).await;
-    let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+    let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
         .await
         .unwrap();
     let mut execution = SessionExecution::new(
@@ -233,7 +233,7 @@ async fn guidance_folded_at_the_step_boundary_is_visible_in_the_shared_state() {
     .unwrap();
     inbox.accept(&steer).await.unwrap();
 
-    let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+    let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
         .await
         .unwrap();
     let mut execution = SessionExecution::new(
@@ -297,7 +297,7 @@ async fn guidance_accepted_before_the_run_is_folded_into_the_first_step() {
     .unwrap();
     inbox.accept(&steer).await.unwrap();
 
-    let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+    let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
         .await
         .unwrap();
     let mut execution = SessionExecution::new(

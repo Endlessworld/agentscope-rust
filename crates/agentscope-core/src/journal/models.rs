@@ -1,4 +1,4 @@
-//! Journaled model adapter boundary, mirroring `SessionModels` / `SessionModelPolicy`.
+//! Journaled model adapter boundary, mirroring `RecordedModels` / `ModelCallPolicy`.
 //!
 //! The ReAct loop calls a model through the middleware chain, but auxiliary calls (structured
 //! output, summaries, adapters) also reach a provider. Java closes that gap by wrapping every
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt};
 
-use super::{SessionEvent, SessionLog, SessionRecorder};
+use super::{InvocationRecorder, JournalEvent, ThreadJournal};
 use crate::agent::RuntimeContext;
 use crate::message::{
     ChatUsage, ContentBlock, Msg, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock,
@@ -22,15 +22,15 @@ use crate::message::{
 use crate::middleware::ModelCallInput;
 use crate::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 
-/// Runtime-context key carrying the active [`SessionModelPolicy`].
+/// Runtime-context key carrying the active [`ModelCallPolicy`].
 pub const MODEL_POLICY_CONTEXT_KEY: &str = "agentscope.session.modelPolicy";
 
 /// Optional hosted admission/accounting policy, shared with inherited child contexts.
 ///
-/// Mirrors Java `SessionModelPolicy`: the host can admit or throttle a call before it is
+/// Mirrors Java `ModelCallPolicy`: the host can admit or throttle a call before it is
 /// dispatched ([`before_call`](Self::before_call)) and account for it afterwards
 /// ([`after_call`](Self::after_call)), with the journal's `modelCallId` as the correlation id.
-pub trait SessionModelPolicy: Send + Sync {
+pub trait ModelCallPolicy: Send + Sync {
     /// Called before the call is prepared, i.e. before `request/prepared` is written.
     fn before_call(&self, call_id: &str, model: &str, ctx: &RuntimeContext);
 
@@ -46,23 +46,23 @@ pub trait SessionModelPolicy: Send + Sync {
     );
 }
 
-/// [`RuntimeContext::extension`] carrier for a boxed [`SessionModelPolicy`].
+/// [`RuntimeContext::extension`] carrier for a boxed [`ModelCallPolicy`].
 ///
-/// Extensions store `T: Any` values, and a bare `Arc<dyn SessionModelPolicy>` cannot be
+/// Extensions store `T: Any` values, and a bare `Arc<dyn ModelCallPolicy>` cannot be
 /// downcast (`dyn Trait` is neither `Sized` nor `Any`), so the policy travels inside this
 /// concrete handle and is unwrapped by [`policy_from_context`].
 #[derive(Clone)]
-pub struct SessionModelPolicyHandle(pub Arc<dyn SessionModelPolicy>);
+pub struct ModelCallPolicyHandle(pub Arc<dyn ModelCallPolicy>);
 
-impl std::fmt::Debug for SessionModelPolicyHandle {
+impl std::fmt::Debug for ModelCallPolicyHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SessionModelPolicyHandle(..)")
+        f.write_str("ModelCallPolicyHandle(..)")
     }
 }
 
 /// Returns the policy attached to `ctx`, if any.
-pub fn policy_from_context(ctx: &RuntimeContext) -> Option<Arc<dyn SessionModelPolicy>> {
-    ctx.extension::<SessionModelPolicyHandle>(MODEL_POLICY_CONTEXT_KEY)
+pub fn policy_from_context(ctx: &RuntimeContext) -> Option<Arc<dyn ModelCallPolicy>> {
+    ctx.extension::<ModelCallPolicyHandle>(MODEL_POLICY_CONTEXT_KEY)
         .map(|handle| Arc::clone(&handle.0))
 }
 
@@ -88,7 +88,7 @@ pub struct InterruptedOutput {
 /// newest unfinished call rather than scoping by turn: only the latest unfinished turn can be
 /// continued, and that is where the newest call lives.
 pub async fn interrupted_model_output(
-    log: &dyn SessionLog,
+    log: &dyn ThreadJournal,
 ) -> crate::error::Result<Option<InterruptedOutput>> {
     let head = log.head().await?;
     if head.seq == 0 {
@@ -97,7 +97,7 @@ pub async fn interrupted_model_output(
     // Only the newest dispatched call can be unfinished; older ones were either ended or
     // superseded by a retry.
     let mut open: Option<InterruptedOutput> = None;
-    let mut visit = |event: &SessionEvent| -> crate::error::Result<()> {
+    let mut visit = |event: &JournalEvent| -> crate::error::Result<()> {
         let payload: serde_json::Value = match serde_json::from_str(&event.payload_json) {
             Ok(value) => value,
             // A payload that cannot be decoded is not evidence of an unfinished call.
@@ -151,11 +151,11 @@ pub async fn interrupted_model_output(
     Ok(open.filter(|open| !open.text.is_empty() || !open.thinking.is_empty()))
 }
 
-/// Namespace for the journaled model boundary (Java `SessionModels`).
-pub struct SessionModels;
+/// Namespace for the journaled model boundary (Java `RecordedModels`).
+pub struct RecordedModels;
 
-impl SessionModels {
-    /// Wraps `model` so every call is journaled while `ctx` carries a [`SessionRecorder`].
+impl RecordedModels {
+    /// Wraps `model` so every call is journaled while `ctx` carries a [`InvocationRecorder`].
     ///
     /// Returns `model` unchanged when no recorder is attached, so un-journaled executions pay
     /// nothing. Wrap each model **once**: the decorator is indistinguishable from a plain
@@ -169,13 +169,13 @@ impl SessionModels {
     }
 }
 
-/// Free-function form of [`SessionModels::wrap`].
+/// Free-function form of [`RecordedModels::wrap`].
 pub fn wrap(
     model: Arc<dyn Model>,
     ctx: &RuntimeContext,
     purpose: impl Into<String>,
 ) -> Arc<dyn Model> {
-    if SessionRecorder::from_context(ctx).is_none() {
+    if InvocationRecorder::from_context(ctx).is_none() {
         return model;
     }
     Arc::new(Recorded {
@@ -305,7 +305,7 @@ impl MergedChunk {
 }
 
 async fn record_merged_chunk(
-    recorder: &SessionRecorder,
+    recorder: &InvocationRecorder,
     call_id: &str,
     purpose: &str,
     merged: &mut MergedChunk,
@@ -345,7 +345,7 @@ impl Model for Recorded {
     ) -> BoxStream<'_, crate::error::Result<ChatResponse>> {
         // Resolved at subscribe time (Java resolves it inside `Flux.defer` too), so a recorder
         // attached after the wrap still records and a detached one stops recording.
-        let Some(recorder) = SessionRecorder::from_context(&self.ctx) else {
+        let Some(recorder) = InvocationRecorder::from_context(&self.ctx) else {
             return self.delegate.stream(messages, tools, options);
         };
 
@@ -442,7 +442,7 @@ impl Model for Recorded {
 
             // Flush the trailing merged delta, including a partial response before a
             // provider failure. A persistence failure is never retried into the journal.
-            if !matches!(failure, Some(crate::error::Error::Session(_))) {
+            if !matches!(failure, Some(crate::error::Error::Journal(_))) {
                 if let Err(error) =
                     record_merged_chunk(&recorder, &call_id, &purpose, &mut merged).await
                 {
@@ -461,7 +461,7 @@ impl Model for Recorded {
             // Mirrors Java `SessionLogException.causedBy(error) ? Mono.empty()`: a failure to
             // persist is never itself recorded — that could loop on the same broken journal and
             // hide the original cause.
-            let persistence_failed = matches!(failure, Some(crate::error::Error::Session(_)));
+            let persistence_failed = matches!(failure, Some(crate::error::Error::Journal(_)));
             if !persistence_failed {
                 let mut payload = serde_json::Map::new();
                 payload.insert("modelCallId".to_string(), call_id.clone().into());
@@ -546,10 +546,11 @@ fn error_category(error: &crate::error::Error) -> &'static str {
         crate::error::Error::Model(_) => "model",
         crate::error::Error::Tool(_) => "tool",
         crate::error::Error::ToolSuspended(_) => "tool_suspended",
+        crate::error::Error::HostPaused => "host_paused",
         crate::error::Error::Agent(_) => "agent",
         crate::error::Error::Interrupted(_) => "interrupted",
         crate::error::Error::Cancelled(_) => "cancelled",
-        crate::error::Error::Session(_) => "session",
+        crate::error::Error::Journal(_) => "journal",
         crate::error::Error::ActionObservation(_) => "action_observation",
         crate::error::Error::ActionDispatch(_) => "action_dispatch",
         crate::error::Error::ConcurrentSessionModification { .. } => {
@@ -569,11 +570,11 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
-    use crate::message::{ContentBlock, TextBlock};
-    use crate::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionLog, SessionRecorder,
-        RECORDER_CONTEXT_KEY,
+    use crate::journal::{
+        AtomicJournalStorage, AtomicThreadJournal, InvocationRecorder, MemoryJournalStorage,
+        ThreadJournal, RECORDER_CONTEXT_KEY,
     };
+    use crate::message::{ContentBlock, TextBlock};
 
     /// A model that yields fixed chunks and optionally fails at the end.
     struct StubModel {
@@ -637,16 +638,16 @@ mod tests {
         }
     }
 
-    async fn journal() -> Arc<dyn SessionLog> {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        Arc::new(JournalSessionLog::new(storage, "s1"))
+    async fn journal() -> Arc<dyn ThreadJournal> {
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        Arc::new(AtomicThreadJournal::new(storage, "s1"))
     }
 
-    fn context(recorder: &Arc<SessionRecorder>) -> RuntimeContext {
+    fn context(recorder: &Arc<InvocationRecorder>) -> RuntimeContext {
         RuntimeContext::new().with_extension_arc(RECORDER_CONTEXT_KEY, Arc::clone(recorder))
     }
 
-    async fn events(log: &dyn SessionLog) -> Vec<crate::session::SessionEvent> {
+    async fn events(log: &dyn ThreadJournal) -> Vec<crate::journal::JournalEvent> {
         let head = log.head().await.unwrap();
         log.scan(0, head.seq).await.unwrap()
     }
@@ -679,12 +680,12 @@ mod tests {
         // since the last delta.
         let log = journal().await;
         let recorder = Arc::new(
-            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            InvocationRecorder::open(Arc::clone(&log), Some("t1"))
                 .await
                 .unwrap(),
         );
         let ctx = context(&recorder);
-        let wrapped = SessionModels::wrap(Arc::new(StallingModel), &ctx, "REASONING");
+        let wrapped = RecordedModels::wrap(Arc::new(StallingModel), &ctx, "REASONING");
         let mut stream = wrapped.stream(
             vec![Msg::user("hi")],
             Vec::new(),
@@ -741,7 +742,7 @@ mod tests {
     async fn an_unfinished_model_call_is_recoverable() {
         let log = journal().await;
         let recorder = Arc::new(
-            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            InvocationRecorder::open(Arc::clone(&log), Some("t1"))
                 .await
                 .unwrap(),
         );
@@ -787,7 +788,7 @@ mod tests {
     async fn an_empty_unfinished_call_is_not_worth_continuing() {
         let log = journal().await;
         let recorder = Arc::new(
-            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            InvocationRecorder::open(Arc::clone(&log), Some("t1"))
                 .await
                 .unwrap(),
         );
@@ -806,7 +807,7 @@ mod tests {
     async fn records_the_adapter_boundary_like_java() {
         let log = journal().await;
         let recorder = Arc::new(
-            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            InvocationRecorder::open(Arc::clone(&log), Some("t1"))
                 .await
                 .unwrap(),
         );
@@ -825,7 +826,7 @@ mod tests {
                 chunk("c1", "lo", usage(3, 2)),
             ],
         ));
-        let wrapped = SessionModels::wrap(model, &ctx, "REASONING");
+        let wrapped = RecordedModels::wrap(model, &ctx, "REASONING");
         assert_eq!(wrapped.model_name(), "stub");
         let streamed: Vec<_> = wrapped
             .stream(
@@ -892,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn without_a_recorder_the_model_is_returned_unchanged() {
         let model: Arc<dyn Model> = Arc::new(StubModel::new("stub", Vec::new()));
-        let wrapped = SessionModels::wrap(Arc::clone(&model), &RuntimeContext::new(), "REASONING");
+        let wrapped = RecordedModels::wrap(Arc::clone(&model), &RuntimeContext::new(), "REASONING");
         assert!(Arc::ptr_eq(&model, &wrapped));
     }
 
@@ -900,7 +901,7 @@ mod tests {
     async fn a_failing_model_records_failed_and_propagates_the_error() {
         let log = journal().await;
         let recorder = Arc::new(
-            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            InvocationRecorder::open(Arc::clone(&log), Some("t1"))
                 .await
                 .unwrap(),
         );
@@ -910,7 +911,7 @@ mod tests {
             "stub",
             vec![chunk("c1", "partial", usage(1, 1))],
         ));
-        let wrapped = SessionModels::wrap(model, &ctx, "SUMMARY");
+        let wrapped = RecordedModels::wrap(model, &ctx, "SUMMARY");
         let streamed: Vec<_> = wrapped
             .stream(
                 vec![Msg::user("hi")],
@@ -947,7 +948,7 @@ mod tests {
             seen: Mutex<Vec<String>>,
         }
 
-        impl SessionModelPolicy for RecordingPolicy {
+        impl ModelCallPolicy for RecordingPolicy {
             fn before_call(&self, call_id: &str, model: &str, _ctx: &RuntimeContext) {
                 self.seen
                     .lock()
@@ -973,18 +974,18 @@ mod tests {
 
         let log = journal().await;
         let recorder = Arc::new(
-            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            InvocationRecorder::open(Arc::clone(&log), Some("t1"))
                 .await
                 .unwrap(),
         );
         let policy = Arc::new(RecordingPolicy::default());
-        let dynamic: Arc<dyn SessionModelPolicy> = policy.clone();
+        let dynamic: Arc<dyn ModelCallPolicy> = policy.clone();
         let ctx = context(&recorder)
-            .with_extension(MODEL_POLICY_CONTEXT_KEY, SessionModelPolicyHandle(dynamic));
+            .with_extension(MODEL_POLICY_CONTEXT_KEY, ModelCallPolicyHandle(dynamic));
 
         let model: Arc<dyn Model> =
             Arc::new(StubModel::new("stub", vec![chunk("c1", "hi", usage(2, 3))]));
-        let wrapped = SessionModels::wrap(model, &ctx, "REASONING");
+        let wrapped = RecordedModels::wrap(model, &ctx, "REASONING");
         let _: Vec<_> = wrapped
             .stream(
                 vec![Msg::user("hi")],

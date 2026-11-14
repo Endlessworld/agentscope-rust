@@ -726,7 +726,7 @@ fn finished_event(outcome: &Result<String>) -> AgentEvent {
 fn is_unreconciled(error: &agentscope_core::Error) -> bool {
     matches!(
         error,
-        agentscope_core::Error::Session(message) if message.contains("reconciliation required")
+        agentscope_core::Error::Journal(message) if message.contains("reconciliation required")
     )
 }
 
@@ -957,8 +957,8 @@ mod tests {
     impl CallableAgent for UnreconciledOnce {
         async fn call(&self, _messages: Vec<Msg>) -> Result<Msg> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(agentscope_core::Error::Session(
-                    "session log: Explicit reconciliation required for unknown tool outcomes: \
+                Err(agentscope_core::Error::Journal(
+                    "journal: Explicit reconciliation required for unknown tool outcomes: \
                      {\"call-1\"}"
                         .into(),
                 ))

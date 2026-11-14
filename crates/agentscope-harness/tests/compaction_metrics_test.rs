@@ -6,11 +6,11 @@
 //! reader can recover after the fact — not a `Custom` payload that only a live stream sees.
 use std::sync::Arc;
 
-use agentscope_core::agent::RuntimeContext;
-use agentscope_core::message::Msg;
-use agentscope_core::session::{
-    InMemorySessionLogStore, SessionKey, SessionLog, SessionLogStore, SessionRecorder,
+use agentscope_core::agent::{RuntimeContext, ThreadKey};
+use agentscope_core::journal::{
+    InMemoryThreadJournalStore, InvocationRecorder, ThreadJournal, ThreadJournalStore,
 };
+use agentscope_core::message::Msg;
 use agentscope_harness::{
     calculate_token, CompactionConfig, CompactionStatus, ConversationCompactor,
 };
@@ -48,13 +48,13 @@ impl agentscope_core::model::Model for FailingModel {
 }
 
 /// Opens a recorder on a fresh in-memory journal, returning it with the log handle.
-async fn recorder() -> (Arc<SessionRecorder>, Arc<dyn SessionLog>) {
-    let store = InMemorySessionLogStore::new();
+async fn recorder() -> (Arc<InvocationRecorder>, Arc<dyn ThreadJournal>) {
+    let store = InMemoryThreadJournalStore::new();
     let context = RuntimeContext::new().with_user_id("u");
-    let key = SessionKey::new(Some("u"), "agent", "s1").unwrap();
+    let key = ThreadKey::new(Some("u"), "agent", "s1").unwrap();
     let log = store.open(&key, &context).await.unwrap();
     let recorder = Arc::new(
-        SessionRecorder::open(Arc::clone(&log), Some("turn"))
+        InvocationRecorder::open(Arc::clone(&log), Some("turn"))
             .await
             .unwrap(),
     );
@@ -62,7 +62,7 @@ async fn recorder() -> (Arc<SessionRecorder>, Arc<dyn SessionLog>) {
 }
 
 /// Reads every committed `compaction/*` event as `(type, payload)`.
-async fn compaction_events(log: &Arc<dyn SessionLog>) -> Vec<(String, serde_json::Value)> {
+async fn compaction_events(log: &Arc<dyn ThreadJournal>) -> Vec<(String, serde_json::Value)> {
     log.read_after(0, 100)
         .await
         .unwrap()

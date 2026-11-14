@@ -8,7 +8,7 @@
 //! ```text
 //! snapshot.json              SnapshotPointer (latest)     <- the only publish point (CAS)
 //! snapshot.previous.json     SnapshotPointer (previous)   <- retention floor + fallback
-//! snapshots/<hash>.json      SessionSnapshot (immutable, named by its own checksum)
+//! snapshots/<hash>.json      JournalSnapshot (immutable, named by its own checksum)
 //! ```
 //!
 //! Crash safety: the object is written before the pointer. A crash while writing leaves an
@@ -21,7 +21,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{SessionEvent, SessionLog, SessionProjection, SessionTurns, Transcript};
+use super::{JournalEvent, JournalProjection, ThreadJournal, Transcript, TurnViews};
 
 /// Snapshot layout version. A pointer or object with another version is ignored.
 pub const SNAPSHOT_FORMAT: u32 = 1;
@@ -47,17 +47,17 @@ pub(crate) const SNAPSHOT_PREVIOUS: &str = "snapshot.previous.json";
 /// A fold of one committed prefix, plus the sequence number it is exact as of.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionSnapshot {
+pub struct JournalSnapshot {
     pub format: u32,
     pub as_of_seq: u64,
     pub as_of_commit_id: String,
     #[serde(default)]
-    pub turns: SessionTurns,
+    pub turns: TurnViews,
     #[serde(default)]
-    pub projection: SessionProjection,
+    pub projection: JournalProjection,
 
     #[serde(default)]
-    pub pending: BTreeMap<String, SessionEvent>,
+    pub pending: BTreeMap<String, JournalEvent>,
     #[serde(default)]
     pub transcript: Transcript,
     /// Execution run ids seen up to `as_of_seq`, oldest first.
@@ -65,7 +65,7 @@ pub struct SessionSnapshot {
     pub runs: Vec<String>,
 }
 
-impl SessionSnapshot {
+impl JournalSnapshot {
     /// Keeps the guard bounded: only the newest [`SNAPSHOT_TRACKED_RUNS`] ids are retained.
     pub fn trim_runs(runs: &mut Vec<String>) {
         if runs.len() > SNAPSHOT_TRACKED_RUNS {
@@ -88,14 +88,14 @@ pub struct SnapshotPointer {
 
 /// How much committed history is kept once a snapshot covers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionRetention {
+pub struct JournalRetention {
     /// Whether commits covered by an older snapshot may be deleted at all.
     pub prune: bool,
     /// Keep every commit younger than this, even when a snapshot covers it.
     pub min_age: Duration,
 }
 
-impl SessionRetention {
+impl JournalRetention {
     /// Retention disabled: snapshots are still published, nothing is deleted.
     pub const OFF: Self = Self {
         prune: false,
@@ -148,7 +148,7 @@ fn parse_min_age(value: &str) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
-impl Default for SessionRetention {
+impl Default for JournalRetention {
     fn default() -> Self {
         Self {
             prune: true,
@@ -175,10 +175,10 @@ pub(crate) fn object_path(prefix: &str, hash: &str) -> String {
 /// Loads the snapshot a backend published, ignoring one written in an unknown format.
 ///
 /// This only rules out a *format* mismatch. A caller must still confirm that the snapshot was
-/// taken on the chain it is about to extend (see [`SessionLog::commit_at`]).
+/// taken on the chain it is about to extend (see [`ThreadJournal::commit_at`]).
 pub(crate) async fn load_verified(
-    log: &dyn SessionLog,
-) -> crate::error::Result<Option<SessionSnapshot>> {
+    log: &dyn ThreadJournal,
+) -> crate::error::Result<Option<JournalSnapshot>> {
     match log.snapshot().await? {
         Some(snapshot) if snapshot.format == SNAPSHOT_FORMAT => Ok(Some(snapshot)),
         Some(snapshot) => {
@@ -201,11 +201,11 @@ mod tests {
     fn retention_reads_the_off_switches() {
         // The environment is process-wide, so this only checks the parsing helper indirectly:
         // `from_env` is exercised through the `off` spellings by the journal tests instead.
-        assert!(SessionRetention::OFF.min_age.is_zero());
-        assert!(!SessionRetention::OFF.prune);
-        assert!(SessionRetention::default().prune);
+        assert!(JournalRetention::OFF.min_age.is_zero());
+        assert!(!JournalRetention::OFF.prune);
+        assert!(JournalRetention::default().prune);
         assert_eq!(
-            SessionRetention::default().min_age,
+            JournalRetention::default().min_age,
             Duration::from_secs(30 * 86_400)
         );
     }
@@ -232,7 +232,7 @@ mod tests {
         let mut runs: Vec<String> = (0..SNAPSHOT_TRACKED_RUNS + 2)
             .map(|index| format!("run-{index}"))
             .collect();
-        SessionSnapshot::trim_runs(&mut runs);
+        JournalSnapshot::trim_runs(&mut runs);
         assert_eq!(runs.len(), SNAPSHOT_TRACKED_RUNS);
         assert_eq!(runs.first().map(String::as_str), Some("run-2"));
     }

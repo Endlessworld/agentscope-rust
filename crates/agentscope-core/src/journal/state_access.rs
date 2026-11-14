@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{pending_interactions, session_error, SessionEvent, SessionLog, SessionProjection};
+use super::{journal_error, pending_interactions, JournalEvent, JournalProjection, ThreadJournal};
 use crate::message::{ContentBlock, Msg, MsgRole};
 use crate::state::AgentState;
 
@@ -23,11 +23,11 @@ pub struct Snapshot {
 }
 
 /// Reads one committed prefix without acquiring a writer or changing session history.
-pub async fn read<F>(log: &dyn SessionLog, initial_state: F) -> crate::error::Result<Snapshot>
+pub async fn read<F>(log: &dyn ThreadJournal, initial_state: F) -> crate::error::Result<Snapshot>
 where
     F: FnOnce() -> AgentState,
 {
-    let projection = SessionProjection::read(log).await?;
+    let projection = JournalProjection::read(log).await?;
     let state = projection.restore()?.unwrap_or_else(initial_state);
     Ok(Snapshot {
         as_of_seq: projection.as_of_seq,
@@ -37,7 +37,7 @@ where
 
 /// Reloads and mutates state while holding the writer lease, then commits a checkpoint.
 pub async fn update<F, M>(
-    log: Arc<dyn SessionLog>,
+    log: Arc<dyn ThreadJournal>,
     initial_state: F,
     reason: &str,
     mutation: M,
@@ -53,7 +53,7 @@ where
 ///
 /// A stale snapshot is rejected; it never overwrites an execution completed elsewhere.
 pub async fn replace<F>(
-    log: Arc<dyn SessionLog>,
+    log: Arc<dyn ThreadJournal>,
     initial_state: F,
     reason: &str,
     snapshot: Snapshot,
@@ -77,7 +77,7 @@ where
 }
 
 async fn change<F, M>(
-    log: &Arc<dyn SessionLog>,
+    log: &Arc<dyn ThreadJournal>,
     initial_state: &F,
     reason: &str,
     replacement: Option<Snapshot>,
@@ -88,7 +88,7 @@ where
     M: FnOnce(&mut AgentState) -> crate::error::Result<()>,
 {
     if reason.trim().is_empty() {
-        return Err(session_error("A state change reason is required"));
+        return Err(journal_error("A state change reason is required"));
     }
     let writer = log
         .acquire(&uuid::Uuid::new_v4().to_string(), LEASE)
@@ -107,7 +107,7 @@ where
 }
 
 async fn change_locked<F, M>(
-    log: &Arc<dyn SessionLog>,
+    log: &Arc<dyn ThreadJournal>,
     writer: super::Writer,
     initial_state: &F,
     reason: &str,
@@ -118,15 +118,15 @@ where
     F: Fn() -> AgentState,
     M: FnOnce(&mut AgentState) -> crate::error::Result<()>,
 {
-    let projection = SessionProjection::read(&**log).await?;
+    let projection = JournalProjection::read(&**log).await?;
     if !projection.uncertain_tool_calls.is_empty() {
-        return Err(session_error(
+        return Err(journal_error(
             "Reconcile unresolved tool outcomes before changing session state",
         ));
     }
     if let Some(snapshot) = &replacement {
         if snapshot.as_of_seq != projection.as_of_seq {
-            return Err(session_error(
+            return Err(journal_error(
                 "Session state changed since inspection; reload or use an atomic update",
             ));
         }
@@ -146,7 +146,7 @@ where
         mutation(&mut changed)?;
     }
     if changed.user_id != user_id || changed.session_id != session_id {
-        return Err(session_error(
+        return Err(journal_error(
             "State changes must preserve session identity",
         ));
     }
@@ -155,16 +155,16 @@ where
 
     let context_changed = before_value.get("context") != after_value.get("context");
     if context_changed && !pending_interactions(&**log).await?.is_empty() {
-        return Err(session_error(
+        return Err(journal_error(
             "Resolve pending interactions before replacing context",
         ));
     }
 
-    let mut facts: Vec<SessionEvent> = Vec::new();
+    let mut facts: Vec<JournalEvent> = Vec::new();
     let mut next_seq = projection.as_of_seq;
     let mut push = |event_type: &str, payload: serde_json::Value| -> crate::error::Result<()> {
         next_seq += 1;
-        facts.push(SessionEvent::new(
+        facts.push(JournalEvent::new(
             uuid::Uuid::new_v4().to_string(),
             next_seq,
             chrono::Utc::now().timestamp_millis(),
@@ -251,13 +251,13 @@ fn message_event_type(message: &Msg) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionRecorder,
+    use crate::journal::{
+        AtomicJournalStorage, AtomicThreadJournal, InvocationRecorder, MemoryJournalStorage,
     };
 
-    fn journal() -> Arc<dyn SessionLog> {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        Arc::new(JournalSessionLog::new(storage, "s1"))
+    fn journal() -> Arc<dyn ThreadJournal> {
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        Arc::new(AtomicThreadJournal::new(storage, "s1"))
     }
 
     fn initial() -> AgentState {
@@ -268,9 +268,9 @@ mod tests {
             .build()
     }
 
-    async fn seeded() -> Arc<dyn SessionLog> {
+    async fn seeded() -> Arc<dyn ThreadJournal> {
         let log = journal();
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let state = initial();
@@ -381,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn context_replacement_is_blocked_while_an_interaction_is_pending() {
         let log = seeded().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let mut data = crate::event::EventData::default();

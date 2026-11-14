@@ -1,7 +1,7 @@
 //! Session journal memory probe.
 //!
 //! Reproduces the EventLog hot path per turn (`start` -> `state/checkpoint` -> `finish`) against
-//! a real `SessionRecorder`, and reports allocator counters so the effect of implementation
+//! a real `InvocationRecorder`, and reports allocator counters so the effect of implementation
 //! changes is measurable without a model server.
 //!
 //! Usage:
@@ -15,10 +15,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use agentscope_core::journal::{
+    AtomicThreadJournal, InvocationRecorder, RecorderBaseline, ThreadJournal,
+};
 use agentscope_core::message::Msg;
-use agentscope_core::session::{JournalSessionLog, RecorderBaseline, SessionLog, SessionRecorder};
 use agentscope_core::state::AgentState;
-use agentscope_harness::agent::session::{SqliteSessionStorage, WorkspaceSessionStorage};
+use agentscope_harness::agent::session::{SqliteJournalStorage, WorkspaceJournalStorage};
 use agentscope_harness::filesystem::LocalFilesystem;
 
 struct Counting;
@@ -93,17 +95,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root_path = std::path::PathBuf::from(&root);
     std::fs::create_dir_all(&root_path)?;
 
-    let log: Option<Arc<dyn SessionLog>> = match backend.as_str() {
+    let log: Option<Arc<dyn ThreadJournal>> = match backend.as_str() {
         "none" => None,
         "file" => {
-            let storage = Arc::new(WorkspaceSessionStorage::new(Arc::new(
+            let storage = Arc::new(WorkspaceJournalStorage::new(Arc::new(
                 LocalFilesystem::new(root_path.join("workspace")),
             )));
-            Some(Arc::new(JournalSessionLog::new(storage, "probe")))
+            Some(Arc::new(AtomicThreadJournal::new(storage, "probe")))
         }
         "sqlite" => {
-            let storage = Arc::new(SqliteSessionStorage::new(&root_path));
-            Some(Arc::new(JournalSessionLog::new(storage, "probe")))
+            let storage = Arc::new(SqliteJournalStorage::new(&root_path));
+            Some(Arc::new(AtomicThreadJournal::new(storage, "probe")))
         }
         other => return Err(format!("unknown backend: {other}").into()),
     };
@@ -157,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resumed_turn: false,
             };
             let phase_baseline = TOTAL.load(Ordering::Relaxed);
-            let mut recorder = SessionRecorder::open_with_baseline(
+            let mut recorder = InvocationRecorder::open_with_baseline(
                 Arc::clone(log),
                 Some(&format!("turn-{turn}")),
                 None,

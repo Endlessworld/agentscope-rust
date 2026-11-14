@@ -124,7 +124,7 @@ impl BaseStore for OssStore {
     ///
     /// Without the precondition the Java `putIfVersion` is a read-check-write sequence, so
     /// two writers can both "win"; only a backend-evaluated precondition may back a session
-    /// journal (harness `StoreSessionStorage` refuses anything else).
+    /// journal (harness `StoreJournalStorage` refuses anything else).
     fn supports_atomic_session_storage(&self) -> bool {
         self.client.supports_conditional_writes()
     }

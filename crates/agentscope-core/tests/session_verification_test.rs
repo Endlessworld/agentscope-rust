@@ -1,4 +1,4 @@
-//! `TaskVerification` data model + `verification/result` replay into `SessionProjection`.
+//! `TaskVerification` data model + `verification/result` replay into `JournalProjection`.
 //!
 //! Scope: the durable record shape, its validation, and the read-only replay pipe. Nothing here
 //! decides when a verification runs or what it asserts — that orchestration is the caller's job.
@@ -6,15 +6,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentscope_core::session::{
-    AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, SessionEvent, SessionLog,
-    SessionProjection, Writer,
+use agentscope_core::journal::{
+    AtomicJournalStorage, AtomicThreadJournal, JournalEvent, JournalProjection,
+    MemoryJournalStorage, ThreadJournal, Writer,
 };
 use agentscope_core::state::{AgentState, EvidenceBinding, TaskVerification, VerificationOutcome};
 use serde_json::json;
 
-fn event(seq: u64, kind: &str, payload: serde_json::Value) -> SessionEvent {
-    SessionEvent::new(
+fn event(seq: u64, kind: &str, payload: serde_json::Value) -> JournalEvent {
+    JournalEvent::new(
         format!("e{seq}"),
         seq,
         0,
@@ -27,9 +27,10 @@ fn event(seq: u64, kind: &str, payload: serde_json::Value) -> SessionEvent {
     .expect("valid event envelope")
 }
 
-async fn journal() -> (Arc<dyn SessionLog>, Writer) {
-    let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-    let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
+async fn journal() -> (Arc<dyn ThreadJournal>, Writer) {
+    let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+    let log: Arc<dyn ThreadJournal> =
+        Arc::new(AtomicThreadJournal::new(Arc::clone(&storage), "s1"));
     let writer = log
         .acquire("run-1", Duration::from_secs(60))
         .await
@@ -37,7 +38,7 @@ async fn journal() -> (Arc<dyn SessionLog>, Writer) {
     (log, writer)
 }
 
-async fn commit(log: &dyn SessionLog, writer: &Writer, batch: &str, events: &[SessionEvent]) {
+async fn commit(log: &dyn ThreadJournal, writer: &Writer, batch: &str, events: &[JournalEvent]) {
     let head = log.head().await.expect("head");
     log.commit(writer, batch, head.seq, events)
         .await
@@ -62,7 +63,7 @@ fn verification(id: &str, outcome: VerificationOutcome) -> TaskVerification {
     .expect("valid verification")
 }
 
-fn checkpoint(seq: u64, summary: &str) -> SessionEvent {
+fn checkpoint(seq: u64, summary: &str) -> JournalEvent {
     let mut state = AgentState::builder().session_id("s1").build();
     state.summary = summary.to_string();
     event(
@@ -72,7 +73,7 @@ fn checkpoint(seq: u64, summary: &str) -> SessionEvent {
     )
 }
 
-fn verification_event(seq: u64, report: &TaskVerification) -> SessionEvent {
+fn verification_event(seq: u64, report: &TaskVerification) -> JournalEvent {
     event(
         seq,
         "verification/result",
@@ -89,7 +90,7 @@ async fn committed_verification_is_replayed_with_its_fields() {
     let report = verification("ver-1", VerificationOutcome::Passed);
     commit(&*log, &writer, "b1", &[verification_event(1, &report)]).await;
 
-    let projection = SessionProjection::read(&*log).await.expect("projection");
+    let projection = JournalProjection::read(&*log).await.expect("projection");
     assert_eq!(projection.verifications.len(), 1);
     let replayed = &projection.verifications[0];
     assert_eq!(replayed, &report);
@@ -116,7 +117,7 @@ async fn same_id_committed_twice_keeps_one_latest_record() {
     commit(&*log, &writer, "b1", &[verification_event(1, &first)]).await;
     commit(&*log, &writer, "b2", &[verification_event(2, &second)]).await;
 
-    let projection = SessionProjection::read(&*log).await.expect("projection");
+    let projection = JournalProjection::read(&*log).await.expect("projection");
     assert_eq!(projection.verifications.len(), 1, "deduplicated by id");
     assert_eq!(
         projection.verifications[0].outcome,
@@ -142,7 +143,7 @@ async fn checkpoint_clears_verifications_recorded_before_it() {
     .await;
     commit(&*log, &writer, "b2", &[verification_event(3, &fresh)]).await;
 
-    let projection = SessionProjection::read(&*log).await.expect("projection");
+    let projection = JournalProjection::read(&*log).await.expect("projection");
     assert_eq!(projection.verifications.len(), 1);
     assert_eq!(projection.verifications[0].id, "ver-new");
     assert_eq!(
@@ -172,7 +173,7 @@ async fn malformed_verification_payload_fails_the_projection() {
     )
     .await;
 
-    let error = SessionProjection::read(&*log)
+    let error = JournalProjection::read(&*log)
         .await
         .expect_err("malformed verification must be an error");
     let message = error.to_string();
@@ -195,7 +196,7 @@ async fn verification_event_without_a_payload_is_skipped() {
     )
     .await;
 
-    let projection = SessionProjection::read(&*log).await.expect("projection");
+    let projection = JournalProjection::read(&*log).await.expect("projection");
     assert!(projection.verifications.is_empty());
 }
 

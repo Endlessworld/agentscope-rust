@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
+use agentscope_core::agent::ThreadKey;
+use agentscope_core::journal::{InMemoryThreadJournalStore, ThreadJournalStore};
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
-use agentscope_core::session::{InMemorySessionLogStore, SessionKey, SessionLogStore};
 use agentscope_harness::agent::session::{AgentSession, SessionAnswer};
 use agentscope_harness::agent::HarnessAgent;
 use futures::StreamExt;
@@ -137,8 +138,8 @@ async fn a_submit_after_a_failed_run_starts() {
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-retry");
-    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-retry").unwrap();
-    let store = InMemorySessionLogStore::new();
+    let key = ThreadKey::new(Some("alice"), "session-agent", "conversation-retry").unwrap();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
     let session = AgentSession::open(agent, context, key, log).unwrap();
 
@@ -170,8 +171,8 @@ async fn a_failed_run_carries_its_error_on_the_task_receipt() {
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-fail");
-    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-fail").unwrap();
-    let store = InMemorySessionLogStore::new();
+    let key = ThreadKey::new(Some("alice"), "session-agent", "conversation-fail").unwrap();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
     let session = AgentSession::open(agent, context, key, log).unwrap();
 
@@ -200,8 +201,8 @@ async fn open_session(tag: &str, reply: &'static str) -> (AgentSession, std::pat
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-001");
-    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-001").unwrap();
-    let store = InMemorySessionLogStore::new();
+    let key = ThreadKey::new(Some("alice"), "session-agent", "conversation-001").unwrap();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
     let session = AgentSession::open(agent, context, key, log).unwrap();
     (session, dir)
@@ -344,14 +345,14 @@ async fn an_interrupted_resumable_turn_is_continued_before_a_new_submission_runs
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-continue");
-    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-continue").unwrap();
-    let store = InMemorySessionLogStore::new();
+    let key = ThreadKey::new(Some("alice"), "session-agent", "conversation-continue").unwrap();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
 
     {
-        use agentscope_core::session::SessionRecorder;
+        use agentscope_core::journal::InvocationRecorder;
         use agentscope_core::state::AgentState;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("turn-stale"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("turn-stale"))
             .await
             .unwrap();
         let state = AgentState::builder()
@@ -374,7 +375,7 @@ async fn an_interrupted_resumable_turn_is_continued_before_a_new_submission_runs
     let next = session.submit("second").await.unwrap();
     session.await_task(&next.command_id).await.unwrap();
 
-    let turns = agentscope_core::session::SessionTurns::read(&*log)
+    let turns = agentscope_core::journal::TurnViews::read(&*log)
         .await
         .unwrap();
     let stale = turns
@@ -410,15 +411,15 @@ async fn an_interrupted_turn_is_closed_before_a_new_submission_runs() {
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-abandon");
-    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-abandon").unwrap();
-    let store = InMemorySessionLogStore::new();
+    let key = ThreadKey::new(Some("alice"), "session-agent", "conversation-abandon").unwrap();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
 
     // Seed an interrupted turn the way a crashed run leaves one: started, never finished.
     {
-        use agentscope_core::session::SessionRecorder;
+        use agentscope_core::journal::InvocationRecorder;
         use agentscope_core::state::AgentState;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("turn-stale"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("turn-stale"))
             .await
             .unwrap();
         let state = AgentState::builder()
@@ -454,7 +455,7 @@ async fn a_superseded_resume_does_not_starve_the_queue() {
     // submit that opened a newer turn can never be admitted again ("Only the latest unfinished
     // task can continue"). The dispatcher always launches the first accepted command, so
     // retrying that one forever meant no later prompt ever started.
-    use agentscope_core::session::{Command, SessionInbox, SessionRecorder};
+    use agentscope_core::journal::{Command, InvocationRecorder, SessionInbox};
     use agentscope_core::state::AgentState;
 
     let dir = temp_dir("stale-resume");
@@ -470,8 +471,8 @@ async fn a_superseded_resume_does_not_starve_the_queue() {
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-stale-resume");
-    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-stale-resume").unwrap();
-    let store = InMemorySessionLogStore::new();
+    let key = ThreadKey::new(Some("alice"), "session-agent", "conversation-stale-resume").unwrap();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
 
     // `turn-old` was interrupted mid-run (non-terminal, resumable); `turn-new` is the latest
@@ -480,7 +481,7 @@ async fn a_superseded_resume_does_not_starve_the_queue() {
         ("turn-old", "earlier", "interrupted"),
         ("turn-new", "later", "completed"),
     ] {
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some(turn))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some(turn))
             .await
             .unwrap();
         let state = AgentState::builder()
@@ -597,8 +598,8 @@ async fn a_queued_turn_behind_a_running_one_is_not_starving() {
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-behind");
-    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-behind").unwrap();
-    let store = InMemorySessionLogStore::new();
+    let key = ThreadKey::new(Some("alice"), "session-agent", "conversation-behind").unwrap();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
     let session = AgentSession::open(agent, context, key, log).unwrap();
 
@@ -648,7 +649,7 @@ async fn a_queued_turn_behind_a_running_one_is_not_starving() {
 async fn a_queued_turn_with_nothing_running_is_starving() {
     // The other half of the watchdog decision: a command nobody dispatches (no handle started
     // its loop) has no execution in flight, so the stall must still be reported.
-    use agentscope_core::session::{Command, SessionInbox};
+    use agentscope_core::journal::{Command, SessionInbox};
 
     let (session, dir) = open_session("starving", "never reached").await;
     let inbox = SessionInbox::new(session.log()).unwrap();
@@ -709,8 +710,8 @@ async fn a_run_that_panics_does_not_wedge_the_session() {
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-panic");
-    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-panic").unwrap();
-    let store = InMemorySessionLogStore::new();
+    let key = ThreadKey::new(Some("alice"), "session-agent", "conversation-panic").unwrap();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
     let session = AgentSession::open(agent, context, key, log).unwrap();
 
@@ -773,8 +774,8 @@ async fn a_locally_owned_run_is_never_reported_interrupted() {
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-local-lease");
-    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-local-lease").unwrap();
-    let store = InMemorySessionLogStore::new();
+    let key = ThreadKey::new(Some("alice"), "session-agent", "conversation-local-lease").unwrap();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
     let session = AgentSession::open(agent, context, key, log).unwrap();
 
@@ -824,13 +825,13 @@ async fn a_stale_interrupt_does_not_kill_the_next_run() {
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-stale-interrupt");
-    let key = SessionKey::new(
+    let key = ThreadKey::new(
         Some("alice"),
         "session-agent",
         "conversation-stale-interrupt",
     )
     .unwrap();
-    let store = InMemorySessionLogStore::new();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
     let session = AgentSession::open(Arc::clone(&agent), context, key, log).unwrap();
 
@@ -970,8 +971,8 @@ async fn a_resumed_turn_does_not_replay_its_original_input() {
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-resume-dedup");
-    let key = SessionKey::new(Some("alice"), "session-agent", "conversation-resume-dedup").unwrap();
-    let store = InMemorySessionLogStore::new();
+    let key = ThreadKey::new(Some("alice"), "session-agent", "conversation-resume-dedup").unwrap();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
     let session = AgentSession::open(Arc::clone(&agent), context, key, log).unwrap();
 
@@ -1104,13 +1105,13 @@ async fn a_resumed_turn_continues_the_partial_model_output() {
     let context = RuntimeContext::new()
         .with_user_id("alice")
         .with_session_id("conversation-resume-partial");
-    let key = SessionKey::new(
+    let key = ThreadKey::new(
         Some("alice"),
         "session-agent",
         "conversation-resume-partial",
     )
     .unwrap();
-    let store = InMemorySessionLogStore::new();
+    let store = InMemoryThreadJournalStore::new();
     let log = store.open(&key, &context).await.unwrap();
     let session = AgentSession::open(Arc::clone(&agent), context, key, log).unwrap();
 

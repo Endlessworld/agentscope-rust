@@ -1,5 +1,5 @@
 //! Per-execution ordered acceptance and acknowledged checkpoints, mirroring
-//! `SessionRecorder`.
+//! `InvocationRecorder`.
 //!
 //! The recorder holds the execution writer lease for the lifetime of a run. Facts are buffered
 //! in acceptance order and published by one commit; a failed commit is retained as a sticky
@@ -11,7 +11,7 @@
 //!   stream, one slow tool) while it still owns the session; without renewal the lease expires
 //!   and the next fact fails with `Session writer ownership expired or fenced` — which for an
 //!   observation is fatal, because the tool already ran and must not be replayed.
-//! * **Publishing facts** stays caller-driven ([`SessionRecorder::flush`]). A background commit
+//! * **Publishing facts** stays caller-driven ([`InvocationRecorder::flush`]). A background commit
 //!   could race the agent loop's own flush on the same pending buffer and turn a healthy run
 //!   into a sticky "Stale committed prefix" failure.
 
@@ -20,15 +20,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::snapshot::{SessionRetention, SNAPSHOT_EVERY, SNAPSHOT_EVERY_EVENTS};
+use super::snapshot::{JournalRetention, SNAPSHOT_EVERY, SNAPSHOT_EVERY_EVENTS};
 use super::{
-    session_error, SessionEvent, SessionLog, SessionLogExporter, SessionProjection, Writer,
+    journal_error, JournalEvent, JournalExporter, JournalProjection, ThreadJournal, Writer,
 };
 use crate::agent::RuntimeContext;
 use crate::message::{ContentBlock, GenerateReason, Msg, MsgRole, ToolResultBlock};
 use crate::state::AgentState;
 
-/// Runtime-context key carrying the active [`SessionRecorder`].
+/// Runtime-context key carrying the active [`InvocationRecorder`].
 pub const RECORDER_CONTEXT_KEY: &str = "agentscope.session.recorder";
 /// Runtime-context key carrying the turn id pinned for this execution.
 pub const TURN_ID_CONTEXT_KEY: &str = "agentscope.session.turnId";
@@ -136,7 +136,7 @@ fn is_stale_prefix(message: &str) -> bool {
 
 /// The logical outcome of a normally returned result, independent of the caller's handle.
 ///
-/// Mirrors Java `SessionRecorder.outcome`.
+/// Mirrors Java `InvocationRecorder.outcome`.
 pub fn outcome(reason: GenerateReason) -> &'static str {
     match reason {
         GenerateReason::ToolSuspended
@@ -342,14 +342,14 @@ struct InflightBatch {
     batch_id: String,
     /// Shared so a flush never copies the batch payload (a `state/checkpoint` event can be
     /// megabytes). Callers that need to mutate it take a copy explicitly.
-    events: Arc<Vec<SessionEvent>>,
+    events: Arc<Vec<JournalEvent>>,
     bytes: usize,
 }
 
 /// Mutable recording state guarded by one mutex.
 #[derive(Default)]
 struct RecorderState {
-    pending: Vec<SessionEvent>,
+    pending: Vec<JournalEvent>,
     pending_bytes: usize,
     /// Events handed to an in-flight commit but not acknowledged yet.
     inflight: Option<InflightBatch>,
@@ -377,15 +377,15 @@ struct RecorderState {
 }
 
 /// Per-execution ordered acceptance and acknowledged checkpoints.
-pub struct SessionRecorder {
-    log: Arc<dyn SessionLog>,
+pub struct InvocationRecorder {
+    log: Arc<dyn ThreadJournal>,
     writer: Writer,
     run_id: String,
     turn_id: String,
     resumed_turn: bool,
-    initial: SessionProjection,
+    initial: JournalProjection,
     /// The serialized state the journal was opened with. The caller takes it once through
-    /// [`SessionRecorder::restore_initial`]; keeping it after that would hold a second copy of
+    /// [`InvocationRecorder::restore_initial`]; keeping it after that would hold a second copy of
     /// the whole conversation for the life of the turn.
     initial_state: Mutex<Option<String>>,
     /// Whether the journal already carried a state baseline when this recorder opened.
@@ -393,7 +393,7 @@ pub struct SessionRecorder {
     /// What this recorder persists for each model call.
     policy: RecordingPolicy,
     state: Mutex<RecorderState>,
-    exporter: Option<Arc<SessionLogExporter>>,
+    exporter: Option<Arc<JournalExporter>>,
     /// The lease duration this recorder acquires and renews with.
     lease: Duration,
     /// Background lease renewal; `None` when no Tokio runtime was available at open time.
@@ -404,7 +404,7 @@ pub struct SessionRecorder {
     replay_ms: u64,
 }
 
-impl Drop for SessionRecorder {
+impl Drop for InvocationRecorder {
     fn drop(&mut self) {
         // A recorder that is dropped without `close()` means its run unwound abnormally (a
         // panic in the agent loop, a future dropped mid-run). The writer lease must not be left
@@ -445,7 +445,7 @@ impl Drop for SessionRecorder {
 
 /// Renews the execution writer lease while the recorder is open.
 ///
-/// Mirrors the renewal half of Java's `SessionRecorder` heartbeat thread. It deliberately does
+/// Mirrors the renewal half of Java's `InvocationRecorder` heartbeat thread. It deliberately does
 /// **not** flush: a background commit would race the agent loop's own flush on the same pending
 /// buffer. Renewal alone is what keeps a long model stream or a slow tool from losing ownership.
 struct LeaseHeartbeat {
@@ -486,7 +486,7 @@ impl LeaseHeartbeat {
     /// renews inline before committing, so a run that keeps writing keeps its lease — but a long
     /// silent stretch (one slow tool, one long model stream) would then be uncovered, so it is
     /// reported instead of silently pretending the lease is guarded.
-    fn start(log: Arc<dyn SessionLog>, writer: Writer, lease: Duration) -> Option<Self> {
+    fn start(log: Arc<dyn ThreadJournal>, writer: Writer, lease: Duration) -> Option<Self> {
         let runtime = match tokio::runtime::Handle::try_current() {
             Ok(runtime) => runtime,
             Err(_) => {
@@ -581,9 +581,9 @@ impl Drop for LeaseHeartbeat {
     }
 }
 
-impl std::fmt::Debug for SessionRecorder {
+impl std::fmt::Debug for InvocationRecorder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionRecorder")
+        f.debug_struct("InvocationRecorder")
             .field("run_id", &self.run_id)
             .field("turn_id", &self.turn_id)
             .field("resumed_turn", &self.resumed_turn)
@@ -614,10 +614,10 @@ pub struct RecorderBaseline {
     pub resumed_turn: bool,
 }
 
-impl SessionRecorder {
+impl InvocationRecorder {
     /// Opens a recorder for `turn_id`, allocating a fresh run id.
     pub async fn open(
-        log: Arc<dyn SessionLog>,
+        log: Arc<dyn ThreadJournal>,
         turn_id: Option<&str>,
     ) -> crate::error::Result<Self> {
         Self::open_with_exporter(log, turn_id, None).await
@@ -625,22 +625,22 @@ impl SessionRecorder {
 
     /// Opens a recorder for `turn_id` with an optional committed-event exporter in one call.
     ///
-    /// Equivalent to [`SessionRecorder::open`] when `exporter` is `None`. This is the seam
+    /// Equivalent to [`InvocationRecorder::open`] when `exporter` is `None`. This is the seam
     /// used by the agent loop: the run id stays internal while the exporter is supplied.
     pub async fn open_with_exporter(
-        log: Arc<dyn SessionLog>,
+        log: Arc<dyn ThreadJournal>,
         turn_id: Option<&str>,
-        exporter: Option<Arc<SessionLogExporter>>,
+        exporter: Option<Arc<JournalExporter>>,
     ) -> crate::error::Result<Self> {
         Self::open_with(log, turn_id, &uuid::Uuid::new_v4().to_string(), exporter).await
     }
 
     /// Opens a recorder with an explicit run id, optionally exporting committed events.
     pub async fn open_with(
-        log: Arc<dyn SessionLog>,
+        log: Arc<dyn ThreadJournal>,
         turn_id: Option<&str>,
         run_id: &str,
-        exporter: Option<Arc<SessionLogExporter>>,
+        exporter: Option<Arc<JournalExporter>>,
     ) -> crate::error::Result<Self> {
         Self::open_with_lease(log, turn_id, run_id, exporter, LEASE).await
     }
@@ -652,9 +652,9 @@ impl SessionRecorder {
     /// journal replay. This is the fast path for a long-lived session whose in-memory
     /// state already is the committed history.
     pub async fn open_with_baseline(
-        log: Arc<dyn SessionLog>,
+        log: Arc<dyn ThreadJournal>,
         turn_id: Option<&str>,
-        exporter: Option<Arc<SessionLogExporter>>,
+        exporter: Option<Arc<JournalExporter>>,
         baseline: RecorderBaseline,
     ) -> crate::error::Result<Self> {
         Self::open_with_baseline_and_policy(
@@ -669,9 +669,9 @@ impl SessionRecorder {
 
     /// Opens a recorder with a caller-supplied baseline under an explicit recording policy.
     pub async fn open_with_baseline_and_policy(
-        log: Arc<dyn SessionLog>,
+        log: Arc<dyn ThreadJournal>,
         turn_id: Option<&str>,
-        exporter: Option<Arc<SessionLogExporter>>,
+        exporter: Option<Arc<JournalExporter>>,
         baseline: RecorderBaseline,
         policy: RecordingPolicy,
     ) -> crate::error::Result<Self> {
@@ -689,9 +689,9 @@ impl SessionRecorder {
 
     /// Opens a recorder without a baseline under an explicit recording policy.
     pub async fn open_with_exporter_and_policy(
-        log: Arc<dyn SessionLog>,
+        log: Arc<dyn ThreadJournal>,
         turn_id: Option<&str>,
-        exporter: Option<Arc<SessionLogExporter>>,
+        exporter: Option<Arc<JournalExporter>>,
         policy: RecordingPolicy,
     ) -> crate::error::Result<Self> {
         Self::open_with_lease_policy(
@@ -707,13 +707,13 @@ impl SessionRecorder {
 
     /// Opens a recorder whose writer lease (and renewal cadence) is explicit.
     ///
-    /// Production callers use [`SessionRecorder::open_with`]; the shorter lease exists so a test
+    /// Production callers use [`InvocationRecorder::open_with`]; the shorter lease exists so a test
     /// can observe renewal without waiting two minutes.
     pub(crate) async fn open_with_lease(
-        log: Arc<dyn SessionLog>,
+        log: Arc<dyn ThreadJournal>,
         turn_id: Option<&str>,
         run_id: &str,
-        exporter: Option<Arc<SessionLogExporter>>,
+        exporter: Option<Arc<JournalExporter>>,
         lease: Duration,
     ) -> crate::error::Result<Self> {
         Self::open_with_lease_and_baseline(
@@ -730,10 +730,10 @@ impl SessionRecorder {
 
     /// Lease-explicit open under an explicit recording policy.
     pub(crate) async fn open_with_lease_policy(
-        log: Arc<dyn SessionLog>,
+        log: Arc<dyn ThreadJournal>,
         turn_id: Option<&str>,
         run_id: &str,
-        exporter: Option<Arc<SessionLogExporter>>,
+        exporter: Option<Arc<JournalExporter>>,
         lease: Duration,
         policy: RecordingPolicy,
     ) -> crate::error::Result<Self> {
@@ -742,23 +742,23 @@ impl SessionRecorder {
     }
 
     async fn open_with_lease_and_baseline(
-        log: Arc<dyn SessionLog>,
+        log: Arc<dyn ThreadJournal>,
         turn_id: Option<&str>,
         run_id: &str,
-        exporter: Option<Arc<SessionLogExporter>>,
+        exporter: Option<Arc<JournalExporter>>,
         lease: Duration,
         baseline: Option<RecorderBaseline>,
         policy: RecordingPolicy,
     ) -> crate::error::Result<Self> {
         let turn_id = match turn_id {
             Some(id) if id.trim().is_empty() => {
-                return Err(session_error("Run and turn IDs must not be blank"));
+                return Err(journal_error("Run and turn IDs must not be blank"));
             }
             Some(id) => id.to_string(),
             None => uuid::Uuid::new_v4().to_string(),
         };
         if run_id.trim().is_empty() {
-            return Err(session_error("Run and turn IDs must not be blank"));
+            return Err(journal_error("Run and turn IDs must not be blank"));
         }
 
         let writer = log.acquire(run_id, lease).await?;
@@ -786,7 +786,7 @@ impl SessionRecorder {
                     seq = baseline.seq,
                     "session recorder opened from a caller-supplied baseline"
                 );
-                let initial = SessionProjection {
+                let initial = JournalProjection {
                     as_of_seq: baseline.seq,
                     state_json: Some(baseline.state_json),
                     uncertain_tool_calls: baseline.uncertain_tool_calls,
@@ -794,7 +794,7 @@ impl SessionRecorder {
                     verifications: Vec::new(),
                 };
                 if !initial.uncertain_tool_calls.is_empty() {
-                    return Err(session_error(format!(
+                    return Err(journal_error(format!(
                         "Explicit reconciliation required for unknown tool outcomes: {:?}",
                         initial.uncertain_tool_calls
                     )));
@@ -829,9 +829,9 @@ impl SessionRecorder {
             // One replay feeds the projection, the transcript and the duplicate run/turn check.
             // Opening a recorder used to walk the whole prefix three times, which is the cold
             // start a long session pays for on every new turn.
-            let mut inspect = |event: &SessionEvent| -> crate::error::Result<()> {
+            let mut inspect = |event: &JournalEvent| -> crate::error::Result<()> {
                 if event.execution_run_id.as_deref() == Some(run_id) {
-                    return Err(session_error(
+                    return Err(journal_error(
                         "Run ID already used; prepare a new execution to resume",
                     ));
                 }
@@ -850,7 +850,7 @@ impl SessionRecorder {
                             .as_deref()
                             == Some("completed"));
                 if completed {
-                    return Err(session_error("Turn already completed; use a new turn ID"));
+                    return Err(journal_error("Turn already completed; use a new turn ID"));
                 }
                 Ok(())
             };
@@ -868,7 +868,7 @@ impl SessionRecorder {
                         == Some(snapshot.as_of_commit_id.as_str())
                 {
                     if snapshot.runs.iter().any(|run| run == run_id) {
-                        return Err(session_error(
+                        return Err(journal_error(
                             "Run ID already used; prepare a new execution to resume",
                         ));
                     }
@@ -878,7 +878,7 @@ impl SessionRecorder {
                         .iter()
                         .any(|turn| turn.turn_id == turn_id && turn.status == "completed")
                     {
-                        return Err(session_error("Turn already completed; use a new turn ID"));
+                        return Err(journal_error("Turn already completed; use a new turn ID"));
                     }
                 }
             }
@@ -886,7 +886,7 @@ impl SessionRecorder {
             let (initial, transcript) = super::views::open_views(&*log, &mut inspect).await?;
             let durable_seq = initial.as_of_seq;
             if !initial.uncertain_tool_calls.is_empty() {
-                return Err(session_error(format!(
+                return Err(journal_error(format!(
                     "Explicit reconciliation required for unknown tool outcomes: {:?}",
                     initial.uncertain_tool_calls
                 )));
@@ -971,8 +971,8 @@ impl SessionRecorder {
     }
 
     /// Returns the recorder carried by a runtime context, if any.
-    pub fn from_context(context: &RuntimeContext) -> Option<Arc<SessionRecorder>> {
-        context.extension::<SessionRecorder>(RECORDER_CONTEXT_KEY)
+    pub fn from_context(context: &RuntimeContext) -> Option<Arc<InvocationRecorder>> {
+        context.extension::<InvocationRecorder>(RECORDER_CONTEXT_KEY)
     }
 
     /// The execution run id.
@@ -986,7 +986,7 @@ impl SessionRecorder {
     }
 
     /// The committed prefix the recorder started from.
-    pub fn initial(&self) -> &SessionProjection {
+    pub fn initial(&self) -> &JournalProjection {
         &self.initial
     }
 
@@ -1025,10 +1025,10 @@ impl SessionRecorder {
 
     fn check(state: &RecorderState) -> crate::error::Result<()> {
         if state.closed {
-            return Err(session_error("Session recorder closed"));
+            return Err(journal_error("Session recorder closed"));
         }
         if let Some(failure) = &state.failure {
-            return Err(session_error(format!(
+            return Err(journal_error(format!(
                 "Session persistence failed: {failure}"
             )));
         }
@@ -1074,7 +1074,7 @@ impl SessionRecorder {
             .map(|inflight| inflight.bytes)
             .unwrap_or(0);
         if !admits_bytes(guard.pending_bytes, inflight_bytes, bytes) {
-            return Err(session_error("Session pending buffer exhausted"));
+            return Err(journal_error("Session pending buffer exhausted"));
         }
         let inflight_events = guard
             .inflight
@@ -1090,7 +1090,7 @@ impl SessionRecorder {
         } else {
             None
         };
-        let event = SessionEvent::new(
+        let event = JournalEvent::new(
             uuid::Uuid::new_v4().to_string(),
             seq,
             chrono::Utc::now().timestamp_millis(),
@@ -1100,7 +1100,7 @@ impl SessionRecorder {
             required,
             payload_json,
         )?;
-        super::SessionEventTypes::validate(&event)?;
+        super::JournalEventTypes::validate(&event)?;
         if let Some((id, result)) = completed {
             guard.completed_tool_results.insert(id, result);
         }
@@ -1164,7 +1164,7 @@ impl SessionRecorder {
                 return Ok(());
             }
             let batch_id = uuid::Uuid::new_v4().to_string();
-            let events: Vec<SessionEvent> = guard.pending.drain(..).collect();
+            let events: Vec<JournalEvent> = guard.pending.drain(..).collect();
             let bytes = guard.pending_bytes;
             guard.pending_bytes = 0;
             let expected = guard.durable_seq;
@@ -1189,7 +1189,7 @@ impl SessionRecorder {
                     .inflight
                     .as_ref()
                     .filter(|inflight| inflight.batch_id == batch)
-                    .ok_or_else(|| session_error("Session commit batch disappeared"))?;
+                    .ok_or_else(|| journal_error("Session commit batch disappeared"))?;
                 (Arc::clone(&inflight.events), inflight.bytes)
             };
             let commit = match self.log.renew(&self.writer, self.lease).await {
@@ -1290,7 +1290,7 @@ impl SessionRecorder {
                         %error,
                         "session commit failed permanently; the run cannot make progress"
                     );
-                    return Err(session_error(format!(
+                    return Err(journal_error(format!(
                         "Failed to commit session prefix: {message}"
                     )));
                 }
@@ -1316,7 +1316,7 @@ impl SessionRecorder {
         }
         let outcome = self
             .log
-            .publish_snapshot(&self.writer, SessionRetention::from_env())
+            .publish_snapshot(&self.writer, JournalRetention::from_env())
             .await;
         let mut state = self.lock();
         state.snapshot_at_ms = now_ms();
@@ -1968,7 +1968,7 @@ fn checkpoint_payload(state: &AgentState, reason: &str) -> crate::error::Result<
     out.extend_from_slice(b"\",\"reason\":\"");
     escape_json_into(&mut out, reason.as_bytes());
     out.extend_from_slice(b"\"}");
-    String::from_utf8(out).map_err(|error| session_error(format!("checkpoint payload: {error}")))
+    String::from_utf8(out).map_err(|error| journal_error(format!("checkpoint payload: {error}")))
 }
 
 /// Extracts tool calls from an event payload (`toolCalls` / `tool_calls`).
@@ -2004,8 +2004,8 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::session::{
-        AtomicSessionStorage, JournalSessionLog, MemorySessionStorage, StorageValue,
+    use crate::journal::{
+        AtomicJournalStorage, AtomicThreadJournal, MemoryJournalStorage, StorageValue,
     };
 
     #[test]
@@ -2021,21 +2021,21 @@ mod tests {
 
     /// Storage that can be told to fail commit writes, to exercise sticky failures.
     struct FailingStorage {
-        inner: MemorySessionStorage,
+        inner: MemoryJournalStorage,
         fail_commits: AtomicBool,
     }
 
     impl FailingStorage {
         fn new() -> Self {
             Self {
-                inner: MemorySessionStorage::new(),
+                inner: MemoryJournalStorage::new(),
                 fail_commits: AtomicBool::new(false),
             }
         }
     }
 
     #[async_trait]
-    impl AtomicSessionStorage for FailingStorage {
+    impl AtomicJournalStorage for FailingStorage {
         async fn read(&self, path: &str) -> crate::error::Result<Option<StorageValue>> {
             self.inner.read(path).await
         }
@@ -2057,13 +2057,13 @@ mod tests {
 
     /// Storage whose head reads can be made to fail, to exercise the open failure path.
     struct HeadFailingStorage {
-        inner: MemorySessionStorage,
+        inner: MemoryJournalStorage,
         /// Head reads still allowed before every further one fails.
         head_reads_left: AtomicUsize,
     }
 
     #[async_trait]
-    impl AtomicSessionStorage for HeadFailingStorage {
+    impl AtomicJournalStorage for HeadFailingStorage {
         async fn read(&self, path: &str) -> crate::error::Result<Option<StorageValue>> {
             if path.ends_with("head.json") {
                 let left = self.head_reads_left.load(Ordering::SeqCst);
@@ -2092,13 +2092,14 @@ mod tests {
         }
     }
 
-    async fn journal() -> (Arc<dyn SessionLog>, Arc<dyn AtomicSessionStorage>) {
-        let storage: Arc<dyn AtomicSessionStorage> = Arc::new(MemorySessionStorage::new());
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(Arc::clone(&storage), "s1"));
+    async fn journal() -> (Arc<dyn ThreadJournal>, Arc<dyn AtomicJournalStorage>) {
+        let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
+        let log: Arc<dyn ThreadJournal> =
+            Arc::new(AtomicThreadJournal::new(Arc::clone(&storage), "s1"));
         (log, storage)
     }
 
-    async fn seed(log: &dyn SessionLog, owner: &str, events: Vec<SessionEvent>) {
+    async fn seed(log: &dyn ThreadJournal, owner: &str, events: Vec<JournalEvent>) {
         let writer = log.acquire(owner, LEASE).await.unwrap();
         log.commit(&writer, "seed", 0, &events).await.unwrap();
         log.release(&writer).await.unwrap();
@@ -2110,8 +2111,8 @@ mod tests {
         run: Option<&str>,
         turn: Option<&str>,
         payload: &str,
-    ) -> SessionEvent {
-        SessionEvent::new(
+    ) -> JournalEvent {
+        JournalEvent::new(
             format!("e{seq}"),
             seq,
             0,
@@ -2131,7 +2132,7 @@ mod tests {
             .build()
     }
 
-    async fn event_types(log: &dyn SessionLog) -> Vec<String> {
+    async fn event_types(log: &dyn ThreadJournal) -> Vec<String> {
         let head = log.head().await.unwrap();
         log.scan(0, head.seq)
             .await
@@ -2155,7 +2156,7 @@ mod tests {
     #[tokio::test]
     async fn start_records_baseline_run_and_input() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let input = vec![Msg::user("hello")];
@@ -2204,7 +2205,7 @@ mod tests {
             (RecordingPolicy::without_request_payloads(), false),
         ] {
             let (log, _storage) = journal().await;
-            let recorder = SessionRecorder::open_with_exporter_and_policy(
+            let recorder = InvocationRecorder::open_with_exporter_and_policy(
                 Arc::clone(&log),
                 Some("t1"),
                 None,
@@ -2266,7 +2267,7 @@ mod tests {
         )
         .await;
 
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         assert!(
@@ -2285,7 +2286,7 @@ mod tests {
     #[tokio::test]
     async fn a_turn_keeps_only_its_newest_checkpoint_payload() {
         let (log, storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let state = crate::state::AgentState::builder().session_id("s1").build();
@@ -2312,7 +2313,7 @@ mod tests {
             1,
             "each checkpoint supersedes the previous one of the same turn"
         );
-        let projection = crate::session::SessionProjection::read(&*log)
+        let projection = crate::journal::JournalProjection::read(&*log)
             .await
             .unwrap();
         let restored = projection
@@ -2331,7 +2332,7 @@ mod tests {
             vec![raw(1, "run/start", Some("run-0"), Some("t1"), "{}")],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let state = crate::state::AgentState::builder().session_id("s1").build();
@@ -2354,12 +2355,12 @@ mod tests {
             ],
         )
         .await;
-        let err = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let err = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Turn already completed"), "{err}");
 
-        let err = SessionRecorder::open_with(Arc::clone(&log), Some("t2"), "run-0", None)
+        let err = InvocationRecorder::open_with(Arc::clone(&log), Some("t2"), "run-0", None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Run ID already used"), "{err}");
@@ -2393,7 +2394,7 @@ mod tests {
             ],
         )
         .await;
-        let err = SessionRecorder::open(Arc::clone(&log), Some("t2"))
+        let err = InvocationRecorder::open(Arc::clone(&log), Some("t2"))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("reconciliation required"), "{err}");
@@ -2405,7 +2406,7 @@ mod tests {
         // as the state is serialized, so the payload must still decode back to the exact same
         // state — this is the crash-recovery path.
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let control = char::from_u32(1).unwrap();
@@ -2435,7 +2436,7 @@ mod tests {
         );
 
         // The fold through the journal must reach the same state, escaped payload and all.
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert_eq!(projection.restore().unwrap().expect("restored"), state);
         recorder.close().await;
     }
@@ -2443,7 +2444,7 @@ mod tests {
     #[tokio::test]
     async fn stats_are_recorded_once_per_message() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let user = Msg::user("hello");
@@ -2472,7 +2473,7 @@ mod tests {
     #[tokio::test]
     async fn a_shrinking_history_records_context_replacement() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let first = Msg::user("first");
@@ -2505,7 +2506,7 @@ mod tests {
     #[tokio::test]
     async fn finish_writes_terminal_facts_and_releases_the_lease() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let state = state_with(Msg::user("hello"));
@@ -2531,7 +2532,7 @@ mod tests {
         // context, so the checkpoint taken at cancellation would carry an assistant `tool_use`
         // with no result and a resume would re-execute the tool that already succeeded.
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let mut state = state_with(
@@ -2590,7 +2591,7 @@ mod tests {
             live,
             "only the snapshot is supplemented"
         );
-        let projection = SessionProjection::read(&*log).await.unwrap();
+        let projection = JournalProjection::read(&*log).await.unwrap();
         assert_eq!(
             projection
                 .uncertain_tool_calls
@@ -2615,7 +2616,7 @@ mod tests {
     #[tokio::test]
     async fn interruption_finishes_the_turn_as_interrupted() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let state = state_with(Msg::user("hello"));
@@ -2627,11 +2628,11 @@ mod tests {
     #[tokio::test]
     async fn a_failed_commit_is_sticky_and_never_reports_success() {
         let storage = Arc::new(FailingStorage::new());
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(
-            Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
+        let log: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(
+            Arc::clone(&storage) as Arc<dyn AtomicJournalStorage>,
             "s1",
         ));
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         storage.fail_commits.store(true, Ordering::SeqCst);
@@ -2654,7 +2655,7 @@ mod tests {
     #[tokio::test]
     async fn a_batch_is_rebased_when_the_committed_prefix_moved() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         recorder
@@ -2696,12 +2697,12 @@ mod tests {
     #[tokio::test]
     async fn a_transient_commit_failure_is_retried_and_does_not_poison_the_recorder() {
         struct FlakyStorage {
-            inner: MemorySessionStorage,
+            inner: MemoryJournalStorage,
             failures_left: std::sync::atomic::AtomicUsize,
         }
 
         #[async_trait]
-        impl AtomicSessionStorage for FlakyStorage {
+        impl AtomicJournalStorage for FlakyStorage {
             async fn read(&self, path: &str) -> crate::error::Result<Option<StorageValue>> {
                 self.inner.read(path).await
             }
@@ -2731,14 +2732,14 @@ mod tests {
         }
 
         let storage = Arc::new(FlakyStorage {
-            inner: MemorySessionStorage::new(),
+            inner: MemoryJournalStorage::new(),
             failures_left: std::sync::atomic::AtomicUsize::new(1),
         });
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(
-            Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
+        let log: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(
+            Arc::clone(&storage) as Arc<dyn AtomicJournalStorage>,
             "s1",
         ));
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
 
@@ -2771,7 +2772,7 @@ mod tests {
             &writer,
             "batch",
             0,
-            &[SessionEvent::new(
+            &[JournalEvent::new(
                 "e1",
                 1,
                 0,
@@ -2794,7 +2795,7 @@ mod tests {
         // commit returned, so an event appended while storage was awaiting was silently lost
         // (its sequence number was also reused by the next append).
         struct GatedStorage {
-            inner: MemorySessionStorage,
+            inner: MemoryJournalStorage,
             /// Whether the next commit write should pause inside storage.
             gate_next_commit: AtomicBool,
             entered: tokio::sync::Notify,
@@ -2802,7 +2803,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl AtomicSessionStorage for GatedStorage {
+        impl AtomicJournalStorage for GatedStorage {
             async fn read(&self, path: &str) -> crate::error::Result<Option<StorageValue>> {
                 self.inner.read(path).await
             }
@@ -2825,17 +2826,17 @@ mod tests {
         }
 
         let storage = Arc::new(GatedStorage {
-            inner: MemorySessionStorage::new(),
+            inner: MemoryJournalStorage::new(),
             gate_next_commit: AtomicBool::new(true),
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(
-            Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
+        let log: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(
+            Arc::clone(&storage) as Arc<dyn AtomicJournalStorage>,
             "s1",
         ));
         let recorder = Arc::new(
-            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            InvocationRecorder::open(Arc::clone(&log), Some("t1"))
                 .await
                 .unwrap(),
         );
@@ -2886,7 +2887,7 @@ mod tests {
                 &writer,
                 "b1",
                 0,
-                &[SessionEvent::new(
+                &[JournalEvent::new(
                     "e1",
                     1,
                     0,
@@ -2907,7 +2908,7 @@ mod tests {
     #[tokio::test]
     async fn closing_twice_is_idempotent() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         recorder.close().await;
@@ -2923,7 +2924,7 @@ mod tests {
         let (log, _storage) = journal().await;
         let lease = Duration::from_millis(200);
         let recorder =
-            SessionRecorder::open_with_lease(Arc::clone(&log), Some("t1"), "run-1", None, lease)
+            InvocationRecorder::open_with_lease(Arc::clone(&log), Some("t1"), "run-1", None, lease)
                 .await
                 .unwrap();
 
@@ -2946,7 +2947,7 @@ mod tests {
         let (log, _storage) = journal().await;
         let lease = Duration::from_millis(200);
         let recorder =
-            SessionRecorder::open_with_lease(Arc::clone(&log), Some("t1"), "run-1", None, lease)
+            InvocationRecorder::open_with_lease(Arc::clone(&log), Some("t1"), "run-1", None, lease)
                 .await
                 .unwrap();
         recorder.close().await;
@@ -2965,7 +2966,7 @@ mod tests {
         // Without a snapshot, every cold start replays the whole chain. The recorder publishes
         // one on its own once enough facts are committed, and reports where it landed.
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         assert_eq!(recorder.metrics().snapshot_seq, 0);
@@ -2998,18 +2999,18 @@ mod tests {
         // in the snapshot's own record.
         let (log, _storage) = journal().await;
         let writer = log.acquire("run-1", LEASE).await.unwrap();
-        let events: Vec<SessionEvent> = (1..=2)
+        let events: Vec<JournalEvent> = (1..=2)
             .map(|seq| raw(seq, "run/start", Some("run-1"), Some("t1"), "{}"))
             .collect();
         log.commit(&writer, "seed", 0, &events).await.unwrap();
-        log.publish_snapshot(&writer, SessionRetention::OFF)
+        log.publish_snapshot(&writer, JournalRetention::OFF)
             .await
             .unwrap();
         // The recorder has to take the lease, so the seeding writer releases it first.
         log.release(&writer).await.unwrap();
 
         let err =
-            SessionRecorder::open_with_lease(Arc::clone(&log), Some("t1"), "run-1", None, LEASE)
+            InvocationRecorder::open_with_lease(Arc::clone(&log), Some("t1"), "run-1", None, LEASE)
                 .await
                 .err()
                 .expect("a reused run id must still be rejected");
@@ -3028,7 +3029,7 @@ mod tests {
             vec![raw(1, "run/start", Some("run-0"), Some("t0"), "{}")],
         )
         .await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
 
@@ -3056,16 +3057,16 @@ mod tests {
         // releasing it, so the session stayed owned by a run that never existed for a whole
         // lease — every following turn waited for it.
         let storage = Arc::new(HeadFailingStorage {
-            inner: MemorySessionStorage::new(),
+            inner: MemoryJournalStorage::new(),
             // `acquire` reads the head once; the recorder's own head read then fails.
             head_reads_left: AtomicUsize::new(1),
         });
-        let log: Arc<dyn SessionLog> = Arc::new(JournalSessionLog::new(
-            Arc::clone(&storage) as Arc<dyn AtomicSessionStorage>,
+        let log: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(
+            Arc::clone(&storage) as Arc<dyn AtomicJournalStorage>,
             "s1",
         ));
 
-        let error = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let error = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .expect_err("the failing head read must fail the open");
         assert!(error.to_string().contains("head read failed"), "{error}");
@@ -3079,22 +3080,22 @@ mod tests {
     async fn recorder_is_reachable_through_the_runtime_context() {
         let (log, _storage) = journal().await;
         let recorder = Arc::new(
-            SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            InvocationRecorder::open(Arc::clone(&log), Some("t1"))
                 .await
                 .unwrap(),
         );
         let context = crate::agent::RuntimeContext::new()
             .with_extension_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
-        let found = SessionRecorder::from_context(&context).expect("recorder attached");
+        let found = InvocationRecorder::from_context(&context).expect("recorder attached");
         assert_eq!(found.turn_id(), "t1");
-        assert!(SessionRecorder::from_context(&crate::agent::RuntimeContext::new()).is_none());
+        assert!(InvocationRecorder::from_context(&crate::agent::RuntimeContext::new()).is_none());
         recorder.close().await;
     }
 
     #[tokio::test]
     async fn observe_records_interaction_requests_and_resolutions() {
         let (log, _storage) = journal().await;
-        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
             .await
             .unwrap();
         let call = crate::message::ToolUseBlock::new("call-1", "create_order", Default::default());

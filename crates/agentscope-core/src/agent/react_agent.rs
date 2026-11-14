@@ -18,6 +18,7 @@ use super::agent_traits::{Agent, CallableAgent, ObservableAgent};
 use super::lifecycle::{CallGate, ExecutionGuard};
 use super::runtime_context::MODEL_ID_CONTEXT_KEY;
 use super::stream_options::StreamOptions;
+use super::ThreadKey;
 use crate::agent::run::{
     AgentRun, CancelSignal, RunControl, RunStatus, CANCEL_SIGNAL_CONTEXT_KEY,
     RUN_CONTROL_CONTEXT_KEY,
@@ -26,6 +27,11 @@ use crate::error::{Error, Result};
 use crate::event::{AgentEvent, AgentEventType, ConfirmResult, EventData};
 use crate::formatter::{JsonSchema, ResponseFormat};
 use crate::interruption::InterruptControl;
+use crate::journal::{
+    outcome, InvocationRecorder, JournalExportSinkHandle, RecordedModels, SessionExecution,
+    SessionHistoryMode, ThreadJournal, ThreadJournalStore, JOURNAL_EXPORT_SINK_CONTEXT_KEY,
+    RECORDER_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
+};
 use crate::message::{
     ChatUsage, ContentBlock, GenerateReason, JsonMap, Msg, MsgRole, TextBlock, ThinkingBlock,
     ToolResultBlock, ToolResultState, ToolUseBlock,
@@ -38,11 +44,6 @@ use crate::model::{ExecutionConfig, GenerateOptions, Model, ModelUtils};
 use crate::permission::{
     PermissionBehavior, PermissionContextState, PermissionDecision, PermissionEngine,
     PermissionRule,
-};
-use crate::session::{
-    outcome, SessionExecution, SessionExportSinkHandle, SessionHistoryMode, SessionKey, SessionLog,
-    SessionLogStore, SessionModels, SessionRecorder, RECORDER_CONTEXT_KEY,
-    SESSION_EXPORT_SINK_CONTEXT_KEY, TURN_ID_CONTEXT_KEY,
 };
 use crate::state::context::TaskContextState;
 use crate::state::AgentState;
@@ -147,10 +148,10 @@ struct AgentCore {
     /// `validateStructuredOutput`.
     validate_structured_output: bool,
     /// Native session journal backend. When set together with
-    /// [`SessionHistoryMode::EventLog`], every call owns a [`SessionRecorder`] and
+    /// [`SessionHistoryMode::EventLog`], every call owns a [`InvocationRecorder`] and
     /// history is reconstructed from committed events instead of a state store.
     /// Mirrors Java `ReActAgent.sessionLogStore`.
-    session_log_store: Option<Arc<dyn SessionLogStore>>,
+    session_log_store: Option<Arc<dyn ThreadJournalStore>>,
     /// Agent id used inside the native journal key. Mirrors Java
     /// `sessionLogAgentId` (defaults to the agent name/id).
     session_log_agent_id: String,
@@ -158,7 +159,7 @@ struct AgentCore {
     /// Mirrors Java `ReActAgent.sessionHistoryMode` (default `EVENT_LOG`).
     session_history_mode: SessionHistoryMode,
     /// What a recorder this agent opens itself journals per model call.
-    recording_policy: crate::session::RecordingPolicy,
+    recording_policy: crate::journal::RecordingPolicy,
     /// Tool-result metadata keys that exist only for the event stream.
     ///
     /// A transport may attach render-only payload to a result (for example the ACP file
@@ -184,7 +185,7 @@ struct RunGuard {
     /// The journal this call owns, if any. Released (not finished) on the disposal path:
     /// the terminal facts of an aborted run are the recovery path's business, and writing
     /// them twice would duplicate the `run/end` event.
-    journal: Arc<Mutex<Option<Arc<SessionRecorder>>>>,
+    journal: Arc<Mutex<Option<Arc<InvocationRecorder>>>>,
 }
 
 impl Drop for RunGuard {
@@ -481,7 +482,7 @@ impl ReActAgent {
     /// the agent state. Both [`ReActAgent::session_key`] and the recorder created during a call
     /// resolve through this one function, so a caller reading the journal can never address a
     /// different session than the one the call wrote.
-    pub fn session_key(&self, context: &crate::agent::RuntimeContext) -> Option<SessionKey> {
+    pub fn session_key(&self, context: &crate::agent::RuntimeContext) -> Option<ThreadKey> {
         self.core.session_log_store.as_ref()?;
         let state = self.core.state.lock().unwrap();
         let session_id = context.session_id().map(str::to_string).or_else(|| {
@@ -496,21 +497,21 @@ impl ReActAgent {
             .user_id()
             .map(str::to_string)
             .or_else(|| state.user_id().map(str::to_string));
-        SessionKey::new(user_id, self.core.session_log_agent_id.clone(), session_id).ok()
+        ThreadKey::new(user_id, self.core.session_log_agent_id.clone(), session_id).ok()
     }
 
     /// Opens the journal for `context`. Mirrors Java `ReActAgent.sessionLog(RuntimeContext)`.
     pub async fn session_log(
         &self,
         context: &crate::agent::RuntimeContext,
-    ) -> Result<Arc<dyn SessionLog>> {
+    ) -> Result<Arc<dyn ThreadJournal>> {
         let store = self
             .core
             .session_log_store
             .as_ref()
-            .ok_or_else(|| Error::Session("session log is not configured".into()))?;
+            .ok_or_else(|| Error::Journal("journal is not configured".into()))?;
         let key = self.session_key(context).ok_or_else(|| {
-            Error::Session("session identity is incomplete (missing session id)".into())
+            Error::Journal("session identity is incomplete (missing session id)".into())
         })?;
         store.open(&key, context).await
     }
@@ -747,7 +748,7 @@ impl ReActAgent {
     /// Runs one call, merging caller-supplied per-run services into the call context.
     ///
     /// When native committed history is enabled and the caller did **not** already attach a
-    /// [`SessionRecorder`], this call owns one for its lifetime: it is opened inside the
+    /// [`InvocationRecorder`], this call owns one for its lifetime: it is opened inside the
     /// per-session gate, attached to the runtime context (so `observe`, tools and middlewares
     /// see it), and finished when the call ends. This is the Rust equivalent of Java
     /// `ReActAgent.acquireCallExecution`, which is why a bare `HarnessAgent::call` journals
@@ -776,7 +777,7 @@ impl ReActAgent {
         // The journal handle is shared with the drop guard: when the call's future is dropped
         // (timeout, abort, lost lease) the guard releases the writer lease instead of leaving
         // the session blocked.
-        let journal_slot: Arc<Mutex<Option<Arc<SessionRecorder>>>> = Arc::new(Mutex::new(None));
+        let journal_slot: Arc<Mutex<Option<Arc<InvocationRecorder>>>> = Arc::new(Mutex::new(None));
         let _run_guard = RunGuard {
             core: Arc::clone(&self.core),
             run: Arc::clone(&run),
@@ -889,7 +890,7 @@ impl ReActAgent {
     async fn open_owned_recorder(
         &self,
         extensions: &mut crate::agent::Extensions,
-    ) -> Result<Option<Arc<SessionRecorder>>> {
+    ) -> Result<Option<Arc<InvocationRecorder>>> {
         if !self.session_log_enabled() {
             return Ok(None);
         }
@@ -911,20 +912,20 @@ impl ReActAgent {
         };
         let log = store.open(&key, &context).await?;
         // A host opts into committed-event export by installing a sink in the run's
-        // extensions (Java `SessionExportSink.CONTEXT_KEY`). Without one this is byte-for-byte
+        // extensions (Java `JournalExportSink.CONTEXT_KEY`). Without one this is byte-for-byte
         // the previous path: no exporter, no extra work.
         let sink = extensions
-            .get::<SessionExportSinkHandle>(SESSION_EXPORT_SINK_CONTEXT_KEY)
+            .get::<JournalExportSinkHandle>(JOURNAL_EXPORT_SINK_CONTEXT_KEY)
             .or_else(|| {
                 self.core
                     .extensions
-                    .get::<SessionExportSinkHandle>(SESSION_EXPORT_SINK_CONTEXT_KEY)
+                    .get::<JournalExportSinkHandle>(JOURNAL_EXPORT_SINK_CONTEXT_KEY)
             });
         let exporter = sink.map(|handle| {
             Arc::new(handle.exporter_for_session(Arc::clone(&log), key.session_id.clone()))
         });
         let recorder = Arc::new(
-            SessionRecorder::open_with_exporter_and_policy(
+            InvocationRecorder::open_with_exporter_and_policy(
                 log,
                 turn_id.as_deref(),
                 exporter,
@@ -940,7 +941,7 @@ impl ReActAgent {
     ///
     /// Delegates to [`ReActAgent::session_key`] with an empty context so the call path and any
     /// reader share one resolution rule.
-    fn state_session_key(&self) -> Option<SessionKey> {
+    fn state_session_key(&self) -> Option<ThreadKey> {
         self.session_key(&crate::agent::RuntimeContext::new())
     }
 
@@ -1042,7 +1043,7 @@ impl ReActAgent {
         // that asks to stop "run X" compares against an id nobody else has seen and the
         // signal is silently dropped.
         let recorded_run_id = extensions
-            .get::<SessionRecorder>(RECORDER_CONTEXT_KEY)
+            .get::<InvocationRecorder>(RECORDER_CONTEXT_KEY)
             .map(|recorder| recorder.run_id().to_string());
         let run = match extensions.get::<RunControl>(RUN_CONTROL_CONTEXT_KEY) {
             Some(run) => run,
@@ -1519,10 +1520,10 @@ pub struct ReActAgentBuilder {
     confirm_handler: Option<ConfirmHandler>,
     validate_structured_output: bool,
     extensions: crate::agent::Extensions,
-    session_log_store: Option<Arc<dyn SessionLogStore>>,
+    session_log_store: Option<Arc<dyn ThreadJournalStore>>,
     session_log_agent_id: Option<String>,
     session_history_mode: SessionHistoryMode,
-    recording_policy: crate::session::RecordingPolicy,
+    recording_policy: crate::journal::RecordingPolicy,
     event_only_tool_metadata: Vec<String>,
     model_resolver: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn Model>> + Send + Sync>>,
     capability_resolver: Option<Arc<dyn crate::agent::CapabilityResolver>>,
@@ -1553,7 +1554,7 @@ impl Default for ReActAgentBuilder {
             session_log_store: None,
             session_log_agent_id: None,
             session_history_mode: SessionHistoryMode::EventLog,
-            recording_policy: crate::session::RecordingPolicy::default(),
+            recording_policy: crate::journal::RecordingPolicy::default(),
             event_only_tool_metadata: Vec::new(),
             model_resolver: None,
             capability_resolver: None,
@@ -1728,7 +1729,7 @@ impl ReActAgentBuilder {
     ///
     /// Setting a store enables journal-backed history (the default mode). Without one the
     /// agent keeps no journal and history is whatever the caller persists.
-    pub fn session_log_store(mut self, store: Arc<dyn SessionLogStore>) -> Self {
+    pub fn session_log_store(mut self, store: Arc<dyn ThreadJournalStore>) -> Self {
         self.session_log_store = Some(store);
         self
     }
@@ -1752,7 +1753,7 @@ impl ReActAgentBuilder {
     /// Hosts that attach a recorder through the runtime context (the session scheduler) set
     /// this on their own recorder instead; the policy must match on both paths so the switch
     /// means one thing.
-    pub fn recording_policy(mut self, policy: crate::session::RecordingPolicy) -> Self {
+    pub fn recording_policy(mut self, policy: crate::journal::RecordingPolicy) -> Self {
         self.recording_policy = policy;
         self
     }
@@ -2036,7 +2037,7 @@ async fn session_continues(
     }
     let (Some(execution), Some(recorder)) = (
         SessionExecution::from_context(ctx),
-        SessionRecorder::from_context(ctx),
+        InvocationRecorder::from_context(ctx),
     ) else {
         return Ok(false);
     };
@@ -2355,7 +2356,7 @@ async fn reasoning_phase(
     // guidance accepted while the previous step was running reaches this one instead of
     // waiting for the turn to end. A persistence failure propagates: a step that never reached
     // the journal must not look like one that did.
-    if let Some(recorder) = SessionRecorder::from_context(ctx) {
+    if let Some(recorder) = InvocationRecorder::from_context(ctx) {
         recorder.step(iter.max(0) as usize)?;
         if let Some(execution) = SessionExecution::from_context(ctx) {
             execution.before_step(&recorder, state).await?;
@@ -2700,10 +2701,10 @@ async fn run_reasoning(
         let ctx = ctx.clone();
         let model = Arc::clone(&model);
         Box::new(move |r: ReasoningInput| -> EventStream {
-            // Journal the final adapter boundary (Java `SessionModels.wrap`): with a recorder
+            // Journal the final adapter boundary (Java `RecordedModels.wrap`): with a recorder
             // attached to `ctx`, each dispatch records
             // request/prepared → model/dispatch → model/chunk… → model/end.
-            let model = SessionModels::wrap(Arc::clone(&model), &ctx, "REASONING");
+            let model = RecordedModels::wrap(Arc::clone(&model), &ctx, "REASONING");
             // Java keeps exactly one system message at the head of every request:
             // `PreReasoningEvent` hooks may append to it but cannot inject additional
             // SYSTEM entries into `inputMessages`. Normalise here so a third-party
@@ -3552,7 +3553,7 @@ async fn acting_phase(
     // that carries the tool calls *before* running them, and record every dispatch as an
     // uncertain outcome. A later recovery then reconciles them as interrupted instead of
     // re-executing or silently dropping the call.
-    if let Some(recorder) = SessionRecorder::from_context(ctx) {
+    if let Some(recorder) = InvocationRecorder::from_context(ctx) {
         recorder
             .checkpoint_now(state, "before_acting")
             .await
@@ -3701,7 +3702,7 @@ async fn acting_phase(
     // Persist the settled tool results immediately. Waiting for the next `before_model`
     // checkpoint leaves the whole settle window unprotected: a crash in between replays
     // every `tool/dispatch` as uncertain even though the tools already ran and returned.
-    if let Some(recorder) = SessionRecorder::from_context(ctx) {
+    if let Some(recorder) = InvocationRecorder::from_context(ctx) {
         recorder
             .checkpoint_now(state, "after_acting")
             .await
@@ -5226,12 +5227,12 @@ mod tests {
     /// Poking `acting_phase` internals would hide a missing builder/context plumbing step.
     #[tokio::test]
     async fn tool_execution_records_action_facts_through_the_real_agent_entry() {
-        let storage: Arc<dyn crate::session::AtomicSessionStorage> =
-            Arc::new(crate::session::MemorySessionStorage::new());
-        let log: Arc<dyn crate::session::SessionLog> =
-            Arc::new(crate::session::JournalSessionLog::new(storage, "s1"));
+        let storage: Arc<dyn crate::journal::AtomicJournalStorage> =
+            Arc::new(crate::journal::MemoryJournalStorage::new());
+        let log: Arc<dyn crate::journal::ThreadJournal> =
+            Arc::new(crate::journal::AtomicThreadJournal::new(storage, "s1"));
         let recorder = Arc::new(
-            crate::session::SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            crate::journal::InvocationRecorder::open(Arc::clone(&log), Some("t1"))
                 .await
                 .unwrap(),
         );
@@ -5252,7 +5253,7 @@ mod tests {
             .name("t-action")
             .model(model)
             .toolkit(toolkit)
-            .extension_arc(crate::session::RECORDER_CONTEXT_KEY, Arc::clone(&recorder))
+            .extension_arc(crate::journal::RECORDER_CONTEXT_KEY, Arc::clone(&recorder))
             .build()
             .unwrap();
         agent.call(vec![Msg::user("compute")]).await.unwrap();
@@ -5396,7 +5397,7 @@ mod tests {
     async fn call_owns_a_recorder_and_commits_the_turn() {
         // Java `ReActAgent.acquireCallExecution`: the call itself opens the recorder, so a
         // bare `ReActAgent::call` journals without any host-side `AgentSession`.
-        let store = Arc::new(crate::session::InMemorySessionLogStore::new());
+        let store = Arc::new(crate::journal::InMemoryThreadJournalStore::new());
         let model = Arc::new(MockModel::new("mock", vec![text_response("journaled")]));
         let agent = ReActAgent::builder()
             .name("t-journal")
@@ -5407,7 +5408,7 @@ mod tests {
                     .user_id("alice")
                     .build(),
             )
-            .session_log_store(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .session_log_store(Arc::clone(&store) as Arc<dyn ThreadJournalStore>)
             .build()
             .unwrap();
         assert!(agent.session_log_enabled());
@@ -5444,7 +5445,7 @@ mod tests {
         // The journal allows one execution writer. When a host (harness `AgentSession`)
         // already attached a recorder, the call must reuse it — opening a second one would
         // fail with a lease/duplicate-run error, so success here *is* the assertion.
-        let store = Arc::new(crate::session::InMemorySessionLogStore::new());
+        let store = Arc::new(crate::journal::InMemoryThreadJournalStore::new());
         let model = Arc::new(MockModel::new("mock", vec![text_response("journaled")]));
         let agent = ReActAgent::builder()
             .name("t-journal")
@@ -5455,14 +5456,18 @@ mod tests {
                     .user_id("alice")
                     .build(),
             )
-            .session_log_store(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .session_log_store(Arc::clone(&store) as Arc<dyn ThreadJournalStore>)
             .build()
             .unwrap();
 
         let ctx = crate::agent::RuntimeContext::new();
         let key = agent.state_session_key().expect("journal key");
         let log = store.open(&key, &ctx).await.unwrap();
-        let recorder = Arc::new(SessionRecorder::open(log, Some("turn-host")).await.unwrap());
+        let recorder = Arc::new(
+            InvocationRecorder::open(log, Some("turn-host"))
+                .await
+                .unwrap(),
+        );
         let mut extensions = crate::agent::Extensions::new();
         extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
 
@@ -10301,15 +10306,15 @@ mod tests {
     #[tokio::test]
     async fn an_unnamed_agent_falls_back_to_its_agent_id_for_the_session_identity() {
         // Java `d30a6c92f`: without a usable name the journal identity used to be built from a
-        // blank name, which `SessionKey` rejects — the session journal was silently disabled.
-        let store = Arc::new(crate::session::InMemorySessionLogStore::new());
+        // blank name, which `ThreadKey` rejects — the session journal was silently disabled.
+        let store = Arc::new(crate::journal::InMemoryThreadJournalStore::new());
         let model = Arc::new(MockModel::new("mock", vec![text_response("journaled")]));
         let agent = ReActAgent::builder()
             .id("agent-unnamed")
             .name("   ")
             .model(model)
             .state(AgentState::builder().session_id("s-unnamed").build())
-            .session_log_store(Arc::clone(&store) as Arc<dyn SessionLogStore>)
+            .session_log_store(Arc::clone(&store) as Arc<dyn ThreadJournalStore>)
             .build()
             .unwrap();
 

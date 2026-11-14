@@ -1,19 +1,19 @@
-//! Immutable session facts, mirroring `SessionEvent`, `SessionEventTypes` and
-//! `SessionEventCodecRegistry`.
+//! Immutable session facts, mirroring `JournalEvent`, `JournalEventTypes` and
+//! `JournalEventCodecRegistry`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-use super::session_error;
+use super::journal_error;
 use crate::state::AgentState;
 
 /// An immutable native fact. Payload is JSON captured at acceptance, never a mutable
 /// message reference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionEvent {
+pub struct JournalEvent {
     pub schema_version: i32,
     pub event_id: String,
     pub seq: u64,
@@ -28,7 +28,11 @@ pub struct SessionEvent {
     pub payload_json: String,
 }
 
-impl SessionEvent {
+impl JournalEvent {
+    /// The only accepted envelope version. Version 1 is rejected: there is no reader for the
+    /// pre-journal envelope, matching the Java `journal-event-v2` contract.
+    pub const SCHEMA_VERSION: i32 = 2;
+
     /// Creates an event, validating the envelope and that the payload is JSON.
     pub fn new(
         event_id: impl Into<String>,
@@ -41,7 +45,7 @@ impl SessionEvent {
         payload_json: impl Into<String>,
     ) -> crate::error::Result<Self> {
         let event = Self {
-            schema_version: 1,
+            schema_version: Self::SCHEMA_VERSION,
             event_id: event_id.into(),
             seq,
             occurred_at,
@@ -79,14 +83,14 @@ impl SessionEvent {
     }
 
     fn validate_envelope(&self) -> crate::error::Result<()> {
-        if self.schema_version != 1 || self.seq < 1 {
-            return Err(session_error("Unsupported event envelope"));
+        if self.schema_version != Self::SCHEMA_VERSION || self.seq < 1 {
+            return Err(journal_error("Unsupported event envelope"));
         }
         if self.event_id.is_empty() {
-            return Err(session_error("Session event requires an id"));
+            return Err(journal_error("Session event requires an id"));
         }
         if self.event_type.is_empty() {
-            return Err(session_error("Session event requires a type"));
+            return Err(journal_error("Session event requires a type"));
         }
         serde_json::from_str::<serde_json::Value>(&self.payload_json)?;
         Ok(())
@@ -104,9 +108,9 @@ impl SessionEvent {
 }
 
 /// Native schema v1 event type names.
-pub struct SessionEventTypes;
+pub struct JournalEventTypes;
 
-impl SessionEventTypes {
+impl JournalEventTypes {
     /// Every built-in event type, in schema order.
     pub const BUILTIN: [&'static str; 57] = [
         "run/start",
@@ -174,13 +178,13 @@ impl SessionEventTypes {
     }
 
     /// Validates an event against the default codec registry.
-    pub fn validate(event: &SessionEvent) -> crate::error::Result<()> {
-        SessionEventCodecRegistry::default_registry().validate(event)
+    pub fn validate(event: &JournalEvent) -> crate::error::Result<()> {
+        JournalEventCodecRegistry::default_registry().validate(event)
     }
 }
 
 /// An explicit extension schema for a non-reserved, namespaced event type.
-pub trait SessionEventCodec: Send + Sync {
+pub trait JournalEventCodec: Send + Sync {
     /// Validates the payload; an invalid payload must stop recovery.
     fn validate(&self, data: &serde_json::Value) -> crate::error::Result<()>;
 
@@ -190,41 +194,41 @@ pub trait SessionEventCodec: Send + Sync {
 
 /// Registry of extension codecs. Required unknown versions/types always stop recovery.
 #[derive(Default)]
-pub struct SessionEventCodecRegistry {
-    extensions: RwLock<HashMap<String, Arc<dyn SessionEventCodec>>>,
+pub struct JournalEventCodecRegistry {
+    extensions: RwLock<HashMap<String, Arc<dyn JournalEventCodec>>>,
 }
 
-impl std::fmt::Debug for SessionEventCodecRegistry {
+impl std::fmt::Debug for JournalEventCodecRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let count = self.extensions.read().map(|m| m.len()).unwrap_or(0);
-        f.debug_struct("SessionEventCodecRegistry")
+        f.debug_struct("JournalEventCodecRegistry")
             .field("extensions", &count)
             .finish()
     }
 }
 
-impl SessionEventCodecRegistry {
+impl JournalEventCodecRegistry {
     /// The process-wide registry used by recovery.
-    pub fn default_registry() -> &'static SessionEventCodecRegistry {
-        static DEFAULT: OnceLock<SessionEventCodecRegistry> = OnceLock::new();
-        DEFAULT.get_or_init(SessionEventCodecRegistry::default)
+    pub fn default_registry() -> &'static JournalEventCodecRegistry {
+        static DEFAULT: OnceLock<JournalEventCodecRegistry> = OnceLock::new();
+        DEFAULT.get_or_init(JournalEventCodecRegistry::default)
     }
 
     /// Registers a codec for a non-reserved, namespaced event type.
     pub fn register(
         &self,
         event_type: &str,
-        codec: Arc<dyn SessionEventCodec>,
+        codec: Arc<dyn JournalEventCodec>,
     ) -> crate::error::Result<()> {
-        if !event_type.contains('/') || SessionEventTypes::is_builtin(event_type) {
-            return Err(session_error("Use a non-reserved namespaced event type"));
+        if !event_type.contains('/') || JournalEventTypes::is_builtin(event_type) {
+            return Err(journal_error("Use a non-reserved namespaced event type"));
         }
         let mut guard = self
             .extensions
             .write()
-            .map_err(|_| session_error("Codec registry lock poisoned"))?;
+            .map_err(|_| journal_error("Codec registry lock poisoned"))?;
         if guard.contains_key(event_type) {
-            return Err(session_error(format!(
+            return Err(journal_error(format!(
                 "Event codec already registered: {event_type}"
             )));
         }
@@ -240,7 +244,7 @@ impl SessionEventCodecRegistry {
             .unwrap_or(false)
     }
 
-    fn get(&self, event_type: &str) -> Option<Arc<dyn SessionEventCodec>> {
+    fn get(&self, event_type: &str) -> Option<Arc<dyn JournalEventCodec>> {
         self.extensions
             .read()
             .ok()
@@ -248,12 +252,12 @@ impl SessionEventCodecRegistry {
     }
 
     /// Validates a registered extension payload; unknown *required* types are rejected.
-    pub fn validate(&self, event: &SessionEvent) -> crate::error::Result<()> {
+    pub fn validate(&self, event: &JournalEvent) -> crate::error::Result<()> {
         if let Some(codec) = self.get(&event.event_type) {
             return codec.validate(&event.data()?);
         }
-        if event.required && !SessionEventTypes::is_builtin(&event.event_type) {
-            return Err(session_error(format!(
+        if event.required && !JournalEventTypes::is_builtin(&event.event_type) {
+            return Err(journal_error(format!(
                 "Unknown required event: {}",
                 event.event_type
             )));
@@ -265,7 +269,7 @@ impl SessionEventCodecRegistry {
     pub fn apply_extension(
         &self,
         state: &mut AgentState,
-        event: &SessionEvent,
+        event: &JournalEvent,
     ) -> crate::error::Result<()> {
         match self.get(&event.event_type) {
             Some(codec) => codec.apply(state, &event.data()?),
@@ -278,8 +282,8 @@ impl SessionEventCodecRegistry {
 mod tests {
     use super::*;
 
-    fn event(event_type: &str, required: bool) -> SessionEvent {
-        SessionEvent::new("e1", 1, 0, event_type, None, None, required, "{}").unwrap()
+    fn event(event_type: &str, required: bool) -> JournalEvent {
+        JournalEvent::new("e1", 1, 0, event_type, None, None, required, "{}").unwrap()
     }
 
     #[test]
@@ -287,24 +291,24 @@ mod tests {
         let ev = event("run/start", true);
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "run/start");
-        assert_eq!(json["schemaVersion"], 1);
+        assert_eq!(json["schemaVersion"], 2);
         assert_eq!(json["payloadJson"], "{}");
         assert!(json.get("turnId").is_none(), "absent ids stay omitted");
-        let back: SessionEvent = serde_json::from_value(json).unwrap();
+        let back: JournalEvent = serde_json::from_value(json).unwrap();
         assert_eq!(back, ev);
     }
 
     #[test]
     fn envelope_rejects_bad_schema_seq_and_payload() {
         let mut ev = event("run/start", true);
-        ev.schema_version = 2;
+        ev.schema_version = 1;
         assert!(ev.validate_envelope().is_err());
 
         let mut ev = event("run/start", true);
         ev.seq = 0;
         assert!(ev.validate_envelope().is_err());
 
-        assert!(SessionEvent::new("e1", 1, 0, "run/start", None, None, true, "{oops").is_err());
+        assert!(JournalEvent::new("e1", 1, 0, "run/start", None, None, true, "{oops").is_err());
     }
 
     #[test]
@@ -315,17 +319,17 @@ mod tests {
             "inbox/accepted",
             "state/checkpoint",
         ] {
-            assert!(SessionEventTypes::is_builtin(name), "{name}");
+            assert!(JournalEventTypes::is_builtin(name), "{name}");
         }
-        assert!(!SessionEventTypes::is_builtin("extension/custom"));
+        assert!(!JournalEventTypes::is_builtin("extension/custom"));
     }
 
     struct EchoCodec;
 
-    impl SessionEventCodec for EchoCodec {
+    impl JournalEventCodec for EchoCodec {
         fn validate(&self, data: &serde_json::Value) -> crate::error::Result<()> {
             if data.get("ok").is_none() {
-                return Err(session_error("missing ok"));
+                return Err(journal_error("missing ok"));
             }
             Ok(())
         }
@@ -342,7 +346,7 @@ mod tests {
 
     #[test]
     fn extension_codecs_validate_apply_and_reject_reserved_types() {
-        let registry = SessionEventCodecRegistry::default();
+        let registry = JournalEventCodecRegistry::default();
         registry
             .register("extension/echo", Arc::new(EchoCodec))
             .unwrap();
@@ -354,7 +358,7 @@ mod tests {
         assert!(registry.register("run/start", Arc::new(EchoCodec)).is_err());
         assert!(registry.register("noslash", Arc::new(EchoCodec)).is_err());
 
-        let good = SessionEvent::new(
+        let good = JournalEvent::new(
             "e2",
             1,
             0,
@@ -367,7 +371,7 @@ mod tests {
         .unwrap();
         registry.validate(&good).unwrap();
 
-        let bad = SessionEvent::new("e3", 1, 0, "extension/echo", None, None, true, "{}").unwrap();
+        let bad = JournalEvent::new("e3", 1, 0, "extension/echo", None, None, true, "{}").unwrap();
         assert!(registry.validate(&bad).is_err());
 
         let mut state = AgentState::builder().session_id("s").build();
@@ -377,7 +381,7 @@ mod tests {
 
     #[test]
     fn unknown_required_type_stops_recovery_but_optional_does_not() {
-        let registry = SessionEventCodecRegistry::default();
+        let registry = JournalEventCodecRegistry::default();
         let required = event("extension/unknown", true);
         assert!(registry.validate(&required).is_err());
         let optional = event("extension/unknown", false);
