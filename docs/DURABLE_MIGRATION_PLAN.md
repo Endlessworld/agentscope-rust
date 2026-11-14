@@ -119,6 +119,62 @@ core `ReActAgent` 主循环接上 `AgentExecutionHost`；无宿主时行为不�
 - 确定性让步：①进程 1 停在 Acting 边界（意图+派发已提交、工具未运行）而非在工具体内被杀（同步工具无法从内部中断，durable 记录与「死在工具里」相同）；②进程 1 显式 `close()` 交还租约而非任其过期（单进程内无法持有不续租的租约）；③`settle()` 由用例代做（`HarnessAdapter::settle` 尚无实现），只记录真实发生过的 `applied` 与终态；④「效果已发生、结果未落盘」的 UNKNOWN 对账未覆盖，故工具只在恢复进程执行一次。
 - 反向验证：去掉 Acting 边界 halt → 用例 FAILED；不 `settle` → 重复进程 `claim` 成功、用例 FAILED。
 
+### 2.6 M4-a 语义映射与可达边界（2026-11-15，未提交，**无代码改动**）
+
+M4-a 原定「先删 `AgentSession`，ACP 改持 `Arc<dyn ThreadJournal>`」。逐处核对后结论是：**删除动作不可单独执行**——`AgentSession`（`crates/agentscope-harness/src/agent/session/session.rs`，2259 行，含 1915 起的单测块）是本仓库唯一的会话驱动器，ACP 是它唯一的消费者；把 ACP 降级为「只持 journal」会同时失去准入、派发、receipt、resume、respond 五条语义，属于行为回退而非迁移。因此本步只产出映射表与阻塞清单，代码按 M4-b 一起改。
+
+#### 2.6.1 职责映射（`AgentSession` → 新宿主）
+
+| `AgentSession` 职责（行号） | 现实现 | 新归属 |
+|---|---|---|
+| 读取视图 `transcript`/`inspect`/`pending`/`head`（341-374） | journal 读函数 | 不变：`journal::{transcript, JournalProjection::read, pending_interactions}`，或 durable `SessionBackend::{journal, checkpoints}` |
+| 准入 `submit`/`submit_msg`/`submit_with_key(_msg)`/`wakeup`（375-467） | `SessionInbox::accept` + `Command` + `seed_receipt_if_new` | `DurableRuntime::submit`（`request_id` 幂等 + terminal 校验已具备）；wakeup = 空 `input` 的 submit（需 ACP 侧显式提交空输入，durable 无 `wakeup` 概念） |
+| 准入前收尾 `prepare_open_turn_before_submit`（487-546） | 可续跑→`resume`，否则 `abandon_turn`（523） | durable：非终态 turn 的 `resume_turn` / `cancel`；**「可续跑 vs 放弃」的判据要重写**（现有判据 = pending 为空且无 uncertain tool） |
+| 派发 `start`/`dispatch_once`/`launch`（875-936、1218-1800） | 50ms 轮询 + 直接驱动 `ReActAgent` 流 | `DurableRuntime::{tick, scan}` + `Executor`/`AgentScopeExecutionHost`；`launch` 约 410 行不再需要 |
+| receipt `seed_receipt_if_new`/`receipt`/`ReceiptCache`/`Task`/`task`/`tasks`/`await_task`（937-1139） | 反复读 journal 折叠 receipt | `SessionBackend::receipt` → `TurnReceipt`；ACP 依赖的 `Task{status, settled(), run_id, error}` 形态需由 `TurnView`+receipt 投影（形状不同） |
+| 活跃判定 `has_active_execution`（954） | 读 journal | `TurnView.status` / `backend.runs` |
+| 事件渲染 `set_event_sink`（365） | 每次执行捕获 sink | core 流式事件 + durable `events(cursor)`；**语义不同**（见 2.6.3 第 6 条） |
+| 中断 `interrupt`/`interrupt_run`/`stop_active_run`（468-486、828-874） | `RunControl` + journal | 立即中断仍走 `RunControl`；持久意图 `DurableRuntime::cancel`（写 `Cancelling→Cancelled`） |
+| 续跑 `resume(turn_id)`（547-595） | `resume` 命令入 inbox | `DurableRuntime::resume` / `resume_turn`（`TickOutcome`） |
+| 交互答复 `respond`/`respond_all`（659-767） | `answer` 命令入 inbox + 派发 | **无等价物**：durable `signal` 的 `Steer`/`Inject` 仍返回 `unavailable`，且没有「答复 pending interaction」原语（§2.1 缺口 4） |
+| `steer`/`inject`（768-827） | 命令入 inbox，run 前一次性应用 | 同上，**无等价物** |
+| 放弃 `open_turn`/`abandon_unfinished`（596-658） | `TurnViews` + `journal::abandon_turn` | **无等价物**：durable 只有 `cancel`→`Cancelled`，没有「记 interrupted 且以后仍可续跑」的放弃语义 |
+| `/compact` | 不在 `AgentSession`：ACP `session.rs:2075` → `HarnessAgent::compact_now()`（`harness_agent.rs:324` 直接读 `state_handle()`） | 不变，M4 无需迁移 |
+| wakeup 队列与重试 | ACP 自持（`coding_agent.rs:1695 spawn_wakeup_loop` → `run_wakeup` → prompt `TurnInput::Wakeup`） | 不变，只需「无输入 turn」的准入（见上） |
+
+**内部 4 处 `abandon_turn` 的归属**：
+
+| 行 | 场景 | 新归属 |
+|---|---|---|
+| 523 | 提交前遇到孤儿 turn（suspended / uncertain tool） | 准入职责：durable `submit` 前的非终态处理，或带证据的 `reconcile`（比 `cancel` 更准，见 `docs/cloud/durable-handoff-2026-11-14.md` 第 9/11 条） |
+| 634 | `abandon_unfinished`：宿主显式放弃 | **需新增 host-facing abandon**；durable `cancel` 只写 `Cancelled`，丢掉「interrupted 尚可续跑」，不是等价替换 |
+| 1262 | `dispatch_once`：有 open turn 时先把 submit 排到下一 tick | 派发职责：durable `claim` 成功后对非终态 turn 的处置（`resume` 或 `cancel`），不应在准入层重复一遍 |
+| 1774 | `launch` 中 `finish` 失败后的兜底关闭 | **可删**：durable 的终态门禁在 backend（`derive_status` + 原子 commit），commit 失败即未落盘，只需保证释放 claim/lease，不需要事后 abandon |
+
+#### 2.6.2 ACP 6 处的处理方式
+
+`session.rs:3110/3137/3149/3222/3245/3265` 六处形状一致，都是「本轮结束但 turn 未终态 → 记 interrupted 关闭，避免下一个 prompt 被拒」，且只需 `turn_id` + journal。它们**本次未改**：改掉 `session.log()` 只会让 ACP 多出一个与 `runtime` 并存的 journal 字段，不减少任何依赖（`submit`/`task`/`resume`/`respond` 仍要 `AgentSession`），属于纯 churn。迁到 durable 后统一收敛为一次 `cancel` 调用——**但必须先决定「宿主放弃」写 `interrupted` 还是 `Cancelled`**，否则 ACP 的「interrupted 自动续跑」（`MAX_INTERRUPTED_RESUMES`，`session.rs:2794`）会失效。
+
+#### 2.6.3 为什么停在文档层（阻塞证据）
+
+1. **ACP 与 durable 之间零依赖**：`crates/agentscope-extensions-acp/Cargo.toml` 只有 `agentscope-core`/`agentscope-extensions-model`/`agentscope-harness`；`agentscope_durable` 在 `crates/` 下只被 durable 两个 crate 及其测试引用。
+2. **durable 侧没有会话驱动器**：`agentscope-durable-adapter-agentscope` 只有 `BackendThreadJournal` / `AgentScopeExecutionHost` / `checkpoint` / `tool_facts`，没有 `Session`/`Driver` 门面；`DurableRuntime` 是「调用方驱动的一次 `tick`」（Q1=A）。目前唯一跑通全流程的 `three_process_test.rs` 是**用例自己**写了 `prepare_run`/`drive`（拼 `RECORDER`+`EXECUTION_HOST` extensions 再拉 `run_stream_with_extensions`）/`settle`（并注明 `HarnessAdapter::settle` 尚未实现）——这套循环正是 M4-b 要抽成运行时的东西。
+3. **ACP 需要 11 个能力，durable 现覆盖 5 个**：submit ✅、tick ✅、resume ✅、receipt ✅（形状不同）、cancel ≈（语义差）、signal(wakeup) ✗、respond ✗、event sink ✗（需 cursor→`AgentEvent` 映射）、`execution_error` ✗、Task 投影 ✗、abandon ✗。
+4. **重写面**：ACP 的 turn 循环（`session.rs:2780-3300`，约 470 行）与 `launch`（约 410 行）都要重写，且必须一次改完——半删会让 workspace 不编译，违反「不做兼容层/不留半成品」。
+
+#### 2.6.4 M4-b 需要先做的六件事
+
+1. `agentscope-durable` 增加 host-facing `DurableSession` 门面：`submit`/`wakeup`（空 input）/`task`（`TurnReceipt`→ACP 的 `Task` 形状）/`has_active_execution`/`resume`/`cancel_as_abandon`/`respond`/`execution_error`。
+2. `SessionBackend` 补「答复 pending interaction」原语，并让 `Steer`/`Inject` 真正被消费（当前 `unavailable`）。
+3. 拍板放弃语义：`interrupted`（可续跑）还是 `Cancelled`（终态）——决定 ACP 6 处与内部 523/634/1262 的归宿。
+4. 事件流：durable `events(cursor)` → `AgentEvent` 的映射，以及「一次 tick 内如何边跑边推」的策略（回调 vs tick 后批量读 cursor）。
+5. ACP `runtime` 字段改 `Arc<DurableSession>`；`respond`、`run_wakeup` 接新路径（`/compact` 已就绪）。
+6. 最后才删 `AgentSession`/`SessionAnswer`/`HarnessAgent::session()`/`session::{answer, session}` 导出，并改写 `crates/agentscope-harness/tests/harness_session_test.rs`（15 处 `AgentSession::open`）与 `harness_subagent_wiring_test.rs:845` 的注释。
+
+#### 2.6.5 门禁（第 4 步结论）
+
+计划里「关掉 durable 后端 → ACP 用例失败」在当前结构下**不成立**：ACP 不引用 durable，移除/禁用 durable 后端对 ACP 无任何影响，ACP 仍走纯 journal 路径（`AgentSession` + `AtomicThreadJournal`）。这条门禁只能在 M4-b 完成后才有意义，届时写成「把 `DurableRuntime::tick` 换成 no-op / 去掉 durable backend → ACP prompt 不再产生事件且不终止 → 对应用例 FAILED」。当前真实可观测的门禁仍在 durable/harness 层：`agentscope-durable-adapter-agentscope/tests/three_process_test.rs`（去掉 Acting halt 或去掉 settle 即 FAILED，§2.5）与 `harness_session_test.rs` 的 journal 恢复用例。
+
 ## 3. 禁止事项（沿用 Java `agentscope-durable/AGENTS.md`）
 
 - 不做兼容层：不留别名、不保留 deprecated 转发、不写旧格式读取器、不做版本协商/降级回退。
@@ -179,3 +235,4 @@ core `ReActAgent` 主循环接上 `AgentExecutionHost`；无宿主时行为不�
 
 | 2026-11-15 | **M3-b 执行宿主** | ✅ core 主循环接 `AgentExecutionHost`（位置/边界/resume/finish）+ adapter `AgentScopeExecutionHost`/`pin()`；5 条集成测试全绿；core lib 533 passed |
 | 2026-11-15 | **M3-e 三进程验收** | ✅ `three_process_test.rs`：run=2 / `tool/result`=1 / 副作用=1；真实子进程验证状态外置；⚠️ 模型调用=2（D7 要求 1，缺 acting 续跑分支，见 §2.5） |
+| 2026-11-15 | **M4-a 语义映射** | ⚠️ 已产出 §2.6 映射表，**未删代码**：`AgentSession` 是唯一会话驱动器、ACP 是其唯一消费者，而 ACP 与 durable 零依赖、durable 无会话门面（11 项能力只覆盖 5 项）。删 `AgentSession` 与「ACP 改 `DurableRuntime`」必须同批完成（M4-b 六项前置见 §2.6.4）；「关掉 durable → ACP 失败」在当前结构下不成立（§2.6.5） |
