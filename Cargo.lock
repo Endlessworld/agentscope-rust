@@ -136,6 +136,7 @@ dependencies = [
  "agentscope-core",
  "agentscope-durable",
  "async-trait",
+ "futures",
  "serde_json",
  "tokio",
  "tracing",

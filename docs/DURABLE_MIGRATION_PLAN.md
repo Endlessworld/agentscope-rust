@@ -64,6 +64,23 @@ agentscope-harness  ──→  core             # 不得依赖 durable
 7. digest 用「键排序 canonical JSON + SHA-256」，与 Java RFC 8785（含 `{"value":…}` 外壳）不等价——两边数据不互通，故不影响正确性；如需跨语言互通再对齐。
 
 
+### 2.2 M3-b 执行宿主落地（2026-11-15，未提交）
+
+core `ReActAgent` 主循环接上 `AgentExecutionHost`；无宿主时行为不变（core lib 533 passed）。
+
+| 位置 | 行为 |
+|---|---|
+| 入口 | `execution_host(ctx)` + `execution_position(ctx)`；`resume_result()` 命中则跳过推理/工具循环直接收尾 |
+| 迭代预算 | 起点取 `position.reasoning_iteration`（缺省 0），`set_cur_iter` 同步 |
+| 边界 | `reasoning_phase` 开头 Reasoning、模型调用前 Model、`acting_phase` 开头 Acting、续体开头 Finalization |
+| 收尾 | 写回共享 state 包进 `FinishContinuation`；`HostPaused` 原样上抛，不转工具错误 |
+| 状态锁 | hook 作用在循环私有的 `AgentState` 副本（`&mut`）上，不跨 await 持 `MutexGuard` |
+
+适配层：新增 `crates/agentscope-durable-adapter-agentscope/src/execution_host.rs`——`AgentScopeExecutionHost::open`（读 committed `step/start` 得位置、读 `durable/finalization_started|completed` 得待收尾 reply）、`before_boundary`（控制检查 + input 注入）、`finish`（reply 与 checkpoint 同一次 commit）、`pin()`；5 条集成测试全绿。
+
+遗留缺口：①`input:steer|inject` 只注入 state，未 durable 消费（需与 checkpoint 同事务的 `consumed_signals`，journal 桥未暴露）；②`acting_iteration` 无消费者（core 未迁 pending-tool resume 分支）；③`finish` 需 native recorder，缺则报错；④durable 模型调用 replay（Java `durable/finalization_model`）未迁。
+
+
 ## 3. 禁止事项（沿用 Java `agentscope-durable/AGENTS.md`）
 
 - 不做兼容层：不留别名、不保留 deprecated 转发、不写旧格式读取器、不做版本协商/降级回退。
@@ -122,3 +139,4 @@ agentscope-harness  ──→  core             # 不得依赖 durable
 | pending | **M1d** | ⬜ `Head.format_version`（Java `ThreadJournal.Head` 带 `formatVersion`）留到 M3 由 durable backend 接管时加，避免现在改存储头格式两次 |
 | pending | **M2–M6** | ⬜ 见 §2 |
 
+| 2026-11-15 | **M3-b 执行宿主** | ✅ core 主循环接 `AgentExecutionHost`（位置/边界/resume/finish）+ adapter `AgentScopeExecutionHost`/`pin()`；5 条集成测试全绿；core lib 533 passed |

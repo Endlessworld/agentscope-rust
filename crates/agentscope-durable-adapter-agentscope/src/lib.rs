@@ -5,5 +5,9 @@
 //! without the other.
 
 pub mod backend_thread_journal;
+pub mod execution_host;
 
 pub use backend_thread_journal::BackendThreadJournal;
+pub use execution_host::{
+    pin, AgentScopeExecutionHost, FINALIZATION_COMPLETED, FINALIZATION_STARTED,
+};

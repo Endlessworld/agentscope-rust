@@ -47,6 +47,7 @@ use crate::permission::{
 };
 use crate::state::context::TaskContextState;
 use crate::state::AgentState;
+use crate::state::PlanModeContextState;
 use crate::tool::{RequirementProposeTool, TodoWriteTool, ToolExecutionContext, Toolkit};
 
 /// A boxed event sink registered via [`ObservableAgent::subscribe`].
@@ -847,6 +848,9 @@ impl ReActAgent {
                         "cancelled"
                     } else if matches!(result, Err(Error::Interrupted(_))) {
                         "interrupted"
+                    } else if matches!(result, Err(Error::HostPaused)) {
+                        // A paused invocation is a resumable turn, not a failed one.
+                        "suspended"
                     } else if result.is_ok() {
                         "completed"
                     } else {
@@ -1109,6 +1113,8 @@ impl ReActAgent {
                             events.push(Err(match e {
                                 Error::Interrupted(reason) => Error::Interrupted(reason.clone()),
                                 Error::Cancelled(reason) => Error::Cancelled(reason.clone()),
+                                // A pause is control flow, not a failure: keep it classifiable.
+                                Error::HostPaused => Error::HostPaused,
                                 other => Error::Agent(other.to_string()),
                             }));
                         }
@@ -1903,6 +1909,21 @@ async fn run_agent_loop(
     messages.retain(|message| message.role != MsgRole::System);
 
     let mut state = core.state.lock().unwrap().clone();
+    // A durable host may already own this invocation's reply: replaying a finished answer must
+    // not call the model again (Java `resumeResult`).
+    let host = crate::agent::execution_host(ctx);
+    if let Some(reply) = host.as_ref().and_then(|host| host.resume_result()) {
+        let plan_mode_at_start = state.plan_mode_context.clone();
+        return finish_invocation(
+            core,
+            ctx,
+            host.as_ref(),
+            state,
+            plan_mode_at_start,
+            Ok(reply),
+        )
+        .await;
+    }
     // Java's `AgentState.context` never stores the system message: it is frozen
     // per call in `CallExecution.systemMsg`. Drop any SYSTEM material persisted by
     // older builds before this request enters the loop.
@@ -1974,18 +1995,24 @@ async fn run_agent_loop(
     for message in messages {
         state.context_mut().push(message);
     }
-    state.set_cur_iter(0);
+    // A host that restarts an unfinished invocation supplies its committed position: a process
+    // restart is not a fresh iteration budget (Java `AgentExecutionPosition`).
+    let start_iter = crate::agent::execution_position(ctx)
+        .map(|position| position.reasoning_iteration.min(i32::MAX as u32) as i32)
+        .unwrap_or(0);
+    state.set_cur_iter(start_iter);
     // Snapshot plan mode so a plan-control tool's direct write to the shared state can
     // be detected and carried over (the loop otherwise runs on a private clone).
     let plan_mode_at_start = state.plan_mode_context.clone();
-    let mut result = match execute_iteration(core, ctx, &mut state, 0, system_msg.as_ref()).await {
-        // An interrupt is not a failure: reconcile the dangling tool_use left by
-        // the interrupted turn and append a recovery message, so the caller sees
-        // a normal reply and the next turn continues from a consistent context.
-        // Mirrors Java `handleInterrupt`.
-        Err(Error::Interrupted(_)) => Ok(reconcile_interrupted(&mut state)),
-        other => other,
-    };
+    let mut result =
+        match execute_iteration(core, ctx, &mut state, start_iter, system_msg.as_ref()).await {
+            // An interrupt is not a failure: reconcile the dangling tool_use left by
+            // the interrupted turn and append a recovery message, so the caller sees
+            // a normal reply and the next turn continues from a consistent context.
+            // Mirrors Java `handleInterrupt`.
+            Err(Error::Interrupted(_)) => Ok(reconcile_interrupted(&mut state)),
+            other => other,
+        };
     // Session settle loop (Java `settleSession`): a completed result does not end the turn
     // when guidance accepted during the run has not been consumed yet. Continuing keeps the
     // inbox turn open so the accepted steering is acted on instead of being dropped by the
@@ -2003,19 +2030,71 @@ async fn run_agent_loop(
     // resumes instead of replaying from the previous turn boundary. Mirrors
     // Java, where `scope.state` is mutated in place and
     // `saveStateAfterCallFailure` persists it on the error path.
-    {
-        let mut shared = core.state.lock().unwrap();
-        // Carry over plan-mode updates a plan-control tool made directly on the shared
-        // state (the loop ran on a private clone; only rebind when it actually changed).
-        if shared.plan_mode_context != plan_mode_at_start {
-            state.plan_mode_context = shared.plan_mode_context.clone();
-        }
-        // Same for the permission state: mode switches and "always allow" answers reach the
-        // shared handle while the turn runs, and the loop's copy predates them.
-        state.permission_context = shared.permission_context.clone();
-        *shared = state;
+    finish_invocation(core, ctx, host.as_ref(), state, plan_mode_at_start, result).await
+}
+
+/// Runs the attached execution host's hook at a phase boundary.
+///
+async fn host_boundary(
+    ctx: &crate::agent::RuntimeContext,
+    state: &mut AgentState,
+    boundary: crate::agent::ExecutionBoundary,
+) -> Result<()> {
+    match crate::agent::execution_host(ctx) {
+        Some(host) => host.before_boundary(boundary, ctx, state).await,
+        None => Ok(()),
     }
-    result
+}
+
+/// Finalizes the invocation: publishes the accumulated state and, when a host is attached, lets
+/// it persist the reply first and decide whether finalization may run at all.
+async fn finish_invocation(
+    core: &Arc<AgentCore>,
+    ctx: &crate::agent::RuntimeContext,
+    host: Option<&Arc<dyn crate::agent::AgentExecutionHost>>,
+    mut state: AgentState,
+    plan_mode_at_start: PlanModeContextState,
+    result: Result<Msg>,
+) -> Result<Msg> {
+    match (host, result) {
+        (Some(host), Ok(message)) => {
+            // The host persists the reply before the continuation runs finish middleware; a
+            // `HostPaused` keeps the recovery position and propagates unchanged.
+            let continuation: crate::agent::FinishContinuation<'_> = Box::pin(async {
+                host_boundary(
+                    ctx,
+                    &mut state,
+                    crate::agent::ExecutionBoundary::Finalization,
+                )
+                .await?;
+                commit_loop_state(core, state, &plan_mode_at_start);
+                Ok(())
+            });
+            host.finish(ctx, &message, continuation).await?;
+            Ok(message)
+        }
+        (_, result) => {
+            commit_loop_state(core, state, &plan_mode_at_start);
+            result
+        }
+    }
+}
+
+fn commit_loop_state(
+    core: &Arc<AgentCore>,
+    mut state: AgentState,
+    plan_mode_at_start: &PlanModeContextState,
+) {
+    let mut shared = core.state.lock().unwrap();
+    // Carry over plan-mode updates a plan-control tool made directly on the shared
+    // state (the loop ran on a private clone; only rebind when it actually changed).
+    if shared.plan_mode_context != *plan_mode_at_start {
+        state.plan_mode_context = shared.plan_mode_context.clone();
+    }
+    // Same for the permission state: mode switches and "always allow" answers reach the
+    // shared handle while the turn runs, and the loop's copy predates them.
+    state.permission_context = shared.permission_context.clone();
+    *shared = state;
 }
 
 /// Whether the session settle loop must run one more iteration.
@@ -2319,6 +2398,9 @@ async fn reasoning_phase(
     iter: i32,
     system_msg: Option<&Msg>,
 ) -> Result<Msg> {
+    // `ExecutionBoundary::Reasoning`: a host applies persistent input here, before this
+    // iteration publishes the state and builds its model request.
+    host_boundary(ctx, state, crate::agent::ExecutionBoundary::Reasoning).await?;
     check_interrupted(core, Some(ctx))?;
     state.set_cur_iter(iter);
     // `todo_write` mutates the shared task bag, which only lands in the caller's state at the
@@ -2420,6 +2502,9 @@ async fn reasoning_phase(
         crate::middleware::TASK_CONTEXT_STATE_CONTEXT_KEY,
         state.tasks_context.clone(),
     );
+    // `ExecutionBoundary::Model`: the request is already built, so a hook that rewrites the
+    // state here reaches the *next* iteration's request, exactly like Java's `MODEL` boundary.
+    host_boundary(ctx, state, crate::agent::ExecutionBoundary::Model).await?;
     let final_msg = match run_reasoning(core, &call_ctx, input, Arc::clone(&model)).await {
         Ok(msg) => msg,
         Err(e) => {
@@ -3529,6 +3614,9 @@ async fn acting_phase(
     ctx: &crate::agent::RuntimeContext,
     state: &mut AgentState,
 ) -> Result<ActingOutcome> {
+    // `ExecutionBoundary::Acting`: the host sees the assistant message with its tool calls
+    // before any tool runs, so input applied here cannot strand a dispatched call.
+    host_boundary(ctx, state, crate::agent::ExecutionBoundary::Acting).await?;
     check_interrupted(core, Some(ctx))?;
     let pending = extract_pending_tool_calls(state);
     if pending.is_empty() {
