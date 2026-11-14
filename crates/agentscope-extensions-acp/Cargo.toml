@@ -14,6 +14,8 @@ categories.workspace = true
 
 [dependencies]
 agentscope-core = { workspace = true }
+agentscope-durable = { workspace = true }
+agentscope-durable-adapter-agentscope = { workspace = true }
 agentscope-extensions-model = { workspace = true }
 agentscope-harness = { version = "0.1.0", path = "../agentscope-harness", default-features = false }
 agent-client-protocol = { version = "5.0.0", features = [

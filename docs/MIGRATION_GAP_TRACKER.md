@@ -650,3 +650,13 @@
 - 8 个 `ignored` 既有且有意：5 个是 ```ignore 文档示例（`agentscope-rs/src/lib.rs`、`extensions-channel/src/gateway.rs`、`extensions-rag/src/hook.rs`、`harness/src/agent/context/conventions.rs`、`harness/src/agent/gateway/platform_channel.rs`），3 个是 `model::catalog` 里依赖已下载 models.dev payload 或真实网络的 `#[ignore]` 用例。
 - `cargo fmt --all -- --check` → exit 0（本批新增/改动引入的 9 处格式差异已由 `cargo fmt --all` 收敛）。
 - 交叉审查（只读子智能体）逐处对照 Java 原实现；无「必须修复」项，两条优先项已处理：结构化输出混合批次里「未执行的业务调用」不再保留（否则成为 dangling `tool_use`）、`CapabilityResolver` 失败时同时写入事件流与 call 结果槽。
+
+## 9. durable M4-e-3：ACP 换 durable 驱动（2026-11-15，未提交）
+
+- 迁移对象：Java `a4306d63d` 的 durable runtime 在 ACP 侧的**消费端**（Rust 自有代码，无 Java 对应提交）：`crates/agentscope-extensions-acp` 不再用 `AgentSession` 驱动 turn，改 `DurableSession`（准入/tick）+ `AgentScopeHarnessAdapter`（执行）+ durable journal（转录）。
+- 新增依赖：`crates/agentscope-extensions-acp` 引 `agentscope-durable`、`agentscope-durable-adapter-agentscope`（workspace 统一写法）。依赖方向不变：durable 不依赖 core/harness。
+- 语义修正（adapter）：被 `interrupt()` 的 invocation 返回的是 `GenerateReason::Interrupted` 的**正常 reply**（core `reconcile_interrupted`），adapter 现在把它当「让出」而不是「失败」，turn 保留位置由下一 tick 续跑——否则客户端看到 `Refusal` 且用户 prompt 被丢弃。
+- 行为对照（旧 → 新）：`AgentSession` 的 6 处 `abandon_turn` → `cancel`/`suspend`（判据见 `docs/DURABLE_MIGRATION_PLAN.md` §2.8）；`MAX_INTERRUPTED_RESUMES=2` 仍保留（现在由 tick 让出 + `resume` 驱动）；`respond` → `DurableSession::respond`（wait key = interaction id）；`session/load` 转录 → durable journal（harness journal 已不是写者）。
+- 反向验证三处（interrupted 让出、durable journal 转录、durable cancel）均已实测 FAILED 后还原。
+- 遗留：`_agentscope/respond` 依赖 interaction id == wait key；`history()` 无消息转录；`AgentSession`/`SessionAnswer` 仍未删（`harness_session_test.rs` 15 处 `AgentSession::open` 需一起改）。
+

@@ -45,13 +45,11 @@ pub const FINALIZATION_COMPLETED: &str = "durable/finalization_completed";
 struct Frame {
     id: String,
     result: Msg,
-    position: AgentExecutionPosition,
 }
 
 /// [`AgentExecutionHost`] over a [`SessionBackend`] lease.
 pub struct AgentScopeExecutionHost {
     backend: Arc<dyn SessionBackend>,
-    thread: ThreadKey,
     run_id: String,
     lease: Mutex<Option<Lease>>,
     /// Iteration to continue from, read from the committed checkpoint and facts.
@@ -132,11 +130,7 @@ impl AgentScopeExecutionHost {
                         .and_then(|value| serde_json::from_value(value.clone()).ok())
                         .unwrap_or(position);
                     position = frame_position;
-                    frame = Some(Frame {
-                        id,
-                        result,
-                        position: frame_position,
-                    });
+                    frame = Some(Frame { id, result });
                     completed = false;
                 }
                 FINALIZATION_COMPLETED => {
@@ -156,7 +150,6 @@ impl AgentScopeExecutionHost {
         let resume = frame.as_ref().map(|frame| frame.result.clone());
         Ok(Self {
             backend,
-            thread,
             run_id: run_id.into(),
             lease: Mutex::new(Some(lease)),
             position,
@@ -374,7 +367,6 @@ impl AgentExecutionHost for AgentScopeExecutionHost {
                 *guard = Some(Frame {
                     id: frame_id.clone(),
                     result: result.clone(),
-                    position,
                 });
             }
         }

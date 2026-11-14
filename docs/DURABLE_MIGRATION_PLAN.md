@@ -275,6 +275,7 @@ M4-a 原定「先删 `AgentSession`，ACP 改持 `Arc<dyn ThreadJournal>`」。�
 | 2026-11-15 | **M4-a 语义映射** | ⚠️ 已产出 §2.6 映射表，**未删代码**：`AgentSession` 是唯一会话驱动器、ACP 是其唯一消费者，而 ACP 与 durable 零依赖、durable 无会话门面（11 项能力只覆盖 5 项）。删 `AgentSession` 与「ACP 改 `DurableRuntime`」必须同批完成（M4-b 六项前置见 §2.6.4）；「关掉 durable → ACP 失败」在当前结构下不成立（§2.6.5） |
 | 2026-11-15 | **M4-c（一）门面补齐** | ⚠️ `DurableSession::{wakeup,respond,waiting,task,history,set_event_sink}` + `HarnessContext::publish` 落地（session_test 9→15），**ACP 与 `AgentSession` 未改**：换驱动多了两个硬前置（无可执行 `HarnessAdapter`、租约不可转交），见 §2.8 |
 | 2026-11-15 | **M4-d 可执行适配器 + 租约借用** | ✅ `AgentScopeHarnessAdapter`（工厂 `Fn() -> HarnessAgent`）注册给 `DurableRuntime`；`BackendThreadJournal::{attach_lease, detach_lease}`；tick = 一次模型决策；`harness_adapter_test.rs` 7 条全绿；ACP 与 `AgentSession` 未改 |
+| 2026-11-15 | **M4-e-3 ACP 换驱动** | ✅ ACP 不再驱动 `AgentSession`：`SessionRuntime`（`DurableSession` + 另一个 owner 的 `control` + durable journal）+ `drive_turn` tick 循环 + sink 渲染；adapter 补「中断 = 让出」；cancel → `StopReason::Cancelled`，不再 `Refusal`/停顿（§2.10） |
 
 
 ### M4-e 回退记录
@@ -299,3 +300,40 @@ ACP 侧接线已验证可编译、ACP lib 114 条全绿，但集成用例 `sessi
 **用例**（`harness_adapter_test.rs` 7→11）：`a_cancel_before_the_invocation_runs_costs_no_model_call`；`a_cancel_inside_the_invocation_ends_the_tick_as_cancelled`（断言 `TickOutcome::Cancelled`、`run/end=cancelled`、无 `turn/failed`）；`a_pause_inside_the_invocation_is_paused_and_resumable`（`TickOutcome::Paused` 且 `!= Cancelled`、`run/end=suspended`、resume 后 Succeeded）；`a_cancelled_turn_is_terminal_and_repeating_the_settle_is_a_no_op`。反向验证：去 `cancel.cancel()` → 用例 2 挂到 10s 超时；取消/暂停的 native 状态互换 → 各自用例 FAILED。
 
 **剩余**：ACP 换驱动（M4-e-3）；工具内取消的「未知效果」记录（需 executor 语义）。
+
+### 2.10 M4-e-3 ACP 换驱动落地（2026-11-15，未提交）
+
+**结论**：ACP 不再驱动 `AgentSession`，turn 循环换成「`DurableSession` 准入 + `drive_turn` tick 循环 + 事件 sink 渲染」，§2.6.3 的四条阻塞与 §2.8 的两个硬前置全部解除。`AgentSession` 本身未删，第 3 步的删除清单（§2.8）不变。
+
+**依赖方向**：`Cargo.toml` 的 `[workspace.dependencies]` 增加 `agentscope-durable = { version = "0.1.0", path = ... }`，两个 durable crate 进 `members`；`crates/agentscope-extensions-acp/Cargo.toml` 用 workspace 统一写法引 `agentscope-durable` 与 `agentscope-durable-adapter-agentscope`。durable 仍不依赖 core/harness，桥接只在 adapter crate。
+
+**接线**
+
+1. `SessionRuntime { session: Arc<DurableSession>, control: Arc<DurableRuntime>, journal: Arc<dyn ThreadJournal> }`——同一 thread 的三个视图：`session` 准入/tick/读；`control` 是**另一个 owner**（用 tick 自己的 owner 发命令会取走并放掉正在跑的 tick 的租约）；`journal` 是同一 store 的 core `ThreadJournal`，`session/load` 与 turn 结算都读它。
+2. `open_runtime()`：`TxnBackend::open(<cwd>/.agentscope/durable/acp)` + `AgentScopeHarnessAdapter::new(|| Arc::clone(&agent))` + `DurableRuntime::with_adapter("agentscope-acp", "acp/1", adapter)`；线程名取自 `DURABLE_HARNESS`，`DURABLE_DEFINITION = "acp/1"`。
+3. `drive_turn`：一个 prompt 一个 driver（`TurnDriver`），每轮 `session.tick()` 后读 `session.turn(turn_id)`，终态或 `Paused`/`Pausing`/`Waiting` 即交还；`TICK_PAUSE = 20ms`；`finish()` 有 5s 宽限期（tick 卡在阻塞工具里时只告警，不 abort——abort 会让 turn 停在 `Running` 直到租约过期）。
+4. 事件：sink 把 `serde_json::Value` 反序列化回 `AgentEvent` 推进有界队列（`event_queue`，溢出计数，`AgentResult` 必留），渲染路径与原来完全一致（`map_delta_event`/`map_result_event`/`ToolEventMapper`/usage/compaction）。
+5. 取消：ACP 的 `cancel_epoch` 仍是客户端唯一入口；命中后走 `control.cancel(..., control_id("cancel"))` 写 durable 意图，再等 turn 转终态（活会话 10s，关闭中的会话 500ms）后 `driver.finish()`，返回 `StopReason::Cancelled`。
+6. `respond` / `_agentscope/respond`：先把 `SessionAnswer` 折成文本，再 `session.respond(turn_id, interaction_id, text)`；`close`/`replay_notifications` 一律从 durable journal 读（harness journal 已不是写者，读它会重放空会话）。
+7. `turn_status_name` 把 durable 状态映射回客户端认识的六个名字（`Paused`/`Pausing` → `interrupted`）；`interrupted` 保留 `MAX_INTERRUPTED_RESUMES = 2` 的自动续跑，`cancelled` 直接 `StopReason::Cancelled`，`failed` 用 turn 上落盘的错误文本（去重 `Agent error: ` 前缀）。
+
+**adapter 侧同步修的两处语义**
+
+1. **中断 = 让出，不是失败**：一次被 `interrupt()` 的 invocation 结束时 core 会 `reconcile_interrupted` 并返回带 `GenerateReason::Interrupted` 的**正常 reply**；adapter 原先只看 `Error::HostPaused` 才让出，于是把中断当 `failed` 落盘，客户端看到 `Refusal`、用户的 prompt 被丢弃。现在 `reply.generate_reason() == Interrupted` 或流里冒出的 `Err(Error::Interrupted)` 都算让出：turn 保留位置、native run 记 `suspended`，下一个 tick 继续（等价于原来 ACP 的自动续跑，但循环在宿主侧）。
+2. `TurnStatus`/`TickOutcome` 与 durable crate 未改一行。
+
+**验证**（详见 §7 行）
+
+- ACP 集成套件全绿：`acp_cancel_test` 2、`acp_session_cancel_test` 2、`acp_interrupted_turn_test` 3、`acp_load_replay_test` 1、`acp_session_resume_test` 1、`acp_capabilities_test` 10、`acp_event_flow_test` 4、`acp_compact_test` 2、`acp_elicitation_test` 2、`acp_subagent_permission_test` 2、`acp_subagent_test` 4、`acp_auth_test` 3、`acp_catalog_release_test` 3、`acp_stdio_thought_test` 1；lib 114。
+- 反向验证（去掉修复 → 对应用例 FAILED，均已还原）：
+  a) adapter 不把 interrupted 当让出 → `acp_interrupted_turn_test::a_forced_interrupt_is_continued_without_discarding_the_prompt` FAILED；
+  b) `replay_notifications` 不读 durable journal（等价于读没有写者的 harness journal）→ `acp_load_replay_test` FAILED；
+  c) 取消不写 durable 意图 → `acp_session_cancel_test` 两条均 FAILED（`Elapsed`：turn 卡在运行中，teardown 等不满宽限）。
+
+**仍是近似/未做**
+
+- `_agentscope/respond` 的 wait key 仍依赖「interaction id == wait key」（§2.8 前提），没有通用 interaction 记录。
+- ACP 路径不经过 `HarnessAdapter::settle` 的默认实现：adapter 自己 settle。
+- `history()` 仍无消息转录；durable 侧 `acting_iteration` 续跑入口仍缺（§2.5）。
+- 每个 session 一次 `TxnBackend::open`（file store 每次加锁打开），LRU 淘汰时随 runtime 释放，未做全局缓存。
+

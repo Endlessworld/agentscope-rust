@@ -57,6 +57,7 @@ agentscope-core = { version = "0.1.0", path = "crates/agentscope-core" }
 agentscope-macros = { version = "0.1.0", path = "crates/agentscope-macros" }
 agentscope-harness = { version = "0.1.0", path = "crates/agentscope-harness" }
 agentscope-durable = { version = "0.1.0", path = "crates/agentscope-durable" }
+agentscope-durable-adapter-agentscope = { version = "0.1.0", path = "crates/agentscope-durable-adapter-agentscope" }
 agentscope-extensions-model = { version = "0.1.0", path = "crates/agentscope-extensions-model" }
 agentscope-extensions-protocol = { version = "0.1.0", path = "crates/agentscope-extensions-protocol" }
 agentscope-extensions-a2a-client = { version = "0.1.0", path = "crates/agentscope-extensions-a2a-client" }

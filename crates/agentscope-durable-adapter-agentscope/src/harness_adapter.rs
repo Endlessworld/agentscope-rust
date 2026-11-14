@@ -24,7 +24,7 @@ use agentscope_core::agent::{
 };
 use agentscope_core::error::{Error, Result as CoreResult};
 use agentscope_core::journal::{InvocationRecorder, ThreadJournal, RECORDER_CONTEXT_KEY};
-use agentscope_core::message::Msg;
+use agentscope_core::message::{GenerateReason, Msg};
 use agentscope_core::state::AgentState;
 use agentscope_durable::harness_adapter::{AdapterCapabilities, HarnessAdapter, HarnessContext};
 use agentscope_durable::{DurableError, Lease, Result, TurnStatus};
@@ -217,6 +217,15 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
                     drain = true;
                     break;
                 }
+                // An interruption is a yield too, not a failure: the run stopped where a
+                // resume can continue it, so the turn keeps its position and the next tick
+                // carries on. Settling it here would turn a host's own interrupt into a
+                // refusal on the client.
+                Err(Error::Interrupted(_)) => {
+                    yielded = true;
+                    drain = true;
+                    break;
+                }
                 Err(error) => {
                     failure = Some(error.to_string());
                     break;
@@ -238,12 +247,19 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
             }
         }
         drop(stream);
+        // A reconciled interruption is a *normal* reply carrying the interrupted reason: the run
+        // stopped without failing, and the state already has the recovery message appended. The
+        // turn keeps its position so the next tick continues it; settling here would answer the
+        // prompt with the recovery text.
+        let interrupted = reply
+            .as_ref()
+            .is_some_and(|reply| reply.generate_reason() == GenerateReason::Interrupted);
         // Control asked while this invocation ran is only *observed* here: a terminal status can
         // be written by the writer that holds the turn and by nobody else, so leaving it to the
         // next claimant would keep a cancelled turn `Cancelling` forever.
         let frame = ctx.backend.frame(lease).await?;
         let cancelled = frame.turn.cancellation_requested;
-        let paused = frame.turn.status == TurnStatus::Pausing || yielded;
+        let paused = frame.turn.status == TurnStatus::Pausing || yielded || interrupted;
 
         // Close the native run with the status this invocation really reached: a host renders
         // the journal, and a run it never sees ending is indistinguishable from one that hung.

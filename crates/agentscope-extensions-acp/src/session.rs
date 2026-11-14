@@ -17,11 +17,19 @@ use agent_client_protocol::v1::schema::{
 use agent_client_protocol::{v1::ConnectionTo, Client};
 use agentscope_core::agent::CallableAgent;
 use agentscope_core::event::{AgentEvent, ConfirmResult};
+use agentscope_core::journal::ThreadJournal;
 use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
 use agentscope_core::model::catalog::ModelDescriptor;
 use agentscope_core::model::{GenerateOptions, DEFAULT_CONTEXT_WINDOW};
 use agentscope_core::permission::{PermissionBehavior, PermissionRule};
 use agentscope_core::ConfirmHandler;
+use agentscope_durable::backend::TxnBackend;
+use agentscope_durable::store::file::FileStore;
+use agentscope_durable::{
+    DurableRuntime, DurableSession, HarnessAdapter, SessionBackend, SessionKey, SessionSpec,
+    ThreadBinding, ThreadKey, TurnStatus,
+};
+use agentscope_durable_adapter_agentscope::{AgentScopeHarnessAdapter, BackendThreadJournal};
 use sha2::{Digest, Sha256};
 
 use agentscope_harness::agent::bus::MessageBus;
@@ -582,6 +590,157 @@ impl SelectedDescriptor {
     }
 }
 
+/// Name this session's turns are registered under in the durable runtime.
+const DURABLE_HARNESS: &str = "agentscope-acp";
+/// Version of this host's turn definition; a checkpoint is only restorable under the same one.
+const DURABLE_DEFINITION: &str = "acp/1";
+/// Namespace of an ACP session inside its workspace's durable store.
+const DURABLE_NAMESPACE: &str = "acp";
+/// How long the tick loop rests between steps.
+const TICK_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+/// How long a prompt waits for a tick in flight before it stops waiting for it.
+const DRIVER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The durable runtime that drives this session's turns.
+///
+/// One thread per ACP session. `session` admits, ticks and reads it; `control` is the same
+/// thread through a *different* owner, because a control command issued by the owner a tick is
+/// running under would take — and release — that tick's lease; and `journal` is the same store
+/// opened as a core [`ThreadJournal`], which is what `session/load` replays and what the turn's
+/// ending is read through.
+struct SessionRuntime {
+    session: Arc<DurableSession>,
+    control: Arc<DurableRuntime>,
+    journal: Arc<dyn ThreadJournal>,
+}
+
+/// A request id for a durable control command.
+///
+/// Control is idempotent on its request id, so a *fresh* id per call is what makes a repeated
+/// cancel a new intent instead of a stale receipt; the value only has to be unique per command.
+fn control_id(kind: &str) -> String {
+    format!("{kind}-{}", uuid::Uuid::new_v4())
+}
+
+/// The status name this client compares against, mapped from the durable turn.
+pub(crate) fn turn_status_name(status: TurnStatus) -> &'static str {
+    match status {
+        TurnStatus::Succeeded => "completed",
+        TurnStatus::Failed => "failed",
+        TurnStatus::Cancelled => "cancelled",
+        // A paused turn is the "interrupted" this client resumes: the run stopped without a
+        // result and the position is still there, which is the same situation under a new name.
+        TurnStatus::Paused | TurnStatus::Pausing => "interrupted",
+        TurnStatus::Waiting => "waiting",
+        TurnStatus::Queued => "queued",
+        TurnStatus::Running | TurnStatus::Cancelling => "running",
+    }
+}
+
+/// Advances one turn until it settles or yields.
+///
+/// One `tick` is one model decision plus the tools it dispatched, so a turn needs as many ticks
+/// as it takes decisions. The prompt above renders what the sink publishes and watches for
+/// cancellation; this loop only keeps the thread moving. A paused or waiting turn is not ready,
+/// so the loop hands it back instead of spinning on it.
+async fn drive_turn(session: Arc<DurableSession>, turn_id: String, stop: Arc<AtomicBool>) {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        // A failed tick has already recorded its failure on the turn; the status below decides
+        // whether there is more to do.
+        let _ = session.tick().await;
+        match session.turn(&turn_id).await {
+            Ok(view)
+                if view.status.terminal()
+                    || matches!(
+                        view.status,
+                        TurnStatus::Paused | TurnStatus::Pausing | TurnStatus::Waiting
+                    ) =>
+            {
+                return
+            }
+            Ok(_) => {}
+            Err(_) => return,
+        }
+        tokio::time::sleep(TICK_PAUSE).await;
+    }
+}
+
+/// The tick loop of one prompt attempt.
+struct TurnDriver {
+    stop: Arc<AtomicBool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TurnDriver {
+    fn spawn(session: Arc<DurableSession>, turn_id: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(drive_turn(session, turn_id, Arc::clone(&stop)));
+        Self {
+            stop,
+            task: Some(task),
+        }
+    }
+
+    /// Stops the loop and waits for the tick in flight to end.
+    ///
+    /// The wait is bounded because a tick can be stuck in a tool that blocks its thread; past
+    /// the grace the loop is left to end on its own rather than aborting it, because a tick
+    /// dropped mid-invocation leaves its turn `Running` until the lease expires.
+    async fn finish(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(task) = self.task.take() {
+            if tokio::time::timeout(DRIVER_GRACE, task).await.is_err() {
+                tracing::warn!("the durable tick loop did not end within the grace; leaving it");
+            }
+        }
+    }
+}
+
+impl Drop for TurnDriver {
+    fn drop(&mut self) {
+        // Only reached on a path that returned without `finish`: the loop is asked to stop, and
+        // the handle is dropped (the task detaches and ends after its current tick).
+        self.stop.store(true, Ordering::SeqCst);
+        self.task.take();
+    }
+}
+
+/// The text a durable answer carries.
+///
+/// A durable signal is delivered to the model as text, so an answer is folded the same way:
+/// what the user said, or the decision they made.
+fn session_answer_text(answer: &agentscope_harness::agent::SessionAnswer) -> String {
+    use agentscope_harness::agent::SessionAnswer;
+    match answer {
+        SessionAnswer::Output { content } => content
+            .iter()
+            .filter_map(|block| match block {
+                agentscope_core::message::ContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        SessionAnswer::Approval { approved: true, .. } => "approved".to_string(),
+        SessionAnswer::Approval {
+            approved: false,
+            reason,
+        } => reason.clone().unwrap_or_else(|| "rejected".to_string()),
+        SessionAnswer::Confirmation(confirm) => {
+            let result = &confirm.result;
+            if !result.message.is_empty() {
+                result.message.clone()
+            } else if result.confirmed {
+                "approved".to_string()
+            } else {
+                "rejected".to_string()
+            }
+        }
+    }
+}
+
 /// A single ACP session backed by a [`HarnessAgent`].
 #[derive(Clone)]
 pub struct AcpAgentSession {
@@ -652,12 +811,13 @@ pub struct AcpAgentSession {
     elicitation_slot: ElicitationSlot,
     /// Persistent "always allow / always reject" rule store for this workspace.
     permission_store: Arc<PermissionRuleStore>,
-    /// The long-lived runtime handle for this ACP session.
+    /// The durable runtime of this ACP session, opened on the first prompt.
     ///
-    /// Reusing one handle keeps the dispatcher projection and the receipt fold warm across
-    /// prompts. Opening a fresh handle per prompt re-read the whole journal (and every state
-    /// checkpoint) before each turn, which made long sessions slow and memory-hungry.
-    runtime: Arc<tokio::sync::Mutex<Option<Arc<agentscope_harness::agent::AgentSession>>>>,
+    /// Reusing one handle keeps the adapter, the store connection and the event sink warm across
+    /// prompts; opening per prompt would rebuild the store handle and re-read the thread state.
+    /// The turns themselves live in the store, so a restart rebuilds this from what a tick
+    /// committed.
+    runtime: Arc<tokio::sync::Mutex<Option<Arc<SessionRuntime>>>>,
     /// Manages MCP client connections for this session (stdio servers declared
     /// by the ACP client via `mcp_servers`). Shared across clones so tools keep
     /// working after `register_session` write-back.
@@ -1010,6 +1170,116 @@ impl AcpAgentSession {
         agentscope_core::agent::RuntimeContext::new().with_session_id(self.session_id.to_string())
     }
 
+    /// The store root of this session's durable state.
+    ///
+    /// The root is the harness *workspace*, not the ACP `cwd`: `session/load` rebuilds the
+    /// session from the cwd the client sends, and the conversation must still be found there
+    /// (the harness journal lives in the workspace for the same reason).
+    fn durable_root(&self) -> std::result::Result<PathBuf, String> {
+        self.agent
+            .workspace_manager()
+            .map(|manager| manager.workspace().join(".agentscope").join("durable"))
+            .ok_or_else(|| "the agent has no workspace to keep durable state in".to_string())
+    }
+
+    /// The thread this ACP session drives: one session, one thread.
+    fn durable_thread(&self) -> std::result::Result<ThreadKey, String> {
+        let session = SessionKey::new(DURABLE_NAMESPACE, self.session_id.to_string())
+            .map_err(|error| error.to_string())?;
+        ThreadKey::new(session, "main").map_err(|error| error.to_string())
+    }
+
+    fn durable_backend(&self) -> std::result::Result<Arc<dyn SessionBackend>, String> {
+        let store = FileStore::open(self.durable_root()?).map_err(|error| error.to_string())?;
+        Ok(Arc::new(TxnBackend::with_store(Arc::new(store))))
+    }
+
+    /// The durable journal of this session, for a reader that must not open a runtime (the
+    /// `session/load` replay). Reading a thread that was never written is an error, which the
+    /// caller turns into an empty replay.
+    pub(crate) fn durable_journal(&self) -> std::result::Result<Arc<dyn ThreadJournal>, String> {
+        Ok(Arc::new(BackendThreadJournal::new(
+            self.durable_backend()?,
+            self.durable_thread()?,
+        )))
+    }
+
+    /// Opens (or reuses) the durable runtime of this session.
+    ///
+    /// Opening touches durable storage, which can fail transiently (a competing writer, an
+    /// fsync hiccup). Those failures are not the user's fault and must not end a turn on the
+    /// first attempt.
+    async fn open_runtime(&self) -> std::result::Result<Arc<SessionRuntime>, String> {
+        let cached = self.runtime.lock().await.as_ref().map(Arc::clone);
+        if let Some(runtime) = cached {
+            return Ok(runtime);
+        }
+        let backend = self.durable_backend()?;
+        let thread = self.durable_thread()?;
+        let mut attempts = 0usize;
+        let opened = loop {
+            attempts += 1;
+            match self
+                .build_runtime(Arc::clone(&backend), thread.clone())
+                .await
+            {
+                Ok(runtime) => break Arc::new(runtime),
+                Err(error) if attempts < 3 => {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        %error,
+                        "opening the durable runtime failed; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        *self.runtime.lock().await = Some(Arc::clone(&opened));
+        Ok(opened)
+    }
+
+    /// Binds the store to this agent: the adapter runs one `HarnessAgent` invocation per tick,
+    /// and the session/thread creation is idempotent so a restart rebuilds the same identity.
+    async fn build_runtime(
+        &self,
+        backend: Arc<dyn SessionBackend>,
+        thread: ThreadKey,
+    ) -> agentscope_durable::Result<SessionRuntime> {
+        let agent = Arc::clone(&self.agent);
+        let adapter = Arc::new(AgentScopeHarnessAdapter::new(move || Arc::clone(&agent)));
+        let binding = ThreadBinding::new(
+            DURABLE_HARNESS,
+            DURABLE_DEFINITION,
+            adapter.capabilities().state_version,
+        )?;
+        let owner = format!("acp-{}-{}", std::process::id(), control_id("run"));
+        let runtime =
+            DurableRuntime::new(Arc::clone(&backend), owner).with_adapter(DURABLE_HARNESS, adapter);
+        runtime
+            .ensure_session(SessionSpec {
+                key: thread.session.clone(),
+                primary_binding: binding,
+                metadata: serde_json::Value::Null,
+            })
+            .await?;
+        // A control command must not run under the owner the tick uses: `claim` would hand it
+        // the very lease the invocation is writing under, and releasing it would fence the run.
+        let control = Arc::new(DurableRuntime::new(
+            Arc::clone(&backend),
+            control_id("acp-control"),
+        ));
+        let journal: Arc<dyn ThreadJournal> = Arc::new(BackendThreadJournal::new(
+            Arc::clone(&backend),
+            thread.clone(),
+        ));
+        Ok(SessionRuntime {
+            session: Arc::new(DurableSession::new(runtime, thread)),
+            control,
+            journal,
+        })
+    }
+
     /// The working directory.
     pub fn cwd(&self) -> &PathBuf {
         &self.cwd
@@ -1273,19 +1543,32 @@ impl AcpAgentSession {
     pub async fn respond(
         &self,
         answers: std::collections::BTreeMap<String, agentscope_harness::agent::SessionAnswer>,
-    ) -> agentscope_core::error::Result<agentscope_harness::agent::SessionTask> {
-        let session = {
-            let runtime = self.runtime.lock().await;
-            match runtime.as_ref() {
-                Some(session) => Arc::clone(session),
-                None => {
-                    return Err(agentscope_core::Error::Journal(
-                        "the session runtime is not open".into(),
-                    ))
-                }
+    ) -> std::result::Result<(), String> {
+        let runtime = {
+            let slot = self.runtime.lock().await;
+            match slot.as_ref() {
+                Some(runtime) => Arc::clone(runtime),
+                None => return Err("the session runtime is not open".to_string()),
             }
         };
-        session.respond_all(answers).await
+        let turn = runtime
+            .session
+            .active()
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the session has no turn to answer".to_string())?;
+        // The durable wait key *is* the interaction id, so an answer is the signal the waiting
+        // turn folds in at its next boundary; answering a turn that waits on something else is
+        // a conflict instead of a silent drop.
+        for (request_id, answer) in answers {
+            let value = serde_json::json!({ "text": session_answer_text(&answer) });
+            runtime
+                .session
+                .respond(&turn.turn_id, &request_id, &control_id("answer"), value)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Current thought level.
@@ -2169,8 +2452,29 @@ impl AcpAgentSession {
         };
         use agentscope_core::message::{ContentBlock as CoreBlock, MsgRole};
 
-        let ctx = self.session_context();
-        if let Err(error) = self.agent.inspect_session(&ctx).await {
+        // The transcript comes from the durable journal this session writes. The harness journal
+        // store is no longer the writer, so reading it would replay an empty conversation.
+        let cached = self
+            .runtime
+            .lock()
+            .await
+            .as_ref()
+            .map(|runtime| Arc::clone(&runtime.journal));
+        let journal = match cached {
+            Some(journal) => journal,
+            None => match self.durable_journal() {
+                Ok(journal) => journal,
+                Err(error) => {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        %error,
+                        "cannot open the durable journal; session/load will replay nothing"
+                    );
+                    return Vec::new();
+                }
+            },
+        };
+        if let Err(error) = agentscope_core::journal::JournalProjection::read(&*journal).await {
             tracing::warn!(
                 session = %self.session_id,
                 %error,
@@ -2178,7 +2482,7 @@ impl AcpAgentSession {
             );
             return Vec::new();
         }
-        let transcript = match self.agent.session_transcript(&ctx).await {
+        let transcript = match agentscope_core::journal::transcript(&*journal).await {
             Ok(transcript) => transcript,
             Err(error) => {
                 tracing::warn!(
@@ -2639,51 +2943,19 @@ impl AcpAgentSession {
             }
             TurnInput::Wakeup => None,
         };
-        // Run the turn through the session runtime instead of driving `stream_events`
-        // directly: the runtime owns the journal writer, restores the committed state from
-        // the journal before the run, and admits steering/interrupts. This client only
-        // renders — events arrive through the sink below.
-        //
-        // Opening and submitting touch durable storage, which can fail transiently (a
-        // competing writer, an fsync/network hiccup). Those failures are not the user's
-        // fault and must not end the turn on the first attempt; the submit keeps a stable
-        // idempotency key so a retry cannot duplicate the prompt.
-        //
-        // The handle is cached for the lifetime of the ACP session: its dispatcher keeps the
-        // journal projection and receipt fold warm, so later prompts do not re-read the whole
-        // history (and every checkpoint) before they can start.
-        let session = {
-            let mut runtime = self.runtime.lock().await;
-            match runtime.as_ref() {
-                Some(session) => Arc::clone(session),
-                None => {
-                    let mut open_attempts = 0usize;
-                    let opened = loop {
-                        open_attempts += 1;
-                        match self.agent.session(self.session_context()).await {
-                            Ok(session) => break session,
-                            Err(error) if open_attempts < 3 => {
-                                tracing::warn!(
-                                    session = %self.session_id,
-                                    %error,
-                                    "opening the session runtime failed; retrying"
-                                );
-                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            }
-                            Err(error) => {
-                                emit(super::event::message_chunk(
-                                    self.session_id.clone(),
-                                    format!("Agent error: {error}"),
-                                    None,
-                                ));
-                                return StopReason::Refusal;
-                            }
-                        }
-                    };
-                    let opened = Arc::new(opened);
-                    *runtime = Some(Arc::clone(&opened));
-                    opened
-                }
+        // Drive the turn through the durable runtime instead of calling the core loop
+        // directly: the runtime owns the store, restores the committed state from the
+        // checkpoint before the run and admits control. This client only renders — events
+        // arrive through the sink below, and the tick loop is the only writer.
+        let runtime = match self.open_runtime().await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                emit(super::event::message_chunk(
+                    self.session_id.clone(),
+                    format!("Agent error: {error}"),
+                    None,
+                ));
+                return StopReason::Refusal;
             }
         };
         // Bounded backlog: the sink runs inside the agent and cannot block, so a stalled
@@ -2691,41 +2963,78 @@ impl AcpAgentSession {
         // counted (`AGENT_RESULT` is always kept), and the end of the turn reports it.
         let events = crate::event_queue::EventQueue::new(crate::event_queue::EVENT_QUEUE_CAPACITY);
         let sink = crate::event_queue::EventQueueSender::new(Arc::clone(&events));
-        session.set_event_sink(Arc::new(move |event: &AgentEvent| {
-            // A closed queue only means the prompt already returned; the run itself is
-            // unaffected, so dropping the event here is safe.
-            sink.push(event.clone());
-        }));
-        // A previous turn may still be open (the process died mid-run, the provider stalled,
-        // the host stopped waiting). `submit` is now the authority on how to settle it: it
-        // continues a resumable interrupted turn and closes a suspended/unrecoverable one, so
-        // the prompt is never rejected with "the previous turn is still open". All this path
-        // still owes the client is stopping a run this process already owns, so the new
-        // prompt is not queued behind a stalled one.
-        if let Err(error) = session.stop_active_run().await {
-            tracing::warn!(
-                session = %self.session_id,
-                %error,
-                "could not stop the active run before starting a new prompt"
-            );
+        runtime
+            .session
+            .set_event_sink(Arc::new(move |value: &serde_json::Value| {
+                // The sink runs inside the agent and cannot block, so the value it publishes is
+                // the serialized event this client renders. A closed queue only means the
+                // prompt already returned; the run itself is unaffected.
+                if let Ok(event) = serde_json::from_value::<AgentEvent>(value.clone()) {
+                    sink.push(event);
+                }
+            }));
+        // A turn left unfinished by an earlier prompt still owns the thread: the runtime always
+        // advances the oldest unfinished turn, so a new admission would sit behind it forever.
+        // `Paused` is the one state that needs a nudge (it is deliberately not ready); a turn a
+        // dead process left `Running` is reclaimed once its lease expires, which the admission
+        // wait below already covers.
+        if let Ok(Some(current)) = runtime.session.active().await {
+            if current.status == TurnStatus::Paused {
+                if let Err(error) = runtime
+                    .control
+                    .resume(
+                        runtime.session.thread(),
+                        &current.turn_id,
+                        &control_id("resume"),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        turn = %current.turn_id,
+                        %error,
+                        "could not resume the paused turn before the next prompt"
+                    );
+                }
+            }
         }
-        // The key identifies this prompt in the journal: it is derived from the user's text
-        // plus the acceptance time, so a retry of this attempt reuses it while an identical
-        // question asked later is still a new turn. A wakeup turn has no text to hash.
+        // The key identifies this prompt in the store: it is derived from the user's text plus
+        // the acceptance time, so a retry of this attempt reuses it while an identical question
+        // asked later is still a new turn. A wakeup turn has no text to hash.
         let idempotency_key = message
             .as_ref()
             .map(|message| prompt_idempotency_key(message, chrono::Utc::now().timestamp_millis()));
+        let input = match message.as_ref().map(serde_json::to_value) {
+            Some(Ok(value)) => Some(value),
+            Some(Err(error)) => {
+                emit(super::event::message_chunk(
+                    self.session_id.clone(),
+                    format!("Agent error: the prompt could not be encoded: {error}"),
+                    None,
+                ));
+                return StopReason::Refusal;
+            }
+            None => None,
+        };
         let mut submit_attempts = 0usize;
-        let mut task = loop {
+        let turn_id = loop {
             submit_attempts += 1;
-            let submitted = match (&message, &idempotency_key) {
-                (Some(message), Some(key)) => {
-                    session.submit_with_key_msg(key, message.clone()).await
+            // Submitting touches durable storage, which can fail transiently (a competing
+            // writer, an fsync hiccup). Those failures are not the user's fault and must not
+            // end the turn on the first attempt; the idempotency key makes the retry safe.
+            let submitted = match (&idempotency_key, &input) {
+                (Some(key), Some(input)) => runtime.session.submit(key, input.clone()).await,
+                _ => {
+                    let key = format!(
+                        "wakeup-{}-{}",
+                        self.session_id,
+                        chrono::Utc::now().timestamp_millis()
+                    );
+                    runtime.session.wakeup(&key).await
                 }
-                _ => session.wakeup().await,
             };
             match submitted {
-                Ok(task) => break task,
+                Ok(receipt) => break receipt.turn_id,
                 Err(error) if submit_attempts < 3 => {
                     tracing::warn!(
                         session = %self.session_id,
@@ -2798,8 +3107,11 @@ impl AcpAgentSession {
 
         loop {
             // ---- one dispatched attempt: stream until it settles or is cancelled ----
-            let mut settled_task: Option<agentscope_harness::agent::session::Task> = None;
+            let mut settled_task: Option<agentscope_durable::TurnView> = None;
             let mut cancelled = false;
+            // The tick loop is the only writer: this attempt starts it, renders what it
+            // publishes, and hands the thread back when it leaves.
+            let driver = TurnDriver::spawn(Arc::clone(&runtime.session), turn_id.clone());
             // Whether this attempt already streamed incremental text. Reset per attempt: a
             // resumed run may complete without emitting deltas (the answer already exists in
             // the restored state), and it must still reach the client. Keeping the flag from
@@ -2828,35 +3140,38 @@ impl AcpAgentSession {
                             break;
                         }
                         if settled_task.is_none() {
-                            match session.task(&task.command_id).await {
+                            match runtime.session.turn(&turn_id).await {
                                 Ok(current) => {
                                     first_poll_failure = None;
-                                    if current.status != last_status {
+                                    let status = turn_status_name(current.status);
+                                    if status != last_status {
                                         // Any status change is progress: restart the admission
                                         // clock so an earlier `queued` wait cannot accumulate.
-                                        last_status = current.status.clone();
+                                        last_status = status.to_string();
                                         admission_deadline =
                                             std::time::Instant::now() + ADMISSION_TIMEOUT;
-                                        queued_since = (current.status == "queued")
+                                        queued_since = (status == "queued")
                                             .then(std::time::Instant::now);
                                     }
-                                    if current.settled() {
+                                    if current.status.terminal() {
                                         settled_task = Some(current);
-                                    } else if current.status == "queued"
+                                    } else if current.status == TurnStatus::Queued
                                         && std::time::Instant::now() >= admission_deadline
                                     {
-                                        // Sessions run one turn at a time, so a queued turn is a
-                                        // *normal* wait while an earlier turn of the same session
-                                        // is still executing (a blocking tool can keep it alive
-                                        // long after the interrupt this prompt sent). Only a
-                                        // queue with nothing executing is a real stall: no
-                                        // dispatcher will ever pick that command up. An
-                                        // unreadable journal is reported by the receipt poll's
-                                        // own timeout, not blamed on admission.
-                                        let nothing_running = matches!(
-                                            session.has_active_execution().await,
-                                            Ok(false)
-                                        );
+                                        // The runtime always advances the oldest unfinished
+                                        // turn, so a queued turn is a *normal* wait behind an
+                                        // earlier one (a blocking tool can keep it alive long
+                                        // after the cancel this prompt sent). Only a queue whose
+                                        // head is this very turn is a real stall: nothing else
+                                        // explains why it was not admitted.
+                                        let head = runtime
+                                            .session
+                                            .state()
+                                            .await
+                                            .ok()
+                                            .and_then(|state| state.current_turn_id);
+                                        let nothing_running =
+                                            head.as_deref() == Some(turn_id.as_str());
                                         if nothing_running {
                                             stall = Some(format!(
                                                 "the turn was never admitted (status `queued` \
@@ -3039,102 +3354,60 @@ impl AcpAgentSession {
             }
 
             if cancelled {
-                // The ACP cancel flag is the only client-facing cancellation, so stop the run
-                // and close its turn: an interrupted turn stays open in the journal (only
-                // `completed`/`cancelled` end one), and the next prompt must be able to submit.
+                // The ACP cancel flag is the only client-facing cancellation: write it durably
+                // and let the invocation end itself. The tick observes the request at its next
+                // poll and settles the turn as `Cancelled` — a stop, not a rejection, and not a
+                // turn left open for the next prompt.
                 //
-                // The signal is scoped to *this* turn's run id. The loop below keeps retrying
-                // for up to 10s, and the client may already have sent its next prompt by then;
-                // an unscoped `agent.interrupt()` would kill that fresh run — the "turn ended as
-                // interrupted" report on a prompt the user just sent.
-                //
-                // The run id is not known at submit time (the dispatcher publishes it when it
-                // admits the command), so it is re-read every iteration and signalled as soon as
-                // it appears.
-                let mut signalled: Option<String> = task.run_id.clone();
-                if let Some(run_id) = signalled.as_deref() {
-                    self.agent.interrupt_run(run_id);
-                }
-
-                // A closed session has nobody left to answer (`session/close`, LRU eviction,
-                // host shutdown): close the turn now instead of waiting out the settle grace for
-                // a run that may never return (a hung provider). Waiting made teardown take the
-                // full 10s and left the client's `session/close` hanging. A live client keeps the
-                // grace below so the next prompt is not refused with "turn_unfinished" while the
-                // run is still winding down.
-                if !closed.load(Ordering::SeqCst) {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while std::time::Instant::now() < deadline {
-                        // Teardown while the run winds down: stop waiting, the session is gone.
-                        if closed.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let current = session.task(&task.command_id).await;
-                        let current = match current {
-                            Ok(current) => current,
-                            Err(_) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                continue;
-                            }
-                        };
-                        if current.settled() {
-                            break;
-                        }
-                        // Adopt the run id the moment the dispatcher publishes it, then keep the
-                        // signal aimed at that exact run.
-                        if signalled.is_none() {
-                            if let Some(run_id) = current.run_id.clone() {
-                                self.agent.interrupt_run(&run_id);
-                                signalled = Some(run_id);
-                            }
-                        }
-                        if let Some(run_id) = signalled.as_deref() {
-                            let _ = session.interrupt_run(run_id).await;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                }
-
-                // Close the turn before returning. `cancel_pending` retries the writer lease
-                // and settles pending interactions; `abandon_turn` additionally records unknown
-                // tool outcomes as interrupted. Both are needed: the run may have been
-                // interrupted mid-tool, and a turn left open would block the next prompt. Never
-                // fire-and-forget this — a silently failed close is exactly the "stuck session"
-                // symptom.
-                //
-                // A *closed* session is the one exception: no client is left and no later prompt
-                // can be rejected, while the still-live run holds the journal writer lease. There
-                // the close is attempted with a short bound instead of waiting out the lease, so
-                // `session/close` cannot hang on the very turn it is tearing down.
-                let closed_now = closed.load(Ordering::SeqCst);
-                let close = agentscope_core::journal::abandon_turn(session.log(), &task.turn_id);
-                let close = async {
-                    if closed_now {
-                        tokio::time::timeout(CLOSED_TURN_CLOSE_GRACE, close)
-                            .await
-                            .unwrap_or_else(|_| Ok(false))
-                    } else {
-                        close.await
-                    }
-                };
-                if let Err(error) = close.await {
+                // The command goes through the control runtime, not through the one the tick
+                // runs under: claiming under the tick's own owner would take and release the
+                // very lease the invocation is writing with.
+                if let Err(error) = runtime
+                    .control
+                    .cancel(runtime.session.thread(), &turn_id, &control_id("cancel"))
+                    .await
+                {
                     tracing::warn!(
                         session = %self.session_id,
-                        turn = %task.turn_id,
+                        turn = %turn_id,
                         %error,
-                        "failed to close the cancelled turn; the next prompt may be rejected"
+                        "could not request the cancellation; the turn may stay open"
                     );
                 }
+                // A closed session has nobody left to answer (`session/close`, LRU eviction,
+                // host shutdown): bound the wait so teardown cannot hang on the very turn it is
+                // tearing down. A live client keeps the longer grace so the next prompt is not
+                // admitted while the run is still winding down.
+                let grace = if closed.load(Ordering::SeqCst) {
+                    CLOSED_TURN_CLOSE_GRACE
+                } else {
+                    std::time::Duration::from_secs(10)
+                };
+                let deadline = std::time::Instant::now() + grace;
+                while std::time::Instant::now() < deadline {
+                    match runtime.session.turn(&turn_id).await {
+                        Ok(current) if current.status.terminal() => break,
+                        Ok(_) | Err(_) => {}
+                    }
+                    // Teardown while the run winds down: stop waiting, the session is gone.
+                    if closed.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                driver.finish().await;
                 return StopReason::Cancelled;
             }
 
-            // A watchdog fired: the command was never admitted, or the session stopped
-            // reporting. Report it instead of ending the turn silently (which looks like a hang
-            // to the client).
+            // A watchdog fired: the command was never admitted, or the durable state stopped
+            // being readable. Nothing ran (or nothing can be read), so there is no position
+            // worth keeping: end the turn instead of leaving it in front of the next prompt.
             if let Some(reason) = stall {
-                // Try to release whatever the abandoned attempt left open so the next prompt can
-                // start; failures here must not hide the original problem.
-                let _ = agentscope_core::journal::abandon_turn(session.log(), &task.turn_id).await;
+                let _ = runtime
+                    .control
+                    .cancel(runtime.session.thread(), &turn_id, &control_id("stall"))
+                    .await;
+                driver.finish().await;
                 emit(super::event::message_chunk(
                     self.session_id.clone(),
                     format!("Agent error: {reason}"),
@@ -3144,28 +3417,32 @@ impl AcpAgentSession {
             }
 
             // The inner loop can only exit without a receipt on cancel/stall (both handled
-            // above). Never report success for a run whose outcome is unknown.
+            // above). Never report success for a run whose outcome is unknown, and do not
+            // declare it dead either: suspending keeps whatever it already did resumable.
             let Some(current) = settled_task else {
-                let _ = agentscope_core::journal::abandon_turn(session.log(), &task.turn_id).await;
+                let _ = runtime
+                    .control
+                    .suspend(runtime.session.thread(), &turn_id, &control_id("suspend"))
+                    .await;
+                driver.finish().await;
                 emit(super::event::message_chunk(
                     self.session_id.clone(),
                     "Agent error: the run stopped without reporting a result; the turn was \
-                     closed, send a new prompt to continue"
+                     suspended, send a new prompt to continue"
                         .to_string(),
                     message_id_opt.clone(),
                 ));
                 return StopReason::Refusal;
             };
 
-            match current.status.as_str() {
+            match turn_status_name(current.status) {
                 "failed" => {
-                    // Prefer the error persisted with `run/end`; older journals (and a run
-                    // that settled between the last poll and the terminal write) may only
-                    // have the in-memory dispatch error.
+                    // The ending carries the failure the runtime recorded; there is no
+                    // in-memory dispatch error to fall back to, because the writer that
+                    // observed the failure is the one that wrote it.
                     let detail = current
                         .error
                         .clone()
-                        .or_else(|| session.execution_error())
                         .unwrap_or_else(|| "run failed".to_string());
                     // Core errors may already carry the `Agent error:` prefix (possibly more
                     // than once through wrapping); keep exactly one.
@@ -3173,27 +3450,7 @@ impl AcpAgentSession {
                     while let Some(rest) = detail.strip_prefix("Agent error: ") {
                         detail = rest;
                     }
-                    emit(super::event::message_chunk(
-                        self.session_id.clone(),
-                        format!("Agent error: {detail}"),
-                        message_id_opt.clone(),
-                    ));
-                    return StopReason::Refusal;
-                }
-                // The dispatcher refused the command (e.g. an earlier turn is still open).
-                // Ending the turn silently would leave the client believing the prompt ran.
-                "rejected" => {
-                    let detail = current
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "the turn was rejected by the session runtime".into());
-                    let detail = if detail == "turn_unfinished" {
-                        "The previous turn is still open, so this prompt could not start. Wait \
-                         for it to finish or cancel it, then send the prompt again."
-                            .to_string()
-                    } else {
-                        detail
-                    };
+                    driver.finish().await;
                     emit(super::event::message_chunk(
                         self.session_id.clone(),
                         format!("Agent error: {detail}"),
@@ -3202,7 +3459,7 @@ impl AcpAgentSession {
                     return StopReason::Refusal;
                 }
                 // The run stopped without a normal result. Interruption is the one case this
-                // client did not ask for: the turn is still open and resumable, so continue it
+                // client did not ask for: the turn is suspended and resumable, so continue it
                 // instead of throwing the user's prompt away. Hosts interrupt runs for
                 // transient reasons (shutdown sweeps, a raced cancel, a recovered process) and
                 // none of those are the user's problem.
@@ -3213,22 +3470,26 @@ impl AcpAgentSession {
                         "\n\n[run interrupted; continuing]\n\n".to_string(),
                         message_id_opt.clone(),
                     ));
-                    match session.resume(&task.turn_id).await {
-                        Ok(next) => {
-                            task = next;
-                            continue;
-                        }
+                    let resumed = runtime
+                        .control
+                        .resume(runtime.session.thread(), &turn_id, &control_id("resume"))
+                        .await;
+                    driver.finish().await;
+                    match resumed {
+                        Ok(_) => continue,
                         Err(error) => {
-                            let _ = agentscope_core::journal::abandon_turn(
-                                session.log(),
-                                &task.turn_id,
-                            )
-                            .await;
+                            // The turn cannot be continued (another writer already settled
+                            // it). Suspend rather than cancel: whatever the run did stays
+                            // resumable.
+                            let _ = runtime
+                                .control
+                                .suspend(runtime.session.thread(), &turn_id, &control_id("suspend"))
+                                .await;
                             emit(super::event::message_chunk(
                                 self.session_id.clone(),
                                 format!(
                                     "Agent error: the interrupted run could not be continued \
-                                     automatically: {error}. The turn was closed; send a new \
+                                     automatically: {error}. The turn was suspended; send a new \
                                      prompt to continue."
                                 ),
                                 message_id_opt.clone(),
@@ -3239,30 +3500,41 @@ impl AcpAgentSession {
                 }
                 "interrupted" => {
                     // Every resume was interrupted again. The environment, not the prompt, is
-                    // failing; close the turn so the session stays usable and say so without
+                    // failing; suspend it so the turn stays resumable and say so without
                     // refusing the turn at the protocol level.
-                    let _ =
-                        agentscope_core::journal::abandon_turn(session.log(), &task.turn_id).await;
+                    let _ = runtime
+                        .control
+                        .suspend(runtime.session.thread(), &turn_id, &control_id("suspend"))
+                        .await;
+                    driver.finish().await;
                     emit(super::event::message_chunk(
                         self.session_id.clone(),
                         "Agent error: the run kept being interrupted before it finished. The \
-                         turn was closed; send a new prompt to continue."
+                         turn was suspended; send a new prompt to continue."
                             .to_string(),
                         message_id_opt.clone(),
                     ));
                     return StopReason::EndTurn;
                 }
-                // `suspended` (an external tool result never arrived) and any other non-terminal
-                // outcome. Report it and close the turn so the next prompt is not blocked.
+                // A cancel this process did not issue (another writer stopped the turn).
+                "cancelled" => {
+                    driver.finish().await;
+                    return StopReason::Cancelled;
+                }
+                // `waiting` (an external answer never arrived) and any other non-terminal
+                // outcome. Report it and suspend the turn so the next prompt is not blocked.
                 status if status != "completed" => {
                     let detail = current.error.clone().unwrap_or_else(|| {
                         format!(
-                            "the run was {status} before it finished; the turn has been closed, \
-                             send a new prompt to continue"
+                            "the run was {status} before it finished; the turn has been \
+                             suspended, send a new prompt to continue"
                         )
                     });
-                    let _ =
-                        agentscope_core::journal::abandon_turn(session.log(), &task.turn_id).await;
+                    let _ = runtime
+                        .control
+                        .suspend(runtime.session.thread(), &turn_id, &control_id("suspend"))
+                        .await;
+                    driver.finish().await;
                     emit(super::event::message_chunk(
                         self.session_id.clone(),
                         format!("Agent error: {detail}"),
@@ -3290,6 +3562,7 @@ impl AcpAgentSession {
                             message_id_opt.clone(),
                         ));
                     }
+                    driver.finish().await;
                     return StopReason::EndTurn;
                 }
             }
