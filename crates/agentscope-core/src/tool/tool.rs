@@ -58,6 +58,30 @@ impl ToolExecutionContext {
         self.tool_request_config = Some(config);
         self
     }
+
+    /// The call's capability surface, when a [`CapabilityResolver`] ran for it.
+    ///
+    /// Read from the runtime map entry the agent funnel writes. `None` means unrestricted:
+    /// direct executions that never entered an agent call are trusted assembler code, the same
+    /// stance as the executor gate.
+    ///
+    /// [`CapabilityResolver`]: crate::agent::CapabilityResolver
+    pub fn capability_surface(&self) -> Option<crate::agent::CapabilitySurface> {
+        self.runtime
+            .get(crate::agent::CAPABILITY_SURFACE_RUNTIME_KEY)
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
+
+    /// Publishes the call's capability surface into the runtime map.
+    pub fn with_capability_surface(mut self, surface: crate::agent::CapabilitySurface) -> Self {
+        if let Ok(value) = serde_json::to_value(&surface) {
+            self.runtime.insert(
+                crate::agent::CAPABILITY_SURFACE_RUNTIME_KEY.to_string(),
+                value,
+            );
+        }
+        self
+    }
 }
 
 impl std::fmt::Debug for ToolExecutionContext {
@@ -108,6 +132,14 @@ pub trait Tool: Send + Sync {
     }
     /// Whether this tool is executed outside the framework.
     fn is_external(&self) -> bool {
+        false
+    }
+    /// Whether this is a framework capability (a meta tool the agent itself relies on).
+    ///
+    /// System tools bypass capability-surface trimming: revoking them would break the agent's
+    /// bookkeeping rather than withhold a capability from the caller. Mirrors Java
+    /// `AgentTool#isSystem`.
+    fn is_system(&self) -> bool {
         false
     }
     /// Whether multiple invocations may run in parallel.
@@ -213,6 +245,8 @@ pub struct FunctionTool {
     strict: bool,
     /// 是否允许与本工具的其他调用并发执行（见 [`Tool::is_concurrency_safe`]）。
     concurrency_safe: bool,
+    /// Framework capability mark (see [`Tool::is_system`]).
+    system: bool,
     handler: Box<dyn Fn(JsonMap, ToolExecutionContext) -> Result<ToolResultBlock> + Send + Sync>,
     rebind: Option<Box<dyn Fn(&super::toolkit::Toolkit) -> Arc<dyn Tool> + Send + Sync>>,
 }
@@ -237,6 +271,7 @@ impl FunctionTool {
             defer_loading: false,
             strict: false,
             concurrency_safe: true,
+            system: false,
             handler,
             rebind: None,
         }
@@ -273,6 +308,12 @@ impl FunctionTool {
     /// 默认 `true`（对齐 `Tool` trait 默认值）；`false` 时并行批次会把它退化为串行。
     pub fn concurrency_safe(mut self, v: bool) -> Self {
         self.concurrency_safe = v;
+        self
+    }
+
+    /// Marks this tool as a framework capability (see [`Tool::is_system`]).
+    pub fn system(mut self, v: bool) -> Self {
+        self.system = v;
         self
     }
 
@@ -320,6 +361,9 @@ impl Tool for FunctionTool {
     }
     fn is_strict(&self) -> bool {
         self.strict
+    }
+    fn is_system(&self) -> bool {
+        self.system
     }
     fn is_concurrency_safe(&self) -> bool {
         self.concurrency_safe

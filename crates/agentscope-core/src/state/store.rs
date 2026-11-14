@@ -584,11 +584,29 @@ impl JsonFileAgentStateStore {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let tmp = path.with_extension("tmp");
-        tokio::fs::write(&tmp, content).await?;
-        tokio::fs::rename(&tmp, path).await?;
+        // A fixed ".tmp" sibling races when two tasks persist the same state concurrently: one
+        // task's rename consumes the file the other is still writing. Unique temporary names are
+        // never reclaimed by a later write, so a failed one must be removed explicitly
+        // (mirrors Java #4048).
+        let tmp = unique_tmp_sibling(path);
+        if let Err(error) = tokio::fs::write(&tmp, content).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(error.into());
+        }
+        if let Err(error) = tokio::fs::rename(&tmp, path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(error.into());
+        }
         Ok(())
     }
+}
+
+fn unique_tmp_sibling(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    path.with_file_name(format!("{name}.{}.tmp", uuid::Uuid::new_v4()))
 }
 
 #[async_trait]
@@ -1009,6 +1027,72 @@ mod try_variants {
             .unwrap();
         assert!(store.try_get_list(None, "s", "l").await.is_err());
 
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "agentscope-atomic-{tag}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    /// Two concurrent writes of one key must never share a temporary file: a shared name lets
+    /// one rename consume the file the other is still writing (Java #4048).
+    #[test]
+    fn temporary_siblings_are_unique_per_write() {
+        let target = Path::new("state").join("s").join("k.json");
+        let first = unique_tmp_sibling(&target);
+        let second = unique_tmp_sibling(&target);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), target.parent());
+        assert!(first.to_string_lossy().ends_with(".tmp"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_saves_leave_an_intact_value_and_no_temporary_files() {
+        let root = temp_root("concurrent");
+        let store = Arc::new(JsonFileAgentStateStore::new(root.clone()));
+        let mut tasks = Vec::new();
+        for task in 0..8 {
+            let store = Arc::clone(&store);
+            tasks.push(tokio::spawn(async move {
+                for i in 0..20 {
+                    store
+                        .try_save(None, "s", "k", serde_json::json!({"task": task, "i": i}))
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        // Whichever write landed last, the file must be one complete document.
+        let value = store.get(None, "s", "k").await.expect("a saved value");
+        assert!(
+            value.get("task").is_some() && value.get("i").is_some(),
+            "{value}"
+        );
+        let mut entries = tokio::fs::read_dir(root.join("__anon__").join("s"))
+            .await
+            .unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(
+                !entry.file_name().to_string_lossy().ends_with(".tmp"),
+                "leftover temporary: {:?}",
+                entry.file_name()
+            );
+        }
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

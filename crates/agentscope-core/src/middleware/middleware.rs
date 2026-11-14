@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use super::active_points::ActivePointsResolver;
 use super::input::{ActingInput, AgentInput, EventStream, ModelCallInput, ReasoningInput};
 use crate::agent::RuntimeContext;
 use crate::message::Msg;
@@ -138,8 +139,15 @@ pub trait Middleware: Send + Sync {
     /// behaviour. An empty set disables the middleware at every point while keeping
     /// its registration.
     ///
-    /// Activation is decided once when the agent is built. Mirrors Java
-    /// `MiddlewareBase.activePoints()`.
+    /// Every implementation should declare exactly the points its hooks cover. Java's
+    /// `MiddlewareBase.activePoints()` returns `null` by default and then infers the
+    /// points from the hook methods the class implements; Rust cannot inspect which
+    /// hook methods a type overrides, so an undeclared middleware keeps the default
+    /// (every point) instead of being narrowed.
+    ///
+    /// Activation is decided once, when the agent's middleware chain is built; a
+    /// later change to the returned set has no effect on an already-built agent.
+    /// Mirrors Java `MiddlewareBase.activePoints()`.
     fn active_points(&self) -> Vec<ExtensionPoint> {
         ExtensionPoint::ALL.to_vec()
     }
@@ -178,7 +186,21 @@ impl ExtensionPoint {
         ExtensionPoint::OnPreCall,
         ExtensionPoint::OnAgentStateReady,
     ];
+
+    /// Number of extension points, i.e. the length of [`ExtensionPoint::ALL`].
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Position of this point in [`ExtensionPoint::ALL`], used to index the per-point
+    /// participant table.
+    pub fn index(self) -> usize {
+        self as usize
+    }
 }
+
+/// Participants of every extension point, indexed by [`ExtensionPoint::index`].
+///
+/// Points without participants hold an empty bucket.
+pub type PointParticipants = [Vec<Arc<dyn Middleware>>; ExtensionPoint::COUNT];
 
 /// A chain of middleware executed in order (onion pattern).
 ///
@@ -187,6 +209,12 @@ impl ExtensionPoint {
 #[derive(Clone)]
 pub struct MiddlewareChain {
     middlewares: Vec<Arc<dyn Middleware>>,
+    /// Participants per point, resolved whenever a middleware is added.
+    ///
+    /// Activation is decided once, so a middleware that changes its declaration later
+    /// no longer affects a built chain (Java `ReActAgent.groupedMiddlewares`, frozen at
+    /// construction).
+    grouped: PointParticipants,
 }
 
 impl Default for MiddlewareChain {
@@ -200,6 +228,7 @@ impl MiddlewareChain {
     pub fn new() -> Self {
         Self {
             middlewares: Vec::new(),
+            grouped: std::array::from_fn(|_| Vec::new()),
         }
     }
 
@@ -207,8 +236,7 @@ impl MiddlewareChain {
     /// [`Middleware::order`]. `sort_by` is stable, so equal priorities retain
     /// registration order (Java `Comparator.comparingInt(order).reversed()`).
     pub fn add(&mut self, mw: Box<dyn Middleware>) {
-        self.middlewares.push(Arc::from(mw));
-        self.sort_by_order();
+        self.add_arc(Arc::from(mw));
     }
 
     /// Adds an already-`Arc`-wrapped middleware to the chain.
@@ -218,6 +246,7 @@ impl MiddlewareChain {
     pub fn add_arc(&mut self, mw: Arc<dyn Middleware>) {
         self.middlewares.push(mw);
         self.sort_by_order();
+        self.grouped = ActivePointsResolver::group_by_point(&self.middlewares);
     }
 
     fn sort_by_order(&mut self) {
@@ -238,13 +267,12 @@ impl MiddlewareChain {
     /// (higher [`Middleware::order`] first; ties keep registration order).
     ///
     /// A middleware participates when its [`Middleware::active_points`] contains
-    /// `point`. Points with no participants yield an empty slice, which lets the
-    /// caller skip building a wrapper layer entirely (Java `activePoints()`).
+    /// `point`; the grouping was resolved when the middleware was added, so an
+    /// already-built chain ignores later declaration changes. Points with no
+    /// participants yield an empty slice, which lets the caller skip building a
+    /// wrapper layer entirely (Java `activePoints()`).
     pub fn participants(&self, point: ExtensionPoint) -> Vec<&Arc<dyn Middleware>> {
-        self.middlewares
-            .iter()
-            .filter(|mw| mw.active_points().contains(&point))
-            .collect()
+        self.grouped[point.index()].iter().collect()
     }
 
     /// Runs the async pre-call hooks with the full restored state snapshot.
@@ -413,6 +441,17 @@ mod tests {
         fn order(&self) -> i32 {
             self.0
         }
+    }
+
+    #[test]
+    fn every_point_is_indexed_by_its_declaration_order() {
+        // `PointParticipants` is indexed by `ExtensionPoint::index`, so the enum's
+        // declaration order must stay in sync with `ExtensionPoint::ALL`.
+        let indexes: Vec<usize> = ExtensionPoint::ALL
+            .iter()
+            .map(|point| point.index())
+            .collect();
+        assert_eq!(indexes, (0..ExtensionPoint::COUNT).collect::<Vec<_>>());
     }
 
     #[test]

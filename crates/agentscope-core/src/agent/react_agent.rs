@@ -85,6 +85,9 @@ struct AgentCore {
     /// Observer notified when the fallback takes over. Mirrors Java
     /// `ModelConfig.failoverListener`.
     failover_listener: Option<Arc<dyn crate::agent::FailoverListener>>,
+    /// Computes the caller's capability surface once per call (Java
+    /// `ReActAgent.capabilityResolver`).
+    capability_resolver: Option<Arc<dyn crate::agent::CapabilityResolver>>,
     /// Resolves a per-call model id to the model that serves the call.
     ///
     /// Mirrors Java `ModelRegistry#resolve`, which Rust cannot reproduce: its registry is a
@@ -536,12 +539,14 @@ impl ReActAgent {
     /// The model that serves a call carrying `context`. Mirrors Java
     /// `ReActAgent#getModel(RuntimeContext)`.
     ///
-    /// A per-call [`crate::agent::RuntimeContext::model_id`] wins over the default model and is
-    /// resolved through [`ReActAgentBuilder::model_resolver`]; a set-but-blank or unresolvable id
-    /// fails the call rather than silently using the default model (the wrong model — and, in a
-    /// multi-tenant host, the wrong credentials — is worse than a failed call). Callers that
-    /// stamp the selection per run use [`ReActAgent::call_with_model`] or
-    /// [`crate::agent::MODEL_ID_CONTEXT_KEY`].
+    /// Priority: a model pinned on the context
+    /// ([`crate::agent::MODEL_CONTEXT_KEY`]) outranks a per-call
+    /// [`crate::agent::RuntimeContext::model_id`], which is resolved through
+    /// [`ReActAgentBuilder::model_resolver`] and outranks the agent's default model. A
+    /// set-but-blank or unresolvable id fails the call rather than silently using the default
+    /// model (the wrong model — and, in a multi-tenant host, the wrong credentials — is worse
+    /// than a failed call). Callers that stamp the selection per run use
+    /// [`ReActAgent::call_with_model`] or [`crate::agent::MODEL_ID_CONTEXT_KEY`].
     pub fn effective_model(
         &self,
         context: &crate::agent::RuntimeContext,
@@ -977,6 +982,55 @@ impl ReActAgent {
         ctx.model_id = extensions
             .get::<String>(MODEL_ID_CONTEXT_KEY)
             .map(|model_id| model_id.as_str().to_string());
+        // Java `resolveModelAtEntry`: the model is decided once, at run entry, and memoized on
+        // the context. Every later model boundary of the run then reads the pinned instance, so
+        // a rotating resolver can never switch the model mid-response, and an identity that
+        // cannot be resolved fails the run here instead of quietly falling back. Must happen
+        // before `ctx` is cloned for the middleware chain, or the pin would not reach it.
+        if ctx.pinned_model().is_none() && ctx.model_id.is_some() {
+            match effective_model(&self.core, &ctx) {
+                Ok(model) => ctx.set_pinned_model(model),
+                Err(error) => {
+                    // Publish the cause through both channels: `call` reads the slot, streamed
+                    // callers read the events. A run that only reported "produced no result
+                    // message" would hide the bad model selection.
+                    let event_error = Error::Agent(error.to_string());
+                    let slot: Arc<Mutex<Option<Result<Msg>>>> =
+                        Arc::new(Mutex::new(Some(Err(error))));
+                    return (
+                        Box::pin(futures::stream::once(async move { Err(event_error) })),
+                        slot,
+                    );
+                }
+            }
+        }
+        // Capability surface (Java `ReActAgent.capabilityResolver`): resolved once, at call
+        // entry, before any middleware / sandbox acquire / skill staging observes the call, so
+        // every gate downstream reads the same enumeration. A resolver failure aborts the call —
+        // an authorization infrastructure failure is not "no grants".
+        if let Some(resolver) = &self.core.capability_resolver {
+            match resolver.resolve(&ctx) {
+                Ok(Some(surface)) => {
+                    ctx.extensions.insert_arc(
+                        crate::agent::CAPABILITY_SURFACE_CONTEXT_KEY,
+                        Arc::new(surface),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // The failure must reach both the event stream and the call slot: a slot that
+                    // stays empty makes `call` report "produced no result message" and hides the
+                    // resolver failure.
+                    let event_error = Error::Agent(error.to_string());
+                    let slot: Arc<Mutex<Option<Result<Msg>>>> =
+                        Arc::new(Mutex::new(Some(Err(error))));
+                    return (
+                        Box::pin(futures::stream::once(async move { Err(event_error) })),
+                        slot,
+                    );
+                }
+            }
+        }
         // Every streamed run needs its own interrupt control, exactly like the `call` path
         // does. Without one, `check_interrupted` falls back to the agent-level flag, which
         // `interrupt()` sets when no run is registered and which nothing ever clears: the
@@ -1262,10 +1316,13 @@ impl ReActAgent {
                     // streamed, so the emitter (still carrying the call id) discards.
                     let tctx = tool_execution_context(tc, Default::default(), &None, None, "");
                     if let Ok(rb) = toolkit.call_tool(tc, tctx).await {
+                        // Bind the call id/name like the acting path does: the cleanup that
+                        // follows the structured reply identifies these results by name.
+                        let bound = bind_result(tc, rb);
                         self.core.state.lock().unwrap().context_mut().push(
                             Msg::builder()
                                 .role(MsgRole::Tool)
-                                .content(vec![ContentBlock::ToolResult(rb)])
+                                .content(vec![ContentBlock::ToolResult(bound)])
                                 .build(),
                         );
                     }
@@ -1323,6 +1380,15 @@ impl ReActAgent {
         let mut reply = builder.build();
         if let Some(s) = structured {
             reply = reply.with_structured_data(s);
+        }
+        if so_reply.is_some() {
+            // The `generate_response` scaffolding is internal: drop it from the conversation
+            // and keep only what the next turn must see. Mixed messages keep their business
+            // tool calls, otherwise their results are left without the call that produced
+            // them (Java `compressStructuredOutputContext` + appending the final reply).
+            let mut state = self.core.state.lock().unwrap();
+            compress_structured_output_context(&mut state);
+            state.context_mut().push(reply.clone());
         }
         Ok(reply)
     }
@@ -1459,6 +1525,7 @@ pub struct ReActAgentBuilder {
     recording_policy: crate::session::RecordingPolicy,
     event_only_tool_metadata: Vec<String>,
     model_resolver: Option<Arc<dyn Fn(&str) -> Option<Arc<dyn Model>> + Send + Sync>>,
+    capability_resolver: Option<Arc<dyn crate::agent::CapabilityResolver>>,
 }
 
 impl Default for ReActAgentBuilder {
@@ -1489,6 +1556,7 @@ impl Default for ReActAgentBuilder {
             recording_policy: crate::session::RecordingPolicy::default(),
             event_only_tool_metadata: Vec::new(),
             model_resolver: None,
+            capability_resolver: None,
         }
     }
 }
@@ -1532,6 +1600,20 @@ impl ReActAgentBuilder {
         F: Fn(&str) -> Option<Arc<dyn Model>> + Send + Sync + 'static,
     {
         self.model_resolver = Some(Arc::new(resolver));
+        self
+    }
+
+    /// Sets the per-call capability resolver (Java `ReActAgent.Builder.capabilityResolver`).
+    ///
+    /// The resolver runs once at call entry, on the call's [`RuntimeContext`] (caller identity),
+    /// and the resulting [`CapabilitySurface`](crate::agent::CapabilitySurface) trims the tool
+    /// schemas the model sees **and** gates execution. `Ok(None)` = unrestricted; an error aborts
+    /// the call.
+    pub fn capability_resolver(
+        mut self,
+        resolver: Arc<dyn crate::agent::CapabilityResolver>,
+    ) -> Self {
+        self.capability_resolver = Some(resolver);
         self
     }
     /// Sets the fallback model, invoked once the primary exhausts its retry budget.
@@ -1737,6 +1819,7 @@ impl ReActAgentBuilder {
             model: Mutex::new(model),
             fallback_model: self.fallback_model,
             failover_listener: self.failover_listener,
+            capability_resolver: self.capability_resolver,
             model_resolver: self.model_resolver,
             generate_options_defaults: Mutex::new(GenerateOptions::default()),
             toolkit,
@@ -2298,9 +2381,10 @@ async fn reasoning_phase(
     let tool_request_config = ctx.extension::<crate::tool::ToolRequestConfig>(
         crate::tool::tool_request_config::TOOL_REQUEST_CONFIG_CONTEXT_KEY,
     );
-    let tools = core
-        .toolkit
-        .tool_schemas_with(tool_request_config.as_deref());
+    let tools = core.toolkit.tool_schemas_for_call(
+        tool_request_config.as_deref(),
+        crate::agent::capability_surface_from_context(ctx).as_deref(),
+    );
     // The model that serves *this* call (Java `getModel(scope.rc)`): a per-call selection may
     // name a different model than the build-time default, and everything below — the request's
     // model name, the journaled call and the usage tag — has to describe the model that
@@ -2536,13 +2620,20 @@ async fn model_call_through_chain(
 /// The model that serves a call carrying `context`. Mirrors Java
 /// `ReActAgent#getModel(RuntimeContext)`.
 ///
-/// A per-call `model_id` is resolved through the builder's `model_resolver`; without one (or
-/// with an unknown id) the call fails instead of silently using the default model. `None` —
-/// the overwhelmingly common case — returns the agent's default model.
+/// Priority: a model pinned on the context (Java's `RuntimeContext.put(Model.class, …)` slot)
+/// outranks a per-call `model_id`, which is resolved through the builder's `model_resolver` and
+/// outranks the agent's build-time model. Without a resolver (or with an unknown id) a per-call
+/// selection fails the call instead of silently using the default model. `None` for both — the
+/// overwhelmingly common case — returns the agent's default model.
 fn effective_model(
     core: &Arc<AgentCore>,
     context: &crate::agent::RuntimeContext,
 ) -> Result<Arc<dyn Model>> {
+    // A pinned instance is the run's decision (resolved at run entry, or pinned by the caller
+    // / a middleware); re-resolving below would let the model switch mid-response.
+    if let Some(pinned) = context.pinned_model() {
+        return Ok(pinned);
+    }
     let Some(model_id) = context.model_id() else {
         return Ok(core.model.lock().unwrap().clone());
     };
@@ -3397,6 +3488,16 @@ fn tool_runtime(ctx: &crate::agent::RuntimeContext, history: &[Msg]) -> JsonMap 
             serde_json::Value::String(aid.to_string()),
         );
     }
+    // The call's capability surface, so tool-side gates inside the tool body (the skill load
+    // tool) can enforce the same enumeration the schema trimming used.
+    if let Some(surface) = crate::agent::capability_surface_from_context(ctx) {
+        if let Ok(value) = serde_json::to_value(surface.as_ref()) {
+            rt.insert(
+                crate::agent::CAPABILITY_SURFACE_RUNTIME_KEY.to_string(),
+                value,
+            );
+        }
+    }
     // Tools that need "what was said so far" read the history from this entry instead of a
     // structural field on `ToolExecutionContext`. Only the tail is passed: Java hands the
     // whole history to every tool call, the runtime channel caps it to bound the per-call
@@ -3974,6 +4075,25 @@ async fn run_acting_calls(
                     emit_tool_result_start(&run.ctx.delta_tx, &call.id, &call.name);
                     let confirm_result = handler(call.clone()).await;
                     if confirm_result.is_confirmed() {
+                        // Remember the rules the user accepted ("always allow/reject"). They go
+                        // into the engine *and* into the call-scoped state: with a state store
+                        // configured, every call rebuilds the engine from the persisted
+                        // permission context, so an engine-only addition would be lost at the
+                        // next call boundary (Java #3369).
+                        if !confirm_result.rules.is_empty() {
+                            let context = {
+                                let mut engine = run.core.permission_engine.lock().unwrap();
+                                for rule in &confirm_result.rules {
+                                    engine.add_rule(rule.clone());
+                                }
+                                engine.context().clone()
+                            };
+                            run.core
+                                .state
+                                .lock()
+                                .unwrap()
+                                .set_permission_context(context);
+                        }
                         // Use the (possibly modified) tool call if the user tweaked input.
                         let effective_call = confirm_result.tool_call.as_ref().unwrap_or(call);
                         emit_tool_result_start(
@@ -4326,6 +4446,107 @@ fn structured_output_reminder(schema: &JsonSchema) -> Msg {
         ))
         .metadata(metadata)
         .build()
+}
+
+/// Removes the structured-output scaffolding from the conversation context.
+///
+/// A message belongs to that scaffolding when it is the synthetic reminder, carries a
+/// `generate_response` call, or carries nothing but `generate_response` results. Pure
+/// scaffolding messages are dropped. A message that mixes a business call with the internal
+/// one keeps its business calls: dropping it would orphan the business result that answers
+/// them, and the next turn would send a tool result no assistant message asked for. The
+/// retained copy also loses the token usage, which was already charged to the final
+/// structured reply (Java `compressStructuredOutputContext`).
+fn compress_structured_output_context(state: &mut AgentState) {
+    let context = state.context_mut();
+    let original = std::mem::take(context);
+    // Tool results that survive in this context. The degraded path never executes business
+    // tools, so a business call without a result would be sent to the provider as a dangling
+    // `tool_use`; only calls that are actually answered may be kept.
+    let answered: std::collections::HashSet<String> = original
+        .iter()
+        .flat_map(|message| message.content().iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult(result) => result.id.clone(),
+            _ => None,
+        })
+        .collect();
+    for message in original {
+        if !is_structured_output_related(&message) {
+            context.push(message);
+            continue;
+        }
+        if message
+            .metadata()
+            .get(crate::message::keys::metadata_keys::STRUCTURED_OUTPUT_REMINDER)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let retained: Vec<ContentBlock> = message
+            .content()
+            .iter()
+            .filter(|block| match block {
+                ContentBlock::ToolUse(call) => {
+                    call.name != STRUCTURED_OUTPUT_TOOL_NAME && answered.contains(&call.id)
+                }
+                ContentBlock::ToolResult(result) => {
+                    result.name.as_deref() != Some(STRUCTURED_OUTPUT_TOOL_NAME)
+                }
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        if !retained
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse(_)))
+        {
+            continue;
+        }
+        let mut metadata = message.metadata().clone();
+        metadata.remove(crate::message::keys::metadata_keys::CHAT_USAGE);
+        let mut builder = Msg::builder()
+            .role(message.role())
+            .id(message.id())
+            .content(retained)
+            .metadata(metadata)
+            .timestamp(message.timestamp());
+        if let Some(name) = message.name() {
+            builder = builder.name(name);
+        }
+        context.push(builder.build());
+    }
+}
+
+/// Whether `message` exists only because of the synthetic `generate_response` tool.
+fn is_structured_output_related(message: &Msg) -> bool {
+    if message
+        .metadata()
+        .get(crate::message::keys::metadata_keys::STRUCTURED_OUTPUT_REMINDER)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if message
+        .tool_use_blocks()
+        .any(|call| call.name == STRUCTURED_OUTPUT_TOOL_NAME)
+    {
+        return true;
+    }
+    let results: Vec<_> = message
+        .content()
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .collect();
+    !results.is_empty()
+        && results
+            .iter()
+            .all(|result| result.name.as_deref() == Some(STRUCTURED_OUTPUT_TOOL_NAME))
 }
 
 /// Aborts execution if the caller cancelled it, or if the call's own run was interrupted.
@@ -8596,6 +8817,181 @@ mod tests {
         assert_eq!(data["age"], serde_json::json!(42));
     }
 
+    /// The cleanup keeps the business history of a mixed structured-output batch.
+    ///
+    /// A model may answer with a business tool call and the internal `generate_response`
+    /// call in the same message. Dropping that message wholesale (the pre-#4086 behaviour)
+    /// leaves the business result without the call that produced it.
+    #[test]
+    fn structured_output_cleanup_keeps_the_business_tool_history() {
+        let mut state = AgentState::builder()
+            .context(vec![
+                Msg::user("go"),
+                structured_output_reminder(&crate::formatter::JsonSchema::new(
+                    "person",
+                    serde_json::Map::new(),
+                )),
+                Msg::builder()
+                    .id("mixed")
+                    .role(MsgRole::Assistant)
+                    .content(vec![
+                        ContentBlock::ToolUse(ToolUseBlock::new(
+                            "business-1",
+                            "lookup",
+                            JsonMap::new(),
+                        )),
+                        ContentBlock::ToolUse(ToolUseBlock::new(
+                            "so-1",
+                            STRUCTURED_OUTPUT_TOOL_NAME,
+                            JsonMap::new(),
+                        )),
+                    ])
+                    .usage(ChatUsage::builder().input_tokens(7).build())
+                    .build(),
+                // A message carrying a business *and* an internal result is kept whole:
+                // only a message whose results are all internal counts as scaffolding.
+                Msg::builder()
+                    .role(MsgRole::Tool)
+                    .content(vec![
+                        ContentBlock::ToolResult(ToolResultBlock::new(
+                            "business-1",
+                            "lookup",
+                            vec![ContentBlock::Text(TextBlock::new("42"))],
+                        )),
+                        ContentBlock::ToolResult(ToolResultBlock::new(
+                            "so-1",
+                            STRUCTURED_OUTPUT_TOOL_NAME,
+                            vec![ContentBlock::Text(TextBlock::new("{}"))],
+                        )),
+                    ])
+                    .build(),
+                Msg::builder()
+                    .id("pure-so")
+                    .role(MsgRole::Assistant)
+                    .content(vec![ContentBlock::ToolUse(ToolUseBlock::new(
+                        "so-2",
+                        STRUCTURED_OUTPUT_TOOL_NAME,
+                        JsonMap::new(),
+                    ))])
+                    .build(),
+                Msg::builder()
+                    .role(MsgRole::Tool)
+                    .content(vec![ContentBlock::ToolResult(ToolResultBlock::new(
+                        "so-2",
+                        STRUCTURED_OUTPUT_TOOL_NAME,
+                        vec![ContentBlock::Text(TextBlock::new("{}"))],
+                    ))])
+                    .build(),
+            ])
+            .build();
+
+        compress_structured_output_context(&mut state);
+
+        let context = state.context();
+        assert_eq!(
+            context.len(),
+            3,
+            "the reminder and the pure internal turn must be dropped: {context:#?}"
+        );
+        let kept = &context[1];
+        assert_eq!(kept.id(), "mixed");
+        let calls: Vec<_> = kept.tool_use_blocks().collect();
+        assert_eq!(calls.len(), 1, "only the business call may survive");
+        assert_eq!(calls[0].name, "lookup");
+        assert!(
+            kept.usage().is_none(),
+            "the usage was already charged to the final structured reply"
+        );
+    }
+
+    /// The degraded path does not execute business tools, so a business call that never got a
+    /// result must not be retained: it would reach the provider without its `tool_result`.
+    #[test]
+    fn structured_output_cleanup_drops_an_unanswered_business_call() {
+        let mut state = AgentState::builder()
+            .context(vec![
+                Msg::user("go"),
+                Msg::builder()
+                    .id("mixed")
+                    .role(MsgRole::Assistant)
+                    .content(vec![
+                        ContentBlock::ToolUse(ToolUseBlock::new(
+                            "business-1",
+                            "lookup",
+                            JsonMap::new(),
+                        )),
+                        ContentBlock::ToolUse(ToolUseBlock::new(
+                            "so-1",
+                            STRUCTURED_OUTPUT_TOOL_NAME,
+                            JsonMap::new(),
+                        )),
+                    ])
+                    .build(),
+                Msg::builder()
+                    .role(MsgRole::Tool)
+                    .content(vec![ContentBlock::ToolResult(ToolResultBlock::new(
+                        "so-1",
+                        STRUCTURED_OUTPUT_TOOL_NAME,
+                        vec![ContentBlock::Text(TextBlock::new("{}"))],
+                    ))])
+                    .build(),
+            ])
+            .build();
+
+        compress_structured_output_context(&mut state);
+
+        let context = state.context();
+        assert_eq!(
+            context.len(),
+            1,
+            "an unanswered business call and its internal result must go: {context:#?}"
+        );
+        assert_eq!(context[0].text_content(), "go");
+    }
+
+    /// The fallback structured-output path must not leave the synthetic exchange in the
+    /// conversation: the next turn sees the question and the structured answer only.
+    #[tokio::test]
+    async fn fallback_structured_output_leaves_only_the_final_reply_in_history() {
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response(
+                "g1",
+                STRUCTURED_OUTPUT_TOOL_NAME,
+                structured_response_input(),
+            )],
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-so-history")
+            .model(model)
+            .build()
+            .unwrap();
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".into(), serde_json::json!("object"));
+        let reply = agent
+            .call_with_schema(
+                vec![Msg::user("give json")],
+                crate::formatter::JsonSchema::new("person", schema),
+            )
+            .await
+            .unwrap();
+        assert!(reply.has_structured_data());
+
+        let context = agent.core.state.lock().unwrap().context().to_vec();
+        assert_eq!(
+            context.len(),
+            2,
+            "expected the input and the reply: {context:#?}"
+        );
+        assert_eq!(context[1].id(), reply.id());
+        assert!(
+            context.iter().all(|m| m
+                .tool_use_blocks()
+                .all(|call| call.name != STRUCTURED_OUTPUT_TOOL_NAME)),
+            "the synthetic `{STRUCTURED_OUTPUT_TOOL_NAME}` exchange must be gone"
+        );
+    }
+
     /// The `generate_response` arguments used by the structured-output tests.
     fn structured_response_input() -> JsonMap {
         let mut input = JsonMap::new();
@@ -9792,6 +10188,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pinned_model_outranks_the_per_call_selection() {
+        // Java `c05e4b91f`: `RuntimeContext.put(Model.class, …)` is the typed channel for a
+        // model already decided — by the caller, or by a middleware adapting to a per-request
+        // need — and it outranks the per-call id and the build-time instance.
+        let primary = Arc::new(MockModel::new(
+            "primary",
+            vec![text_response("from primary")],
+        ));
+        let specialist: Arc<dyn Model> = Arc::new(MockModel::new(
+            "specialist",
+            vec![text_response("from specialist")],
+        ));
+        let pinned: Arc<dyn Model> =
+            Arc::new(MockModel::new("pinned", vec![text_response("from pinned")]));
+        let resolved: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let resolver = {
+            let specialist = Arc::clone(&specialist);
+            let resolved = Arc::clone(&resolved);
+            move |model_id: &str| {
+                resolved.lock().unwrap().push(model_id.to_string());
+                (model_id == "specialist").then(|| Arc::clone(&specialist))
+            }
+        };
+        let agent = ReActAgent::builder()
+            .name("t-pinned-model")
+            .model(primary)
+            .model_resolver(resolver)
+            .build()
+            .unwrap();
+
+        let mut extensions = crate::agent::Extensions::new();
+        extensions.insert(MODEL_ID_CONTEXT_KEY, "specialist".to_string());
+        extensions.insert(crate::agent::MODEL_CONTEXT_KEY, Arc::clone(&pinned));
+        let reply = agent
+            .call_with_format_and_extensions(vec![Msg::user("hi")], None, extensions)
+            .await
+            .unwrap();
+
+        assert_eq!(reply.text_content(), "from pinned");
+        assert!(
+            resolved.lock().unwrap().is_empty(),
+            "a pinned model must serve the call without resolving the per-call id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_call_model_is_decided_once_per_run() {
+        // Java `resolveModelAtEntry` + the memoized `Model.class` slot: the model is decided
+        // once at run entry, so a rotation between two reasoning boundaries of the same run
+        // cannot switch the model mid-response.
+        let primary = Arc::new(MockModel::new(
+            "primary",
+            vec![text_response("from primary")],
+        ));
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let first: Arc<dyn Model> = Arc::new(MockModel::new(
+            "first",
+            vec![
+                tool_use_response("c1", "add", input),
+                text_response("from first"),
+            ],
+        ));
+        let second: Arc<dyn Model> =
+            Arc::new(MockModel::new("second", vec![text_response("from second")]));
+        let resolutions = Arc::new(Mutex::new(0usize));
+        let resolver = {
+            let first = Arc::clone(&first);
+            let second = Arc::clone(&second);
+            let resolutions = Arc::clone(&resolutions);
+            move |_model_id: &str| {
+                let mut seen = resolutions.lock().unwrap();
+                *seen += 1;
+                Some(if *seen == 1 {
+                    Arc::clone(&first)
+                } else {
+                    Arc::clone(&second)
+                })
+            }
+        };
+        let agent = ReActAgent::builder()
+            .name("t-model-decided-once")
+            .model(primary)
+            .toolkit(toolkit)
+            .model_resolver(resolver)
+            .build()
+            .unwrap();
+
+        let reply = agent
+            .call_with_model(vec![Msg::user("compute")], "rotating")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reply.text_content(),
+            "from first",
+            "the second reasoning boundary must reuse the model the run started with"
+        );
+        assert_eq!(
+            *resolutions.lock().unwrap(),
+            1,
+            "a per-call selection is resolved once per run, not at every model boundary"
+        );
+        assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn an_unnamed_agent_falls_back_to_its_agent_id_for_the_session_identity() {
         // Java `d30a6c92f`: without a usable name the journal identity used to be built from a
         // blank name, which `SessionKey` rejects — the session journal was silently disabled.
@@ -9879,6 +10386,204 @@ mod tests {
             *counter.lock().unwrap(),
             0,
             "the persisted deny rule must be enforced"
+        );
+    }
+
+    /// Records the tool schemas of every request, i.e. exactly what the model can see.
+    struct ToolsRecordingModel {
+        responses: Arc<Mutex<Vec<ChatResponse>>>,
+        seen_tools: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl Model for ToolsRecordingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            self.seen_tools
+                .lock()
+                .unwrap()
+                .push(tools.iter().map(|t| t.name.clone()).collect());
+            let responses = Arc::clone(&self.responses);
+            Box::pin(futures::stream::once(async move {
+                let mut g = responses.lock().unwrap();
+                let r = if g.is_empty() {
+                    text_response("done")
+                } else {
+                    g.remove(0)
+                };
+                Ok(r)
+            }))
+        }
+        fn model_name(&self) -> &str {
+            "tools-recording"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_capability_resolver_trims_what_the_model_sees_and_what_it_can_run() {
+        let executed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let executions = Arc::clone(&executed);
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "add",
+            "adds two integers",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_args: JsonMap, _ctx: ToolExecutionContext| Ok(ToolResultBlock::text("3"))),
+        )));
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "execute",
+            "runs a shell command",
+            serde_json::json!({"type": "object"}),
+            Box::new(move |_args: JsonMap, _ctx: ToolExecutionContext| {
+                *executions.lock().unwrap() += 1;
+                Ok(ToolResultBlock::text("ran"))
+            }),
+        )));
+
+        let seen_tools = Arc::new(Mutex::new(Vec::new()));
+        let model = Arc::new(ToolsRecordingModel {
+            responses: Arc::new(Mutex::new(vec![
+                // The model tries the ungranted tool anyway: it must be refused at the gate.
+                tool_use_response("c1", "execute", JsonMap::new()),
+                text_response("done"),
+            ])),
+            seen_tools: Arc::clone(&seen_tools),
+        });
+        let resolver: Arc<dyn crate::agent::CapabilityResolver> =
+            Arc::new(|_ctx: &crate::agent::RuntimeContext| {
+                Ok(Some(crate::agent::CapabilitySurface::new(
+                    None,
+                    None,
+                    Some(["add".to_string()].into_iter().collect()),
+                )))
+            });
+        let agent = ReActAgent::builder()
+            .name("t-capability")
+            .model(model)
+            .toolkit(toolkit)
+            .capability_resolver(resolver)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("go")]).await.unwrap();
+        assert_eq!(reply.text_content(), "done");
+        // What the model saw: only the granted tool.
+        let seen = seen_tools.lock().unwrap();
+        assert_eq!(seen[0], vec!["add".to_string()]);
+        assert_eq!(seen.len(), 2, "the follow-up reasoning call keeps the trim");
+        drop(seen);
+        // What actually ran: the ungranted call never reached the tool body.
+        assert_eq!(
+            *executed.lock().unwrap(),
+            0,
+            "the ungranted tool body must never run"
+        );
+        let context = agent.state_handle().lock().unwrap().context().to_vec();
+        let error_text = context
+            .iter()
+            .flat_map(|m| m.content().iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(r) => Some(
+                    r.output
+                        .iter()
+                        .filter_map(|o| match o {
+                            ContentBlock::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            error_text.contains("Tool not found: execute"),
+            "an ungranted call must read as not-found: {error_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ask_answer_with_rules_persists_into_the_session_permission_context() {
+        // Java #3369: a remembered \"always allow\" must outlive the call that granted it, so
+        // the rule has to land in the state a checkpoint persists, not only in the engine.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "add", JsonMap::new()),
+                text_response("done"),
+            ],
+        ));
+        let asks = Arc::new(Mutex::new(0u32));
+        let asks_seen = Arc::clone(&asks);
+        let handler: crate::agent::ConfirmHandler = Arc::new(move |_call: ToolUseBlock| {
+            *asks_seen.lock().unwrap() += 1;
+            Box::pin(async move {
+                ConfirmResult::new(
+                    true,
+                    None,
+                    vec![PermissionRule::new(
+                        "add",
+                        None,
+                        PermissionBehavior::Allow,
+                        "user",
+                    )],
+                )
+            })
+        });
+        let state = AgentState::builder()
+            .permission_context(
+                PermissionContextState::builder()
+                    .add_ask_rule(
+                        "add",
+                        PermissionRule::new("add", None, PermissionBehavior::Ask, "policy"),
+                    )
+                    .build(),
+            )
+            .build();
+        let agent = ReActAgent::builder()
+            .name("t-permission-confirm-rules")
+            .model(model)
+            .toolkit(toolkit)
+            .confirm_handler(handler)
+            .state(state)
+            .build()
+            .unwrap();
+
+        agent.call(vec![Msg::user("compute")]).await.unwrap();
+        assert_eq!(*asks.lock().unwrap(), 1);
+        assert_eq!(*counter.lock().unwrap(), 1);
+
+        let persisted = agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .permission_context()
+            .clone();
+        assert!(
+            persisted
+                .allow_rules
+                .get("add")
+                .is_some_and(|rules| rules.iter().any(|r| r.source == "user")),
+            "the accepted rule must be persisted: {persisted:?}"
+        );
+        // Re-accepting the same rule must not grow the tables.
+        let grown = persisted.with_added_rules(&[PermissionRule::new(
+            "add",
+            Some(String::new()),
+            PermissionBehavior::Allow,
+            "user",
+        )]);
+        assert_eq!(
+            grown.allow_rules["add"].len(),
+            persisted.allow_rules["add"].len()
         );
     }
 }

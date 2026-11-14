@@ -135,6 +135,23 @@ impl ModelCreationContext {
 }
 
 /// Provider plugin point (the Rust equivalent of the Java `spi.ModelProvider`).
+///
+/// ## Vocabulary (`c05e4b91f`)
+///
+/// * **provider id** — the routing key, the prefix of a model id (`dashscope`); what
+///   [`ModelProvider::provider_id`] returns.
+/// * **model name** — the bare catalog name sent to the upstream API (`qwen-max`); what
+///   [`Model::model_name`] returns.
+/// * **model id** — the recipe string `provider_id:model_name` (`dashscope:qwen-max`); the
+///   routing argument of [`ModelRegistry::resolve`] / [`ModelProvider::supports`].
+/// * **[`ModelCreationContext`]** — the creation inputs ("with what to build it").
+///
+/// Java hands providers the *full* model id and makes each one strip the prefix itself. Here
+/// [`ModelRegistry`] has already routed by prefix before a provider is asked, so `supports`
+/// and [`ModelProvider::create`] see the bare model name for a prefixed id (and the untouched
+/// id for a bare one); the context's `provider_id` carries the routing key. This is deliberate:
+/// the OpenAI-compatible provider accepts *any* id (gateways, self-hosted endpoints), and
+/// re-parsing a prefix there would misread a model name that contains a colon.
 pub trait ModelProvider: Send + Sync {
     /// Stable provider id (e.g. `openai`, `deepseek`).
     fn provider_id(&self) -> &str;
@@ -276,9 +293,25 @@ impl ModelRegistry {
             }
         }
         Err(Error::Model(format!(
-            "no model provider registered for '{}'",
-            model_id
+            "no model provider registered for '{}' (installed providers: {})",
+            model_id,
+            self.provider_ids()
         )))
+    }
+
+    /// Sorted, de-duplicated provider ids of the registered providers, for error messages.
+    ///
+    /// Mirrors Java `ModelRegistry#installedProviderIds`: a not-found error tells the caller
+    /// which providers would have been able to claim the id.
+    fn provider_ids(&self) -> String {
+        let mut ids: Vec<&str> = self.providers.iter().map(|p| p.provider_id()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            "(none)".to_string()
+        } else {
+            ids.join(", ")
+        }
     }
 
     fn find_provider(&self, provider_id: &str) -> Option<&Arc<dyn ModelProvider>> {
@@ -402,6 +435,46 @@ mod tests {
         assert!(!reg.can_resolve("dummy:unrelated"));
         assert!(!reg.can_resolve("openai:gpt-4o"));
         assert!(reg.len() == 1);
+    }
+
+    #[test]
+    fn a_not_found_error_lists_the_installed_providers() {
+        // Java `installedProviderIds` (`c05e4b91f`): the error tells the caller which
+        // providers could have claimed the id, sorted and de-duplicated, instead of only
+        // restating the id it could not resolve.
+        struct SilentProvider(&'static str);
+        impl ModelProvider for SilentProvider {
+            fn provider_id(&self) -> &str {
+                self.0
+            }
+            fn supports(&self, _model: &str) -> bool {
+                false
+            }
+            fn create(&self, _ctx: ModelCreationContext) -> Result<Arc<dyn Model>> {
+                unreachable!("a provider that supports nothing is never asked to create")
+            }
+        }
+        let mut reg = ModelRegistry::new();
+        reg.register(Arc::new(SilentProvider("zeta")));
+        reg.register(Arc::new(SilentProvider("alpha")));
+
+        let error = match reg.resolve("ghost-model") {
+            Ok(_) => panic!("an unregistered provider set must not resolve"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("alpha, zeta"),
+            "the error must list the installed provider ids in order: {error}"
+        );
+
+        let empty = match ModelRegistry::new().resolve("ghost-model") {
+            Ok(_) => panic!("an empty registry must not resolve"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            empty.contains("(none)"),
+            "an empty registry must say so: {empty}"
+        );
     }
 
     #[test]

@@ -275,6 +275,19 @@ impl ToolGroupManager {
         inner.tools_to_groups.contains_key(name)
     }
 
+    /// The groups the tool currently belongs to.
+    ///
+    /// Mechanical reverse lookup used by the capability gate: the grant decision itself lives
+    /// on [`CapabilitySurface::grants_tool`](crate::agent::CapabilitySurface::grants_tool).
+    pub fn tool_group_names_for(&self, name: &str) -> Vec<String> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .tools_to_groups
+            .get(name)
+            .map(|groups| groups.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub fn get_tool_group(&self, name: &str) -> Option<ToolGroup> {
         self.inner.lock().unwrap().tool_groups.get(name).cloned()
     }

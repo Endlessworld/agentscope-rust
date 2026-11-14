@@ -287,6 +287,9 @@ deactivate groups as soon as they are no longer needed to conserve context space
         .toolkit_aware(Box::new(|new_toolkit: &Toolkit| {
             Arc::new(Self::build_reset_equipped_tools(new_toolkit))
         }))
+        // Framework meta tool: it manages the agent's own tool inventory, so a restricted
+        // capability surface must not revoke it (Java marks it `isSystem`).
+        .system(true)
     }
 }
 

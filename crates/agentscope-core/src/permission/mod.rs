@@ -163,6 +163,34 @@ impl PermissionContextState {
         c.mode = mode;
         c
     }
+
+    /// Returns a copy of this context with `rules` appended to their behavior tables.
+    ///
+    /// Used to persist rules accepted at runtime (Java `ConfirmResult.rules`): with a state
+    /// store configured, every call rebuilds the engine from the persisted context, so an
+    /// engine-only addition is lost at the next call boundary ("always allow for this session"
+    /// would not outlive the call that granted it).
+    ///
+    /// Passthrough rules are not persisted, and a rule already present in its table is not
+    /// added again — re-accepting an equivalent answer must not grow the persisted tables.
+    /// `None` and `Some("")` rule content are equivalent at evaluation time, so they
+    /// de-duplicate too. This instance is never mutated.
+    pub fn with_added_rules(&self, rules: &[PermissionRule]) -> Self {
+        if rules.is_empty() {
+            return self.clone();
+        }
+        let mut context = self.clone();
+        for rule in rules {
+            let table = match rule.behavior {
+                PermissionBehavior::Allow => &mut context.allow_rules,
+                PermissionBehavior::Deny => &mut context.deny_rules,
+                PermissionBehavior::Ask => &mut context.ask_rules,
+                PermissionBehavior::Passthrough => continue,
+            };
+            add_if_absent(table, rule);
+        }
+        context
+    }
 }
 
 /// Builder for [`PermissionContextState`].
@@ -224,7 +252,25 @@ fn push_rule(
         PermissionBehavior::Ask => ask,
         PermissionBehavior::Passthrough => return,
     };
-    table.entry(rule.tool_name.clone()).or_default().push(rule);
+    add_if_absent(table, &rule);
+}
+
+/// Appends `rule` to `table` unless an equivalent rule is already there.
+fn add_if_absent(table: &mut HashMap<String, Vec<PermissionRule>>, rule: &PermissionRule) {
+    let bucket = table.entry(rule.tool_name.clone()).or_default();
+    if bucket.iter().any(|existing| same_rule(existing, rule)) {
+        return;
+    }
+    bucket.push(rule.clone());
+}
+
+/// Rule equivalence for de-duplication: `None` and empty rule content both mean
+/// "unconditional" to the matcher, so they must compare equal here too.
+fn same_rule(a: &PermissionRule, b: &PermissionRule) -> bool {
+    a.tool_name == b.tool_name
+        && a.behavior == b.behavior
+        && a.source == b.source
+        && a.rule_content.as_deref().unwrap_or("") == b.rule_content.as_deref().unwrap_or("")
 }
 
 /// Evaluates tool execution requests against configured permission rules.
@@ -434,5 +480,60 @@ where
     match &rule.rule_content {
         Some(c) if !c.is_empty() => matcher(c, input),
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx_with_mode() -> PermissionContextState {
+        PermissionContextState::builder()
+            .mode(PermissionMode::Explore)
+            .add_allow_rule(
+                "read",
+                PermissionRule::new("read", None, PermissionBehavior::Allow, "policy"),
+            )
+            .build()
+    }
+
+    #[test]
+    fn added_rules_are_routed_by_behavior_and_keep_the_rest_of_the_context() {
+        let context = ctx_with_mode();
+        let merged = context.with_added_rules(&[
+            PermissionRule::new("add", None, PermissionBehavior::Allow, "user"),
+            PermissionRule::new("shell", None, PermissionBehavior::Deny, "user"),
+            PermissionRule::new("add", None, PermissionBehavior::Ask, "user"),
+            // Passthrough rules are not persisted.
+            PermissionRule::new("add", None, PermissionBehavior::Passthrough, "user"),
+        ]);
+        assert_eq!(merged.mode, PermissionMode::Explore);
+        assert!(
+            merged.allow_rules.contains_key("read"),
+            "existing rules stay"
+        );
+        assert_eq!(merged.allow_rules["add"].len(), 1);
+        assert_eq!(merged.ask_rules["add"].len(), 1);
+        assert_eq!(merged.deny_rules["shell"].len(), 1);
+        // The original instance is never mutated.
+        assert!(!context.allow_rules.contains_key("add"));
+
+        // Re-adding an equivalent rule (None vs empty content) does not grow the table.
+        let again = merged.with_added_rules(&[PermissionRule::new(
+            "add",
+            Some(String::new()),
+            PermissionBehavior::Allow,
+            "user",
+        )]);
+        assert_eq!(again.allow_rules["add"].len(), 1);
+    }
+
+    #[test]
+    fn the_engine_does_not_duplicate_a_rule_already_in_the_context() {
+        let rule = PermissionRule::new("add", None, PermissionBehavior::Allow, "user");
+        let mut engine = PermissionEngine::new(ctx_with_mode());
+        engine.add_rule(rule.clone());
+        engine.add_rule(rule);
+        assert_eq!(engine.context().allow_rules["add"].len(), 1);
     }
 }

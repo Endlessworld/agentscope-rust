@@ -21,7 +21,16 @@ const DENYLIST: &[&str] = &[
 ];
 
 /// Shell metacharacters that are banned unless quoted safely.
-const FORBIDDEN_META: &[char] = &[';', '&', '|', '`', '$', '<', '>'];
+///
+/// Newlines and grouping characters belong to the same family as `;`/`&`/`|`: `sh` and
+/// `cmd.exe` both start a new command after a newline and evaluate `( )` / `{ }` groups, so a
+/// “single command” check that allowed them could be bypassed
+/// (Java #3286). Windows-only expansions (`%VAR%`, `!VAR!`) are deliberately not denied: this
+/// validator is platform-agnostic and has no approval channel to route a false positive like
+/// `echo 50% done` through.
+const FORBIDDEN_META: &[char] = &[
+    ';', '&', '|', '`', '$', '<', '>', '\n', '\r', '(', ')', '{', '}',
+];
 
 /// The result of a command validation check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,5 +98,22 @@ mod tests {
     fn denies_metacharacters() {
         let check = validate_command("echo hi; rm -rf /").unwrap();
         assert!(!check.allowed);
+    }
+
+    #[test]
+    fn denies_command_separators_and_grouping() {
+        // A newline starts a second command exactly like `;`; parentheses and braces are
+        // evaluated as groups/substitutions.
+        for command in [
+            "echo marker\nprintf other",
+            "echo marker\rprintf other",
+            "echo (printf marker)",
+            "echo marker)",
+            "echo {marker,other}",
+            "echo marker}",
+        ] {
+            let check = validate_command(command).unwrap();
+            assert!(!check.allowed, "{command}");
+        }
     }
 }

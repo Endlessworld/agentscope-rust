@@ -19,7 +19,12 @@ pub trait Model: Send + Sync {
         options: GenerateOptions,
     ) -> BoxStream<'_, crate::error::Result<ChatResponse>>;
 
-    /// The model name, for logging and identification.
+    /// The bare model name, for logging and identification.
+    ///
+    /// This is the catalog name sent to the upstream API (`qwen-max`), **without** the
+    /// provider prefix — distinct from the full model id (`providerId:modelName`) that
+    /// resolves a model through [`super::ModelRegistry`]. Mirrors the clarified Java
+    /// `Model#getModelName()` contract (`c05e4b91f`).
     fn model_name(&self) -> &str;
 
     /// The provider family this model belongs to (`"openai"`, `"anthropic"`, …), for

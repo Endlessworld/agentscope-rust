@@ -15,7 +15,7 @@
 //!   could race the agent loop's own flush on the same pending buffer and turn a healthy run
 //!   into a sticky "Stale committed prefix" failure.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,7 +25,7 @@ use super::{
     session_error, SessionEvent, SessionLog, SessionLogExporter, SessionProjection, Writer,
 };
 use crate::agent::RuntimeContext;
-use crate::message::{ContentBlock, GenerateReason, Msg, MsgRole};
+use crate::message::{ContentBlock, GenerateReason, Msg, MsgRole, ToolResultBlock};
 use crate::state::AgentState;
 
 /// Runtime-context key carrying the active [`SessionRecorder`].
@@ -365,6 +365,10 @@ struct RecorderState {
     result_json: Option<String>,
     step_id: Option<String>,
     action_ids: HashMap<String, String>,
+    /// `action/end` results, frozen when the fact is accepted. A parallel batch publishes a
+    /// completed action before its result reaches the canonical context, so a later checkpoint
+    /// can hide it; the cancellation snapshot restores these (Java `completedToolResults`).
+    completed_tool_results: BTreeMap<String, ToolResultBlock>,
     previous_state: Option<u64>,
     previous_sections: CheckpointFields,
     previous_messages: Vec<MessageFingerprint>,
@@ -1078,6 +1082,14 @@ impl SessionRecorder {
             .map(|inflight| inflight.events.len() as u64)
             .unwrap_or(0);
         let seq = guard.durable_seq + inflight_events + guard.pending.len() as u64 + 1;
+        // Freeze a completed tool result when the fact is accepted: a parallel batch's
+        // canonical context may only receive it after a checkpoint captured a state that
+        // lacks it.
+        let completed = if event_type == "action/end" {
+            completed_action_result(&payload_json)
+        } else {
+            None
+        };
         let event = SessionEvent::new(
             uuid::Uuid::new_v4().to_string(),
             seq,
@@ -1089,6 +1101,9 @@ impl SessionRecorder {
             payload_json,
         )?;
         super::SessionEventTypes::validate(&event)?;
+        if let Some((id, result)) = completed {
+            guard.completed_tool_results.insert(id, result);
+        }
         guard.pending.push(event);
         guard.pending_bytes += bytes;
         Ok(seq)
@@ -1678,7 +1693,15 @@ impl SessionRecorder {
         status: &str,
         error: Option<&str>,
     ) -> crate::error::Result<()> {
-        self.capture_state(state, &format!("run_{status}"))?;
+        // A parallel batch publishes completed actions before adding their results to the
+        // context. Only the cancellation snapshot is supplemented: the live state, the batch's
+        // own (possibly rewritten) results and settled calls stay untouched.
+        let snapshot = if status == "cancelled" {
+            self.cancellation_state(state)
+        } else {
+            None
+        };
+        self.capture_state(snapshot.as_ref().unwrap_or(state), &format!("run_{status}"))?;
         let (result_json, result_reason, result_status, step_id) = {
             let mut guard = self.lock();
             (
@@ -1720,6 +1743,47 @@ impl SessionRecorder {
         self.append(&format!("turn/{terminal}"), &outcome_payload)?;
         self.append("run/end", &outcome_payload)?;
         self.flush().await
+    }
+
+    /// Builds the cancellation snapshot: completed `action/end` results whose call is still
+    /// unpaired in the live context, added on top of the current state.
+    ///
+    /// Only a `cancelled` finish does this. A checkpoint that ran after a completed action but
+    /// before the batch published its result would otherwise leave an assistant `tool_use` with
+    /// no result, so a resume re-executes a tool that already succeeded.
+    fn cancellation_state(&self, state: &AgentState) -> Option<AgentState> {
+        let pending = pending_tool_use_ids(state);
+        let completed: Vec<ToolResultBlock> = {
+            let guard = self.lock();
+            guard
+                .completed_tool_results
+                .values()
+                .filter(|result| {
+                    result
+                        .id
+                        .as_deref()
+                        .map(|id| pending.contains(id))
+                        .unwrap_or(false)
+                        && !result.is_suspended()
+                })
+                .cloned()
+                .collect()
+        };
+        if completed.is_empty() {
+            return None;
+        }
+        let mut snapshot = state.clone();
+        for block in completed {
+            let id = block.id.clone().unwrap_or_default();
+            snapshot.context.push(
+                crate::message::MsgBuilder::new()
+                    .id(format!("recovered_{id}"))
+                    .role(MsgRole::Tool)
+                    .content(vec![ContentBlock::ToolResult(block)])
+                    .build(),
+            );
+        }
+        Some(snapshot)
     }
 
     /// Releases the writer lease. Idempotent.
@@ -1830,6 +1894,36 @@ fn message_event_type(message: &Msg) -> &'static str {
     } else {
         "message/user"
     }
+}
+
+/// The frozen `action/end` result, tolerating the polymorphic discriminator that early
+/// writers omitted.
+fn completed_action_result(payload_json: &str) -> Option<(String, ToolResultBlock)> {
+    let payload: serde_json::Value = serde_json::from_str(payload_json).ok()?;
+    let id = payload.get("toolCallId")?.as_str()?.to_string();
+    let mut result = payload.get("result").filter(|v| !v.is_null())?.clone();
+    if let Some(object) = result.as_object_mut() {
+        object
+            .entry("type")
+            .or_insert_with(|| serde_json::json!("tool_result"));
+    }
+    let block: ToolResultBlock = serde_json::from_value(result).ok()?;
+    Some((id, block))
+}
+
+/// Ids of tool calls whose `tool_use` carries no matching `tool_result` in the context.
+fn pending_tool_use_ids(state: &AgentState) -> BTreeSet<String> {
+    let mut used = BTreeSet::new();
+    let mut answered = BTreeSet::new();
+    for message in &state.context {
+        used.extend(message.tool_use_blocks().map(|call| call.id.clone()));
+        answered.extend(
+            message
+                .tool_result_blocks()
+                .filter_map(|result| result.id.clone()),
+        );
+    }
+    used.difference(&answered).cloned().collect()
 }
 
 fn message_json(state: &AgentState) -> crate::error::Result<Vec<MessageFingerprint>> {
@@ -2429,6 +2523,93 @@ mod tests {
         // The writer lease is released, so a new run can take it.
         let next = log.acquire("run-next", LEASE).await.unwrap();
         log.release(&next).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_finish_keeps_a_completed_tool_result_beside_an_unknown_sibling() {
+        // A parallel batch publishes `action/end` before its result reaches the canonical
+        // context, so the checkpoint taken at cancellation would carry an assistant `tool_use`
+        // with no result and a resume would re-execute the tool that already succeeded.
+        let (log, _storage) = journal().await;
+        let recorder = SessionRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+        let mut state = state_with(
+            Msg::builder()
+                .role(MsgRole::Assistant)
+                .content(vec![
+                    ContentBlock::ToolUse(crate::message::ToolUseBlock::new(
+                        "fast",
+                        "fast",
+                        Default::default(),
+                    )),
+                    ContentBlock::ToolUse(crate::message::ToolUseBlock::new(
+                        "slow",
+                        "slow",
+                        Default::default(),
+                    )),
+                ])
+                .build(),
+        );
+        recorder.capture_state(&state, "before_tool").unwrap();
+        recorder.flush().await.unwrap();
+
+        let result = ToolResultBlock::new(
+            "fast",
+            "fast",
+            vec![ContentBlock::Text(crate::message::TextBlock::new(
+                "committed-receipt",
+            ))],
+        );
+        recorder
+            .append(
+                "action/end",
+                &serde_json::json!({
+                    "toolCallId": "fast",
+                    "result": serde_json::to_value(&result).unwrap(),
+                }),
+            )
+            .unwrap();
+        // A later checkpoint still does not contain the batch-local result.
+        state.summary = "after dispatch".into();
+        recorder.capture_state(&state, "before_tool").unwrap();
+        // The sibling was only dispatched: its outcome stays unknown.
+        recorder
+            .append(
+                "tool/dispatch",
+                &serde_json::json!({ "toolCallId": "slow" }),
+            )
+            .unwrap();
+        recorder.flush().await.unwrap();
+        let live = state.to_json().unwrap();
+
+        recorder.finish(&state, "cancelled").await.unwrap();
+
+        assert_eq!(
+            state.to_json().unwrap(),
+            live,
+            "only the snapshot is supplemented"
+        );
+        let projection = SessionProjection::read(&*log).await.unwrap();
+        assert_eq!(
+            projection
+                .uncertain_tool_calls
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["slow".to_string()]
+        );
+        let restored = projection.restore().unwrap().unwrap();
+        let recovered: Vec<&ToolResultBlock> = restored
+            .context
+            .iter()
+            .flat_map(|m| m.tool_result_blocks())
+            .collect();
+        assert_eq!(recovered.len(), 1, "{:?}", restored.context);
+        assert_eq!(recovered[0].id.as_deref(), Some("fast"));
+        assert!(serde_json::to_string(&recovered[0])
+            .unwrap()
+            .contains("committed-receipt"));
     }
 
     #[tokio::test]

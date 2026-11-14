@@ -24,9 +24,10 @@ pub mod tool;
 pub mod tracing;
 
 pub use agent::{
-    normalize_agent_id, Agent, CallGate, CallableAgent, ConfirmHandler, EventCategory,
-    ExecutionGuard, Extensions, ObservableAgent, ReActAgent, ReActAgentBuilder, RuntimeContext,
-    StreamOptions, StreamOptionsBuilder, DEFAULT_AGENT_ID, MAX_AGENT_ID_LENGTH,
+    normalize_agent_id, Agent, CallGate, CallableAgent, CapabilityResolver, CapabilitySurface,
+    ConfirmHandler, EventCategory, ExecutionGuard, Extensions, ObservableAgent, ReActAgent,
+    ReActAgentBuilder, RuntimeContext, StreamOptions, StreamOptionsBuilder, DEFAULT_AGENT_ID,
+    MAX_AGENT_ID_LENGTH,
 };
 pub use credential::{
     Credential, DeepSeekCredential, DeepSeekCredentialBuilder, KimiCredential,
@@ -59,9 +60,9 @@ pub use message::{
     ToolUseBlock, URLSource, VideoBlock,
 };
 pub use middleware::{
-    ActingInput, ActingResultsHandle, ActingResultsSnapshot, AgentInput, ExtensionPoint,
-    FinalAnswerFilterMiddleware, Middleware, MiddlewareChain, ModelCallInput, Next, ReasoningInput,
-    TaskReminderMiddleware,
+    ActingInput, ActingResultsHandle, ActingResultsSnapshot, ActivePointsResolver, AgentInput,
+    ExtensionPoint, FinalAnswerFilterMiddleware, Middleware, MiddlewareChain, ModelCallInput, Next,
+    PointParticipants, ReasoningInput, TaskReminderMiddleware,
 };
 pub use model::{
     indicates_output_limit, resolve_context_window, CachePolicy, ChatResponse, ChatResponseBuilder,

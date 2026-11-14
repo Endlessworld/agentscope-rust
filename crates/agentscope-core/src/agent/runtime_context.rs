@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::formatter::ResponseFormat;
 use crate::message::{JsonMap, Msg};
+use crate::model::Model;
 use crate::state::AgentState;
 use crate::tool::Toolkit;
 
@@ -155,6 +156,20 @@ pub fn normalize_agent_id(agent_id: impl AsRef<str>) -> String {
 /// `ReActAgent::stream_events_with_extensions` for streamed ones).
 pub const MODEL_ID_CONTEXT_KEY: &str = "model_id";
 
+/// Runtime-context key carrying the [`Model`] instance that serves a run.
+///
+/// Mirrors the Java `RuntimeContext.put(Model.class, …)` slot: the typed channel that carries
+/// the *decided* model rather than a name to resolve. The run entry point resolves the model
+/// once (see `ReActAgent::run_stream_with_extensions`) and pins it here, so every later model
+/// boundary of the run — and every middleware that needs to know which model actually runs,
+/// e.g. conversation compaction — is a plain read. A caller (or middleware) may pin a model
+/// itself before the run starts; the pin outranks [`RuntimeContext::model_id`] and the agent's
+/// build-time model.
+///
+/// Java `c05e4b91f` replaced the per-call `modelId` field with this slot for exactly that
+/// reason: "the model is decided once and never switches mid-response".
+pub const MODEL_CONTEXT_KEY: &str = "model";
+
 /// Runtime context shared across agent execution, mirroring `RuntimeContext`.
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeContext {
@@ -269,6 +284,18 @@ impl RuntimeContext {
     /// Returns the per-call model id, if any.
     pub fn model_id(&self) -> Option<&str> {
         self.model_id.as_deref()
+    }
+
+    /// Returns the model pinned on this context, if any (see [`MODEL_CONTEXT_KEY`]).
+    pub fn pinned_model(&self) -> Option<Arc<dyn Model>> {
+        self.extension::<Arc<dyn Model>>(MODEL_CONTEXT_KEY)
+            .map(|model| (*model).clone())
+    }
+
+    /// Pins `model` as the model serving this run, outranking [`Self::model_id`] and the
+    /// agent's build-time model.
+    pub fn set_pinned_model(&mut self, model: Arc<dyn Model>) {
+        self.extensions.insert(MODEL_CONTEXT_KEY, model);
     }
 }
 

@@ -541,5 +541,32 @@ impl GracefulShutdownManager {
         if let Ok(mut started) = self.shutdown_started.try_lock() {
             *started = None;
         }
+        // The configuration is mutable (`set_config`) and process-wide on the singleton, so a test
+        // that leaves a non-default one behind would leak it into every later test
+        // (Java 2d09b15a2).
+        self.set_config_now(GracefulShutdownConfig::default());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_for_testing_restores_the_default_config() {
+        let manager = GracefulShutdownManager::new();
+        manager.set_config_now(GracefulShutdownConfig {
+            shutdown_timeout: Some(std::time::Duration::from_millis(100)),
+            partial_reasoning_policy: PartialReasoningPolicy::Discard,
+        });
+
+        manager.reset_for_testing();
+
+        let config = manager.config_snapshot();
+        assert_eq!(config.shutdown_timeout, None);
+        assert_eq!(
+            config.partial_reasoning_policy,
+            PartialReasoningPolicy::Save
+        );
     }
 }

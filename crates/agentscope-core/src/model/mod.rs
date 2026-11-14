@@ -4,6 +4,26 @@
 //! This module only carries the **interface abstraction** (trait, SPI, DTOs).
 //! Concrete provider implementations live in
 //! `agentscope-extensions-model` (see `docs/extensions/MODEL__GAP_TRACKER.md`).
+//!
+//! ## Model identifier vocabulary
+//!
+//! Mirrors the concept dictionary Java `c05e4b91f` added to `ModelRegistry`:
+//!
+//! * **provider id** — the routing key and model-id prefix (`dashscope`, `openai`); see
+//!   [`ModelProvider::provider_id`](provider::ModelProvider::provider_id).
+//! * **model name** — the bare catalog name sent to the upstream API (`qwen-max`);
+//!   [`Model::model_name`](model::Model::model_name).
+//! * **model id** — the recipe string `provider_id + ":" + model_name`
+//!   (`dashscope:qwen-max`), or a bare model name routed by asking every provider.
+//! * **[`ModelCreationContext`](provider::ModelCreationContext)** — the creation inputs.
+//! * **model identity** — the pair (model id, creation context): a model id alone never
+//!   identifies an instance. Rust has no registry cache, so this is only a conceptual
+//!   distinction here (every [`ModelRegistry::resolve`](provider::ModelRegistry::resolve)
+//!   builds a fresh instance).
+//!
+//! On the agent side, [`MODEL_ID_CONTEXT_KEY`](crate::agent::MODEL_ID_CONTEXT_KEY) carries a
+//! model id to resolve per call, while [`MODEL_CONTEXT_KEY`](crate::agent::MODEL_CONTEXT_KEY)
+//! carries the already-decided [`Model`] instance for a run.
 
 pub mod cache_policy;
 pub mod catalog;

@@ -218,29 +218,56 @@ impl Toolkit {
         &self,
         config: Option<&super::tool_request_config::ToolRequestConfig>,
     ) -> Vec<ToolSchema> {
-        let Some(config) = config else {
-            return self.tool_schemas();
-        };
+        self.tool_schemas_for_call(config, None)
+    }
+
+    /// Returns the schemas visible for the active groups under a per-call config **and** the
+    /// call's capability surface.
+    ///
+    /// Grant filtering runs in the same pass: a backend tool the caller is not granted is
+    /// treated as non-existent, so it never reaches the model. System tools bypass trimming
+    /// (they are the agent's own bookkeeping), and externally injected tools stay
+    /// caller-controlled — the caller supplied them for this call. A missing surface means
+    /// unrestricted, mirroring [`CapabilitySurface::grants_tool`].
+    pub fn tool_schemas_for_call(
+        &self,
+        config: Option<&super::tool_request_config::ToolRequestConfig>,
+        surface: Option<&crate::agent::CapabilitySurface>,
+    ) -> Vec<ToolSchema> {
         let active_groups = self.groups.get_active_groups();
         let mut out = Vec::new();
-        if !config.hides_backend() {
+        if !config.is_some_and(|c| c.hides_backend()) {
             let tools = self.tools.lock().unwrap();
             for (name, tool) in tools.iter() {
-                if config.overrides(name) {
+                if config.is_some_and(|c| c.overrides(name)) {
                     continue;
                 }
-                if self.groups.is_active_tool_for(name, &active_groups) {
-                    out.push(tool.schema());
+                if !self.groups.is_active_tool_for(name, &active_groups) {
+                    continue;
                 }
+                if let Some(surface) = surface {
+                    let groups = self.groups.tool_group_names_for(name);
+                    if !surface.grants_tool(name, &groups, tool.is_system()) {
+                        continue;
+                    }
+                }
+                out.push(tool.schema());
             }
         }
-        for tool in config.external_tools().values() {
-            out.push(tool.schema());
+        if let Some(config) = config {
+            for tool in config.external_tools().values() {
+                out.push(tool.schema());
+            }
         }
         // Same stability requirement as `tool_schemas_for`: backend and external tools are
         // merged from two maps, so the combined list must be ordered deterministically.
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// The groups a tool currently belongs to (mechanical lookup for the capability gate).
+    pub fn tool_groups_for(&self, name: &str) -> Vec<String> {
+        self.groups.tool_group_names_for(name)
     }
 
     /// Whether a tool may run in parallel with itself. Unknown tools default to
@@ -570,6 +597,78 @@ mod tests {
         assert_eq!(
             names,
             vec!["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"]
+        );
+    }
+
+    fn surface(
+        groups_granted: Option<&[&str]>,
+        tools_granted: Option<&[&str]>,
+    ) -> crate::agent::CapabilitySurface {
+        let set = |values: Option<&[&str]>| {
+            values.map(|vs| {
+                vs.iter()
+                    .map(|v| v.to_string())
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+        };
+        crate::agent::CapabilitySurface::new(None, set(groups_granted), set(tools_granted))
+    }
+
+    #[test]
+    fn a_capability_surface_trims_the_backend_schemas_the_model_sees() {
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "web_read",
+            "read",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
+        )));
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "execute",
+            "run",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
+        )));
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "web_search",
+            "search",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
+        )));
+        toolkit.create_tool_group("search", "search tools", true);
+        toolkit.add_tool_to_group("search", "web_search");
+
+        // No surface → nothing is trimmed (the pre-existing behaviour).
+        let untrimmed = toolkit.tool_schemas_for_call(None, None);
+        assert_eq!(untrimmed.len(), 3);
+
+        let granted = surface(Some(&["search"]), Some(&["web_read"]));
+        let names: Vec<String> = toolkit
+            .tool_schemas_for_call(None, Some(&granted))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["web_read", "web_search"]);
+
+        // A deny-everything surface still keeps the framework meta tool.
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "execute",
+            "run",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
+        )));
+        toolkit.register_meta_tools();
+        let denied = crate::agent::CapabilitySurface::deny_all();
+        let names: Vec<String> = toolkit
+            .tool_schemas_for_call(None, Some(&denied))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["reset_equipped_tools"],
+            "the system meta tool must survive a deny-all surface"
         );
     }
 }

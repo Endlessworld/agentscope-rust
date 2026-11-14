@@ -31,6 +31,17 @@ impl ToolExecutor {
         ctx: ToolExecutionContext,
         config: Option<&ExecutionConfig>,
     ) -> Result<ToolResultBlock> {
+        // A malformed-arguments marker means the raw streamed arguments were truncated or
+        // corrupt. The agent loop refuses these calls before execution; this is the single
+        // funnel for direct Toolkit/executor paths too, and the merged input beside the marker
+        // can coincidentally look complete, so refuse here instead of executing it.
+        if call.has_malformed_arguments() {
+            return Err(Error::Tool(
+                "Tool call not executed: its arguments were marked malformed (truncated or \
+                 corrupt). Reissue the call with corrected JSON object arguments."
+                    .into(),
+            ));
+        }
         // 1. Lookup (composed with the per-call request config: external tools take
         //    priority; EXTERNAL_ONLY hides the backend).
         let request_config = ctx.tool_request_config.clone();
@@ -45,17 +56,43 @@ impl ToolExecutor {
                 call.name
             )));
         }
-        // 3. Group activation check. Only backend tools are gated: a tool injected through
+        // 3. Capability grant gate. Runs *before* the activation check so an ungranted probe
+        //    never reaches activation wording, and reports the same text a missing tool does:
+        //    the model channel must not distinguish "exists but ungranted" from "missing".
+        //    Only backend tools are gated — a tool injected through the request config was
+        //    supplied by the caller for this call.
+        let from_request_config = view.map(|c| c.overrides(&call.name)).unwrap_or(false);
+        if !from_request_config {
+            if let Some(surface) = ctx.capability_surface() {
+                let groups = toolkit.tool_groups_for(&call.name);
+                if !surface.grants_tool(&call.name, &groups, tool.is_system()) {
+                    tracing::info!(
+                        "tool call denied by capability grant: tool='{}', userId='{}', \
+                         sessionId='{}'",
+                        call.name,
+                        ctx.runtime
+                            .get("userId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                        ctx.runtime
+                            .get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    );
+                    return Err(Error::Tool(format!("Tool not found: {}", call.name)));
+                }
+            }
+        }
+        // 4. Group activation check. Only backend tools are gated: a tool injected through
         //    the request config is ungrouped and always callable, so a same-named but
         //    inactive backend tool must not reject the call the model was shown.
-        let from_request_config = view.map(|c| c.overrides(&call.name)).unwrap_or(false);
         if !from_request_config && !toolkit.is_tool_active(&call.name) {
             return Err(Error::Tool(format!(
                 "Unauthorized tool call: {} is not available",
                 call.name
             )));
         }
-        // 4. Schema validation.
+        // 5. Schema validation.
         // strict 模式用「注入了 additionalProperties:false 的同一份 schema」校验，
         // 因此 schema 未声明的入参会被拒绝（与发给模型的 schema 保持一致）。
         let schema = if tool.is_strict() {
@@ -70,9 +107,9 @@ impl ToolExecutor {
         if let Some(err) = ToolValidator::validate_input(&schema, &input_val) {
             return Err(Error::Tool(format!("Parameter validation failed: {}", err)));
         }
-        // 5. Preset parameters override (preset wins over LLM input).
+        // 6. Preset parameters override (preset wins over LLM input).
         let input = toolkit.merge_presets(&call.name, call.input.clone());
-        // 6. Per-call interception (Java `ToolCallInterceptor`): after schema validation
+        // 7. Per-call interception (Java `ToolCallInterceptor`): after schema validation
         //    and preset merging, before real execution. External tools never reach it
         //    (they short-circuited above).
         let interceptors = toolkit.config().call_interceptors.clone();
@@ -109,7 +146,7 @@ impl ToolExecutor {
                 other => other,
             };
         }
-        // 7. Timeout + retry around the raw call.
+        // 8. Timeout + retry around the raw call.
         execute_with_policy(&tool, call, ctx, input, config).await
     }
 
@@ -350,6 +387,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_malformed_call_is_refused_before_schema_validation() {
+        // A truncated call carries merged input beside the malformed marker — the merged args
+        // can even look complete and schema-valid. Direct Toolkit paths must refuse it like
+        // the agent loop does instead of executing it from that input.
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(strict_tool());
+        let mut call = ToolUseBlock::new(
+            "c-malformed",
+            "strict",
+            serde_json::json!({"a": "looks-complete"})
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        call.metadata.insert(
+            ToolUseBlock::METADATA_MALFORMED_ARGUMENTS.to_string(),
+            serde_json::Value::Bool(true),
+        );
+
+        let err = ToolExecutor::new()
+            .execute(&toolkit, &call, ToolExecutionContext::default(), None)
+            .await
+            .expect_err("a malformed call must not execute");
+        match err {
+            Error::Tool(msg) => assert!(msg.contains("malformed"), "{msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn strict_tool_still_requires_the_declared_arguments() {
         let err = call_strict(serde_json::json!({}))
             .await
@@ -361,5 +428,109 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    fn granted_tools(names: &[&str]) -> crate::agent::CapabilitySurface {
+        crate::agent::CapabilitySurface::new(
+            None,
+            None,
+            Some(names.iter().map(|n| n.to_string()).collect()),
+        )
+    }
+
+    fn echo_tool(name: &'static str) -> Arc<dyn Tool> {
+        Arc::new(FunctionTool::new(
+            name,
+            "test tool",
+            serde_json::json!({"type": "object", "properties": {}}),
+            Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
+        ))
+    }
+
+    #[tokio::test]
+    async fn an_ungranted_tool_is_refused_with_the_not_found_wording() {
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(echo_tool("web_read"));
+        toolkit.register_tool(echo_tool("execute"));
+
+        let ctx =
+            ToolExecutionContext::default().with_capability_surface(granted_tools(&["web_read"]));
+        // The granted tool still runs.
+        let ok = ToolExecutor::new()
+            .execute(
+                &toolkit,
+                &ToolUseBlock::new("c1", "web_read", JsonMap::new()),
+                ctx.clone(),
+                None,
+            )
+            .await
+            .expect("a granted tool must execute");
+        let text = ok
+            .output
+            .iter()
+            .filter_map(|b| match b {
+                crate::message::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(text, "ok");
+
+        // The ungranted one reports exactly what a missing tool reports.
+        let err = ToolExecutor::new()
+            .execute(
+                &toolkit,
+                &ToolUseBlock::new("c2", "execute", JsonMap::new()),
+                ctx,
+                None,
+            )
+            .await
+            .expect_err("an ungranted tool must not execute");
+        assert_eq!(err.to_string(), "Tool error: Tool not found: execute");
+    }
+
+    #[tokio::test]
+    async fn a_group_grant_admits_its_members_and_the_system_flag_bypasses() {
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(echo_tool("web_search"));
+        toolkit.create_tool_group("search", "search", true);
+        toolkit.add_tool_to_group("search", "web_search");
+        toolkit.register_meta_tools();
+
+        let surface = crate::agent::CapabilitySurface::new(
+            None,
+            Some(["search".to_string()].into_iter().collect()),
+            None,
+        );
+        let ctx = ToolExecutionContext::default().with_capability_surface(surface);
+        let call_for = |name: &str| {
+            let mut input = JsonMap::new();
+            if name == "reset_equipped_tools" {
+                input.insert("to_activate".to_string(), serde_json::json!(["search"]));
+            }
+            ToolUseBlock::new("c", name, input)
+        };
+        for name in ["web_search", "reset_equipped_tools"] {
+            ToolExecutor::new()
+                .execute(&toolkit, &call_for(name), ctx.clone(), None)
+                .await
+                .unwrap_or_else(|e| panic!("{name} must be admitted: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_surface_leaves_direct_execution_unrestricted() {
+        // A call that never entered an agent funnel carries no surface: trusted assembler code.
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(echo_tool("execute"));
+        ToolExecutor::new()
+            .execute(
+                &toolkit,
+                &ToolUseBlock::new("c", "execute", JsonMap::new()),
+                ToolExecutionContext::default(),
+                None,
+            )
+            .await
+            .expect("no surface = unrestricted");
     }
 }
