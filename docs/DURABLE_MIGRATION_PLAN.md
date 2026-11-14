@@ -31,7 +31,7 @@ agentscope-harness  ──→  core             # 不得依赖 durable
 | **M0 删除 controlplane** | 删 crate + workspace member + `agentscope-rs` feature/文档 | `cargo check --workspace --all-targets`、`cargo test -p agentscope-rs`、全量测试 0 failed | — |
 | **M1 core 语义 + 重命名** | `session`→`journal`（目录 + 类型）；新增 `agent::{ThreadKey, RunOutcome, AgentExecutionHost, AgentExecutionPosition}`；`GenerateReason::HostPaused`；`ToolCallParam::propagate_errors` + call context；事件/头 v2 强切 | core 单测全绿、workspace 绿、fmt 绿 | 事件 v1 必被拒；HostPaused→`RunOutcome::Suspended` |
 | **M2 durable 骨架 + 最小集** | `agentscope-durable`：`DurableRuntime/Session/Thread/Turn`、`SessionBackend`（InMemory + File）、`Executor`（InProcess）、`HarnessAdapter`、`HarnessContext`、公共事件流/游标、`ExecutionRecovery` 判定树 | durable 自测：单进程 submit→tick→completed；`UNKNOWN` 分支 | 去掉 `query` 分支 → 恢复测试 FAILED |
-| **M3 adapter + harness 接线** | `BackendThreadJournal`（实现 core `ThreadJournal`，与 durable 共事务）、`AgentScopeExecutionHost`、工具三态、结果按 `tool_call_id` 归位 | **三进程** suspend/resume/duplicate（run=2、模型调用=1、`tool/result`=1）；halt 后取回结果且副作用只 1 次 | 同 D7 |
+| **M3 adapter + harness 接线** | `BackendThreadJournal`（实现 core `ThreadJournal`，与 durable 共事务）、`AgentScopeExecutionHost`、工具三态、结果按 `tool_call_id` 归位 | **三进程** suspend/resume/duplicate（run=2、模型调用=2、`tool/result`=1；模型次数对齐 Java `ProcessRecoveryTest` 的 `model-calls`）；halt 后取回结果且副作用只 1 次 | 同 D7 |
 | **M4 ACP 迁 durable + 删 AgentSession** | ACP 会话驱动改 `DurableRuntime`；删 `AgentSession`/`SessionAnswer`、`core::journal::{inbox, execution, turns}`；`/compact`、wakeup、respond 全部接 durable | ACP 全测试绿 + stdio smoke；durable 恢复路径覆盖 ACP 断线 | 关掉 durable 后端 → ACP 用例失败 |
 | **M5 全量对齐 + 清理** | 删 controlplane 残留引用与文档；`docs`/tracker 更新；版本 0.2.0；`cargo fmt`；发布说明 | 全量 `cargo test --workspace` 0 failed；`fmt --check` 0 | — |
 | **M6 后置** | `durable-worker`（Brain/Hands）、`durable-{jdbc,http,mcp,rocketmq,objects,sandbox}`、`Postgres` 后端、protocol JSON-Schema 全量 | 各自独立验收 | — |
@@ -111,6 +111,14 @@ core `ReActAgent` 主循环接上 `AgentExecutionHost`；无宿主时行为不�
 - 测试 `tests/checkpoint_test.rs`：`an_unchanged_state_does_not_create_a_new_checkpoint`（同上状态/无 state 批次 → 位置仍 `[1]`，journal 前进 2）、`a_changed_state_creates_a_new_checkpoint`（`[1,2]` 且位置 2 就是新状态）、`a_reopened_host_rebuilds_the_committed_state`（全字段相等 + `cur_iter`/`context`/四类上下文）、`a_reopened_host_keeps_the_committed_iteration_budget`（`position().reasoning_iteration=3`，`max_iters=3` → MaxIterations 且 0 次模型调用）。
 - 缺口：①重建出的 state 只用于位置与暴露，loop 仍从 `core.state` 起跑（回填到 live state 属 M4 `AgentSession`）；②checkpoint 是整体快照（大对象外置未做）；③`state/checkpoint` 事件本身仍全量入 journal（journal 与 checkpoint 双份）。
 
+### 2.5 M3-e 三进程验收（2026-11-15，未提交）
+
+`crates/agentscope-durable-adapter-agentscope/tests/three_process_test.rs`：三个独立 `TxnBackend` 只共享 store（不传 frame/checkpoint/lease）。`suspend_resume_and_duplicate_share_only_the_store` → **run=2 / `tool/result`=1 / 副作用=1**；halt 后结论（`Succeeded` + reply `recorded`）由全新 backend 从 store 读出；重复进程 `claim` 返回 `None`，模型与 `tool/result` 计数不变。`the_store_keeps_the_state_after_the_writer_process_exits` 用 `std::process::Command` 以 `DURABLE_WRITER_ROOT` 跑本测试二进制的 writer 角色，子进程写完即退出，父进程**在其退出后**才打开同一 file store（file store 按事务加锁，先退出再读，避免把锁竞争混进结论），等待用 `try_wait` 有界轮询（120s 上限）而非固定 sleep。
+
+- **模型调用 = 2，与 Java 一致**：Java `ProcessRecoveryTest` 断言 `model-calls` = 2 且 `effects` = 1，Rust 同值（`a_resumed_process_repeats_the_tool_decision_but_not_its_effect`）。本表原先写「模型调用=1」是判据笔误，已更正。真实缺口：core 无 acting 阶段续跑入口（`acting_iteration` 无消费者），Java 的 `resumeAgent()`（`ReActAgent.java:3172-3177`）尚未迁移——它影响「上一轮遗留 pending tool calls 的续跑」，不影响本验收。
+- 确定性让步：①进程 1 停在 Acting 边界（意图+派发已提交、工具未运行）而非在工具体内被杀（同步工具无法从内部中断，durable 记录与「死在工具里」相同）；②进程 1 显式 `close()` 交还租约而非任其过期（单进程内无法持有不续租的租约）；③`settle()` 由用例代做（`HarnessAdapter::settle` 尚无实现），只记录真实发生过的 `applied` 与终态；④「效果已发生、结果未落盘」的 UNKNOWN 对账未覆盖，故工具只在恢复进程执行一次。
+- 反向验证：去掉 Acting 边界 halt → 用例 FAILED；不 `settle` → 重复进程 `claim` 成功、用例 FAILED。
+
 ## 3. 禁止事项（沿用 Java `agentscope-durable/AGENTS.md`）
 
 - 不做兼容层：不留别名、不保留 deprecated 转发、不写旧格式读取器、不做版本协商/降级回退。
@@ -170,3 +178,4 @@ core `ReActAgent` 主循环接上 `AgentExecutionHost`；无宿主时行为不�
 | pending | **M2–M6** | ⬜ 见 §2 |
 
 | 2026-11-15 | **M3-b 执行宿主** | ✅ core 主循环接 `AgentExecutionHost`（位置/边界/resume/finish）+ adapter `AgentScopeExecutionHost`/`pin()`；5 条集成测试全绿；core lib 533 passed |
+| 2026-11-15 | **M3-e 三进程验收** | ✅ `three_process_test.rs`：run=2 / `tool/result`=1 / 副作用=1；真实子进程验证状态外置；⚠️ 模型调用=2（D7 要求 1，缺 acting 续跑分支，见 §2.5） |
