@@ -8,8 +8,8 @@
 
 use agentscope_core::event::AgentEvent;
 use agentscope_core::message::{
-    ContentBlock, DataBlock, HintBlock, JsonMap, Msg, MsgRole, Source, TextBlock, ThinkingBlock,
-    ToolResultBlock,
+    ContentBlock, DataBlock, GenerateReason, HintBlock, JsonMap, Msg, MsgRole, Source, TextBlock,
+    ThinkingBlock, ToolResultBlock,
 };
 /// Properties about agent execution.
 ///
@@ -98,6 +98,8 @@ pub struct AgentOutputProjector {
     require_inner_message: bool,
     accumulated: Vec<Msg>,
     streamed_output: bool,
+    /// The run's final reply when it asks for a tool confirmation.
+    confirmation_request: Option<Msg>,
     result_projected: bool,
 }
 
@@ -108,6 +110,7 @@ impl AgentOutputProjector {
             require_inner_message: properties.require_inner_message,
             accumulated: Vec::new(),
             streamed_output: false,
+            confirmation_request: None,
             result_projected: false,
         }
     }
@@ -116,6 +119,13 @@ impl AgentOutputProjector {
     ///
     /// Mirrors Java `isNoResponseEvent` + `convertToResponseMessage`.
     pub fn project(&mut self, event: &AgentEvent) -> Option<Msg> {
+        if let AgentEvent::AgentResult(data) = event {
+            if let Some(reply) = result_reply(data) {
+                if reply.generate_reason() == GenerateReason::PermissionAsking {
+                    self.confirmation_request = Some(reply);
+                }
+            }
+        }
         let msg = match event {
             AgentEvent::TextBlockDelta(data) => {
                 self.streamed_output = true;
@@ -215,6 +225,16 @@ impl AgentOutputProjector {
         self.result_projected
     }
 
+    /// The request a paused run waits on, i.e. its final reply when that reply asks for a tool
+    /// confirmation.
+    ///
+    /// Mirrors Java `isWaitingForConfirmation` plus `MessageConvertUtil#convertFromMsgToMessage`
+    /// on the final result: the reply carries the tool calls the caller has to confirm, so the
+    /// A2A task is reported `input-required` with it (`a338d520d`).
+    pub fn confirmation_request(&self) -> Option<&Msg> {
+        self.confirmation_request.as_ref()
+    }
+
     /// Projects an `AGENT_RESULT` payload: its `content` block array becomes one assistant `Msg`.
     fn project_result(&self, data: &agentscope_core::event::EventData) -> Option<Msg> {
         let blocks = data.fields.get("content")?.as_array()?;
@@ -309,6 +329,14 @@ fn result_message_id(data: &agentscope_core::event::EventData) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or(&data.id)
         .to_string()
+}
+
+/// The run's final reply carried by an `AGENT_RESULT` event, when the event is message-level.
+///
+/// Core (and harness) agents publish the whole `Msg` under `reply`, which is where the generate
+/// reason that marks a paused run lives.
+fn result_reply(data: &agentscope_core::event::EventData) -> Option<Msg> {
+    serde_json::from_value(data.fields.get("reply")?.clone()).ok()
 }
 
 fn string_field(data: &agentscope_core::event::EventData, key: &str) -> String {

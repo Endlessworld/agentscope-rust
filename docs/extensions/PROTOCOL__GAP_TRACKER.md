@@ -365,3 +365,23 @@ cargo test -p agentscope-extensions-protocol -p agentscope-extensions-a2a-client
 
 - 执行记录 / 静态复核 / 勘误 / 反向验证明细：[`history/PROTOCOL__MIGRATION_HISTORY.md`](./history/PROTOCOL__MIGRATION_HISTORY.md)
 - 本文件只保留现行状态（§0–§5）；历史条目一律写进上述归档文件，不再回填本文。
+
+### 2026-11-14 迁移批次（Java 9ab7a4fab..a4306d63d，extensions 组）
+
+- `9d4f86426` fix(protocol): serialize concurrent task submissions — **已迁移**
+  - Rust 位置：`crates/agentscope-extensions-agent-protocol/src/lib.rs`：新增 `task_lock(task_id)`（:755，按 taskId 的锁条带）并在 `submit` 的「查重 + 启动 run」临界区内持锁（:780 新建路径、:837 复用/恢复路径），同一 taskId 的并发提交只产生一次 run，不同 taskId 互不阻塞。
+  - 测试：`tests::concurrent_submits_of_one_task_start_a_single_run`、`tests::submits_of_different_tasks_are_not_serialized`（门控 gate 统计真正启动的 run 数）；反向验证：去掉记录锁后前者 FAILED。
+  - 偏差：Java 用 `synchronized` / `ConcurrentHashMap#compute` 级别串行化，Rust 用按 taskId 的条带锁，语义相同、粒度更细（不同任务不串行）。
+  - 验证：`cargo test -p agentscope-extensions-agent-protocol --lib` → 41 passed / 0 failed。
+
+- `a338d520d` feat(a2a): report input-required when the agent waits for a tool confirmation — **已迁移**
+  - Rust 位置：`crates/agentscope-extensions-a2a-server/src/executor.rs`（`AgentOutputProjector::project` 捕获 `GenerateReason::PermissionAsking` 的最终回复，新增 `confirmation_request()`）；`src/lib.rs`（新增 `RunStart::InputRequired`，:1097 流式、:1740 运行结束、:1225-1231 续跑入口统一映射 `TaskStatus::new(TaskState::InputRequired)` 并携带该回复，`confirms_pending_tool_calls` 判定后续消息是否确认了挂起的 tool call）；`src/runner.rs`（`ensure_agent_has_state` + `carries_confirm_results`：请求确认挂起 run 但 agent 无 state 时返回 `A2aError::InvalidRequest`）。
+  - 测试：`a_run_that_asks_for_a_confirmation_reports_input_required`、`message_stream_reports_a_pause_as_input_required`、`a_confirmation_of_another_tool_call_keeps_the_task_input_required`、`a_follow_up_without_a_confirmation_keeps_the_task_input_required`；反向验证：短路 PermissionAsking 判定 → 4 条全 FAILED；恒真化 `confirms_pending_tool_calls` → 后 2 条 FAILED。
+  - 偏差：Java 经 `ClientEventContext`/`TaskUpdater` 上报，Rust 在 `start_run` 返回 `RunStart::InputRequired { task }`；wire 状态复用既有 `input-required`（`crates/agentscope-extensions-a2a-client/src/model.rs` 的 `#[serde(rename = "input-required")]`），字段名未变。
+  - 验证：`cargo test -p agentscope-extensions-a2a-server --lib` → 92 passed / 0 failed。
+
+- `33c3dc5f3` fix(a2a): stop the remote stream and task when an A2aAgent call is cancelled — **已迁移**
+  - Rust 位置：`crates/agentscope-extensions-a2a-client/src/agent.rs`：`CallParts::register_in_flight` 在开流之前登记调用（interrupt 早于首个 task 事件也能命中，:240 `is_cancelled`）、`IncrementalCall::cancel_remote`（:905，poll 边界丢弃在飞事件、关闭远端帧流并发 `tasks/cancel`，复用 `client.rs::A2aClient::tasks_cancel`）、`event_task_id`（从流事件取 task id 供取消）；`Agent::interrupt` 保持同步置位 + `cancel_remote_task` 的既有语义。
+  - 测试：`agent::tests::a_cancelled_stream_stops_the_remote_stream_and_the_task`（半开流的桩 transport：断言不再转发事件、确实发出 `tasks/cancel`、以取消提示结束）；反向验证：短路 :940 的取消检查后该用例不再结束（挂起），证明依赖该检查。
+  - 偏差：Java 新增 `StreamTrackingHttpClient`（174 行）跟踪并取消 HTTP 流，Rust 以「丢弃帧流即关闭响应体」表达同等语义，不新增客户端类型、不改公共 API。
+  - 验证：`cargo test -p agentscope-extensions-a2a-client --lib` → 90 passed / 0 failed。

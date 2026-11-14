@@ -46,7 +46,7 @@ pub use transport::{
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use agentscope_core::event::AgentEvent;
+use agentscope_core::event::{AgentEvent, ConfirmResult};
 use agentscope_core::message::{ContentBlock, Msg, MsgRole};
 use futures::stream::BoxStream;
 
@@ -316,6 +316,21 @@ impl A2aTaskRegistry {
         drop(guard);
         self.cancel_signal(task_id).cancel();
         self.get(task_id)
+    }
+
+    /// Records that the run of `task_id` waits for a tool confirmation.
+    ///
+    /// The status carries the request the caller has to answer, and that request also joins the
+    /// task history: a follow-up moves the status message there, so the pause must stay
+    /// repeatable from either place (`a338d520d`).
+    pub fn pause_input_required(&self, task_id: &str, request: Message) -> Option<Task> {
+        let mut guard = self.tasks.lock().unwrap();
+        let task = guard.get_mut(task_id)?;
+        let mut status = TaskStatus::new(TaskState::InputRequired);
+        status.message = Some(request.clone());
+        task.status = status;
+        task.history.get_or_insert_with(Vec::new).push(request);
+        Some(task.clone())
     }
 
     /// The cancellation signal of `task_id`, created on demand.
@@ -1002,14 +1017,24 @@ impl A2aRequestHandler {
         params: &MessageSendParams,
         call_context: &A2aCallContext,
     ) -> Result<Task, JsonRpcError> {
-        let (task_id, context_id, mut events) = start_run(
+        let (task_id, context_id, mut events) = match start_run(
             &self.runner,
             &self.registry,
             self.context_resolver.as_ref(),
             call_context,
             params,
         )
-        .await?;
+        .await?
+        {
+            RunStart::Started {
+                task_id,
+                context_id,
+                events,
+            } => (task_id, context_id, events),
+            // Still waiting for the confirmation of its tool calls: the pending request is
+            // repeated instead of starting a run the agent would reject (`a338d520d`).
+            RunStart::InputRequired { task } => return Ok(task),
+        };
         let mut projector = AgentOutputProjector::new(self.execute_properties);
         // Opened right after the task is recorded, so a `CancelTask` racing the start is seen.
         let cancel = self.registry.cancel_signal(&task_id);
@@ -1067,6 +1092,15 @@ impl A2aRequestHandler {
         }
 
         let compacted = projector.compacted();
+        if let Some(reply) = projector.confirmation_request() {
+            // The run stopped to ask for a tool confirmation: the reply *is* the request, so the
+            // task is reported `input-required` with it instead of `completed` (`a338d520d`).
+            let request =
+                ServerMessageConvert::convert_from_msg_to_message(reply, &task_id, &context_id);
+            return self
+                .pause_task(&task_id, &context_id, request)
+                .ok_or_else(|| JsonRpcError::new(JsonRpcError::TASK_NOT_FOUND, "task vanished"));
+        }
         let mut status = TaskStatus::new(TaskState::Completed);
         if !compacted.is_empty() {
             status.message = Some(ServerMessageConvert::convert_from_msgs_to_message(
@@ -1113,6 +1147,25 @@ impl A2aRequestHandler {
         serde_json::to_value(&task).map_err(internal)
     }
 
+    /// Records and publishes that `task_id` waits for a tool confirmation.
+    ///
+    /// `input-required` is not terminal, so the status update is not final: the task is resumed by
+    /// a follow-up on the same id (`a338d520d`).
+    fn pause_task(&self, task_id: &str, context_id: &str, request: Message) -> Option<Task> {
+        let task = self.registry.pause_input_required(task_id, request)?;
+        let mut event = agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent::new(
+            task_id.to_string(),
+            task.status.clone(),
+            false,
+        );
+        event.context_id = Some(context_id.to_string());
+        if let Ok(value) = serde_json::to_value(&event) {
+            self.registry.publish_event(task_id, value);
+        }
+        self.registry.close_events(task_id);
+        Some(task)
+    }
+
     /// Records the terminal status of `task_id` in its event log and closes it.
     fn close_task_events(
         &self,
@@ -1145,14 +1198,7 @@ async fn start_run(
     context_resolver: Option<&Arc<dyn A2aContextResolver>>,
     call_context: &A2aCallContext,
     params: &MessageSendParams,
-) -> Result<
-    (
-        String,
-        String,
-        BoxStream<'static, Result<AgentEvent, A2aError>>,
-    ),
-    JsonRpcError,
-> {
+) -> Result<RunStart, JsonRpcError> {
     let msgs = ServerMessageConvert::convert_from_message_to_msgs(&params.message);
     let task_id = params
         .message
@@ -1169,11 +1215,30 @@ async fn start_run(
     // leave a stray task behind.
     let user_id = resolve_call_user_id(context_resolver, call_context, &params.message)?;
 
-    registry.put(Task::new(
-        task_id.clone(),
-        TaskStatus::new(TaskState::Submitted),
-    ));
-    registry.update_status(&task_id, TaskStatus::new(TaskState::Working));
+    let paused = registry
+        .get(&task_id)
+        .filter(|task| task.status.state == TaskState::InputRequired);
+    match paused {
+        // A follow-up that confirms the tool calls of the paused run resumes it; anything else
+        // would make the agent reject the run and leave the task unconfirmable (`a338d520d`).
+        Some(task) => {
+            if !confirms_pending_tool_calls(&msgs, pending_request(&task).as_ref()) {
+                return Ok(RunStart::InputRequired { task });
+            }
+            // The resumed run is no longer waiting for input, and a fresh event log keeps the
+            // pause out of the new stream.
+            let mut resumed = task;
+            resumed.status = TaskStatus::new(TaskState::Working);
+            registry.put(resumed);
+        }
+        None => {
+            registry.put(Task::new(
+                task_id.clone(),
+                TaskStatus::new(TaskState::Submitted),
+            ));
+            registry.update_status(&task_id, TaskStatus::new(TaskState::Working));
+        }
+    }
 
     let options = AgentRequestOptions::new()
         .with_task_id(task_id.clone())
@@ -1190,7 +1255,78 @@ async fn start_run(
             Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
         }
     };
-    Ok((task_id, context_id, stream))
+    Ok(RunStart::Started {
+        task_id,
+        context_id,
+        events: stream,
+    })
+}
+
+/// What one submitted message produced, mirroring the executor's submit step.
+enum RunStart {
+    /// The agent run is open.
+    Started {
+        task_id: String,
+        context_id: String,
+        events: BoxStream<'static, Result<AgentEvent, A2aError>>,
+    },
+    /// The task still waits for the confirmation of its tool calls, so no run was opened.
+    InputRequired { task: Task },
+}
+
+/// Finds the request a paused task waits on.
+///
+/// Mirrors Java `pendingRequest`: a follow-up moves the status message of the task into its
+/// history, so the request is the latest agent message there (the status message is the same
+/// request before that move).
+fn pending_request(task: &Task) -> Option<Message> {
+    task.history
+        .iter()
+        .flatten()
+        .rev()
+        .find(|message| message.role == MessageRole::Agent)
+        .cloned()
+        .or_else(|| {
+            task.status
+                .message
+                .clone()
+                .filter(|message| message.role == MessageRole::Agent)
+        })
+}
+
+/// Whether `messages` confirm at least one tool call and only tool calls the pending request asks
+/// about.
+///
+/// Mirrors Java `confirmsPendingToolCalls`: a confirmation for another call must not resume the
+/// run, and a follow-up without one must not either.
+fn confirms_pending_tool_calls(messages: &[Msg], pending: Option<&Message>) -> bool {
+    let confirmed: Vec<String> = messages
+        .iter()
+        .filter_map(|message| message.metadata.get(Msg::METADATA_CONFIRM_RESULTS))
+        .filter_map(|value| serde_json::from_value::<Vec<ConfirmResult>>(value.clone()).ok())
+        .flatten()
+        .filter_map(|result| result.tool_call.map(|call| call.id))
+        .collect();
+    let Some(pending) = pending else {
+        return !confirmed.is_empty();
+    };
+    if confirmed.is_empty() {
+        return false;
+    }
+    let pending_ids: Vec<String> = pending
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Data(data) => MessageConstants::metadata_value(
+                data.metadata.as_ref(),
+                MessageConstants::TOOL_CALL_ID_METADATA_KEY,
+            ),
+            _ => None,
+        })
+        .collect();
+    confirmed
+        .iter()
+        .all(|id| pending_ids.iter().any(|pending_id| pending_id == id))
 }
 
 /// Resolves the session id of one request, mirroring Java
@@ -1425,6 +1561,27 @@ impl StreamState {
         self.phase = StreamPhase::Done;
     }
 
+    /// Reports that the run stopped to wait for a tool confirmation, mirroring Java
+    /// `emitter.requiresInput` (`a338d520d`).
+    ///
+    /// `input-required` is not terminal, so the status update is not final and the event log is
+    /// kept replayable: the caller resumes the task with a follow-up on the same id.
+    fn finish_input_required(&mut self, task_id: String, context_id: String, request: Message) {
+        let Some(task) = self.registry.pause_input_required(&task_id, request) else {
+            self.finish_failed(task_id, context_id, "task vanished");
+            return;
+        };
+        let mut event = agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent::new(
+            task_id.clone(),
+            task.status.clone(),
+            false,
+        );
+        event.context_id = Some(context_id);
+        self.push_task_event(&task_id, &event);
+        self.registry.close_events(&task_id);
+        self.phase = StreamPhase::Done;
+    }
+
     /// Fails the task and emits the terminal status update carrying the error message.
     fn finish_failed(&mut self, task_id: String, context_id: String, message: &str) {
         let status = TaskStatus {
@@ -1473,7 +1630,11 @@ async fn next_stream_item(mut state: StreamState) -> Option<(JsonRpcResponse, St
                 )
                 .await
                 {
-                    Ok((task_id, context_id, events)) => {
+                    Ok(RunStart::Started {
+                        task_id,
+                        context_id,
+                        events,
+                    }) => {
                         // Opened before the first frame, so a cancel racing the start is seen.
                         let cancel = state.registry.cancel_signal(&task_id);
                         if cancel.is_cancelled() {
@@ -1504,6 +1665,22 @@ async fn next_stream_item(mut state: StreamState) -> Option<(JsonRpcResponse, St
                     }
                     Err(error) => {
                         state.push_error(error);
+                    }
+                    // Still waiting for the confirmation of its tool calls: the pending request
+                    // is repeated instead of starting a run the agent would reject.
+                    Ok(RunStart::InputRequired { task }) => {
+                        let context_id = task.context_id.clone().unwrap_or_default();
+                        let request = pending_request(&task);
+                        match request {
+                            Some(request) => {
+                                state.finish_input_required(task.id, context_id, request)
+                            }
+                            None => state.finish_failed(
+                                task.id,
+                                context_id,
+                                "the task waits for a tool confirmation but keeps no request",
+                            ),
+                        }
                     }
                 }
             }
@@ -1555,7 +1732,18 @@ async fn next_stream_item(mut state: StreamState) -> Option<(JsonRpcResponse, St
                         state.finish_failed(task_id, context_id, &error.to_string());
                     }
                     Some(None) => {
-                        state.finish_succeeded(task_id, context_id, projector);
+                        if let Some(reply) = projector.confirmation_request() {
+                            // The run stopped to ask for a tool confirmation, so the task waits
+                            // for the caller's answer instead of completing (`a338d520d`).
+                            let request = ServerMessageConvert::convert_from_msg_to_message(
+                                reply,
+                                &task_id,
+                                &context_id,
+                            );
+                            state.finish_input_required(task_id, context_id, request);
+                        } else {
+                            state.finish_succeeded(task_id, context_id, projector);
+                        }
                     }
                 }
             }
@@ -1811,7 +1999,7 @@ async fn agent_card_endpoint(
 mod tests {
     use super::*;
     use agentscope_core::event::EventData;
-    use agentscope_core::message::{TextBlock, ThinkingBlock};
+    use agentscope_core::message::{GenerateReason, TextBlock, ThinkingBlock};
 
     /// Deterministic [`AgentRunner`] stub emitting one `AGENT_RESULT` text block.
     struct EchoRunner {
@@ -2338,6 +2526,229 @@ mod tests {
             agentscope_extensions_a2a_client::model::PartKind::Text
         );
         assert_eq!(handler.registry().len(), 1);
+    }
+
+    /// Runner that asks for a tool confirmation on its first run and answers afterwards.
+    struct AskingRunner {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRunner for AskingRunner {
+        fn agent_name(&self) -> String {
+            "asking-agent".to_string()
+        }
+
+        fn agent_description(&self) -> String {
+            "asks before acting".to_string()
+        }
+
+        async fn stream_events(
+            &self,
+            _request_messages: Vec<Msg>,
+            _options: AgentRequestOptions,
+        ) -> Result<Vec<AgentEvent>, A2aError> {
+            let run = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let reply = if run == 1 {
+                Msg::builder()
+                    .id("msg-ask")
+                    .role(MsgRole::Assistant)
+                    .block(ContentBlock::ToolUse(
+                        agentscope_core::message::ToolUseBlock {
+                            id: "call-1".to_string(),
+                            name: "write_file".to_string(),
+                            input: serde_json::Map::new(),
+                            content: None,
+                            metadata: Default::default(),
+                            state: agentscope_core::message::ToolCallState::Asking,
+                        },
+                    ))
+                    .generate_reason(GenerateReason::PermissionAsking)
+                    .build()
+            } else {
+                Msg::builder()
+                    .id("msg-done")
+                    .role(MsgRole::Assistant)
+                    .text_content("done")
+                    .build()
+            };
+            let mut data = EventData::default();
+            data.fields
+                .insert("reply".to_string(), serde_json::to_value(&reply).unwrap());
+            Ok(vec![AgentEvent::AgentResult(data)])
+        }
+
+        fn stop(&self, _task_id: &str) {}
+    }
+
+    fn asking_handler() -> (A2aRequestHandler, Arc<std::sync::atomic::AtomicUsize>) {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = A2aRequestHandler::new(
+            Arc::new(AskingRunner { runs: runs.clone() }),
+            AgentCard::new("asking-agent", "http://localhost"),
+            registry(),
+        );
+        (handler, runs)
+    }
+
+    fn send(handler: &A2aRequestHandler, message: Message) -> Task {
+        let params = MessageSendParams {
+            message,
+            configuration: None,
+            metadata: None,
+        };
+        let request = JsonRpcRequest::new(
+            methods::MESSAGE_SEND,
+            Some(serde_json::to_value(params).unwrap()),
+            Some(serde_json::Value::from(1)),
+        );
+        let response = rt().block_on(handler.handle(&request));
+        let result: SendResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        result.as_task().unwrap().clone()
+    }
+
+    /// A user message on an existing task, optionally carrying a tool confirmation.
+    fn follow_up(task_id: &str, confirmed_call: Option<&str>) -> Message {
+        let mut msg = Msg::builder()
+            .id("msg-follow-up")
+            .role(MsgRole::User)
+            .text_content("continue")
+            .build();
+        if let Some(call_id) = confirmed_call {
+            let result = ConfirmResult::new(
+                true,
+                Some(agentscope_core::message::ToolUseBlock {
+                    id: call_id.to_string(),
+                    name: "write_file".to_string(),
+                    input: serde_json::Map::new(),
+                    content: None,
+                    metadata: Default::default(),
+                    state: agentscope_core::message::ToolCallState::Asking,
+                }),
+                Vec::new(),
+            );
+            msg.metadata.insert(
+                Msg::METADATA_CONFIRM_RESULTS.to_string(),
+                serde_json::to_value(vec![result]).unwrap(),
+            );
+        }
+        let mut message = ServerMessageConvert::convert_from_msg_to_message(&msg, task_id, "ctx-1");
+        message.role = MessageRole::User;
+        message
+    }
+
+    fn input_required_parts(task: &Task) -> Vec<&Part> {
+        task.status
+            .message
+            .as_ref()
+            .map(|message| message.parts.iter().collect())
+            .unwrap_or_default()
+    }
+
+    // Java `a338d520d`: a run that stops for a tool confirmation is reported `input-required`
+    // with the pending tool calls instead of completing the task.
+    #[test]
+    fn a_run_that_asks_for_a_confirmation_reports_input_required() {
+        let (handler, runs) = asking_handler();
+        let task = send(
+            &handler,
+            Message::new("m1", MessageRole::User, vec![Part::text("write")]),
+        );
+
+        assert_eq!(task.status.state, TaskState::InputRequired);
+        let parts = input_required_parts(&task);
+        assert_eq!(parts.len(), 1, "the request carries the pending tool call");
+        let Part::Data(data) = parts[0] else {
+            panic!("expected a data part, got {:?}", parts[0]);
+        };
+        assert_eq!(
+            MessageConstants::metadata_value(
+                data.metadata.as_ref(),
+                MessageConstants::TOOL_CALL_ID_METADATA_KEY
+            )
+            .as_deref(),
+            Some("call-1")
+        );
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let stored = handler.registry().get(&task.id).unwrap();
+        assert_eq!(stored.status.state, TaskState::InputRequired);
+    }
+
+    // A follow-up without a confirmation must repeat the request instead of starting a run the
+    // agent would reject.
+    #[test]
+    fn a_follow_up_without_a_confirmation_keeps_the_task_input_required() {
+        let (handler, runs) = asking_handler();
+        let task = send(
+            &handler,
+            Message::new("m1", MessageRole::User, vec![Part::text("write")]),
+        );
+
+        let repeated = send(&handler, follow_up(&task.id, None));
+
+        assert_eq!(repeated.status.state, TaskState::InputRequired);
+        assert_eq!(input_required_parts(&repeated).len(), 1);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the agent must not run without a confirmation"
+        );
+    }
+
+    // A confirmation of another tool call does not answer the pending request.
+    #[test]
+    fn a_confirmation_of_another_tool_call_keeps_the_task_input_required() {
+        let (handler, runs) = asking_handler();
+        let task = send(
+            &handler,
+            Message::new("m1", MessageRole::User, vec![Part::text("write")]),
+        );
+
+        let still_paused = send(&handler, follow_up(&task.id, Some("call-unknown")));
+
+        assert_eq!(still_paused.status.state, TaskState::InputRequired);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // Confirming the pending tool call resumes the run on the same task.
+    #[test]
+    fn a_confirmation_of_the_pending_tool_call_resumes_the_run() {
+        let (handler, runs) = asking_handler();
+        let task = send(
+            &handler,
+            Message::new("m1", MessageRole::User, vec![Part::text("write")]),
+        );
+
+        let resumed = send(&handler, follow_up(&task.id, Some("call-1")));
+
+        assert_eq!(resumed.status.state, TaskState::Completed);
+        assert_eq!(resumed.id, task.id);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // The streaming path reports the pause as a non-final `input-required` status update.
+    #[test]
+    fn message_stream_reports_a_pause_as_input_required() {
+        let (handler, _runs) = asking_handler();
+        let params = MessageSendParams {
+            message: Message::new("m1", MessageRole::User, vec![Part::text("write")]),
+            configuration: None,
+            metadata: None,
+        };
+        let request = JsonRpcRequest::new(
+            methods::MESSAGE_STREAM,
+            Some(serde_json::to_value(params).unwrap()),
+            None,
+        );
+        let response = rt().block_on(handler.handle(&request));
+        let events: Vec<serde_json::Value> =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+
+        let last: agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent =
+            serde_json::from_value(events.last().unwrap().clone()).unwrap();
+        assert_eq!(last.status.state, TaskState::InputRequired);
+        assert!(!last.is_final, "the task can still be resumed");
+        assert_eq!(last.status.message.as_ref().map(|m| m.parts.len()), Some(1));
     }
 
     #[test]

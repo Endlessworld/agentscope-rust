@@ -502,10 +502,15 @@ impl CallParts {
     }
 
     fn register_call(&self, task: &Task) -> Arc<InFlightCall> {
-        let call = Arc::new(InFlightCall::new(
-            uuid::Uuid::new_v4().to_string(),
-            Some(task.id.clone()),
-        ));
+        self.register_in_flight(Some(task.id.clone()))
+    }
+
+    /// Registers a call that has no task id yet.
+    ///
+    /// A streaming call learns the id with its first task event, but must be reachable by
+    /// [`Agent::interrupt`] from the moment the stream is opened (`33c3dc5f3`).
+    fn register_in_flight(&self, task_id: Option<String>) -> Arc<InFlightCall> {
+        let call = Arc::new(InFlightCall::new(uuid::Uuid::new_v4().to_string(), task_id));
         if let Ok(mut running) = self.running.lock() {
             running.push(call.clone());
         }
@@ -819,6 +824,10 @@ struct IncrementalCall {
     /// Held for the whole stream, so two calls of one agent never interleave.
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     frames: Option<BoxStream<'static, Result<StreamEvent, A2aError>>>,
+    /// The call as [`Agent::interrupt`] sees it, registered when the stream opens.
+    call: Option<Arc<InFlightCall>>,
+    /// Removes the call from the registry when the stream ends or is dropped.
+    call_guard: Option<CallGuard>,
     accumulator: TaskResultAccumulator,
     /// The plain message reply, which ends a stream that carries no task.
     message_reply: Option<Msg>,
@@ -834,6 +843,8 @@ impl IncrementalCall {
             messages,
             guard: None,
             frames: None,
+            call: None,
+            call_guard: None,
             accumulator: TaskResultAccumulator::new(),
             message_reply: None,
             pending: VecDeque::new(),
@@ -845,6 +856,13 @@ impl IncrementalCall {
     async fn open(&mut self) {
         self.guard = Some(self.handler.gate.clone().lock_owned().await);
         self.handler.append_history(&self.messages);
+        // Registered before the stream is opened, so an interrupt racing the open still ends it.
+        let call = self.handler.register_in_flight(None);
+        self.call_guard = Some(CallGuard {
+            running: self.handler.running.clone(),
+            call: call.clone(),
+        });
+        self.call = Some(call);
         let (user_id, session_id) = self.handler.identity();
         let params = MessageSendParams {
             message: MessageConvert::convert_from_msgs_with_identity(
@@ -868,6 +886,43 @@ impl IncrementalCall {
             }
         }
     }
+
+    fn is_cancelled(&self) -> bool {
+        self.call.as_ref().is_some_and(|call| call.is_cancelled())
+    }
+
+    /// Stops the remote stream and the remote task of a cancelled call.
+    ///
+    /// Mirrors Java `endCall` after `33c3dc5f3`: the events still in flight are dropped, the
+    /// remote stream is closed, and the task is cancelled because nobody waits for its reply any
+    /// more. Java reports the interrupt with the hint message of `cancelRemoteTask`, which is what
+    /// this stream publishes instead of an internal "no result" error.
+    async fn cancel_remote(&mut self) {
+        self.pending.clear();
+        // Dropping the frame stream closes the HTTP response body: it is the Rust counterpart of
+        // Java `StreamTrackingHttpClient#cancelStreams`.
+        self.frames = None;
+        self.done = true;
+        let Some(task_id) = self.call.as_ref().and_then(|call| call.task_id()) else {
+            return;
+        };
+        let client = self.handler.client();
+        if client
+            .tasks_cancel(TaskIdParams {
+                id: task_id.clone(),
+                metadata: None,
+            })
+            .await
+            .is_ok()
+        {
+            publish(
+                &self.outcome,
+                Ok(Msg::assistant(format!(
+                    "Task {task_id} interrupt successfully."
+                ))),
+            );
+        }
+    }
 }
 
 /// One poll of an incremental call, mirroring Java `A2aAgent#streamEvents`.
@@ -875,6 +930,11 @@ async fn next_incremental_item(
     mut call: IncrementalCall,
 ) -> Option<(CoreResult<AgentEvent>, IncrementalCall)> {
     loop {
+        // `interrupt()` only marks the call; the poll boundary performs the remote cancel and
+        // stops relaying (`33c3dc5f3`).
+        if call.is_cancelled() {
+            call.cancel_remote().await;
+        }
         if let Some(event) = call.pending.pop_front() {
             return Some((Ok(event), call));
         }
@@ -887,6 +947,10 @@ async fn next_incremental_item(
         };
         match frames.next().await {
             Some(Ok(event)) => {
+                if let (Some(task_id), Some(running)) = (event_task_id(&event), call.call.as_ref())
+                {
+                    running.set_task_id(task_id);
+                }
                 call.pending.extend(stream_event_to_agent_events(&event));
                 if let Some(reply) = call.accumulator.observe(&event, &call.handler.name) {
                     call.handler.append_history(std::slice::from_ref(&reply));
@@ -921,6 +985,16 @@ async fn next_incremental_item(
                 call.done = true;
             }
         }
+    }
+}
+
+/// The task a stream event belongs to, so a cancelled call knows which remote task to cancel.
+fn event_task_id(event: &StreamEvent) -> Option<&str> {
+    match event {
+        StreamEvent::Task(task) => Some(task.id.as_str()),
+        StreamEvent::StatusUpdate(update) => Some(update.task_id.as_str()),
+        StreamEvent::ArtifactUpdate(update) => Some(update.task_id.as_str()),
+        StreamEvent::Message(_) => None,
     }
 }
 
@@ -1637,6 +1711,145 @@ mod tests {
 
         // Every emitted event reached the sink.
         assert_eq!(*seen.lock().unwrap(), kinds);
+    }
+
+    /// Transport whose `message/stream` stays open until the test sends more frames.
+    struct OpenStreamTransport {
+        frames: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<JsonRpcResponse>>>,
+        methods: Mutex<Vec<String>>,
+        cancel_reply: JsonRpcResponse,
+    }
+
+    impl OpenStreamTransport {
+        fn new(
+            frames: tokio::sync::mpsc::UnboundedReceiver<JsonRpcResponse>,
+            cancel_reply: JsonRpcResponse,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                frames: Mutex::new(Some(frames)),
+                methods: Mutex::new(Vec::new()),
+                cancel_reply,
+            })
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.methods.lock().unwrap().clone()
+        }
+    }
+
+    impl JsonRpcTransport for OpenStreamTransport {
+        fn send(
+            &self,
+            _url: &str,
+            request: &JsonRpcRequest,
+            _headers: &BTreeMap<String, String>,
+        ) -> Pin<Box<dyn Future<Output = Result<JsonRpcResponse, A2aError>> + Send + '_>> {
+            self.methods.lock().unwrap().push(request.method.clone());
+            let response = match request.method.as_str() {
+                crate::model::methods::TASKS_CANCEL => self.cancel_reply.clone(),
+                _ => JsonRpcResponse::success(serde_json::Value::Null, Some("unexpected".into())),
+            };
+            Box::pin(async move { Ok(response) })
+        }
+
+        fn send_stream(
+            &self,
+            _url: String,
+            request: JsonRpcRequest,
+            _headers: BTreeMap<String, String>,
+        ) -> futures::stream::BoxStream<'static, Result<JsonRpcResponse, A2aError>> {
+            self.methods.lock().unwrap().push(request.method.clone());
+            let frames = self
+                .frames
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one streaming call");
+            Box::pin(futures::stream::unfold(frames, |mut frames| async move {
+                let response = frames.recv().await?;
+                Some((Ok(response), frames))
+            }))
+        }
+    }
+
+    fn working_update() -> JsonRpcResponse {
+        let update = crate::model::TaskStatusUpdateEvent::new(
+            "t-1",
+            TaskStatus::new(TaskState::Working),
+            false,
+        );
+        JsonRpcResponse::success(serde_json::to_value(&update).unwrap(), Some(1.into()))
+    }
+
+    // Java `33c3dc5f3`: cancelling a streamed call stops the remote stream and the remote task
+    // instead of keeping the events of a run nobody waits for.
+    #[test]
+    fn a_cancelled_stream_stops_the_remote_stream_and_the_task() {
+        use futures::StreamExt;
+
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let transport = OpenStreamTransport::new(
+            receiver,
+            JsonRpcResponse::success(
+                serde_json::to_value(Task::new("t-1", TaskStatus::new(TaskState::Canceled)))
+                    .unwrap(),
+                Some(2.into()),
+            ),
+        );
+        let agent = A2aAgent::builder("remote", resolver())
+            .config(
+                A2aAgentConfig::builder()
+                    .transport(transport.clone())
+                    .build(),
+            )
+            .build();
+
+        // The task id comes with the status update; the text delta gives the stream something to
+        // relay before the interrupt.
+        sender.send(working_update()).unwrap();
+        sender.send(artifact_update("Hel")).unwrap();
+
+        let runtime = rt();
+        let events = runtime.block_on(async {
+            let mut stream = agent.stream_events(vec![Msg::user("hi")]);
+            let mut events = Vec::new();
+            let first = stream.next().await.unwrap().unwrap();
+            events.push(first);
+            events.push(stream.next().await.unwrap().unwrap());
+
+            // The call is registered with its task id, so the interrupt reaches it.
+            agent.interrupt();
+            // An event still in flight must not be relayed after the cancellation.
+            sender.send(artifact_update("late")).unwrap();
+            while let Some(event) = stream.next().await {
+                events.push(event.unwrap());
+            }
+            events
+        });
+
+        assert!(
+            transport
+                .methods()
+                .contains(&crate::model::methods::TASKS_CANCEL.to_string()),
+            "the remote task is cancelled: {:?}",
+            transport.methods()
+        );
+        // Nothing of the late frame reaches the caller, and the stream ends with the interrupt
+        // hint instead of an internal "no result" error.
+        let deltas: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event_type() == agentscope_core::event::AgentEventType::TextBlockDelta
+            })
+            .map(|event| event.data().fields["delta"].clone())
+            .collect();
+        assert_eq!(deltas, vec![serde_json::json!("Hel")]);
+        let reply: Msg = events
+            .iter()
+            .find_map(|event| event.data().fields.get("reply"))
+            .map(|value| serde_json::from_value(value.clone()).unwrap())
+            .expect("the stream publishes the interrupt hint");
+        assert_eq!(reply.text_content(), "Task t-1 interrupt successfully.");
     }
 
     /// Wraps `inner`, recording `<point>:<label>:out` once the stream is exhausted.

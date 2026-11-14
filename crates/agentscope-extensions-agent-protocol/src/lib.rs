@@ -640,6 +640,17 @@ impl ProtocolTaskRepository for InMemoryProtocolTaskRepository {
 ///    Rust has no thread pool here, so the run is `tokio::spawn`ed instead.
 /// 2. Java's `waitFor` blocks on a `CompletableFuture`; here it polls the persisted record,
 ///    which keeps the terminal-status contract while staying runtime-agnostic.
+///
+/// # Task transitions are serialized per id
+///
+/// `submit` and `resume` are check-then-act transitions: the persisted record and the running
+/// handle are inspected, a record is saved and the run is registered. Two concurrent calls for
+/// one id would both pass the check and start duplicate runs, so every transition holds the
+/// stripe of its id (Java `9d4f86426`, `taskLocks` → `taskLockFor`). The lock storage is fixed
+/// at [`TASK_LOCK_STRIPE_COUNT`] entries, so finished ids do not accumulate locks, and different
+/// ids keep independent registration.
+///
+/// The coordination is in-process: one store per replica, like Java's documented scope.
 pub struct AgentProtocolTaskStore {
     agent_factory: Arc<dyn AgentFactory>,
     task_repository: Arc<dyn ProtocolTaskRepository>,
@@ -647,7 +658,13 @@ pub struct AgentProtocolTaskStore {
     properties: AgentProtocolProperties,
     runtime_context_customizers: Vec<Arc<dyn RuntimeContextCustomizer>>,
     running: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    task_locks: Vec<Mutex<()>>,
 }
+
+/// Number of lock stripes serializing the `submit` / `resume` transitions of one task id.
+///
+/// Mirrors Java `AgentProtocolTaskStore#TASK_LOCK_STRIPE_COUNT`.
+pub(crate) const TASK_LOCK_STRIPE_COUNT: usize = 64;
 
 impl std::fmt::Debug for AgentProtocolTaskStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -679,6 +696,9 @@ impl AgentProtocolTaskStore {
             properties,
             runtime_context_customizers,
             running: Mutex::new(HashMap::new()),
+            task_locks: (0..TASK_LOCK_STRIPE_COUNT)
+                .map(|_| Mutex::new(()))
+                .collect(),
         }
     }
 
@@ -728,6 +748,21 @@ impl AgentProtocolTaskStore {
         &self.properties
     }
 
+    /// The in-process stripe serializing the transitions of `task_id`.
+    ///
+    /// Poisoning is recovered: a transition that panicked did not leave half of the lock state
+    /// behind, only the stripe marked poisoned.
+    fn task_lock(&self, task_id: &str) -> std::sync::MutexGuard<'_, ()> {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in task_id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.task_locks[hash as usize % TASK_LOCK_STRIPE_COUNT]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Starts a background task, mirroring Java `submit`.
     ///
     /// Idempotent while running: if a non-terminal task with the same id already exists, this
@@ -739,6 +774,10 @@ impl AgentProtocolTaskStore {
         input: &str,
         context: Option<BTreeMap<String, Value>>,
     ) -> Result<(), AgentProtocolError> {
+        // The terminal check, the running-handle check, the pending record and the registration
+        // are one transition: two concurrent submits of one id would otherwise both pass the
+        // checks and start duplicate runs (9d4f86426).
+        let _transition = self.task_lock(task_id);
         if let Some(existing) = self.task_repository.find(task_id) {
             if existing.status.is_terminal() {
                 return Err(AgentProtocolError::InvalidRequest(format!(
@@ -793,6 +832,9 @@ impl AgentProtocolTaskStore {
                 "HITL is disabled on this server".to_string(),
             ));
         }
+        // Like `submit`: the awaiting check, the cleared record and the registration are one
+        // transition for this id (Java keeps both under the same task lock).
+        let _transition = self.task_lock(task_id);
         let record = self
             .task_repository
             .find(task_id)
@@ -1926,6 +1968,267 @@ mod tests {
         assert!(matches!(err, AgentProtocolError::TaskNotFound(_)));
     }
 
+    /// Repository whose first `PENDING` save parks until the test releases it, so a second
+    /// submission reaches the store's checks while the first one is still registering.
+    struct BlockingRepository {
+        inner: InMemoryProtocolTaskRepository,
+        first_pending: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        pending_saves: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BlockingRepository {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryProtocolTaskRepository::new(),
+                first_pending: std::sync::Mutex::new(None),
+                release: std::sync::Arc::new((
+                    std::sync::Mutex::new(false),
+                    std::sync::Condvar::new(),
+                )),
+                pending_saves: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Returns a receiver that fires once the first pending record has been saved.
+        fn park_first_pending_save(&self) -> std::sync::mpsc::Receiver<()> {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            *self.first_pending.lock().unwrap() = Some(sender);
+            receiver
+        }
+
+        fn release(&self) {
+            let (released, wake) = &*self.release;
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        }
+
+        fn pending_saves(&self) -> usize {
+            self.pending_saves.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ProtocolTaskRepository for BlockingRepository {
+        fn save(&self, record: &TaskRecord) {
+            self.inner.save(record);
+            if record.status != TaskStatus::Pending {
+                return;
+            }
+            let first = self
+                .pending_saves
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0;
+            let Some(reached) = (if first {
+                self.first_pending.lock().unwrap().take()
+            } else {
+                None
+            }) else {
+                return;
+            };
+            let _ = reached.send(());
+            let (released, wake) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        }
+
+        fn find(&self, task_id: &str) -> Option<TaskRecord> {
+            self.inner.find(task_id)
+        }
+    }
+
+    /// Agent that counts how many runs it drives and holds each run open until the test releases
+    /// it, so a submission's run is never accidentally finished before the assertions.
+    struct CountingAgent {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+        finish: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProtocolAgent for CountingAgent {
+        async fn stream_events(
+            &self,
+            _messages: Vec<Msg>,
+            _context: RuntimeContext,
+        ) -> Result<Vec<AgentEvent>, AgentProtocolError> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut finish = self.finish.clone();
+            while !*finish.borrow_and_update() {
+                if finish.changed().await.is_err() {
+                    break;
+                }
+            }
+            let mut data = EventData::default();
+            data.fields.insert(
+                "result".to_string(),
+                serde_json::to_value(reply_msg("done")).unwrap(),
+            );
+            Ok(vec![AgentEvent::AgentResult(data)])
+        }
+    }
+
+    /// Waits until `runs` reaches `expected`, so a just-spawned run gets its turn to start.
+    fn wait_for_runs(runs: &Arc<std::sync::atomic::AtomicUsize>, expected: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runs.load(std::sync::atomic::Ordering::SeqCst) < expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected {expected} runs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Submits `task_id` from a plain thread with a runtime handle, as a server handler would.
+    fn submit_from_thread(
+        store: Arc<AgentProtocolTaskStore>,
+        handle: tokio::runtime::Handle,
+        task_id: String,
+        started: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    ) -> std::thread::JoinHandle<Result<(), AgentProtocolError>> {
+        std::thread::spawn(move || {
+            let _guard = handle.enter();
+            let (done, wake) = &*started;
+            let result = store.submit(&task_id, "worker", "request", None);
+            *done.lock().unwrap() = true;
+            wake.notify_all();
+            result
+        })
+    }
+
+    fn wait_until(
+        started: &std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        ms: u64,
+    ) -> bool {
+        let (done, wake) = &**started;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        let mut done = done.lock().unwrap();
+        while !*done {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return *done;
+            }
+            let (next, _) = wake.wait_timeout(done, left).unwrap();
+            done = next;
+        }
+        true
+    }
+
+    /// Two concurrent submits of one id register a single run and a single pending record.
+    ///
+    /// Without the per-id transition lock the second submit passes the checks while the first
+    /// one is saving its pending record, so it saves a second record and starts a second run.
+    #[test]
+    fn concurrent_submits_of_one_task_start_a_single_run() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (finish, finish_rx) = tokio::sync::watch::channel(false);
+        let repository = Arc::new(BlockingRepository::new());
+        let parked = repository.park_first_pending_save();
+        let store = Arc::new(AgentProtocolTaskStore::with_repository(
+            Arc::new(FixedAgentFactory::new(Arc::new(CountingAgent {
+                runs: runs.clone(),
+                finish: finish_rx,
+            }))),
+            repository.clone(),
+        ));
+        let runtime = rt();
+
+        let first_done = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let second_done = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let first = submit_from_thread(
+            store.clone(),
+            runtime.handle().clone(),
+            "same-task".to_string(),
+            first_done,
+        );
+        parked
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the first pending save was reached");
+
+        let second = submit_from_thread(
+            store.clone(),
+            runtime.handle().clone(),
+            "same-task".to_string(),
+            second_done.clone(),
+        );
+        // The same id must wait for the first transition to finish registering.
+        assert!(
+            !wait_until(&second_done, 300),
+            "the second submit must wait for the first one"
+        );
+
+        repository.release();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        wait_for_runs(&runs, 1);
+
+        assert_eq!(repository.pending_saves(), 1, "one record per logical task");
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one execution per logical task"
+        );
+        finish.send(true).unwrap();
+        runtime
+            .block_on(store.wait_for("same-task", 5_000))
+            .expect("the registered run finishes");
+    }
+
+    /// Different ids keep independent registration: a second id must not wait for the first.
+    #[test]
+    fn submits_of_different_tasks_are_not_serialized() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (finish, finish_rx) = tokio::sync::watch::channel(false);
+        let repository = Arc::new(BlockingRepository::new());
+        let parked = repository.park_first_pending_save();
+        let store = Arc::new(AgentProtocolTaskStore::with_repository(
+            Arc::new(FixedAgentFactory::new(Arc::new(CountingAgent {
+                runs: runs.clone(),
+                finish: finish_rx,
+            }))),
+            repository.clone(),
+        ));
+        let runtime = rt();
+
+        let first_done = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let second_done = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let first = submit_from_thread(
+            store.clone(),
+            runtime.handle().clone(),
+            "first-task".to_string(),
+            first_done,
+        );
+        parked
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the first pending save was reached");
+
+        let second = submit_from_thread(
+            store.clone(),
+            runtime.handle().clone(),
+            "other-task".to_string(),
+            second_done.clone(),
+        );
+        assert!(
+            wait_until(&second_done, 2_000),
+            "a different id must register while the first one is parked"
+        );
+
+        repository.release();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        wait_for_runs(&runs, 2);
+
+        assert_eq!(repository.pending_saves(), 2);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+        finish.send(true).unwrap();
+        runtime
+            .block_on(store.wait_for("first-task", 5_000))
+            .expect("the parked run finishes");
+        runtime
+            .block_on(store.wait_for("other-task", 5_000))
+            .expect("the second run finishes");
+    }
     #[test]
     fn cancel_marks_a_task_cancelled() {
         let store = store_for(Arc::new(ResultAgent {

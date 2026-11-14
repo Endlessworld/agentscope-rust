@@ -264,6 +264,7 @@ impl<F: TaskAgentFactory + 'static> AgentRunner for BaseReActAgentRunner<F> {
     ) -> Result<Vec<AgentEvent>, A2aError> {
         let task_id = required_task_id(&options)?;
         let agent = self.register(&task_id, session_of(&options))?;
+        ensure_agent_has_state(&agent, &request_messages)?;
         // Dropped on every exit path below, including an erroring event stream.
         let _guard = self.guard(&task_id, &agent);
         apply_identity(&agent, &options);
@@ -285,6 +286,9 @@ impl<F: TaskAgentFactory + 'static> AgentRunner for BaseReActAgentRunner<F> {
         let task_id = options.task_id().map(str::to_string)?;
         match self.register(&task_id, session_of(&options)) {
             Ok(agent) => {
+                if let Err(error) = ensure_agent_has_state(&agent, &request_messages) {
+                    return Some(Box::pin(futures::stream::once(async move { Err(error) })));
+                }
                 let guard = self.guard(&task_id, &agent);
                 apply_identity(&agent, &options);
                 let stream = agent.stream_events(request_messages).map(move |item| {
@@ -319,6 +323,37 @@ impl<F: TaskAgentFactory + 'static> AgentRunner for BaseReActAgentRunner<F> {
             None => task.agent.interrupt(),
         }
     }
+}
+
+/// Rejects a request that confirms tool calls of a paused run when the agent cannot restore that
+/// run.
+///
+/// Mirrors Java `BaseReActAgentRunner#streamEvents` (`a338d520d`): without shared agent state the
+/// agent would handle the confirmation as the start of a new conversation instead of resuming the
+/// paused one.
+fn ensure_agent_has_state(
+    agent: &Arc<dyn TaskAgent>,
+    request_messages: &[Msg],
+) -> Result<(), A2aError> {
+    if agent.state_handle().is_some() || !carries_confirm_results(request_messages) {
+        return Ok(());
+    }
+    Err(A2aError::InvalidRequest(
+        "The request confirms tool calls of a paused run, but the agent keeps no state to restore \
+         that run from. Configure an agent with state."
+            .to_string(),
+    ))
+}
+
+/// Whether any message carries tool confirmation results (Java `carriesConfirmResults`).
+fn carries_confirm_results(messages: &[Msg]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .metadata
+            .get(Msg::METADATA_CONFIRM_RESULTS)
+            .and_then(|value| value.as_array())
+            .is_some_and(|results| !results.is_empty())
+    })
 }
 
 /// The session scope of one request, or `None` when the caller sent none.
