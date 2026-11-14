@@ -7,9 +7,11 @@
 pub mod backend_thread_journal;
 mod checkpoint;
 pub mod execution_host;
+pub mod harness_adapter;
 mod tool_facts;
 
 pub use backend_thread_journal::BackendThreadJournal;
 pub use execution_host::{
     pin, AgentScopeExecutionHost, FINALIZATION_COMPLETED, FINALIZATION_STARTED,
 };
+pub use harness_adapter::AgentScopeHarnessAdapter;

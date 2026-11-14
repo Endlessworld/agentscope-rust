@@ -14,10 +14,11 @@ categories.workspace = true
 [dependencies]
 agentscope-durable.workspace = true
 agentscope-core.workspace = true
+agentscope-harness.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-futures.workspace = true
 tokio.workspace = true

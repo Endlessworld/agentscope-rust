@@ -60,6 +60,8 @@ pub struct AgentScopeExecutionHost {
     state: Option<AgentState>,
     /// A committed reply whose finalization must be resumed.
     resume: Option<Msg>,
+    /// Whether the turn already committed facts, i.e. a previous tick ran it.
+    started: bool,
     completed: AtomicBool,
     frame: Mutex<Option<Frame>>,
 }
@@ -98,10 +100,12 @@ impl AgentScopeExecutionHost {
         };
         let mut frame: Option<Frame> = None;
         let mut completed = false;
+        let mut started = false;
         for event in read_events(backend.as_ref(), &thread, thread_state.journal_position).await? {
             if event.turn_id.as_deref() != Some(turn_id.as_str()) {
                 continue;
             }
+            started = true;
             let data = event.data().unwrap_or(Value::Null);
             match event.event_type.as_str() {
                 "step/start" => {
@@ -158,6 +162,7 @@ impl AgentScopeExecutionHost {
             position,
             state,
             resume,
+            started,
             completed: AtomicBool::new(completed),
             frame: Mutex::new(frame),
         })
@@ -171,6 +176,14 @@ impl AgentScopeExecutionHost {
     /// The native state rebuilt from the committed checkpoint, if the thread has one.
     pub fn state(&self) -> Option<&AgentState> {
         self.state.as_ref()
+    }
+
+    /// Whether this turn already ran, so its input is part of the committed state.
+    ///
+    /// A turn with no committed fact of its own has never been invoked: that is the invocation
+    /// that must deliver the turn's input. A resumed one must not repeat it.
+    pub fn turn_started(&self) -> bool {
+        self.started
     }
 
     fn lease(&self) -> Result<Lease> {

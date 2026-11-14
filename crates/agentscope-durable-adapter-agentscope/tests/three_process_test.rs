@@ -411,13 +411,18 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 
 /// A scratch directory outside the repository, so the effect is a real file a second process
 /// (or a later test run) could have written.
+// A parallel run can observe the same `now()` value, so the counter removes the last window in
+// which two scenarios would share a scratch directory and double-count their effects.
+static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn scratch_dir(name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
+    let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "agentscope-durable-{name}-{}-{nanos}",
+        "agentscope-durable-{name}-{}-{nanos}-{seq}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);

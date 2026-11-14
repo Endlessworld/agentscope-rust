@@ -200,6 +200,18 @@ M4-a 原定「先删 `AgentSession`，ACP 改持 `Arc<dyn ThreadJournal>`」。�
 
 **剩余项**：可执行适配器 + 租约借用 → ACP `runtime` 字段换 `DurableSession`、turn 循环（`session.rs:2780-3300`）重写、`respond`/`run_wakeup` 接新路径 → 最后才是删除。`history()` 仍无消息转录（归 adapter）。
 
+### 2.9 M4-d 可执行适配器 + 租约借用（2026-11-15，未提交；ACP 与 `AgentSession` 未改）
+
+**已落地**：`AgentScopeHarnessAdapter`（适配 crate）通过 `DurableRuntime::with_adapter(harness, Arc<dyn HarnessAdapter>)` 注册，构造只收一个 `Fn() -> HarnessAgent` 工厂（每 tick 调一次：invocation 是建立在已提交事实上的新 agent，不是长活对象）。一次 tick 的顺序：open 执行宿主 → 用 checkpoint 回填 `ReActAgent` 的 state（不回填则恢复进程看到空历史）→ journal 借用 tick 租约 → `stream_events_with_extensions` 跑一轮 → 事件逐条 `ctx.publish` → flush、close recorder → `settle`。`HostPaused` 是让出（适配器返回 `Ok(())`，turn 仍 `Running`、不记 error，runtime 记 `TickOutcome::Settled`）；事件流里的其它错误以 `turn.failed` 落终态并带 error 文本。
+
+**一次 tick 一次模型调用**：`TickBudget` 包住执行宿主数 `Model` 边界，第二次直接 `HostPaused`。暂停点选 `Model` 而非下一个 `Reasoning`：那一刻 core 已 `set_cur_iter(N+1)` 且 `recorder.step(N+1)` 已入队，适配器退出前 `recorder.flush()` 落盘，恢复位置就是 N+1，迭代预算跨 tick 前进；选 `Reasoning` 会每 tick 重跑同一迭代（实测把 2 迭代的 turn 拖成 3 tick / 3 次调用）。边界：**一个 tick = 一次模型决策 + 该决策触发的工具执行**（core 无 acting 续跑分支，停在决策与工具之间会丢决策），不是「一个工具 apply 一次 tick」；`max_iters` 仍是全局预算，超出后由 core 的 summarizing 收尾。
+
+**租约借用**：`BackendThreadJournal::{attach_lease, detach_lease}`。借用期 `acquire` 直接返回该租约（owner/epoch 取 tick 的，不再 `claim`），`release` 空转（租约归 runtime），`detach_lease` 后恢复 claim 语义。不变量未动：epoch 不 bump、receipt 先于 fence、CAS/终态不可逆/工具三态全在 backend。
+
+**测试**（`tests/harness_adapter_test.rs`，7 条）：`a_tick_makes_exactly_one_model_call`、`a_borrowed_lease_lets_the_tick_write_the_journal`、`the_borrow_ends_with_the_tick`、`a_paused_tick_yields_and_the_next_one_finishes_the_turn`、`a_turn_runs_across_ticks_on_its_committed_conversation`、`the_iteration_budget_carries_across_ticks`、`a_second_turn_on_the_thread_gets_its_own_input`。反向验证 7 处全部 FAILED 后还原：去 state 回填 / 去 `attach_lease` / 借用期真 release / 去 tick 预算 / 暂停点改 `Reasoning` / 去 `recorder.flush()` / `turn_started()` 退回 `state().is_some()`。
+
+**剩余（M4-e）**：①ACP 仍走 `AgentSession`，需把 prompt→input、事件→`ctx.publish`、`respond`/`wakeup` 接到 `DurableSession`；②`history()` 消息转录；③输入投递用 `turn_started()`（= 本 turn 是否已有 journal 事实），若 ACP 在 submit 与首个 tick 之间写入本 turn 的控制事实需复核；④agent 工厂由 ACP 提供（模型/工具/中间件装配在 ACP 侧）；⑤`settle` 目前把非 `HostPaused` 错误一律记为终态 `Failed`，重试预算未用（ACP 若要重试由宿主重新 submit）。
+
 ## 3. 禁止事项（沿用 Java `agentscope-durable/AGENTS.md`）
 
 - 不做兼容层：不留别名、不保留 deprecated 转发、不写旧格式读取器、不做版本协商/降级回退。
@@ -262,3 +274,5 @@ M4-a 原定「先删 `AgentSession`，ACP 改持 `Arc<dyn ThreadJournal>`」。�
 | 2026-11-15 | **M3-e 三进程验收** | ✅ `three_process_test.rs`：run=2 / `tool/result`=1 / 副作用=1；真实子进程验证状态外置；⚠️ 模型调用=2（D7 要求 1，缺 acting 续跑分支，见 §2.5） |
 | 2026-11-15 | **M4-a 语义映射** | ⚠️ 已产出 §2.6 映射表，**未删代码**：`AgentSession` 是唯一会话驱动器、ACP 是其唯一消费者，而 ACP 与 durable 零依赖、durable 无会话门面（11 项能力只覆盖 5 项）。删 `AgentSession` 与「ACP 改 `DurableRuntime`」必须同批完成（M4-b 六项前置见 §2.6.4）；「关掉 durable → ACP 失败」在当前结构下不成立（§2.6.5） |
 | 2026-11-15 | **M4-c（一）门面补齐** | ⚠️ `DurableSession::{wakeup,respond,waiting,task,history,set_event_sink}` + `HarnessContext::publish` 落地（session_test 9→15），**ACP 与 `AgentSession` 未改**：换驱动多了两个硬前置（无可执行 `HarnessAdapter`、租约不可转交），见 §2.8 |
+| 2026-11-15 | **M4-d 可执行适配器 + 租约借用** | ✅ `AgentScopeHarnessAdapter`（工厂 `Fn() -> HarnessAgent`）注册给 `DurableRuntime`；`BackendThreadJournal::{attach_lease, detach_lease}`；tick = 一次模型决策；`harness_adapter_test.rs` 7 条全绿；ACP 与 `AgentSession` 未改 |
+

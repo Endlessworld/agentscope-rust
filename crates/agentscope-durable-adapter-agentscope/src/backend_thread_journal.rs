@@ -1,4 +1,15 @@
 //! `ThreadJournal` over a durable backend.
+//!
+//! The bridge writes under one lease, obtained in one of two ways:
+//!
+//! * **claim** (the default): [`ThreadJournal::acquire`] claims the thread's single-writer
+//!   lease and [`ThreadJournal::release`] gives it back. This is how a host owns its own
+//!   writer slot.
+//! * **borrow** ([`BackendThreadJournal::attach_lease`]): the caller already holds the lease
+//!   (a durable tick does), so `acquire` adopts it without claiming and `release` leaves it
+//!   alone. The runtime stays the only owner: no epoch is bumped and no invariant depends on
+//!   the bridge. The borrow lasts until [`BackendThreadJournal::detach_lease`], after which
+//!   the bridge claims and releases again.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,6 +24,22 @@ use serde_json::Value;
 
 use crate::{checkpoint, tool_facts};
 
+/// How this bridge came to hold its writer lease.
+enum Held {
+    /// Claimed by [`ThreadJournal::acquire`]; releasing gives it back.
+    Claimed(Lease),
+    /// Handed over by [`BackendThreadJournal::attach_lease`]; releasing must not give it back.
+    Borrowed(Lease),
+}
+
+impl Held {
+    fn lease(&self) -> &Lease {
+        match self {
+            Held::Claimed(lease) | Held::Borrowed(lease) => lease,
+        }
+    }
+}
+
 /// A durable journal scoped to one thread.
 ///
 /// Core's `expected_seq` is the native journal position, not the turn revision: the bridge
@@ -20,7 +47,7 @@ use crate::{checkpoint, tool_facts};
 pub struct BackendThreadJournal {
     backend: Arc<dyn SessionBackend>,
     thread: ThreadKey,
-    lease: Mutex<Option<Lease>>,
+    lease: Mutex<Option<Held>>,
     /// Whether the batch's tool facts are recorded in the same commit (see [`crate::tool_facts`]).
     tool_facts: bool,
 }
@@ -44,18 +71,53 @@ impl BackendThreadJournal {
         self
     }
 
+    /// Borrows `lease` instead of claiming one.
+    ///
+    /// For a writer already inside the tick that holds the lease: `acquire` then adopts it
+    /// (same owner, same epoch, nothing claimed) and `release` is a no-op, because the lease
+    /// belongs to the runtime. Attach before the first `acquire`.
+    pub fn attach_lease(self, lease: Lease) -> Self {
+        if let Ok(mut guard) = self.lease.lock() {
+            *guard = Some(Held::Borrowed(lease));
+        }
+        self
+    }
+
+    /// Ends the borrow, restoring claim/release semantics for every later `acquire`.
+    ///
+    /// A lease this bridge claimed itself is kept: only a borrow is dropped.
+    pub fn detach_lease(&self) {
+        if let Ok(mut guard) = self.lease.lock() {
+            if matches!(guard.as_ref(), Some(Held::Borrowed(_))) {
+                *guard = None;
+            }
+        }
+    }
+
     pub fn thread(&self) -> &ThreadKey {
         &self.thread
     }
 
     /// The lease this bridge writes under, for a host that must share the same writer.
     ///
-    /// `None` before [`ThreadJournal::acquire`] and after [`ThreadJournal::release`].
+    /// `None` before [`ThreadJournal::acquire`] and after [`ThreadJournal::release`]; a borrowed
+    /// lease is returned until [`BackendThreadJournal::detach_lease`].
     pub fn lease(&self) -> Option<Lease> {
         self.lease
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().cloned())
+            .and_then(|guard| guard.as_ref().map(|held| held.lease().clone()))
+    }
+
+    /// The borrowed lease, when the caller already owns the writer slot.
+    fn borrowed(&self) -> Option<Lease> {
+        self.lease
+            .lock()
+            .ok()
+            .and_then(|guard| match guard.as_ref() {
+                Some(Held::Borrowed(lease)) => Some(lease.clone()),
+                _ => None,
+            })
     }
 
     /// The committed native state, which a later commit must not discard.
@@ -70,6 +132,7 @@ impl BackendThreadJournal {
             .map_err(|_| journal_error("Journal lease lock poisoned"))?;
         let lease = guard
             .as_ref()
+            .map(Held::lease)
             .ok_or_else(|| journal_error("No writer lease was acquired"))?;
         if lease.owner != writer.owner || lease.epoch != writer.epoch {
             return Err(journal_error("Writer lease was fenced"));
@@ -100,6 +163,14 @@ impl ThreadJournal for BackendThreadJournal {
     }
 
     async fn acquire(&self, owner: &str, lease: Duration) -> CoreResult<Writer> {
+        // A borrowed lease is already held by the caller (a durable tick): adopt it instead of
+        // claiming, because claiming would be refused by our own writer slot.
+        if let Some(borrowed) = self.borrowed() {
+            return Ok(Writer {
+                owner: borrowed.owner.clone(),
+                epoch: borrowed.epoch,
+            });
+        }
         let acquired = self
             .backend
             .claim(&self.thread, owner, lease)
@@ -114,7 +185,7 @@ impl ThreadJournal for BackendThreadJournal {
             .lease
             .lock()
             .map_err(|_| journal_error("Journal lease lock poisoned"))?;
-        *guard = Some(acquired);
+        *guard = Some(Held::Claimed(acquired));
         Ok(writer)
     }
 
@@ -125,6 +196,11 @@ impl ThreadJournal for BackendThreadJournal {
 
     async fn release(&self, writer: &Writer) -> CoreResult<()> {
         let current = self.lease_for(writer)?;
+        // A borrowed lease belongs to the tick that handed it over: releasing it here would
+        // hand the thread to another writer while the runtime is still running it.
+        if self.borrowed().is_some() {
+            return Ok(());
+        }
         let result = self
             .backend
             .release(&current, Duration::ZERO)
