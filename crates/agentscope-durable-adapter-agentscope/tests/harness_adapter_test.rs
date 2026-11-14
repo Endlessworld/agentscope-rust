@@ -133,11 +133,11 @@ fn factory(
     model: Arc<ScriptedModel>,
     root: PathBuf,
     max_iters: i32,
-) -> impl Fn() -> HarnessAgent + Send + Sync + 'static {
+) -> impl Fn() -> Arc<HarnessAgent> + Send + Sync + 'static {
     move || {
         let toolkit = Toolkit::new();
         toolkit.register_tool(mark_tool());
-        HarnessAgent::builder()
+        Arc::new(HarnessAgent::builder()
             .name(HARNESS)
             .model(Arc::clone(&model) as Arc<dyn Model>)
             .session_id(SESSION)
@@ -155,7 +155,7 @@ fn factory(
             .disable_shell_tool()
             .disable_subagents()
             .disable_session_persistence()
-            .build()
+            .build())
     }
 }
 

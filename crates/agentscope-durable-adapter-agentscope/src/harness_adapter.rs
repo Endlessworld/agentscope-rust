@@ -33,16 +33,24 @@ const STATE_VERSION: &str = "agentscope/state/1";
 /// Model calls one tick may start.
 const MODEL_CALLS_PER_TICK: usize = 1;
 
+/// How often a running invocation re-reads the committed frame to look for control.
+///
+/// A cancel or pause can arrive while the model call is still streaming, and a provider that
+/// never returns would otherwise hold the turn until its lease expires. Polling is the only
+/// way to observe the request from inside the call that is blocking.
+const STREAM_CONTROL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Runs turns of one harness definition by building the agent that executes them.
 ///
-/// The factory is called once per tick: an invocation is a fresh agent over the committed
-/// state, never a long-lived one that could carry a previous turn's services.
+/// The factory is called once per tick: an invocation runs over the committed state and never
+/// carries a previous tick's in-flight state. A host that owns one long-lived agent (ACP) hands
+/// the same `Arc` back every time; a host that wants a fresh agent builds one per tick.
 pub struct AgentScopeHarnessAdapter {
-    build: Arc<dyn Fn() -> HarnessAgent + Send + Sync>,
+    build: Arc<dyn Fn() -> Arc<HarnessAgent> + Send + Sync>,
 }
 
 impl AgentScopeHarnessAdapter {
-    pub fn new(build: impl Fn() -> HarnessAgent + Send + Sync + 'static) -> Self {
+    pub fn new(build: impl Fn() -> Arc<HarnessAgent> + Send + Sync + 'static) -> Self {
         Self {
             build: Arc::new(build),
         }
@@ -123,7 +131,28 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
         let mut reply: Option<Msg> = None;
         let mut failure: Option<String> = None;
         let mut yielded = false;
-        while let Some(item) = stream.next().await {
+        let mut drain = false;
+        // A model call may never return (a provider streaming nothing, a hung socket). The only
+        // place a cancel can be noticed then is here: poll the committed frame while waiting, so
+        // the request stops the invocation instead of waiting out the stream.
+        let mut control = tokio::time::interval(STREAM_CONTROL_POLL);
+        control.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let item = tokio::select! {
+                item = stream.next() => item,
+                _ = control.tick() => {
+                    let frame = ctx.backend.frame(lease).await?;
+                    if frame.turn.cancellation_requested {
+                        break;
+                    }
+                    if frame.turn.status == TurnStatus::Pausing {
+                        yielded = true;
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let Some(item) = item else { break };
             match item {
                 Ok(event) => {
                     if let agentscope_core::event::AgentEvent::AgentResult(data) = &event {
@@ -140,11 +169,26 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
                 // next tick continues from the step the loop had already opened.
                 Err(Error::HostPaused) => {
                     yielded = true;
+                    drain = true;
                     break;
                 }
                 Err(error) => {
                     failure = Some(error.to_string());
                     break;
+                }
+            }
+        }
+        if drain {
+            // A pause is reported through the same stream that carries the events, so whatever
+            // the invocation produced just before it (a tool result that finished, a block end)
+            // may still be buffered. Drain it before handing the turn back: a host rendering a
+            // live stream must not see a tool call stuck at `InProgress` because the tick ended
+            // a moment too early.
+            while let Some(item) = stream.next().await {
+                if let Ok(event) = item {
+                    if let Ok(value) = serde_json::to_value(&event) {
+                        ctx.publish(&value);
+                    }
                 }
             }
         }
@@ -157,7 +201,18 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
         recorder.close().await;
         journal.detach_lease();
 
-        if yielded {
+        // Control asked while this invocation ran is only *observed* here: a terminal status can
+        // be written by the writer that holds the turn and by nobody else, so leaving it to the
+        // next claimant would keep a cancelled turn `Cancelling` forever.
+        let frame = ctx.backend.frame(lease).await?;
+        if frame.turn.cancellation_requested {
+            return self
+                .settle(ctx, TurnStatus::Cancelled, Value::Null, None)
+                .await;
+        }
+        // A pause is the runtime's to complete when the lease is handed back; settling the reply
+        // here would overwrite the pause the host asked for.
+        if frame.turn.status == TurnStatus::Pausing || yielded {
             return Ok(());
         }
         if let Some(message) = failure {

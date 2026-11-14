@@ -276,3 +276,14 @@ M4-a 原定「先删 `AgentSession`，ACP 改持 `Arc<dyn ThreadJournal>`」。�
 | 2026-11-15 | **M4-c（一）门面补齐** | ⚠️ `DurableSession::{wakeup,respond,waiting,task,history,set_event_sink}` + `HarnessContext::publish` 落地（session_test 9→15），**ACP 与 `AgentSession` 未改**：换驱动多了两个硬前置（无可执行 `HarnessAdapter`、租约不可转交），见 §2.8 |
 | 2026-11-15 | **M4-d 可执行适配器 + 租约借用** | ✅ `AgentScopeHarnessAdapter`（工厂 `Fn() -> HarnessAgent`）注册给 `DurableRuntime`；`BackendThreadJournal::{attach_lease, detach_lease}`；tick = 一次模型决策；`harness_adapter_test.rs` 7 条全绿；ACP 与 `AgentSession` 未改 |
 
+
+### M4-e 回退记录
+
+ACP 侧接线已验证可编译、ACP lib 114 条全绿，但集成用例 `session_cancel_notification_stops_the_prompt` 失败（实际 `Refusal`，期望 `Cancelled`），且另一条取消用例挂起。取消路径把「用户中断」映射成拒绝，新驱动路径在取消后还会停滞——这不是映射单点问题，故整批回退，不留半迁移状态。
+
+保留：适配层 `HarnessAdapter` 的 tick 让出/结束判定增强及其测试（30 条全绿）。
+
+阻塞结论（下次接手必读）：
+1. 取消语义断链：agent 侧 `cancellation.is_cancelled()` 从未变真，durable 的 cancel 意图没有传到 `ReActAgent` 的取消信号，需要在 tick 内把 durable `cancel`/`pause` 映射成 `CancelSignal`。
+2. 挂起：新路径在取消后没有让 tick 落到可终结状态，调用方等待不返回。
+3. 顺序：先补 1、2 并加针对性的取消/暂停用例，再重做 ACP 换驱动，最后才删 `AgentSession`/`SessionAnswer`。

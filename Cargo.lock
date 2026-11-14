@@ -135,6 +135,7 @@ version = "0.1.1"
 dependencies = [
  "agentscope-core",
  "agentscope-durable",
+ "agentscope-harness",
  "async-trait",
  "futures",
  "serde_json",
