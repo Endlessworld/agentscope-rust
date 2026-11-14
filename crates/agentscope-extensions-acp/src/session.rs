@@ -708,39 +708,6 @@ impl Drop for TurnDriver {
     }
 }
 
-/// The text a durable answer carries.
-///
-/// A durable signal is delivered to the model as text, so an answer is folded the same way:
-/// what the user said, or the decision they made.
-fn session_answer_text(answer: &agentscope_harness::agent::SessionAnswer) -> String {
-    use agentscope_harness::agent::SessionAnswer;
-    match answer {
-        SessionAnswer::Output { content } => content
-            .iter()
-            .filter_map(|block| match block {
-                agentscope_core::message::ContentBlock::Text(text) => Some(text.text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        SessionAnswer::Approval { approved: true, .. } => "approved".to_string(),
-        SessionAnswer::Approval {
-            approved: false,
-            reason,
-        } => reason.clone().unwrap_or_else(|| "rejected".to_string()),
-        SessionAnswer::Confirmation(confirm) => {
-            let result = &confirm.result;
-            if !result.message.is_empty() {
-                result.message.clone()
-            } else if result.confirmed {
-                "approved".to_string()
-            } else {
-                "rejected".to_string()
-            }
-        }
-    }
-}
-
 /// A single ACP session backed by a [`HarnessAgent`].
 #[derive(Clone)]
 pub struct AcpAgentSession {
@@ -1542,7 +1509,7 @@ impl AcpAgentSession {
     /// suspended turn. Answers are validated against the committed pending requests.
     pub async fn respond(
         &self,
-        answers: std::collections::BTreeMap<String, agentscope_harness::agent::SessionAnswer>,
+        answers: std::collections::BTreeMap<String, String>,
     ) -> std::result::Result<(), String> {
         let runtime = {
             let slot = self.runtime.lock().await;
@@ -1561,7 +1528,7 @@ impl AcpAgentSession {
         // turn folds in at its next boundary; answering a turn that waits on something else is
         // a conflict instead of a silent drop.
         for (request_id, answer) in answers {
-            let value = serde_json::json!({ "text": session_answer_text(&answer) });
+            let value = serde_json::json!({ "text": answer });
             runtime
                 .session
                 .respond(&turn.turn_id, &request_id, &control_id("answer"), value)

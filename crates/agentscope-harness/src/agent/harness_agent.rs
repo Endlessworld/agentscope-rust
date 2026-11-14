@@ -567,22 +567,6 @@ impl HarnessAgent {
         agentscope_core::journal::transcript(&*log).await
     }
 
-    /// Binds a conversation's commands and read views. Obtaining this handle never starts
-    /// inference. Mirrors Java `HarnessAgent.session(RuntimeContext)`.
-    ///
-    /// Unlike Java this does not memoise the handle: a cached `AgentSession` would hold an
-    /// `Arc<HarnessAgent>` inside the agent itself and leak the reference cycle.
-    pub async fn session(
-        self: &Arc<Self>,
-        context: RuntimeContext,
-    ) -> crate::Result<super::session::AgentSession> {
-        let key = self.session_key(&context).ok_or_else(|| {
-            crate::Error::Journal("native session history is not enabled for this agent".into())
-        })?;
-        let log = self.session_log(&context).await?;
-        super::session::AgentSession::open(Arc::clone(self), context, key, log)
-    }
-
     /// Returns the workspace manager bound to this agent, if configured.
     pub fn workspace_manager(&self) -> Option<&Arc<WorkspaceManager>> {
         self.workspace_manager.as_ref()
@@ -3033,7 +3017,7 @@ impl HarnessAgentBuilder {
             ]);
             // Native committed history is the default authority. The store is resolved in
             // `build()` rather than left to the caller, so a bare `HarnessAgent` journals
-            // without any host-side `AgentSession` (Java does the same).
+            // without any host-side session handle (Java does the same).
             match &session_log_store {
                 Some(store) => {
                     agent_builder = agent_builder

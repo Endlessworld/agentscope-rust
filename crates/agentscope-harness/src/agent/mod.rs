@@ -87,10 +87,7 @@ pub use sandbox::{
     SandboxManager, SandboxSnapshotSpec, SandboxState, SandboxStateStore, VolumeMount,
     WorkspaceSpec, WorkspaceSpecApplier,
 };
-pub use session::{
-    AgentSession, InputReceipt, SessionAnswer, SessionConfirm, Task as SessionTask,
-    WorkspaceJournalStorage, WorkspaceThreadJournalStore,
-};
+pub use session::{WorkspaceJournalStorage, WorkspaceThreadJournalStore};
 pub use shutdown::{
     json_file_saver_in, GracefulShutdownController, JsonFileShutdownStateSaver,
     StateStoreShutdownStateSaver, INTERRUPT_GRACE_PERIOD,

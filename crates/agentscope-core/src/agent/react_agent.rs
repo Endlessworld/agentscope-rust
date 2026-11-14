@@ -753,7 +753,7 @@ impl ReActAgent {
     /// per-session gate, attached to the runtime context (so `observe`, tools and middlewares
     /// see it), and finished when the call ends. This is the Rust equivalent of Java
     /// `ReActAgent.acquireCallExecution`, which is why a bare `HarnessAgent::call` journals
-    /// without any host-side `AgentSession`.
+    /// without any host-side session runtime.
     async fn call_with_format_and_extensions(
         &self,
         messages: Vec<Msg>,
@@ -5484,7 +5484,7 @@ mod tests {
     #[tokio::test]
     async fn call_owns_a_recorder_and_commits_the_turn() {
         // Java `ReActAgent.acquireCallExecution`: the call itself opens the recorder, so a
-        // bare `ReActAgent::call` journals without any host-side `AgentSession`.
+        // bare `ReActAgent::call` journals without any host-side session runtime.
         let store = Arc::new(crate::journal::InMemoryThreadJournalStore::new());
         let model = Arc::new(MockModel::new("mock", vec![text_response("journaled")]));
         let agent = ReActAgent::builder()
@@ -5530,7 +5530,7 @@ mod tests {
 
     #[tokio::test]
     async fn caller_supplied_recorder_is_not_reopened() {
-        // The journal allows one execution writer. When a host (harness `AgentSession`)
+        // The journal allows one execution writer. When a host (harness session runtime)
         // already attached a recorder, the call must reuse it — opening a second one would
         // fail with a lease/duplicate-run error, so success here *is* the assertion.
         let store = Arc::new(crate::journal::InMemoryThreadJournalStore::new());

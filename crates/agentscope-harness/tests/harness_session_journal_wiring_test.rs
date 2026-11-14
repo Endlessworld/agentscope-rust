@@ -2,8 +2,8 @@
 //!
 //! These assertions go through the **real** `HarnessAgent::build()` + call path, because the
 //! bug class they guard against is a missing assembly step: a journal backend that exists but
-//! is never injected, or a recorder that is only created when a host happens to build an
-//! `AgentSession`. A unit test on `InvocationRecorder` cannot catch either.
+//! is never injected, or a recorder that is only created when a host happens to drive a turn
+//! through the durable runtime. A unit test on `InvocationRecorder` cannot catch either.
 
 use std::sync::{Arc, Mutex};
 

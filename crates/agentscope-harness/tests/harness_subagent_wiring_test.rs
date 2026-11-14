@@ -841,9 +841,10 @@ async fn spawned_subagent_result_is_delivered_on_the_next_turn() {
 
 #[tokio::test]
 async fn wakeup_turn_delivers_background_results_without_user_input() {
+    use futures::StreamExt;
     // Regression: a background result is pull-based (the middleware reads it on a reasoning
-    // step), so an idle session needs a turn to be started for it. `AgentSession::wakeup`
-    // provides that turn, and task completion must also push an inbox hint so a host that
+    // step), so an idle session needs a turn to be started for it. A turn with no input at
+    // all provides that turn, and task completion must also push an inbox hint so a host that
     // only watches the inbox still notices.
     let dir = temp_dir("wakeup");
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -925,13 +926,13 @@ async fn wakeup_turn_delivers_background_results_without_user_input() {
     );
 
     // A turn with no user input must deliver it.
-    let session = agent.session(ctx.clone()).await.expect("session opens");
-    let task = session.wakeup().await.expect("wakeup admitted");
-    let settled = session
-        .await_task(&task.command_id)
-        .await
-        .expect("wakeup settles");
-    assert_eq!(settled.status, "completed", "{settled:?}");
+    let events: Vec<_> = agent
+        .stream_events(Vec::new(), StreamOptions::defaults())
+        .collect()
+        .await;
+    for ev in events {
+        ev.expect("the wakeup turn must succeed");
+    }
 
     let prompts = seen.lock().unwrap().clone();
     assert!(

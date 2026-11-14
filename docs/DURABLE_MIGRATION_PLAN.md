@@ -276,6 +276,7 @@ M4-a 原定「先删 `AgentSession`，ACP 改持 `Arc<dyn ThreadJournal>`」。�
 | 2026-11-15 | **M4-c（一）门面补齐** | ⚠️ `DurableSession::{wakeup,respond,waiting,task,history,set_event_sink}` + `HarnessContext::publish` 落地（session_test 9→15），**ACP 与 `AgentSession` 未改**：换驱动多了两个硬前置（无可执行 `HarnessAdapter`、租约不可转交），见 §2.8 |
 | 2026-11-15 | **M4-d 可执行适配器 + 租约借用** | ✅ `AgentScopeHarnessAdapter`（工厂 `Fn() -> HarnessAgent`）注册给 `DurableRuntime`；`BackendThreadJournal::{attach_lease, detach_lease}`；tick = 一次模型决策；`harness_adapter_test.rs` 7 条全绿；ACP 与 `AgentSession` 未改 |
 | 2026-11-15 | **M4-e-3 ACP 换驱动** | ✅ ACP 不再驱动 `AgentSession`：`SessionRuntime`（`DurableSession` + 另一个 owner 的 `control` + durable journal）+ `drive_turn` tick 循环 + sink 渲染；adapter 补「中断 = 让出」；cancel → `StopReason::Cancelled`，不再 `Refusal`/停顿（§2.10） |
+| 2026-11-15 | **M4-e-4 删除 `AgentSession`（D3）** | ✅ 删除 `AgentSession`/`SessionAnswer`/`InputReceipt`/`SessionConfirm`/`HarnessAgent::session()`（3 文件 3333 行 + 6 处引用）；`core::journal::{inbox, execution, views}` 全部保留；harness 44 targets / 898 passed，ACP lib 114 + 关键集成用例全绿（§2.11） |
 
 
 ### M4-e 回退记录
@@ -336,4 +337,12 @@ ACP 侧接线已验证可编译、ACP lib 114 条全绿，但集成用例 `sessi
 - ACP 路径不经过 `HarnessAdapter::settle` 的默认实现：adapter 自己 settle。
 - `history()` 仍无消息转录；durable 侧 `acting_iteration` 续跑入口仍缺（§2.5）。
 - 每个 session 一次 `TxnBackend::open`（file store 每次加锁打开），LRU 淘汰时随 runtime 释放，未做全局缓存。
+
+### 2.11 M4-e-4 删除 `AgentSession` / `SessionAnswer`（2026-11-15，未提交，D3 达成）
+
+- **删除清单**：`crates/agentscope-harness/src/agent/session/session.rs`（2141 行：`AgentSession`/`Task`/`InputReceipt`、`SessionState`、dispatch/launch/收据折叠、7 条单测）、`session/answer.rs`（130 行：`SessionAnswer`/`SessionConfirm`）、`tests/harness_session_test.rs`（1062 行）；`HarnessAgent::session()`；`agent/mod.rs` 的 `AgentSession, InputReceipt, SessionAnswer, SessionConfirm, Task as SessionTask` 再导出；`session/mod.rs` 的 `answer`/`session` 模块声明。`session/` 目录只剩 `sqlite`/`storage`/`store` 三个 journal 后端（`StoreJournalStorage`、`WorkspaceThreadJournalStore` 等消费者不变）。
+- **4 处内部 `abandon_turn` 的行为归属**：①`prepare_open_turn_before_submit`（孤儿 turn 挡住新提交）→ `backend::turn::submit` 的准入事务 + `claim`/`tick`：turn 状态在 store 里，进程死了由新 owner 按 epoch 围栏接管，不存在「进程内孤儿」；②`abandon_unfinished`（宿主放弃一个仍在跑的 turn）→ `DurableRuntime::cancel`（`Cancelling`→`Cancelled`）或 `pause`（`Paused`，可 `resume`）；③`dispatch_once`（无活跃 writer 却遇到未完成 turn）→ 同 ①，由下一次 `tick` 续跑，不再强制写 `interrupted`；④`launch` 收尾（终态写失败后强制关 turn）→ durable `Commit` 是单事务（失败即无写入，turn 保持原状态由 `tick` 重试），未知工具结果由三态 `attempted`/`result.state`/`applied` + `NOT_FOUND` 表达。
+- **`core::journal` 处置**：三个模块全部保留，均仍有消费者——`inbox`（`SessionInbox`：`recovery::cancel_pending`、`execution::SessionExecution`、core 的 `session_step_boundary`/`session_settle_loop`/`session_acting_checkpoint` 三条集成测试）、`execution`（`SessionExecution`/`EXECUTION_CONTEXT_KEY`：`react_agent`、core 测试）、`views`（`TurnViews`：`snapshot`、`recovery`、`atomic`、harness `subagent/materialize`）。唯一失去消费者的是 `ExecutionBaseline` + `SessionExecution::prepare_with_baseline`（原缓存者就是 `AgentSession`），按「只记录不删」留档。
+- **ACP 侧同步（无行为变化）**：`respond` 原先借 harness `SessionAnswer` 折文本，现在 `ExtAnswer::to_answer_text()` 直接产出文本、`ExtRespondParams::to_answers() -> BTreeMap<String, String>`、`AcpAgentSession::respond(BTreeMap<String, String>)`。线上 JSON 不变，发出的 signal 仍是 `{"text": ...}`（`Output` 折叠本来就是恒等，`Approval`/`Confirmation` 分支 ACP 从未构造）。
+- **测试结果**：`cargo check --workspace --all-targets -j 2` EXIT=0；`cargo test -p agentscope-harness` 44 targets / 898 passed / 0 failed / 2 ignored；`cargo test -p agentscope-extensions-acp --lib` 114 passed；ACP 集成 `acp_cancel_test` 2、`acp_session_cancel_test` 2、`acp_interrupted_turn_test` 3、`acp_load_replay_test` 1、`acp_event_flow_test` 4、`acp_compact_test` 2、`acp_catalog_release_test` 3 全绿。`harness_subagent_wiring_test` 的 wakeup 用例改由 `stream_events(Vec::new(), …)`（无输入 turn，与 durable wakeup 同路径）驱动，不再需要会话句柄。
 

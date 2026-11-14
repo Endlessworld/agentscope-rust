@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use agent_client_protocol::{JsonRpcMessage, JsonRpcRequest, UntypedMessage};
-use agentscope_harness::agent::SessionAnswer;
 use serde::{Deserialize, Serialize};
 
 /// Answers one or more pending interactions of a session and continues its turn.
@@ -41,14 +40,15 @@ pub struct ExtAnswer {
 }
 
 impl ExtAnswer {
-    /// Converts the wire answer into the harness answer, rejecting an empty one.
-    pub fn to_session_answer(self) -> Result<SessionAnswer, String> {
+    /// Folds the wire answer into the text the model receives, rejecting an empty one.
+    ///
+    /// A durable signal is delivered to the model as text, so an answer is folded the same
+    /// way: what the user said, or the decision they made.
+    pub fn to_answer_text(self) -> Result<String, String> {
         match (self.output, self.approved) {
-            (Some(output), None) => Ok(SessionAnswer::text(output)),
-            (None, Some(true)) => Ok(SessionAnswer::approve()),
-            (None, Some(false)) => Ok(SessionAnswer::reject(
-                self.reason.unwrap_or_else(|| "rejected".to_string()),
-            )),
+            (Some(output), None) => Ok(output),
+            (None, Some(true)) => Ok("approved".to_string()),
+            (None, Some(false)) => Ok(self.reason.unwrap_or_else(|| "rejected".to_string())),
             (Some(_), Some(_)) => {
                 Err("an answer must carry either `output` or `approved`, not both".to_string())
             }
@@ -69,7 +69,7 @@ pub struct ExtRespondParams {
 
 impl ExtRespondParams {
     /// Converts every answer, failing on the first invalid one.
-    pub fn to_answers(&self) -> Result<BTreeMap<String, SessionAnswer>, String> {
+    pub fn to_answers(&self) -> Result<BTreeMap<String, String>, String> {
         if self.answers.is_empty() {
             return Err("an answer is required".to_string());
         }
@@ -77,7 +77,7 @@ impl ExtRespondParams {
         for (request_id, answer) in &self.answers {
             converted.insert(
                 request_id.clone(),
-                answer.clone().to_session_answer().map_err(|error| {
+                answer.clone().to_answer_text().map_err(|error| {
                     format!("invalid answer for request '{request_id}': {error}")
                 })?,
             );
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(request.method(), RESPOND_METHOD);
         assert_eq!(request.params.session_id, "session-1");
         let answers = request.params.to_answers().unwrap();
-        assert_eq!(answers.get("req-1"), Some(&SessionAnswer::approve()));
+        assert_eq!(answers.get("req-1"), Some(&"approved".to_string()));
     }
 
     #[test]
@@ -161,10 +161,7 @@ mod tests {
             approved: Some(false),
             reason: None,
         };
-        assert_eq!(
-            answer.to_session_answer().unwrap(),
-            SessionAnswer::reject("rejected")
-        );
+        assert_eq!(answer.to_answer_text().unwrap(), "rejected");
     }
 
     #[test]
@@ -174,7 +171,7 @@ mod tests {
             approved: Some(true),
             reason: None,
         };
-        assert!(answer.to_session_answer().is_err());
+        assert!(answer.to_answer_text().is_err());
     }
 
     #[test]

@@ -658,5 +658,5 @@
 - 语义修正（adapter）：被 `interrupt()` 的 invocation 返回的是 `GenerateReason::Interrupted` 的**正常 reply**（core `reconcile_interrupted`），adapter 现在把它当「让出」而不是「失败」，turn 保留位置由下一 tick 续跑——否则客户端看到 `Refusal` 且用户 prompt 被丢弃。
 - 行为对照（旧 → 新）：`AgentSession` 的 6 处 `abandon_turn` → `cancel`/`suspend`（判据见 `docs/DURABLE_MIGRATION_PLAN.md` §2.8）；`MAX_INTERRUPTED_RESUMES=2` 仍保留（现在由 tick 让出 + `resume` 驱动）；`respond` → `DurableSession::respond`（wait key = interaction id）；`session/load` 转录 → durable journal（harness journal 已不是写者）。
 - 反向验证三处（interrupted 让出、durable journal 转录、durable cancel）均已实测 FAILED 后还原。
-- 遗留：`_agentscope/respond` 依赖 interaction id == wait key；`history()` 无消息转录；`AgentSession`/`SessionAnswer` 仍未删（`harness_session_test.rs` 15 处 `AgentSession::open` 需一起改）。
+- 遗留：`_agentscope/respond` 依赖 interaction id == wait key；`history()` 无消息转录；`AgentSession`/`SessionAnswer` 已在 M4-e-4 删除（`_agentscope/respond` 现接收已折叠的文本，见 `docs/DURABLE_MIGRATION_PLAN.md` §2.11）。
 
