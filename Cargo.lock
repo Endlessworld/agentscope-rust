@@ -246,28 +246,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentscope-extensions-controlplane"
-version = "0.1.1"
-dependencies = [
- "agentscope-core",
- "agentscope-harness",
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "futures",
- "http 1.5.0",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "agentscope-extensions-cos"
 version = "0.1.1"
 dependencies = [
@@ -665,7 +643,6 @@ dependencies = [
  "agentscope-extensions-agui",
  "agentscope-extensions-channel",
  "agentscope-extensions-chat-completions-web",
- "agentscope-extensions-controlplane",
  "agentscope-extensions-cos",
  "agentscope-extensions-higress",
  "agentscope-extensions-jdbc",

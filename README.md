@@ -109,7 +109,6 @@ use agentscope_rs::{core::agent::ReActAgent, harness::HarnessAgent};
 | `agentscope-extensions-channel` | 平台通道：钉钉 / 飞书 / 企业微信 / 个人微信 / GitHub / GitLab（回调 + 长连接） |
 | `agentscope-extensions-nacos` | Nacos：A2A 注册发现、prompt 订阅、只读 skill 仓库 |
 | `agentscope-extensions-higress` | Higress AI 网关工具检索（`x_higress_tool_search`） |
-| `agentscope-extensions-controlplane` | control-plane 数据面 SDK：会话快照、事件流、有效上下文 |
 | `agentscope-extensions-studio` | AgentScope Studio 集成（REST + Socket.IO）+ OpenTelemetry GenAI 遥测 |
 | `agentscope-extensions-judge` | 校准式决策 API：TypeSafe JEV（概率分布）+ OpenAI Decisions |
 

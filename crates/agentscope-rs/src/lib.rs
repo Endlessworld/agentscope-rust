@@ -24,7 +24,6 @@
 //! | `sandbox` | [`sandbox`] | `agentscope-extensions-sandbox` |
 //! | `channel` | [`channel`] | `agentscope-extensions-channel` |
 //! | `mem` | [`mem`] | `agentscope-extensions-mem` |
-//! | `controlplane` | [`controlplane`] | `agentscope-extensions-controlplane` |
 //! | `studio` | [`studio`] | `agentscope-extensions-studio` |
 //! | `skills` | [`skills`] | `agentscope-extensions-skills` |
 //! | `scheduler` | [`scheduler`] | `agentscope-extensions-scheduler` |
@@ -88,8 +87,6 @@ pub use agentscope_extensions_protocol as protocol;
 pub use agentscope_extensions_acp as acp;
 #[cfg(feature = "channel")]
 pub use agentscope_extensions_channel as channel;
-#[cfg(feature = "controlplane")]
-pub use agentscope_extensions_controlplane as controlplane;
 #[cfg(feature = "higress")]
 pub use agentscope_extensions_higress as higress;
 #[cfg(feature = "judge")]

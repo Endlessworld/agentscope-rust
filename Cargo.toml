@@ -26,7 +26,6 @@ members = [
     "crates/agentscope-extensions-postgresql",
     "crates/agentscope-extensions-cos",
     "crates/agentscope-extensions-oss",
-    "crates/agentscope-extensions-controlplane",
     "crates/agentscope-extensions-studio",
     "crates/agentscope-extensions-skills",
     "crates/agentscope-extensions-scheduler",

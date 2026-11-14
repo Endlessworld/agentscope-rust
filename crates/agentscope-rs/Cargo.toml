@@ -35,7 +35,6 @@ agentscope-extensions-mysql = { workspace = true, optional = true }
 agentscope-extensions-postgresql = { workspace = true, optional = true }
 agentscope-extensions-cos = { workspace = true, optional = true }
 agentscope-extensions-oss = { workspace = true, optional = true }
-agentscope-extensions-controlplane = { workspace = true, optional = true }
 agentscope-extensions-studio = { workspace = true, optional = true }
 agentscope-extensions-skills = { workspace = true, optional = true }
 agentscope-extensions-scheduler = { workspace = true, optional = true }
@@ -69,7 +68,6 @@ rag = ["harness", "dep:agentscope-extensions-rag"]
 sandbox = ["harness", "dep:agentscope-extensions-sandbox"]
 channel = ["harness", "dep:agentscope-extensions-channel"]
 mem = ["harness", "dep:agentscope-extensions-mem"]
-controlplane = ["harness", "dep:agentscope-extensions-controlplane"]
 studio = ["harness", "dep:agentscope-extensions-studio"]
 skills = ["harness", "dep:agentscope-extensions-skills"]
 scheduler = ["core", "dep:agentscope-extensions-scheduler"]
@@ -101,7 +99,6 @@ full = [
     "sandbox",
     "channel",
     "mem",
-    "controlplane",
     "studio",
     "skills",
     "scheduler",
