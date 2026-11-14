@@ -121,7 +121,6 @@ name = "agentscope-durable"
 version = "0.1.1"
 dependencies = [
  "async-trait",
- "futures",
  "serde",
  "serde_json",
  "sha2 0.10.9",

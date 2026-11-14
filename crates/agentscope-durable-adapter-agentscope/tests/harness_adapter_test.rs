@@ -137,25 +137,27 @@ fn factory(
     move || {
         let toolkit = Toolkit::new();
         toolkit.register_tool(mark_tool());
-        Arc::new(HarnessAgent::builder()
-            .name(HARNESS)
-            .model(Arc::clone(&model) as Arc<dyn Model>)
-            .session_id(SESSION)
-            .user_id("alice")
-            .max_iters(max_iters)
-            .cwd(root.clone())
-            .workspace(root.join("workspace"))
-            .toolkit(toolkit)
-            .disable_compaction()
-            .disable_workspace_context()
-            .disable_at_path_expansion()
-            .disable_memory_hooks()
-            .disable_memory_tools()
-            .disable_web_tools()
-            .disable_shell_tool()
-            .disable_subagents()
-            .disable_session_persistence()
-            .build())
+        Arc::new(
+            HarnessAgent::builder()
+                .name(HARNESS)
+                .model(Arc::clone(&model) as Arc<dyn Model>)
+                .session_id(SESSION)
+                .user_id("alice")
+                .max_iters(max_iters)
+                .cwd(root.clone())
+                .workspace(root.join("workspace"))
+                .toolkit(toolkit)
+                .disable_compaction()
+                .disable_workspace_context()
+                .disable_at_path_expansion()
+                .disable_memory_hooks()
+                .disable_memory_tools()
+                .disable_web_tools()
+                .disable_shell_tool()
+                .disable_subagents()
+                .disable_session_persistence()
+                .build(),
+        )
     }
 }
 
