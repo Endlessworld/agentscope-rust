@@ -1,15 +1,15 @@
 //! HayStack HTTP client.
 //!
 //! Ports `HayStackClient`: it `POST`s the retrieve body to the configured `baseUrl`, maps a
-//! non-zero API `code` onto [`RagError::Api`] (Java `HayStackApiException`) and maps transport
-//! / non-2xx failures onto [`RagError::Http`] / [`RagError::Api`] through the shared
-//! [`crate::transport`] helpers.
+//! non-2xx status or a non-zero API `code` onto [`RagError::Api`] (Java `HayStackApiException`)
+//! and maps transport failures onto [`RagError::Http`] through the shared [`crate::transport`]
+//! helpers.
 //!
 //! Two Java behaviours are preserved deliberately:
 //!
-//! * the body is parsed even for non-2xx responses, and only then is the API `code` checked —
-//!   so a `200` with `code != successCode` is an API error, and a `500` with a parseable body
-//!   surfaces whichever error the body describes;
+//! * a non-2xx status fails with the HTTP status *before* the body is read (Java `865d1dec8`: a
+//!   gateway error body carries no `code` field, so the status alone has to mark the failure),
+//!   while a `2xx` whose `code != successCode` is the API error the body describes;
 //! * retries cover transport failures, `429` and `5xx` only (the Java `RetryInterceptor` did not
 //!   retry below 500, except that it also skipped 4xx), which is exactly what
 //!   [`crate::reqwest`]-backed [`crate::transport::ReqwestTransport`] implements.
@@ -100,10 +100,21 @@ impl HayStackClient {
         let request = self.build_retrieve_http_request(query, top_k, score_threshold);
         let response = self.transport.execute(request).await?;
 
-        // Java only *logged* the HTTP status and always attempted to parse the body
-        // (`JsonUtils.fromJson(responseBody, HayStackResponse.class)`), so an unparseable / empty
-        // body is the only transport-level error and the API `code` is the only business error.
-        // This port keeps that split instead of inventing a status-based one.
+        // Java `865d1dec8`: a non-2xx response fails on its status alone. Retries already
+        // happened in the transport, so this is the final answer of the call.
+        if !response.is_success() {
+            return Err(RagError::Api {
+                status_code: response.status_code,
+                error_code: None,
+                message: format!("HayStack API error: HTTP {}", response.status_code),
+            });
+        }
+
+        // Java only *logged* the HTTP status of a successful response and always attempted to
+        // parse the body (`JsonUtils.fromJson(responseBody, HayStackResponse.class)`), so an
+        // unparseable / empty body is the only transport-level error and the API `code` is the
+        // only business error. This port keeps that split instead of inventing a status-based
+        // one.
         if response.body.trim().is_empty() {
             return Err(RagError::Http(format!(
                 "HayStack returned an empty body (status {})",
@@ -285,7 +296,7 @@ mod tests {
         assert_eq!(transport.requests.lock().unwrap().len(), 2);
     }
 
-    /// A `400` is terminal: sent once, and its body is still parsed (Java only logged the status).
+    /// A `400` is terminal: sent once, and its status is the failure (the body is not parsed).
     #[tokio::test]
     async fn a_400_is_sent_exactly_once() {
         let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(
@@ -301,8 +312,8 @@ mod tests {
         );
 
         let error = client.retrieve("q", None, None).await.unwrap_err();
-        assert!(error.to_string().contains("bad request"), "{error}");
-        assert_eq!(error.error_code(), Some("1001"));
+        assert_eq!(error.status_code(), Some(400));
+        assert_eq!(error.error_code(), None);
         assert_eq!(transport.requests.lock().unwrap().len(), 1);
     }
 
@@ -334,35 +345,45 @@ mod tests {
         assert!(client.retrieve("q", None, None).await.is_ok());
     }
 
+    /// Java `865d1dec8`: a non-2xx status fails on its own, even when the body parses.
     #[tokio::test]
-    async fn non_2xx_with_a_parseable_envelope_is_parsed_like_java() {
-        // Java never enforced the HTTP status: it logged it and parsed the body, so a 500 that
-        // still carries a valid `code` is judged purely by that code.
+    async fn a_non_2xx_status_fails_before_the_body_is_parsed() {
         let transport = ScriptedTransport::with_responses(vec![
-            HttpResponse::new(500, r#"{"code":1001,"error":"boom"}"#),
+            HttpResponse::new(503, r#"{"error": "service unavailable"}"#),
             HttpResponse::new(500, r#"{"code":0,"documents":[]}"#),
         ]);
         let client = client(transport);
 
-        let response = client.retrieve("q", None, None).await.unwrap();
-        assert!(response.effective_documents().is_empty());
-
-        let error = client.retrieve("q", None, None).await.unwrap_err();
-        assert!(matches!(error, RagError::Api { .. }), "{error:?}");
+        for _ in 0..2 {
+            let error = client.retrieve("q", None, None).await.unwrap_err();
+            assert!(matches!(error, RagError::Api { .. }), "{error:?}");
+            assert!(
+                error.to_string().contains("HayStack API error: HTTP"),
+                "{error}"
+            );
+            // The body carried no business code, so only the status identifies the failure.
+            assert_eq!(error.error_code(), None);
+        }
     }
 
     #[tokio::test]
-    async fn unparseable_body_is_a_transport_error_regardless_of_status() {
-        let transport = ScriptedTransport::with_responses(vec![
-            HttpResponse::new(200, "not json"),
-            HttpResponse::new(400, "not json"),
-            HttpResponse::new(500, "<html>server error</html>"),
-        ]);
+    async fn a_503_reports_the_http_status() {
+        let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(
+            503,
+            r#"{"error": "service unavailable"}"#,
+        )]);
         let client = client(transport);
-        for _ in 0..3 {
-            let error = client.retrieve("q", None, None).await.unwrap_err();
-            assert!(matches!(error, RagError::Http(_)), "{error:?}");
-        }
+        let error = client.retrieve("bad query", None, None).await.unwrap_err();
+        assert_eq!(error.status_code(), Some(503));
+        assert!(error.to_string().contains("HTTP 503"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unparseable_body_of_a_successful_response_is_a_transport_error() {
+        let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(200, "not json")]);
+        let client = client(transport);
+        let error = client.retrieve("q", None, None).await.unwrap_err();
+        assert!(matches!(error, RagError::Http(_)), "{error:?}");
     }
 
     #[tokio::test]

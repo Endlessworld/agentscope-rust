@@ -412,3 +412,11 @@ cargo test  -p agentscope-extensions-rag -j 2 --no-fail-fast --features pdf,docx
 
 - 执行记录 / 静态复核 / 勘误 / 反向验证明细：[`history/RAG__MIGRATION_HISTORY.md`](./history/RAG__MIGRATION_HISTORY.md)
 - 本文件只保留现行状态（§0–§5）；历史条目一律写进上述归档文件，不再回填本文。
+
+### 2026-11-14 迁移批次（Java 9ab7a4fab..a4306d63d，extensions 组）
+
+- `865d1dec8` fix(rag-haystack): fail the retrieval on a non-2xx response — **已迁移**
+  - Rust 位置：`crates/agentscope-extensions-rag/src/haystack/client.rs::HayStackClient::retrieve`（:105 起：非 2xx 在解析 body 之前直接返回 `RagError::Api { status_code, error_code: None, message: "HayStack API error: HTTP <code>" }`）；模块文档同步改为「非 2xx 状态 → Api，传输失败 → Http」。
+  - 测试：`a_non_2xx_status_fails_before_the_body_is_parsed`（503 + 可解析 body → Api 且 `error_code()` 为空）、`a_503_reports_the_http_status`、`a_400_is_sent_exactly_once`（改为断言 400 且 `error_code()==None`）、`unparseable_body_of_a_successful_response_is_a_transport_error`；反向验证：把状态检查短路成 `if false &&` 后前三条 FAILED。
+  - 偏差：旧实现刻意保留「非 2xx 仍解析 body、只按 code 判错」（原注释写明 Java 只记日志），本次按 Java 新语义改为状态优先；2xx + 可解析 body 仍由 `successCode` 决定 `RagError::Api`，2xx 空/非 JSON body 仍为 `RagError::Http`，重试仍只覆盖传输错误/429/5xx。
+  - 验证：`cargo test -p agentscope-extensions-rag --lib` → 506 passed / 0 failed。
