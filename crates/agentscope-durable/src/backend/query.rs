@@ -16,6 +16,61 @@ pub(super) fn turn(store: &dyn RecordStore, thread: &ThreadKey, turn_id: &str) -
     })
 }
 
+/// Writer-side view of a thread: journal position, fence state and the active turn.
+pub(super) fn thread_state(store: &dyn RecordStore, thread: &ThreadKey) -> Result<ThreadStateView> {
+    with_session(store, &thread.session, |txn| {
+        let data = require_thread(txn, thread)?;
+        let current = current_turn(txn, &thread.thread_id)?;
+        Ok(ThreadStateView {
+            definition: data.definition.clone(),
+            status: data.status,
+            journal_position: data.journal_position,
+            epoch: data.epoch,
+            owner: current.as_ref().and_then(|turn| turn.owner.clone()),
+            lease_until: current.as_ref().map(|turn| turn.expires_at).unwrap_or(0),
+            current_turn_id: current.as_ref().map(|turn| turn.turn_id.clone()),
+            checkpoint_metadata: data.checkpoint_metadata.clone(),
+        })
+    })
+}
+
+/// Lease-free journal read: readers must not need the writer's ownership to catch up.
+pub(super) fn read_journal(
+    store: &dyn RecordStore,
+    thread: &ThreadKey,
+    after: u64,
+    limit: usize,
+) -> Result<Vec<Value>> {
+    let limit = clamp_limit(limit)?;
+    with_session(store, &thread.session, |txn| {
+        let data = require_thread(txn, thread)?;
+        if after > data.journal_position {
+            return Ok(Vec::new());
+        }
+        let prefix = journal_prefix(&thread.thread_id, &data.journal_branch);
+        let mut entries = Vec::new();
+        for part in txn.keys(&prefix, None, 100_000)? {
+            let Some(position) = part
+                .rsplit(':')
+                .next()
+                .and_then(|raw| raw.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if position <= after {
+                continue;
+            }
+            if let Some(entry) = txn.get(&part)? {
+                entries.push(entry);
+                if entries.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(entries)
+    })
+}
+
 pub(super) fn turns(
     store: &dyn RecordStore,
     thread: &ThreadKey,

@@ -984,6 +984,19 @@ mod tests {
             Err(DurableError::unavailable("not used in this test"))
         }
 
+        async fn read_journal(
+            &self,
+            _thread: &ThreadKey,
+            _after: u64,
+            _limit: usize,
+        ) -> Result<Vec<Value>> {
+            Err(DurableError::unavailable("not used in this test"))
+        }
+
+        async fn thread_state(&self, _key: &ThreadKey) -> Result<ThreadStateView> {
+            Err(DurableError::unavailable("not used in this test"))
+        }
+
         async fn execution(
             &self,
             _thread: &ThreadKey,

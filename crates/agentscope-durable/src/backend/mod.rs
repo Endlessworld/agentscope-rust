@@ -329,6 +329,10 @@ impl SessionBackend for TxnBackend {
         identity::thread(self.store.as_ref(), key)
     }
 
+    async fn thread_state(&self, key: &ThreadKey) -> Result<ThreadStateView> {
+        query::thread_state(self.store.as_ref(), key)
+    }
+
     async fn close_thread(&self, key: &ThreadKey) -> Result<ThreadView> {
         identity::close_thread(self.store.as_ref(), key)
     }
@@ -453,6 +457,15 @@ impl SessionBackend for TxnBackend {
 
     async fn journal(&self, lease: &Lease, after: u64, limit: usize) -> Result<Vec<Value>> {
         commit::journal(self.store.as_ref(), lease, after, limit)
+    }
+
+    async fn read_journal(
+        &self,
+        thread: &ThreadKey,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        query::read_journal(self.store.as_ref(), thread, after, limit)
     }
 
     async fn execution(&self, thread: &ThreadKey, execution_id: &str) -> Result<ToolExecution> {

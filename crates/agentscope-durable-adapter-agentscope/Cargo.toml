@@ -1,0 +1,22 @@
+[package]
+name = "agentscope-durable-adapter-agentscope"
+description = "AgentScope Rust - Durable adapter for the agentscope harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+agentscope-durable.workspace = true
+agentscope-core.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

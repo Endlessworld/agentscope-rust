@@ -48,6 +48,7 @@ pub trait SessionBackend: Send + Sync {
     async fn create_thread(&self, spec: ThreadSpec) -> Result<ThreadView>;
     async fn thread(&self, key: &ThreadKey) -> Result<ThreadView>;
     async fn close_thread(&self, key: &ThreadKey) -> Result<ThreadView>;
+    async fn thread_state(&self, key: &ThreadKey) -> Result<ThreadStateView>;
     async fn threads(
         &self,
         session: &SessionKey,
@@ -116,6 +117,13 @@ pub trait SessionBackend: Send + Sync {
         limit: usize,
     ) -> Result<StepPage>;
     async fn journal(&self, lease: &Lease, after: u64, limit: usize) -> Result<Vec<Value>>;
+    /// Lease-free journal read for readers catching up outside the writer lease.
+    async fn read_journal(
+        &self,
+        thread: &ThreadKey,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<Value>>;
 
     // ---- tools ----
     async fn execution(&self, thread: &ThreadKey, execution_id: &str) -> Result<ToolExecution>;

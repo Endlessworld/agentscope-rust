@@ -130,6 +130,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentscope-durable-adapter-agentscope"
+version = "0.1.1"
+dependencies = [
+ "agentscope-core",
+ "agentscope-durable",
+ "async-trait",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agentscope-extensions-a2a-client"
 version = "0.1.1"
 dependencies = [

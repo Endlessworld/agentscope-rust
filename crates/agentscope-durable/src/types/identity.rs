@@ -6,6 +6,8 @@ use serde_json::Value;
 use crate::json;
 use crate::Result;
 
+use super::CheckpointMetadata;
+
 /// `SessionKey` is the outer identity; the pairing matches the core `ThreadKey` layout.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -137,6 +139,25 @@ impl ThreadSpec {
 pub struct ThreadView {
     pub definition: ThreadSpec,
     pub status: Lifecycle,
+}
+
+/// Writer-side view of a thread: what a journal bridge needs to build a head.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadStateView {
+    pub definition: ThreadSpec,
+    pub status: Lifecycle,
+    /// Committed native journal entries; independent of the turn revision.
+    pub journal_position: u64,
+    /// Monotonic fencing counter of this thread.
+    pub epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    pub lease_until: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_metadata: Option<CheckpointMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
