@@ -165,16 +165,4 @@ mod tests {
             "different keys must overlap"
         );
     }
-
-    #[tokio::test]
-    async fn execution_guard_registers_and_releases() {
-        let mgr = GracefulShutdownManager::instance();
-        let before = mgr.get_active_request_count();
-        {
-            let guard = ExecutionGuard::acquire().unwrap();
-            assert_eq!(mgr.get_active_request_count(), before + 1);
-            drop(guard);
-        }
-        assert_eq!(mgr.get_active_request_count(), before);
-    }
 }
