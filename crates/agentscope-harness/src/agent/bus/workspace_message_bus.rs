@@ -2,7 +2,8 @@
 //!
 //! Works with any filesystem backend (local, remote, sandbox) and is suitable for
 //! cross-process scenarios where multiple runtimes share the same workspace
-//! directory.
+//! directory. Queue delivery depends on the backend's `write` being an atomic
+//! create-if-absent, which the local (exclusive create) and remote (CAS) backends are.
 //!
 //! Mode D (pub/sub) is degraded to polling: `subscribe` spawns a task that emits
 //! an empty signal every 3 seconds; `publish` is a no-op.
@@ -10,9 +11,14 @@
 //! File layout under `busRoot`:
 //! ```text
 //! {busRoot}/
-//!   queues/{key-hash}/  {entryId}.json   — Mode A entries (drain = ls + read + delete)
-//!   logs/{key-hash}/    {entryId}.json   — Mode C entries (append-only)
+//!   queues/{key-hash}/  {entryId}.payload      — payload, written before publication
+//!                       {entryId}.ready        — ready marker (legacy entries: {entryId}.json)
+//!                       {entryId}.ready.claim  — exclusive drain claim
+//!   logs/{key-hash}/    {entryId}.json         — Mode C entries (append-only)
 //! ```
+//!
+//! Claims are not leased: a crash after claiming leaves the entry unavailable until
+//! operator-led recovery, because automatically reclaiming it could deliver it twice.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -20,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
-use agentscope_core::error::Result;
+use agentscope_core::error::{Error, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -70,9 +76,13 @@ impl WorkspaceMessageBus {
 
     async fn ensure_dir(&self, dir: &str) -> Result<()> {
         if !self.fs.exists(&self.ctx, dir).await? {
-            self.fs
-                .write(&self.ctx, &format!("{dir}/.keep"), "")
-                .await?;
+            // Concurrent producers race on the marker; an existing marker is the goal, so a
+            // create-if-absent conflict is not an error.
+            if let Err(e) = self.fs.write(&self.ctx, &format!("{dir}/.keep"), "").await {
+                if !crate::filesystem::is_already_exists_error(&e) {
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
@@ -80,6 +90,20 @@ impl WorkspaceMessageBus {
     /// Lists `.json` file paths in `dir`, sorted lexicographically (equal to the
     /// entry-id order). Empty when the directory does not exist.
     async fn list_sorted(&self, dir: &str) -> Result<Vec<String>> {
+        self.list_matching(dir, |p| p.ends_with(".json")).await
+    }
+
+    /// Lists queue entry markers (`.json` legacy entries and `.ready` markers).
+    async fn list_queue_entries(&self, dir: &str) -> Result<Vec<String>> {
+        self.list_matching(dir, |p| p.ends_with(".json") || p.ends_with(".ready"))
+            .await
+    }
+
+    async fn list_matching(
+        &self,
+        dir: &str,
+        include: impl Fn(&str) -> bool,
+    ) -> Result<Vec<String>> {
         if !self.fs.exists(&self.ctx, dir).await? {
             return Ok(Vec::new());
         }
@@ -88,7 +112,7 @@ impl WorkspaceMessageBus {
             .ls(&self.ctx, dir)
             .await?
             .into_iter()
-            .filter(|f| !f.is_directory && f.path.ends_with(".json"))
+            .filter(|f| !f.is_directory && include(&f.path))
             .map(|f| f.path)
             .collect();
         files.sort();
@@ -121,7 +145,43 @@ impl WorkspaceMessageBus {
 
     fn extract_entry_id(path: &str) -> String {
         let name = path.rsplit('/').next().unwrap_or(path);
-        name.strip_suffix(".json").unwrap_or(name).to_string()
+        name.strip_suffix(".json")
+            .or_else(|| name.strip_suffix(".ready"))
+            .unwrap_or(name)
+            .to_string()
+    }
+
+    /// Reads the payload behind a queue entry: a `.ready` marker resolves to its
+    /// sibling `.payload`, a legacy entry *is* its own payload.
+    async fn read_queue_entry_content(&self, path: &str) -> Option<String> {
+        match Self::fs_path(path).strip_suffix(".ready") {
+            Some(prefix) => {
+                let payload = format!("{prefix}.payload");
+                self.read_file_content(&payload).await
+            }
+            None => self.read_file_content(path).await,
+        }
+    }
+
+    /// Deletes a claimed entry; a `.ready` marker is removed together with its payload.
+    async fn delete_queue_entry(&self, path: &str) -> Result<()> {
+        let path = Self::fs_path(path);
+        let Some(prefix) = path.strip_suffix(".ready") else {
+            return self.fs.delete(&self.ctx, path).await;
+        };
+        self.fs.delete(&self.ctx, path).await?;
+        self.fs
+            .delete(&self.ctx, &format!("{prefix}.payload"))
+            .await
+    }
+
+    /// Releases a claim after a read failure so a later drain can retry the entry.
+    async fn release_claim(&self, claim_path: &str) {
+        if let Err(e) = self.fs.delete(&self.ctx, claim_path).await {
+            tracing::warn!(
+                "queue_drain: failed to release claim {claim_path} ({e}); entry will remain unavailable"
+            );
+        }
     }
 }
 
@@ -152,25 +212,62 @@ impl MessageBus for WorkspaceMessageBus {
         let entry_id = self.next_entry_id();
         let dir = self.queue_dir(key);
         self.ensure_dir(&dir).await?;
-        let path = format!("{dir}/{entry_id}.json");
-        self.fs
-            .write(&self.ctx, &path, &serde_json::to_string(&payload)?)
-            .await?;
+        let payload_path = format!("{dir}/{entry_id}.payload");
+        let ready_path = format!("{dir}/{entry_id}.ready");
+        let json = serde_json::to_string(&payload)?;
+        if let Err(e) = self.fs.write(&self.ctx, &payload_path, &json).await {
+            return Err(Error::Other(format!(
+                "queue_push: failed to write payload {payload_path} ({e})"
+            )));
+        }
+        if let Err(e) = self.fs.write(&self.ctx, &ready_path, "").await {
+            // A failed write does not establish ownership of the marker: removing either
+            // file here could discard an entry another writer published.
+            tracing::warn!(
+                "queue_push: publication of {ready_path} failed ({e}); retaining payload \
+                 {payload_path} for possible drain or operator recovery"
+            );
+            return Err(Error::Other(format!(
+                "queue_push: failed to publish entry {ready_path} ({e})"
+            )));
+        }
         Ok(entry_id)
     }
 
     async fn queue_drain(&self, key: &str, max_count: usize) -> Result<Vec<BusEntry>> {
         let dir = self.queue_dir(key);
-        let files = self.list_sorted(&dir).await?;
+        let files = self.list_queue_entries(&dir).await?;
         let mut result = Vec::new();
-        for path in files.iter().take(max_count) {
-            let Some(content) = self.read_file_content(path).await else {
-                // Transient read failure (race with concurrent drain, I/O error).
-                // Do NOT delete — preserve the entry so the next drain can retry it.
+        for path in files {
+            if result.len() >= max_count {
+                break;
+            }
+            // Atomic create-if-absent: exactly one drainer wins an entry.
+            let claim_path = format!("{}.claim", Self::fs_path(&path));
+            if let Err(e) = self.fs.write(&self.ctx, &claim_path, "").await {
+                if crate::filesystem::is_already_exists_error(&e) {
+                    tracing::debug!("queue_drain: entry {path} is already claimed, skipping");
+                    continue;
+                }
+                if !result.is_empty() {
+                    tracing::warn!(
+                        "queue_drain: failed to claim entry {path} ({e}); returning {} \
+                         already-drained entries",
+                        result.len()
+                    );
+                    break;
+                }
+                return Err(Error::Other(format!(
+                    "queue_drain: failed to claim entry {path} ({e})"
+                )));
+            }
+            let Some(content) = self.read_queue_entry_content(&path).await else {
+                // A transient read failure is retryable because no entry was returned.
                 tracing::warn!("queue_drain: failed to read entry {path}, skipping without delete");
+                self.release_claim(&claim_path).await;
                 continue;
             };
-            let entry_id = Self::extract_entry_id(path);
+            let entry_id = Self::extract_entry_id(&path);
             match serde_json::from_str::<Value>(&content) {
                 Ok(payload) => result.push(BusEntry::new(entry_id, payload)),
                 Err(e) => {
@@ -178,7 +275,20 @@ impl MessageBus for WorkspaceMessageBus {
                     tracing::warn!("queue_drain: corrupt JSON in entry {path} ({e}), deleting");
                 }
             }
-            self.fs.delete(&self.ctx, Self::fs_path(path)).await?;
+            match self.delete_queue_entry(&path).await {
+                Ok(()) => {
+                    if let Err(e) = self.fs.delete(&self.ctx, &claim_path).await {
+                        tracing::warn!(
+                            "queue_drain: failed to delete claim {claim_path} ({e}) after \
+                             deleting its entry"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "queue_drain: failed to delete claimed entry {path} ({e}); retaining claim \
+                     to prevent duplicate delivery"
+                ),
+            }
         }
         Ok(result)
     }
@@ -188,7 +298,10 @@ impl MessageBus for WorkspaceMessageBus {
     }
 
     async fn queue_peek(&self, key: &str) -> Result<bool> {
-        Ok(!self.list_sorted(&self.queue_dir(key)).await?.is_empty())
+        Ok(!self
+            .list_queue_entries(&self.queue_dir(key))
+            .await?
+            .is_empty())
     }
 
     // ---- Mode C: replay log ----

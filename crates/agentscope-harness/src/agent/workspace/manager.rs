@@ -39,6 +39,8 @@ pub struct WorkspaceManager {
     namespace_factory: Option<Arc<dyn NamespaceFactory>>,
     owns_index: bool,
     path_locks: PathLocks,
+    /// Root-level runtime-data copies already reported as un-namespaced leftovers.
+    warned_legacy_root_copies: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl WorkspaceManager {
@@ -58,6 +60,7 @@ impl WorkspaceManager {
             namespace_factory: None,
             owns_index: true,
             path_locks: std::sync::Mutex::new(BTreeMap::new()),
+            warned_legacy_root_copies: Default::default(),
         }
     }
 
@@ -74,6 +77,7 @@ impl WorkspaceManager {
             namespace_factory: None,
             owns_index: false,
             path_locks: std::sync::Mutex::new(BTreeMap::new()),
+            warned_legacy_root_copies: Default::default(),
         }
     }
 
@@ -91,6 +95,7 @@ impl WorkspaceManager {
             namespace_factory,
             owns_index: false,
             path_locks: std::sync::Mutex::new(BTreeMap::new()),
+            warned_legacy_root_copies: Default::default(),
         }
     }
 
@@ -156,14 +161,22 @@ impl WorkspaceManager {
 
     /// Resolves a workspace-relative path for runtime user data, applying the namespace prefix.
     pub fn resolve_runtime_data_path(&self, ctx: &RuntimeContext, relative_path: &str) -> PathBuf {
-        let ns = self
-            .namespace_factory
-            .as_deref()
-            .map(|f| f.get_namespace(ctx))
-            .unwrap_or_default();
+        let ns = self.namespace_of(ctx);
         if ns.is_empty() {
             return self.workspace.join(relative_path);
         }
+        self.resolve_in_namespace(&ns, relative_path)
+    }
+
+    /// Namespace segments for this call; empty when nothing scopes the workspace.
+    fn namespace_of(&self, ctx: &RuntimeContext) -> Vec<String> {
+        self.namespace_factory
+            .as_deref()
+            .map(|f| f.get_namespace(ctx))
+            .unwrap_or_default()
+    }
+
+    fn resolve_in_namespace(&self, ns: &[String], relative_path: &str) -> PathBuf {
         let mut base = self.workspace.clone();
         for seg in ns {
             base = base.join(seg);
@@ -182,9 +195,9 @@ impl WorkspaceManager {
         self.read_with_override(ctx, &rel).await
     }
 
-    /// Reads MEMORY.md content (two-layer: filesystem override, local fallback).
+    /// Reads MEMORY.md content (two-layer: filesystem override, caller-namespace fallback).
     pub async fn read_memory_md(&self, ctx: &RuntimeContext) -> String {
-        self.read_with_override(ctx, MEMORY_MD).await
+        self.read_namespaced_runtime_data(ctx, MEMORY_MD).await
     }
 
     /// Reads a UTF-8 file under the workspace using the two-layer pattern.
@@ -547,6 +560,50 @@ impl WorkspaceManager {
         }
     }
 
+    /// Two-layer read for per-identity runtime data: filesystem first, then the caller's
+    /// namespace. The fallback never reads the workspace root — a copy there belongs to no
+    /// identity, and a relative path such as `other-user/MEMORY.md` would name a sibling's
+    /// directory. Contexts without a namespace keep the historical root read.
+    async fn read_namespaced_runtime_data(
+        &self,
+        ctx: &RuntimeContext,
+        relative_path: &str,
+    ) -> String {
+        let fs_content = self.read_text_through_filesystem(ctx, relative_path).await;
+        if !fs_content.is_empty() {
+            return fs_content;
+        }
+        let ns = self.namespace_of(ctx);
+        if self.filesystem.is_none() || ns.is_empty() {
+            // Nothing namespaces the write path either, so the root copy is the caller's own.
+            return read_file_quietly(&self.workspace.join(relative_path));
+        }
+        let namespaced = self.resolve_in_namespace(&ns, relative_path);
+        let content = read_file_quietly(&namespaced);
+        if content.is_empty() {
+            self.warn_when_unnamespaced_root_copy_exists(relative_path, &namespaced);
+        }
+        content
+    }
+
+    /// Reports a pre-namespace root copy once per path, so an operator knows to move it.
+    fn warn_when_unnamespaced_root_copy_exists(&self, relative_path: &str, namespaced: &Path) {
+        if !self.workspace.join(relative_path).is_file() {
+            return;
+        }
+        let first = self
+            .warned_legacy_root_copies
+            .lock()
+            .map(|mut warned| warned.insert(relative_path.to_string()))
+            .unwrap_or(false);
+        if first {
+            tracing::warn!(
+                "Runtime data {relative_path} exists at the workspace root but not in the caller's namespace ({}); root copies are no longer served to identified callers — move it into the namespace directory to keep it",
+                namespaced.display()
+            );
+        }
+    }
+
     /// Reads a workspace-relative UTF-8 file via the safe-path (two-layer) pattern.
     async fn read_writable_workspace_relative_utf8(
         &self,
@@ -560,7 +617,7 @@ impl WorkspaceManager {
         if normalized.is_empty() {
             return String::new();
         }
-        self.read_with_override(ctx, &normalized).await
+        self.read_namespaced_runtime_data(ctx, &normalized).await
     }
 
     /// Appends UTF-8 content to a local file under the workspace, creating parents.
@@ -781,5 +838,57 @@ mod tests {
         let dir = mgr.get_memory_dir(&ctx);
         assert!(dir.ends_with("users/u1/sessions/s1/memory"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_root_level_memory_copy_is_not_served_to_an_identified_caller() {
+        let root = temp_dir("rootleftover");
+        let fs_root = temp_dir("rootleftoverfs");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(MEMORY_MD), "shared legacy").unwrap();
+        use super::super::namespace::UserSessionNamespace;
+        let factory: Arc<dyn NamespaceFactory> = Arc::new(UserSessionNamespace);
+        let fs: Arc<dyn Filesystem> = Arc::new(crate::filesystem::LocalFilesystem::sandboxed(
+            fs_root.clone(),
+        ));
+        let mgr = WorkspaceManager::with_namespace(root.clone(), Some(fs), None, Some(factory));
+
+        let identified = RuntimeContext::new()
+            .with_user_id("u1")
+            .with_session_id("s1");
+        assert_eq!(mgr.read_memory_md(&identified).await, "");
+
+        // Nothing scopes the workspace, so the root copy is the caller's own.
+        let anonymous = RuntimeContext::new();
+        assert_eq!(mgr.read_memory_md(&anonymous).await, "shared legacy");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&fs_root);
+    }
+
+    #[tokio::test]
+    async fn memory_reads_stay_inside_the_callers_namespace() {
+        let root = temp_dir("nssibling");
+        let fs_root = temp_dir("nssiblingfs");
+        use super::super::namespace::UserSessionNamespace;
+        let factory: Arc<dyn NamespaceFactory> = Arc::new(UserSessionNamespace);
+        let fs: Arc<dyn Filesystem> = Arc::new(crate::filesystem::LocalFilesystem::sandboxed(
+            fs_root.clone(),
+        ));
+        let mgr = WorkspaceManager::with_namespace(root.clone(), Some(fs), None, Some(factory));
+        let alice = RuntimeContext::new()
+            .with_user_id("alice")
+            .with_session_id("s1");
+        let bob = RuntimeContext::new()
+            .with_user_id("bob")
+            .with_session_id("s1");
+
+        let alice_file = mgr.resolve_runtime_data_path(&alice, MEMORY_MD);
+        std::fs::create_dir_all(alice_file.parent().unwrap()).unwrap();
+        std::fs::write(&alice_file, "alice memory").unwrap();
+
+        assert_eq!(mgr.read_memory_md(&alice).await, "alice memory");
+        assert_eq!(mgr.read_memory_md(&bob).await, "");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&fs_root);
     }
 }

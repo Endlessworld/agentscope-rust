@@ -21,6 +21,9 @@ pub const CACHE_DIR: &str = ".skills-cache";
 /// Namespace used for repositories with an empty source.
 pub const GLOBAL_NAMESPACE: &str = "_global";
 
+/// Bound mapped identities while leaving room for a disambiguating digest.
+const MAX_CACHE_SEGMENT: usize = 64;
+
 /// The repository that produced a skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillRepo {
@@ -93,14 +96,90 @@ pub fn resolve_source_namespaces(repos: &[SkillRepo]) -> Vec<String> {
         }
         let total = count.get(&src).copied().unwrap_or(1);
         if total == 1 {
-            out.push(src);
+            out.push(source_namespace_segment(&src));
         } else {
             let idx = seen.entry(src.clone()).or_insert(0);
             *idx += 1;
-            out.push(format!("{src}_{idx}"));
+            out.push(source_namespace_segment(&format!("{src}_{idx}")));
         }
     }
     out
+}
+
+/// Maps a repository source identifier to one safe directory segment.
+///
+/// Source identifiers are metadata rather than user-controlled skill names, and shipped
+/// repositories use values such as `owner/repository`; rejecting those values would silently
+/// disable staging. A digest suffix disambiguates identifiers whenever sanitisation changes them.
+fn source_namespace_segment(namespace: &str) -> String {
+    if namespace.trim().is_empty() {
+        return GLOBAL_NAMESPACE.to_string();
+    }
+    let safe: String = namespace
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // A suffix alone would leave names such as NUL.txt-<digest> reserved on Windows.
+    let safe = if is_windows_device_name(&safe) {
+        format!("_{safe}")
+    } else {
+        safe
+    };
+    let lossless = safe == namespace
+        && safe.len() <= MAX_CACHE_SEGMENT
+        // Spaces are already replaced above; this also excludes "." and "..".
+        && !safe.ends_with('.');
+    if lossless {
+        return safe;
+    }
+    let digest = sha256_hex(namespace.as_bytes());
+    let digest = &digest[..12];
+    let keep = safe.len().min(MAX_CACHE_SEGMENT - digest.len() - 1);
+    format!("{}-{}", &safe[..keep], digest)
+}
+
+/// Resolves one directory component without allowing aliases of its parent or siblings.
+fn resolve_staging_directory(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let resolved = parent.join(name);
+    // Check both separator styles and drive syntax even on Unix, since the cache may be
+    // projected onto another filesystem. Windows also aliases trailing dots and spaces
+    // and reserves device names, including those with an extension.
+    if resolved.parent() != Some(parent)
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains(':')
+        || name.ends_with('.')
+        || name.ends_with(' ')
+        || is_windows_device_name(name)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Staging path component must be a single directory name",
+        ));
+    }
+    Ok(resolved)
+}
+
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let mut chars = stem.chars();
+    let prefix: String = chars.by_ref().take(3).collect();
+    matches!(prefix.as_str(), "COM" | "LPT")
+        // Win32 also recognises superscript 1, 2 and 3 in COM/LPT device names.
+        && matches!(
+            chars.next(),
+            Some('1'..='9' | '\u{00b9}' | '\u{00b2}' | '\u{00b3}')
+        )
+        && chars.next().is_none()
 }
 
 fn effective_source(repo: &SkillRepo) -> String {
@@ -156,12 +235,20 @@ pub fn stage(
                     .filter(|s| !s.is_empty())
                     .cloned()
                     .unwrap_or_else(|| bound.repo.source());
-                let ns = if ns.is_empty() {
-                    GLOBAL_NAMESPACE.to_string()
-                } else {
-                    ns
+                // Source identifiers may contain repository-specific values (`owner/repo`); they
+                // are mapped to one safe directory segment before any cache path is built.
+                let ns = source_namespace_segment(&ns);
+                let staged_dir = match resolve_staging_directory(&cache_root, &ns)
+                    .and_then(|namespace_dir| resolve_staging_directory(&namespace_dir, &name))
+                {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        // An unsafe skill name publishes no staging root; other skills still stage.
+                        tracing::warn!("Failed to stage skill '{name}' (source-ns={ns}): {e}");
+                        roots.insert(name, StageResult::None);
+                        continue;
+                    }
                 };
-                let staged_dir = cache_root.join(&ns).join(&name);
                 if !materialize_if_changed(&staged_dir, bound.skill.resources())? {
                     // Nothing was materialised — exactly what a lazy repository produces, since it
                     // publishes no in-memory resources. Reporting `Cached` here would advertise a
@@ -515,5 +602,74 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_absolute_skill_name_cannot_write_outside_the_cache() {
+        let base = std::env::temp_dir().join(format!("asr_stager_esc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let escaped = base.join("escaped");
+
+        let name = escaped.to_string_lossy().into_owned();
+        let skill = AgentSkill::builder()
+            .name(&name)
+            .source("market")
+            .description("d")
+            .add_resource("SKILL.md", "# escaped")
+            .build();
+        let visible = vec![RepoBound::new(
+            skill,
+            SkillRepo::External {
+                source: "market".to_string(),
+            },
+        )];
+        let ns = resolve_source_namespaces(&[SkillRepo::External {
+            source: "market".to_string(),
+        }]);
+
+        let roots = stage(Some(&base), &visible, &ns).unwrap();
+        assert_eq!(roots.get(&name), Some(&StageResult::None));
+        assert!(!escaped.exists(), "no write may land outside the cache");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn traversal_and_device_names_are_rejected_as_skill_names() {
+        assert!(resolve_staging_directory(Path::new("cache"), "../sibling").is_err());
+        assert!(resolve_staging_directory(Path::new("cache"), "nested/dir").is_err());
+        assert!(resolve_staging_directory(Path::new("cache"), "nested\\dir").is_err());
+        assert!(resolve_staging_directory(Path::new("cache"), "C:\\x").is_err());
+        assert!(resolve_staging_directory(Path::new("cache"), "trailing.").is_err());
+        assert!(resolve_staging_directory(Path::new("cache"), "trailing ").is_err());
+        assert!(resolve_staging_directory(Path::new("cache"), "NUL").is_err());
+        assert!(resolve_staging_directory(Path::new("cache"), "con.md").is_err());
+        // Supported names keep uppercase letters, internal spaces, underscores and dots.
+        for ok in ["My Skill_1.2", "tool"] {
+            assert_eq!(
+                resolve_staging_directory(Path::new("cache"), ok).unwrap(),
+                Path::new("cache").join(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_namespace_is_mapped_to_one_safe_segment() {
+        let repos = vec![
+            SkillRepo::External {
+                source: "owner/repository".to_string(),
+            },
+            SkillRepo::External {
+                source: "../escape".to_string(),
+            },
+        ];
+        let ns = resolve_source_namespaces(&repos);
+        for segment in &ns {
+            assert!(!segment.contains('/'), "{segment}");
+            assert!(!segment.contains('\\'), "{segment}");
+            assert_ne!(segment, "..");
+            assert!(resolve_staging_directory(Path::new("cache"), segment).is_ok());
+        }
     }
 }

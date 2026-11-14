@@ -160,6 +160,22 @@ async fn memory_get_reports_missing_file_and_traversal() {
         "got: {traversal}"
     );
 
+    // Leading whitespace must not smuggle a `..` segment past the check (Java
+    // `requireSafeRelativePath` trims before validating).
+    let padded = run(
+        &get,
+        tool_args(&[
+            ("path", str_arg("  ../secret.md")),
+            ("startLine", serde_json::json!(1)),
+            ("endLine", serde_json::json!(2)),
+        ]),
+    )
+    .await;
+    assert!(
+        padded.contains("path traversal not allowed"),
+        "got: {padded}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

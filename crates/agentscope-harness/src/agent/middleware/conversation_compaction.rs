@@ -69,6 +69,21 @@ impl ConversationCompactionMiddleware {
         Arc::clone(&self.requested)
     }
 
+    /// The compactor that summarizes this run.
+    ///
+    /// A model pinned on the run context (the model that actually serves the conversation)
+    /// wins over the build-time compactor model, mirroring Java `CompactionMiddleware`
+    /// resolving `react.getModel(ctx)` instead of the agent's default instance, so the summary
+    /// follows the model serving the conversation instead of the build-time default. Rust has
+    /// no dedicated compaction-model setting (`CompactionConfig` carries no model field), so
+    /// Java's "dedicated model outranks the effective model" level does not exist here yet.
+    fn run_compactor(&self, ctx: &RuntimeContext) -> Arc<ConversationCompactor> {
+        match ctx.pinned_model() {
+            Some(model) => Arc::new(ConversationCompactor::with_model(model)),
+            None => Arc::clone(&self.compactor),
+        }
+    }
+
     /// Convenience constructor using the agent's primary model for summarization.
     pub fn with_model(
         model: Arc<dyn agentscope_core::model::Model>,
@@ -219,10 +234,10 @@ impl Middleware for ConversationCompactionMiddleware {
         let Some(state) = ctx.state.clone() else {
             return next(input);
         };
-        let compactor = Arc::clone(&self.compactor);
+        let compactor = self.run_compactor(ctx);
         let config = self.config.clone();
         let agent_id = self.agent_id.clone();
-        let model_name = self.compactor.model_name().map(str::to_string);
+        let model_name = compactor.model_name().map(str::to_string);
         // A recorder attached by the session scheduler makes `compaction/start` and
         // `compaction/end` durable session facts instead of only an in-band marker.
         let recorder = ctx.extension::<SessionRecorder>(RECORDER_CONTEXT_KEY);
@@ -307,10 +322,10 @@ impl Middleware for ConversationCompactionMiddleware {
         let Some(state) = ctx.state.clone() else {
             return next(input);
         };
-        let compactor = Arc::clone(&self.compactor);
+        let compactor = self.run_compactor(ctx);
         let config = self.config.clone();
         let agent_id = self.agent_id.clone();
-        let model_name = self.compactor.model_name().map(str::to_string);
+        let model_name = compactor.model_name().map(str::to_string);
         let recorder = ctx.extension::<SessionRecorder>(RECORDER_CONTEXT_KEY);
         // `on_reasoning` events are not forwarded by the core stream; publish the marker
         // through the delta channel so ACP still receives `compaction_update`.
@@ -892,5 +907,108 @@ mod tests {
             !request.load(Ordering::SeqCst),
             "the request is consumed by the step that honours it"
         );
+    }
+
+    /// Counts summarization calls and answers with text naming itself.
+    struct NamingModel {
+        name: &'static str,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl agentscope_core::model::Model for NamingModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<agentscope_core::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> futures::stream::BoxStream<'_, crate::Result<agentscope_core::model::ChatResponse>>
+        {
+            *self.calls.lock().unwrap() += 1;
+            let text = format!("summary from {}", self.name);
+            Box::pin(futures::stream::once(async move {
+                Ok(agentscope_core::model::ChatResponse::builder()
+                    .content(vec![agentscope_core::message::ContentBlock::Text(
+                        agentscope_core::message::TextBlock::new(text),
+                    )])
+                    .build())
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            self.name
+        }
+    }
+
+    #[tokio::test]
+    async fn the_run_pinned_model_summarizes_the_conversation() {
+        // Java `CompactionMiddleware` (`c05e4b91f`): the summary follows the model serving the
+        // conversation (`react.getModel(ctx)`), not the middleware's build-time instance.
+        let build_time_calls = Arc::new(Mutex::new(0usize));
+        let pinned_calls = Arc::new(Mutex::new(0usize));
+        let build_time: Arc<dyn agentscope_core::model::Model> = Arc::new(NamingModel {
+            name: "build-time",
+            calls: Arc::clone(&build_time_calls),
+        });
+        let pinned: Arc<dyn agentscope_core::model::Model> = Arc::new(NamingModel {
+            name: "pinned",
+            calls: Arc::clone(&pinned_calls),
+        });
+
+        let state = state_with_history();
+        let history = state.lock().unwrap().context().to_vec();
+        let (delta_tx, _delta_rx) = futures::channel::mpsc::unbounded();
+        let mut ctx = RuntimeContext::new()
+            .with_agent_id("agent")
+            .with_session_id("s1");
+        ctx.state = Some(Arc::clone(&state));
+        ctx.delta_tx = Some(delta_tx);
+        ctx.set_pinned_model(Arc::clone(&pinned));
+
+        let middleware = ConversationCompactionMiddleware::with_model(
+            Arc::clone(&build_time),
+            CompactionConfig::builder()
+                .trigger_messages(0)
+                .trigger_tokens(100)
+                .keep_messages(1)
+                .build(),
+            "agent",
+        );
+        let mut chain = MiddlewareChain::new();
+        chain.add(Box::new(middleware));
+
+        let seen: Arc<Mutex<Vec<Msg>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let core: Next<ReasoningInput> = Box::new(move |input: ReasoningInput| -> EventStream {
+            *captured.lock().unwrap() = input.messages;
+            Box::pin(futures::stream::once(async {
+                Ok(agentscope_core::event::AgentEvent::ModelCallEnd(
+                    Default::default(),
+                ))
+            }))
+        });
+        let mut messages = vec![Msg::system("frozen system prompt")];
+        messages.extend(history);
+        let input = ReasoningInput::new(messages, Vec::new(), GenerateOptions::default());
+        let events: Vec<_> = chain.wrap_reasoning(ctx, input, core).collect().await;
+        assert!(events.iter().all(|event| event.is_ok()), "{events:?}");
+
+        assert_eq!(
+            *pinned_calls.lock().unwrap(),
+            1,
+            "the model serving the run must summarize it"
+        );
+        assert_eq!(
+            *build_time_calls.lock().unwrap(),
+            0,
+            "the build-time compactor model must not summarize a run with a pinned model"
+        );
+        let rendered = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Msg::text_content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("summary from pinned"), "{rendered}");
     }
 }

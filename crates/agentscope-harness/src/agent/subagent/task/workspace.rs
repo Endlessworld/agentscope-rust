@@ -57,19 +57,31 @@ pub const ORPHAN_TIMEOUT_MINUTES: u64 = 10;
 /// How often (in minutes) the orphan sweeper scans all workspace task records.
 pub const SWEEP_INTERVAL_MINUTES: u64 = 5;
 
+/// Local task handle key: storage namespace + parent session + task id.
+///
+/// The persisted record is namespace-scoped, so the in-memory handle must be too: keyed only by
+/// `"<sessionId>:<taskId>"`, two users sharing a workspace and parent session id could look up
+/// or cancel each other's background task. Mirrors Java `WorkspaceTaskRepository.LocalTaskKey`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LocalTaskKey {
+    namespace: Vec<String>,
+    session_id: String,
+    task_id: String,
+}
+
 /// State shared with the background maintenance tasks, hence `Arc`. Mirrors the Java per-field
 /// concurrent maps (`localTasks` / `localTaskSessionIds` / `localTaskContexts`).
 struct RepoState {
     fs: Arc<dyn Filesystem>,
     parent_agent_id: String,
-    /// In-memory local task handles, keyed by `"<sessionId>:<taskId>"`.
-    local_tasks: std::sync::Mutex<BTreeMap<String, Arc<BackgroundTask>>>,
+    /// In-memory local task handles, isolated by workspace namespace and parent session.
+    local_tasks: std::sync::Mutex<BTreeMap<LocalTaskKey, Arc<BackgroundTask>>>,
     /// `localKey → (sessionId, RuntimeContext)` captured at `put_task` time, so the heartbeat and
     /// sweeper can persist task state under the originating user's namespace.
     ///
     /// Only a fast path for local heartbeats: the durable registry (`register_task_scope`) is the
     /// authority the sweeper uses, because this map is empty after a process restart.
-    local_contexts: std::sync::Mutex<BTreeMap<String, (String, RuntimeContext)>>,
+    local_contexts: std::sync::Mutex<BTreeMap<LocalTaskKey, (String, RuntimeContext)>>,
     /// Namespace factory used to derive a context's isolation domain. `None` means
     /// [`IsolationScope::User`], the Java default (`IsolationScope.USER.toNamespaceFactory()`).
     namespace_factory: Option<Arc<dyn NamespaceFactory>>,
@@ -280,7 +292,7 @@ impl TaskRepository for WorkspaceTaskRepository {
         session_id: &str,
         task_id: &str,
     ) -> Option<Arc<BackgroundTask>> {
-        let key = format!("{session_id}:{task_id}");
+        let key = local_key(&self.state, ctx, session_id, task_id);
         if let Some(local) = self.state.local_tasks.lock().unwrap().get(&key).cloned() {
             return Some(local);
         }
@@ -326,7 +338,7 @@ impl TaskRepository for WorkspaceTaskRepository {
         }
         self.persist_record(ctx, session_id, &record).await;
 
-        let local_key = format!("{session_id}:{task_id}");
+        let local_key = local_key(&self.state, ctx, session_id, task_id);
         let bg = BackgroundTask::controlled(task_id, sub_agent_id);
 
         // `cancel()` aborts the wrapper task. Dropping a `JoinHandle` *detaches* its task, so a
@@ -480,7 +492,7 @@ impl TaskRepository for WorkspaceTaskRepository {
     }
 
     async fn remove_task(&self, ctx: &RuntimeContext, session_id: &str, task_id: &str) {
-        let key = format!("{session_id}:{task_id}");
+        let key = local_key(&self.state, ctx, session_id, task_id);
         self.state.local_tasks.lock().unwrap().remove(&key);
         self.state.local_contexts.lock().unwrap().remove(&key);
         let path = self.tasks_path(session_id);
@@ -506,7 +518,7 @@ impl TaskRepository for WorkspaceTaskRepository {
         let map = read_records(self.state.fs.as_ref(), ctx, &path).await;
         let mut result = Vec::new();
         for (task_id, ws_record) in map {
-            let key = format!("{session_id}:{task_id}");
+            let key = local_key(&self.state, ctx, session_id, &task_id);
             let local = self.state.local_tasks.lock().unwrap().get(&key).cloned();
             let effective = if let Some(l) = local {
                 if !ws_record.status.is_terminal() {
@@ -529,7 +541,7 @@ impl TaskRepository for WorkspaceTaskRepository {
     }
 
     async fn cancel_task(&self, ctx: &RuntimeContext, session_id: &str, task_id: &str) -> bool {
-        let key = format!("{session_id}:{task_id}");
+        let key = local_key(&self.state, ctx, session_id, task_id);
         let local = self.state.local_tasks.lock().unwrap().get(&key).cloned();
         let found_local = local.is_some();
 
@@ -884,10 +896,26 @@ async fn maintenance_contexts(state: &RepoState) -> Vec<RuntimeContext> {
 ///
 /// The in-memory capture from `put_task` is preferred when it belongs to the same domain (it may
 /// carry extra metadata), but it is never allowed to redirect a write into another namespace.
+/// Builds the in-memory handle key, resolving the caller's storage namespace the same way the
+/// persisted record is scoped. Backends that ignore namespaces resolve to the default domain, so
+/// their keys keep the previous behaviour.
+fn local_key(
+    state: &RepoState,
+    ctx: &RuntimeContext,
+    session_id: &str,
+    task_id: &str,
+) -> LocalTaskKey {
+    LocalTaskKey {
+        namespace: namespace_for(state, ctx),
+        session_id: session_id.to_string(),
+        task_id: task_id.to_string(),
+    }
+}
+
 fn write_back_context(
     state: &RepoState,
     domain: &RuntimeContext,
-    local_key: &str,
+    local_key: &LocalTaskKey,
 ) -> RuntimeContext {
     let cached = {
         let contexts = state.local_contexts.lock().unwrap();
@@ -1317,7 +1345,7 @@ async fn sweep_once(state: &RepoState, orphan_timeout: Duration, sweep_time_ms: 
             }
             let sid = rec.parent_session_id.clone();
             // Skip when this node still has an active local future — the heartbeat is live.
-            let key = format!("{sid}:{task_id}");
+            let key = local_key(state, &domain, &sid, &task_id);
             let live = {
                 let tasks = state.local_tasks.lock().unwrap();
                 tasks.get(&key).map(|t| !t.is_completed()).unwrap_or(false)
@@ -2033,16 +2061,17 @@ mod tests {
 
         // Register a live local handle + captured context, then heartbeat again.
         let bg = BackgroundTask::controlled("t1", "sub1");
+        let key = local_key(&repo.state, &ctx, "sess", "t1");
         repo.state
             .local_tasks
             .lock()
             .unwrap()
-            .insert("sess:t1".into(), bg);
+            .insert(key.clone(), bg);
         repo.state
             .local_contexts
             .lock()
             .unwrap()
-            .insert("sess:t1".into(), ("sess".into(), ctx.clone()));
+            .insert(key, ("sess".into(), ctx.clone()));
         repo.heartbeat().await;
         assert!(read_records(fs.as_ref(), &ctx, &path).await["t1"].last_updated_at > 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2079,7 +2108,7 @@ mod tests {
 
         let repo = WorkspaceTaskRepository::new(fs.clone(), "parent");
         repo.state.local_tasks.lock().unwrap().insert(
-            "sess:live".into(),
+            local_key(&repo.state, &ctx, "sess", "live"),
             BackgroundTask::controlled("live", "sub1"),
         );
 
@@ -2345,6 +2374,45 @@ mod tests {
         RuntimeContext::default()
             .with_user_id(user)
             .with_session_id(session)
+    }
+
+    /// Java #4043: the local handle cache is keyed by storage namespace too, so a user sharing a
+    /// workspace and parent session id cannot look up or cancel another user's task.
+    #[tokio::test]
+    async fn local_handles_are_isolated_by_storage_namespace() {
+        let (dir, fs) = namespaced_fs("local_ns_isolation");
+        let alice = user_ctx("alice", "same-session");
+        let bob = user_ctx("bob", "same-session");
+        let repo = WorkspaceTaskRepository::new(fs.clone(), "parent");
+
+        let task = repo
+            .put_task(
+                &alice,
+                "t1",
+                "sub1",
+                "same-session",
+                TaskRunSpec::local(|| Ok("done".to_string())),
+            )
+            .await;
+        assert!(Arc::ptr_eq(
+            &task,
+            &repo
+                .get_task(&alice, "same-session", "t1")
+                .await
+                .expect("own local handle")
+        ));
+
+        // Bob shares the workspace and parent session id but must not see or cancel Alice's task.
+        assert!(repo.get_task(&bob, "same-session", "t1").await.is_none());
+        assert!(repo.list_tasks(&bob, "same-session", None).await.is_empty());
+        assert!(!repo.cancel_task(&bob, "same-session", "t1").await);
+        repo.remove_task(&bob, "same-session", "t1").await;
+        assert!(
+            repo.get_task(&alice, "same-session", "t1").await.is_some(),
+            "another namespace must not evict the owner's handle or record"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Writes one stale `Running` record through the repository, which is what registers the

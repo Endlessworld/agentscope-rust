@@ -15,6 +15,9 @@ use super::model::SkillCatalogSnapshot;
 /// Tool that loads a skill's documentation or resource by `skillId`.
 pub struct LoadSkillTool {
     index: HashMap<String, PathBuf>,
+    /// `skillId -> skill name`, so a name-based grant (one entry covering every copy) can be
+    /// applied to a load request that only carries an id.
+    names: HashMap<String, String>,
 }
 
 impl LoadSkillTool {
@@ -22,26 +25,62 @@ impl LoadSkillTool {
     pub const TOOL_NAME: &'static str = "load_skill_through_path";
 
     pub fn new(index: HashMap<String, PathBuf>) -> Self {
-        Self { index }
+        Self {
+            index,
+            names: HashMap::new(),
+        }
+    }
+
+    /// Attaches the `skillId -> name` map used by the capability gate.
+    pub fn with_names(mut self, names: HashMap<String, String>) -> Self {
+        self.names = names;
+        self
     }
 
     /// Convenience builder from a list of `(skill_id, dir)` pairs.
     pub fn from_entries(entries: Vec<(String, PathBuf)>) -> Self {
-        Self {
-            index: entries.into_iter().collect(),
-        }
+        Self::new(entries.into_iter().collect())
     }
 
     /// Builds a tool restricted to the given catalog snapshot (skills without a
     /// files root cannot be loaded).
     pub fn from_snapshot(snapshot: &SkillCatalogSnapshot) -> Self {
-        Self {
-            index: snapshot
+        Self::new(
+            snapshot
                 .files_roots
                 .iter()
                 .map(|(id, root)| (id.clone(), PathBuf::from(root)))
                 .collect(),
-        }
+        )
+    }
+
+    /// Whether the call's capability surface grants this skill.
+    ///
+    /// A missing surface means the call never entered an agent funnel: direct execution is
+    /// trusted assembler code, the same stance as the executor gate.
+    fn granted(&self, skill_id: &str, ctx: &ToolExecutionContext) -> bool {
+        let Some(surface) = ctx.capability_surface() else {
+            return true;
+        };
+        let name = self.names.get(skill_id).map(String::as_str).unwrap_or("");
+        surface.grants_skill(name, Some(skill_id))
+    }
+
+    /// The not-found answer, byte-identical for an unknown and an un-granted skill so the model
+    /// cannot distinguish existence. Only granted skills are listed.
+    fn unknown_skill(&self, skill_id: &str, ctx: &ToolExecutionContext) -> String {
+        let mut available: Vec<&String> = self
+            .index
+            .keys()
+            .filter(|id| self.granted(id, ctx))
+            .collect();
+        available.sort();
+        let listed = available
+            .into_iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Unknown skillId '{skill_id}'. Available skills: {listed}")
     }
 }
 
@@ -61,6 +100,12 @@ impl Tool for LoadSkillTool {
         true
     }
 
+    /// Framework meta tool: a restricted surface must not revoke the load tool itself; the
+    /// per-skill grant is enforced inside [`Tool::call`]. Mirrors Java `SkillLoadTool#isSystem`.
+    fn is_system(&self) -> bool {
+        true
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -72,7 +117,7 @@ impl Tool for LoadSkillTool {
         })
     }
 
-    async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
+    async fn call(&self, args: JsonMap, ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
         let skill_id = args
             .get("skillId")
             .and_then(|v| v.as_str())
@@ -87,11 +132,19 @@ impl Tool for LoadSkillTool {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "SKILL.md".to_string());
 
+        // Capability gate (defense in depth on top of the grant-filtered catalog): a skill the
+        // caller is not granted answers with the *not found* wording, so the model cannot tell
+        // "exists but ungranted" from "missing". The available list is the granted view only.
+        if !self.granted(&skill_id, &ctx) {
+            tracing::info!(
+                "skill load denied by capability grant: skillId='{}'",
+                skill_id
+            );
+            return Ok(ToolResultBlock::error(self.unknown_skill(&skill_id, &ctx)));
+        }
+
         let Some(dir) = self.index.get(&skill_id) else {
-            return Ok(ToolResultBlock::error(format!(
-                "Unknown skillId '{skill_id}'. Available skills: {}",
-                self.index.keys().cloned().collect::<Vec<_>>().join(", ")
-            )));
+            return Ok(ToolResultBlock::error(self.unknown_skill(&skill_id, &ctx)));
         };
         let rel_normalized = rel.replace('\\', "/");
         if rel_normalized.starts_with('/') || rel_normalized.contains("..") {
@@ -178,6 +231,10 @@ impl Tool for LazyLoadSkillTool {
         true
     }
 
+    fn is_system(&self) -> bool {
+        true
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -191,6 +248,117 @@ impl Tool for LazyLoadSkillTool {
 
     async fn call(&self, args: JsonMap, ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
         let index = self.middleware.load_index();
-        LoadSkillTool::new(index).call(args, ctx).await
+        let names = self.middleware.load_name_index();
+        LoadSkillTool::new(index)
+            .with_names(names)
+            .call(args, ctx)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentscope_core::agent::{CapabilitySurface, CAPABILITY_SURFACE_RUNTIME_KEY};
+
+    fn skill_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("asr_load_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "# body\n").unwrap();
+        dir
+    }
+
+    fn tool(dir: &PathBuf) -> LoadSkillTool {
+        LoadSkillTool::new(
+            [("pdf_user".to_string(), dir.clone())]
+                .into_iter()
+                .collect(),
+        )
+        .with_names(
+            [("pdf_user".to_string(), "pdf".to_string())]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    fn ctx_granting(names: Option<&[&str]>) -> ToolExecutionContext {
+        let mut ctx = ToolExecutionContext::default();
+        if let Some(names) = names {
+            let surface = CapabilitySurface::new(
+                Some(names.iter().map(|n| n.to_string()).collect()),
+                None,
+                None,
+            );
+            if let Ok(value) = serde_json::to_value(&surface) {
+                ctx.runtime
+                    .insert(CAPABILITY_SURFACE_RUNTIME_KEY.to_string(), value);
+            }
+        }
+        ctx
+    }
+
+    fn args(skill_id: &str) -> JsonMap {
+        let mut map = JsonMap::new();
+        map.insert("skillId".to_string(), json!(skill_id));
+        map
+    }
+
+    fn text(block: &ToolResultBlock) -> String {
+        block
+            .output
+            .iter()
+            .filter_map(|b| match b {
+                agentscope_core::message::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[tokio::test]
+    async fn an_ungranted_skill_reads_exactly_like_an_unknown_one() {
+        let dir = skill_dir("grant");
+        let tool = tool(&dir);
+
+        // A granted name covers the copy from that source.
+        let ok = tool
+            .call(args("pdf_user"), ctx_granting(Some(&["pdf"])))
+            .await
+            .unwrap();
+        assert!(text(&ok).contains("# body"), "{}", text(&ok));
+
+        // Another name grants nothing here, and the answer neither leaks the skill nor a list.
+        let denied = tool
+            .call(args("pdf_user"), ctx_granting(Some(&["docx"])))
+            .await
+            .unwrap();
+        let denied_text = text(&denied);
+        assert!(
+            denied_text.contains("Unknown skillId 'pdf_user'"),
+            "{denied_text}"
+        );
+        assert!(
+            !denied_text.contains("pdf_user,"),
+            "no available-list leak: {denied_text}"
+        );
+        assert_eq!(
+            denied_text,
+            "Error: Unknown skillId 'pdf_user'. Available skills: "
+        );
+
+        // An unknown id under the same surface answers in the same shape.
+        let unknown = tool
+            .call(args("nope"), ctx_granting(Some(&["docx"])))
+            .await
+            .unwrap();
+        assert!(text(&unknown).starts_with("Error: Unknown skillId 'nope'. Available skills: "));
+
+        // A call that never entered an agent funnel has no surface: trusted assembler code.
+        let direct = tool
+            .call(args("pdf_user"), ctx_granting(None))
+            .await
+            .unwrap();
+        assert!(text(&direct).contains("# body"), "{}", text(&direct));
     }
 }

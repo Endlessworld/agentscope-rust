@@ -79,6 +79,7 @@ pub struct HarnessSkillMiddleware {
 struct SkillCache {
     catalog: Option<SkillCatalog>,
     index: Option<HashMap<String, PathBuf>>,
+    names: Option<HashMap<String, String>>,
 }
 
 impl HarnessSkillMiddleware {
@@ -139,17 +140,35 @@ impl HarnessSkillMiddleware {
         if let Some(index) = &guard.index {
             return index.clone();
         }
+        self.scan_index(&mut guard);
+        guard.index.clone().unwrap_or_default()
+    }
+
+    /// The `skillId -> skill name` map, so the load tool can apply name-based grants
+    /// (`CapabilitySurface` speaks skill *names*, one entry covering every copy).
+    pub fn load_name_index(&self) -> HashMap<String, String> {
+        let mut guard = self.cache.lock().unwrap();
+        if guard.names.is_none() {
+            self.scan_index(&mut guard);
+        }
+        guard.names.clone().unwrap_or_default()
+    }
+
+    /// Scans every repository once and caches both the on-disk index and the name map.
+    fn scan_index(&self, guard: &mut SkillCache) {
         let mut index = HashMap::new();
+        let mut names = HashMap::new();
         for repo in &self.repos {
             for skill in repo.load() {
                 let id = skill.skill_id();
+                names.insert(id.clone(), skill.name().to_string());
                 if let Some(dir) = repo.skill_dir(&skill.name()) {
                     index.insert(id, dir);
                 }
             }
         }
-        guard.index = Some(index.clone());
-        index
+        guard.index = Some(index);
+        guard.names = Some(names);
     }
 
     /// 惰性构建并缓存渲染目录（首次 on_system_prompt 时才扫描磁盘）。
@@ -168,6 +187,7 @@ impl HarnessSkillMiddleware {
         let mut guard = self.cache.lock().unwrap();
         guard.catalog = None;
         guard.index = None;
+        guard.names = None;
     }
 
     /// Builds the catalog with shell-reachable `filesRoot` resolved per skill.
@@ -210,11 +230,33 @@ impl HarnessSkillMiddleware {
 
 #[async_trait::async_trait]
 impl Middleware for HarnessSkillMiddleware {
-    async fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
+    async fn on_system_prompt(&self, ctx: &RuntimeContext, current_prompt: String) -> String {
         if self.repos.is_empty() {
             return current_prompt;
         }
         let catalog = self.cached_catalog();
+        if catalog.is_empty() {
+            return current_prompt;
+        }
+        // Capability grant (Java `DynamicSkillMiddleware`): the visible catalog is
+        // `SkillFilter` ∩ grant. The grant runs after the configuration intent and can only
+        // narrow — a runtime overlay may widen the filter, never the authorization surface.
+        let catalog = match agentscope_core::agent::capability_surface_from_context(ctx) {
+            Some(surface) if !surface.is_unrestricted() => SkillCatalog::of(
+                catalog
+                    .all()
+                    .iter()
+                    .filter(|entry| {
+                        surface.grants_skill(
+                            entry.skill().name(),
+                            Some(entry.skill().skill_id().as_str()),
+                        )
+                    })
+                    .cloned()
+                    .collect(),
+            ),
+            _ => catalog,
+        };
         if catalog.is_empty() {
             return current_prompt;
         }
@@ -342,5 +384,63 @@ mod tests {
         assert_eq!(index.len(), 1);
         let dir = index.get("data_user").expect("skill_dir must be indexed");
         assert!(dir.join("SKILL.md").is_file());
+    }
+
+    fn two_skill_middleware(tag: &str) -> (HarnessSkillMiddleware, std::path::PathBuf) {
+        let root = temp_dir(tag);
+        write_skill(&root, "pdf", "# PDF\n");
+        write_skill(&root, "docx", "# DOCX\n");
+        let repo: Arc<dyn SkillRepository> =
+            Arc::new(FileSystemSkillRepository::new(&root, "user"));
+        let mw = HarnessSkillMiddleware::new(
+            vec![repo],
+            SkillFilter::all(),
+            None,
+            ShellPathPolicy::no_shell(),
+            Some(root.clone()),
+        );
+        (mw, root)
+    }
+
+    fn ctx_with_skills(names: &[&str]) -> RuntimeContext {
+        let mut ctx = RuntimeContext::new().with_user_id("u1");
+        ctx.extensions.insert_arc(
+            agentscope_core::agent::CAPABILITY_SURFACE_CONTEXT_KEY,
+            Arc::new(agentscope_core::agent::CapabilitySurface::new(
+                Some(names.iter().map(|n| n.to_string()).collect()),
+                None,
+                None,
+            )),
+        );
+        ctx
+    }
+
+    #[tokio::test]
+    async fn the_prompt_catalog_is_trimmed_by_the_capability_grant() {
+        let (mw, _root) = two_skill_middleware("grant_prompt");
+        // Without a surface both skills are offered.
+        let prompt = mw
+            .on_system_prompt(&RuntimeContext::new(), "base".to_string())
+            .await;
+        assert!(
+            prompt.contains("pdf") && prompt.contains("docx"),
+            "{prompt}"
+        );
+
+        // A granted name covers the copy from that source; the other skill disappears.
+        let prompt = mw
+            .on_system_prompt(&ctx_with_skills(&["pdf"]), "base".to_string())
+            .await;
+        assert!(prompt.contains("pdf"), "{prompt}");
+        assert!(
+            !prompt.contains("docx"),
+            "an ungranted skill must not reach the prompt: {prompt}"
+        );
+
+        // An explicit empty grant keeps only the base prompt.
+        let prompt = mw
+            .on_system_prompt(&ctx_with_skills(&[]), "base".to_string())
+            .await;
+        assert_eq!(prompt, "base");
     }
 }

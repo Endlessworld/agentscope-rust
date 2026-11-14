@@ -50,6 +50,14 @@ impl WorkspacePathNormalizer {
 fn try_strip(path: &str, prefix: &str) -> Option<String> {
     let normalized_path = path.replace('\\', "/");
     let normalized_prefix = prefix.replace('\\', "/");
+    if normalized_prefix == "/" && normalized_path.starts_with('/') {
+        let rest = &normalized_path[1..];
+        return Some(if rest.is_empty() {
+            ".".to_string()
+        } else {
+            rest.to_string()
+        });
+    }
     if normalized_path.starts_with(&format!("{normalized_prefix}/")) {
         let rest = normalized_path[normalized_prefix.len() + 1..].to_string();
         return Some(if rest.is_empty() {
@@ -110,5 +118,15 @@ mod tests {
         let n = WorkspacePathNormalizer::of_many(&["/ws", "/workspace"]);
         assert_eq!(n.normalize("/ws/x"), "x");
         assert_eq!(n.normalize("/workspace/y"), "y");
+    }
+
+    /// A sandbox whose root *is* the filesystem root strips only the leading separator
+    /// (Java `WorkspacePathNormalizer#tryStrip`, commit `6ff7590af`).
+    #[test]
+    fn filesystem_root_prefix_strips_only_the_leading_separator() {
+        let n = WorkspacePathNormalizer::of("/");
+        assert_eq!(n.normalize("/a.txt"), "a.txt");
+        assert_eq!(n.normalize("/"), ".");
+        assert_eq!(n.normalize("relative/a.txt"), "relative/a.txt");
     }
 }

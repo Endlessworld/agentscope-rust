@@ -85,6 +85,134 @@ async fn queue_drain_honors_max_count() {
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 
+/// Every file name across all queue directories under `busRoot`.
+fn queue_files(dir: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(queues) = std::fs::read_dir(dir.join("bus").join("queues")) else {
+        return names;
+    };
+    for queue in queues {
+        for file in std::fs::read_dir(queue.unwrap().path()).unwrap() {
+            names.push(file.unwrap().file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn queue_entries_publish_a_ready_marker_after_the_payload() {
+    let dir = temp_dir("queue_layout").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    let bus = WorkspaceMessageBus::new(fs, "/bus");
+
+    let id = bus.queue_push("lay", json!({"n": 1})).await.unwrap();
+    assert_eq!(
+        queue_files(&dir)
+            .into_iter()
+            .filter(|f| f != ".keep") // directory marker written by `ensure_dir`
+            .collect::<Vec<_>>(),
+        vec![format!("{id}.payload"), format!("{id}.ready")]
+    );
+
+    // Draining removes the marker, its payload and the claim.
+    assert_eq!(bus.queue_drain("lay", 10).await.unwrap().len(), 1);
+    assert!(
+        queue_files(&dir).iter().all(|f| f == ".keep"),
+        "{:?}",
+        queue_files(&dir)
+    );
+
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+#[tokio::test]
+async fn a_payload_without_a_ready_marker_is_not_drainable() {
+    let dir = temp_dir("queue_pending").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    let bus = WorkspaceMessageBus::new(fs, "/bus");
+
+    let id = bus.queue_push("pending", json!({"n": 1})).await.unwrap();
+    // Simulate a producer that wrote the payload but has not published it yet.
+    let queue_dir = std::fs::read_dir(dir.join("bus").join("queues"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::remove_file(queue_dir.join(format!("{id}.ready"))).unwrap();
+
+    assert!(!bus.queue_peek("pending").await.unwrap());
+    assert!(bus.queue_drain("pending", 10).await.unwrap().is_empty());
+
+    // Once published, the entry becomes drainable.
+    std::fs::write(queue_dir.join(format!("{id}.ready")), "").unwrap();
+    let drained = bus.queue_drain("pending", 10).await.unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].payload["n"], 1);
+
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+#[tokio::test]
+async fn a_claimed_entry_is_not_returned_to_a_second_drainer() {
+    let dir = temp_dir("queue_claim").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    let bus = WorkspaceMessageBus::new(fs, "/bus");
+
+    let id = bus.queue_push("claim", json!({"n": 1})).await.unwrap();
+    let queue_dir = std::fs::read_dir(dir.join("bus").join("queues"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Another drainer won the claim for this entry.
+    std::fs::write(queue_dir.join(format!("{id}.ready.claim")), "").unwrap();
+
+    assert!(bus.queue_drain("claim", 10).await.unwrap().is_empty());
+
+    // The entry survives and is delivered once the claim is released.
+    std::fs::remove_file(queue_dir.join(format!("{id}.ready.claim"))).unwrap();
+    let drained = bus.queue_drain("claim", 10).await.unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].id, id);
+
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+#[tokio::test]
+async fn legacy_json_queue_entries_are_still_drained() {
+    let dir = temp_dir("queue_legacy").await;
+    let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+    let bus = WorkspaceMessageBus::new(fs, "/bus");
+
+    // Create the queue directory, then drop a pre-upgrade entry into it.
+    bus.queue_push("legacy", json!({"old": false}))
+        .await
+        .unwrap();
+    assert_eq!(bus.queue_drain("legacy", 10).await.unwrap().len(), 1);
+    let queue_dir = std::fs::read_dir(dir.join("bus").join("queues"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(
+        queue_dir.join("00000000000000000009.json"),
+        "{\"old\":true}",
+    )
+    .unwrap();
+
+    let drained = bus.queue_drain("legacy", 10).await.unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].id, "00000000000000000009");
+    assert_eq!(drained[0].payload["old"], true);
+    assert!(bus.queue_drain("legacy", 10).await.unwrap().is_empty());
+
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
 // ---- Mode C: replay log ----
 
 #[tokio::test]

@@ -18,9 +18,8 @@ use crate::tool::{int_arg, opt_str_arg};
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const DEFAULT_HISTORY_LIMIT: usize = 20;
 
-/// Hard ceiling for model-supplied result limits. Both session tools are excluded from
-/// tool-result eviction on the bounded-results rationale, so nothing downstream trims an
-/// oversized result — the clamp has to happen here.
+/// Hard ceiling for model-supplied result limits (#3270). This bounds the number of
+/// matches, not their size; oversized results are left to tool-result eviction.
 const MAX_RESULTS_CEILING: usize = 100;
 
 /// Characters kept from a matched message before the preview is elided.

@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use agentscope_core::agent::RuntimeContext;
-use agentscope_core::middleware::Middleware;
+use agentscope_core::middleware::{ExtensionPoint, Middleware};
 
 use crate::agent::workspace::WorkspaceManager;
 use crate::filesystem::{
@@ -206,6 +206,13 @@ impl WorkspaceContextMiddleware {
 
 #[async_trait::async_trait]
 impl Middleware for WorkspaceContextMiddleware {
+    /// Narrow declaration: only the system-prompt hook is implemented (Java
+    /// `ContextConventionsMiddleware.activePoints()`); subclasses overriding more hooks
+    /// must extend this set.
+    fn active_points(&self) -> Vec<ExtensionPoint> {
+        vec![ExtensionPoint::OnSystemPrompt]
+    }
+
     async fn on_system_prompt(&self, ctx: &RuntimeContext, current_prompt: String) -> String {
         // Freeze the section per session so an in-session `memory_save` (or a workspace
         // file edit) cannot rewrite the system prompt and invalidate the prompt cache.

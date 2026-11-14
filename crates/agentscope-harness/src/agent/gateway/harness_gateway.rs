@@ -566,3 +566,77 @@ impl super::wakeup_dispatcher::WakeupTarget for HarnessGateway {
         HarnessGateway::run_wakeup(self, user_id, session_id).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentscope_core::message::MsgRole;
+
+    /// Agent that blocks until the test releases it, so the gate stays held.
+    struct BlockingAgent {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl GatewayAgent for BlockingAgent {
+        async fn call(&self, _messages: Vec<Msg>, _ctx: &GatewayTurnContext) -> Result<Msg> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Msg::builder()
+                .role(MsgRole::Assistant)
+                .text_content("done")
+                .build())
+        }
+    }
+
+    fn user_msg() -> Msg {
+        Msg::builder()
+            .role(MsgRole::User)
+            .text_content("hi")
+            .build()
+    }
+
+    /// Java #3550: a cancelled subscription must release *its own* turn lease only.
+    /// In Rust the lease is a local guard inside the turn future, so dropping the
+    /// future (cancellation) releases it and a later turn for the same session runs.
+    #[tokio::test]
+    async fn a_cancelled_turn_releases_its_gate_lease() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gateway = Arc::new(HarnessGateway::create_standalone());
+        gateway
+            .bind_main_agent(Arc::new(BlockingAgent {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }))
+            .await;
+
+        let turn = tokio::spawn({
+            let gateway = Arc::clone(&gateway);
+            async move { gateway.run(None, vec![user_msg()]).await }
+        });
+        entered.notified().await;
+        let session_id = gateway
+            .session_to_gate_key
+            .read()
+            .await
+            .iter()
+            .find(|(_, key)| key.as_str() == MsgContext::default_context().canonical_key())
+            .map(|(id, _)| id.clone())
+            .expect("turn should have registered its session");
+        assert!(gateway.is_session_running(&session_id).await);
+
+        turn.abort();
+        let _ = turn.await;
+        assert!(!gateway.is_session_running(&session_id).await);
+
+        // The gate is free again: another turn for the same session is admitted.
+        let next = tokio::spawn({
+            let gateway = Arc::clone(&gateway);
+            async move { gateway.run(None, vec![user_msg()]).await }
+        });
+        release.notify_one();
+        assert_eq!(next.await.unwrap().unwrap().text_content(), "done");
+    }
+}

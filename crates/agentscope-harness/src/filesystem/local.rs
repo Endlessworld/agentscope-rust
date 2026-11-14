@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use globset::{GlobBuilder, GlobMatcher};
 use regex::{Regex, RegexBuilder};
 
-use super::{validate_path, FileData, FileInfo, Filesystem, GrepMatch};
+use super::{already_exists_error, validate_path, FileData, FileInfo, Filesystem, GrepMatch};
 
 /// Number of leading bytes inspected when deciding whether a file is binary.
 ///
@@ -409,14 +409,26 @@ impl Filesystem for LocalFilesystem {
     async fn write(&self, ctx: &RuntimeContext, path: &str, content: &str) -> Result<()> {
         let resolved = self.resolve(ctx, path)?;
         if resolved.exists() {
-            return Err(Error::Tool(format!(
-                "Cannot write to {path} because it already exists. Read and edit, or write to a new path."
-            )));
+            return Err(already_exists_error(path));
         }
         if let Some(parent) = resolved.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
         }
-        tokio::fs::write(&resolved, content)
+        // Exclusive create, so a concurrent create-if-absent claim loses with the
+        // shared "already exists" error instead of overwriting the winner.
+        let mut file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&resolved)
+            .await
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(already_exists_error(path));
+            }
+            Err(e) => return Err(Error::Io(e)),
+        };
+        tokio::io::AsyncWriteExt::write_all(&mut file, content.as_bytes())
             .await
             .map_err(Error::Io)?;
         Ok(())

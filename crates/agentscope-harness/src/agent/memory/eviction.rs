@@ -18,6 +18,9 @@ pub const DEFAULT_PREVIEW_CHARS: usize = 2_000;
 pub const DEFAULT_EVICTION_PATH: &str = "large_tool_results";
 
 /// Tools excluded from eviction by default (small or self-paginating).
+///
+/// `session_search` is deliberately absent: its match count is capped, but each match
+/// carries a whole stored message, so a few matches can exceed the threshold.
 pub fn default_excluded_tools() -> HashSet<String> {
     [
         "read_file",
@@ -28,7 +31,6 @@ pub fn default_excluded_tools() -> HashSet<String> {
         "list_files",
         "memory_search",
         "memory_get",
-        "session_search",
     ]
     .into_iter()
     .map(str::to_string)
@@ -148,6 +150,15 @@ mod tests {
         assert!(!cfg.should_evict("read_file", 1_000_000));
         // Under the threshold, nothing is evicted.
         assert!(!cfg.should_evict("execute", 1_000));
+    }
+
+    #[test]
+    fn oversized_session_search_results_are_evictable() {
+        let cfg = ToolResultEvictionConfig::defaults();
+        assert!(!cfg.excluded_tool_names.contains("session_search"));
+        assert!(cfg.should_evict("session_search", 100_000));
+        // Small results stay inline.
+        assert!(!cfg.should_evict("session_search", 1_000));
     }
 
     #[test]

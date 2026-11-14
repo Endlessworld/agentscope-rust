@@ -15,7 +15,7 @@ use async_trait::async_trait;
 
 use super::local::{build_glob_matcher, GrepGlob, PatternMatcher};
 use super::util;
-use super::{validate_path, FileData, FileInfo, Filesystem, GrepMatch};
+use super::{already_exists_error, validate_path, FileData, FileInfo, Filesystem, GrepMatch};
 use store::{
     BaseStore, DefaultNamespace, NamespaceFactory, StaticNamespace, StoreItem, StoreValue,
 };
@@ -269,10 +269,7 @@ impl Filesystem for RemoteFilesystem {
             .store
             .put_if_version(&ns, path, file_data_to_store_value(&fd), 0);
         if !written {
-            return Err(Error::Tool(format!(
-                "Cannot write to {path} because it already exists. \
-                 Read and then make an edit, or write to a new path."
-            )));
+            return Err(already_exists_error(path));
         }
         Ok(())
     }

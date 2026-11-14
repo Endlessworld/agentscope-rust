@@ -275,3 +275,58 @@
 ## 6. 执行记录
 
 - 归档：`docs/extensions/history/HARNESS__MIGRATION_HISTORY.md`（本轮未新建，按 BRIEF 要求历史进程不入本文件）。
+
+### 2026-11-14 迁移批次（Java 9ab7a4fab..a4306d63d，harness 组）
+
+| 提交 | 结论 | Rust 落地位置 | 测试 | 与 Java 偏差 |
+|---|---|---|---|---|
+| `36cabf4a5` session_search 结果可被 evict | 已迁移 | `agent/memory/eviction.rs`（`default_excluded_tools` 移除 `session_search`）、`tool/session_search.rs`（ceilning 注释） | `eviction::tests::oversized_session_search_results_are_evictable` | Rust 默认排除表仍多含 `grep_files`/`glob_files`/`list_files`（既有偏差，本次未动）；`compaction.rs` 的 prune 排除表按 Java 保持含 `session_search` |
+| `867c092c4` web 工具共享默认 HttpClient | 已迁移 | `tool/web_tools.rs`：`shared_default_client()` 用 `OnceLock` 持有进程级 client，`http()` 返回 `&reqwest::Client` | `default_constructed_web_tools_share_one_client`（`ptr::eq` 断言默认构造共享、注入的不共享） | Rust 原实现是每次调用新建 client（比 Java 的每次 build 更糟），现改为共享；注入 client 生命周期仍归调用方 |
+| `3438964bb` gateway turn lease 按订阅作用域 | 不适用 | `agent/gateway/harness_gateway.rs`：无 Reactor `Mono.defer` + 共享 `AtomicReference<TurnLease>` 结构；`run_with_outbound`/`run_subagent`/`run_wakeup` 各自在 async 体内持有局部 `_guard`，订阅即作用域、drop 即释放 | 新增 `a_cancelled_turn_releases_its_gate_lease`（abort 中途取消后 gate 立即空出，下一次 turn 可入） | 无。语义已由 RAII 保证，不需要对应改动 |
+| `bedf292ad` workspace 队列原子 claim | 已迁移 | `agent/bus/workspace_message_bus.rs`（`.payload` → `.ready` → `.ready.claim` 协议，旧 `.json` 仍可 drain，claim 冲突跳过、读失败释放 claim、删失败保留 claim、claim 存储异常上抛）；`filesystem/mod.rs` 新增 `already_exists_error` / `is_already_exists_error`（对应 Java `WriteResult.alreadyExists` / `isAlreadyExists`）；`filesystem/local.rs` 改 `create_new` 原子独占创建；`filesystem/remote/mod.rs` 复用同一错误构造；`ensure_dir` 容忍 create-if-absent 冲突（并发 producer 抢写 `.keep`） | `harness_bus_test.rs`：`queue_entries_publish_a_ready_marker_after_the_payload`、`a_payload_without_a_ready_marker_is_not_drainable`、`a_claimed_entry_is_not_returned_to_a_second_drainer`、`legacy_json_queue_entries_are_still_drained`；反向验证：去掉冲突分支 → 后者 FAILED | `Filesystem::write` 返回 `Result<()>` 而非 Result 结构，冲突靠共享错误文案识别（routed 沙箱后端的冲突会被当成存储故障）；sandbox 后端（`crates/agentscope-extensions-sandbox/src/fs_spec.rs`）的独占占位/失败清理未迁移（越权 crate + Rust 无占位文件模型） |
+| `55498cf00` ROOTED 本地 FS 的 namespace 边界 | 不适用 | Rust `LocalFilesystem::resolve` 忽略 `RuntimeContext`，不做 namespace 前缀（隔离只在 `RemoteFilesystem` 的 store namespace）；`LocalFsMode::Rooted` 已要求绝对路径落在 root/additional_roots 内 | 无 | Rust 不存在「同一个 workspace root 下的 per-session namespace 目录」这一前提，也就没有绝对路径绕过边界的问题 |
+| `9cdaa81dd` skill staging 路径穿越 | 已迁移 | `agent/skill/stager.rs`：新增 `source_namespace_segment`（源标识归一为单段 + 冲突时 sha256 后缀，Windows 设备名加 `_` 前缀）与 `resolve_staging_directory`（拒绝 `/`、`\`、`:`、尾点/尾空格、Windows 设备名、非直接子目录）；`stage` 遇非法名记 warn 并写 `StageResult::None`，其余 skill 继续 | `an_absolute_skill_name_cannot_write_outside_the_cache`、`traversal_and_device_names_are_rejected_as_skill_names`、`a_source_namespace_is_mapped_to_one_safe_segment`；反向验证：改回裸 `join` → 首条 FAILED | Rust cache 布局无 scope 段（`.skills-cache/<ns>/<name>`，Java 为 `<scope>/<ns>/<name>`）；未引入 symlink 安全操作（Java 同） |
+| `e6a422900` 子智能体任务句柄按存储 namespace 隔离 | 已迁移 | `agent/subagent/task/workspace.rs`：`LocalTaskKey{namespace, session_id, task_id}`，`get_task`/`put_task`/`remove_task`/`list_tasks`/`cancel_task`/`sweep_once`/`write_back_context`/heartbeat 全部改用该键 | `local_handles_are_isolated_by_storage_namespace`（同名 session 下 bob 看不到/取消/删除 alice 的句柄与记录）+ 反向验证（namespace 置空 → FAILED） | 复用既有 `namespace_for`（等价 Java `WorkspaceManager.taskStorageNamespace`），无需改 `workspace/**`；Rust 本地 FS 无 `storageNamespace`（无 namespace 概念）；未新增 `LocalFilesystem::storageNamespace` |
+| `e5dd38983` memory 读取锚定调用方 namespace | 部分 | 已改 `tool/memory_get.rs`：工具描述改为「相对调用方的 memory namespace」；路径先归一（`\`→`/`、去前导空白与 `/`）再 `validate_path`，使 `  ../x` 也被拒（对齐 Java `requireSafeRelativePath`）。**未改（禁区）**：`agent/workspace/manager.rs` 的 `read_with_override` 仍回落 workspace 根 | `harness_memory_tool_test.rs::memory_get_reports_missing_file_and_traversal` 增补前导空白用例 | 待主 agent 处理：`read_namespaced_runtime_data`（filesystem → namespace 内回落，legacy 根副本只 warn 不服务）、`resolve_runtime_data_path` 复用同一 namespace、task record 读同样锚定；另 `MemoryGetTool`/`MemorySaveTool` 仍写死 `RuntimeContext::default()`（`ToolExecutionContext` 只有 `runtime: JsonMap`，无 RuntimeContext 字段），身份无法下传 |
+
+验证：`cargo check -p agentscope-harness --all-targets` 通过（仅既有 warning）；`cargo test -p agentscope-harness --lib` 654 passed / 0 failed；`--test harness_bus_test` 19 passed；`--test harness_memory_tool_test` 5 passed；`--test harness_channel_test` 6 passed。
+
+### 2026-11-14 迁移批次补充（`e5dd38983` 的 workspace 侧，主 agent 收尾）
+
+harness 子智能体因文件所有权跳过 `agent/workspace/manager.rs`，本项由主 agent 补齐：
+
+| 项 | 状态 | 落地位置 | 说明 |
+|---|---|---|---|
+| `readNamespacedRuntimeData` 等价 | 已完成 | `agent/workspace/manager.rs::read_namespaced_runtime_data` | filesystem 优先，其次调用者 namespace；namespace 为空或无 filesystem 时保留历史 root 读取（写入路径此时也不 namespace） |
+| `readMemoryMd` 锚定 | 已完成 | 同上；`read_memory_md` 改走 namespaced 读取 | 对齐 Java `readMemoryFileUtf8` 非路由分支 |
+| task record / sweep marker 读 | 已完成 | `read_writable_workspace_relative_utf8` 改走 namespaced 读取 | 写入路径本就按 namespace 落盘，读路径原为唯一漏点 |
+| root 残留副本一次性告警 | 已完成 | `warn_when_unnamespaced_root_copy_exists` + `Mutex<HashSet>` 字段 | 对齐 Java `warnedLegacyRootCopies`（每 manager 每路径一次） |
+| namespace 解析复用 | 已完成 | `namespace_of` / `resolve_in_namespace` | 与 `resolve_runtime_data_path` 共用同一份规则 |
+| `requireSafeRelativePath` 公开 | 不适用 | — | Rust `require_safe_relative_path` 已是模块内共享函数 |
+
+测试：`agent::workspace::manager` 7 passed（新增 2 条：`a_root_level_memory_copy_is_not_served_to_an_identified_caller`、`memory_reads_stay_inside_the_callers_namespace`；反向验证：把 fallback 改回 workspace root → 两条 FAILED）。
+
+
+### 2026-11-14 迁移批次（Java 5e1a102f4 / e46890477 / f45820e2a，capability 组）
+
+| 提交 | 结论 | Rust 位置 / 说明 | 测试 |
+|---|---|---|---|
+| `5e1a102f4` capability surface（harness 侧） | **部分**（语义迁移） | `HarnessAgentBuilder::capability_resolver(...)` 转发给内嵌 `ReActAgent`（与 core 同一份 surface，工具 schema / 执行门自动生效）；`HarnessSkillMiddleware::on_system_prompt` 把可见目录裁成 `SkillFilter ∩ grant`（授权面只能收窄，overlay 不能放大）；`LoadSkillTool`/`LazyLoadSkillTool` 标记 `is_system()` 并在 `Tool::call` 内做 per-skill 门（未授权与不存在返回逐字相同的 "Unknown skillId ... Available skills: <仅已授权>"，不泄漏存在性）；`SkillCache` 新增 `skillId -> name` 映射（`load_name_index`），使按 name 的 grant 能覆盖同一 skill 的各来源副本 | `agent::middleware::skill_middleware::tests::the_prompt_catalog_is_trimmed_by_the_capability_grant`、`agent::skill::load_tool::tests::an_ungranted_skill_reads_exactly_like_an_unknown_one` |
+| `e46890477` 确认规则持久化 | 已迁移（core 侧） | 见 CORE tracker；harness 无需改动（`set_permission_context`/`add_permission_rule` 已转发） | core 用例 |
+| `f45820e2a` `replacePermissionContext` | **不适用**（已有等价能力） | Rust 无 `(userId, sessionId)` 多会话寻址；`HarnessAgent::set_permission_context(ctx)` 就是「替换本会话权限上下文」的等价入口 | 既有权限用例 |
+
+**与 Java 的偏差（harness 侧）**：① skill 预置/落盘未按 grant 收窄（Java 只把已授权 skill 物化到 `.skills-cache`，并收窄 sandbox 工作区投影）；Rust 的 stager 在构建期运行、没有 per-call 上下文，`filesystem/`、`sandbox/` 本轮未改。② `load_skill_through_path` 的索引仍来自磁盘全量扫描（`load_index`），授权只靠调用期门与 prompt 裁剪，不靠目录本身；③ 未迁移 `SandboxLifecycleMiddleware` / `WorkspaceProjectionApplier` / `MarketplaceStager` 的 grant 收窄（依赖 sandbox 侧改造，属后续批次）。
+
+**验证**：`cargo check -p agentscope-core -p agentscope-harness --all-targets` 通过；`cargo test -p agentscope-harness --lib` → **658 passed / 0 failed**；反向验证 2 项（prompt 裁剪、加载门）FAILED 后还原。
+
+### 2026-11-14 迁移批次（Java c05e4b91f，model-vocab 组）
+
+**已迁移**
+- `ConversationCompactionMiddleware` 现在按 **run 钉住的模型**（`RuntimeContext::pinned_model`，即 Java `react.getModel(ctx)`）做摘要、并让事件里的 model 名跟随它，而不是只用构建期 compactor 的模型：使用 per-call 选模（`call_with_model` / `MODEL_ID_CONTEXT_KEY`）的会话不再用默认模型摘要。测试 `agent::middleware::conversation_compaction::tests::the_run_pinned_model_summarizes_the_conversation`（反向验证：`run_compactor` 退回构建期实例 → FAILED）。
+
+**不适用 / 未迁移（实证理由）**
+- `AgentSession` 清除调用方 per-call 选择：Rust 的 session dispatch 自己构造 per-run `Extensions`（`session.rs` 只注入 recorder/execution），从不转发调用方 `RuntimeContext` 的 `model_id`，会话轮次结构上不可能继承，加清除属死代码。
+- `DefaultAgentManager` / `SubAgentTool` 剥离调用方模型：Rust 子智能体由 `agent_spawn` 以全新的 child context 运行，父 ctx 的模型选择不会流入。
+- `HarnessAgent.Builder.model(String)` 的「构建期即解析」：Rust builder 只接受实例 + `model_resolver`，`fallback_model_by_name` 已是构建期解析，且无 identity 模式可迁。
+- `AgentTraceMiddleware` 报模型名：Rust trace 不解析模型名（模型信息随事件走），无可对齐点。
+- **剩余缺口**：压缩触发预算（`trigger_tokens`）仍由宿主在构建期按默认模型窗口计算，per-call 模型的窗口差异不会重算（Java 由 effective model 推导）；`CompactionConfig` 也没有「专用压缩模型」字段（Java 的 dedicated model 优先于 effective model）。

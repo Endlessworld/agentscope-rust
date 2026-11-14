@@ -186,6 +186,23 @@ pub trait Filesystem: Send + Sync + 'static {
     }
 }
 
+/// Builds the shared create-if-absent conflict error.
+///
+/// Backends report a failed exclusive write with this message so a caller that needs an
+/// atomic claim (e.g. `WorkspaceMessageBus`) can tell a normal conflict apart from a
+/// storage failure, independently of any routed path rewriting. Mirrors Java
+/// `WriteResult.alreadyExists`.
+pub fn already_exists_error(path: &str) -> agentscope_core::Error {
+    agentscope_core::Error::Tool(format!(
+        "Cannot write to {path} because it already exists. Read and then make an edit, or write to a new path."
+    ))
+}
+
+/// Recognizes [`already_exists_error`] independently of a routed backend's path.
+pub fn is_already_exists_error(err: &agentscope_core::Error) -> bool {
+    matches!(err, agentscope_core::Error::Tool(msg) if msg.contains("because it already exists"))
+}
+
 /// Validates that `path` is safe (non-blank, no `..` traversal).
 pub fn validate_path(path: &str) -> Result<()> {
     if path.trim().is_empty() {

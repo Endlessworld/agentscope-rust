@@ -1040,6 +1040,8 @@ pub struct HarnessAgentBuilder {
     confirm_handler: Option<agentscope_core::ConfirmHandler>,
     /// Optional initial permission context forwarded to the embedded ReActAgent.
     permission_context: Option<agentscope_core::PermissionContextState>,
+    /// Optional per-call capability resolver forwarded to the embedded ReActAgent.
+    capability_resolver: Option<std::sync::Arc<dyn agentscope_core::CapabilityResolver>>,
     /// Per-call generation defaults (e.g. additional request headers) applied
     /// to the embedded ReActAgent at build time.
     generate_options_defaults: Option<agentscope_core::model::GenerateOptions>,
@@ -1180,6 +1182,7 @@ impl Default for HarnessAgentBuilder {
             skill_filter: SkillFilter::all(),
             confirm_handler: None,
             permission_context: None,
+            capability_resolver: None,
             generate_options_defaults: None,
             prompt_cache: None,
             model_execution_config: None,
@@ -1800,6 +1803,18 @@ impl HarnessAgentBuilder {
     /// (`PermissionBehavior::Ask`). Forwarded to the embedded ReActAgent at build.
     pub fn confirm_handler(mut self, handler: agentscope_core::ConfirmHandler) -> Self {
         self.confirm_handler = Some(handler);
+        self
+    }
+
+    /// Sets the per-call capability resolver forwarded to the embedded ReActAgent.
+    ///
+    /// Resolved at the harness call entry, so the tool schemas the model sees, the skill
+    /// catalog/prompt and every execution gate observe the same per-caller grants.
+    pub fn capability_resolver(
+        mut self,
+        resolver: std::sync::Arc<dyn agentscope_core::CapabilityResolver>,
+    ) -> Self {
+        self.capability_resolver = Some(resolver);
         self
     }
 
@@ -2959,6 +2974,9 @@ impl HarnessAgentBuilder {
             }
             if let Some(ctx) = &self.permission_context {
                 agent_builder = agent_builder.permission_context(ctx.clone());
+            }
+            if let Some(resolver) = &self.capability_resolver {
+                agent_builder = agent_builder.capability_resolver(std::sync::Arc::clone(resolver));
             }
             if let Some(handler) = &self.confirm_handler {
                 agent_builder = agent_builder.confirm_handler(handler.clone());

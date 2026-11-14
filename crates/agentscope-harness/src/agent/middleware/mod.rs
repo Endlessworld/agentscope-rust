@@ -6,7 +6,7 @@
 //! `RuntimeContext` to scope their work.
 
 use agentscope_core::agent::RuntimeContext;
-use agentscope_core::middleware::Middleware;
+use agentscope_core::middleware::{ExtensionPoint, Middleware};
 
 pub mod agent_trace;
 pub mod async_tool;
@@ -70,6 +70,12 @@ impl CompactionMiddleware {
 
 #[async_trait::async_trait]
 impl Middleware for CompactionMiddleware {
+    /// Narrow declaration: only the system-prompt hook is implemented (Java
+    /// `CompactionMiddleware.activePoints()`).
+    fn active_points(&self) -> Vec<ExtensionPoint> {
+        vec![ExtensionPoint::OnSystemPrompt]
+    }
+
     async fn on_system_prompt(&self, _ctx: &RuntimeContext, current_prompt: String) -> String {
         if self.config.enabled {
             format!(

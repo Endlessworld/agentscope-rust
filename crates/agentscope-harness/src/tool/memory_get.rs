@@ -42,7 +42,7 @@ impl Tool for MemoryGetTool {
 
     fn description(&self) -> &str {
         "Read specific lines from a memory file. Use after memory_search to pull full \
-         context around matched lines. Path is relative to workspace."
+         context around matched lines. Path is relative to the caller's memory namespace."
     }
 
     fn is_read_only(&self) -> bool {
@@ -69,7 +69,11 @@ impl Tool for MemoryGetTool {
         let start_line = int_arg(&args, "startLine").unwrap_or(0);
         let end_line = int_arg(&args, "endLine").unwrap_or(0);
 
-        // Reject `..` traversal, mirroring Java's `resolved.startsWith(workspace)` guard.
+        // Reject `..` traversal with the workspace manager's own rule: normalize separators and
+        // strip leading whitespace/slashes first, so `  ../x` cannot smuggle the segment past
+        // the check (its leading spaces survive a plain `validate_path`).
+        let path = path.replace('\\', "/");
+        let path = path.trim_start().trim_start_matches('/').to_string();
         if validate_path(&path).is_err() {
             return Ok(ToolResultBlock::text("Error: path traversal not allowed"));
         }

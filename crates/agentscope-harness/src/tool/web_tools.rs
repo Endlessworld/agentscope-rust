@@ -15,7 +15,7 @@ const USER_AGENT: &str = "AgentScope-Harness-WebFetch/1.0";
 const DEEPSEEK_SEARCH_API: &str = "https://api.deepseek.com/v1/tools/search";
 const DEEPSEEK_FETCH_API: &str = "https://api.deepseek.com/v1/tools/fetch";
 
-fn client() -> reqwest::Client {
+fn build_default_client() -> reqwest::Client {
     agentscope_core::tls::ensure_crypto_provider();
     agentscope_core::tls::apply_tls_defaults(reqwest::Client::builder())
         .connect_timeout(Duration::from_secs(20))
@@ -23,6 +23,16 @@ fn client() -> reqwest::Client {
         .user_agent(USER_AGENT)
         .build()
         .unwrap_or_default()
+}
+
+/// Process-wide default client shared by every default-constructed web tool.
+///
+/// Callers that need a custom proxy / TLS / HTTP version inject their own client with
+/// [`WebFetchTool::with_client`] / [`WebSearchTool::with_client`]; such clients stay owned by
+/// the caller and are never shared.
+fn shared_default_client() -> &'static reqwest::Client {
+    static SHARED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    SHARED.get_or_init(build_default_client)
 }
 
 /// Fetches content from an HTTP(S) URL and returns a truncated text preview.
@@ -69,8 +79,10 @@ impl WebFetchTool {
         self
     }
 
-    fn http(&self) -> reqwest::Client {
-        self.client.clone().unwrap_or_else(client)
+    fn http(&self) -> &reqwest::Client {
+        self.client
+            .as_ref()
+            .unwrap_or_else(|| shared_default_client())
     }
 
     pub fn register(toolkit: &agentscope_core::tool::Toolkit) {
@@ -359,8 +371,10 @@ impl WebSearchTool {
         self
     }
 
-    fn http(&self) -> reqwest::Client {
-        self.client.clone().unwrap_or_else(client)
+    fn http(&self) -> &reqwest::Client {
+        self.client
+            .as_ref()
+            .unwrap_or_else(|| shared_default_client())
     }
 
     pub fn register(toolkit: &agentscope_core::tool::Toolkit) {
@@ -478,6 +492,18 @@ pub fn register_web_tools(toolkit: &agentscope_core::tool::Toolkit) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_constructed_web_tools_share_one_client() {
+        let fetch = WebFetchTool::new();
+        let search = WebSearchTool::from_env();
+        assert!(std::ptr::eq(fetch.http(), search.http()));
+        // Repeated default constructions stay on the shared client.
+        assert!(std::ptr::eq(WebFetchTool::new().http(), search.http()));
+        // A caller-supplied client keeps its own lifecycle.
+        let custom = WebFetchTool::new().with_client(reqwest::Client::new());
+        assert!(!std::ptr::eq(custom.http(), search.http()));
+    }
 
     #[test]
     fn html_to_text_drops_scripts_styles_and_tags() {
