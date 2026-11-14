@@ -34,7 +34,15 @@ pub struct HarnessContext {
     pub backend: Arc<dyn SessionBackend>,
     pub executor: Arc<dyn Executor>,
     pub lease: Lease,
+    /// Where the adapter publishes a run's events while it is still going.
+    pub events: Option<EventSink>,
 }
+
+/// A host sink for the events of a run that has not settled yet.
+///
+/// The payload is the event the adapter serialized for its journal; a host that renders a live
+/// stream (ACP, a CLI) decodes it, and one that does not installs no sink at all.
+pub type EventSink = Arc<dyn Fn(&Value) + Send + Sync>;
 
 impl HarnessContext {
     pub fn turn(&self) -> &TurnView {
@@ -47,6 +55,13 @@ impl HarnessContext {
 
     pub fn checkpoint(&self) -> &Value {
         &self.frame.checkpoint
+    }
+
+    /// Hands one event to the host that asked for this tick; a no-op without a host sink.
+    pub fn publish(&self, event: &Value) {
+        if let Some(sink) = &self.events {
+            sink(event);
+        }
     }
 }
 

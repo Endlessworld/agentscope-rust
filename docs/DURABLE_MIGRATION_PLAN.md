@@ -185,6 +185,21 @@ M4-a 原定「先删 `AgentSession`，ACP 改持 `Arc<dyn ThreadJournal>`」。�
 - **仍未覆盖**（M4-c 前需补）：`wakeup`（空输入 turn）、`respond` 与 pending interaction 记录、`TurnReceipt`→ACP `Task` 投影、事件流实时推送（现只有 `events(cursor)` 读）、`history()` 仍返回空页、`execution_error` 投影；`suspend` 之后 native invocation 的续跑仍受 core「无 acting 阶段续跑」限制。
 - 测试：新增 `agentscope-durable/tests/session_test.rs`（9 条）与 `execution_host_test.rs::a_delivered_signal_is_folded_once_and_marked_consumed`；durable 13+6+9、适配器 4+6+4+4+5 全绿。
 
+### 2.8 M4-c（一）：门面补齐完成，ACP 换驱动受阻于两个新前置（2026-11-15，未提交）
+
+**已落地（只在 durable 侧，均有测试）**：`DurableSession::{wakeup, respond, waiting, task, history, set_event_sink}` + `HarnessContext::publish`，`settle` 增 `error` 参数。语义：wakeup = `input` 为 `null` 的 admission（同 request id 幂等）；respond 以 **wait key 就是 interaction id** 为前提，先校验 `TurnView.waiting` 再把答案落成 `Signal`（不是新记录，所以重复答复幂等、终态回答 `CONFLICT`）；`task()` 投影出 `TurnTask{status, settled, run_id, error, output}`（`error` 同时覆盖 `record_failure` 与 settle 携带的错误，即 `execution_error` 的归宿）；`history()` 从空页改为「每个 turn 的 committed output 按队列序」；事件推送是 `HarnessAdapter` 在 `execute` 里 `ctx.publish(value)` → runtime 的 sink。
+测试：`session_test.rs` 9→15（`a_wakeup_is_an_admission_without_input_and_it_is_idempotent`、`a_waiting_turn_is_answered_by_its_interaction_key`、`the_task_projection_reads_the_status_the_run_and_the_ending`、`history_projects_the_committed_outputs_in_queue_order`、`a_run_publishes_through_the_session_event_sink`、`a_run_without_a_host_sink_still_advances`）。durable 17+6+15、适配器 4+6+4+4+5 全绿。
+
+**ACP 未换驱动（也未删任何东西）：§2.6.4 的六项补齐后仍有两个硬前置**
+1. **没有可执行的 `HarnessAdapter`**：`advance` 只按 `definition.harness()` 查适配器，未注册就 `record_failure`；仓库里 `HarnessAdapter` 只有测试桩的实现。把 `HarnessAgent` 跑成一次 turn（inputs → `stream_events_with_extensions`、checkpoint/工具事实、`settle`）的适配器必须新写。
+2. **租约不可转交**：`InvocationRecorder::open_with(..., run_id, ...)` 用 `run_id` 当 owner 调 `journal.acquire` → `backend.claim(thread, run_id, ttl)`；tick 已以 runtime owner 持租且未过期，`claim` 直接返回 `None`，recorder 建不起来（`No turn is ready to execute`）。方案 A（推荐）：`BackendThreadJournal` 增「借用 tick 租约」模式（`acquire` 返回既有 lease、`release` 不真释放），runtime 仍是唯一 owner，不 bump epoch、不碰 durable 不变量；方案 B：core recorder 接受外部 `Writer`（改 core）。
+
+**6 处 `abandon_turn` 的分流结论（第 2 步落地时按此写注释）**：`3110` 客户端 cancel / 会话已关闭 → `cancel`（用户要停）；`3137` admission 看门狗（turn 从未被取走或状态读不出，没有位置可续）→ `cancel`；`3149` 内部循环未拿到 receipt（可能已有副作用，位置值得留）→ `suspend`；`3222` 自动续跑失败（durable 下失败多为 `CONFLICT`，说明已在别处落终态）→ 只记日志，不再 abandon；`3245` 反复被打断（环境问题）→ `suspend`；`3265` 其它非终态（含 external tool 未回）→ `suspend`。判据一句话：**用户要停或没有可续位置 → `cancel`；跑过东西但没有结论 → `suspend`**。选 `suspend` 的几处要求 ACP 在下一个 prompt 前先把非终态 turn 处理掉（`AgentSession::prepare_open_turn_before_submit` 的职责，需搬进 ACP）。
+
+**删除清单（第 3 步，未执行）**：`AgentSession`、`SessionAnswer`、`HarnessAgent::session()`、`session::{answer, session}` 导出、`harness_session_test.rs`（15 处 `AgentSession::open`）。`core::journal::{inbox, execution, turns}` 保留：删掉 `AgentSession` 后它们的生产消费者归零，但 `TurnViews` 仍在 `JournalProjection`/`recovery` 里，`inbox`/`execution` 仍被 core 自己的 `session_*` 集成测试与 `harness_session_test.rs` 使用（应随这些测试一起删）。
+
+**剩余项**：可执行适配器 + 租约借用 → ACP `runtime` 字段换 `DurableSession`、turn 循环（`session.rs:2780-3300`）重写、`respond`/`run_wakeup` 接新路径 → 最后才是删除。`history()` 仍无消息转录（归 adapter）。
+
 ## 3. 禁止事项（沿用 Java `agentscope-durable/AGENTS.md`）
 
 - 不做兼容层：不留别名、不保留 deprecated 转发、不写旧格式读取器、不做版本协商/降级回退。
@@ -246,3 +261,4 @@ M4-a 原定「先删 `AgentSession`，ACP 改持 `Arc<dyn ThreadJournal>`」。�
 | 2026-11-15 | **M3-b 执行宿主** | ✅ core 主循环接 `AgentExecutionHost`（位置/边界/resume/finish）+ adapter `AgentScopeExecutionHost`/`pin()`；5 条集成测试全绿；core lib 533 passed |
 | 2026-11-15 | **M3-e 三进程验收** | ✅ `three_process_test.rs`：run=2 / `tool/result`=1 / 副作用=1；真实子进程验证状态外置；⚠️ 模型调用=2（D7 要求 1，缺 acting 续跑分支，见 §2.5） |
 | 2026-11-15 | **M4-a 语义映射** | ⚠️ 已产出 §2.6 映射表，**未删代码**：`AgentSession` 是唯一会话驱动器、ACP 是其唯一消费者，而 ACP 与 durable 零依赖、durable 无会话门面（11 项能力只覆盖 5 项）。删 `AgentSession` 与「ACP 改 `DurableRuntime`」必须同批完成（M4-b 六项前置见 §2.6.4）；「关掉 durable → ACP 失败」在当前结构下不成立（§2.6.5） |
+| 2026-11-15 | **M4-c（一）门面补齐** | ⚠️ `DurableSession::{wakeup,respond,waiting,task,history,set_event_sink}` + `HarnessContext::publish` 落地（session_test 9→15），**ACP 与 `AgentSession` 未改**：换驱动多了两个硬前置（无可执行 `HarnessAdapter`、租约不可转交），见 §2.8 |

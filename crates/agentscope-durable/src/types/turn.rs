@@ -149,6 +149,25 @@ pub struct TurnView {
     pub parent: Option<DelegationParent>,
 }
 
+/// Queue-facing projection of one turn.
+///
+/// Every field is read from committed facts: the status and the ending come from the turn itself,
+/// the run id from the invocation that last worked on it. A host renders this as its task list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnTask {
+    pub thread: ThreadKey,
+    pub turn_id: String,
+    pub status: TurnStatus,
+    pub settled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub output: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnPage {

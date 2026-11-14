@@ -435,7 +435,12 @@ async fn settling_applies_the_effects_and_is_idempotent() {
         .expect("result");
 
     session
-        .settle(&lease, TurnStatus::Succeeded, json!({ "reply": "done" }))
+        .settle(
+            &lease,
+            TurnStatus::Succeeded,
+            json!({ "reply": "done" }),
+            None,
+        )
         .await
         .expect("settle");
     let settled = session.turn(&receipt.turn_id).await.expect("turn");
@@ -452,11 +457,16 @@ async fn settling_applies_the_effects_and_is_idempotent() {
 
     // The same ending again is a no-op; a different one would rewrite a terminal status.
     session
-        .settle(&lease, TurnStatus::Succeeded, json!({ "reply": "done" }))
+        .settle(
+            &lease,
+            TurnStatus::Succeeded,
+            json!({ "reply": "done" }),
+            None,
+        )
         .await
         .expect("idempotent settle");
     let rejected = session
-        .settle(&lease, TurnStatus::Failed, json!({ "reply": "no" }))
+        .settle(&lease, TurnStatus::Failed, json!({ "reply": "no" }), None)
         .await;
     assert_eq!(rejected.expect_err("terminal").code(), ErrorCode::Conflict);
 }
@@ -487,4 +497,250 @@ async fn the_facade_exposes_the_views_a_host_drives() {
         .events
         .iter()
         .any(|event| event.event_type == "turn.started"));
+}
+
+// ---------------------------------------------------------------------------
+// E: what a session host needs beyond submit and tick
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_wakeup_is_an_admission_without_input_and_it_is_idempotent() {
+    let (_backend, session, _thread) = fixture(idle()).await;
+    let receipt = session.wakeup("req-wake").await.expect("wakeup");
+    assert_eq!(receipt.request_id, "req-wake");
+    assert_eq!(
+        session.admission("req-wake").await.expect("admission"),
+        Some(receipt.clone())
+    );
+    // A retried wakeup reaches the same turn instead of queueing a second one.
+    let again = session.wakeup("req-wake").await.expect("retried wakeup");
+    assert_eq!(again.turn_id, receipt.turn_id);
+    assert_eq!(session.turns(None, 10).await.expect("turns").items.len(), 1);
+}
+
+#[tokio::test]
+async fn a_waiting_turn_is_answered_by_its_interaction_key() {
+    let (backend, session, thread) = fixture(idle()).await;
+    let receipt = session
+        .submit("req-1", json!({ "text": "go" }))
+        .await
+        .expect("submit");
+    let lease = backend
+        .claim(&thread, "writer-a", TTL)
+        .await
+        .expect("claim")
+        .expect("a claimable turn");
+    let frame_turn = backend.turn(&thread, &receipt.turn_id).await.expect("turn");
+    let mut blocked = Commit::new("wait", frame_turn.revision, TurnStatus::Waiting);
+    blocked.waiting = Some(WaitCondition::new("permission:call-1", 0).expect("wait"));
+    backend.commit(&lease, blocked).await.expect("wait");
+
+    let waiting = session.waiting().await.expect("waiting");
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].turn_id, receipt.turn_id.clone());
+
+    // Only the interaction the turn actually waits on can be answered.
+    let wrong = session
+        .respond(
+            &receipt.turn_id,
+            "permission:call-2",
+            "req-answer-2",
+            json!({ "ok": true }),
+        )
+        .await;
+    assert_eq!(wrong.expect_err("wrong key").code(), ErrorCode::Conflict);
+
+    session
+        .respond(
+            &receipt.turn_id,
+            "permission:call-1",
+            "req-answer",
+            json!({ "ok": true }),
+        )
+        .await
+        .expect("respond");
+    // The answer is one signal record, so retrying it adds nothing.
+    session
+        .respond(
+            &receipt.turn_id,
+            "permission:call-1",
+            "req-answer",
+            json!({ "ok": true }),
+        )
+        .await
+        .expect("retried answer");
+    // The answer is what makes the turn claimable again...
+    let selector = HarnessSelector::all(HARNESS).expect("selector");
+    assert_eq!(
+        backend.ready(&[selector], 10).await.expect("ready").len(),
+        1
+    );
+
+    // ...and the next writer sees it as one delivered fact.
+    let next = backend
+        .claim(&thread, "writer-b", TTL)
+        .await
+        .expect("claim")
+        .expect("the answered turn");
+    let frame = backend.frame(&next).await.expect("frame");
+    assert_eq!(frame.signals.len(), 1);
+    assert_eq!(frame.signals[0].key, "permission:call-1");
+    assert_eq!(frame.signals[0].value, json!({ "ok": true }));
+
+    // A settled turn can no longer be answered.
+    session
+        .settle(&next, TurnStatus::Cancelled, json!({}), None)
+        .await
+        .expect("settle");
+    let late = session
+        .respond(
+            &receipt.turn_id,
+            "permission:call-1",
+            "req-answer-late",
+            json!({ "ok": false }),
+        )
+        .await;
+    assert_eq!(late.expect_err("terminal").code(), ErrorCode::Conflict);
+}
+
+#[tokio::test]
+async fn the_task_projection_reads_the_status_the_run_and_the_ending() {
+    let (backend, session, thread) = fixture(idle()).await;
+    let receipt = session
+        .submit("req-1", json!({ "text": "go" }))
+        .await
+        .expect("submit");
+
+    // Queued: nothing has worked on it yet, so there is no run to name.
+    let queued = session.task(&receipt.turn_id).await.expect("task");
+    assert_eq!(queued.status, TurnStatus::Queued);
+    assert!(!queued.settled);
+    assert_eq!(queued.run_id, None);
+
+    let lease = backend
+        .claim(&thread, "writer-a", TTL)
+        .await
+        .expect("claim")
+        .expect("a claimable turn");
+    let run = backend
+        .prepare_run(&lease, "invoke-r1")
+        .await
+        .expect("run record");
+    let running = session.task(&receipt.turn_id).await.expect("task");
+    assert_eq!(running.status, TurnStatus::Running);
+    assert_eq!(running.run_id.as_deref(), Some(run.run_id.as_str()));
+
+    session
+        .settle(
+            &lease,
+            TurnStatus::Failed,
+            json!({}),
+            Some("provider timed out".to_string()),
+        )
+        .await
+        .expect("settle");
+    let failed = session.task(&receipt.turn_id).await.expect("task");
+    assert_eq!(failed.status, TurnStatus::Failed);
+    assert!(failed.settled);
+    assert_eq!(failed.error.as_deref(), Some("provider timed out"));
+}
+
+#[tokio::test]
+async fn history_projects_the_committed_outputs_in_queue_order() {
+    let (backend, session, thread) = fixture(idle()).await;
+    let first = session
+        .submit("req-1", json!({ "text": "one" }))
+        .await
+        .expect("submit");
+    let lease = backend
+        .claim(&thread, "writer-a", TTL)
+        .await
+        .expect("claim")
+        .expect("a claimable turn");
+    session
+        .settle(
+            &lease,
+            TurnStatus::Succeeded,
+            json!({ "reply": "one" }),
+            None,
+        )
+        .await
+        .expect("settle");
+    assert!(session.waiting().await.expect("waiting").is_empty());
+
+    let second = session
+        .submit("req-2", json!({ "text": "two" }))
+        .await
+        .expect("submit");
+    let lease = backend
+        .claim(&thread, "writer-a", TTL)
+        .await
+        .expect("claim")
+        .expect("a claimable turn");
+    session
+        .settle(
+            &lease,
+            TurnStatus::Succeeded,
+            json!({ "reply": "two" }),
+            None,
+        )
+        .await
+        .expect("settle");
+
+    let history = session.history(None, 10).await.expect("history");
+    let ids: Vec<&str> = history
+        .items
+        .iter()
+        .filter_map(|item| item["turnId"].as_str())
+        .collect();
+    assert_eq!(ids, vec![first.turn_id.as_str(), second.turn_id.as_str()]);
+    assert_eq!(history.items[0]["output"], json!({ "reply": "one" }));
+}
+
+/// Publishes one event while it runs, as a run adapter that renders a live stream does.
+struct Streaming;
+
+#[async_trait]
+impl HarnessAdapter for Streaming {
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            event_delivery: true,
+            ..capabilities()
+        }
+    }
+
+    async fn execute(&self, ctx: &HarnessContext) -> agentscope_durable::Result<()> {
+        ctx.publish(&json!({ "type": "text.delta", "text": "hi" }));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_run_publishes_through_the_session_event_sink() {
+    let (_backend, session, _thread) = fixture(Arc::new(Streaming)).await;
+    session
+        .submit("req-1", json!({ "text": "go" }))
+        .await
+        .expect("submit");
+
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    session.set_event_sink(Arc::new(move |event: &Value| {
+        sink.lock().expect("seen").push(event.clone());
+    }));
+    session.tick().await.expect("tick");
+
+    let seen = seen.lock().expect("seen");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["text"], json!("hi"));
+}
+
+#[tokio::test]
+async fn a_run_without_a_host_sink_still_advances() {
+    let (_backend, session, _thread) = fixture(Arc::new(Streaming)).await;
+    session
+        .submit("req-1", json!({ "text": "go" }))
+        .await
+        .expect("submit");
+    assert_eq!(session.tick().await.expect("tick"), TickOutcome::Settled);
 }

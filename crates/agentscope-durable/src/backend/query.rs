@@ -109,17 +109,44 @@ pub(super) fn turns(
 }
 
 /// The message projection is produced by the adapter; the backend only exposes what it stored.
+///
+/// Until an adapter publishes a transcript, the one projection the store already holds is each
+/// turn's committed output, in queue order; a turn that produced none is skipped.
 pub(super) fn history(
     store: &dyn RecordStore,
     thread: &ThreadKey,
-    _cursor: Option<&str>,
+    cursor: Option<&str>,
     limit: usize,
 ) -> Result<HistoryPage> {
-    clamp_limit(limit)?;
+    let limit = clamp_limit(limit)?;
     with_session(store, &thread.session, |txn| {
         require_thread(txn, thread)?;
+        let ids = queue_ids(txn, &thread.thread_id)?;
+        let start = match cursor {
+            Some(cursor) => {
+                let index: usize = cursor
+                    .parse()
+                    .map_err(|_| DurableError::invalid("Invalid pagination cursor"))?;
+                index + 1
+            }
+            None => 0,
+        };
+        let mut items = Vec::new();
+        for (index, id) in ids.iter().enumerate().skip(start) {
+            if items.len() == limit {
+                return Ok(HistoryPage {
+                    items,
+                    cursor: Some((index - 1).to_string()),
+                });
+            }
+            let turn = require_turn(txn, id)?;
+            if turn.output.is_null() {
+                continue;
+            }
+            items.push(json!({ "turnId": turn.turn_id, "output": turn.output }));
+        }
         Ok(HistoryPage {
-            items: Vec::new(),
+            items,
             cursor: None,
         })
     })

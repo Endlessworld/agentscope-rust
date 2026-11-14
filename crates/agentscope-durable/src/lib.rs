@@ -20,7 +20,7 @@ pub mod store;
 pub mod types;
 
 pub use error::{DurableError, ErrorCode, Result};
-pub use harness_adapter::{AdapterCapabilities, HarnessAdapter, HarnessContext};
+pub use harness_adapter::{AdapterCapabilities, EventSink, HarnessAdapter, HarnessContext};
 pub use runtime::{DurableRuntime, TickOutcome};
 pub use session::DurableSession;
 pub use session_backend::{BackendCapabilities, SessionBackend};

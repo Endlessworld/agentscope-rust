@@ -9,26 +9,26 @@
 //!
 //! Deliberately **not** provided, because there is no honest implementation yet:
 //!
-//! * `wakeup` — a turn without input. Durable admission freezes the input for a request id, so a
-//!   host submits an explicit empty input instead of getting a second concept.
-//! * `respond` / pending interactions — the durable record has signals, not interaction records;
-//!   a host answers a wait by accepting a signal with the waiting key.
-//! * an ACP-shaped `Task` — `TurnView` (status/output/error) plus the receipt is the source, and
-//!   projecting it is the caller's business.
-//! * live event push — `events(cursor)` is a committed read, not a stream.
+//! * a run — `tick` needs an adapter that knows how to execute the harness; the binding lives in
+//!   `agentscope-durable-adapter-agentscope`, and publishing events is the adapter's call.
 
 use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::error::Result;
-use crate::harness_adapter::settle_turn;
+use crate::error::{DurableError, Result};
+use crate::harness_adapter::{settle_turn, EventSink};
 use crate::runtime::{DurableRuntime, TickOutcome};
 use crate::session_backend::SessionBackend;
 use crate::types::{
-    CommandReceipt, EventPage, Lease, Signal, ThreadKey, ThreadStateView, TurnPage, TurnReceipt,
-    TurnStatus, TurnView,
+    CommandReceipt, EventPage, HistoryPage, Lease, Signal, ThreadKey, ThreadStateView, TurnPage,
+    TurnReceipt, TurnStatus, TurnTask, TurnView,
 };
+
+/// How many turns one page of [`DurableSession::waiting`] asks for.
+const WAIT_PAGE: usize = 100;
+/// How many invocations one page of [`DurableSession::task`] reads; a turn has one per process.
+const RUN_PAGE: usize = 100;
 
 /// The session surface a host drives: admission, one tick, control, ending and views.
 pub struct DurableSession {
@@ -64,11 +64,29 @@ impl DurableSession {
             .await
     }
 
+    /// Admits a turn that carries no input: a wakeup.
+    ///
+    /// The durable record has no separate concept, so a wakeup is an admission whose input is
+    /// `null`. What a turn does without a prompt (injected context, due reminders) is the
+    /// adapter's business.
+    pub async fn wakeup(&self, request_id: &str) -> Result<TurnReceipt> {
+        self.submit(request_id, Value::Null).await
+    }
+
     // ---- drive ----
 
     /// One unit of progress; the caller decides when to call again.
     pub async fn tick(&self) -> Result<TickOutcome> {
         self.runtime.tick(&self.thread).await
+    }
+
+    /// Installs the sink a run's events are published to while the run is still going.
+    ///
+    /// This is the live stream a host renders; the committed `events(cursor)` page is what a
+    /// reader catching up after a restart replays. A host that replaces the sink per prompt does
+    /// so through this call.
+    pub fn set_event_sink(&self, sink: EventSink) {
+        self.runtime.set_event_sink(sink);
     }
 
     // ---- control ----
@@ -119,12 +137,65 @@ impl DurableSession {
         self.runtime.signal(&self.thread, turn_id, signal).await
     }
 
+    /// Answers the interaction a waiting turn is blocked on.
+    ///
+    /// The wait key *is* the interaction id, so an answer needs no second record: it is the
+    /// signal the turn folds in at its next boundary. Answering a turn that waits on something
+    /// else, or on nothing, is a `CONFLICT` — that is the validation an answer needs.
+    pub async fn respond(
+        &self,
+        turn_id: &str,
+        interaction_id: &str,
+        request_id: &str,
+        answer: Value,
+    ) -> Result<()> {
+        match self.turn(turn_id).await?.waiting {
+            Some(waiting) if waiting.key == interaction_id => {}
+            Some(waiting) => {
+                return Err(DurableError::conflict(format!(
+                    "Turn waits on `{}`, not on `{interaction_id}`",
+                    waiting.key
+                )))
+            }
+            None => return Err(DurableError::conflict("Turn is not waiting for an answer")),
+        }
+        self.signal(turn_id, Signal::new(request_id, interaction_id, answer)?)
+            .await
+    }
+
+    /// The turns of this thread that are blocked on an interaction, in queue order.
+    pub async fn waiting(&self) -> Result<Vec<TurnView>> {
+        let mut waiting = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self.turns(cursor.as_deref(), WAIT_PAGE).await?;
+            waiting.extend(page.items.into_iter().filter(|turn| turn.waiting.is_some()));
+            match page.cursor {
+                Some(next) => cursor = Some(next),
+                None => return Ok(waiting),
+            }
+        }
+    }
+
     // ---- ending ----
 
     /// Writes the ending the lease holder observed; the lease is the caller's, not the façade's,
     /// because a tick never leaves one behind.
-    pub async fn settle(&self, lease: &Lease, status: TurnStatus, output: Value) -> Result<()> {
-        settle_turn(self.runtime.backend().as_ref(), lease, status, output, None).await
+    pub async fn settle(
+        &self,
+        lease: &Lease,
+        status: TurnStatus,
+        output: Value,
+        error: Option<String>,
+    ) -> Result<()> {
+        settle_turn(
+            self.runtime.backend().as_ref(),
+            lease,
+            status,
+            output,
+            error,
+        )
+        .await
     }
 
     // ---- views ----
@@ -135,6 +206,30 @@ impl DurableSession {
 
     pub async fn turns(&self, cursor: Option<&str>, limit: usize) -> Result<TurnPage> {
         self.runtime.turns(&self.thread, cursor, limit).await
+    }
+
+    /// The committed history of this thread: today the output each turn produced, in queue order.
+    pub async fn history(&self, cursor: Option<&str>, limit: usize) -> Result<HistoryPage> {
+        self.runtime.history(&self.thread, cursor, limit).await
+    }
+
+    /// The queue-facing projection of one turn: status, ending, the run that last worked on it.
+    pub async fn task(&self, turn_id: &str) -> Result<TurnTask> {
+        let turn = self.turn(turn_id).await?;
+        let runs = self
+            .runtime
+            .backend()
+            .runs(&self.thread, turn_id, None, RUN_PAGE)
+            .await?;
+        Ok(TurnTask {
+            thread: turn.thread.clone(),
+            turn_id: turn.turn_id.clone(),
+            status: turn.status,
+            settled: turn.status.terminal(),
+            run_id: runs.items.last().map(|run| run.run_id.clone()),
+            error: turn.error.clone(),
+            output: turn.output.clone(),
+        })
     }
 
     /// The turn a writer would work on, if any: the first non-terminal turn of the thread.

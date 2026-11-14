@@ -7,7 +7,7 @@
 //! long-running local host and an edge host that may sleep share one implementation.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 
 use crate::error::{DurableError, ErrorCode, Result};
 use crate::executor::Executor;
-use crate::harness_adapter::{HarnessAdapter, HarnessContext};
+use crate::harness_adapter::{EventSink, HarnessAdapter, HarnessContext};
 use crate::now_millis;
 use crate::session_backend::SessionBackend;
 use crate::types::*;
@@ -90,6 +90,7 @@ pub struct DurableRuntime {
     lease_ttl: Duration,
     executor: Arc<dyn Executor>,
     adapters: HashMap<String, Arc<dyn HarnessAdapter>>,
+    events: Mutex<Option<EventSink>>,
 }
 
 impl DurableRuntime {
@@ -100,6 +101,7 @@ impl DurableRuntime {
             lease_ttl: DEFAULT_LEASE_TTL,
             executor: Arc::new(UnconfiguredExecutor),
             adapters: HashMap::new(),
+            events: Mutex::new(None),
         }
     }
 
@@ -127,6 +129,20 @@ impl DurableRuntime {
 
     fn adapter(&self, harness: &str) -> Option<Arc<dyn HarnessAdapter>> {
         self.adapters.get(harness).cloned()
+    }
+
+    /// Installs the sink a run's events are published to while it is still going.
+    ///
+    /// The sink belongs to the host, not to a turn: a host that renders a live stream replaces
+    /// it per prompt, and a host that polls `events(cursor)` never sets one.
+    pub fn set_event_sink(&self, sink: EventSink) {
+        if let Ok(mut slot) = self.events.lock() {
+            *slot = Some(sink);
+        }
+    }
+
+    fn event_sink(&self) -> Option<EventSink> {
+        self.events.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// The backend the runtime drives, for a façade that reads views the runtime does not expose.
@@ -257,6 +273,7 @@ impl DurableRuntime {
             backend: Arc::clone(&self.backend),
             executor: Arc::clone(&self.executor),
             lease: lease.clone(),
+            events: self.event_sink(),
         };
         adapter.execute(&context).await?;
         let turn = self.backend.turn(&lease.thread, &lease.turn_id).await?;
