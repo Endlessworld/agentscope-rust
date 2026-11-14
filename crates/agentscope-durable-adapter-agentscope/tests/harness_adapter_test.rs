@@ -16,6 +16,7 @@ use agentscope_core::message::{ContentBlock, Msg, TextBlock, ToolResultBlock, To
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::tool::{FunctionTool, Tool, ToolExecutionContext, Toolkit};
 use agentscope_durable::backend::TxnBackend;
+use agentscope_durable::harness_adapter::settle_turn;
 use agentscope_durable::types::*;
 use agentscope_durable::{DurableRuntime, Result as DurableResult, SessionBackend, TickOutcome};
 use agentscope_durable_adapter_agentscope::{
@@ -41,6 +42,10 @@ struct ScriptedModel {
     seen: Mutex<Vec<Vec<String>>>,
     /// The tool-call ids to ask for, in order, before answering in text.
     script: Vec<&'static str>,
+    /// The first call never answers, so the invocation stays in flight until control arrives.
+    hold_first: bool,
+    /// How many streams it opened.
+    entered: AtomicUsize,
 }
 
 impl ScriptedModel {
@@ -49,11 +54,35 @@ impl ScriptedModel {
             calls: AtomicUsize::new(0),
             seen: Mutex::new(Vec::new()),
             script: script.to_vec(),
+            hold_first: false,
+            entered: AtomicUsize::new(0),
+        })
+    }
+
+    /// A model whose first call hangs: only a control request can end that invocation.
+    fn held() -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
+            script: Vec::new(),
+            hold_first: true,
+            entered: AtomicUsize::new(0),
         })
     }
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Waits until a model call is in flight, so a control request really lands mid-invocation.
+    async fn await_in_flight(&self) {
+        for _ in 0..500 {
+            if self.entered.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the model call never started");
     }
 
     /// Whether any request carried `text`.
@@ -74,7 +103,13 @@ impl Model for ScriptedModel {
         _tools: Vec<ToolSchema>,
         _options: GenerateOptions,
     ) -> BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        if self.hold_first && call == 0 {
+            // An in-flight provider call that never yields: only the control the tick observes can
+            // end the invocation, which is what a cancel and a pause have to interrupt.
+            return Box::pin(futures::stream::pending());
+        }
         self.seen
             .lock()
             .expect("seen")
@@ -130,7 +165,7 @@ fn scratch_dir(name: &str) -> PathBuf {
 
 /// The factory the adapter calls once per tick.
 fn factory(
-    model: Arc<ScriptedModel>,
+    model: Arc<dyn Model>,
     root: PathBuf,
     max_iters: i32,
 ) -> impl Fn() -> Arc<HarnessAgent> + Send + Sync + 'static {
@@ -140,7 +175,7 @@ fn factory(
         Arc::new(
             HarnessAgent::builder()
                 .name(HARNESS)
-                .model(Arc::clone(&model) as Arc<dyn Model>)
+                .model(Arc::clone(&model))
                 .session_id(SESSION)
                 .user_id("alice")
                 .max_iters(max_iters)
@@ -162,7 +197,7 @@ fn factory(
 }
 
 struct Fixture {
-    runtime: DurableRuntime,
+    runtime: Arc<DurableRuntime>,
     backend: Arc<TxnBackend>,
     thread: ThreadKey,
     turn_id: String,
@@ -174,18 +209,28 @@ async fn fixture(script: &[&'static str]) -> Fixture {
 }
 
 async fn fixture_with(script: &[&'static str], max_iters: i32) -> Fixture {
+    fixture_of(ScriptedModel::new(script), max_iters).await
+}
+
+/// A fixture whose first model call never answers: the tick stays in flight until control.
+async fn held_fixture() -> Fixture {
+    fixture_of(ScriptedModel::held(), 6).await
+}
+
+async fn fixture_of(model: Arc<ScriptedModel>, max_iters: i32) -> Fixture {
     let backend = Arc::new(TxnBackend::in_memory());
-    let model = ScriptedModel::new(script);
-    let runtime = DurableRuntime::new(Arc::clone(&backend) as Arc<dyn SessionBackend>, "runtime")
-        .with_adapter(
-            HARNESS,
-            Arc::new(AgentScopeHarnessAdapter::new(factory(
-                Arc::clone(&model),
-                scratch_dir("agent"),
-                max_iters,
-            ))),
-        )
-        .with_lease_ttl(LEASE);
+    let runtime = Arc::new(
+        DurableRuntime::new(Arc::clone(&backend) as Arc<dyn SessionBackend>, "runtime")
+            .with_adapter(
+                HARNESS,
+                Arc::new(AgentScopeHarnessAdapter::new(factory(
+                    Arc::clone(&model) as Arc<dyn Model>,
+                    scratch_dir("agent"),
+                    max_iters,
+                ))),
+            )
+            .with_lease_ttl(LEASE),
+    );
     let key = SessionKey::new("ns", SESSION).expect("session key");
     runtime
         .ensure_session(SessionSpec {
@@ -508,7 +553,8 @@ async fn the_iteration_budget_carries_across_ticks() {
     assert_eq!(fixture.turn().await.status, TurnStatus::Succeeded);
 }
 
-/// The adapter is registered by harness name, which is what `advance` looks up.#[tokio::test]
+/// The adapter is registered by harness name, which is what `advance` looks up.
+#[tokio::test]
 async fn a_thread_without_an_adapter_is_a_non_retryable_failure() -> DurableResult<()> {
     let backend = Arc::new(TxnBackend::in_memory());
     let runtime = DurableRuntime::new(Arc::clone(&backend) as Arc<dyn SessionBackend>, "runtime");
@@ -529,4 +575,227 @@ async fn a_thread_without_an_adapter_is_a_non_retryable_failure() -> DurableResu
         TickOutcome::Failed { retryable: false }
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Control: cancel and pause are different endings
+// ---------------------------------------------------------------------------
+
+/// Runs one tick on its own task, so a control request can land while it is in flight.
+fn spawn_tick(fixture: &Fixture) -> tokio::task::JoinHandle<DurableResult<TickOutcome>> {
+    let runtime = Arc::clone(&fixture.runtime);
+    let thread = fixture.thread.clone();
+    tokio::spawn(async move { runtime.tick(&thread).await })
+}
+
+/// The status a `run/end` fact carries, as a host reads it.
+fn run_status(event: &JournalEvent) -> Option<String> {
+    event
+        .data()
+        .ok()?
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The status of the last run that ended in this journal.
+fn last_run_status(events: &[JournalEvent]) -> Option<String> {
+    events
+        .iter()
+        .filter(|event| event.event_type == "run/end")
+        .filter_map(run_status)
+        .last()
+}
+
+/// A second runtime, as a host that asks another process's tick to stop: it never shares the
+/// writer's owner, so its `cancel` observes the turn instead of re-entering the lease.
+fn controller(fixture: &Fixture) -> DurableRuntime {
+    DurableRuntime::new(
+        Arc::clone(&fixture.backend) as Arc<dyn SessionBackend>,
+        "control",
+    )
+}
+
+#[tokio::test]
+async fn a_cancel_before_the_invocation_runs_costs_no_model_call() {
+    let fixture = fixture(&["m1"]).await;
+    fixture
+        .runtime
+        .cancel(&fixture.thread, &fixture.turn_id, "cancel-1")
+        .await
+        .expect("cancel");
+
+    let outcome = fixture.runtime.tick(&fixture.thread).await.expect("tick");
+
+    assert_eq!(outcome, TickOutcome::Idle, "a cancelled turn is not run");
+    assert_eq!(fixture.model.calls(), 0, "cancelling spends no model call");
+    let turn = fixture.turn().await;
+    assert_eq!(turn.status, TurnStatus::Cancelled);
+    assert!(
+        turn.error.is_none(),
+        "a cancellation is an ending, not a failure: {turn:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_inside_the_invocation_ends_the_tick_as_cancelled() {
+    // The model never answers: only the cancel the tick observes can end the invocation.
+    let fixture = held_fixture().await;
+    let tick = spawn_tick(&fixture);
+    fixture.model.await_in_flight().await;
+
+    controller(&fixture)
+        .cancel(&fixture.thread, &fixture.turn_id, "cancel-1")
+        .await
+        .expect("cancel");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), tick)
+        .await
+        .expect("a cancel must end the tick, not leave the caller waiting")
+        .expect("tick task")
+        .expect("tick");
+
+    assert_eq!(
+        outcome,
+        TickOutcome::Cancelled,
+        "the cancellation must reach the agent, not surface as a refusal or a failure"
+    );
+    assert_ne!(outcome, TickOutcome::Paused, "a cancel is not a pause");
+    assert_eq!(
+        fixture.model.calls(),
+        1,
+        "the in-flight call was not repeated"
+    );
+    let turn = fixture.turn().await;
+    assert_eq!(turn.status, TurnStatus::Cancelled);
+    assert!(
+        turn.error.is_none(),
+        "a cancellation is an ending, not a failure: {turn:?}"
+    );
+    // The native journal is what a host renders: a run it never sees ending looks like a hang,
+    // and one that ends `failed` is read as a refusal.
+    let events = fixture.journal().await;
+    assert_eq!(
+        last_run_status(&events).as_deref(),
+        Some("cancelled"),
+        "the native run must end as cancelled: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| event.event_type == "turn/failed"),
+        "a cancellation is not a failed turn: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pause_inside_the_invocation_is_paused_and_resumable() {
+    let fixture = held_fixture().await;
+    let tick = spawn_tick(&fixture);
+    fixture.model.await_in_flight().await;
+
+    let requested = controller(&fixture)
+        .pause(&fixture.thread, &fixture.turn_id, "pause-1")
+        .await
+        .expect("pause");
+    assert_eq!(
+        requested.status,
+        TurnStatus::Pausing,
+        "a live writer only sees the request"
+    );
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), tick)
+        .await
+        .expect("a pause must end the tick, not leave the caller waiting")
+        .expect("tick task")
+        .expect("tick");
+
+    assert_eq!(
+        outcome,
+        TickOutcome::Paused,
+        "a pause is a yield the host resumes, not a cancellation"
+    );
+    assert_ne!(
+        outcome,
+        TickOutcome::Cancelled,
+        "a pause must never be reported as a cancellation"
+    );
+    let paused = fixture.turn().await;
+    assert_eq!(paused.status, TurnStatus::Paused);
+    assert!(
+        !paused.status.terminal() && paused.error.is_none(),
+        "a paused turn is resumable and records no error: {paused:?}"
+    );
+    let events = fixture.journal().await;
+    assert!(
+        events.iter().any(|event| event.event_type == "run/end"
+            && run_status(event).as_deref() == Some("suspended")),
+        "the paused run ends as suspended, not cancelled: {events:?}"
+    );
+
+    // The turn continues where it stopped: the next tick spends a fresh model call and settles.
+    let resumed = fixture
+        .runtime
+        .resume(&fixture.thread, &fixture.turn_id, "resume-1")
+        .await
+        .expect("resume");
+    assert_eq!(resumed.status, TurnStatus::Running);
+    let again = tokio::time::timeout(
+        Duration::from_secs(10),
+        fixture.runtime.tick(&fixture.thread),
+    )
+    .await
+    .expect("the resumed tick must not hang")
+    .expect("tick");
+    assert_eq!(again, TickOutcome::Settled);
+    let settled = fixture.turn().await;
+    assert_eq!(settled.status, TurnStatus::Succeeded, "{settled:?}");
+    assert_eq!(reply_text(&settled.output).as_deref(), Some("done"));
+    assert_eq!(fixture.model.calls(), 2, "the pause was not a replay");
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_is_terminal_and_repeating_the_settle_is_a_no_op() {
+    let fixture = fixture(&[]).await;
+    // A writer holds the turn, so the cancel is a request it has to observe.
+    let lease = fixture
+        .backend
+        .claim(&fixture.thread, "writer-a", LEASE)
+        .await
+        .expect("claim")
+        .expect("a claimable turn");
+    fixture
+        .runtime
+        .cancel(&fixture.thread, &fixture.turn_id, "cancel-1")
+        .await
+        .expect("cancel");
+    assert_eq!(
+        fixture.turn().await.status,
+        TurnStatus::Cancelling,
+        "only the writer that holds the turn may terminate it"
+    );
+
+    for attempt in 1..=2 {
+        settle_turn(
+            fixture.backend.as_ref(),
+            &lease,
+            TurnStatus::Cancelled,
+            Value::Null,
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("settle #{attempt} must be idempotent: {error}"));
+    }
+
+    let settled = fixture.turn().await;
+    assert_eq!(settled.status, TurnStatus::Cancelled);
+    assert!(settled.error.is_none(), "{settled:?}");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.runtime.tick(&fixture.thread),
+    )
+    .await
+    .expect("a settled turn must not keep a caller waiting")
+    .expect("tick");
+    assert_eq!(outcome, TickOutcome::Idle, "a cancelled turn is never run");
+    assert_eq!(fixture.model.calls(), 0);
+    assert_eq!(fixture.turn().await.status, TurnStatus::Cancelled);
 }

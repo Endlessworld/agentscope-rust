@@ -287,3 +287,15 @@ ACP 侧接线已验证可编译、ACP lib 114 条全绿，但集成用例 `sessi
 1. 取消语义断链：agent 侧 `cancellation.is_cancelled()` 从未变真，durable 的 cancel 意图没有传到 `ReActAgent` 的取消信号，需要在 tick 内把 durable `cancel`/`pause` 映射成 `CancelSignal`。
 2. 挂起：新路径在取消后没有让 tick 落到可终结状态，调用方等待不返回。
 3. 顺序：先补 1、2 并加针对性的取消/暂停用例，再重做 ACP 换驱动，最后才删 `AgentSession`/`SessionAnswer`。
+
+### M4-e-1/M4-e-2 控制桥接（2026-11-15，未提交；ACP 与 `AgentSession` 未改）
+
+**桥接**：tick 在 `stream_events_with_extensions` 前建 `CancelSignal` 并经 `CANCEL_SIGNAL_CONTEXT_KEY` 注入；轮询（50ms）到 `turn.cancellation_requested` 就 `signal.cancel()` 交给 core，agent 在相位/流式检查点看到它并 `Err(Error::Cancelled)` 结束本次调用（该 error 不再记 `failed`）。`TurnStatus::Pausing` 仍走让出（`Ok(())`，turn 留 `Pausing`→`Paused` 可 `resume`），两者不混同。
+
+**结果映射**：取消 → `settle(Cancelled)` + `TickOutcome::Cancelled`；暂停 → `TickOutcome::Paused`。另补 native journal 的跑尾（`recorder.finish_with_error`：`completed`/`cancelled`/`suspended`/`failed` + `run/end`）——之前只 `flush()+close()`，宿主读不到本次 run 的结束，只能映射成 Refusal/挂起。
+
+**覆盖边界**：模型调用进行中、相位边界、工具派发前的取消都覆盖；`CANCEL_GRACE=2s` 是最后手（到点不再等）。**不覆盖**：阻塞 runtime 线程的同步工具——轮询没机会跑，只能等它返回；工具已派发后取消，turn 因「效果未 settle 不得落终态」停在 `Cancelling`，由后续 tick/executor 收尾。
+
+**用例**（`harness_adapter_test.rs` 7→11）：`a_cancel_before_the_invocation_runs_costs_no_model_call`；`a_cancel_inside_the_invocation_ends_the_tick_as_cancelled`（断言 `TickOutcome::Cancelled`、`run/end=cancelled`、无 `turn/failed`）；`a_pause_inside_the_invocation_is_paused_and_resumable`（`TickOutcome::Paused` 且 `!= Cancelled`、`run/end=suspended`、resume 后 Succeeded）；`a_cancelled_turn_is_terminal_and_repeating_the_settle_is_a_no_op`。反向验证：去 `cancel.cancel()` → 用例 2 挂到 10s 超时；取消/暂停的 native 状态互换 → 各自用例 FAILED。
+
+**剩余**：ACP 换驱动（M4-e-3）；工具内取消的「未知效果」记录（需 executor 语义）。

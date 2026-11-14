@@ -6,13 +6,21 @@
 //! observed. One tick is one model decision, not one whole turn: `ReActAgent` runs its
 //! reasoning/acting loop to completion inside a single invocation, so the adapter stops that
 //! loop before the second model call ([`TickBudget`]) and leaves the rest to the next tick.
+//!
+//! Control is durable, so it is read from the committed turn and never assumed: a cancel is
+//! delivered into the invocation as a core `CancelSignal` (the agent ends the run as cancelled
+//! instead of the tick dropping a live stream), a pause is a yield that leaves the turn
+//! resumable, and the run's native ending is written from that same status. The boundary is the
+//! poll: control lands at the next poll while the invocation yields, and a tool that blocks the
+//! runtime thread is only stopped once it returns.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use agentscope_core::agent::{
-    AgentExecutionHost, ExecutionBoundary, Extensions, FinishContinuation, RuntimeContext,
-    StreamOptions, EXECUTION_HOST_CONTEXT_KEY, EXECUTION_POSITION_CONTEXT_KEY,
+    AgentExecutionHost, CancelSignal, ExecutionBoundary, Extensions, FinishContinuation,
+    RuntimeContext, StreamOptions, CANCEL_SIGNAL_CONTEXT_KEY, EXECUTION_HOST_CONTEXT_KEY,
+    EXECUTION_POSITION_CONTEXT_KEY,
 };
 use agentscope_core::error::{Error, Result as CoreResult};
 use agentscope_core::journal::{InvocationRecorder, ThreadJournal, RECORDER_CONTEXT_KEY};
@@ -33,12 +41,23 @@ const STATE_VERSION: &str = "agentscope/state/1";
 /// Model calls one tick may start.
 const MODEL_CALLS_PER_TICK: usize = 1;
 
+/// What a tick reports when its invocation ended without a reply.
+const NO_REPLY: &str = "The invocation produced no reply";
+
 /// How often a running invocation re-reads the committed frame to look for control.
 ///
 /// A cancel or pause can arrive while the model call is still streaming, and a provider that
 /// never returns would otherwise hold the turn until its lease expires. Polling is the only
 /// way to observe the request from inside the call that is blocking.
 const STREAM_CONTROL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long a cancelled invocation may take to end on its own before the tick drops it.
+///
+/// The agent observes the signal at its phase boundaries and inside a streaming model call, so
+/// a cancel normally ends the invocation within a poll or two. A tool that blocks where no
+/// checkpoint runs cannot be interrupted at all: waiting forever would leave the turn
+/// un-terminated, so the tick stops waiting and settles the cancellation itself.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Runs turns of one harness definition by building the agent that executes them.
 ///
@@ -117,6 +136,12 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
             Arc::clone(&budget) as Arc<dyn AgentExecutionHost>,
         );
         extensions.insert(EXECUTION_POSITION_CONTEXT_KEY, host.position());
+        // The durable turn is the authority on control; the agent only knows this signal. It is
+        // installed before the invocation starts, and a cancel observed below is delivered
+        // through it, so the agent ends the run as cancelled itself instead of the tick dropping
+        // a stream mid-run.
+        let cancel = CancelSignal::new();
+        extensions.insert(CANCEL_SIGNAL_CONTEXT_KEY, cancel.clone());
 
         // Only the first invocation of a turn carries the input; a turn that already ran has it
         // in the committed state, and re-feeding it would duplicate the user message.
@@ -133,17 +158,33 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
         let mut yielded = false;
         let mut drain = false;
         // A model call may never return (a provider streaming nothing, a hung socket). The only
-        // place a cancel can be noticed then is here: poll the committed frame while waiting, so
-        // the request stops the invocation instead of waiting out the stream.
+        // place a cancel can be noticed then is here: poll the committed frame while waiting and
+        // hand the request to the invocation, so the request stops it instead of waiting out the
+        // stream. A pause is different: it is a yield, and the turn stays runnable.
         let mut control = tokio::time::interval(STREAM_CONTROL_POLL);
         control.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut cancel_deadline: Option<tokio::time::Instant> = None;
         loop {
             let item = tokio::select! {
                 item = stream.next() => item,
                 _ = control.tick() => {
                     let frame = ctx.backend.frame(lease).await?;
                     if frame.turn.cancellation_requested {
-                        break;
+                        // Deliver the request into the invocation: the agent checks the signal at
+                        // its phase boundaries and while a model call streams, so it ends the run
+                        // as cancelled on its own and everything it committed stays consistent.
+                        if !cancel.is_cancelled() {
+                            cancel.cancel();
+                            cancel_deadline = Some(tokio::time::Instant::now() + CANCEL_GRACE);
+                        } else if cancel_deadline
+                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                        {
+                            // The invocation is stuck where no checkpoint runs (a tool blocking
+                            // on I/O). Stop waiting and let the ending below terminate the turn;
+                            // the stuck effect itself is the executor's to cancel.
+                            break;
+                        }
+                        continue;
                     }
                     if frame.turn.status == TurnStatus::Pausing {
                         yielded = true;
@@ -165,6 +206,10 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
                         ctx.publish(&value);
                     }
                 }
+                // The signal did its job: a cancelled run is an ending, not a failure. The turn's
+                // own status is settled below, from the frame, so a cancel that raced a
+                // successful reply still wins.
+                Err(Error::Cancelled(_)) => break,
                 // A pause is the tick's yield, not a failure: the turn stays runnable and the
                 // next tick continues from the step the loop had already opened.
                 Err(Error::HostPaused) => {
@@ -193,26 +238,59 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
             }
         }
         drop(stream);
-        // Commit what the invocation recorded but did not flush — the step it opened just before
-        // the pause: the next tick resumes from the committed position, not a buffered one.
-        recorder.flush().await.map_err(convert)?;
-        // The recorder owns the lease heartbeat; stopping it also leaves the borrowed lease in
-        // place for the runtime that handed it over.
-        recorder.close().await;
-        journal.detach_lease();
-
         // Control asked while this invocation ran is only *observed* here: a terminal status can
         // be written by the writer that holds the turn and by nobody else, so leaving it to the
         // next claimant would keep a cancelled turn `Cancelling` forever.
         let frame = ctx.backend.frame(lease).await?;
-        if frame.turn.cancellation_requested {
+        let cancelled = frame.turn.cancellation_requested;
+        let paused = frame.turn.status == TurnStatus::Pausing || yielded;
+
+        // Close the native run with the status this invocation really reached: a host renders
+        // the journal, and a run it never sees ending is indistinguishable from one that hung.
+        // The recorder does not write these facts on its own (only a call that owns its recorder
+        // does), so the tick that supplies it has to.
+        let (status, detail) = if cancelled {
+            ("cancelled", None)
+        } else if paused {
+            ("suspended", None)
+        } else if let Some(message) = failure.as_deref() {
+            ("failed", Some(message))
+        } else if let Some(reply) = reply.as_ref() {
+            recorder.result(Some(reply)).map_err(convert)?;
+            ("completed", None)
+        } else {
+            ("failed", Some(NO_REPLY))
+        };
+        // Commit what the invocation recorded but did not flush — the step it opened just before
+        // the pause — and seal the run. The next tick resumes from the committed position, not a
+        // buffered one.
+        let state = agent
+            .agent()
+            .and_then(|react| react.state_handle().lock().ok().map(|state| state.clone()));
+        match state {
+            Some(state) => recorder
+                .finish_with_error(&state, status, detail)
+                .await
+                .map_err(convert)?,
+            // Without a native state there is nothing to snapshot; still flush what the run
+            // recorded so the next tick's position is committed.
+            None => {
+                recorder.flush().await.map_err(convert)?;
+                recorder.close().await;
+            }
+        }
+        // The recorder owns the lease heartbeat; stopping it also leaves the borrowed lease in
+        // place for the runtime that handed it over.
+        journal.detach_lease();
+
+        if cancelled {
             return self
                 .settle(ctx, TurnStatus::Cancelled, Value::Null, None)
                 .await;
         }
         // A pause is the runtime's to complete when the lease is handed back; settling the reply
         // here would overwrite the pause the host asked for.
-        if frame.turn.status == TurnStatus::Pausing || yielded {
+        if paused {
             return Ok(());
         }
         if let Some(message) = failure {
@@ -220,8 +298,7 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
                 .settle(ctx, TurnStatus::Failed, Value::Null, Some(message))
                 .await;
         }
-        let reply =
-            reply.ok_or_else(|| DurableError::invalid("The invocation produced no reply"))?;
+        let reply = reply.ok_or_else(|| DurableError::invalid(NO_REPLY))?;
         let output = serde_json::to_value(&reply)?;
         self.settle(ctx, TurnStatus::Succeeded, output, None).await
     }
