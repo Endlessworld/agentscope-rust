@@ -9,8 +9,9 @@ use agentscope_durable::{
     Commit, DurableError, JournalAppend, Lease, SessionBackend, ThreadKey, TurnStatus,
 };
 use async_trait::async_trait;
+use serde_json::Value;
 
-use crate::tool_facts;
+use crate::{checkpoint, tool_facts};
 
 /// A durable journal scoped to one thread.
 ///
@@ -45,6 +46,21 @@ impl BackendThreadJournal {
 
     pub fn thread(&self) -> &ThreadKey {
         &self.thread
+    }
+
+    /// The lease this bridge writes under, for a host that must share the same writer.
+    ///
+    /// `None` before [`ThreadJournal::acquire`] and after [`ThreadJournal::release`].
+    pub fn lease(&self) -> Option<Lease> {
+        self.lease
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    /// The committed native state, which a later commit must not discard.
+    async fn current_checkpoint(&self, lease: &Lease) -> CoreResult<Value> {
+        Ok(self.backend.frame(lease).await.map_err(convert)?.checkpoint)
     }
 
     fn lease_for(&self, writer: &Writer) -> CoreResult<Lease> {
@@ -193,6 +209,14 @@ impl ThreadJournal for BackendThreadJournal {
             expected_position: expected_seq,
             entries,
         });
+        // The batch's native state becomes the thread's checkpoint. A batch without one carries
+        // the committed checkpoint forward: the backend refuses a commit that discards it, and
+        // re-committing the same value is deduplicated (no new position).
+        commit.checkpoint = match checkpoint::from_batch(events)? {
+            Some(snapshot) => snapshot,
+            None if state.checkpoint_metadata.is_some() => self.current_checkpoint(&lease).await?,
+            None => Value::Null,
+        };
         self.backend.commit(&lease, commit).await.map_err(convert)?;
         self.head().await
     }

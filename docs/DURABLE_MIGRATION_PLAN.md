@@ -99,6 +99,18 @@ core `ReActAgent` 主循环接上 `AgentExecutionHost`；无宿主时行为不�
 缺口：①`action/start` / `action/end` 故意不推导（与 `tool/dispatch`/`tool/result` 重复，且 `action/end` 与 returnDirect 占位结果可能不一致）；②core 的 acting continuation 未消费「已派发未完成」事实，恢复时仍会重新执行 pending call（需 core 侧 pending-tool resume 分支）；③转发工具（executor ≠ local）与 delegation 未接；④UNKNOWN 对账（reconcile + evidence）未做。
 
 
+
+### 2.4 M3-d `AgentState` ↔ checkpoint 映射（2026-11-15，未提交）
+
+新增 `src/checkpoint.rs`：checkpoint 值就是 `AgentState` 自身 JSON（`encode`/`decode`），去重判据是 backend 已有的 digest + `resource_position` 比较。
+
+- **写**：`AgentScopeExecutionHost::before_boundary` 在 `Reasoning`/`Acting` 边界调 `recorder.checkpoint_now(state, "durable_boundary")`；`BackendThreadJournal::commit` 从批次里取最后一个 `state/checkpoint`/`migration/baseline`/`state/restored` 的 `stateJson` 作 `Commit.checkpoint`（与 journal 投影认的三种载体一致）。
+- **必须携带**：backend 拒绝「已有 checkpoint 后 checkpoint 为 null」的提交，所以无 state 的批次（含 `dispatch_calls`）沿用已提交的 checkpoint（`frame().checkpoint`）；同一值写入不产生新位置。
+- **读**：`open()` 用 `thread_state.checkpoint_metadata.position` → `backend.checkpoint()` → `decode`，得到 `state()`（无则 `None`）与 `AgentExecutionPosition::new(cur_iter, cur_iter-1)`（与 `step/start` 推导同一规则）；journal 事件（`step/start`、finalization）仍可覆盖为更精确的位置。
+- **暴露**：`pin()` 写入 `EXECUTION_POSITION_CONTEXT_KEY` 的值即上述 checkpoint 重建结果，不是入参常量。
+- 测试 `tests/checkpoint_test.rs`：`an_unchanged_state_does_not_create_a_new_checkpoint`（同上状态/无 state 批次 → 位置仍 `[1]`，journal 前进 2）、`a_changed_state_creates_a_new_checkpoint`（`[1,2]` 且位置 2 就是新状态）、`a_reopened_host_rebuilds_the_committed_state`（全字段相等 + `cur_iter`/`context`/四类上下文）、`a_reopened_host_keeps_the_committed_iteration_budget`（`position().reasoning_iteration=3`，`max_iters=3` → MaxIterations 且 0 次模型调用）。
+- 缺口：①重建出的 state 只用于位置与暴露，loop 仍从 `core.state` 起跑（回填到 live state 属 M4 `AgentSession`）；②checkpoint 是整体快照（大对象外置未做）；③`state/checkpoint` 事件本身仍全量入 journal（journal 与 checkpoint 双份）。
+
 ## 3. 禁止事项（沿用 Java `agentscope-durable/AGENTS.md`）
 
 - 不做兼容层：不留别名、不保留 deprecated 转发、不写旧格式读取器、不做版本协商/降级回退。

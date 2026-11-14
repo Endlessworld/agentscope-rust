@@ -2,8 +2,10 @@
 //! fences its own writes.
 //!
 //! Core owns the loop; this host only acts at the boundaries [`ReActAgent`] reports, using the
-//! facts a durable commit already published. Two gaps are deliberate and documented in
-//! `docs/DURABLE_MIGRATION_PLAN.md`:
+//! facts a durable commit already published. Every boundary commits the native `AgentState` as
+//! the thread's checkpoint (see [`crate::checkpoint`]), and [`AgentScopeExecutionHost::open`]
+//! rebuilds it, together with the iteration it was taken in, instead of starting from zero.
+//! Two gaps are deliberate and documented in `docs/DURABLE_MIGRATION_PLAN.md`:
 //!
 //! * `input/steer` | `input/inject` signals are folded into the context, but they are **not**
 //!   consumed durably: that needs a commit carrying `consumed_signals` together with the native
@@ -33,7 +35,7 @@ use agentscope_durable::{
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::tool_facts;
+use crate::{checkpoint, tool_facts};
 
 /// A reply was produced and persisted; finalization has not completed.
 pub const FINALIZATION_STARTED: &str = "durable/finalization_started";
@@ -54,8 +56,10 @@ pub struct AgentScopeExecutionHost {
     thread: ThreadKey,
     run_id: String,
     lease: Mutex<Option<Lease>>,
-    /// Iteration to continue from, read from the committed facts at construction.
+    /// Iteration to continue from, read from the committed checkpoint and facts.
     position: AgentExecutionPosition,
+    /// Native state rebuilt from the committed checkpoint; `None` when the thread has none.
+    state: Option<AgentState>,
     /// A committed reply whose finalization must be resumed.
     resume: Option<Msg>,
     completed: AtomicBool,
@@ -63,8 +67,8 @@ pub struct AgentScopeExecutionHost {
 }
 
 impl AgentScopeExecutionHost {
-    /// Reads the thread's committed facts: the last reasoning iteration and whether a produced
-    /// reply still awaits finalization.
+    /// Reads the thread's committed facts: the native state, the iteration to continue from and
+    /// whether a produced reply still awaits finalization.
     pub async fn open(
         backend: Arc<dyn SessionBackend>,
         thread: ThreadKey,
@@ -73,10 +77,30 @@ impl AgentScopeExecutionHost {
     ) -> Result<Self> {
         ensure_event_codecs();
         let turn_id = lease.turn_id.clone();
-        let mut position = AgentExecutionPosition::default();
+        let thread_state = backend.thread_state(&thread).await.map_err(convert)?;
+        // The committed checkpoint is the only source of the previous invocation's state, and
+        // so of the iteration it died in: a restart is not a fresh iteration budget.
+        let (state, mut position) = match &thread_state.checkpoint_metadata {
+            Some(metadata) => {
+                let committed = metadata.position.parse::<u64>().map_err(|error| {
+                    journal_error(format!("Invalid checkpoint position: {error}"))
+                })?;
+                let view = backend
+                    .checkpoint(&thread, committed)
+                    .await
+                    .map_err(convert)?;
+                let state = checkpoint::decode(&view.checkpoint)?;
+                let iteration = state.cur_iter().max(0) as u32;
+                (
+                    Some(state),
+                    AgentExecutionPosition::new(iteration, iteration.saturating_sub(1)),
+                )
+            }
+            None => (None, AgentExecutionPosition::default()),
+        };
         let mut frame: Option<Frame> = None;
         let mut completed = false;
-        for event in read_events(backend.as_ref(), &thread).await? {
+        for event in read_events(backend.as_ref(), &thread, thread_state.journal_position).await? {
             if event.turn_id.as_deref() != Some(turn_id.as_str()) {
                 continue;
             }
@@ -134,6 +158,7 @@ impl AgentScopeExecutionHost {
             run_id: run_id.into(),
             lease: Mutex::new(Some(lease)),
             position,
+            state,
             resume,
             completed: AtomicBool::new(completed),
             frame: Mutex::new(frame),
@@ -143,6 +168,11 @@ impl AgentScopeExecutionHost {
     /// The iteration this invocation continues from.
     pub fn position(&self) -> AgentExecutionPosition {
         self.position
+    }
+
+    /// The native state rebuilt from the committed checkpoint, if the thread has one.
+    pub fn state(&self) -> Option<&AgentState> {
+        self.state.as_ref()
     }
 
     fn lease(&self) -> Result<Lease> {
@@ -223,10 +253,25 @@ impl AgentScopeExecutionHost {
         // Deterministic per revision: a replay of the same boundary writes nothing new.
         let commit_id = format!("dispatch:{}:{}", lease.turn_id, frame.turn.revision);
         let mut commit = Commit::new(commit_id, frame.turn.revision, TurnStatus::Running);
+        // The backend refuses a commit that discards committed native state; the identical
+        // value is deduplicated, so carrying it costs no checkpoint position.
+        commit.checkpoint = frame.checkpoint.clone();
         commit.tools = calls;
         commit.dispatches = dispatches;
         self.backend.commit(&lease, commit).await.map_err(convert)?;
         Ok(())
+    }
+
+    /// Commits the boundary's state as the turn's native checkpoint.
+    ///
+    /// The snapshot rides the recorder's next journal batch, so the checkpoint and the turn
+    /// revision advance in one transaction; an unchanged state is deduplicated by the backend
+    /// (and skipped outright by the recorder), so a repeated boundary adds no position.
+    async fn persist_state(&self, context: &RuntimeContext, state: &AgentState) -> Result<()> {
+        let Some(recorder) = InvocationRecorder::from_context(context) else {
+            return Ok(());
+        };
+        recorder.checkpoint_now(state, "durable_boundary").await
     }
 
     fn frame_id(&self) -> String {
@@ -244,7 +289,7 @@ impl AgentExecutionHost for AgentScopeExecutionHost {
     async fn before_boundary(
         &self,
         boundary: ExecutionBoundary,
-        _context: &RuntimeContext,
+        context: &RuntimeContext,
         state: &mut AgentState,
     ) -> Result<()> {
         self.check_control().await?;
@@ -253,9 +298,11 @@ impl AgentExecutionHost for AgentScopeExecutionHost {
             ExecutionBoundary::Reasoning => self.apply_inputs(state).await?,
             // Every tool call this iteration will run is logged before any of them runs.
             ExecutionBoundary::Acting => self.dispatch_calls(state).await?,
-            _ => {}
+            // `Model` runs with the recorder's own `before_model` snapshot and `Finalization`
+            // persists the reply together with the state it belongs to.
+            _ => return Ok(()),
         }
-        Ok(())
+        self.persist_state(context, state).await
     }
 
     fn resume_result(&self) -> Option<Msg> {
@@ -324,8 +371,11 @@ impl AgentExecutionHost for AgentScopeExecutionHost {
     }
 }
 
-/// Pins the host and its committed position onto a call context, so the agent resumes the
+/// Pins the host and the position it committed onto a call context, so the agent resumes the
 /// invocation instead of starting a fresh iteration budget.
+///
+/// The position is the host's committed one (rebuilt from the checkpoint), never a constant
+/// supplied by the caller: a restart after a crash must not reset the budget to zero.
 pub fn pin(context: &mut RuntimeContext, host: Arc<AgentScopeExecutionHost>) {
     let position = host.position();
     let host: Arc<dyn AgentExecutionHost> = host;
@@ -353,12 +403,12 @@ fn convert(error: DurableError) -> Error {
 async fn read_events(
     backend: &dyn SessionBackend,
     thread: &ThreadKey,
+    journal_position: u64,
 ) -> Result<Vec<JournalEvent>> {
-    let state = backend.thread_state(thread).await.map_err(convert)?;
-    if state.journal_position == 0 {
+    if journal_position == 0 {
         return Ok(Vec::new());
     }
-    let limit = state.journal_position.min(usize::MAX as u64) as usize;
+    let limit = journal_position.min(usize::MAX as u64) as usize;
     let entries = backend
         .read_journal(thread, 0, limit)
         .await

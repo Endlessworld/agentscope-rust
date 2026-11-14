@@ -5,6 +5,7 @@
 //! without the other.
 
 pub mod backend_thread_journal;
+mod checkpoint;
 pub mod execution_host;
 mod tool_facts;
 
