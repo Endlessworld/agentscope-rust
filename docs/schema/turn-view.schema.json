@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/turn-view.schema.json",
+  "title": "TurnView",
+  "description": "Read view of one turn. Rust: crates/agentscope-durable/src/types/turn.rs::TurnView. Java: DurableTypes.TurnView. Terminal statuses are SUCCEEDED / FAILED / CANCELLED; QUEUED, RUNNING, WAITING, PAUSING, PAUSED and CANCELLING are live states.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "thread",
+    "turnId",
+    "status",
+    "revision",
+    "cancellationRequested"
+  ],
+  "properties": {
+    "thread": { "$ref": "#/$defs/ThreadKey" },
+    "turnId": { "$ref": "#/$defs/IdentityText" },
+    "status": { "$ref": "#/$defs/TurnStatus" },
+    "revision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Commit revision of this turn; every accepted commit increments it by one."
+    },
+    "cancellationRequested": { "type": "boolean" },
+    "output": { "description": "Turn output; JSON null until the turn produced one." },
+    "error": {
+      "type": "string",
+      "description": "Settled failure message; present only for a failed or interrupted turn."
+    },
+    "waiting": { "$ref": "#/$defs/WaitCondition" },
+    "recovery": { "$ref": "#/$defs/RecoveryView" },
+    "parent": { "$ref": "#/$defs/DelegationParent" }
+  },
+  "$defs": {
+    "IdentityText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S",
+      "description": "1..=256 characters, not blank (json::text)."
+    },
+    "TurnStatus": {
+      "type": "string",
+      "enum": [
+        "QUEUED",
+        "RUNNING",
+        "WAITING",
+        "PAUSING",
+        "PAUSED",
+        "CANCELLING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED"
+      ],
+      "description": "TurnStatus, serialized SCREAMING_SNAKE_CASE. terminal() = SUCCEEDED | FAILED | CANCELLED."
+    },
+    "SessionKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "sessionId"],
+      "properties": {
+        "namespace": { "$ref": "#/$defs/IdentityText" },
+        "sessionId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ThreadKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session", "threadId"],
+      "properties": {
+        "session": { "$ref": "#/$defs/SessionKey" },
+        "threadId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "RunStepRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/IdentityText" },
+        "stepId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "WaitCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "deadline"],
+      "description": "What a waiting turn is waiting for: a signal key plus an optional deadline in epoch millis.",
+      "properties": {
+        "key": { "$ref": "#/$defs/IdentityText" },
+        "deadline": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Epoch millis; WaitCondition::new rejects a negative deadline."
+        }
+      }
+    },
+    "RecoveryPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxRetries", "initialDelayMillis", "maxDelayMillis"],
+      "properties": {
+        "maxRetries": { "type": "integer", "minimum": 0, "maximum": 1000 },
+        "initialDelayMillis": { "type": "integer", "minimum": 1 },
+        "maxDelayMillis": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000,
+          "description": "RecoveryPolicy::new also requires maxDelayMillis >= initialDelayMillis; that cross-field rule is not expressible in draft 2020-12 and is enforced by the runtime."
+        }
+      }
+    },
+    "RecoveryView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["failures", "policy", "retryable", "message"],
+      "description": "Host classification of a failure. RecoveryView::validate requires failures in 1..=maxRetries+1, and retryAt present exactly when retry_allowed() (retryable && failures <= policy.maxRetries) holds.",
+      "properties": {
+        "failures": { "type": "integer", "minimum": 1 },
+        "policy": { "$ref": "#/$defs/RecoveryPolicy" },
+        "retryable": { "type": "boolean" },
+        "retryAt": { "type": "integer", "minimum": 0 },
+        "message": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "$comment": "exactly one of: retry_allowed (retryAt required) or not (retryAt absent). The failures<=maxRetries half cannot be expressed without arithmetic.",
+          "if": {
+            "properties": { "retryable": { "const": false } },
+            "required": ["retryable"]
+          },
+          "then": { "not": { "required": ["retryAt"] } }
+        }
+      ]
+    },
+    "DelegationParent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["thread", "turnId", "executionId"],
+      "description": "Parent identity of a delegated (child) turn.",
+      "properties": {
+        "thread": { "$ref": "#/$defs/ThreadKey" },
+        "turnId": { "$ref": "#/$defs/IdentityText" },
+        "executionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 513,
+          "description": "Derived as '<turnId>:<callId>'; see EXECUTION_ID_MAX_CHARS = 513 in types/execution.rs."
+        },
+        "origin": { "$ref": "#/$defs/RunStepRef" }
+      }
+    }
+  }
+}

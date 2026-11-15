@@ -1,0 +1,12 @@
+{
+  "turnId": "turn_9f86d081884c7d65",
+  "threadId": "thread-main",
+  "status": "WAITING",
+  "revision": 4,
+  "epoch": 2,
+  "expiresAt": 0,
+  "pauseRequested": false,
+  "nextAttemptAt": 1760000000000,
+  "admittedAt": 1759999000000,
+  "invocationCount": 2
+}

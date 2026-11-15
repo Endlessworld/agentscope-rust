@@ -1,0 +1,19 @@
+{
+  "request": {
+    "executionId": "turn_9f86d081884c7d65:call_1",
+    "thread": {
+      "session": { "namespace": "agentscope", "sessionId": "sess-001" },
+      "threadId": "thread-main"
+    },
+    "turnId": "turn_9f86d081884c7d65",
+    "call": {
+      "callId": "call_1",
+      "executor": "builtin",
+      "name": "read_file",
+      "arguments": { "path": "notes.md" }
+    }
+  },
+  "dispatchAttempted": true,
+  "result": { "state": "NOT_FOUND" },
+  "applied": false
+}

@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/thread.schema.json",
+  "title": "ThreadView or ThreadStateView",
+  "description": "Read views of one thread. Rust: crates/agentscope-durable/src/types/identity.rs::{ThreadView, ThreadStateView}. Java: DurableTypes.ThreadView / ThreadState. ThreadView is the plain view; ThreadStateView is the writer-side view that adds journal position, fencing epoch, lease and checkpoint metadata.",
+  "oneOf": [
+    { "$ref": "#/$defs/ThreadView" },
+    { "$ref": "#/$defs/ThreadStateView" }
+  ],
+  "$defs": {
+    "IdentityText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S",
+      "description": "1..=256 characters, not blank (json::text)."
+    },
+    "Lifecycle": {
+      "type": "string",
+      "enum": ["OPEN", "CLOSED"],
+      "description": "Lifecycle, serialized SCREAMING_SNAKE_CASE."
+    },
+    "SessionKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "sessionId"],
+      "properties": {
+        "namespace": { "$ref": "#/$defs/IdentityText" },
+        "sessionId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ThreadKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session", "threadId"],
+      "properties": {
+        "session": { "$ref": "#/$defs/SessionKey" },
+        "threadId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ThreadBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Frozen harness identity: a checkpoint is only restorable under the same binding.",
+      "required": ["harness", "definitionVersion", "stateVersion"],
+      "properties": {
+        "harness": { "$ref": "#/$defs/IdentityText" },
+        "definitionVersion": { "$ref": "#/$defs/IdentityText" },
+        "stateVersion": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ThreadSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "binding"],
+      "properties": {
+        "key": { "$ref": "#/$defs/ThreadKey" },
+        "binding": { "$ref": "#/$defs/ThreadBinding" }
+      }
+    },
+    "CheckpointMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "harness",
+        "definitionVersion",
+        "stateVersion",
+        "position",
+        "digest"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "type": "string",
+          "const": "1",
+          "description": "CHECKPOINT_SCHEMA_VERSION; bumped whenever the checkpoint layout changes."
+        },
+        "harness": { "$ref": "#/$defs/IdentityText" },
+        "definitionVersion": { "$ref": "#/$defs/IdentityText" },
+        "stateVersion": { "$ref": "#/$defs/IdentityText" },
+        "position": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$",
+          "description": "Decimal journal position. CheckpointMetadata::verify rejects an empty string, a leading zero and non-digits."
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "SHA-256 (64 hex characters) over the RFC 8785 canonical checkpoint, verified by json::matches."
+        }
+      }
+    },
+    "ThreadView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["definition", "status"],
+      "properties": {
+        "definition": { "$ref": "#/$defs/ThreadSpec" },
+        "status": { "$ref": "#/$defs/Lifecycle" }
+      }
+    },
+    "ThreadStateView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "definition",
+        "status",
+        "journalPosition",
+        "epoch",
+        "leaseUntil",
+        "resourcePosition"
+      ],
+      "properties": {
+        "definition": { "$ref": "#/$defs/ThreadSpec" },
+        "status": { "$ref": "#/$defs/Lifecycle" },
+        "journalPosition": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Committed native journal entries; independent of the turn revision. Readers must page it with limit 1..=1000 (see page.schema.json) instead of asking for it in one read."
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic fencing counter of this thread; a lease carries the epoch it was granted under."
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Owner of the current lease; absent when the thread is idle."
+        },
+        "leaseUntil": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Epoch millis on the store clock; 0 means no lease."
+        },
+        "currentTurnId": { "$ref": "#/$defs/IdentityText" },
+        "checkpointMetadata": { "$ref": "#/$defs/CheckpointMetadata" },
+        "resourcePosition": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Generation of the session's private resources this thread has observed. Defaults to 0 for scopes written before resources existed."
+        }
+      }
+    }
+  }
+}

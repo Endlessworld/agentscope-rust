@@ -1,0 +1,18 @@
+{
+  "thread": {
+    "session": { "namespace": "agentscope", "sessionId": "sess-001" },
+    "threadId": "thread-main"
+  },
+  "turnId": "turn_9f86d081884c7d659a2feaa0c55ad015",
+  "status": "FAILED",
+  "revision": 5,
+  "cancellationRequested": false,
+  "error": "provider rejected the request",
+  "recovery": {
+    "failures": 4,
+    "policy": { "maxRetries": 3, "initialDelayMillis": 1000, "maxDelayMillis": 30000 },
+    "retryable": false,
+    "retryAt": 1760000030000,
+    "message": "provider rejected the request"
+  }
+}

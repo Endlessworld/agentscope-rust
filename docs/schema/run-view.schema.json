@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/run-view.schema.json",
+  "title": "RunView",
+  "description": "One actual native invocation. Rust: crates/agentscope-durable/src/types/run.rs::RunView. Java: DurableTypes.RunView. A run never owns the logical task queue: the turn does.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "thread",
+    "turnId",
+    "runId",
+    "requestId",
+    "owner",
+    "epoch",
+    "status",
+    "preparedAt"
+  ],
+  "properties": {
+    "thread": { "$ref": "#/$defs/ThreadKey" },
+    "turnId": { "$ref": "#/$defs/IdentityText" },
+    "runId": { "$ref": "#/$defs/IdentityText" },
+    "requestId": { "$ref": "#/$defs/IdentityText" },
+    "owner": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "The writer that prepared this invocation; leases are fenced by (owner, epoch)."
+    },
+    "epoch": { "type": "integer", "minimum": 0 },
+    "previousRunId": { "$ref": "#/$defs/IdentityText" },
+    "status": { "$ref": "#/$defs/RunStatus" },
+    "preparedAt": { "type": "integer", "minimum": 0 },
+    "startedAt": { "type": "integer", "minimum": 0 },
+    "endedAt": { "type": "integer", "minimum": 0 },
+    "outcome": {
+      "type": "string",
+      "description": "Required for a terminal run (RunChange::validate); absent while PREPARED/RUNNING."
+    },
+    "reason": { "type": "string" }
+  },
+  "$defs": {
+    "IdentityText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S"
+    },
+    "SessionKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "sessionId"],
+      "properties": {
+        "namespace": { "$ref": "#/$defs/IdentityText" },
+        "sessionId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ThreadKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session", "threadId"],
+      "properties": {
+        "session": { "$ref": "#/$defs/SessionKey" },
+        "threadId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "RunStatus": {
+      "type": "string",
+      "enum": ["PREPARED", "RUNNING", "COMPLETED", "STOPPED", "FAILED", "LOST"],
+      "description": "RunStatus, SCREAMING_SNAKE_CASE. terminal() = not (PREPARED | RUNNING)."
+    }
+  }
+}

@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/event.schema.json",
+  "title": "Event (PublicEvent)",
+  "description": "A committed public fact with a stable cursor. Rust: crates/agentscope-durable/src/types/commit.rs::PublicEvent. Java: DurableTypes.PublicEvent. Field naming note: the wire field for the event kind is `type` (Rust #[serde(rename = \"type\")]); this document also knows it as `kind` in prose. `required`/extension semantics come from core's JournalEvent (crates/agentscope-core/src/journal/event.rs): namespaced kinds such as durable/finalization_started are required extension events, so a reader that does not know their codec must stop recovery.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "eventId",
+    "session",
+    "threadId",
+    "turnId",
+    "sequence",
+    "cursor",
+    "type"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "1",
+      "description": "Envelope version written by append_event. Core journal envelopes are version 2 (JournalEvent::SCHEMA_VERSION); this is the durable public-event envelope and is a separate counter."
+    },
+    "eventId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S",
+      "description": "Stable identity of the fact. Re-appending the same id with different content is rejected as CONFLICT ('Event identity changed')."
+    },
+    "session": { "$ref": "#/$defs/SessionKey" },
+    "threadId": { "$ref": "#/$defs/IdentityText" },
+    "turnId": { "$ref": "#/$defs/IdentityText" },
+    "runId": { "$ref": "#/$defs/IdentityText" },
+    "stepId": { "$ref": "#/$defs/IdentityText" },
+    "sequence": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$",
+      "description": "Per-session monotonic counter, rendered as a decimal string (u64 in Rust). Session-scoped, so sequence 1 of two sessions are different facts."
+    },
+    "cursor": {
+      "type": "string",
+      "pattern": "^session:[0-9a-fA-F]{64}:[0-9a-fA-F]{64}:[1-9][0-9]*$",
+      "description": "Opaque page cursor: '<session storage key>:<sequence>'. Requests pass it back verbatim; a cursor below the pruned watermark answers cursor_expired and the client resyncs from snapshot."
+    },
+    "type": { "$ref": "#/$defs/EventKind" },
+    "data": {
+      "description": "Event payload; for turn status events it is {\"status\": TurnStatus, \"revision\": n}."
+    }
+  },
+  "$defs": {
+    "IdentityText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S"
+    },
+    "SessionKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "sessionId"],
+      "properties": {
+        "namespace": { "$ref": "#/$defs/IdentityText" },
+        "sessionId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "KnownKind": {
+      "type": "string",
+      "description": "Kinds the durable backend itself commits, plus the namespaced required extension events the agentscope adapter registers. Host-defined kinds are admitted by the second branch of EventKind.",
+      "enum": [
+        "turn.queued",
+        "turn.running",
+        "turn.waiting",
+        "turn.paused",
+        "turn.cancelled",
+        "turn.succeeded",
+        "turn.failed",
+        "turn.resumed",
+        "durable/finalization_started",
+        "durable/finalization_completed"
+      ]
+    },
+    "EventKind": {
+      "description": "The event kind. The enum half names every kind this repository writes; the string half admits a host-defined kind, which the durable runtime allows as long as it does not start with a reserved prefix (session./thread./run./step.).",
+      "anyOf": [
+        { "$ref": "#/$defs/KnownKind" },
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "\\S",
+          "$comment": "Host-defined kind. Commit.event types are rejected when they start with session./thread./run./step.; namespaced kinds (e.g. durable/…) are extension events and may be `required`."
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/session-key.schema.json",
+  "title": "SessionKey",
+  "description": "Outer durable identity. Rust: crates/agentscope-durable/src/types/identity.rs::SessionKey (#[serde(rename_all = camelCase)]). Java: DurableTypes.SessionKey. Both fields are opaque but must be present and bounded by json::text: 1..=256 characters and not blank.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["namespace", "sessionId"],
+  "properties": {
+    "namespace": { "$ref": "#/$defs/IdentityText" },
+    "sessionId": { "$ref": "#/$defs/IdentityText" }
+  },
+  "$defs": {
+    "IdentityText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S",
+      "description": "1..=256 characters, and at least one non-whitespace character (json::text rejects blank identities). Length is counted in Unicode code points, which is what Rust's chars().count() and JSON Schema's minLength/maxLength both count."
+    }
+  }
+}

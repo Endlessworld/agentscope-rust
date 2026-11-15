@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/blob.schema.json",
+  "title": "BlobReference ($blob)",
+  "description": "Reference a store writes in place of a JSON value larger than 16 KiB (BLOB_THRESHOLD). Rust: crates/agentscope-durable/src/store/file.rs::{blob_reference, blob_reference_of}; the object store that serves the same layout is crates/agentscope-durable-objects. The shape is matched strictly: `$blob` must be the only key, `kind` is the one representation the store writes, `bytes` is a number and `digest` is 64 hex characters, so a value whose own JSON happens to carry a `$blob` field keeps being read as data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$blob"],
+  "properties": {
+    "$blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "bytes", "kind"],
+      "properties": {
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "SHA-256 of the stored payload; the file name is <digest>.json, so the name is the content and a write is idempotent."
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Payload length in bytes before encoding."
+        },
+        "kind": {
+          "type": "string",
+          "const": "json",
+          "description": "BLOB_KIND: the payload is the JSON encoding of the value."
+        }
+      }
+    }
+  }
+}

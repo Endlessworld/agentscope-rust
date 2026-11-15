@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/execution-view.schema.json",
+  "title": "ExecutionView (ToolExecution)",
+  "description": "Durable record of one tool effect and its three-state recovery surface. Rust: crates/agentscope-durable/src/types/execution.rs::ToolExecution. Java: DurableTypes.ToolExecution. SUCCEEDED/FAILED/CANCELLED are terminal; UNKNOWN is concluded but never success; PENDING/RUNNING are in flight; NOT_FOUND is a query answer and is never recordable.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request", "dispatchAttempted", "applied"],
+  "properties": {
+    "request": { "$ref": "#/$defs/ExecutionRequest" },
+    "dispatchAttempted": {
+      "type": "boolean",
+      "description": "True once the effect may have left this process. An attempt that never produced a result is the unknown-outcome case."
+    },
+    "result": { "$ref": "#/$defs/StoredExecutionResult" },
+    "applied": {
+      "type": "boolean",
+      "description": "The result is merged into native input/state; appliedAt prevents double application."
+    },
+    "appliedAt": { "$ref": "#/$defs/RunStepRef" },
+    "delegation": { "$ref": "#/$defs/DelegationLink" }
+  },
+  "$defs": {
+    "IdentityText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S"
+    },
+    "SessionKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "sessionId"],
+      "properties": {
+        "namespace": { "$ref": "#/$defs/IdentityText" },
+        "sessionId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ThreadKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session", "threadId"],
+      "properties": {
+        "session": { "$ref": "#/$defs/SessionKey" },
+        "threadId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ExecutionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 513,
+      "description": "Derived as '<turnId>:<callId>'. EXECUTION_ID_MAX_CHARS = 256 + 1 + 256 = 513 (types/execution.rs). The 256+256 comes from json::text's bound on each part; checking the derived id against 256 wrongly rejected legal calls."
+    },
+    "RunStepRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/IdentityText" },
+        "stepId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ToolCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callId", "executor", "name"],
+      "properties": {
+        "callId": { "$ref": "#/$defs/IdentityText" },
+        "executor": { "$ref": "#/$defs/IdentityText" },
+        "name": { "$ref": "#/$defs/IdentityText" },
+        "arguments": {},
+        "binding": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "Digest of the bound tool catalog entry (64 hex characters)."
+        },
+        "origin": { "$ref": "#/$defs/RunStepRef" }
+      }
+    },
+    "ExecutionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executionId", "thread", "turnId", "call"],
+      "properties": {
+        "executionId": { "$ref": "#/$defs/ExecutionId" },
+        "thread": { "$ref": "#/$defs/ThreadKey" },
+        "turnId": { "$ref": "#/$defs/IdentityText" },
+        "call": { "$ref": "#/$defs/ToolCall" }
+      }
+    },
+    "ExecutionState": {
+      "type": "string",
+      "enum": [
+        "PENDING",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED",
+        "NOT_FOUND",
+        "UNKNOWN"
+      ],
+      "description": "Full query surface. terminal() = SUCCEEDED | FAILED | CANCELLED; concluded() = terminal() | UNKNOWN."
+    },
+    "StoredExecutionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["SUCCEEDED", "FAILED", "CANCELLED", "UNKNOWN"],
+          "description": "NOT_FOUND is not a recordable result: ToolResultRecord::validate rejects it with 'NOT_FOUND is not a recordable execution result'. PENDING/RUNNING mean no result has been recorded yet, so the field is absent instead."
+        },
+        "handle": {
+          "type": "string",
+          "description": "Executor-side handle for an effect whose outcome may still be queried."
+        },
+        "result": {},
+        "error": { "type": "string" }
+      }
+    },
+    "DelegationLink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["thread", "turnId"],
+      "properties": {
+        "thread": { "$ref": "#/$defs/ThreadKey" },
+        "turnId": { "$ref": "#/$defs/IdentityText" }
+      }
+    }
+  }
+}

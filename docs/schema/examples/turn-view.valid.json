@@ -1,0 +1,18 @@
+{
+  "thread": {
+    "session": { "namespace": "agentscope", "sessionId": "sess-001" },
+    "threadId": "thread-main"
+  },
+  "turnId": "turn_9f86d081884c7d659a2feaa0c55ad015",
+  "status": "RUNNING",
+  "revision": 3,
+  "cancellationRequested": false,
+  "output": null,
+  "recovery": {
+    "failures": 1,
+    "policy": { "maxRetries": 3, "initialDelayMillis": 1000, "maxDelayMillis": 30000 },
+    "retryable": true,
+    "retryAt": 1760000030000,
+    "message": "provider timeout"
+  }
+}

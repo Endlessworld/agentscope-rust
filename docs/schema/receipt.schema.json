@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/receipt.schema.json",
+  "title": "Receipt (CommitReceipt | TurnReceipt | CommandReceipt)",
+  "description": "Stable idempotency answers. Rust: crates/agentscope-durable/src/types/{commit.rs::CommitReceipt, turn.rs::TurnReceipt, turn.rs::CommandReceipt}. Java: CommitReceipt / TurnReceipt / CommandReceipt. Exactly one shape matches a given document.",
+  "oneOf": [
+    { "$ref": "#/$defs/CommitReceipt" },
+    { "$ref": "#/$defs/TurnReceipt" },
+    { "$ref": "#/$defs/CommandReceipt" }
+  ],
+  "$defs": {
+    "IdentityText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S"
+    },
+    "SessionKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "sessionId"],
+      "properties": {
+        "namespace": { "$ref": "#/$defs/IdentityText" },
+        "sessionId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ThreadKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session", "threadId"],
+      "properties": {
+        "session": { "$ref": "#/$defs/SessionKey" },
+        "threadId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "CommitReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commitId", "digest", "revision", "cursor"],
+      "description": "Answer of one applied commit. `receipt(thread, turnId, commitId)` replays it without re-applying the commit.",
+      "properties": {
+        "commitId": { "$ref": "#/$defs/IdentityText" },
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "SHA-256 over the RFC 8785 canonical commit, 64 hex characters."
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Turn revision after this commit (the first commit takes a turn from 0 to 1)."
+        },
+        "cursor": {
+          "type": "string",
+          "pattern": "^session:[0-9a-fA-F]{64}:[0-9a-fA-F]{64}:[1-9][0-9]*$",
+          "description": "'<session storage key>:<sequence>'. The storage key is 'session:<sha256(namespace)>:<sha256(sessionId)>'."
+        }
+      }
+    },
+    "TurnReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["thread", "requestId", "turnId"],
+      "description": "Admission answer: the same requestId on the same thread with the same input answers the same turnId.",
+      "properties": {
+        "thread": { "$ref": "#/$defs/ThreadKey" },
+        "requestId": { "$ref": "#/$defs/IdentityText" },
+        "turnId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "CommandReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestId", "turnId", "operation", "status"],
+      "description": "Admission answer of a control command (STEER/INJECT/WITHDRAW/CANCEL/RESPOND/PAUSE/RESUME/SIGNAL). Later application is observed through events and state.",
+      "properties": {
+        "requestId": { "$ref": "#/$defs/IdentityText" },
+        "turnId": { "$ref": "#/$defs/IdentityText" },
+        "operation": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "status": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "cursor": {
+          "type": "string",
+          "pattern": "^session:[0-9a-fA-F]{64}:[0-9a-fA-F]{64}:[1-9][0-9]*$"
+        }
+      }
+    }
+  }
+}

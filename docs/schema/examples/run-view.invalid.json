@@ -1,0 +1,13 @@
+{
+  "thread": {
+    "session": { "namespace": "agentscope", "sessionId": "sess-001" },
+    "threadId": "thread-main"
+  },
+  "turnId": "turn_9f86d081884c7d659a2feaa0c55ad015",
+  "runId": "run_1",
+  "requestId": "req-1",
+  "owner": "worker-a",
+  "epoch": -1,
+  "status": "RUNNING",
+  "preparedAt": 1759999000000
+}

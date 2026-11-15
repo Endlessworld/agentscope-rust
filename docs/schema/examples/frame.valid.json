@@ -1,0 +1,38 @@
+{
+  "definition": {
+    "key": {
+      "session": { "namespace": "agentscope", "sessionId": "sess-001" },
+      "threadId": "thread-main"
+    },
+    "binding": {
+      "harness": "agentscope",
+      "definitionVersion": "react/1",
+      "stateVersion": "2"
+    }
+  },
+  "turn": {
+    "thread": {
+      "session": { "namespace": "agentscope", "sessionId": "sess-001" },
+      "threadId": "thread-main"
+    },
+    "turnId": "turn_9f86d081884c7d659a2feaa0c55ad015",
+    "status": "RUNNING",
+    "revision": 3,
+    "cancellationRequested": false
+  },
+  "input": { "message": "hello" },
+  "checkpoint": { "iteration": 1 },
+  "checkpointMetadata": {
+    "schemaVersion": "1",
+    "harness": "agentscope",
+    "definitionVersion": "react/1",
+    "stateVersion": "2",
+    "position": "12",
+    "digest": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+  },
+  "tools": [],
+  "signals": [
+    { "id": "sig_1", "key": "approval", "value": { "ok": true } }
+  ],
+  "now": 1760000000000
+}

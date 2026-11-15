@@ -1,0 +1,449 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/turn-data.schema.json",
+  "title": "TurnData",
+  "description": "Persisted turn record inside a session scope (not a public read view). Rust: crates/agentscope-durable/src/backend/model.rs::TurnData (#[serde(rename_all = camelCase)]). Keys of the maps are the ids of the values (signals by signal id, runs by runId, steps by stepId, modelCalls by modelCallId, tools by executionId, receipts by commitId); *_order arrays give the committed order.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "turnId",
+    "threadId",
+    "status",
+    "revision",
+    "epoch",
+    "expiresAt",
+    "cancel",
+    "pauseRequested",
+    "nextAttemptAt",
+    "admittedAt",
+    "invocationCount"
+  ],
+  "properties": {
+    "turnId": { "$ref": "#/$defs/IdentityText" },
+    "threadId": { "$ref": "#/$defs/IdentityText" },
+    "status": { "$ref": "#/$defs/TurnStatus" },
+    "revision": { "type": "integer", "minimum": 0 },
+    "owner": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "epoch": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Fencing epoch of the lease the turn was last granted under."
+    },
+    "expiresAt": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Lease expiry in epoch millis on the store clock; cleared to 0 when the turn leaves RUNNING."
+    },
+    "cancel": { "type": "boolean" },
+    "pauseRequested": { "type": "boolean" },
+    "waiting": { "$ref": "#/$defs/WaitCondition" },
+    "output": {},
+    "error": { "type": "string" },
+    "recovery": { "$ref": "#/$defs/RecoveryView" },
+    "failedEpoch": { "type": "integer", "minimum": 0 },
+    "nextAttemptAt": {
+      "type": "integer",
+      "description": "Epoch millis at which the turn becomes selectable again; the ready index mirrors it."
+    },
+    "input": {
+      "description": "Admitted input, verbatim; the admission digest covers its canonical rendering."
+    },
+    "admittedAt": { "type": "integer", "minimum": 0 },
+    "parent": { "$ref": "#/$defs/DelegationParent" },
+    "lastRunId": { "$ref": "#/$defs/IdentityText" },
+    "invocationCount": { "type": "integer", "minimum": 0 },
+    "consumed": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/IdentityText" },
+      "description": "Signal ids folded into the context and marked delivered."
+    },
+    "withdrawn": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/IdentityText" }
+    },
+    "signals": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/Signal" }
+    },
+    "runs": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/RunView" }
+    },
+    "runOrder": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/IdentityText" }
+    },
+    "steps": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/StepView" }
+    },
+    "stepOrder": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/IdentityText" }
+    },
+    "modelCalls": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/ModelCallView" }
+    },
+    "modelCallOrder": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/IdentityText" }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/ToolExecution" }
+    },
+    "toolOrder": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/IdentityText" }
+    },
+    "receipts": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/CommitReceipt" }
+    }
+  },
+  "$defs": {
+    "IdentityText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S"
+    },
+    "TurnStatus": {
+      "type": "string",
+      "enum": [
+        "QUEUED",
+        "RUNNING",
+        "WAITING",
+        "PAUSING",
+        "PAUSED",
+        "CANCELLING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED"
+      ]
+    },
+    "SessionKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "sessionId"],
+      "properties": {
+        "namespace": { "$ref": "#/$defs/IdentityText" },
+        "sessionId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ThreadKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session", "threadId"],
+      "properties": {
+        "session": { "$ref": "#/$defs/SessionKey" },
+        "threadId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "RunStepRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/IdentityText" },
+        "stepId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "WaitCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "deadline"],
+      "properties": {
+        "key": { "$ref": "#/$defs/IdentityText" },
+        "deadline": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "RecoveryPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxRetries", "initialDelayMillis", "maxDelayMillis"],
+      "properties": {
+        "maxRetries": { "type": "integer", "minimum": 0, "maximum": 1000 },
+        "initialDelayMillis": { "type": "integer", "minimum": 1 },
+        "maxDelayMillis": { "type": "integer", "minimum": 1, "maximum": 86400000 }
+      }
+    },
+    "RecoveryView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["failures", "policy", "retryable", "message"],
+      "properties": {
+        "failures": { "type": "integer", "minimum": 1 },
+        "policy": { "$ref": "#/$defs/RecoveryPolicy" },
+        "retryable": { "type": "boolean" },
+        "retryAt": { "type": "integer", "minimum": 0 },
+        "message": { "type": "string" }
+      }
+    },
+    "DelegationParent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["thread", "turnId", "executionId"],
+      "properties": {
+        "thread": { "$ref": "#/$defs/ThreadKey" },
+        "turnId": { "$ref": "#/$defs/IdentityText" },
+        "executionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 513
+        },
+        "origin": { "$ref": "#/$defs/RunStepRef" }
+      }
+    },
+    "Signal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "key"],
+      "properties": {
+        "id": { "$ref": "#/$defs/IdentityText" },
+        "key": { "$ref": "#/$defs/IdentityText" },
+        "value": {}
+      }
+    },
+    "TokenUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inputTokens": { "type": "integer", "minimum": 0 },
+        "outputTokens": { "type": "integer", "minimum": 0 },
+        "details": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "RunStatus": {
+      "type": "string",
+      "enum": ["PREPARED", "RUNNING", "COMPLETED", "STOPPED", "FAILED", "LOST"]
+    },
+    "RunView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "thread",
+        "turnId",
+        "runId",
+        "requestId",
+        "owner",
+        "epoch",
+        "status",
+        "preparedAt"
+      ],
+      "properties": {
+        "thread": { "$ref": "#/$defs/ThreadKey" },
+        "turnId": { "$ref": "#/$defs/IdentityText" },
+        "runId": { "$ref": "#/$defs/IdentityText" },
+        "requestId": { "$ref": "#/$defs/IdentityText" },
+        "owner": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "epoch": { "type": "integer", "minimum": 0 },
+        "previousRunId": { "$ref": "#/$defs/IdentityText" },
+        "status": { "$ref": "#/$defs/RunStatus" },
+        "preparedAt": { "type": "integer", "minimum": 0 },
+        "startedAt": { "type": "integer", "minimum": 0 },
+        "endedAt": { "type": "integer", "minimum": 0 },
+        "outcome": { "type": "string" },
+        "reason": { "type": "string" }
+      }
+    },
+    "StepStatus": {
+      "type": "string",
+      "enum": ["RUNNING", "COMPLETED", "STOPPED", "FAILED", "LOST"]
+    },
+    "StepPhase": {
+      "type": "string",
+      "enum": ["REASONING", "ACTING", "FINALIZATION"]
+    },
+    "StepView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "thread",
+        "turnId",
+        "runId",
+        "stepId",
+        "index",
+        "status",
+        "phase",
+        "startedAt"
+      ],
+      "properties": {
+        "thread": { "$ref": "#/$defs/ThreadKey" },
+        "turnId": { "$ref": "#/$defs/IdentityText" },
+        "runId": { "$ref": "#/$defs/IdentityText" },
+        "stepId": { "$ref": "#/$defs/IdentityText" },
+        "index": { "type": "integer" },
+        "status": { "$ref": "#/$defs/StepStatus" },
+        "phase": { "$ref": "#/$defs/StepPhase" },
+        "resumedFromStepId": { "$ref": "#/$defs/IdentityText" },
+        "startedAt": { "type": "integer", "minimum": 0 },
+        "endedAt": { "type": "integer", "minimum": 0 },
+        "reason": { "type": "string" }
+      }
+    },
+    "ModelStatus": {
+      "type": "string",
+      "enum": ["RUNNING", "COMPLETED", "FAILED", "CANCELLED", "LOST"]
+    },
+    "ModelObservation": {
+      "type": "string",
+      "enum": ["MODEL_CALL", "PROVIDER_ATTEMPTS"]
+    },
+    "ModelRequestView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "attempt",
+        "provider",
+        "status",
+        "startedAt",
+        "usageComplete"
+      ],
+      "properties": {
+        "requestId": { "$ref": "#/$defs/IdentityText" },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "provider": { "$ref": "#/$defs/IdentityText" },
+        "status": { "$ref": "#/$defs/ModelStatus" },
+        "startedAt": { "type": "integer", "minimum": 0 },
+        "endedAt": { "type": "integer", "minimum": 0 },
+        "durationMillis": { "type": "integer", "minimum": 0 },
+        "usage": { "$ref": "#/$defs/TokenUsage" },
+        "usageComplete": { "type": "boolean" },
+        "errorType": { "type": "string" }
+      }
+    },
+    "ModelCallView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "thread",
+        "turnId",
+        "modelCallId",
+        "startedAt",
+        "status",
+        "observation",
+        "usageComplete"
+      ],
+      "properties": {
+        "thread": { "$ref": "#/$defs/ThreadKey" },
+        "turnId": { "$ref": "#/$defs/IdentityText" },
+        "runId": { "$ref": "#/$defs/IdentityText" },
+        "stepId": { "$ref": "#/$defs/IdentityText" },
+        "modelCallId": { "$ref": "#/$defs/IdentityText" },
+        "model": { "type": "string" },
+        "purpose": { "type": "string" },
+        "iteration": { "type": "integer" },
+        "startedAt": { "type": "integer", "minimum": 0 },
+        "endedAt": { "type": "integer", "minimum": 0 },
+        "durationMillis": { "type": "integer", "minimum": 0 },
+        "status": { "$ref": "#/$defs/ModelStatus" },
+        "observation": { "$ref": "#/$defs/ModelObservation" },
+        "usage": { "$ref": "#/$defs/TokenUsage" },
+        "usageComplete": { "type": "boolean" },
+        "requests": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ModelRequestView" }
+        }
+      }
+    },
+    "ExecutionState": {
+      "type": "string",
+      "enum": [
+        "PENDING",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED",
+        "NOT_FOUND",
+        "UNKNOWN"
+      ],
+      "description": "Tool three-state surface: terminal() = SUCCEEDED | FAILED | CANCELLED; concluded() adds UNKNOWN (business outcome, never retried automatically, never reported as success)."
+    },
+    "ToolCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callId", "executor", "name"],
+      "properties": {
+        "callId": { "$ref": "#/$defs/IdentityText" },
+        "executor": { "$ref": "#/$defs/IdentityText" },
+        "name": { "$ref": "#/$defs/IdentityText" },
+        "arguments": {},
+        "binding": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "Digest of the bound tool catalog entry; required by catalog-backed workers (ToolCall::validate requires 64 hex characters)."
+        },
+        "origin": { "$ref": "#/$defs/RunStepRef" }
+      }
+    },
+    "ExecutionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["SUCCEEDED", "FAILED", "CANCELLED", "UNKNOWN"],
+          "description": "A stored result never carries PENDING/RUNNING/NOT_FOUND: NOT_FOUND is not recordable (ToolResultRecord::validate rejects it)."
+        },
+        "handle": { "type": "string" },
+        "result": {},
+        "error": { "type": "string" }
+      }
+    },
+    "ExecutionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executionId", "thread", "turnId", "call"],
+      "properties": {
+        "executionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 513,
+          "description": "Derived as '<turnId>:<callId>'. EXECUTION_ID_MAX_CHARS = 256 + 1 + 256 = 513; a longer value is rejected as INVALID before the transaction opens."
+        },
+        "thread": { "$ref": "#/$defs/ThreadKey" },
+        "turnId": { "$ref": "#/$defs/IdentityText" },
+        "call": { "$ref": "#/$defs/ToolCall" }
+      }
+    },
+    "ToolExecution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request", "dispatchAttempted", "applied"],
+      "properties": {
+        "request": { "$ref": "#/$defs/ExecutionRequest" },
+        "dispatchAttempted": { "type": "boolean" },
+        "result": { "$ref": "#/$defs/ExecutionResult" },
+        "applied": { "type": "boolean" },
+        "appliedAt": { "$ref": "#/$defs/RunStepRef" },
+        "delegation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["thread", "turnId"],
+          "properties": {
+            "thread": { "$ref": "#/$defs/ThreadKey" },
+            "turnId": { "$ref": "#/$defs/IdentityText" }
+          }
+        }
+      }
+    },
+    "CommitReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commitId", "digest", "revision", "cursor"],
+      "properties": {
+        "commitId": { "$ref": "#/$defs/IdentityText" },
+        "digest": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "cursor": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

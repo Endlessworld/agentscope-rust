@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/resource-value.schema.json",
+  "title": "ResourceValue",
+  "description": "A session-scoped, versioned private resource. Rust: crates/agentscope-durable/src/types/resource.rs::ResourceValue. Java: DurableTypes.ResourceValue. A mutation advances the thread's resourcePosition, so a checkpoint and the resources it depends on stay paired.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["key", "value", "version"],
+  "properties": {
+    "namespace": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "\\S"
+      },
+      "description": "Namespace path; ResourceValue::validate rejects more than 32 parts."
+    },
+    "key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S"
+    },
+    "value": {
+      "type": "object",
+      "description": "Resource payload. Both ResourceValue::validate and ResourceRequest::validate require an object, not an arbitrary JSON value."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic version, starting at 1. CAS requests carry expectedVersion; 0 means 'create only'."
+    }
+  },
+  "$defs": {
+    "ResourceOperation": {
+      "type": "string",
+      "enum": ["GET", "SEARCH", "PUT", "CAS", "DELETE"],
+      "description": "Operations a ResourceRequest may name; GET/SEARCH are reads and never write."
+    }
+  }
+}

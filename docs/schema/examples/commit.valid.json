@@ -1,0 +1,57 @@
+{
+  "commitId": "commit-7",
+  "expectedRevision": 6,
+  "checkpoint": { "iteration": 2, "context": [] },
+  "tools": [
+    {
+      "callId": "call_2",
+      "executor": "builtin",
+      "name": "write_file",
+      "arguments": { "path": "notes.md", "content": "hi" }
+    }
+  ],
+  "dispatches": ["turn_9f86d081884c7d65:call_2"],
+  "results": [
+    {
+      "executionId": "turn_9f86d081884c7d65:call_1",
+      "result": { "state": "SUCCEEDED", "result": { "content": "hello" } }
+    }
+  ],
+  "appliedResults": [
+    {
+      "executionId": "turn_9f86d081884c7d65:call_1",
+      "appliedAt": { "runId": "run_1", "stepId": "step_2" }
+    }
+  ],
+  "consumedSignals": ["sig_1"],
+  "events": [
+    {
+      "eventId": "turn.9f86d081.8",
+      "type": "durable/finalization_started",
+      "data": { "reply": "hello" },
+      "runId": "run_1"
+    }
+  ],
+  "status": "RUNNING",
+  "output": null,
+  "journal": { "expectedPosition": 42, "entries": [] },
+  "run": { "runId": "run_1", "status": "RUNNING" },
+  "steps": [
+    {
+      "runId": "run_1",
+      "stepId": "step_2",
+      "status": "RUNNING",
+      "phase": "ACTING"
+    }
+  ],
+  "modelCalls": [
+    {
+      "modelCallId": "model_call_1",
+      "status": "COMPLETED",
+      "provider": "deepseek-chat",
+      "stepId": "step_1",
+      "usage": { "inputTokens": 120, "outputTokens": 40 },
+      "usageComplete": true
+    }
+  ]
+}

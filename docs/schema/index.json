@@ -1,0 +1,112 @@
+{
+  "schemaSetVersion": "durable.schema.v1",
+  "protocolVersion": "durable.v1",
+  "checkpointSchemaVersion": "1",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "source": "crates/agentscope-durable/src/types + session_backend.rs + store.rs; event kinds from crates/agentscope-core/src/journal/event.rs and crates/agentscope-durable-adapter-agentscope/src/execution_host.rs",
+  "schemas": [
+    {
+      "file": "session-key.schema.json",
+      "title": "SessionKey",
+      "rust": "types/identity.rs::SessionKey",
+      "java": "DurableTypes.SessionKey"
+    },
+    {
+      "file": "thread.schema.json",
+      "title": "ThreadView | ThreadStateView",
+      "rust": "types/identity.rs::{ThreadView, ThreadStateView}",
+      "java": "DurableTypes.ThreadView / ThreadState"
+    },
+    {
+      "file": "turn-view.schema.json",
+      "title": "TurnView",
+      "rust": "types/turn.rs::TurnView",
+      "java": "DurableTypes.TurnView"
+    },
+    {
+      "file": "turn-data.schema.json",
+      "title": "TurnData",
+      "rust": "backend/model.rs::TurnData",
+      "java": "internal turn record (persisted state, not a Java view)"
+    },
+    {
+      "file": "run-view.schema.json",
+      "title": "RunView",
+      "rust": "types/run.rs::RunView",
+      "java": "DurableTypes.RunView"
+    },
+    {
+      "file": "execution-view.schema.json",
+      "title": "ExecutionView (ToolExecution)",
+      "rust": "types/execution.rs::ToolExecution",
+      "java": "DurableTypes.ToolExecution"
+    },
+    {
+      "file": "commit.schema.json",
+      "title": "Commit",
+      "rust": "types/commit.rs::Commit",
+      "java": "DurableTypes.Commit"
+    },
+    {
+      "file": "receipt.schema.json",
+      "title": "Receipt (CommitReceipt | TurnReceipt | CommandReceipt)",
+      "rust": "types/commit.rs::CommitReceipt, types/turn.rs::{TurnReceipt, CommandReceipt}",
+      "java": "CommitReceipt / TurnReceipt / CommandReceipt"
+    },
+    {
+      "file": "event.schema.json",
+      "title": "Event (PublicEvent)",
+      "rust": "types/commit.rs::PublicEvent",
+      "java": "DurableTypes.PublicEvent"
+    },
+    {
+      "file": "resource-value.schema.json",
+      "title": "ResourceValue",
+      "rust": "types/resource.rs::ResourceValue",
+      "java": "DurableTypes.ResourceValue"
+    },
+    {
+      "file": "work-item.schema.json",
+      "title": "WorkerItem (WorkItem)",
+      "rust": "store.rs::WorkItem (persisted as store/file.rs::WorkRecord)",
+      "java": "WorkItem / ready index entry"
+    },
+    {
+      "file": "blob.schema.json",
+      "title": "BlobReference ($blob)",
+      "rust": "store/file.rs::blob_reference (layout shared with agentscope-durable-objects)",
+      "java": "blob reference written by the Java file store"
+    },
+    {
+      "file": "page.schema.json",
+      "title": "PageRequest",
+      "rust": "session_backend.rs limit parameters + backend/mod.rs::clamp_limit",
+      "java": "page request limit"
+    },
+    {
+      "file": "frame.schema.json",
+      "title": "Frame",
+      "rust": "types/commit.rs::Frame",
+      "java": "DurableTypes.Frame"
+    }
+  ],
+  "hardConstraints": [
+    {
+      "rule": "executionId is '<turnId>:<callId>' and at most 513 characters",
+      "where": ["execution-view.schema.json", "commit.schema.json", "turn-view.schema.json", "turn-data.schema.json", "frame.schema.json"]
+    },
+    {
+      "rule": "event type enum includes the required extension events durable/finalization_started and durable/finalization_completed",
+      "where": ["event.schema.json"]
+    },
+    {
+      "rule": "page limit is 1..=1000 inclusive",
+      "where": ["page.schema.json"]
+    },
+    {
+      "rule": "$blob reference is exactly {\"$blob\":{\"digest\",\"bytes\",\"kind\"}}",
+      "where": ["blob.schema.json"]
+    }
+  ],
+  "examples": "docs/schema/examples/ — one <schema>.valid.json and one <schema>.invalid.json per schema; see README.md for the constraint each invalid sample violates"
+}

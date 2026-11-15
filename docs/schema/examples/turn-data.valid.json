@@ -1,0 +1,49 @@
+{
+  "turnId": "turn_9f86d081884c7d65",
+  "threadId": "thread-main",
+  "status": "WAITING",
+  "revision": 4,
+  "epoch": 2,
+  "expiresAt": 0,
+  "cancel": false,
+  "pauseRequested": false,
+  "waiting": { "key": "approval", "deadline": 1760000600000 },
+  "output": null,
+  "nextAttemptAt": 1760000000000,
+  "input": { "message": "hello" },
+  "admittedAt": 1759999000000,
+  "lastRunId": "run_1",
+  "invocationCount": 2,
+  "consumed": [],
+  "withdrawn": [],
+  "signals": {
+    "approval": { "id": "sig_1", "key": "approval", "value": { "ok": true } }
+  },
+  "runs": {
+    "run_1": {
+      "thread": {
+        "session": { "namespace": "agentscope", "sessionId": "sess-001" },
+        "threadId": "thread-main"
+      },
+      "turnId": "turn_9f86d081884c7d65",
+      "runId": "run_1",
+      "requestId": "req-1",
+      "owner": "worker-a",
+      "epoch": 2,
+      "status": "STOPPED",
+      "preparedAt": 1759999000000,
+      "startedAt": 1759999000100,
+      "endedAt": 1759999009000,
+      "outcome": "turn_settled",
+      "reason": "turn_settled"
+    }
+  },
+  "runOrder": ["run_1"],
+  "steps": {},
+  "stepOrder": [],
+  "modelCalls": {},
+  "modelCallOrder": [],
+  "tools": {},
+  "toolOrder": [],
+  "receipts": {}
+}

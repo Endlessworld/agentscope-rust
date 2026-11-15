@@ -1,0 +1,276 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/commit.schema.json",
+  "title": "Commit",
+  "description": "One fenced state transition: the only way a writer changes a turn. Rust: crates/agentscope-durable/src/types/commit.rs::Commit. Java: DurableTypes.Commit. Checkpoint, tool intents, results, model-call changes and events land in one session transaction.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["commitId", "expectedRevision", "status"],
+  "properties": {
+    "commitId": { "$ref": "#/$defs/IdentityText" },
+    "expectedRevision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Compare-and-set against TurnView.revision; a mismatch answers CONFLICT."
+    },
+    "checkpoint": {
+      "description": "Native checkpoint value; null when this commit does not move it. Applying results requires a non-null checkpoint."
+    },
+    "tools": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ToolCall" },
+      "description": "Tool calls this commit declares (intent)."
+    },
+    "dispatches": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ExecutionId" },
+      "description": "Execution ids dispatched by this commit, applied after the intents above."
+    },
+    "results": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ToolResultRecord" },
+      "description": "Results observed by this commit, applied after the dispatches."
+    },
+    "appliedResults": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/AppliedResult" }
+    },
+    "consumedSignals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/IdentityText" },
+      "description": "Signal ids folded into the context by this commit."
+    },
+    "events": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/EventInput" },
+      "description": "Facts appended inside the same transaction. Types prefixed session./thread./run./step. are reserved and rejected."
+    },
+    "status": { "$ref": "#/$defs/CommitStatus" },
+    "waiting": { "$ref": "#/$defs/WaitCondition" },
+    "output": {},
+    "error": { "type": "string" },
+    "journal": { "$ref": "#/$defs/JournalAppend" },
+    "run": { "$ref": "#/$defs/RunChange" },
+    "steps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/StepChange" }
+    },
+    "modelCalls": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ModelCallChange" },
+      "description": "Model calls this commit observed (a dispatch, its ending, or both). Omitted when empty, so a commit that observes no model call serializes to exactly the bytes it did before this fact existed."
+    }
+  },
+  "$defs": {
+    "IdentityText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S"
+    },
+    "ExecutionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 513,
+      "description": "'<turnId>:<callId>', bounded by EXECUTION_ID_MAX_CHARS = 513 (types/execution.rs)."
+    },
+    "TurnStatus": {
+      "type": "string",
+      "enum": [
+        "QUEUED",
+        "RUNNING",
+        "WAITING",
+        "PAUSING",
+        "PAUSED",
+        "CANCELLING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED"
+      ]
+    },
+    "CommitStatus": {
+      "type": "string",
+      "enum": ["RUNNING", "WAITING", "PAUSED", "SUCCEEDED", "FAILED", "CANCELLED"],
+      "description": "Commit::validate rejects QUEUED, PAUSING and CANCELLING: those states are owned by admission and by control commands, never written as a commit target."
+    },
+    "WaitCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "deadline"],
+      "properties": {
+        "key": { "$ref": "#/$defs/IdentityText" },
+        "deadline": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "RunStepRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/IdentityText" },
+        "stepId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ToolCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callId", "executor", "name"],
+      "properties": {
+        "callId": { "$ref": "#/$defs/IdentityText" },
+        "executor": { "$ref": "#/$defs/IdentityText" },
+        "name": { "$ref": "#/$defs/IdentityText" },
+        "arguments": {},
+        "binding": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "origin": { "$ref": "#/$defs/RunStepRef" }
+      }
+    },
+    "StoredExecutionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["SUCCEEDED", "FAILED", "CANCELLED", "UNKNOWN"],
+          "description": "NOT_FOUND is not recordable; PENDING/RUNNING mean 'no result recorded', so they are absent rather than stored."
+        },
+        "handle": { "type": "string" },
+        "result": {},
+        "error": { "type": "string" }
+      }
+    },
+    "ToolResultRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executionId", "result"],
+      "properties": {
+        "executionId": { "$ref": "#/$defs/ExecutionId" },
+        "result": { "$ref": "#/$defs/StoredExecutionResult" }
+      }
+    },
+    "AppliedResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executionId", "appliedAt"],
+      "properties": {
+        "executionId": { "$ref": "#/$defs/ExecutionId" },
+        "appliedAt": { "$ref": "#/$defs/RunStepRef" }
+      }
+    },
+    "EventInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["eventId", "type"],
+      "properties": {
+        "eventId": { "$ref": "#/$defs/IdentityText" },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Kind of the fact. Reserved prefixes session./thread./run./step. are rejected; namespaced kinds such as durable/finalization_started are extension events."
+        },
+        "data": {},
+        "runId": { "$ref": "#/$defs/IdentityText" },
+        "stepId": {
+          "$ref": "#/$defs/IdentityText",
+          "description": "EventInput::validate requires runId whenever stepId is present ('Step requires a Run')."
+        }
+      }
+    },
+    "JournalAppend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedPosition"],
+      "properties": {
+        "expectedPosition": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Compare-and-set against ThreadStateView.journalPosition; a mismatch answers CONFLICT."
+        },
+        "entries": {
+          "type": "array",
+          "items": {},
+          "description": "Opaque native journal entries appended atomically with the checkpoint."
+        }
+      }
+    },
+    "RunChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "status"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/IdentityText" },
+        "status": {
+          "type": "string",
+          "enum": ["RUNNING", "COMPLETED", "STOPPED", "FAILED"],
+          "description": "RunChange::validate rejects PREPARED and LOST: those are owned by the execution host. Terminal states require an outcome."
+        },
+        "outcome": { "type": "string" },
+        "reason": { "type": "string" }
+      }
+    },
+    "StepChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "stepId", "status", "phase"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/IdentityText" },
+        "stepId": { "$ref": "#/$defs/IdentityText" },
+        "status": {
+          "type": "string",
+          "enum": ["RUNNING", "COMPLETED", "STOPPED", "FAILED"],
+          "description": "Only takeover may declare LOST, so a commit never carries it."
+        },
+        "phase": {
+          "type": "string",
+          "enum": ["REASONING", "ACTING", "FINALIZATION"]
+        },
+        "resumedFromStepId": { "$ref": "#/$defs/IdentityText" },
+        "reason": { "type": "string" }
+      }
+    },
+    "TokenUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inputTokens": { "type": "integer", "minimum": 0 },
+        "outputTokens": { "type": "integer", "minimum": 0 },
+        "details": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "ModelCallChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["modelCallId", "status"],
+      "description": "Upsert by id: provider opens a provider attempt, status settles it. A running model call carries no final usage (ModelCallChange::validate).",
+      "properties": {
+        "modelCallId": { "$ref": "#/$defs/IdentityText" },
+        "status": {
+          "type": "string",
+          "enum": ["RUNNING", "COMPLETED", "FAILED", "CANCELLED", "LOST"]
+        },
+        "model": { "type": "string" },
+        "purpose": { "type": "string" },
+        "iteration": { "type": "integer" },
+        "stepId": { "$ref": "#/$defs/IdentityText" },
+        "provider": { "type": "string" },
+        "usage": { "$ref": "#/$defs/TokenUsage" },
+        "usageComplete": { "type": "boolean" },
+        "errorType": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "$comment": "A RUNNING model call has no final usage.",
+          "if": {
+            "properties": { "status": { "const": "RUNNING" } },
+            "required": ["status"]
+          },
+          "then": { "not": { "required": ["usage"] } }
+        }
+      ]
+    }
+  }
+}

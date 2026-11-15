@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/page.schema.json",
+  "title": "PageRequest",
+  "description": "How a caller asks for a page. Rust: every `limit` parameter of SessionBackend (crates/agentscope-durable/src/session_backend.rs) is validated by backend/mod.rs::clamp_limit, which answers INVALID 'Page limit must be 1..=1000' for 0 or anything above 1000. The same bound applies to journal reads, event reads and resource SEARCH limits (ResourceRequest::validate also caps limit at 1000).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["limit"],
+  "properties": {
+    "cursor": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque cursor returned by the previous page (event cursors are '<session storage key>:<sequence>'). Omit for the first page."
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "description": "Page size. 1..=1000 inclusive; both ends are hard: 0 and 1001 are rejected, never clamped."
+    }
+  }
+}

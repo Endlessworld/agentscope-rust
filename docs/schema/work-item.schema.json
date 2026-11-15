@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/work-item.schema.json",
+  "title": "WorkerItem (WorkItem)",
+  "description": "One entry of the durable readiness index: what a worker is due to work on. Rust: crates/agentscope-durable/src/store.rs::WorkItem; the persisted record is store/file.rs::WorkRecord (#[serde(rename_all = camelCase)] on workId/readyAt). Ordering is by readiness, and `ready_at < 0` removes the entry.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["queue", "workId", "readyAt"],
+  "properties": {
+    "queue": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Queue name. The turn queue is keyed by harness selector, so one store can serve several definitions."
+    },
+    "workId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S",
+      "description": "Identity of the work item inside its queue (a thread id for the turn queue)."
+    },
+    "readyAt": {
+      "type": "integer",
+      "description": "Epoch millis on the store clock. A worker may only claim the item once now >= readyAt; a negative value marks the entry for removal."
+    },
+    "payload": {
+      "description": "Opaque scheduling payload; absent when the queue stores none."
+    }
+  }
+}

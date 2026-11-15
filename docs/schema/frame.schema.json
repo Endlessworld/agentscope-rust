@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentscope.dev/schema/durable.v1/frame.schema.json",
+  "title": "Frame",
+  "description": "The material state a worker needs to make progress on one thread. Rust: crates/agentscope-durable/src/types/commit.rs::Frame. Java: DurableTypes.Frame. `now` is the store clock of the transaction that produced the frame; a worker must not use its own clock for lease decisions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["definition", "turn", "now"],
+  "properties": {
+    "definition": { "$ref": "#/$defs/ThreadSpec" },
+    "turn": { "$ref": "#/$defs/TurnView" },
+    "input": {},
+    "checkpoint": {},
+    "checkpointMetadata": { "$ref": "#/$defs/CheckpointMetadata" },
+    "tools": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ToolExecution" }
+    },
+    "signals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Signal" }
+    },
+    "now": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "IdentityText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S"
+    },
+    "SessionKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "sessionId"],
+      "properties": {
+        "namespace": { "$ref": "#/$defs/IdentityText" },
+        "sessionId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ThreadKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session", "threadId"],
+      "properties": {
+        "session": { "$ref": "#/$defs/SessionKey" },
+        "threadId": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ThreadBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["harness", "definitionVersion", "stateVersion"],
+      "properties": {
+        "harness": { "$ref": "#/$defs/IdentityText" },
+        "definitionVersion": { "$ref": "#/$defs/IdentityText" },
+        "stateVersion": { "$ref": "#/$defs/IdentityText" }
+      }
+    },
+    "ThreadSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "binding"],
+      "properties": {
+        "key": { "$ref": "#/$defs/ThreadKey" },
+        "binding": { "$ref": "#/$defs/ThreadBinding" }
+      }
+    },
+    "TurnStatus": {
+      "type": "string",
+      "enum": [
+        "QUEUED",
+        "RUNNING",
+        "WAITING",
+        "PAUSING",
+        "PAUSED",
+        "CANCELLING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED"
+      ]
+    },
+    "TurnView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "thread",
+        "turnId",
+        "status",
+        "revision",
+        "cancellationRequested"
+      ],
+      "properties": {
+        "thread": { "$ref": "#/$defs/ThreadKey" },
+        "turnId": { "$ref": "#/$defs/IdentityText" },
+        "status": { "$ref": "#/$defs/TurnStatus" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "cancellationRequested": { "type": "boolean" },
+        "output": {},
+        "error": { "type": "string" },
+        "waiting": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["key", "deadline"],
+          "properties": {
+            "key": { "$ref": "#/$defs/IdentityText" },
+            "deadline": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "recovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["failures", "policy", "retryable", "message"],
+          "properties": {
+            "failures": { "type": "integer", "minimum": 1 },
+            "policy": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["maxRetries", "initialDelayMillis", "maxDelayMillis"],
+              "properties": {
+                "maxRetries": { "type": "integer", "minimum": 0, "maximum": 1000 },
+                "initialDelayMillis": { "type": "integer", "minimum": 1 },
+                "maxDelayMillis": { "type": "integer", "minimum": 1, "maximum": 86400000 }
+              }
+            },
+            "retryable": { "type": "boolean" },
+            "retryAt": { "type": "integer", "minimum": 0 },
+            "message": { "type": "string" }
+          }
+        },
+        "parent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["thread", "turnId", "executionId"],
+          "properties": {
+            "thread": { "$ref": "#/$defs/ThreadKey" },
+            "turnId": { "$ref": "#/$defs/IdentityText" },
+            "executionId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 513
+            }
+          }
+        }
+      }
+    },
+    "CheckpointMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "harness",
+        "definitionVersion",
+        "stateVersion",
+        "position",
+        "digest"
+      ],
+      "properties": {
+        "schemaVersion": { "type": "string", "const": "1" },
+        "harness": { "$ref": "#/$defs/IdentityText" },
+        "definitionVersion": { "$ref": "#/$defs/IdentityText" },
+        "stateVersion": { "$ref": "#/$defs/IdentityText" },
+        "position": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "digest": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" }
+      }
+    },
+    "ToolCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["callId", "executor", "name"],
+      "properties": {
+        "callId": { "$ref": "#/$defs/IdentityText" },
+        "executor": { "$ref": "#/$defs/IdentityText" },
+        "name": { "$ref": "#/$defs/IdentityText" },
+        "arguments": {},
+        "binding": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" }
+      }
+    },
+    "ToolExecution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request", "dispatchAttempted", "applied"],
+      "properties": {
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["executionId", "thread", "turnId", "call"],
+          "properties": {
+            "executionId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 513
+            },
+            "thread": { "$ref": "#/$defs/ThreadKey" },
+            "turnId": { "$ref": "#/$defs/IdentityText" },
+            "call": { "$ref": "#/$defs/ToolCall" }
+          }
+        },
+        "dispatchAttempted": { "type": "boolean" },
+        "result": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state"],
+          "properties": {
+            "state": {
+              "type": "string",
+              "enum": ["SUCCEEDED", "FAILED", "CANCELLED", "UNKNOWN"]
+            },
+            "handle": { "type": "string" },
+            "result": {},
+            "error": { "type": "string" }
+          }
+        },
+        "applied": { "type": "boolean" }
+      }
+    },
+    "Signal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "key"],
+      "properties": {
+        "id": { "$ref": "#/$defs/IdentityText" },
+        "key": { "$ref": "#/$defs/IdentityText" },
+        "value": {}
+      }
+    }
+  }
+}
