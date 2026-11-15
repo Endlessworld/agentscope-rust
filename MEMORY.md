@@ -1070,3 +1070,9 @@
 - Java 对照结论：Java durable **没有** harness offload 这条路径；它的 tick 对每个非终态 tool 调 `DurableRuntime.resolve`→`ExecutionRecovery.resolve`（`beginDispatch` + query/start/cancel），而 `UNKNOWN` 在 Java **不是 terminal**，所以「结局无法确认」时 Java 直接不结算（turn 一直活着重试）。Rust 选择按既有反挂起原则把它结算成 `Failed(unknown outcome)`，属**有意偏离**，不要当成 bug 改回去。
 - 全量基线（含并行会话的 traffic/control-poll 未提交改动）：**212 targets / 6437 passed / 0 failed / 8 ignored**，`cargo fmt --check` 干净。
 - 注意：工作树里 `crates/agentscope-durable/src/traffic.rs`、`tests/control_poll_test.rs`、`tests/read_traffic_test.rs`、`TurnControl`/`control_state`、以及 `store.rs`/`store/file.rs`/`store/memory.rs` 的大段改动来自**并行会话**（读放大/控制轮询治理），不是本会话产物，勿回退。
+
+- 2026-11-16 L3 落地（未提交，仅 `agentscope-durable`）：`SessionBackend` 新增三方法且都有默认实现（返回 `UNAVAILABLE`）——`resources(&Lease, ResourceRequest) -> Vec<ResourceValue>`（GET/SEARCH 只读、PUT/CAS/DELETE 各推进一次 `resource_position`，`requestId` 幂等靠 `resource-receipt:<hash>`）、`delegate(&Lease, execution_id, request_id, DelegationTarget) -> DelegationView`、`restore(Restoration) -> ThreadView`。实现分落 `backend/resource.rs`（一值一键 `resource:<hash(ns\0key)>`，不嵌入 SessionState）与 `backend/branch.rs`。
+- 分支语义定案：`journal_branch` 只在**空时间线**上改名（委派新建子 thread → `delegate-<hash 前32>`；restore 目标 journal=0 且无 checkpoint → `restore-<hash 前32>`），因 compaction 只走当前分支，给已有历史的线程改分支会把旧字节搁死。label 不得含 ':' 且 ≤64 字符。
+- `restore` 语义：目标线程必须存在且空闲、`expected_position == journal_position`（CAS）、checkpoint 非 null；checkpoint 装成新 history 位置（settled=true），journal 追加在 expected_position 之后，resources 按自身版本写入；`requestId` 幂等靠 `restore:<hash>`。
+- `ThreadStateView` 新增 `#[serde(default)] resource_position`（唯一可观测口径，测试据此断言）；`identity::create_thread_in_branch` 与 `turn::submit_with_parent` 为内部旁路（admission digest 不含 parent，避免老数据 digest 变化）。
+- 三方法当前**零调用方**（契约就绪、待 M6 使用方接入）；验证 `cargo test -p agentscope-durable -p agentscope-durable-adapter-agentscope -j 2` → 19 targets / 164 passed / 0 failed，fmt 干净。

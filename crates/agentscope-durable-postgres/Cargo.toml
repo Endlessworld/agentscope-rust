@@ -1,0 +1,24 @@
+[package]
+name = "agentscope-durable-postgres"
+description = "AgentScope Rust - PostgreSQL record store for the durable runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# Exposes the in-memory `SqlSession` double as library API for downstream tests. Off by default
+# so a simulated database cannot be mistaken for the real one.
+testing = []
+
+[dependencies]
+agentscope-durable = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

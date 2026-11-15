@@ -145,6 +145,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentscope-durable-objects"
+version = "0.2.0"
+dependencies = [
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "agentscope-durable-postgres"
+version = "0.2.0"
+dependencies = [
+ "agentscope-durable",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "agentscope-durable-worker"
+version = "0.2.0"
+dependencies = [
+ "agentscope-durable",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "agentscope-extensions-a2a-client"
 version = "0.2.0"
 dependencies = [

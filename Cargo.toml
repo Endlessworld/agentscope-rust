@@ -8,6 +8,9 @@ members = [
     "crates/agentscope-harness",
     "crates/agentscope-durable",
     "crates/agentscope-durable-adapter-agentscope",
+    "crates/agentscope-durable-worker",
+    "crates/agentscope-durable-postgres",
+    "crates/agentscope-durable-objects",
     # agentscope-extensions/* 迁移 crate（每个 crate 由 docs/extensions/<MODULE>__GAP_TRACKER.md 跟踪）
     "crates/agentscope-extensions-model",
     "crates/agentscope-extensions-protocol",
