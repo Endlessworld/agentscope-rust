@@ -183,27 +183,95 @@ pub(super) fn require_turn(txn: &dyn Txn, turn_id: &str) -> Result<TurnData> {
     load_turn(txn, turn_id)?.ok_or_else(|| DurableError::not_found("Turn does not exist"))
 }
 
-/// Turns admitted to a thread, in admission order.
-pub(super) fn queue_ids(txn: &dyn Txn, thread_id: &str) -> Result<Vec<String>> {
-    let parts = txn.keys(&queue_prefix(thread_id), None, 10_000)?;
+/// How many turn ids one read of a thread queue returns.
+///
+/// The queue is read in pages so that a conversation is never cut off at a fixed size: a single
+/// read used to stop at ten thousand turns, after which the newest turn was invisible to
+/// [`current_turn`], `ready_at` answered `-1` and the thread stopped being scheduled while
+/// `submit` kept succeeding.
+const QUEUE_PAGE: usize = 1_000;
+
+/// How many turns one thread may hold before the backend refuses to walk its queue.
+///
+/// Some bound has to exist — walking a queue of unknown length inside one transaction is the read
+/// amplification this store is trying to avoid — but it is reported, never applied silently: a
+/// caller that hits it gets an `INVALID` failure instead of a thread that quietly stops running.
+const QUEUE_MAX_TURNS: usize = 1_000_000;
+
+fn queue_over_limit(turns: usize) -> DurableError {
+    DurableError::invalid(format!(
+        "thread queue holds more than {QUEUE_MAX_TURNS} turns ({turns} read)"
+    ))
+}
+
+/// One page of a thread's turn queue: the ids in admission order, and the key to continue after
+/// (`None` when the queue ends here).
+fn queue_page(
+    txn: &dyn Txn,
+    thread_id: &str,
+    after: Option<&str>,
+) -> Result<(Vec<String>, Option<String>)> {
+    // One id more than the page tells whether another page exists without a second round trip.
+    let mut parts = txn.keys(&queue_prefix(thread_id), after, QUEUE_PAGE + 1)?;
+    let more = parts.len() > QUEUE_PAGE;
+    if more {
+        parts.truncate(QUEUE_PAGE);
+    }
+    let next = if more { parts.last().cloned() } else { None };
     let mut ids = Vec::with_capacity(parts.len());
     for part in parts {
         if let Some(id) = load_json::<String>(txn, &part)? {
             ids.push(id);
         }
     }
-    Ok(ids)
+    Ok((ids, next))
+}
+
+/// Turns admitted to a thread, in admission order.
+///
+/// Paged rather than windowed: the only limit is [`QUEUE_MAX_TURNS`], and reaching it is an
+/// error. A cap that is applied silently is how a long conversation stops being scheduled without
+/// anybody noticing.
+pub(super) fn queue_ids(txn: &dyn Txn, thread_id: &str) -> Result<Vec<String>> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let (page, next) = queue_page(txn, thread_id, after.as_deref())?;
+        if ids.len() + page.len() > QUEUE_MAX_TURNS {
+            return Err(queue_over_limit(ids.len() + page.len()));
+        }
+        ids.extend(page);
+        match next {
+            Some(next) => after = Some(next),
+            None => return Ok(ids),
+        }
+    }
 }
 
 /// The turn a writer would work on: the first non-terminal one in admission order.
+///
+/// Stops at the first non-terminal turn, so the common case costs one page; a thread with a
+/// hundred thousand finished turns is still askable on every tick.
 pub(super) fn current_turn(txn: &dyn Txn, thread_id: &str) -> Result<Option<TurnData>> {
-    for turn_id in queue_ids(txn, thread_id)? {
-        let turn = require_turn(txn, &turn_id)?;
-        if !turn.status.terminal() {
-            return Ok(Some(turn));
+    let mut after: Option<String> = None;
+    let mut read = 0usize;
+    loop {
+        let (page, next) = queue_page(txn, thread_id, after.as_deref())?;
+        read += page.len();
+        if read > QUEUE_MAX_TURNS {
+            return Err(queue_over_limit(read));
+        }
+        for turn_id in page {
+            let turn = require_turn(txn, &turn_id)?;
+            if !turn.status.terminal() {
+                return Ok(Some(turn));
+            }
+        }
+        match next {
+            Some(next) => after = Some(next),
+            None => return Ok(None),
         }
     }
-    Ok(None)
 }
 
 fn waiting_satisfied(turn: &TurnData, key: &str) -> bool {
@@ -585,5 +653,51 @@ impl SessionBackend for TxnBackend {
 
     async fn prune_events(&self, session: &SessionKey, keep_newest: u64) -> Result<u64> {
         query::prune_events(self.store.as_ref(), session, keep_newest)
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    /// The queue is walked in pages, so its length is not the schedule's length.
+    ///
+    /// It used to be read with one fixed window of ten thousand ids: the ten-thousand-and-first
+    /// turn was invisible to `current_turn`, `ready_at` answered `-1` and the thread was never
+    /// scheduled again — while `submit` kept succeeding, so nothing reported the stall.
+    #[test]
+    fn a_queue_longer_than_one_page_still_finds_the_active_turn() -> Result<()> {
+        let store = InMemoryStore::new();
+        let thread = "thread-with-a-long-queue";
+        let total = QUEUE_PAGE + 3;
+        crate::store::txn(&store, "session", |txn: &mut dyn Txn| -> Result<()> {
+            for index in 0..total {
+                let turn_id = format!("turn-{index:05}");
+                txn.put(
+                    &queue_part(thread, index as u64),
+                    Some(serde_json::json!(turn_id)),
+                )?;
+                let mut turn = TurnData::new(turn_id, thread.to_string(), Value::Null, 0);
+                // Everything but the newest turn is finished, so only that one is work.
+                if index + 1 < total {
+                    turn.status = TurnStatus::Succeeded;
+                }
+                save_turn(txn, &turn)?;
+            }
+            Ok(())
+        })?;
+        let ids = crate::store::txn(&store, "session", |txn: &mut dyn Txn| {
+            queue_ids(txn, thread)
+        })?;
+        assert_eq!(ids.len(), total, "every admitted turn is listed");
+        let current = crate::store::txn(&store, "session", |txn: &mut dyn Txn| {
+            current_turn(txn, thread)
+        })?;
+        assert_eq!(
+            current.map(|turn| turn.turn_id),
+            Some(format!("turn-{:05}", total - 1)),
+            "the turn past the first page is the one to run"
+        );
+        Ok(())
     }
 }

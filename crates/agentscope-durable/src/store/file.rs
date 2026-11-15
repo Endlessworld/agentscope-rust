@@ -1,14 +1,30 @@
 //! Single-host file store: one JSON document per scope plus one per work item.
 //!
-//! Every write goes through a temporary file in the same directory followed by a rename,
-//! so a crash leaves either the previous document or the new one, never half of each.
-//! Cross-process exclusion uses one lock file per scope.
+//! # What is promised, and what is not
+//!
+//! Every write goes through a temporary file in the same directory followed by a rename, so a
+//! *process* crash — a panic, a `kill`, a supervisor restart — leaves either the previous
+//! document or the new one, never half of each, and a concurrent reader never sees a partial
+//! document.
+//!
+//! Power loss is a different promise and this store does not make it: no `sync_all` and no
+//! directory fsync are issued. A scope document is tens of megabytes and is rewritten on every
+//! turn, so flushing each one to the platter would multiply the write cost of a turn — the
+//! deployment this store targets (an agent host that is restarted far more often than the machine
+//! is powered off) cannot pay that. A machine that loses power in the middle of a write may
+//! therefore find a zero-length or half-written document; it is reported as an `INVALID` document
+//! rather than silently trusted, and the previous one is gone. Restoring power-loss safety is a
+//! deliberate trade against the low-consumption rule, not an oversight.
+//!
+//! Cross-process exclusion uses one lock file per scope; any number of hosts may share one root
+//! (see [`FileStore`]).
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -33,6 +49,24 @@ const LOCK_RETRY: Duration = Duration::from_millis(10);
 // pid at all. It is far larger than any transaction, because reclaiming a live lock is a lost
 // update, not a hiccup.
 const LOCK_STALE_UNKNOWN: Duration = Duration::from_secs(30 * 60);
+
+// How long a lock body that a reclaim had to move aside is given to get back to its path.
+//
+// The body belongs to a live holder, so the reclaim must not drop it; but waiting out the whole
+// `LOCK_TIMEOUT` would spend the *contender's* deadline on somebody else's transaction. The short
+// bound covers the case it is there for — a third contender that creates the lock and drops it
+// again immediately. When it expires the body stays in its aside file instead of being deleted,
+// and the holder's `verify` then refuses the commit it could no longer be sure of.
+const LOCK_PUT_BACK: Duration = Duration::from_secs(2);
+
+/// The body written over a lock this process failed to delete.
+///
+/// `holder_alive` reads the first field as a pid, so an abandoned lock has to name a pid that is
+/// provably gone: this one is above the maximum pid on both platforms (`pid_max` is below 2^22 on
+/// Linux, and Windows refuses `OpenProcess` for it) while still parsing as a `u32`. A lock
+/// carrying it is reclaimed by the next contender at once instead of reading as a live holder for
+/// `LOCK_STALE_UNKNOWN`.
+const LOCK_TOMBSTONE: &str = "2147483646 0";
 
 // The retry budget of one file operation another process holds.
 //
@@ -115,6 +149,12 @@ impl FileStore {
             // which is success; a transient hold on the parent is retried like any other.
             retry_while_held(|| fs::create_dir_all(root.join(dir)))?;
         }
+        // One canonical root when the file system offers one: the in-process holder table is
+        // keyed by lock path, and two stores of this process opened on the same directory under
+        // different spellings (relative, absolute, a `..` in the middle) would otherwise disagree
+        // about what a lock path *is* — one store would take the other's live lock for an orphan.
+        // The fallback keeps a store usable where canonicalising is refused.
+        let root = fs::canonicalize(&root).unwrap_or(root);
         Ok(Self { root })
     }
 
@@ -156,6 +196,7 @@ impl FileStore {
     fn commit(
         &self,
         scope: &str,
+        lock: &ScopeLock,
         base: BTreeMap<String, Value>,
         staged: BTreeMap<String, Option<Value>>,
         scheduled: BTreeMap<String, Scheduled>,
@@ -206,6 +247,11 @@ impl FileStore {
             }
         }
         if touched {
+            // The last moment at which losing the lock can still be noticed, and the only one that
+            // matters: the lock is what excludes the other writer, so a stolen lock must cost an
+            // abandoned commit, not a lost update. One small read against a whole-document
+            // rewrite, so the check is cheap enough to make unconditionally.
+            lock.verify()?;
             let bytes = serde_json::to_vec(&committed)?;
             count_scope_write(bytes.len());
             write_atomic(&self.scope_path(scope), &bytes)?;
@@ -220,7 +266,7 @@ impl RecordStore for FileStore {
         scope: &str,
         work: &mut dyn FnMut(&mut dyn Txn) -> Result<()>,
     ) -> Result<()> {
-        let _lock = acquire_lock(&self.lock_path(scope))?;
+        let lock = acquire_lock(&self.lock_path(scope))?;
         let base = self.read_scope(scope)?;
         let mut staged = StagedTxn {
             base: &base,
@@ -237,7 +283,7 @@ impl RecordStore for FileStore {
             return Err(error);
         }
         TRANSACTIONS.fetch_add(1, Ordering::Relaxed);
-        self.commit(scope, base, staged, scheduled)
+        self.commit(scope, &lock, base, staged, scheduled)
     }
 
     fn scope_bytes(&self, scope: &str) -> Result<Option<u64>> {
@@ -409,6 +455,10 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 /// Temporary file plus rename, retried because another host may briefly hold the target.
+///
+/// Deliberately no `sync_all` and no directory fsync: see the module note. The rename is what
+/// makes a *process* crash safe; a power cut is not covered, and buying that coverage would cost a
+/// platter flush of every scope document on every turn.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     BYTES_WRITTEN.fetch_add(bytes.len() as u64, Ordering::Relaxed);
     let sequence = next_sequence();
@@ -464,6 +514,50 @@ fn next_sequence() -> u64 {
     SEQUENCE.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Locks this process currently holds, `path -> body`.
+///
+/// `process_alive` answers for a pid, not for a lock: after a delete that failed, a lock still
+/// names a live process — us — and would block its scope until the process exits, `LOCK_TIMEOUT`
+/// at a time, with no way to recover. This table is the missing half of the answer: a lock whose
+/// body names *this* process but is not registered here is a leftover of this process, and taking
+/// it over is always right because nothing in this process is behind it. Cross-process exclusion
+/// is untouched: another process's lock names a pid that is not ours and stays subject to the
+/// liveness rule.
+fn held_locks() -> &'static Mutex<BTreeMap<PathBuf, String>> {
+    static HELD: OnceLock<Mutex<BTreeMap<PathBuf, String>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Registers a lock this process now holds. Failing to register means the liveness answer can no
+/// longer be trusted for it, so the acquisition is refused instead.
+fn hold(path: &Path, stamp: &str) -> Result<()> {
+    let mut held = held_locks()
+        .lock()
+        .map_err(|_| DurableError::unavailable("lock table poisoned"))?;
+    held.insert(path.to_path_buf(), stamp.to_string());
+    Ok(())
+}
+
+/// Forgets a lock, but only while the table still names the body this holder wrote: a successor of
+/// the same process may already hold the path and must keep its entry.
+fn release_held(path: &Path, stamp: &str) {
+    if let Ok(mut held) = held_locks().lock() {
+        if held.get(path).is_some_and(|current| current == stamp) {
+            held.remove(path);
+        }
+    }
+}
+
+/// Whether `body` is the lock this process is holding at `path` right now.
+fn registered(path: &Path, body: &str) -> bool {
+    match held_locks().lock() {
+        Ok(held) => held.get(path).is_some_and(|current| current == body),
+        // A poisoned table cannot be read, and not knowing must not turn a live lock into an
+        // orphan: answering "registered" only leaves such a lock for the older rules to decide.
+        Err(_) => true,
+    }
+}
+
 /// Held for the lifetime of one transaction; removal happens on every exit path.
 struct ScopeLock {
     path: PathBuf,
@@ -471,17 +565,58 @@ struct ScopeLock {
     stamp: String,
 }
 
+impl ScopeLock {
+    /// Whether this transaction still owns the scope lock it took.
+    ///
+    /// Two things can take a lock away: a contender that judged it stale (only possible when its
+    /// pid is unreadable or reused), and `reclaim_stale` that had to move it aside and could not
+    /// put it back. Either way the only answer that is safe is to abandon the commit — writing the
+    /// scope would be exactly the lost update the lock exists to prevent. The check costs one
+    /// small read next to a whole-document rewrite, so it is done immediately before the write.
+    fn verify(&self) -> Result<()> {
+        let body = retry_while_held(|| fs::read_to_string(&self.path)).map_err(|error| {
+            DurableError::unavailable(format!("scope lock is unreadable: {error}"))
+        })?;
+        if body != self.stamp {
+            return Err(DurableError::unavailable("scope lock was lost"));
+        }
+        Ok(())
+    }
+}
+
 impl Drop for ScopeLock {
     fn drop(&mut self) {
         // Only the lock this transaction created: a lock written by a later holder belongs to it,
         // and removing it would let a third writer in while that one is still writing the scope.
         // The read is retried like the removal: a transient hold here must not leave a lock
-        // behind that blocks the scope until its timeout.
+        // behind that blocks the scope until its timeout. Bodies are unique per acquisition, so a
+        // match here is this transaction's own file, never a successor's.
         let ours = retry_while_held(|| fs::read_to_string(&self.path))
             .is_ok_and(|body| body == self.stamp);
         if ours {
-            let _ = retry_while_held(|| fs::remove_file(&self.path));
+            match retry_while_held(|| fs::remove_file(&self.path)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    // The delete failed and the file still names this live pid. Left alone it
+                    // stops the scope for as long as this process runs, so it is overwritten with
+                    // a body whose owner is provably gone and the next contender reclaims it at
+                    // once. The re-read is inside the retried closure so a lock that changed
+                    // hands in the meantime is never touched.
+                    let _ = retry_while_held(|| {
+                        let body = fs::read_to_string(&self.path)?;
+                        if body != self.stamp {
+                            return Ok(());
+                        }
+                        fs::write(&self.path, LOCK_TOMBSTONE.as_bytes())
+                    });
+                }
+            }
         }
+        // Dropped last: even when both the delete and the tombstone failed, removing the entry
+        // turns the leftover into "a lock naming this process that nobody here holds", which is
+        // what `stale_body` reclaims at once.
+        release_held(&self.path, &self.stamp);
     }
 }
 
@@ -494,9 +629,37 @@ fn acquire_lock(path: &Path) -> Result<ScopeLock> {
             .open(path)
         {
             Ok(mut file) => {
-                let stamp = format!("{} {}", std::process::id(), crate::now_millis());
-                let _ = file.write_all(stamp.as_bytes());
-                let _ = file.flush();
+                // Two fields would not identify a *lock*: two threads of this process can take the
+                // lock in the same millisecond, and identical bodies would then let one of them
+                // delete the other's file in `Drop` while it still holds it — two writers on one
+                // scope. The per-process sequence makes every acquisition's body unique.
+                let stamp = format!(
+                    "{} {} {}",
+                    std::process::id(),
+                    crate::now_millis(),
+                    next_sequence()
+                );
+                // Registered before the body is written, so that no contender can ever read a
+                // body naming this process that the holder table does not yet know: that would be
+                // the "orphan" rule stealing a lock that was live a microsecond later. An empty
+                // body is unattributable and therefore not taken either way.
+                if let Err(error) = hold(path, &stamp) {
+                    let _ = retry_while_held(|| fs::remove_file(path));
+                    return Err(error);
+                }
+                // The body names the holder, so writing it belongs to taking the lock: an empty
+                // body cannot be attributed to anybody, and a lock nobody can attribute keeps the
+                // scope busy for `LOCK_STALE_UNKNOWN` if it survives. A failure therefore hands
+                // the lock back instead of leaving an unattributable file behind.
+                if let Err(error) = retry_while_held(|| file.write_all(stamp.as_bytes()))
+                    .and_then(|()| retry_while_held(|| file.flush()))
+                {
+                    drop(file);
+                    let _ = retry_while_held(|| fs::remove_file(path));
+                    release_held(path, &stamp);
+                    return Err(error.into());
+                }
+                drop(file);
                 return Ok(ScopeLock {
                     path: path.to_path_buf(),
                     stamp,
@@ -537,6 +700,10 @@ fn acquire_lock(path: &Path) -> Result<ScopeLock> {
 /// compared with the one the caller saw as stale: if they differ, the winner had already
 /// recovered and that lock is put back exactly as it was, never replacing a lock that appeared in
 /// the meantime.
+///
+/// The body of a live lock is never deleted, whatever happens next: its holder would go on writing
+/// the scope while a third contender held the lock. A body that cannot be put back stays in its
+/// aside file, and `ScopeLock::verify` makes that holder abandon the commit instead.
 fn reclaim_stale(path: &Path, observed: &str) {
     let name = path
         .file_name()
@@ -547,31 +714,73 @@ fn reclaim_stale(path: &Path, observed: &str) {
         std::process::id(),
         next_sequence()
     ));
-    // Somebody else won the reclaim, or the file is gone: the loop decides with `create_new`.
+    // The lock that read as stale is not necessarily the lock still on disk, and the second look
+    // is authoritative in both directions: a body that changed means another contender already
+    // dealt with it, and a body that is *gone* — the usual case, because the winner of a reclaim
+    // leaves the path free for a moment before it retries — means there is nothing to reclaim at
+    // all. Renaming a lock that appeared in that moment would take it away from a live holder
+    // while a third contender creates its own: two writers on one scope.
+    if !retry_while_held(|| fs::read_to_string(path)).is_ok_and(|body| body == observed) {
+        return;
+    }
+    // Somebody else won the race in the last instant, or the file is gone: the loop decides with
+    // `create_new`.
     if retry_while_held(|| fs::rename(path, &aside)).is_err() {
         return;
     }
     match retry_while_held(|| fs::read_to_string(&aside)) {
         Ok(body) if body == observed => {
+            // Really the stale lock: nobody is behind it, so dropping it *is* the reclaim.
             let _ = retry_while_held(|| fs::remove_file(&aside));
         }
         Ok(body) => {
             // A lock somebody else had just created. `create_new` puts it back without ever
-            // overwriting a lock a third contender may have created in the meantime. It is retried
-            // like every other file operation: a transient hold here would lose a live lock.
-            if let Ok(mut file) = retry_while_held(|| {
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-            }) {
-                let _ = file.write_all(body.as_bytes());
-                let _ = file.flush();
+            // overwriting a lock a third contender may have created in the meantime.
+            if put_back(path, &body).is_ok() {
+                let _ = retry_while_held(|| fs::remove_file(&aside));
             }
-            let _ = retry_while_held(|| fs::remove_file(&aside));
+            // Otherwise the body stays in `aside`: deleting it would be the lost update this
+            // function exists to prevent, and its holder notices through `verify`.
         }
         Err(_) => {
-            let _ = retry_while_held(|| fs::remove_file(&aside));
+            // The body cannot be read, so nothing is known about its owner. The path is free,
+            // which is what a reclaim wants; inventing a body to put back would be worse than
+            // leaving the aside file behind.
+        }
+    }
+}
+
+/// Puts a lock body that had to be moved aside back at its path.
+///
+/// `create_new` is what makes this safe: the path may have been taken by a third contender while
+/// the file was aside, and overwriting that lock would be a lost update for *its* holder. A busy
+/// path is therefore waited for, but only for [`LOCK_PUT_BACK`]: waiting out `LOCK_TIMEOUT` would
+/// spend the recovering contender's own deadline on another host's transaction.
+fn put_back(path: &Path, body: &str) -> std::io::Result<()> {
+    let deadline = Instant::now() + LOCK_PUT_BACK;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                // The body is a few bytes; if writing it fails the path names a holder that wrote
+                // nothing, which `LOCK_STALE_UNKNOWN` still reclaims.
+                let _ = file.write_all(body.as_bytes());
+                let _ = file.flush();
+                return Ok(());
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    || is_transient_hold(&error) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(LOCK_RETRY);
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -598,8 +807,14 @@ fn is_stale(path: &Path) -> bool {
 ///
 /// The body is returned so a reclaim can prove it moved *the* lock it judged stale.
 fn stale_body(path: &Path) -> Option<String> {
-    let body = fs::read_to_string(path).ok()?;
+    // Retried like every other read: a transient hold must not be mistaken for "the lock is gone"
+    // by one contender after another.
+    let body = retry_while_held(|| fs::read_to_string(path)).ok()?;
     match holder_alive(&body) {
+        // This process's pid is live, but that says nothing about *this lock*: a delete that
+        // failed leaves a body naming us with nobody behind it. Only a lock registered in the
+        // holder table is a live owner here.
+        Some(true) if is_orphan_of_this_process(path, &body) => Some(body),
         // Another thread of this very process is a live owner too: waiting is correct.
         Some(true) => None,
         // A lock whose writer already exited can be taken over at once: waiting out a grace
@@ -607,6 +822,23 @@ fn stale_body(path: &Path) -> Option<String> {
         Some(false) => Some(body),
         // No readable pid: only age can decide, and it has to be beyond any transaction.
         None => is_old(path).then_some(body),
+    }
+}
+
+/// Whether this lock names this very process but is not held by it.
+///
+/// `process_alive` answers for a pid, not for a lock. After a delete that failed, the body still
+/// names a live process — us — and would block the scope until this process exits, with no
+/// recovery path at all; the holder table is what tells that leftover from a lock another thread
+/// of this process is really holding.
+fn is_orphan_of_this_process(path: &Path, body: &str) -> bool {
+    match body
+        .split_whitespace()
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok())
+    {
+        Some(pid) if pid == std::process::id() => !registered(path, body),
+        _ => false,
     }
 }
 
@@ -708,10 +940,69 @@ mod lock_liveness_tests {
     }
 
     #[test]
-    fn a_lock_held_by_a_live_process_is_not_stale() {
+    fn a_lock_this_process_holds_is_not_stale() {
         let path = lock_file("live");
-        fs::write(&path, format!("{} 0", std::process::id())).unwrap();
+        // Taking the lock registers it: a registered lock of this process is a live owner, not an
+        // orphan, however much the file looks like one.
+        let lock = acquire_lock(&path).unwrap();
         assert!(!is_stale(&path));
+        drop(lock);
+        assert!(!path.exists(), "a normal release removes the lock");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_lock_naming_this_process_that_nobody_holds_is_an_orphan() {
+        // The field symptom: a `remove_file` that failed leaves the lock naming a live pid — this
+        // one — with nothing behind it. `process_alive` alone would keep the scope unusable for
+        // the whole life of the process, `LOCK_TIMEOUT` per transaction.
+        let path = lock_file("orphan");
+        fs::write(&path, format!("{} 1", std::process::id())).unwrap();
+        assert!(
+            is_stale(&path),
+            "a lock of our pid that we do not hold is a leftover"
+        );
+
+        let started = Instant::now();
+        let lock = acquire_lock(&path).expect("an orphan of this process is reclaimed at once");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "an orphan must not be waited for: {:?}",
+            started.elapsed()
+        );
+        drop(lock);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_lock_left_behind_as_a_tombstone_is_reclaimed() {
+        // What `Drop` writes when the delete fails: a body whose owner is provably gone, so the
+        // next contender reclaims it instead of waiting out a grace period.
+        let path = lock_file("tombstone");
+        fs::write(&path, LOCK_TOMBSTONE).unwrap();
+        assert_eq!(LOCK_TOMBSTONE, format!("{DEAD_PID} 0"));
+        assert!(is_stale(&path));
+
+        let started = Instant::now();
+        let lock = acquire_lock(&path).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(lock);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_holder_that_lost_its_lock_cannot_commit() {
+        // A reclaim that could not put a live body back leaves its holder owning a lock file that
+        // is no longer there. The holder has to notice before it writes the scope, not after.
+        let path = lock_file("verify");
+        let lock = acquire_lock(&path).unwrap();
+        fs::write(&path, format!("{DEAD_PID} 0")).unwrap();
+        let refused = lock.verify().is_err();
+        drop(lock);
+        assert!(
+            refused,
+            "a holder whose lock was taken away must be refused"
+        );
         cleanup(&path);
     }
 
@@ -732,12 +1023,13 @@ mod lock_liveness_tests {
         // could give it. Taking the lock away from a live owner is a lost update, so age must not
         // decide while the owner can be identified.
         let path = lock_file("live-old");
-        fs::write(&path, format!("{} 0", std::process::id())).unwrap();
+        let lock = acquire_lock(&path).unwrap();
         make_old(&path, Duration::from_secs(3600));
         assert!(
             !is_stale(&path),
             "a live owner keeps its lock however old the file is"
         );
+        drop(lock);
         cleanup(&path);
     }
 
@@ -768,26 +1060,25 @@ mod lock_liveness_tests {
 
     #[test]
     fn a_lock_held_by_a_thread_of_this_process_is_waited_for() {
-        // `process_alive` answers true for our own pid, so a lock another thread of this process
-        // holds must be waited for — reclaiming it would put two writers on one scope. The age is
-        // shrunk only through `make_old`, the wait itself uses the real retry interval.
+        // A lock another thread of this process holds must be waited for — reclaiming it would put
+        // two writers on one scope. What makes it live is the holder table (the pid alone cannot
+        // tell it from an orphan), and the wait uses the real retry interval.
         let path = lock_file("same-process");
-        fs::write(&path, format!("{} 0", std::process::id())).unwrap();
+        let lock = acquire_lock(&path).unwrap();
         make_old(&path, Duration::from_secs(3600));
-        let held = path.clone();
         let holder = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
-            fs::remove_file(&held).unwrap();
+            drop(lock);
         });
         let started = Instant::now();
-        let lock = acquire_lock(&path).expect("the release must be waited for");
+        let second = acquire_lock(&path).expect("the release must be waited for");
         holder.join().unwrap();
         assert!(
             started.elapsed() >= Duration::from_millis(150),
             "a lock of a live holder must not be reclaimed early: {:?}",
             started.elapsed()
         );
-        drop(lock);
+        drop(second);
         cleanup(&path);
     }
 
