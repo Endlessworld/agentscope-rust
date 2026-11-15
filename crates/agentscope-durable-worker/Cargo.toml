@@ -1,0 +1,22 @@
+[package]
+name = "agentscope-durable-worker"
+description = "AgentScope Rust - Brain/Hands worker and drivers over the durable tick"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# The only durable dependency is the runtime this crate drives; no harness, model or tool
+# implementation belongs here. `async-trait` and `serde_json` are already workspace deps.
+[dependencies]
+agentscope-durable.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
