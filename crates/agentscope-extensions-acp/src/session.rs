@@ -37,6 +37,7 @@ use agentscope_harness::agent::subagent::task::{BackgroundTask, TaskStatus};
 use agentscope_harness::agent::HarnessAgent;
 
 use super::config::{self, ModeChoice, ModelChoice};
+use super::deferred_effects::OffloadedToolEffects;
 use super::elicitation::{ElicitationClient, ElicitationSlot};
 use super::event;
 use super::permission_store::PermissionRuleStore;
@@ -1271,8 +1272,19 @@ impl AcpAgentSession {
             adapter.capabilities().state_version,
         )?;
         let owner = format!("acp-{}-{}", std::process::id(), control_id("run"));
-        let runtime =
+        let mut runtime =
             DurableRuntime::new(Arc::clone(&backend), owner).with_adapter(DURABLE_HARNESS, adapter);
+        // An offloaded tool outlives the turn that started it: the turn only holds a placeholder
+        // result, so its record blocks every terminal status until somebody says what became of
+        // the effect. The harness registry is the only authority on that, and the executor is
+        // how the runtime asks (a call whose outcome nothing can confirm stays unknown, which
+        // never lets the turn claim success).
+        if let Some(registry) = self.agent.async_tool_registry() {
+            runtime = runtime.with_executor(Arc::new(OffloadedToolEffects::new(
+                Arc::clone(registry),
+                self.session_id.to_string(),
+            )));
+        }
         runtime
             .ensure_session(SessionSpec {
                 key: thread.session.clone(),
@@ -3446,6 +3458,13 @@ impl AcpAgentSession {
                     std::time::Duration::from_secs(10)
                 };
                 let deadline = std::time::Instant::now() + grace;
+                // The tick loop hands a waiting or paused turn back instead of spinning on it,
+                // so a cancel landing on one would leave nobody to write the ending and the turn
+                // would sit in `cancelling` until the next prompt ticked it. Stop the loop first
+                // (its in-flight tick observes the cancel through its control poll), then drive
+                // the turn from here: a cancel of a turn nobody runs is settled by that tick
+                // itself, without an invocation and without a model call.
+                driver.finish().await;
                 while std::time::Instant::now() < deadline {
                     match runtime.session.turn(&turn_id).await {
                         Ok(current) if current.status.terminal() => break,
@@ -3455,9 +3474,9 @@ impl AcpAgentSession {
                     if closed.load(Ordering::SeqCst) {
                         break;
                     }
+                    let _ = runtime.session.tick().await;
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                driver.finish().await;
                 return StopReason::Cancelled;
             }
 

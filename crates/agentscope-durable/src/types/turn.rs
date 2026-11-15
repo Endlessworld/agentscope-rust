@@ -149,6 +149,20 @@ pub struct TurnView {
     pub parent: Option<DelegationParent>,
 }
 
+/// The control facts a running invocation polls while it holds the lease.
+///
+/// Deliberately smaller than a [`Frame`](crate::types::Frame): a poll happens while a model call
+/// is streaming — several times a second — and what it asks is "was I stopped, and am I still the
+/// writer". The frame carries the conversation (tools, checkpoint, signals), so polling it costs
+/// a read of the whole session; this costs one record, which is why the poll can stay frequent
+/// while the rest of the tick got cheaper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnControl {
+    pub status: TurnStatus,
+    pub cancellation_requested: bool,
+}
+
 /// Queue-facing projection of one turn.
 ///
 /// Every field is read from committed facts: the status and the ending come from the turn itself,

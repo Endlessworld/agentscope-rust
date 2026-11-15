@@ -282,6 +282,41 @@ async fn a_committed_iteration_position_continues_the_budget() {
 }
 
 #[tokio::test]
+async fn a_resumed_acting_pass_keeps_its_iteration() {
+    let (backend, thread, lease) = running_turn().await;
+    // Core opens `step/resumed` (not `step/start`) when an invocation continues the tool calls a
+    // previous tick committed: the acting pass is at the *same* iteration as the reasoning step
+    // that decided it. Folding only `step/start` moved the position back one iteration, so a
+    // crash inside the resumed pass cost an extra model call and repeated the iteration number.
+    seed(
+        &backend,
+        &thread,
+        &lease,
+        vec![
+            ("step/start", json!({ "stepId": "step-2", "iteration": 2 })),
+            (
+                "step/resumed",
+                json!({ "stepId": "step-2-acting", "iteration": 2, "phase": "ACTING" }),
+            ),
+        ],
+    )
+    .await;
+    let host = AgentScopeExecutionHost::open(
+        Arc::clone(&backend) as Arc<dyn SessionBackend>,
+        thread.clone(),
+        lease.clone(),
+        "run-1",
+    )
+    .await
+    .expect("host");
+    assert_eq!(
+        host.position(),
+        AgentExecutionPosition::new(2, 2),
+        "the resumed acting pass continues at the iteration it belongs to, not the one before it"
+    );
+}
+
+#[tokio::test]
 async fn a_thread_past_one_journal_page_still_opens() {
     let (backend, thread, lease) = running_turn().await;
     // The backend serves journal reads one page (1,000 entries) at a time, so a thread past that

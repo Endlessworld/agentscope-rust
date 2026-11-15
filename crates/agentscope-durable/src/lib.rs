@@ -17,6 +17,7 @@ pub mod runtime;
 pub mod session;
 pub mod session_backend;
 pub mod store;
+pub mod traffic;
 pub mod types;
 
 pub use error::{DurableError, ErrorCode, Result};

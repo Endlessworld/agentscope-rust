@@ -49,25 +49,19 @@ pub(super) fn read_journal(
             return Ok(Vec::new());
         }
         let prefix = journal_prefix(&thread.thread_id, &data.journal_branch);
+        // Journal parts end in their zero-padded position, so the lexical order *is* the sequence
+        // order and the cursor can be a key: asking for "everything after the entry I already
+        // read" then costs the page, not the history in front of it. Without the cursor every
+        // page of a long journal re-walked the whole prefix — quadratic reads on the one path a
+        // tick takes before it can decide anything.
+        let cursor = journal_part(&thread.thread_id, &data.journal_branch, after);
         let mut entries = Vec::new();
-        for part in txn.keys(&prefix, None, 100_000)? {
-            let Some(position) = part
-                .rsplit(':')
-                .next()
-                .and_then(|raw| raw.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            if position <= after {
-                continue;
-            }
+        for part in txn.keys(&prefix, Some(&cursor), limit)? {
             if let Some(entry) = txn.get(&part)? {
                 entries.push(entry);
-                if entries.len() == limit {
-                    break;
-                }
             }
         }
+        crate::traffic::count_journal_read(entries.len());
         Ok(entries)
     })
 }

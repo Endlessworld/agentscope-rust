@@ -54,19 +54,13 @@ impl Txn for StagedTxn<'_> {
     }
 
     fn keys(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
-        let mut keys: Vec<String> = self
-            .base
-            .keys()
-            .chain(self.staged.keys())
-            .filter(|key| key.starts_with(prefix))
-            .filter(|key| after.is_none_or(|after| key.as_str() > after))
-            .filter(|key| self.read(key).is_some())
-            .cloned()
-            .collect();
-        keys.sort_unstable();
-        keys.dedup();
-        keys.truncate(limit);
-        Ok(keys)
+        Ok(crate::store::merge_keys(
+            self.base,
+            &self.staged,
+            prefix,
+            after,
+            limit,
+        ))
     }
 
     fn schedule(

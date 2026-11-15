@@ -582,25 +582,21 @@ pub(super) fn journal(
             return Err(DurableError::invalid("Journal position is out of range"));
         }
         let prefix = journal_prefix(&thread.definition.key.thread_id, &thread.journal_branch);
+        // The cursor is the key of the last entry already read: journal parts end in their
+        // zero-padded position, so lexical order is sequence order and the store can start the
+        // page where the caller stopped instead of at the beginning of the thread.
+        let cursor = journal_part(
+            &thread.definition.key.thread_id,
+            &thread.journal_branch,
+            after,
+        );
         let mut entries = Vec::new();
-        for part in txn.keys(&prefix, None, 100_000)? {
-            let Some(position) = part
-                .rsplit(':')
-                .next()
-                .and_then(|raw| raw.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            if position <= after {
-                continue;
-            }
+        for part in txn.keys(&prefix, Some(&cursor), limit)? {
             if let Some(entry) = txn.get(&part)? {
                 entries.push(entry);
-                if entries.len() == limit {
-                    break;
-                }
             }
         }
+        crate::traffic::count_journal_read(entries.len());
         Ok(entries)
     })
 }

@@ -550,6 +550,10 @@ impl SessionBackend for TxnBackend {
         turn::frame(self.store.as_ref(), lease)
     }
 
+    async fn control_state(&self, lease: &Lease) -> Result<TurnControl> {
+        turn::control_state(self.store.as_ref(), lease)
+    }
+
     async fn record_failure(&self, lease: &Lease, failure: Failure) -> Result<RecoveryView> {
         turn::record_failure(self.store.as_ref(), lease, failure)
     }

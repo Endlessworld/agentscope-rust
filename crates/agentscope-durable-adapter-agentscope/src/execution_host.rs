@@ -78,6 +78,7 @@ impl AgentScopeExecutionHost {
         let thread_state = backend.thread_state(&thread).await.map_err(convert)?;
         // The committed checkpoint is the only source of the previous invocation's state, and
         // so of the iteration it died in: a restart is not a fresh iteration budget.
+        let mut covered = 0u64;
         let (state, mut position) = match &thread_state.checkpoint_metadata {
             Some(metadata) => {
                 let committed = metadata.position.parse::<u64>().map_err(|error| {
@@ -89,6 +90,7 @@ impl AgentScopeExecutionHost {
                     .map_err(convert)?;
                 let state = checkpoint::decode(&view.checkpoint)?;
                 let iteration = state.cur_iter().max(0) as u32;
+                covered = view.journal_position;
                 (
                     Some(state),
                     AgentExecutionPosition::new(iteration, iteration.saturating_sub(1)),
@@ -99,7 +101,20 @@ impl AgentScopeExecutionHost {
         let mut frame: Option<Frame> = None;
         let mut completed = false;
         let mut started = false;
-        for event in read_events(backend.as_ref(), &thread, thread_state.journal_position).await? {
+        // Start where the committed native state starts, not at the beginning of the thread: the
+        // checkpoint is the state those entries produced, so replaying them again only re-reads
+        // history the invocation already has. One entry *before* the checkpoint is included on
+        // purpose — it is the fact that produced the state, and it is also how a turn that already
+        // ran (and whose input is therefore committed) is told from one that never did.
+        let from = covered.saturating_sub(1);
+        for event in read_events(
+            backend.as_ref(),
+            &thread,
+            from,
+            thread_state.journal_position,
+        )
+        .await?
+        {
             if event.turn_id.as_deref() != Some(turn_id.as_str()) {
                 continue;
             }
@@ -111,6 +126,18 @@ impl AgentScopeExecutionHost {
                         let iteration = iteration.min(u32::MAX as u64) as u32;
                         position =
                             AgentExecutionPosition::new(iteration, iteration.saturating_sub(1));
+                    }
+                }
+                // A resumed acting pass. Core opens it instead of a reasoning step when the
+                // invocation continues the tool calls a previous tick had already committed
+                // (`resume_step`), so the action phase is at the *same* iteration rather than
+                // one before it. Folding only `step/start` walked the position back a step
+                // after a crash inside that pass: the next tick would open the iteration
+                // again (an extra model call and a duplicated iteration number).
+                "step/resumed" => {
+                    if let Some(iteration) = data.get("iteration").and_then(Value::as_u64) {
+                        let iteration = iteration.min(u32::MAX as u64) as u32;
+                        position = AgentExecutionPosition::new(iteration, iteration);
                     }
                 }
                 FINALIZATION_STARTED => {
@@ -414,6 +441,7 @@ fn convert(error: DurableError) -> Error {
 async fn read_events(
     backend: &dyn SessionBackend,
     thread: &ThreadKey,
+    from: u64,
     journal_position: u64,
 ) -> Result<Vec<JournalEvent>> {
     // The backend reads at most one page per call (`Page limit must be 1..=1000`). A thread whose
@@ -422,7 +450,7 @@ async fn read_events(
     // the thread passed 1,000 entries, which failed every `open` of that thread.
     const PAGE: usize = 1000;
     let mut events = Vec::new();
-    let mut after = 0u64;
+    let mut after = from;
     while after < journal_position {
         let entries = backend
             .read_journal(thread, after, PAGE)

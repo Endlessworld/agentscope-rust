@@ -9,6 +9,7 @@
 
 pub mod coding_agent;
 pub mod config;
+pub mod deferred_effects;
 pub mod elicitation;
 pub mod event;
 mod event_queue;

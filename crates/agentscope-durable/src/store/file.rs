@@ -19,7 +19,7 @@
 //! Cross-process exclusion uses one lock file per scope; any number of hosts may share one root
 //! (see [`FileStore`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -88,7 +88,35 @@ const HELD_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(400);
 /// a complete previous or complete next document.
 pub struct FileStore {
     root: PathBuf,
+    /// Scope documents this process last answered a [`RecordStore::read_parts`] from.
+    ///
+    /// Only that path uses it; see [`Picked`].
+    picked: Mutex<HashMap<String, Picked>>,
 }
+
+/// A `read_parts` answer kept until the document behind it is replaced.
+///
+/// A control poll asks the same question several times a second against a document that is
+/// rewritten whole, and scanning the bytes is three orders of magnitude more expensive than
+/// comparing the file's identity. A write is a fresh temporary file renamed over the old one, so
+/// `(len, modified, created)` changes on every write, and serving a stale answer would need two
+/// writes with the same length and both timestamps. Nothing but the control poll reads through
+/// this cache: a transaction always parses the document it commits.
+struct Picked {
+    stamp: (
+        u64,
+        Option<std::time::SystemTime>,
+        Option<std::time::SystemTime>,
+    ),
+    parts: Vec<String>,
+    values: Vec<Option<Value>>,
+}
+
+/// How many scopes keep a picked answer before the cache is cleared.
+///
+/// The entries are a few hundred bytes each and nothing depends on them: a miss only means the
+/// next poll scans the document, which is the behaviour without the cache.
+const PICKED_SCOPES: usize = 8;
 
 // ----------------------------------------------------------------------------
 // Write-traffic counters
@@ -155,7 +183,10 @@ impl FileStore {
         // about what a lock path *is* — one store would take the other's live lock for an orphan.
         // The fallback keeps a store usable where canonicalising is refused.
         let root = fs::canonicalize(&root).unwrap_or(root);
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            picked: Mutex::new(HashMap::new()),
+        })
     }
 
     fn scope_path(&self, scope: &str) -> PathBuf {
@@ -182,14 +213,113 @@ impl FileStore {
         self.root.join("locks").join("work-index.lock")
     }
 
+    /// The last answer for `(scope, parts)`, if the document behind it is unchanged.
+    fn pick_from_cache(
+        &self,
+        scope: &str,
+        parts: &[&str],
+        stamp: &(
+            u64,
+            Option<std::time::SystemTime>,
+            Option<std::time::SystemTime>,
+        ),
+    ) -> Option<Vec<Option<Value>>> {
+        let picked = self.picked.lock().ok()?;
+        let entry = picked.get(scope)?;
+        if entry.stamp != *stamp || entry.parts.len() != parts.len() {
+            return None;
+        }
+        if !entry
+            .parts
+            .iter()
+            .zip(parts)
+            .all(|(cached, asked)| cached == asked)
+        {
+            return None;
+        }
+        Some(entry.values.clone())
+    }
+
+    fn keep_picked(
+        &self,
+        scope: &str,
+        parts: &[&str],
+        stamp: (
+            u64,
+            Option<std::time::SystemTime>,
+            Option<std::time::SystemTime>,
+        ),
+        values: &[Option<Value>],
+    ) {
+        let Ok(mut picked) = self.picked.lock() else {
+            return;
+        };
+        if picked.len() >= PICKED_SCOPES && !picked.contains_key(scope) {
+            picked.clear();
+        }
+        picked.insert(
+            scope.to_string(),
+            Picked {
+                stamp,
+                parts: parts.iter().map(|part| (*part).to_string()).collect(),
+                values: values.to_vec(),
+            },
+        );
+    }
+
     fn read_scope(&self, scope: &str) -> Result<BTreeMap<String, Value>> {
         // A share violation from the host that is replacing the document right now is transient;
         // a missing document is not, and is answered at once.
         match retry_while_held(|| fs::read(self.scope_path(scope))) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                let scope = serde_json::from_slice(&bytes)?;
+                crate::traffic::count_scope_parse();
+                Ok(scope)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Reads `parts` out of one scope document without building the rest of it.
+    ///
+    /// A control poll needs the turn record and nothing else, and it happens several times a
+    /// second while a model call streams. Parsing the whole document into a
+    /// `BTreeMap<String, Value>` for that is what made a hung provider cost tens of megabytes a
+    /// second; this streams the document and allocates only the values asked for, leaving every
+    /// other record to be skipped as input. It also takes no scope lock: a document is replaced
+    /// by an atomic rename, so a reader always sees a complete one (the same reasoning as
+    /// [`FileStore::ready`]), and a poll has no reason to write a lock file.
+    ///
+    /// An answer is reused while the document behind it has not been replaced, because a poll
+    /// repeats the same question and the answer can only change when the file does. The reuse is
+    /// a stat and a comparison; the scan it skips is the whole conversation.
+    fn scope_parts(&self, scope: &str, parts: &[&str]) -> Result<Vec<Option<Value>>> {
+        let path = self.scope_path(scope);
+        let stamp = match retry_while_held(|| fs::metadata(&path)) {
+            Ok(meta) => (meta.len(), meta.modified().ok(), meta.created().ok()),
+            // A document that was never written answers `None` for everything, and is not
+            // cached: the first write has to be seen.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(vec![None; parts.len()])
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(values) = self.pick_from_cache(scope, parts, &stamp) {
+            return Ok(values);
+        }
+        let bytes = match retry_while_held(|| fs::read(&path)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(vec![None; parts.len()])
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut picked = pick_parts(&bytes, parts)?;
+        crate::traffic::count_scope_pick();
+        let values: Vec<Option<Value>> = parts.iter().map(|part| picked.remove(*part)).collect();
+        self.keep_picked(scope, parts, stamp, &values);
+        Ok(values)
     }
 
     /// Applies a finished transaction. Only reached when the closure returned `Ok`.
@@ -340,6 +470,10 @@ impl RecordStore for FileStore {
     fn shared_across_hosts(&self) -> bool {
         true
     }
+
+    fn read_parts(&self, scope: &str, parts: &[&str]) -> Result<Vec<Option<Value>>> {
+        self.scope_parts(scope, parts)
+    }
 }
 
 /// A staged readiness write. It also lands in `staged` under the reserved key so that
@@ -382,19 +516,13 @@ impl Txn for StagedTxn<'_> {
     }
 
     fn keys(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
-        let mut keys: Vec<String> = self
-            .base
-            .keys()
-            .chain(self.staged.keys())
-            .filter(|key| key.starts_with(prefix))
-            .filter(|key| after.is_none_or(|after| key.as_str() > after))
-            .filter(|key| self.read(key).is_some())
-            .cloned()
-            .collect();
-        keys.sort_unstable();
-        keys.dedup();
-        keys.truncate(limit);
-        Ok(keys)
+        Ok(crate::store::merge_keys(
+            self.base,
+            &self.staged,
+            prefix,
+            after,
+            limit,
+        ))
     }
 
     fn schedule(
@@ -447,6 +575,51 @@ fn digest(input: &str) -> String {
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
+}
+
+/// The values of `wanted` in one serialized scope document, skipping everything else.
+///
+/// Skips are `IgnoredAny`: the bytes are still scanned (a document cannot be jumped over) but no
+/// `Value` is built for them, which is the difference between a control poll allocating the whole
+/// conversation and allocating one record.
+fn pick_parts(bytes: &[u8], wanted: &[&str]) -> Result<BTreeMap<String, Value>> {
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
+    use serde::Deserializer;
+
+    struct Picker<'a> {
+        wanted: &'a [&'a str],
+        picked: BTreeMap<String, Value>,
+    }
+
+    impl<'de> Visitor<'de> for Picker<'_> {
+        type Value = BTreeMap<String, Value>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a stored scope document")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(
+            mut self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if self.wanted.contains(&key.as_str()) {
+                    self.picked.insert(key, map.next_value::<Value>()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(self.picked)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let picked = deserializer.deserialize_map(Picker {
+        wanted,
+        picked: BTreeMap::new(),
+    })?;
+    deserializer.end()?;
+    Ok(picked)
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1309,6 +1482,57 @@ mod tests {
             txn.keys("p:", None, 10)
         })?;
         assert_eq!(after_delete, vec!["p:1", "p:3"]);
+        Ok(())
+    }
+
+    #[test]
+    fn keys_merge_staged_writes_over_the_document() -> Result<()> {
+        let root = TempRoot::new("keys-staged");
+        let store = FileStore::open(root.path())?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            for key in ["p:1", "p:2", "p:3"] {
+                txn.put(key, Some(json!(key)))?;
+            }
+            Ok(())
+        })?;
+        // One transaction that deletes the first, replaces the second and appends a fourth: the
+        // page must be the document with those three edits, in order.
+        let merged = crate::store::read(&store, "session", |txn: &mut dyn Txn| {
+            txn.put("p:1", None)?;
+            txn.put("p:2", Some(json!("replaced")))?;
+            txn.put("p:4", Some(json!("p:4")))?;
+            txn.keys("p:", None, 10)
+        })?;
+        assert_eq!(merged, vec!["p:2", "p:3", "p:4"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_parts_answers_from_the_document_and_sees_a_rewrite() -> Result<()> {
+        let root = TempRoot::new("read-parts");
+        let store = FileStore::open(root.path())?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!(1)))?;
+            txn.put("b", Some(json!(2)))
+        })?;
+        let first = store.read_parts("session", &["a", "b", "missing"])?;
+        assert_eq!(first, vec![Some(json!(1)), Some(json!(2)), None]);
+
+        // The same question against an unchanged document is answered from the last scan: one
+        // scan for the two calls, which is what makes a control poll cheap.
+        crate::traffic::reset_read_stats();
+        assert_eq!(store.read_parts("session", &["a", "b", "missing"])?, first);
+        assert_eq!(crate::traffic::read_stats().scope_picks, 0);
+
+        // A rewrite is a new document, so the cached answer is not used.
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!(3)))
+        })?;
+        assert_eq!(store.read_parts("session", &["a"])?, vec![Some(json!(3))]);
+        assert_eq!(crate::traffic::read_stats().scope_picks, 1);
+
+        // A scope that was never written answers `None`.
+        assert_eq!(store.read_parts("other", &["a"])?, vec![None]);
         Ok(())
     }
 

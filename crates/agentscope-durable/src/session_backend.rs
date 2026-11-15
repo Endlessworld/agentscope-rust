@@ -89,6 +89,21 @@ pub trait SessionBackend: Send + Sync {
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<()>;
     async fn release(&self, lease: &Lease, delay: Duration) -> Result<()>;
     async fn frame(&self, lease: &Lease) -> Result<Frame>;
+
+    /// The control facts a running invocation polls: its status and whether a stop was requested.
+    ///
+    /// Split from [`frame`](SessionBackend::frame) because of *when* it is asked: while a model
+    /// call is streaming, several times a second. A backend that can answer it without building
+    /// the frame should (the transactional backend reads one record); the default answers from
+    /// the frame, which is always correct and only expensive.
+    async fn control_state(&self, lease: &Lease) -> Result<TurnControl> {
+        let frame = self.frame(lease).await?;
+        Ok(TurnControl {
+            status: frame.turn.status,
+            cancellation_requested: frame.turn.cancellation_requested,
+        })
+    }
+
     async fn record_failure(&self, lease: &Lease, failure: Failure) -> Result<RecoveryView>;
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<CommitReceipt>;
     async fn receipt(

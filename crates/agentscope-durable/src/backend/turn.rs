@@ -488,6 +488,30 @@ pub(super) fn release(store: &dyn RecordStore, lease: &Lease, delay: Duration) -
     })
 }
 
+/// The control facts a running invocation polls, read without materializing the frame.
+///
+/// One record instead of the conversation, and no scope transaction: the file store answers it
+/// from the document without a lock (a document is replaced by an atomic rename), so a poll costs
+/// a scan of the bytes rather than a lock file plus a full parse of the whole session.
+pub(super) fn control_state(store: &dyn RecordStore, lease: &Lease) -> Result<TurnControl> {
+    crate::traffic::count_control_read();
+    let part = turn_part(&lease.turn_id);
+    let mut values = store.read_parts(&lease.thread.session.storage_key(), &[part.as_str()])?;
+    let value = values
+        .pop()
+        .flatten()
+        .ok_or_else(|| DurableError::not_found("Turn does not exist"))?;
+    let turn: TurnData = serde_json::from_value(value)?;
+    // The same ownership rule as `frame`, answered on the reader's clock: a poll is where a
+    // writer that lost its lease gets to notice, and waiting for its next commit to be fenced
+    // would spend the whole stall before the turn could be handed on.
+    assert_owned(&turn, lease, crate::now_millis())?;
+    Ok(TurnControl {
+        status: turn.status,
+        cancellation_requested: turn.cancel,
+    })
+}
+
 pub(super) fn frame(store: &dyn RecordStore, lease: &Lease) -> Result<Frame> {
     with_session(store, &lease.thread.session, |txn| {
         let thread = require_thread(txn, &lease.thread)?;

@@ -110,6 +110,10 @@ pub struct HarnessAgent {
     /// builder falls back to a workspace-backed bus). Exposed so a host can run the wakeup
     /// dispatcher against the same queue this agent enqueues into.
     message_bus: Option<Arc<dyn MessageBus>>,
+    /// The registry tracking tool calls offloaded to the background (always present: the builder
+    /// falls back to the workspace-backed registry). Exposed so a host can ask what became of an
+    /// offloaded call — the effect keeps running after the turn that started it.
+    async_tool_registry: Option<Arc<dyn AsyncToolRegistry>>,
     /// The embedded ReAct agent that drives the reasoning→acting loop.
     /// `None` when no model was configured (assembly-only mode).
     agent: Option<ReActAgent>,
@@ -429,6 +433,14 @@ impl HarnessAgent {
     /// works, but reusing the agent's own handle avoids depending on the root layout.
     pub fn message_bus(&self) -> Option<&Arc<dyn MessageBus>> {
         self.message_bus.as_ref()
+    }
+
+    /// The registry tracking tool calls offloaded to the background.
+    ///
+    /// A host needs it to answer what became of an effect that outlived the turn which started
+    /// it: the placeholder result only says "not finished yet".
+    pub fn async_tool_registry(&self) -> Option<&Arc<dyn AsyncToolRegistry>> {
+        self.async_tool_registry.as_ref()
     }
 
     /// Whether the conversation still holds background work the model has not seen: an
@@ -3079,6 +3091,7 @@ impl HarnessAgentBuilder {
             record_model_requests: self.record_model_requests,
             task_repository: task_repo,
             message_bus: message_bus.clone(),
+            async_tool_registry: async_tool_registry.clone(),
             agent,
             workspace_manager: Some(workspace_manager),
             plan_mode_manager,

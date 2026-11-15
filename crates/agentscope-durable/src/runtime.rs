@@ -247,6 +247,18 @@ impl DurableRuntime {
         if frame.turn.status.terminal() {
             return Ok(Step::settled());
         }
+        // A turn nobody is executing cannot observe its own cancel: a waiting or paused turn has
+        // no invocation, and the tick loop of a host hands it back instead of spinning on it.
+        // Starting an invocation just to have it cancel itself spends a model call and still
+        // leaves the turn `CANCELLING` if that call never returns, so the cancellation is
+        // settled here — the state a host asked for, at the cost of one commit.
+        if frame.turn.cancellation_requested {
+            self.settle_abandoned_cancel(lease, &frame).await?;
+            return Ok(Step {
+                outcome: TickOutcome::Cancelled,
+                delay: Duration::ZERO,
+            });
+        }
         let run = self
             .backend
             .prepare_run(lease, &run_request_id(lease))
@@ -281,6 +293,55 @@ impl DurableRuntime {
             outcome: TickOutcome::for_status(turn.status),
             delay: Duration::ZERO,
         })
+    }
+
+    /// Ends a cancelled turn that no invocation is running.
+    ///
+    /// A cancellation only *requests* an end: the writer that owns the turn writes it, and a
+    /// turn a host already handed back (waiting on an external effect, or paused) has no such
+    /// writer. The effects still recorded as in flight belong to the turn being stopped, so they
+    /// are settled first — the executor is asked what became of them, and one that is still in
+    /// flight is recorded as cancelled — which is what lets the terminal commit pass the
+    /// "unsettled effects" invariant.
+    async fn settle_abandoned_cancel(&self, lease: &Lease, frame: &Frame) -> Result<()> {
+        let lookup = self.executor.capabilities().lookup_by_execution_id;
+        for tool in frame.tools.iter().filter(|tool| !settled_effect(tool)) {
+            let mut confirmed = None;
+            if lookup {
+                if let Ok(answered) = self.executor.query(&tool.request).await {
+                    // Only an answer that really happened is worth keeping; "cannot tell" is
+                    // what the cancel itself resolves.
+                    if answered.state.terminal() {
+                        confirmed = Some(answered);
+                    }
+                }
+            }
+            let result = confirmed.unwrap_or(ExecutionResult {
+                state: ExecutionState::Cancelled,
+                handle: tool
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.handle.clone()),
+                result: Value::Null,
+                error: Some("The turn was cancelled before the effect reported".to_string()),
+            });
+            if let Err(error) = self
+                .backend
+                .accept_result(&lease.thread, &tool.request.execution_id, result)
+                .await
+            {
+                // Losing the race to another writer is not a reason to fail the ending.
+                debug!(execution = %tool.request.execution_id, %error, "cannot record the cancelled effect");
+            }
+        }
+        crate::harness_adapter::settle_turn(
+            self.backend.as_ref(),
+            lease,
+            TurnStatus::Cancelled,
+            Value::Null,
+            None,
+        )
+        .await
     }
 
     /// Turns an advance failure into a recorded failure plus the release delay it implies.

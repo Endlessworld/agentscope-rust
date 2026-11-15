@@ -287,7 +287,6 @@ pub(super) fn apply_result(
             "NOT_FOUND is not a recordable execution result",
         ));
     }
-    let now = txn.now();
     let Some(tool) = turn.tools.get_mut(execution_id) else {
         return Err(DurableError::not_found("Execution does not exist"));
     };
@@ -305,6 +304,10 @@ pub(super) fn apply_result(
         }
     }
     let terminal = result.state.terminal();
+    // The event is keyed by the result it records, not by the clock: two results for one
+    // execution inside the same millisecond used to share an event id and the second one was
+    // rejected as `Event identity changed`.
+    let fingerprint = json::hash(&serde_json::to_value(result)?);
     tool.result = Some(result.clone());
     turn.next_attempt_at = 0;
     let origin = turn
@@ -318,7 +321,7 @@ pub(super) fn apply_result(
         &turn.turn_id,
         origin.as_ref().map(|origin| origin.run_id.as_str()),
         origin.as_ref().and_then(|origin| origin.step_id.as_deref()),
-        &format!("tool.result.{execution_id}.{now}"),
+        &format!("tool.result.{execution_id}.{fingerprint}"),
         if terminal {
             "tool.result.accepted"
         } else {
