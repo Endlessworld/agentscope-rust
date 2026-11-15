@@ -51,6 +51,18 @@ pub(super) fn commit(
             apply_dispatch(txn, &mut state, &mut turn, lease, execution_id)?;
         }
         for record in &command.results {
+            // A result for a call this turn keeps no execution record of: when it is the
+            // `interrupted` settlement of a call the journal dispatched but this turn never
+            // recorded (an explicit reconciliation of an unknown outcome), the effect may or may
+            // not have happened and is never replayed, so the journal's settlement stands and
+            // the commit proceeds — refusing it here is what made such a session refuse to open
+            // at all. Any other state for an unknown execution is an inconsistency between the
+            // journal and the durable facts, and still fails the batch.
+            if record.result.state == ExecutionState::Unknown
+                && !turn.tools.contains_key(&record.execution_id)
+            {
+                continue;
+            }
             apply_result(
                 txn,
                 &mut state,

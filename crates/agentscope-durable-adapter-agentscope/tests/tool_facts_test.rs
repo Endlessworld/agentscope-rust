@@ -123,6 +123,25 @@ fn resulted(seq: u64, call_id: &str, state: ToolResultState) -> JournalEvent {
     .expect("event")
 }
 
+/// A journaled native state: the baseline a reconciliation needs to restore.
+fn checkpointed(seq: u64, state: &AgentState) -> JournalEvent {
+    JournalEvent::from_payload(
+        format!("evt-{seq}"),
+        seq,
+        1_700_000_000_000 + seq as i64,
+        "state/checkpoint",
+        None,
+        None,
+        true,
+        &json!({
+            "projectorVersion": 1,
+            "stateJson": state.to_json().expect("state json"),
+            "reason": "test",
+        }),
+    )
+    .expect("event")
+}
+
 fn assistant_with_call(call_id: &str) -> Msg {
     let input = json!({ "text": "hi" })
         .as_object()
@@ -390,4 +409,91 @@ async fn a_rejected_tool_fact_rolls_the_journal_batch_back() {
 
     assert_eq!(journal.head().await.expect("head").seq, 0);
     assert!(journal.read_after(0, 10).await.expect("read").is_empty());
+}
+
+/// A settlement must not be blocked by a durable record that does not exist.
+///
+/// The journal can hold a `tool/dispatch` the durable turn never recorded (a batch committed by a
+/// writer with tool facts off, a record lost with an earlier turn). Its outcome can never arrive,
+/// so the settlement records it as interrupted — and that settlement used to fail with
+/// `NOT_FOUND: Execution does not exist`, which blocked the session from ever opening again.
+#[tokio::test]
+async fn a_dispatch_the_durable_turn_never_recorded_still_settles_as_interrupted() {
+    let (backend, thread, _receipt, lease) = session().await;
+    let raw = BackendThreadJournal::new(
+        Arc::clone(&backend) as Arc<dyn SessionBackend>,
+        thread.clone(),
+    )
+    .with_tool_facts(false);
+    let writer = raw
+        .acquire("owner-a", Duration::from_secs(60))
+        .await
+        .expect("acquire");
+    let mut state = AgentState::builder()
+        .session_id("s1")
+        .user_id("alice")
+        .build();
+    state.context_mut().push(Msg::user("go"));
+    state.context_mut().push(assistant_with_call("c1"));
+    raw.commit(
+        &writer,
+        "batch-1",
+        0,
+        &[checkpointed(1, &state), dispatched(2, "c1")],
+    )
+    .await
+    .expect("journal batch");
+    raw.release(&writer).await.expect("release");
+    let id = execution_id(&lease, "c1");
+    assert!(
+        backend.execution(&thread, &id).await.is_err(),
+        "the durable turn keeps no record of the dispatched call"
+    );
+
+    let log: Arc<dyn ThreadJournal> = Arc::new(BackendThreadJournal::new(
+        Arc::clone(&backend) as Arc<dyn SessionBackend>,
+        thread.clone(),
+    ));
+    let settled = agentscope_core::journal::recovery::settle_uncertain_tool_outcomes(
+        Arc::clone(&log),
+        "outcome unknown",
+        "test: settle a call with no durable execution",
+    )
+    .await
+    .expect("a settlement must not be blocked by the missing record");
+    assert_eq!(
+        settled.into_iter().collect::<Vec<_>>(),
+        vec!["c1".to_string()]
+    );
+
+    // The journal carries the interrupted settlement, so the session can be opened again.
+    let entries = log.read_after(0, 100).await.expect("read");
+    let states: Vec<ToolResultState> = entries
+        .iter()
+        .filter(|event| event.event_type == "tool/result")
+        .flat_map(|event| {
+            let data = event.data().expect("payload");
+            let message = data.get("message").cloned().expect("message");
+            let message: Msg = serde_json::from_value(message).expect("tool result message");
+            message
+                .tool_result_blocks()
+                .map(|block| block.state)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(states, vec![ToolResultState::Interrupted]);
+
+    // Nothing is invented on the durable side, and the turn is still workable.
+    assert!(
+        backend.execution(&thread, &id).await.is_err(),
+        "no execution record is fabricated for the unknown call"
+    );
+    assert_eq!(
+        backend
+            .turn(&thread, &lease.turn_id)
+            .await
+            .expect("turn")
+            .status,
+        TurnStatus::Running
+    );
 }
