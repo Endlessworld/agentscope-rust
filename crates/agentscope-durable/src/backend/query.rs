@@ -103,48 +103,95 @@ pub(super) fn turns(
     })
 }
 
-/// The message projection is produced by the adapter; the backend only exposes what it stored.
+/// The thread's message transcript, rebuilt from the committed journal.
 ///
-/// Until an adapter publishes a transcript, the one projection the store already holds is each
-/// turn's committed output, in queue order; a turn that produced none is skipped.
+/// The journal is the only durable record of the conversation: `message/user`,
+/// `message/assistant`, `message/system` and `tool/result` carry the messages the loop actually
+/// applied, in commit order. The projection is a pure read — it writes nothing and needs no new
+/// fact — and a thread whose journal holds no message (a scope written before these facts existed,
+/// or one that never ran) answers an empty page instead of an invented one.
+///
+/// The cursor is the journal sequence of the last returned message, so the next page starts after
+/// it: paging a long conversation costs the pages walked, not the history in front of them.
 pub(super) fn history(
     store: &dyn RecordStore,
     thread: &ThreadKey,
     cursor: Option<&str>,
     limit: usize,
 ) -> Result<HistoryPage> {
+    /// A journal page is capped by the backend at 1,000 entries.
+    const PAGE: usize = 1000;
     let limit = clamp_limit(limit)?;
-    with_session(store, &thread.session, |txn| {
-        require_thread(txn, thread)?;
-        let ids = queue_ids(txn, &thread.thread_id)?;
-        let start = match cursor {
-            Some(cursor) => {
-                let index: usize = cursor
-                    .parse()
-                    .map_err(|_| DurableError::invalid("Invalid pagination cursor"))?;
-                index + 1
+    let mut after = match cursor {
+        None | Some("") => 0,
+        Some(cursor) => cursor
+            .parse()
+            .map_err(|_| DurableError::invalid("Invalid pagination cursor"))?,
+    };
+    let mut items = Vec::new();
+    loop {
+        let page = read_journal(store, thread, after, PAGE)?;
+        if page.is_empty() {
+            return Ok(HistoryPage {
+                items,
+                cursor: None,
+            });
+        }
+        let full_page = page.len() == PAGE;
+        for entry in page {
+            let Some(sequence) = entry.get("seq").and_then(Value::as_u64) else {
+                continue;
+            };
+            if sequence <= after {
+                continue;
             }
-            None => 0,
-        };
-        let mut items = Vec::new();
-        for (index, id) in ids.iter().enumerate().skip(start) {
+            after = sequence;
+            let Some(item) = message_item(&entry, sequence) else {
+                continue;
+            };
+            items.push(item);
             if items.len() == limit {
                 return Ok(HistoryPage {
                     items,
-                    cursor: Some((index - 1).to_string()),
+                    cursor: Some(sequence.to_string()),
                 });
             }
-            let turn = require_turn(txn, id)?;
-            if turn.output.is_null() {
-                continue;
-            }
-            items.push(json!({ "turnId": turn.turn_id, "output": turn.output }));
         }
-        Ok(HistoryPage {
-            items,
-            cursor: None,
-        })
-    })
+        // A short page is the end of the journal; a full one may have more behind it.
+        if !full_page {
+            return Ok(HistoryPage {
+                items,
+                cursor: None,
+            });
+        }
+    }
+}
+
+/// One transcript item, or `None` for a fact that is not a message.
+///
+/// The payload's message is projected to what a transcript needs — who spoke and what they said —
+/// instead of being handed back verbatim: the journal already holds the full [`Msg`], and a
+/// reader asking for history does not need the metadata or the per-message usage again.
+fn message_item(entry: &Value, sequence: u64) -> Option<Value> {
+    let role = match entry.get("type").and_then(Value::as_str)? {
+        "message/user" => "user",
+        "message/assistant" => "assistant",
+        "message/system" => "system",
+        "tool/result" => "tool",
+        _ => return None,
+    };
+    let payload = entry.get("payloadJson").and_then(Value::as_str)?;
+    let payload: Value = serde_json::from_str(payload).ok()?;
+    let message = payload.get("message")?;
+    let turn_id = entry.get("turnId").and_then(Value::as_str);
+    Some(json!({
+        "seq": sequence.to_string(),
+        "role": role,
+        "messageId": message.get("id").cloned().unwrap_or(Value::Null),
+        "content": message.get("content").cloned().unwrap_or(Value::Null),
+        "timestamp": message.get("timestamp").cloned().unwrap_or(Value::Null),
+        "turnId": turn_id,
+    }))
 }
 
 pub(super) fn ready(

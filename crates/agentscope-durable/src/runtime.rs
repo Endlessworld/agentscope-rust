@@ -1039,6 +1039,16 @@ mod tests {
             Err(DurableError::unavailable("not used in this test"))
         }
 
+        async fn model_calls(
+            &self,
+            _thread: &ThreadKey,
+            _turn_id: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<ModelCallPage> {
+            Err(DurableError::unavailable("not used in this test"))
+        }
+
         async fn control(
             &self,
             _thread: &ThreadKey,

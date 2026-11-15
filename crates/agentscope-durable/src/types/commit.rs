@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    AppliedResult, ResourceValue, RunChange, SessionKey, Signal, StepChange, ThreadSpec, ToolCall,
-    ToolExecution, ToolResultRecord, TurnStatus, TurnView, WaitCondition,
+    AppliedResult, ModelCallChange, ResourceValue, RunChange, SessionKey, Signal, StepChange,
+    ThreadSpec, ToolCall, ToolExecution, ToolResultRecord, TurnStatus, TurnView, WaitCondition,
 };
 use crate::json;
 use crate::{DurableError, Result};
@@ -184,6 +184,12 @@ pub struct Commit {
     pub run: Option<RunChange>,
     #[serde(default)]
     pub steps: Vec<StepChange>,
+    /// Model calls this commit observed (a dispatch, its ending, or both).
+    ///
+    /// Skipped when empty so that a commit which observes no model call serializes to exactly the
+    /// bytes it did before this fact existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_calls: Vec<ModelCallChange>,
 }
 
 impl Commit {
@@ -205,6 +211,7 @@ impl Commit {
             journal: None,
             run: None,
             steps: Vec::new(),
+            model_calls: Vec::new(),
         }
     }
 
@@ -233,6 +240,9 @@ impl Commit {
         }
         for step in &self.steps {
             step.validate()?;
+        }
+        for call in &self.model_calls {
+            call.validate()?;
         }
         Ok(())
     }

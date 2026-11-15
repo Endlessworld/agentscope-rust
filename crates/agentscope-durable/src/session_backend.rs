@@ -131,6 +131,17 @@ pub trait SessionBackend: Send + Sync {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<StepPage>;
+    /// Model calls one turn observed, in the order they were dispatched.
+    ///
+    /// Facts only: a call that never reached its ending is reported as `RUNNING`, and a turn that
+    /// never dispatched one answers an empty page.
+    async fn model_calls(
+        &self,
+        thread: &ThreadKey,
+        turn_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ModelCallPage>;
     async fn journal(&self, lease: &Lease, after: u64, limit: usize) -> Result<Vec<Value>>;
     /// Lease-free journal read for readers catching up outside the writer lease.
     async fn read_journal(

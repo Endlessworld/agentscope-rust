@@ -140,6 +140,13 @@ pub enum ModelStatus {
     Lost,
 }
 
+impl ModelStatus {
+    /// Whether the call reached an observed ending.
+    pub fn terminal(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
 /// A model call cannot reveal retries hidden inside an uninstrumented implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -225,22 +232,32 @@ pub struct ModelRequestView {
 }
 
 /// A logical call with its observed requests. A replay refers to the original call.
+///
+/// `runId`/`stepId`/`iteration`/`model` are optional because the Rust loop does not produce
+/// run/step facts, and `model/dispatch` does not name the model: a value nobody observed is
+/// absent (and costs no bytes), never a placeholder.
 #[allow(clippy::too_many_arguments)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCallView {
     pub thread: ThreadKey,
     pub turn_id: String,
-    pub run_id: String,
-    pub step_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
     pub model_call_id: String,
-    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
-    pub iteration: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<i32>,
     pub started_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_millis: Option<i64>,
     pub status: ModelStatus,
     pub observation: ModelObservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,6 +265,64 @@ pub struct ModelCallView {
     pub usage_complete: bool,
     #[serde(default)]
     pub requests: Vec<ModelRequestView>,
+}
+
+/// One observed state of a model call, carried by a commit.
+///
+/// A dispatch and its ending arrive in different native journal batches, so a change is an
+/// upsert by id that only carries what *it* observed: `provider` opens a provider attempt (it
+/// is the model the ending named), and `status` settles it. Nothing here copies the request
+/// body: when the host's [`RecordingPolicy`] records it, it stays the journal's own
+/// `request/prepared` fact, addressed by the same `requestId`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCallChange {
+    pub model_call_id: String,
+    pub status: ModelStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    /// The provider (model name in this implementation) of the attempt this change opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+    #[serde(default)]
+    pub usage_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+}
+
+impl ModelCallChange {
+    pub fn validate(&self) -> Result<()> {
+        json::text(&self.model_call_id, "modelCallId")?;
+        for value in [
+            self.model.as_deref(),
+            self.purpose.as_deref(),
+            self.step_id.as_deref(),
+            self.provider.as_deref(),
+            self.error_type.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            json::text(value, "model call metadata")?;
+        }
+        if let Some(usage) = &self.usage {
+            usage.validate()?;
+        }
+        if self.status == ModelStatus::Running && self.usage.is_some() {
+            return Err(DurableError::invalid(
+                "A running model call has no final usage",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

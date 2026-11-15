@@ -178,6 +178,80 @@ impl ThreadData {
     }
 }
 
+/// A model call as stored inside its turn.
+///
+/// The stored shape leaves out everything the turn already knows (`thread`, `turnId`): repeating
+/// the session key on every call of every turn is pure write amplification on a store that
+/// rewrites the scope document per commit. Absent optional fields are skipped as well, so a call
+/// that never ended (no model, no usage, no request) costs a few dozen bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ModelCallData {
+    pub model_call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    pub started_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_millis: Option<i64>,
+    pub status: ModelStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+    #[serde(default)]
+    pub usage_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<ModelRequestView>,
+}
+
+impl ModelCallData {
+    pub fn new(model_call_id: String, started_at: i64) -> Self {
+        Self {
+            model_call_id,
+            model: None,
+            purpose: None,
+            iteration: None,
+            step_id: None,
+            started_at,
+            ended_at: None,
+            duration_millis: None,
+            status: ModelStatus::Running,
+            usage: None,
+            usage_complete: false,
+            error_type: None,
+            requests: Vec::new(),
+        }
+    }
+
+    pub fn view(&self, thread: &ThreadKey, turn_id: &str) -> ModelCallView {
+        ModelCallView {
+            thread: thread.clone(),
+            turn_id: turn_id.to_string(),
+            run_id: None,
+            step_id: self.step_id.clone(),
+            model_call_id: self.model_call_id.clone(),
+            model: self.model.clone(),
+            purpose: self.purpose.clone(),
+            iteration: self.iteration,
+            started_at: self.started_at,
+            ended_at: self.ended_at,
+            duration_millis: self.duration_millis,
+            status: self.status,
+            observation: ModelObservation::ModelCall,
+            usage: self.usage.clone(),
+            usage_complete: self.usage_complete,
+            requests: self.requests.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ToolData {
     pub request: ExecutionRequest,
@@ -257,6 +331,14 @@ pub(crate) struct TurnData {
     pub steps: BTreeMap<String, StepView>,
     #[serde(default)]
     pub step_order: Vec<String>,
+    /// Model calls this turn observed, in dispatch order.
+    ///
+    /// `serde(default)` keeps every scope written before model facts existed readable: such a
+    /// turn has no calls, which is what it truthfully has.
+    #[serde(default)]
+    pub model_calls: BTreeMap<String, ModelCallData>,
+    #[serde(default)]
+    pub model_call_order: Vec<String>,
     #[serde(default)]
     pub tools: BTreeMap<String, ToolData>,
     #[serde(default)]
@@ -295,6 +377,8 @@ impl TurnData {
             run_order: Vec::new(),
             steps: BTreeMap::new(),
             step_order: Vec::new(),
+            model_calls: BTreeMap::new(),
+            model_call_order: Vec::new(),
             tools: BTreeMap::new(),
             tool_order: Vec::new(),
             receipts: BTreeMap::new(),
@@ -401,6 +485,45 @@ mod tests {
         assert_eq!(state.retained_after, 2);
         assert_eq!(state.compacted_bytes, 0, "no trim has been measured");
         assert!(!state.compact_pending);
+    }
+
+    /// The stored model call is the only byte cost of wiring model facts, so it is pinned here:
+    /// one call with its single provider attempt must stay small, because the turn document that
+    /// carries it is rewritten by every later commit of the same turn.
+    #[test]
+    fn a_stored_model_call_keeps_its_record_small() {
+        let mut call = ModelCallData::new("0123456789abcdef0123456789abcdef".to_string(), 0);
+        call.model = Some("scripted".to_string());
+        call.purpose = Some("REASONING".to_string());
+        call.iteration = Some(0);
+        call.step_id = Some("7c2fd8c0-6ad3-4b2c-9f1e-5a1e6d1f0a11".to_string());
+        call.status = ModelStatus::Completed;
+        call.ended_at = Some(1_700_000_000_123);
+        call.duration_millis = Some(123);
+        call.usage = Some(TokenUsage {
+            input_tokens: Some(1_204),
+            output_tokens: Some(87),
+            details: Default::default(),
+        });
+        call.usage_complete = true;
+        call.requests.push(ModelRequestView {
+            request_id: "0123456789abcdef0123456789abcdef:1".to_string(),
+            attempt: 1,
+            provider: "scripted".to_string(),
+            status: ModelStatus::Completed,
+            started_at: 0,
+            ended_at: Some(1_700_000_000_123),
+            duration_millis: Some(123),
+            usage: call.usage.clone(),
+            usage_complete: true,
+            error_type: None,
+        });
+        let bytes = serde_json::to_vec(&call).expect("serialize").len();
+        eprintln!("one stored model call = {bytes} bytes");
+        assert!(
+            bytes <= 600,
+            "one model call costs {bytes} stored bytes, which is more than the 600-byte budget"
+        );
     }
 
     /// The settled prefix is a new field on an old record: a thread written before it existed

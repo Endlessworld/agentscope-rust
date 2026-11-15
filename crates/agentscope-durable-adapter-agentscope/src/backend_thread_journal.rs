@@ -22,7 +22,7 @@ use agentscope_durable::{
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::{checkpoint, tool_facts};
+use crate::{checkpoint, model_facts, tool_facts};
 
 /// How this bridge came to hold its writer lease.
 enum Held {
@@ -68,10 +68,11 @@ impl BackendThreadJournal {
         }
     }
 
-    /// Turns tool-fact derivation off, leaving the bridge a pure journal writer.
+    /// Turns tool-fact derivation off, leaving the bridge a pure journal writer for tool calls.
     ///
     /// Only for callers that own tool records themselves; a batch then commits the journal
-    /// alone and no dispatch/result fact is written.
+    /// alone and no dispatch/result fact is written. Model facts are always derived: they are
+    /// the only record of what a real provider call cost.
     pub fn with_tool_facts(mut self, enabled: bool) -> Self {
         self.tool_facts = enabled;
         self
@@ -318,6 +319,10 @@ impl ThreadJournal for BackendThreadJournal {
         commit.tools = facts.intents;
         commit.dispatches = facts.dispatches;
         commit.results = facts.results;
+        // Model facts ride the same transaction as the journal entries that imply them, so a
+        // real provider call costs no extra commit (and a tick that writes no model fact writes
+        // no model record).
+        commit.model_calls = model_facts::from_batch(events)?;
         commit.journal = Some(JournalAppend {
             expected_position: expected_seq,
             entries,

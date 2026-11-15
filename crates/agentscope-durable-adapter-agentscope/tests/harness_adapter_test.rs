@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agentscope_core::journal::{JournalEvent, ThreadJournal};
+use agentscope_core::message::ChatUsage;
 use agentscope_core::message::JsonMap;
 use agentscope_core::message::{
     ContentBlock, Msg, TextBlock, ToolResultBlock, ToolResultState, ToolUseBlock,
@@ -49,16 +50,24 @@ struct ScriptedModel {
     hold_first: bool,
     /// How many streams it opened.
     entered: AtomicUsize,
+    /// The usage every response reports; zero by default.
+    usage: ChatUsage,
 }
 
 impl ScriptedModel {
     fn new(script: &[&'static str]) -> Arc<Self> {
+        Self::with_usage(script, ChatUsage::default())
+    }
+
+    /// A model that bills the given token counts, so the recorded facts can be checked.
+    fn with_usage(script: &[&'static str], usage: ChatUsage) -> Arc<Self> {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
             seen: Mutex::new(Vec::new()),
             script: script.to_vec(),
             hold_first: false,
             entered: AtomicUsize::new(0),
+            usage,
         })
     }
 
@@ -70,6 +79,7 @@ impl ScriptedModel {
             script: Vec::new(),
             hold_first: true,
             entered: AtomicUsize::new(0),
+            usage: ChatUsage::default(),
         })
     }
 
@@ -133,9 +143,11 @@ impl Model for ScriptedModel {
                     TOOL,
                     JsonMap::new(),
                 ))])
+                .usage(self.usage)
                 .build(),
             None => ChatResponse::builder()
                 .content(vec![ContentBlock::Text(TextBlock::new("done"))])
+                .usage(self.usage)
                 .build(),
         };
         Box::pin(futures::stream::once(async move { Ok(response) }))
@@ -318,6 +330,92 @@ async fn a_tick_makes_exactly_one_model_call() {
         "the turn still has work the next tick will do"
     );
     assert!(turn.error.is_none(), "a bounded tick records no error");
+}
+
+#[tokio::test]
+async fn a_model_call_records_its_usage_and_stays_metadata_only() {
+    let model = ScriptedModel::with_usage(
+        &[],
+        ChatUsage::builder()
+            .input_tokens(3)
+            .output_tokens(5)
+            .build(),
+    );
+    let fixture = fixture_of(model, 6).await;
+    fixture.runtime.tick(&fixture.thread).await.expect("tick");
+
+    let calls = fixture
+        .backend
+        .model_calls(&fixture.thread, &fixture.turn_id, None, 10)
+        .await
+        .expect("model calls");
+    assert_eq!(calls.items.len(), 1, "one call: {:?}", calls.items);
+    let call = &calls.items[0];
+    assert_eq!(call.model.as_deref(), Some("scripted"));
+    assert_eq!(call.purpose.as_deref(), Some("REASONING"));
+    assert_eq!(call.status, ModelStatus::Completed);
+    assert_eq!(call.observation, ModelObservation::ModelCall);
+    let usage = call.usage.as_ref().expect("the call's usage");
+    assert_eq!(usage.input_tokens, Some(3));
+    assert_eq!(usage.output_tokens, Some(5));
+    assert!(call.usage_complete, "the completed call reported usage");
+    assert_eq!(call.requests.len(), 1, "one observed provider attempt");
+    assert_eq!(call.requests[0].provider, "scripted");
+    assert_eq!(call.requests[0].attempt, 1);
+    assert_eq!(
+        call.requests[0]
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.output_tokens),
+        Some(5)
+    );
+
+    // The fact is metadata: the request body is never copied into it, so it stays a few hundred
+    // bytes instead of the conversation it carried.
+    let json = serde_json::to_string(call).expect("serialize the call");
+    assert!(!json.contains("messages"), "{json}");
+    assert!(!json.contains("\"tools\""), "{json}");
+    eprintln!("one model call stores {} bytes: {json}", json.len());
+}
+
+#[tokio::test]
+async fn the_model_fact_holds_no_request_body_even_when_the_journal_does() {
+    // The journal keeps the full request as `request/prepared` (the default `RecordingPolicy`),
+    // while the durable fact stays metadata: the body is referenced by the call id, never copied.
+    // With `without_request_payloads` the journal drops the body and the fact is unchanged —
+    // `model_facts::from_batch` never reads `request/prepared`.
+    let model = ScriptedModel::with_usage(
+        &[],
+        ChatUsage::builder()
+            .input_tokens(2)
+            .output_tokens(1)
+            .build(),
+    );
+    let fixture = fixture_of(model, 6).await;
+    fixture.runtime.tick(&fixture.thread).await.expect("tick");
+
+    let events = fixture.journal().await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "request/prepared"),
+        "the default policy still records the request in the journal"
+    );
+    let calls = fixture
+        .backend
+        .model_calls(&fixture.thread, &fixture.turn_id, None, 10)
+        .await
+        .expect("model calls");
+    assert_eq!(calls.items.len(), 1);
+    let call = &calls.items[0];
+    let json = serde_json::to_string(call).expect("serialize the call");
+    assert!(!json.contains("messages"), "{json}");
+    assert!(!json.contains("\"tools\""), "{json}");
+    assert!(!json.contains("requestPrepared"), "{json}");
+    assert_eq!(
+        call.usage.as_ref().and_then(|usage| usage.input_tokens),
+        Some(2)
+    );
 }
 
 #[tokio::test]

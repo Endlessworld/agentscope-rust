@@ -159,6 +159,14 @@ pub struct FileStore {
     blobs: Mutex<BlobCache>,
     /// Scopes whose legacy inline payloads this process already moved out of line.
     rolled_out: Mutex<HashSet<String>>,
+    /// Whole-document scans this store answered a [`RecordStore::read_parts`] from.
+    ///
+    /// Per store and only under `cfg(test)`. [`crate::traffic::read_stats`] is process wide by
+    /// design (a whole tick is what it measures), so a unit test that asserts an exact pick count
+    /// on it also counts the tests running beside it in the same binary — and one of those resets
+    /// the counter. This is the same number without the neighbours.
+    #[cfg(test)]
+    scans: AtomicU64,
 }
 
 /// The out-of-line payloads this process read last.
@@ -268,6 +276,8 @@ impl FileStore {
             picked: Mutex::new(HashMap::new()),
             blobs: Mutex::new(BlobCache::default()),
             rolled_out: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            scans: AtomicU64::new(0),
         };
         store.adopt_flat_work_records()?;
         Ok(store)
@@ -516,6 +526,15 @@ impl FileStore {
         }
     }
 
+    /// How many whole-document scans this store performed for [`RecordStore::read_parts`].
+    ///
+    /// The negative space of the [`Picked`] cache, and the only way a test can say "one scan, not
+    /// two" without reading the process-wide counter its neighbours also write to.
+    #[cfg(test)]
+    fn scans(&self) -> u64 {
+        self.scans.load(Ordering::Relaxed)
+    }
+
     /// The last answer for `(scope, parts)`, if the document behind it is unchanged.
     fn pick_from_cache(
         &self,
@@ -620,6 +639,8 @@ impl FileStore {
         };
         let mut picked = pick_parts(&bytes, parts)?;
         crate::traffic::count_scope_pick();
+        #[cfg(test)]
+        self.scans.fetch_add(1, Ordering::Relaxed);
         let mut values: Vec<Option<Value>> =
             parts.iter().map(|part| picked.remove(*part)).collect();
         for slot in values.iter_mut() {
@@ -1901,19 +1922,29 @@ mod tests {
         })?;
         let first = store.read_parts("session", &["a", "b", "missing"])?;
         assert_eq!(first, vec![Some(json!(1)), Some(json!(2)), None]);
+        assert_eq!(store.scans(), 1, "the first question scans the document");
 
         // The same question against an unchanged document is answered from the last scan: one
         // scan for the two calls, which is what makes a control poll cheap.
-        crate::traffic::reset_read_stats();
         assert_eq!(store.read_parts("session", &["a", "b", "missing"])?, first);
-        assert_eq!(crate::traffic::read_stats().scope_picks, 0);
+        assert_eq!(
+            store.scans(),
+            1,
+            "the second question is served from the cache"
+        );
 
-        // A rewrite is a new document, so the cached answer is not used.
+        // A rewrite is a new document, so the cached answer is not used — and it is asked with the
+        // same parts list, so the parts cannot be what tells the two documents apart: only the
+        // stamp can. The rewrite keeps the document the same length, so the length alone would
+        // not catch it either.
         store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
             txn.put("a", Some(json!(3)))
         })?;
-        assert_eq!(store.read_parts("session", &["a"])?, vec![Some(json!(3))]);
-        assert_eq!(crate::traffic::read_stats().scope_picks, 1);
+        assert_eq!(
+            store.read_parts("session", &["a", "b", "missing"])?,
+            vec![Some(json!(3)), Some(json!(2)), None]
+        );
+        assert_eq!(store.scans(), 2, "the rewrite is scanned, not served stale");
 
         // A scope that was never written answers `None`.
         assert_eq!(store.read_parts("other", &["a"])?, vec![None]);

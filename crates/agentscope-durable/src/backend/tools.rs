@@ -137,6 +137,36 @@ pub(super) fn steps(
     })
 }
 
+pub(super) fn model_calls(
+    store: &dyn RecordStore,
+    thread: &ThreadKey,
+    turn_id: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<ModelCallPage> {
+    let limit = clamp_limit(limit)?;
+    with_session(store, &thread.session, |txn| {
+        require_thread(txn, thread)?;
+        let turn = require_turn(txn, turn_id)?;
+        let start = cursor_offset(cursor)?;
+        let mut items = Vec::new();
+        let mut next = None;
+        for (index, model_call_id) in turn.model_call_order.iter().enumerate().skip(start) {
+            if items.len() == limit {
+                next = Some((index - 1).to_string());
+                break;
+            }
+            if let Some(call) = turn.model_calls.get(model_call_id) {
+                items.push(call.view(thread, &turn.turn_id));
+            }
+        }
+        Ok(ModelCallPage {
+            items,
+            cursor: next,
+        })
+    })
+}
+
 fn cursor_offset(cursor: Option<&str>) -> Result<usize> {
     match cursor {
         None => Ok(0),

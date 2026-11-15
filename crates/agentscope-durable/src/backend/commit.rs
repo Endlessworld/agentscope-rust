@@ -58,6 +58,7 @@ pub(super) fn commit(
         for step in &command.steps {
             apply_step(&mut turn, step, now)?;
         }
+        apply_model_calls(&mut turn, &command.model_calls, now)?;
         if !command.applied_results.is_empty() && command.checkpoint.is_null() {
             return Err(DurableError::invalid(
                 "Result application requires a native checkpoint",
@@ -291,6 +292,70 @@ fn apply_step(turn: &mut TurnData, change: &StepChange, now: i64) -> Result<()> 
                 },
             );
             turn.step_order.push(change.step_id.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Applies the model facts one batch observed.
+///
+/// The native journal writes a dispatch and its ending in two batches, so this is an upsert by
+/// `modelCallId`: a change only overwrites what it carries, and a call whose ending was already
+/// recorded is left alone (a replayed batch must not reopen it).
+fn apply_model_calls(turn: &mut TurnData, changes: &[ModelCallChange], now: i64) -> Result<()> {
+    for change in changes {
+        if !turn.model_calls.contains_key(&change.model_call_id) {
+            turn.model_calls.insert(
+                change.model_call_id.clone(),
+                ModelCallData::new(change.model_call_id.clone(), now),
+            );
+            turn.model_call_order.push(change.model_call_id.clone());
+        }
+        let call = turn
+            .model_calls
+            .get_mut(&change.model_call_id)
+            .ok_or_else(|| DurableError::invalid("Unknown model call"))?;
+        if let Some(model) = &change.model {
+            call.model = Some(model.clone());
+        }
+        if let Some(purpose) = &change.purpose {
+            call.purpose = Some(purpose.clone());
+        }
+        if let Some(iteration) = change.iteration {
+            call.iteration = Some(iteration);
+        }
+        if let Some(step) = &change.step_id {
+            call.step_id = Some(step.clone());
+        }
+        if call.status.terminal() {
+            continue;
+        }
+        call.status = change.status;
+        if change.status.terminal() {
+            call.ended_at = Some(now);
+            call.duration_millis = Some(now.saturating_sub(call.started_at));
+            call.usage = change.usage.clone();
+            call.usage_complete = change.usage_complete;
+            call.error_type = change.error_type.clone();
+        }
+        // A change that names a provider opened one attempt; its ending settles the same entry
+        // instead of adding a second one, because the native journal reports one attempt per
+        // dispatch and this implementation never retries inside a dispatch.
+        if let Some(provider) = &change.provider {
+            let attempt = call.requests.len() as i32 + 1;
+            let ended = change.status.terminal().then_some(now);
+            call.requests.push(ModelRequestView {
+                request_id: format!("{}:{attempt}", change.model_call_id),
+                attempt,
+                provider: provider.clone(),
+                status: change.status,
+                started_at: call.started_at,
+                ended_at: ended,
+                duration_millis: ended.map(|ended| ended.saturating_sub(call.started_at)),
+                usage: change.usage.clone(),
+                usage_complete: change.usage_complete,
+                error_type: change.error_type.clone(),
+            });
         }
     }
     Ok(())

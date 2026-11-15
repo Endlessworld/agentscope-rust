@@ -645,10 +645,34 @@ async fn the_task_projection_reads_the_status_the_run_and_the_ending() {
     assert_eq!(failed.error.as_deref(), Some("provider timed out"));
 }
 
+/// The shape core's recorder commits: an envelope with the message as its payload.
+fn journal_entry(sequence: u64, event_type: &str, message: &Value, turn_id: &str) -> Value {
+    json!({
+        "schemaVersion": 2,
+        "eventId": format!("e{sequence}"),
+        "seq": sequence,
+        "occurredAt": 1_700_000_000_000i64,
+        "type": event_type,
+        "turnId": turn_id,
+        "required": true,
+        "payloadJson": json!({ "message": message }).to_string(),
+    })
+}
+
+fn message_json(id: &str, text: &str) -> Value {
+    json!({
+        "id": id,
+        "content": [{ "type": "text", "text": text }],
+        "timestamp": "2026-01-01 00:00:00.000",
+    })
+}
+
 #[tokio::test]
-async fn history_projects_the_committed_outputs_in_queue_order() {
+async fn history_is_empty_when_the_journal_holds_no_message() {
+    // The shape a scope written before message facts existed has: turns, no journal messages.
+    // History must answer an empty page, not invent one from the turn outputs.
     let (backend, session, thread) = fixture(idle()).await;
-    let first = session
+    session
         .submit("req-1", json!({ "text": "one" }))
         .await
         .expect("submit");
@@ -666,10 +690,17 @@ async fn history_projects_the_committed_outputs_in_queue_order() {
         )
         .await
         .expect("settle");
-    assert!(session.waiting().await.expect("waiting").is_empty());
 
-    let second = session
-        .submit("req-2", json!({ "text": "two" }))
+    let history = session.history(None, 10).await.expect("history");
+    assert!(history.items.is_empty(), "{:?}", history.items);
+    assert_eq!(history.cursor, None);
+}
+
+#[tokio::test]
+async fn history_rebuilds_the_journal_messages_in_order_and_pages_by_sequence() {
+    let (backend, session, thread) = fixture(idle()).await;
+    let receipt = session
+        .submit("req-1", json!({ "text": "one" }))
         .await
         .expect("submit");
     let lease = backend
@@ -677,24 +708,68 @@ async fn history_projects_the_committed_outputs_in_queue_order() {
         .await
         .expect("claim")
         .expect("a claimable turn");
-    session
-        .settle(
-            &lease,
-            TurnStatus::Succeeded,
-            json!({ "reply": "two" }),
-            None,
-        )
+
+    let user = message_json("m-user", "hello");
+    let assistant = message_json("m-assistant", "hi");
+    let tool = json!({
+        "id": "m-tool",
+        "content": [{ "type": "tool_result", "id": "call-1", "output": "ok", "state": "SUCCESS" }],
+        "timestamp": "2026-01-01 00:00:03.000"
+    });
+    let revision = session.turn(&receipt.turn_id).await.expect("turn").revision;
+    let mut commit = Commit::new("journal-1", revision, TurnStatus::Running);
+    commit.journal = Some(JournalAppend {
+        expected_position: 0,
+        entries: vec![
+            journal_entry(1, "message/user", &user, &receipt.turn_id),
+            journal_entry(2, "message/assistant", &assistant, &receipt.turn_id),
+            journal_entry(3, "tool/result", &tool, &receipt.turn_id),
+        ],
+    });
+    backend
+        .commit(&lease, commit)
         .await
-        .expect("settle");
+        .expect("journal commit");
 
     let history = session.history(None, 10).await.expect("history");
+    let roles: Vec<&str> = history
+        .items
+        .iter()
+        .filter_map(|item| item["role"].as_str())
+        .collect();
+    assert_eq!(roles, vec!["user", "assistant", "tool"]);
     let ids: Vec<&str> = history
         .items
         .iter()
-        .filter_map(|item| item["turnId"].as_str())
+        .filter_map(|item| item["messageId"].as_str())
         .collect();
-    assert_eq!(ids, vec![first.turn_id.as_str(), second.turn_id.as_str()]);
-    assert_eq!(history.items[0]["output"], json!({ "reply": "one" }));
+    assert_eq!(ids, vec!["m-user", "m-assistant", "m-tool"]);
+    assert_eq!(history.items[0]["turnId"], json!(receipt.turn_id));
+    assert_eq!(history.items[0]["seq"], json!("1"));
+
+    // One item per page: the cursor is the sequence of the last item handed out, so the next
+    // page starts behind it instead of walking the history in front of it again.
+    let first = session.history(None, 1).await.expect("first page");
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.cursor.as_deref(), Some("1"));
+    let second = session
+        .history(first.cursor.as_deref(), 1)
+        .await
+        .expect("second page");
+    assert_eq!(second.items[0]["messageId"], json!("m-assistant"));
+    assert_eq!(second.cursor.as_deref(), Some("2"));
+    let last = session
+        .history(second.cursor.as_deref(), 1)
+        .await
+        .expect("last page");
+    assert_eq!(last.items[0]["messageId"], json!("m-tool"));
+    assert_eq!(last.cursor.as_deref(), Some("3"));
+    assert!(session
+        .history(last.cursor.as_deref(), 1)
+        .await
+        .expect("past the end")
+        .items
+        .is_empty());
 }
 
 /// Publishes one event while it runs, as a run adapter that renders a live stream does.

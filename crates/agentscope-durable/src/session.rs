@@ -21,8 +21,8 @@ use crate::harness_adapter::{settle_turn, EventSink};
 use crate::runtime::{DurableRuntime, TickOutcome};
 use crate::session_backend::SessionBackend;
 use crate::types::{
-    CommandReceipt, EventPage, HistoryPage, Lease, Signal, ThreadKey, ThreadStateView, TurnPage,
-    TurnReceipt, TurnStatus, TurnTask, TurnView,
+    CommandReceipt, EventPage, HistoryPage, Lease, ModelCallPage, Signal, ThreadKey,
+    ThreadStateView, TurnPage, TurnReceipt, TurnStatus, TurnTask, TurnView,
 };
 
 /// How many turns one page of [`DurableSession::waiting`] asks for.
@@ -208,9 +208,22 @@ impl DurableSession {
         self.runtime.turns(&self.thread, cursor, limit).await
     }
 
-    /// The committed history of this thread: today the output each turn produced, in queue order.
+    /// The committed transcript of this thread, rebuilt from the journal's message facts.
     pub async fn history(&self, cursor: Option<&str>, limit: usize) -> Result<HistoryPage> {
         self.runtime.history(&self.thread, cursor, limit).await
+    }
+
+    /// The model calls one turn observed, in dispatch order.
+    pub async fn model_calls(
+        &self,
+        turn_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ModelCallPage> {
+        self.runtime
+            .backend()
+            .model_calls(&self.thread, turn_id, cursor, limit)
+            .await
     }
 
     /// The queue-facing projection of one turn: status, ending, the run that last worked on it.

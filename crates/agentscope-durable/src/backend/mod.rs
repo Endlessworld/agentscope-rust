@@ -736,6 +736,16 @@ impl SessionBackend for TxnBackend {
         tools::steps(self.store.as_ref(), thread, turn_id, run_id, cursor, limit)
     }
 
+    async fn model_calls(
+        &self,
+        thread: &ThreadKey,
+        turn_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ModelCallPage> {
+        tools::model_calls(self.store.as_ref(), thread, turn_id, cursor, limit)
+    }
+
     async fn journal(&self, lease: &Lease, after: u64, limit: usize) -> Result<Vec<Value>> {
         commit::journal(self.store.as_ref(), lease, after, limit)
     }
