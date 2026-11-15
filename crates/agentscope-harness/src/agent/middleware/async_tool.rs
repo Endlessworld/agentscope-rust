@@ -18,7 +18,10 @@ use std::time::Duration;
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
 use agentscope_core::event::{AgentEvent, AgentEventType};
-use agentscope_core::message::ToolUseBlock;
+use agentscope_core::journal::InvocationRecorder;
+use agentscope_core::message::{
+    ContentBlock, Msg, MsgRole, TextBlock, ToolResultBlock, ToolResultState, ToolUseBlock,
+};
 use agentscope_core::middleware::{ActingInput, EventStream, Middleware, Next};
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -134,6 +137,12 @@ impl Middleware for AsyncToolMiddleware {
         // the equivalent of Java's direct `state.contextMutable().add(...)` write in
         // `emitPlaceholderAndComplete` is a write to the acting results handle.
         let results_handle = input.results.clone();
+        // The journal the call was dispatched into. The placeholder only reaches it through
+        // the acting results handle, i.e. on the checkpoint after the acting phase; a turn
+        // that yields first (a pause, a cancel, a stop request) would leave `tool/dispatch`
+        // without any outcome and make every later open of the session demand explicit
+        // reconciliation for a call whose result is merely deferred.
+        let recorder = InvocationRecorder::from_context(ctx);
 
         // Shared state between the background task and the outer stream.
         let buffer = Arc::new(std::sync::Mutex::new(Vec::<Result<AgentEvent>>::new()));
@@ -236,6 +245,41 @@ impl Middleware for AsyncToolMiddleware {
                                     chrono::Utc::now(),
                                 ))
                                 .await;
+                        }
+                    }
+                    // Record the deferral here, not only through the placeholder: the fact says
+                    // "the outcome is not terminal yet, it will arrive as a notification", which
+                    // clears the dispatch uncertainty without claiming the tool finished or
+                    // writing anything into the state context (a suspended result is skipped by
+                    // the projection).
+                    if let Some(recorder) = &recorder {
+                        let blocks: Vec<ContentBlock> = tool_calls
+                            .iter()
+                            .map(|tc| {
+                                ContentBlock::ToolResult(
+                                    ToolResultBlock::new(
+                                        &tc.id,
+                                        &tc.name,
+                                        vec![ContentBlock::Text(TextBlock::new(placeholder_text(
+                                            &tc.name,
+                                            &tc.id,
+                                            offload_timeout.as_secs(),
+                                        )))],
+                                    )
+                                    .with_state(ToolResultState::Suspended),
+                                )
+                            })
+                            .collect();
+                        let message = Msg::builder().role(MsgRole::Tool).content(blocks).build();
+                        if let Err(error) = recorder
+                            .record("tool/result", &json!({ "message": message }))
+                            .await
+                        {
+                            tracing::warn!(
+                                %error,
+                                "could not record the offloaded tool calls; the next open of \
+                                 this session will ask for explicit reconciliation"
+                            );
                         }
                     }
                     let reply_id = new_hex();
