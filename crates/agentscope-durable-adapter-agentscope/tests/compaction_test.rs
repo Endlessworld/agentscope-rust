@@ -166,6 +166,22 @@ impl Fixture {
             .expect("the root record is the empty part")
     }
 
+    /// How many checkpoint payloads in the scope document still carry a state.
+    ///
+    /// The payloads are JSON *strings* inside the entries, so the count is the number of times the
+    /// field name occurs in the document bytes. A superseded checkpoint keeps its entry but its
+    /// payload is replaced by a marker, which is exactly what this counts.
+    fn state_payloads(&self) -> usize {
+        let path = std::fs::read_dir(self.root.join("scopes"))
+            .expect("scopes")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .expect("one scope document");
+        let document = std::fs::read_to_string(&path).expect("scope");
+        document.matches("stateJson").count()
+    }
+
     /// A reader that shares nothing with the writer but the directory, i.e. a restart.
     fn reopen(&self) -> Arc<BackendThreadJournal> {
         let store: Arc<dyn RecordStore> =
@@ -230,8 +246,10 @@ fn transcript_messages(transcript: &agentscope_core::journal::Transcript) -> Vec
 #[tokio::test]
 async fn a_scope_over_the_threshold_is_compacted_without_losing_a_fact() {
     let fixture = Fixture::open("compaction").await;
-    // ~120 KB of conversation: the size a real session reaches after a while.
-    let state = big_state(4, 30_000);
+    // ~12 KB of conversation per checkpoint: under the blob threshold, so the payload stays in the
+    // document and is what a trim can still give up. (A payload above the threshold is stored out
+    // of line, which leaves nothing here to reclaim.)
+    let state = big_state(4, 3_000);
     let state_bytes = serde_json::to_string(&state).expect("state json").len() as u64;
 
     // The first batch also dispatches a call that is never answered.
@@ -262,8 +280,8 @@ async fn a_scope_over_the_threshold_is_compacted_without_losing_a_fact() {
         .expect("projection");
     let mut previous_transcript = transcript(&*fixture.reopen()).await.expect("transcript");
     let mut compacted: Option<(u64, u64)> = None;
-    // Enough batches of a 120 KB state to pass one mebibyte several times over.
-    for index in 0..24 {
+    // Enough batches of a 12 KB state to pass one mebibyte.
+    for index in 0..120 {
         fixture
             .commit_state(&format!("batch-{index}"), &state)
             .await;
@@ -298,15 +316,16 @@ async fn a_scope_over_the_threshold_is_compacted_without_losing_a_fact() {
     let (before, after) = compacted.expect("a compaction must have run");
     eprintln!("COMPACT scope_bytes {before} -> {after} (state {state_bytes})");
 
-    // (a) the document fell back to about one state plus the journal tail.
+    // (a) the document fell back to one state and the tail the journal keeps.
     assert!(before > 1 << 20, "the trigger is the mebibyte threshold");
     assert!(
-        after * 2 < before,
+        after * 4 < before,
         "the compacted scope is much smaller: {after} after {before}"
     );
-    assert!(
-        after < 4 * state_bytes,
-        "the compacted scope holds about one state: {after} bytes for a {state_bytes}-byte state"
+    assert_eq!(
+        fixture.state_payloads(),
+        1,
+        "only the newest checkpoint still carries a state, every older payload is a marker"
     );
 
     // (b) a restart folds to the same state, the same uncertainty and the same runs.
@@ -560,7 +579,7 @@ async fn a_compaction_keeps_the_finalization_frames_a_replay_needs() {
     use agentscope_durable_adapter_agentscope::{FINALIZATION_COMPLETED, FINALIZATION_STARTED};
 
     let fixture = Fixture::open("compaction-finalization").await;
-    let state = big_state(4, 30_000);
+    let state = big_state(4, 3_000);
     let state_bytes = serde_json::to_string(&state).expect("state json").len() as u64;
     let reply = Msg::assistant("first");
 
@@ -584,7 +603,7 @@ async fn a_compaction_keeps_the_finalization_frames_a_replay_needs() {
     // Push the scope past the mebibyte threshold, exactly as a long session does.
     let mut previous_bytes = fixture.scope_bytes();
     let mut compacted = false;
-    for index in 0..24 {
+    for index in 0..120 {
         fixture
             .commit_state(&format!("batch-{index}"), &state)
             .await;
@@ -636,11 +655,21 @@ async fn a_compaction_keeps_the_finalization_frames_a_replay_needs() {
 #[tokio::test]
 async fn a_scope_that_cannot_shrink_is_not_walked_again_for_a_few_kilobytes() {
     let fixture = Fixture::open("trim-guard").await;
-    // One checkpoint of a little over a mebibyte and no later one: nothing here is superseded and
-    // no event is old enough to prune, so a trim can give up almost nothing. This is the scope
-    // that used to pay for three key walks on every commit and get smaller by nothing.
-    let state = big_state(1, 1_150_000);
-    fixture.commit_state("batch-big", &state).await;
+    // A scope that cannot shrink: a transcript of messages, each below the blob threshold so it
+    // stays in the document, and no fact a trim is allowed to give up (no superseded checkpoint
+    // payload, no event outside the retention window). This is the scope that used to pay for
+    // three key walks on every commit and get smaller by nothing. One batch, so the commit that
+    // trims is the one after it and not one inside the loop.
+    let text = "z".repeat(12 * 1024);
+    let facts: Vec<(&str, Value)> = (0..90)
+        .map(|index| {
+            (
+                "message/assistant",
+                message_payload(&format!("{index}:{text}")),
+            )
+        })
+        .collect();
+    fixture.commit("batch-big", &facts).await;
     let over = fixture.scope_bytes();
     assert!(over > 1 << 20, "the scope is over the threshold: {over}");
 

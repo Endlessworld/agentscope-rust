@@ -1,5 +1,26 @@
 //! Single-host file store: one JSON document per scope plus one per work item.
 //!
+//! # Large values
+//!
+//! A scope is one document that every commit rewrites, so a value kept inline is written again on
+//! every later commit of that session: a 27 MB conversation state turned each journal batch into
+//! 27 MB of disk traffic. A payload above [`BLOB_THRESHOLD`] is therefore written once into
+//! `blobs/<scope>/<digest>.json` and the document keeps a small reference to it, which bounds a
+//! commit by the number of *facts* in the session instead of by the bytes those facts carry.
+//!
+//! The reference is content addressed — the file name is the SHA-256 of the serialized payload —
+//! so a payload written twice (the same checkpoint state at every step of a turn, two identical
+//! tool results) lands once, and a commit that changes nothing else rewrites nothing. Blob writes
+//! are temp-then-rename like every other file, so two hosts storing the same digest produce one
+//! complete file and never a partial one.
+//!
+//! Atomicity is unchanged: blobs are written first, the document second. A commit that fails after
+//! its blobs landed leaves files nothing references, which cost disk until
+//! [`FileStore::collect_blobs`] sweeps them and can never be read by mistake, because a reader
+//! only follows a reference out of a committed document. A value a caller reads back is always the
+//! logical payload: the reference never escapes `Txn::get`, so digests, event ids and execution
+//! ids computed from stored values do not move.
+//!
 //! # What is promised, and what is not
 //!
 //! Every write goes through a temporary file in the same directory followed by a rename, so a
@@ -19,7 +40,7 @@
 //! Cross-process exclusion uses one lock file per scope; any number of hosts may share one root
 //! (see [`FileStore`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -81,6 +102,48 @@ const HELD_RETRIES: u32 = 10;
 const HELD_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 const HELD_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(400);
 
+/// How large a stored value may be before it is kept out of line.
+///
+/// The document is the unit every commit rewrites, so the threshold is the point where keeping a
+/// fact inline starts costing more than the extra file it would take to store it apart. One model
+/// message, one tool result and certainly one conversation checkpoint are far above this — a
+/// checkpoint payload is hundreds of kilobytes to megabytes — while every control-plane record
+/// (a turn, a receipt, a lease, an execution) is a few hundred bytes. 16 KiB is therefore above
+/// every record whose shape a scope is *about* and below every payload whose bytes dominate it,
+/// so a scope stays a document of records and a directory of payloads instead of a mix.
+const BLOB_THRESHOLD: usize = 16 * 1024;
+
+/// The single key that marks a stored value as a reference to a blob.
+const BLOB_MARKER: &str = "$blob";
+
+/// The only payload representation this store writes. Named so a future one (a compressed body,
+/// say) is a different `kind` rather than a guess about the bytes.
+const BLOB_KIND: &str = "json";
+
+/// How long a blob that no committed document references is left alone before a sweep deletes it.
+///
+/// It closes the one window the design cannot: a reader parses a document, then loads the blobs it
+/// names, and a commit replacing that document in between would otherwise be able to delete a
+/// payload out from under it. A reader that opened the document before the removing commit is
+/// done with it far inside this grace period, and an in-flight *writer* is covered too because a
+/// blob it just wrote is younger than the grace.
+const BLOB_GC_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// How big a document must be for the legacy roll-out pass to be worth its walk.
+///
+/// The pass serializes every value of the document once to find the ones still inline. Below this
+/// size a rewrite is cheap enough that moving a few kilobytes out of line is not worth a pass;
+/// above it the pass is paid for once and the document cannot come back, because every new
+/// payload is stored out of line.
+const ROLL_OUT_BYTES: u64 = 1 << 20;
+
+/// How many blobs this process keeps parsed, and how many bytes they may hold.
+const BLOB_CACHE_ENTRIES: usize = 16;
+const BLOB_CACHE_BYTES: usize = 4 << 20;
+
+/// How many scopes remember that their legacy payloads were already moved out of line.
+const ROLLED_OUT_SCOPES: usize = 64;
+
 /// Scope maps and the readiness index backed by plain files under one directory.
 ///
 /// Any number of hosts (processes) may open the same root at the same time: exclusion is per
@@ -92,6 +155,23 @@ pub struct FileStore {
     ///
     /// Only that path uses it; see [`Picked`].
     picked: Mutex<HashMap<String, Picked>>,
+    /// Out-of-line payloads this process read last; see [`BlobCache`].
+    blobs: Mutex<BlobCache>,
+    /// Scopes whose legacy inline payloads this process already moved out of line.
+    rolled_out: Mutex<HashSet<String>>,
+}
+
+/// The out-of-line payloads this process read last.
+///
+/// Content addressing makes the digest the identity of the payload, so an entry never needs
+/// invalidating: a blob is immutable for the life of its digest, and a rewrite of the same payload
+/// writes the same bytes. A journal fold reads the same checkpoint payload on every tick, which is
+/// the repetition this avoids; the two bounds are what keep it from becoming a second copy of the
+/// session.
+#[derive(Default)]
+struct BlobCache {
+    entries: HashMap<String, Value>,
+    total: usize,
 }
 
 /// A `read_parts` answer kept until the document behind it is replaced.
@@ -172,7 +252,7 @@ fn count_scope_write(bytes: usize) {
 impl FileStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        for dir in ["scopes", "work", "locks"] {
+        for dir in ["scopes", "work", "locks", "blobs"] {
             // Creating a directory two hosts need at the same moment answers "already exists",
             // which is success; a transient hold on the parent is retried like any other.
             retry_while_held(|| fs::create_dir_all(root.join(dir)))?;
@@ -186,6 +266,8 @@ impl FileStore {
         let store = Self {
             root,
             picked: Mutex::new(HashMap::new()),
+            blobs: Mutex::new(BlobCache::default()),
+            rolled_out: Mutex::new(HashSet::new()),
         };
         store.adopt_flat_work_records()?;
         Ok(store)
@@ -261,6 +343,177 @@ impl FileStore {
     /// One lock for the whole readiness index; see [`FileStore::commit`].
     fn work_lock_path(&self) -> PathBuf {
         self.root.join("locks").join("work-index.lock")
+    }
+
+    // ------------------------------------------------------------------------
+    // Out-of-line payloads
+    // ------------------------------------------------------------------------
+
+    /// One directory per scope, so a sweep only ever has to look at the blobs a single document
+    /// can reference. Content addressing across scopes was the alternative and is not worth it:
+    /// two sessions sharing a byte-identical payload is rare, while deciding whether a shared file
+    /// is still referenced would mean walking every scope of the root — or keeping a reference
+    /// count that every commit would have to update.
+    fn blob_dir(&self, scope: &str) -> PathBuf {
+        self.root.join("blobs").join(digest(scope))
+    }
+
+    fn blob_path(&self, scope: &str, blob: &str) -> PathBuf {
+        self.blob_dir(scope).join(format!("{blob}.json"))
+    }
+
+    /// Writes `bytes` as the blob they digest to and answers the reference that replaces them.
+    ///
+    /// The file is checked before it is written: the name *is* the content, so an existing file of
+    /// the same length is the same payload, and rewriting it would cost exactly the bytes this
+    /// mechanism exists to save. Two hosts reaching this point for one digest write the same bytes
+    /// through temp-then-rename, so the result is one complete file either way.
+    fn store_blob(&self, scope: &str, bytes: &[u8]) -> Result<Value> {
+        let blob = sha256_hex(bytes);
+        let path = self.blob_path(scope, &blob);
+        let present = match retry_while_held(|| fs::metadata(&path)) {
+            Ok(meta) => meta.len() == bytes.len() as u64,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !present {
+            retry_while_held(|| fs::create_dir_all(self.blob_dir(scope)))?;
+            write_atomic(&path, bytes)?;
+        }
+        Ok(blob_reference(&blob, bytes.len()))
+    }
+
+    /// The value a reference stands for, from the cache or from its file.
+    fn load_blob(&self, scope: &str, blob: &str) -> Result<Value> {
+        if let Some(value) = self.cached_blob(blob) {
+            return Ok(value);
+        }
+        let path = self.blob_path(scope, blob);
+        let bytes = match retry_while_held(|| fs::read(&path)) {
+            Ok(bytes) => bytes,
+            // The document names it, so it has to be there: a missing file is a damaged store and
+            // must stop the read instead of answering with the reference itself.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(DurableError::invalid(format!(
+                    "Referenced blob {blob} is missing"
+                )))
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let value: Value = serde_json::from_slice(&bytes)?;
+        self.keep_blob(blob, bytes.len(), &value);
+        Ok(value)
+    }
+
+    /// The value of a stored part, with a reference resolved to the payload it names.
+    fn resolve(&self, scope: &str, stored: Value) -> Result<Value> {
+        match blob_reference_of(&stored) {
+            Some(blob) => self.load_blob(scope, blob),
+            None => Ok(stored),
+        }
+    }
+
+    /// The value a `put` stores: out of line when it is large, unchanged otherwise.
+    fn externalize(&self, scope: &str, value: Value) -> Result<Value> {
+        // A reference is already the compact form; measuring it would only externalize the
+        // reference itself.
+        if blob_reference_of(&value).is_some() {
+            return Ok(value);
+        }
+        let bytes = serde_json::to_vec(&value)?;
+        if bytes.len() <= BLOB_THRESHOLD {
+            return Ok(value);
+        }
+        self.store_blob(scope, &bytes)
+    }
+
+    fn cached_blob(&self, blob: &str) -> Option<Value> {
+        let cache = self.blobs.lock().ok()?;
+        cache.entries.get(blob).cloned()
+    }
+
+    /// Remembers a parsed payload, dropping the previous contents when either bound is reached.
+    ///
+    /// Wholesale clearing is enough: a miss only means the next read parses the file again, which
+    /// is the behaviour without the cache, and it keeps the bookkeeping to one addition.
+    fn keep_blob(&self, blob: &str, bytes: usize, value: &Value) {
+        let Ok(mut cache) = self.blobs.lock() else {
+            return;
+        };
+        if bytes > BLOB_CACHE_BYTES {
+            return;
+        }
+        if cache.total + bytes > BLOB_CACHE_BYTES || cache.entries.len() >= BLOB_CACHE_ENTRIES {
+            cache.entries.clear();
+            cache.total = 0;
+        }
+        if !cache.entries.contains_key(blob) {
+            cache.total += bytes;
+        }
+        cache.entries.insert(blob.to_string(), value.clone());
+    }
+
+    /// Moves the large inline payloads of a document written before blobs existed out of line.
+    ///
+    /// New writes always externalize, so anything still inline is legacy, and a document only has
+    /// legacy payloads until this pass has seen it once. Re-serializing every value to measure it
+    /// is a walk over the whole document, which is only worth paying above [`ROLL_OUT_BYTES`] —
+    /// below that a rewrite is cheap and the pass would cost more than the bytes it frees. The
+    /// memo is per process and per scope: after the pass the document cannot go back to holding a
+    /// large payload, so a second pass could not find one.
+    fn roll_out(&self, scope: &str, committed: &mut BTreeMap<String, Value>) -> Result<()> {
+        match self.rolled_out.lock() {
+            Ok(rolled) if rolled.contains(scope) => return Ok(()),
+            Ok(_) => {}
+            Err(_) => return Ok(()),
+        }
+        for value in committed.values_mut() {
+            if blob_reference_of(value).is_some() {
+                continue;
+            }
+            let bytes = serde_json::to_vec(value)?;
+            if bytes.len() > BLOB_THRESHOLD {
+                *value = self.store_blob(scope, &bytes)?;
+            }
+        }
+        if let Ok(mut rolled) = self.rolled_out.lock() {
+            if rolled.len() >= ROLLED_OUT_SCOPES {
+                // The set is tiny and nothing depends on it: forgetting means one more pass over
+                // one more document, never a wrong answer.
+                rolled.clear();
+            }
+            rolled.insert(scope.to_string());
+        }
+        Ok(())
+    }
+
+    /// Deletes the blobs no part of `committed` refers to any more.
+    ///
+    /// Best effort by design: an unreferenced file is only wasted disk, so a listing or a delete
+    /// that fails (another host reading it, a scanner holding it) must not fail the commit that
+    /// noticed it. It runs only after the document that stopped referencing them was written, and
+    /// only for a commit that removed parts — that is the only way a reference can disappear. A
+    /// blob younger than [`BLOB_GC_GRACE`] is left alone; see that constant for the reader it
+    /// protects.
+    fn collect_blobs(&self, scope: &str, committed: &BTreeMap<String, Value>) {
+        let referenced: HashSet<&str> = committed.values().filter_map(blob_reference_of).collect();
+        let entries = match retry_while_held(|| fs::read_dir(self.blob_dir(scope))) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(blob) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if referenced.contains(blob) || !older_than(&path, BLOB_GC_GRACE) {
+                continue;
+            }
+            let _ = retry_while_held(|| fs::remove_file(&path));
+        }
     }
 
     /// The last answer for `(scope, parts)`, if the document behind it is unchanged.
@@ -367,7 +620,15 @@ impl FileStore {
         };
         let mut picked = pick_parts(&bytes, parts)?;
         crate::traffic::count_scope_pick();
-        let values: Vec<Option<Value>> = parts.iter().map(|part| picked.remove(*part)).collect();
+        let mut values: Vec<Option<Value>> =
+            parts.iter().map(|part| picked.remove(*part)).collect();
+        for slot in values.iter_mut() {
+            if let Some(stored) = slot.take() {
+                // A poll only asks for control records, which are far below the blob threshold, so
+                // this normally answers without touching a file at all.
+                *slot = Some(self.resolve(scope, stored)?);
+            }
+        }
         self.keep_picked(scope, parts, stamp, &values);
         Ok(values)
     }
@@ -383,16 +644,20 @@ impl FileStore {
     ) -> Result<()> {
         let mut committed = base;
         let mut touched = false;
+        let mut removed = false;
         for (part, value) in staged {
             if scheduled.contains_key(&part) {
                 continue;
             }
             match value {
                 Some(value) => {
-                    committed.insert(part, value);
+                    // A payload this large would be rewritten by every later commit of the session,
+                    // so it is stored once and the document keeps a reference to it.
+                    committed.insert(part, self.externalize(scope, value)?);
                 }
                 None => {
                     committed.remove(&part);
+                    removed = true;
                 }
             }
             touched = true;
@@ -428,6 +693,9 @@ impl FileStore {
             }
         }
         if touched {
+            if self.scope_bytes(scope)?.unwrap_or(0) > ROLL_OUT_BYTES {
+                self.roll_out(scope, &mut committed)?;
+            }
             // The last moment at which losing the lock can still be noticed, and the only one that
             // matters: the lock is what excludes the other writer, so a stolen lock must cost an
             // abandoned commit, not a lost update. One small read against a whole-document
@@ -436,6 +704,11 @@ impl FileStore {
             let bytes = serde_json::to_vec(&committed)?;
             count_scope_write(bytes.len());
             write_atomic(&self.scope_path(scope), &bytes)?;
+            if removed {
+                // Only now: until the document that stopped naming them is on disk, the old one
+                // still references these payloads.
+                self.collect_blobs(scope, &committed);
+            }
         }
         Ok(())
     }
@@ -450,6 +723,8 @@ impl RecordStore for FileStore {
         let lock = acquire_lock(&self.lock_path(scope))?;
         let base = self.read_scope(scope)?;
         let mut staged = StagedTxn {
+            store: self,
+            scope,
             base: &base,
             staged: BTreeMap::new(),
             scheduled: BTreeMap::new(),
@@ -538,6 +813,8 @@ struct Scheduled {
 }
 
 struct StagedTxn<'a> {
+    store: &'a FileStore,
+    scope: &'a str,
     base: &'a BTreeMap<String, Value>,
     staged: BTreeMap<String, Option<Value>>,
     scheduled: BTreeMap<String, Scheduled>,
@@ -559,7 +836,12 @@ impl Txn for StagedTxn<'_> {
     }
 
     fn get(&self, part: &str) -> Result<Option<Value>> {
-        Ok(self.read(part))
+        // A payload stored out of line is read here and nowhere else, so a caller never sees a
+        // reference and every digest it computes stays the digest of the payload.
+        match self.read(part) {
+            Some(stored) => Ok(Some(self.store.resolve(self.scope, stored)?)),
+            None => Ok(None),
+        }
     }
 
     fn put(&mut self, part: &str, value: Option<Value>) -> Result<()> {
@@ -621,12 +903,62 @@ struct WorkRecord {
 }
 
 fn digest(input: &str) -> String {
-    let digest = Sha256::digest(input.as_bytes());
+    sha256_hex(input.as_bytes())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(64);
     for byte in digest {
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
+}
+
+/// The blob a stored value stands for, when the value is a reference.
+///
+/// The shape is checked strictly — `$blob` is the only key, `kind` is the one representation this
+/// store writes, `bytes` is a number and `digest` is 64 hex characters — for two reasons. A part
+/// whose own JSON happens to carry a `$blob` field has to keep being read as itself, and a
+/// reference this store cannot act on has to fail as data rather than be silently resolved to
+/// whatever a loose match found.
+fn blob_reference_of(value: &Value) -> Option<&str> {
+    let map = value.as_object()?;
+    if map.len() != 1 {
+        return None;
+    }
+    let reference = map.get(BLOB_MARKER)?.as_object()?;
+    if reference.len() != 3
+        || reference.get("kind")?.as_str()? != BLOB_KIND
+        || reference.get("bytes")?.as_u64().is_none()
+    {
+        return None;
+    }
+    let blob = reference.get("digest")?.as_str()?;
+    (blob.len() == 64 && blob.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(blob)
+}
+
+/// The document form of a reference: the digest, the payload length and how it is encoded.
+fn blob_reference(blob: &str, bytes: usize) -> Value {
+    let mut reference = serde_json::Map::new();
+    reference.insert("digest".to_string(), Value::String(blob.to_string()));
+    reference.insert("bytes".to_string(), Value::from(bytes as u64));
+    reference.insert("kind".to_string(), Value::String(BLOB_KIND.to_string()));
+    let mut marker = serde_json::Map::new();
+    marker.insert(BLOB_MARKER.to_string(), Value::Object(reference));
+    Value::Object(marker)
+}
+
+/// Whether `path` was last written longer than `age` ago.
+fn older_than(path: &Path, age: Duration) -> bool {
+    match retry_while_held(|| fs::metadata(path)) {
+        Ok(meta) => meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|elapsed| elapsed >= age),
+        Err(_) => false,
+    }
 }
 
 /// The values of `wanted` in one serialized scope document, skipping everything else.
@@ -1669,6 +2001,264 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].payload, Some(json!("payload")));
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Out-of-line payloads
+    // -----------------------------------------------------------------------
+
+    /// A payload well above [`BLOB_THRESHOLD`], distinct per `marker`.
+    fn big_payload(marker: &str) -> Value {
+        json!({
+            "marker": marker,
+            "messages": (0..40)
+                .map(|index| format!("{index}:{}", "x".repeat(8 * 1024)))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    fn blob_files(store: &FileStore, scope: &str) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = fs::read_dir(store.blob_dir(scope))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn a_large_value_is_stored_out_of_line_and_the_scope_shrinks() -> Result<()> {
+        let root = TempRoot::new("blob-large");
+        let store = FileStore::open(root.path())?;
+        let payload = big_payload("large");
+        let inline = serde_json::to_vec(&payload)?.len() as u64;
+
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("big", Some(payload.clone()))
+        })?;
+        let stored = store
+            .scope_bytes("session")?
+            .expect("a file store measures");
+        eprintln!("BLOB scope_bytes inline={inline} stored={stored}");
+        assert!(
+            inline > BLOB_THRESHOLD as u64 * 10,
+            "the payload is worth moving: {inline}"
+        );
+        assert!(
+            stored < 4 * 1024,
+            "the document holds a reference: {stored}"
+        );
+        assert!(
+            stored * 50 < inline,
+            "{inline} inline bytes became {stored} stored bytes"
+        );
+        assert_eq!(blob_files(&store, "session").len(), 1);
+
+        // Committing the same payload again writes the document and nothing else: the blob is
+        // already there under the digest that names it. The blob's own timestamp is the witness —
+        // the process-wide write counters are shared with every test running beside this one.
+        let blob = blob_files(&store, "session").pop().expect("the blob");
+        let untouched = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&blob)?
+            .set_modified(untouched)?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("big", Some(payload.clone()))
+        })?;
+        assert_eq!(
+            fs::metadata(&blob)?.modified()?,
+            untouched,
+            "the stored payload was not written again"
+        );
+        assert!(store.scope_bytes("session")?.expect("measures") < 4 * 1024);
+        assert_eq!(read_value(&store, "session", "big")?, Some(payload));
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_payload_reads_back_byte_for_byte() -> Result<()> {
+        let root = TempRoot::new("blob-round-trip");
+        let store = FileStore::open(root.path())?;
+        // Non-ASCII, escapes, nested containers and numbers: everything a JSON round trip can
+        // change by accident if it goes through a canonical form instead of the stored bytes.
+        let payload = json!({
+            "text": format!(
+                "{}{}",
+                "会话状态\u{1F600}\"\\\n\t".repeat(4000),
+                "x".repeat(64 * 1024)
+            ),
+            "nested": { "list": [1, 2, 3.5, true, null], "empty": {} },
+        });
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("big", Some(payload.clone()))
+        })?;
+        let read = read_value(&store, "session", "big")?.expect("stored");
+        assert_eq!(serde_json::to_vec(&read)?, serde_json::to_vec(&payload)?);
+
+        // The control-poll path resolves a reference the same way.
+        let picked = store.read_parts("session", &["big"])?;
+        let picked = picked[0].clone().expect("picked");
+        assert_eq!(serde_json::to_vec(&picked)?, serde_json::to_vec(&payload)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_document_written_before_blobs_existed_still_reads() -> Result<()> {
+        let root = TempRoot::new("blob-legacy");
+        let store = FileStore::open(root.path())?;
+        // Over the roll-out threshold: this is the 27 MB scope the pass exists for, in miniature.
+        let payload = json!({ "text": "y".repeat(1500 * 1024) });
+        // An older build wrote the payload inline, straight into the scope document.
+        let document = json!({ "legacy": payload, "small": 1 });
+        fs::write(store.scope_path("session"), serde_json::to_vec(&document)?)?;
+        let before = store
+            .scope_bytes("session")?
+            .expect("a file store measures");
+        assert!(
+            before > ROLL_OUT_BYTES,
+            "the legacy document is big: {before}"
+        );
+        assert_eq!(
+            read_value(&store, "session", "legacy")?,
+            Some(payload.clone())
+        );
+
+        // The next commit of any part moves the legacy payload out of line, once.
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("small", Some(json!(2)))
+        })?;
+        let after = store
+            .scope_bytes("session")?
+            .expect("a file store measures");
+        eprintln!("BLOB legacy scope_bytes {before} -> {after}");
+        assert!(after < 4 * 1024, "the legacy payload moved: {after}");
+        assert_eq!(read_value(&store, "session", "legacy")?, Some(payload));
+        Ok(())
+    }
+
+    #[test]
+    fn the_digest_of_a_payload_does_not_change_when_it_is_stored_out_of_line() -> Result<()> {
+        let root = TempRoot::new("blob-digest");
+        let store = FileStore::open(root.path())?;
+        let payload = big_payload("digest");
+        // What an event id or an execution id is derived from.
+        let digest = crate::json::hash(&payload)?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("big", Some(payload.clone()))
+        })?;
+        let read = read_value(&store, "session", "big")?.expect("stored");
+        assert_eq!(crate::json::hash(&read)?, digest);
+
+        // The document itself holds the reference, so a digest of the *document* differs — which
+        // is exactly why callers must only ever see the payload, never the reference.
+        let document: Value = serde_json::from_slice(&fs::read(store.scope_path("session"))?)?;
+        assert_ne!(crate::json::hash(&document)?, digest);
+        Ok(())
+    }
+
+    #[test]
+    fn two_hosts_storing_the_same_payload_leave_one_copy() {
+        let root = TempRoot::new("blob-concurrent");
+        let hosts: Vec<Arc<FileStore>> = (0..2)
+            .map(|_| FileStore::open(root.path()).map(Arc::new))
+            .collect::<Result<Vec<_>>>()
+            .expect("hosts");
+        let payload = Arc::new(big_payload("concurrent"));
+        let expected = Arc::clone(&payload);
+        run_concurrently(4, move |thread| {
+            let store = Arc::clone(&hosts[thread % hosts.len()]);
+            let scope = format!("session-{}", thread % 2);
+            for _ in 0..5 {
+                store
+                    .transaction(&scope, &mut |txn: &mut dyn Txn| -> Result<()> {
+                        txn.put("big", Some((*payload).clone()))
+                    })
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        });
+
+        // Blobs are per scope (that is what makes a sweep safe), so two scopes keep two files and
+        // neither host's concurrent write left a second copy or a broken one.
+        let store = FileStore::open(root.path()).expect("reopened store");
+        for scope in ["session-0", "session-1"] {
+            assert_eq!(blob_files(&store, scope).len(), 1, "one copy in {scope}");
+            assert_eq!(
+                read_value(&store, scope, "big").expect("read"),
+                Some((*expected).clone())
+            );
+        }
+    }
+
+    #[test]
+    fn a_blob_nothing_references_is_reclaimed_and_the_rest_still_reads() -> Result<()> {
+        let root = TempRoot::new("blob-gc");
+        let store = FileStore::open(root.path())?;
+        let kept = big_payload("kept");
+        let dropped = big_payload("dropped");
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("kept", Some(kept.clone()))?;
+            txn.put("dropped", Some(dropped.clone()))
+        })?;
+        assert_eq!(blob_files(&store, "session").len(), 2);
+
+        // The sweep only deletes a blob older than its grace, so age the one that is about to lose
+        // its last reference. It is the reader that parsed the document before the removing
+        // commit that the grace protects.
+        let dropped_blob = store.blob_path("session", &sha256_hex(&serde_json::to_vec(&dropped)?));
+        std::fs::File::options()
+            .write(true)
+            .open(&dropped_blob)?
+            .set_modified(std::time::SystemTime::now() - 2 * BLOB_GC_GRACE)?;
+
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("dropped", None)
+        })?;
+        assert!(!dropped_blob.exists(), "the unreferenced blob is gone");
+        assert_eq!(blob_files(&store, "session").len(), 1);
+        assert_eq!(read_value(&store, "session", "kept")?, Some(kept));
+        assert_eq!(read_value(&store, "session", "dropped")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_payload_under_the_threshold_stays_in_the_document() -> Result<()> {
+        let root = TempRoot::new("blob-small");
+        let store = FileStore::open(root.path())?;
+        let payload = json!({ "text": "x".repeat(BLOB_THRESHOLD - 32) });
+        assert!(serde_json::to_vec(&payload)?.len() <= BLOB_THRESHOLD);
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("small", Some(payload.clone()))
+        })?;
+        assert!(blob_files(&store, "session").is_empty());
+        assert_eq!(read_value(&store, "session", "small")?, Some(payload));
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_exact_reference_shape_is_a_reference() {
+        // A part whose own JSON happens to carry a `$blob` field must keep being read as data.
+        assert!(blob_reference_of(&json!({
+            "$blob": { "digest": "not a digest", "bytes": 1, "kind": "json" }
+        }))
+        .is_none());
+        assert!(blob_reference_of(&json!({
+            "$blob": { "digest": "a".repeat(64), "bytes": 1, "kind": "json" },
+            "extra": true
+        }))
+        .is_none());
+        assert!(blob_reference_of(&json!({
+            "$blob": { "digest": "a".repeat(64), "bytes": 1, "kind": "gzip" }
+        }))
+        .is_none());
+        assert!(blob_reference_of(&blob_reference(&"a".repeat(64), 7)).is_some());
+        assert_eq!(BLOB_THRESHOLD, 16 * 1024);
+        assert_eq!(BLOB_MARKER, "$blob");
     }
 
     // -----------------------------------------------------------------------
