@@ -355,5 +355,15 @@ ACP 侧接线已验证可编译、ACP lib 114 条全绿，但集成用例 `sessi
 - **与 Java 的差异**：①Java 只要有 position 就在有待办时进入续跑，Rust 额外要求 `acting_iteration > 0`（默认 0 不算续跑），以便只跟踪推理位置的宿主保持旧行为——durable adapter 对第 1 轮提交的是 `(cur_iter, cur_iter-1)` = acting 0，故三进程验收的模型调用数仍为 2；②没有 reasoning 消息时，续跑轮的消息取 `last_assistant_message_with_reason`（Java 在 suspend/stop 时另行构造）。
 - **新增用例**（`react_agent.rs::tests`）：`an_acting_position_continues_pending_tool_calls_without_asking_the_model`（模型 0 次、工具 1 次、结果按 id 对上）、`without_a_position_pending_tool_calls_still_reason_first`（模型 1 次，现状不变）、`an_acting_position_without_pending_calls_reasons_normally`（无待办 → 仍推理）、`the_acting_iteration_spends_the_max_iterations_budget`（`acting_iteration=2` + `max_iters=2` → 续跑后越预算，`MaxIterations` 且 0 次模型调用）。
 - **验证**：`cargo test -p agentscope-core --lib` 536 passed / 0 failed；`cargo check --workspace --all-targets -j 2` EXIT=0；`cargo test -p agentscope-durable-adapter-agentscope`、`-p agentscope-extensions-acp` 全绿。反向验证：关掉续跑分支后用例 1、4 FAILED。
-- **剩余风险**：Java 的 `recorder.resumeStep(acting_iteration)` 未同步（core 不写 step 边界，durable 侧仍靠 `before_acting` checkpoint）；`acting_iteration >= 1` 且有待办时确实会跳过推理，若某宿主把该字段当「上一轮推理号」无条件填 >0，模型调用数会变少。
+- **剩余风险**：`acting_iteration >= 1` 且有待办时确实会跳过推理，若某宿主把该字段当「上一轮推理号」无条件填 >0，模型调用数会变少。
+
+### 2.13 acting 续跑同步 step 边界（2026-11-15，未提交）
+
+补齐 §2.12 记的最后一项 Java 差异（`InvocationRecorder.resumeStep`）。
+
+- **Java 语义**（`InvocationRecorder.java:756`）：`resumeStep(iteration)` 把执行位置置为 `(iteration+1, iteration)`，先以 `continued` 关闭已开的 step，再开新 step 并追加 `step/start`（`phase="ACTING"`、`iteration`、`resumedFromStepId=interruptedStep`）；每调用一次就开一个 step，**不幂等**。调用点在 `ReActAgent.doCallInner`（`:2596`），在消费待办 tool_result 之前。
+- **Rust 实现**：`InvocationRecorder::resume_step(iteration)` 关掉已开 step（`step/end continued`）后追加 `step/resumed`（`{stepId, iteration, phase:"ACTING"}`，`required=false` 的扩展类型），并复用同一 `step_id` 槽位，使后续 `step(iter)` 把它 `continued` 掉。**不用 `step/start`**：durable `execution_host` 从 `step/start.iteration` 反推推理位置，复用会把 acting 轮误读成推理轮。重复调用同一 `iteration` 为 no-op（比 Java 严格）。
+- **接线**：只在 `run_agent_loop` 的 `acting_resume = Some(...)` 分支调用，传入 `acting_iteration`；不续跑时完全不调用。
+- **用例**：`react_agent::tests::the_acting_resume_opens_a_step_at_the_supplied_iteration`、`a_turn_without_an_acting_position_opens_no_resumed_step`、`journal::recorder::tests::a_repeated_resume_step_writes_one_step`（另有 `a_resumed_acting_step_is_closed_by_the_next_reasoning_step`）。
+- **是否仍有差异**：语义等价（step 边界 + 迭代号 + 对已开 step 的处置）；缺 Java 的 `resumedFromStepId`（Rust journal 投影里没有 `interruptedStep`），幂等性更严。风险：`step/resumed` 是 Rust 专有类型，读方（durable replay）忽略它，仍以 `before_acting` checkpoint 为主。
 

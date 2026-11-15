@@ -2018,6 +2018,14 @@ async fn run_agent_loop(
         Some(acting_iter) => (acting_iter, true),
         None => (start_iter, false),
     };
+    // Java `ReActAgent.doCallInner`: a resumed acting pass opens its own step at
+    // `acting_iteration` before consuming the pending calls, so the journal carries the
+    // boundary even though no model call reasons this iteration.
+    if let Some(iteration) = acting_resume {
+        if let Some(recorder) = InvocationRecorder::from_context(ctx) {
+            recorder.resume_step(iteration.max(0) as usize)?;
+        }
+    }
     // Snapshot plan mode so a plan-control tool's direct write to the shared state can
     // be detected and carried over (the loop otherwise runs on a private clone).
     let plan_mode_at_start = state.plan_mode_context.clone();
@@ -10959,5 +10967,133 @@ mod tests {
             "the pending call still runs"
         );
         assert_eq!(reply.generate_reason(), GenerateReason::MaxIterations);
+    }
+
+    /// A host-owned recorder plus the journal it writes to, attached the way a durable host
+    /// attaches one.
+    async fn attached_recorder() -> (
+        Arc<dyn crate::journal::ThreadJournal>,
+        Arc<InvocationRecorder>,
+    ) {
+        let storage: Arc<dyn crate::journal::AtomicJournalStorage> =
+            Arc::new(crate::journal::MemoryJournalStorage::new());
+        let log: Arc<dyn crate::journal::ThreadJournal> = Arc::new(
+            crate::journal::AtomicThreadJournal::new(storage, "t-acting"),
+        );
+        let recorder = Arc::new(
+            InvocationRecorder::open(Arc::clone(&log), Some("t1"))
+                .await
+                .unwrap(),
+        );
+        (log, recorder)
+    }
+
+    async fn recorded(
+        log: &Arc<dyn crate::journal::ThreadJournal>,
+        recorder: &Arc<InvocationRecorder>,
+    ) -> Vec<crate::journal::JournalEvent> {
+        recorder.flush().await.unwrap();
+        let head = log.head().await.unwrap();
+        log.scan(0, head.seq).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_acting_resume_opens_a_step_at_the_supplied_iteration() {
+        // Java `InvocationRecorder.resumeStep`: the acting continuation is its own step at
+        // `acting_iteration`, recorded before the pending calls are consumed.
+        let (log, recorder) = attached_recorder().await;
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(counting_return_direct_tool(
+            "final_answer",
+            Arc::new(Mutex::new(0)),
+        ));
+        let agent = ReActAgent::builder()
+            .name("t-acting-resume-step")
+            .model(Arc::new(CountingTextModel {
+                name: "counting",
+                text: "reasoned",
+                calls: Arc::new(Mutex::new(0)),
+            }))
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .context_mut()
+            .push(pending_assistant("c-step", "final_answer"));
+        let mut extensions = acting_position(0, 2);
+        extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
+
+        agent
+            .call_with_format_and_extensions(vec![], None, extensions)
+            .await
+            .unwrap();
+
+        let events = recorded(&log, &recorder).await;
+        let resumed: Vec<&crate::journal::JournalEvent> = events
+            .iter()
+            .filter(|event| event.event_type == "step/resumed")
+            .collect();
+        assert_eq!(resumed.len(), 1, "one resumed acting step: {events:?}");
+        let data = resumed[0].data().unwrap();
+        assert_eq!(
+            data["iteration"], 2,
+            "the step is the acting pass at `acting_iteration`"
+        );
+        assert_eq!(data["phase"], "ACTING");
+        assert!(
+            !events.iter().any(|event| event.event_type == "step/start"),
+            "the acting pass buys no reasoning step: {events:?}"
+        );
+        recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_turn_without_an_acting_position_opens_no_resumed_step() {
+        let (log, recorder) = attached_recorder().await;
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::new(Mutex::new(0))));
+        let agent = ReActAgent::builder()
+            .name("t-acting-resume-absent-step")
+            .model(Arc::new(CountingTextModel {
+                name: "counting",
+                text: "reasoned",
+                calls: Arc::new(Mutex::new(0)),
+            }))
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .context_mut()
+            .push(pending_assistant("c-plain", "add"));
+        let mut extensions = crate::agent::Extensions::new();
+        extensions.insert_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
+
+        agent
+            .call_with_format_and_extensions(vec![], None, extensions)
+            .await
+            .unwrap();
+
+        let events = recorded(&log, &recorder).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event_type == "step/resumed"),
+            "no acting continuation, no resumed step: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "step/start")
+                .count(),
+            1,
+            "the first reasoning iteration still opens its own step"
+        );
+        recorder.close().await;
     }
 }

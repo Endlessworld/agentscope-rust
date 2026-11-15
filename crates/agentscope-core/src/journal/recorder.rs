@@ -364,6 +364,8 @@ struct RecorderState {
     result_reason: Option<String>,
     result_json: Option<String>,
     step_id: Option<String>,
+    /// The iteration a resumed acting step was opened for; `None` for a reasoning step.
+    resumed_step: Option<usize>,
     action_ids: HashMap<String, String>,
     /// `action/end` results, frozen when the fact is accepted. A parallel batch publishes a
     /// completed action before its result reaches the canonical context, so a later checkpoint
@@ -1441,22 +1443,53 @@ impl InvocationRecorder {
 
     /// Marks a reasoning iteration boundary.
     pub fn step(&self, iteration: usize) -> crate::error::Result<()> {
-        let previous = {
-            let mut guard = self.lock();
-            guard.step_id.take()
-        };
+        self.end_open_step()?;
+        let step_id = uuid::Uuid::new_v4().to_string();
+        self.append(
+            "step/start",
+            &serde_json::json!({ "stepId": step_id, "iteration": iteration }),
+        )?;
+        let mut guard = self.lock();
+        guard.step_id = Some(step_id);
+        guard.resumed_step = None;
+        Ok(())
+    }
+
+    /// Opens a step for an acting continuation: iteration `iteration` runs its acting phase
+    /// again without another model decision (Java `InvocationRecorder.resumeStep`). Idempotent:
+    /// repeating the call for the step already open writes nothing more.
+    pub fn resume_step(&self, iteration: usize) -> crate::error::Result<()> {
+        if {
+            let guard = self.lock();
+            guard.step_id.is_some() && guard.resumed_step == Some(iteration)
+        } {
+            return Ok(());
+        }
+        self.end_open_step()?;
+        let step_id = uuid::Uuid::new_v4().to_string();
+        // A dedicated type, not `step/start`: readers rebuild the reasoning position from
+        // `step/start`'s `iteration`, and this step is an acting pass at that same iteration.
+        // `required: false` leaves it optional for readers that do not know it.
+        self.append_required(
+            "step/resumed",
+            &serde_json::json!({ "stepId": step_id, "iteration": iteration, "phase": "ACTING" }),
+            false,
+        )?;
+        let mut guard = self.lock();
+        guard.step_id = Some(step_id);
+        guard.resumed_step = Some(iteration);
+        Ok(())
+    }
+
+    /// Closes the open step as `continued`, if there is one.
+    fn end_open_step(&self) -> crate::error::Result<()> {
+        let previous = self.lock().step_id.take();
         if let Some(step_id) = previous {
             self.append(
                 "step/end",
                 &serde_json::json!({ "stepId": step_id, "status": "continued" }),
             )?;
         }
-        let step_id = uuid::Uuid::new_v4().to_string();
-        self.append(
-            "step/start",
-            &serde_json::json!({ "stepId": step_id, "iteration": iteration }),
-        )?;
-        self.lock().step_id = Some(step_id);
         Ok(())
     }
 
@@ -2140,6 +2173,61 @@ mod tests {
             .into_iter()
             .map(|e| e.event_type)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_repeated_resume_step_writes_one_step() {
+        // Java `resumeStep` opens a step per call; repeating it for the step already open must
+        // not split the acting pass into two.
+        let (log, _storage) = journal().await;
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+        recorder.resume_step(2).unwrap();
+        recorder.resume_step(2).unwrap();
+        recorder.flush().await.unwrap();
+
+        let events = {
+            let head = log.head().await.unwrap();
+            log.scan(0, head.seq).await.unwrap()
+        };
+        let resumed: Vec<&JournalEvent> = events
+            .iter()
+            .filter(|event| event.event_type == "step/resumed")
+            .collect();
+        assert_eq!(resumed.len(), 1, "one acting step, got {events:?}");
+        assert_eq!(resumed[0].data().unwrap()["iteration"], 2);
+        assert!(
+            !events.iter().any(|event| event.event_type == "step/end"),
+            "the repeated call must not close the open step: {events:?}"
+        );
+        recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_resumed_acting_step_is_closed_by_the_next_reasoning_step() {
+        let (log, _storage) = journal().await;
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+        recorder.resume_step(2).unwrap();
+        recorder.step(3).unwrap();
+        recorder.flush().await.unwrap();
+
+        let events = {
+            let head = log.head().await.unwrap();
+            log.scan(0, head.seq).await.unwrap()
+        };
+        let types: Vec<&str> = events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["step/resumed", "step/end", "step/start"],
+            "the acting step is continued into the reasoning step"
+        );
+        recorder.close().await;
     }
 
     #[test]
