@@ -47,6 +47,15 @@ pub trait RecordStore: Send + Sync {
     /// Entries that are due at or before `now`, ordered by readiness.
     fn ready(&self, queue: &str, now: i64, limit: usize) -> Result<Vec<WorkItem>>;
 
+    /// Bytes one scope document occupies right now.
+    ///
+    /// `None` when the store cannot tell (an in-memory map, a remote KV). It exists so the
+    /// backend can decide *when* a scope is worth compacting without knowing what the store is;
+    /// a store that answers `None` never triggers threshold compaction on its own.
+    fn scope_bytes(&self, _scope: &str) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
     fn shared_across_hosts(&self) -> bool;
 }
 

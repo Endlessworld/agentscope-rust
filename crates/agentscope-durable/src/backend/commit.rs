@@ -5,6 +5,7 @@ use serde_json::json;
 use super::tools::{apply_dispatch, apply_result};
 use super::turn::abandon_runs;
 use super::*;
+use crate::backend::compact;
 
 pub(super) fn commit(
     store: &dyn RecordStore,
@@ -13,6 +14,12 @@ pub(super) fn commit(
 ) -> Result<CommitReceipt> {
     command.validate()?;
     let digest = digest_of(&command)?;
+    // Decided before the transaction: the store answers "how big is this scope", the backend
+    // decides what may be dropped. A store that cannot measure (in memory, remote KV) never
+    // triggers this and keeps every fact.
+    let trim = store
+        .scope_bytes(&lease.thread.session.storage_key())?
+        .is_some_and(|bytes| bytes > compact::COMPACT_THRESHOLD_BYTES);
     with_session(store, &lease.thread.session, |txn| {
         let mut state = require_state(txn)?;
         let mut thread = require_thread(txn, &lease.thread)?;
@@ -135,6 +142,27 @@ pub(super) fn commit(
             .insert(command.commit_id.clone(), receipt.clone());
         schedule_thread(txn, &thread, Some(&turn), now)?;
         save_turn(txn, &turn)?;
+        // The scope is one document that this commit is rewriting anyway, so trimming it here
+        // costs no extra write: the bytes it drops are bytes this write would otherwise carry.
+        if trim {
+            match compact::run(txn, &mut state, &thread, compact::EVENT_RETENTION) {
+                Ok(outcome) if !outcome.is_empty() => tracing::debug!(
+                    session = %lease.thread.session.storage_key(),
+                    payloads = outcome.payloads,
+                    checkpoints = outcome.checkpoints,
+                    events = outcome.events,
+                    "compacted the session scope"
+                ),
+                // A compaction that fails is not a failed commit: every fact it drops is
+                // independently safe to drop, and the next commit tries again.
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    session = %lease.thread.session.storage_key(),
+                    %error,
+                    "session scope left uncompacted"
+                ),
+            }
+        }
         save_thread(txn, &thread)?;
         save_state(txn, &state)?;
         Ok(receipt)

@@ -5,13 +5,15 @@
 //! is `Txn::now()`.
 
 pub(crate) mod commit;
+pub(crate) mod compact;
 pub(crate) mod identity;
 pub(crate) mod model;
 pub(crate) mod query;
 pub(crate) mod tools;
 pub(crate) mod turn;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,21 +29,77 @@ use crate::{json, DurableError, Result};
 
 use model::*;
 
+/// How many granted expiries the memo below remembers before it is cleared.
+///
+/// The entries are a few dozen bytes each and nothing depends on them, so the bound only has to
+/// keep a process that claims thousands of turns from growing a map forever.
+const GRANTED_MEMO_ENTRIES: usize = 64;
+
 /// Backend over any [`RecordStore`]. Use [`TxnBackend::in_memory`] for tests and
 /// [`TxnBackend::with_store`] for a durable store.
 pub struct TxnBackend {
     store: Arc<dyn RecordStore>,
+    /// The expiry this process last granted, keyed by session scope and thread epoch.
+    ///
+    /// A lease extension that is already in force needs neither a read nor a write, and one
+    /// session document is the whole conversation: skipping the transaction is what keeps a
+    /// journal flush from re-reading (and re-parsing) tens of megabytes just to confirm an
+    /// expiry it wrote itself a moment ago. Only an optimisation — a miss asks the store, which
+    /// is the behaviour without the memo — and a stale value can only be *older* than the store's
+    /// (nothing in this process shortens a lease it granted), so the worst case is one redundant
+    /// write, never a lease that lapses unextended.
+    granted: Mutex<HashMap<(String, u64), i64>>,
 }
 
 impl TxnBackend {
     pub fn in_memory() -> Self {
         Self {
             store: Arc::new(InMemoryStore::new()),
+            granted: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn with_store(store: Arc<dyn RecordStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            granted: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lease_key(lease: &Lease) -> (String, u64) {
+        (lease.thread.session.storage_key(), lease.epoch)
+    }
+
+    fn remember(&self, lease: &Lease) {
+        if let Ok(mut granted) = self.granted.lock() {
+            // Bounded: one entry per claim, and a long-lived process claims once per turn. A map
+            // that grows past this is cleared wholesale — an empty memo only means the next renew
+            // asks the store, which is the correct behaviour anyway.
+            if granted.len() >= GRANTED_MEMO_ENTRIES {
+                granted.clear();
+            }
+            granted.insert(Self::lease_key(lease), lease.expires_at);
+        }
+    }
+
+    fn forget(&self, lease: &Lease) {
+        if let Ok(mut granted) = self.granted.lock() {
+            granted.remove(&Self::lease_key(lease));
+        }
+    }
+
+    /// Whether the extension `ttl` requests is already in force.
+    fn already_granted(&self, lease: &Lease, ttl: Duration) -> bool {
+        let ttl = ttl.as_millis().min(i64::MAX as u128) as i64;
+        let Ok(granted) = self.granted.lock() else {
+            return false;
+        };
+        let Some(expires_at) = granted.get(&Self::lease_key(lease)) else {
+            return false;
+        };
+        // The caller's own copy of the lease is older than what the store granted, so the memo is
+        // the only one that can answer this; the headroom rule itself lives in `turn::renew`.
+        expires_at - crate::now_millis() > turn::renew_headroom(ttl)
     }
 
     pub fn store(&self) -> &Arc<dyn RecordStore> {
@@ -394,15 +452,30 @@ impl SessionBackend for TxnBackend {
     }
 
     async fn claim(&self, thread: &ThreadKey, owner: &str, ttl: Duration) -> Result<Option<Lease>> {
-        turn::claim(self.store.as_ref(), thread, owner, ttl)
+        let lease = turn::claim(self.store.as_ref(), thread, owner, ttl)?;
+        if let Some(lease) = &lease {
+            self.remember(lease);
+        }
+        Ok(lease)
     }
 
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<()> {
-        turn::renew(self.store.as_ref(), lease, ttl)
+        if self.already_granted(lease, ttl) {
+            return Ok(());
+        }
+        turn::renew(self.store.as_ref(), lease, ttl)?;
+        self.remember(&Lease {
+            expires_at: crate::now_millis() + ttl.as_millis().min(i64::MAX as u128) as i64,
+            ..lease.clone()
+        });
+        Ok(())
     }
 
     async fn release(&self, lease: &Lease, delay: Duration) -> Result<()> {
         turn::release(self.store.as_ref(), lease, delay)
+            // Forgotten on both paths: a failed release either left the lease to expire (the memo
+            // then only under-reports the time left) or the caller retries it.
+            .map(|()| self.forget(lease))
     }
 
     async fn frame(&self, lease: &Lease) -> Result<Frame> {
@@ -508,5 +581,9 @@ impl SessionBackend for TxnBackend {
 
     async fn snapshot(&self, session: &SessionKey) -> Result<Snapshot> {
         query::snapshot(self.store.as_ref(), session)
+    }
+
+    async fn prune_events(&self, session: &SessionKey, keep_newest: u64) -> Result<u64> {
+        query::prune_events(self.store.as_ref(), session, keep_newest)
     }
 }

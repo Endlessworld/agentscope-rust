@@ -146,4 +146,17 @@ pub trait SessionBackend: Send + Sync {
         limit: usize,
     ) -> Result<EventPage>;
     async fn snapshot(&self, session: &SessionKey) -> Result<Snapshot>;
+
+    /// Drops every public event outside the newest `keep_newest` of one session.
+    ///
+    /// Public events are a client-facing log, not durable state: the turn, the tool records and
+    /// the native checkpoint keep everything recovery needs. What a client must lose is bounded
+    /// and reported — a cursor below the new watermark answers `cursor_expired`, and
+    /// [`snapshot`](SessionBackend::snapshot) is how it catches up — instead of the log growing
+    /// with the square of the conversation.
+    ///
+    /// Returns how many events were dropped. A backend that keeps no event log answers `0`.
+    async fn prune_events(&self, _session: &SessionKey, _keep_newest: u64) -> Result<u64> {
+        Ok(0)
+    }
 }

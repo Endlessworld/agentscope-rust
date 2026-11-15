@@ -56,6 +56,57 @@ pub struct FileStore {
     root: PathBuf,
 }
 
+// ----------------------------------------------------------------------------
+// Write-traffic counters
+// ----------------------------------------------------------------------------
+//
+// Two relaxed atomic adds per write and nothing else: no disk, no lock, no allocation. They exist
+// so a test (or a field investigation) can answer "how many transactions and how many bytes does
+// one turn cost" without a profiler, which is the number every storage optimisation has to move.
+// Counting is always on: a `cfg(test)` copy would be invisible to the integration tests that
+// measure a whole turn, and a feature flag would make the numbers depend on the build.
+
+static TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
+static SCOPE_WRITES: AtomicU64 = AtomicU64::new(0);
+static SCOPE_BYTES: AtomicU64 = AtomicU64::new(0);
+static BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// What this process wrote through [`FileStore`] since the last reset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteStats {
+    /// Committed scope transactions.
+    pub transactions: u64,
+    /// Committed transactions that rewrote the scope document.
+    pub scope_writes: u64,
+    /// Bytes of scope documents written by those rewrites.
+    pub scope_bytes: u64,
+    /// Bytes written in total: scope documents, work records, temporary files.
+    pub bytes_written: u64,
+}
+
+/// The counters above, as of now.
+pub fn write_stats() -> WriteStats {
+    WriteStats {
+        transactions: TRANSACTIONS.load(Ordering::Relaxed),
+        scope_writes: SCOPE_WRITES.load(Ordering::Relaxed),
+        scope_bytes: SCOPE_BYTES.load(Ordering::Relaxed),
+        bytes_written: BYTES_WRITTEN.load(Ordering::Relaxed),
+    }
+}
+
+/// Zeroes the counters; a measurement takes one before and one after the turn it costs.
+pub fn reset_write_stats() {
+    TRANSACTIONS.store(0, Ordering::Relaxed);
+    SCOPE_WRITES.store(0, Ordering::Relaxed);
+    SCOPE_BYTES.store(0, Ordering::Relaxed);
+    BYTES_WRITTEN.store(0, Ordering::Relaxed);
+}
+
+fn count_scope_write(bytes: usize) {
+    SCOPE_WRITES.fetch_add(1, Ordering::Relaxed);
+    SCOPE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
 impl FileStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
@@ -155,7 +206,9 @@ impl FileStore {
             }
         }
         if touched {
-            write_json(&self.scope_path(scope), &committed)?;
+            let bytes = serde_json::to_vec(&committed)?;
+            count_scope_write(bytes.len());
+            write_atomic(&self.scope_path(scope), &bytes)?;
         }
         Ok(())
     }
@@ -183,7 +236,17 @@ impl RecordStore for FileStore {
             // Discard: nothing reached the disk.
             return Err(error);
         }
+        TRANSACTIONS.fetch_add(1, Ordering::Relaxed);
         self.commit(scope, base, staged, scheduled)
+    }
+
+    fn scope_bytes(&self, scope: &str) -> Result<Option<u64>> {
+        match fs::metadata(self.scope_path(scope)) {
+            Ok(meta) => Ok(Some(meta.len())),
+            // A scope that was never written has no document yet.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(0)),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn ready(&self, queue: &str, now: i64, limit: usize) -> Result<Vec<WorkItem>> {
@@ -347,6 +410,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 /// Temporary file plus rename, retried because another host may briefly hold the target.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    BYTES_WRITTEN.fetch_add(bytes.len() as u64, Ordering::Relaxed);
     let sequence = next_sequence();
     let name = path
         .file_name()

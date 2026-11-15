@@ -3,6 +3,7 @@
 use serde_json::json;
 
 use super::*;
+use crate::backend::compact;
 
 pub(super) fn turn(store: &dyn RecordStore, thread: &ThreadKey, turn_id: &str) -> Result<TurnView> {
     with_session(store, &thread.session, |txn| {
@@ -250,7 +251,10 @@ pub(super) fn events(
     with_session(store, session, |txn| {
         let state = require_state(txn)?;
         let position = match cursor {
-            None | Some("") => 0,
+            // No cursor means "from the retained start": a session that pruned its oldest events
+            // must still be readable from the beginning of what is left, instead of answering
+            // `cursor_expired` to its own first read.
+            None | Some("") => state.retained_after,
             Some(cursor) => parse_cursor(&state, cursor)?,
         };
         if position < state.retained_after {
@@ -274,6 +278,25 @@ pub(super) fn events(
             cursor: Some(cursor_of(&state, last)),
             high_watermark: Some(cursor_of(&state, state.sequence)),
         })
+    })
+}
+
+/// Drops the oldest public events, keeping the newest `keep_newest`.
+///
+/// The watermark is what makes this safe to expose: a client that asks for a cursor below it is
+/// told to load a snapshot instead of being handed a silent gap.
+pub(super) fn prune_events(
+    store: &dyn RecordStore,
+    session: &SessionKey,
+    keep_newest: u64,
+) -> Result<u64> {
+    with_session(store, session, |txn| {
+        let mut state = require_state(txn)?;
+        let dropped = compact::prune(txn, &mut state, keep_newest)?;
+        if dropped > 0 {
+            save_state(txn, &state)?;
+        }
+        Ok(dropped)
     })
 }
 

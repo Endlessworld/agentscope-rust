@@ -4,6 +4,18 @@ use serde_json::json;
 
 use super::*;
 
+/// How much time a lease extension has to leave on the clock before it is worth writing down.
+///
+/// A lease is extended only when what is left is at most half its ttl (see [`renew`]); this
+/// floor keeps that rule meaningful for a lease shorter than ten seconds, where half the ttl is
+/// no headroom at all. Five seconds is longer than any scope transaction this store performs, so
+/// a caller that renews on schedule always gets its extension written before the lease lapses.
+pub(super) fn renew_headroom(ttl_millis: i64) -> i64 {
+    (ttl_millis / 2).max(LEASE_RENEW_FLOOR_MILLIS)
+}
+
+const LEASE_RENEW_FLOOR_MILLIS: i64 = 5_000;
+
 pub(super) fn submit(
     store: &dyn RecordStore,
     thread_key: &ThreadKey,
@@ -433,6 +445,21 @@ pub(super) fn renew(store: &dyn RecordStore, lease: &Lease, ttl: Duration) -> Re
         let mut turn = require_turn(txn, &lease.turn_id)?;
         let now = txn.now();
         assert_owned(&turn, lease, now)?;
+        // An extension only has to be *written* when the lease is actually running out.
+        //
+        // The whole session is one document, so restating an expiry that already has more than
+        // half its ttl to run costs a rewrite of everything — and every journal flush renews
+        // before it commits, which made the plain record-and-write form cost two full rewrites
+        // per commit for one integer. The fence is enforced by `assert_owned` on every mutating
+        // call anyway, so a later extension is what the caller needs, not an earlier one.
+        //
+        // The floor below `ttl / 2` keeps a short lease extendable: with a millisecond ttl the
+        // half-way rule alone would never fire, so a lease would be allowed to lapse without a
+        // single write trying to save it.
+        let headroom = renew_headroom(ttl);
+        if turn.expires_at - now > headroom {
+            return Ok(());
+        }
         turn.expires_at = now + ttl;
         schedule_thread(txn, &thread, Some(&turn), now)?;
         save_turn(txn, &turn)
