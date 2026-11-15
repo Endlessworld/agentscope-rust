@@ -145,6 +145,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentscope-durable-http"
+version = "0.2.0"
+dependencies = [
+ "agentscope-durable",
+]
+
+[[package]]
+name = "agentscope-durable-jdbc"
+version = "0.2.0"
+dependencies = [
+ "agentscope-durable",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "agentscope-durable-mcp"
+version = "0.2.0"
+dependencies = [
+ "agentscope-durable",
+]
+
+[[package]]
 name = "agentscope-durable-objects"
 version = "0.2.0"
 dependencies = [
@@ -152,12 +175,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentscope-durable-postgres"
+name = "agentscope-durable-rocketmq"
 version = "0.2.0"
 dependencies = [
  "agentscope-durable",
- "serde_json",
- "tokio",
+]
+
+[[package]]
+name = "agentscope-durable-sandbox"
+version = "0.2.0"
+dependencies = [
+ "agentscope-durable",
 ]
 
 [[package]]

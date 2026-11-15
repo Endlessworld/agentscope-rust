@@ -1,6 +1,6 @@
 //! The DDL: the file a deployment applies, and the statements a test can assert on.
 
-/// The whole schema, comments included. This is what `docs/DURABLE_POSTGRES.md` describes.
+/// The whole schema, comments included. This is what `docs/DURABLE_JDBC.md` describes.
 pub const SCHEMA_SQL: &str = include_str!("../schema.sql");
 
 /// The schema as the statements a client executes in order.

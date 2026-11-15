@@ -20,7 +20,7 @@
 //!
 //! `scope_bytes` answers `None`. Measuring a scope means aggregating its rows on every commit, and
 //! the compaction decision it feeds can be made out of band with one query (see
-//! `docs/DURABLE_POSTGRES.md`). A store that guessed a size would either pay for the aggregate on
+//! `docs/DURABLE_JDBC.md`). A store that guessed a size would either pay for the aggregate on
 //! every commit or compact on a number it invented.
 
 use std::cell::{Cell, RefCell};

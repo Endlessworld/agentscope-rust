@@ -6,19 +6,19 @@
 //! and that the revision compare-and-set moves exactly one row.
 //!
 //! These run when `DATABASE_URL` names a database and `psql` is on `PATH` (see
-//! `docs/DURABLE_POSTGRES.md`); otherwise each test prints what it skipped and passes, so
+//! `docs/DURABLE_JDBC.md`); otherwise each test prints what it skipped and passes, so
 //! `cargo test` stays offline-clean. Nothing here talks to a driver: the statements are the ones
 //! the store sends, prepared verbatim.
 
 use std::process::Command;
 
-use agentscope_durable_postgres::schema;
-use agentscope_durable_postgres::statements as sql;
+use agentscope_durable_jdbc::schema;
+use agentscope_durable_jdbc::statements as sql;
 
 /// The database to talk to, or `None` when the test should skip.
 fn database() -> Option<String> {
     let Ok(url) = std::env::var("DATABASE_URL") else {
-        eprintln!("skipped: DATABASE_URL is not set (docs/DURABLE_POSTGRES.md explains the setup)");
+        eprintln!("skipped: DATABASE_URL is not set (docs/DURABLE_JDBC.md explains the setup)");
         return None;
     };
     match Command::new("psql").arg("--version").output() {

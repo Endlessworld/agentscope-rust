@@ -1,5 +1,5 @@
 [package]
-name = "agentscope-durable-postgres"
+name = "agentscope-durable-jdbc"
 description = "AgentScope Rust - PostgreSQL record store for the durable runtime"
 version.workspace = true
 edition.workspace = true

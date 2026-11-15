@@ -1,6 +1,6 @@
 # PostgreSQL as the durable record store
 
-`agentscope-durable-postgres` maps the durable runtime's `RecordStore` onto PostgreSQL. It is a
+`agentscope-durable-jdbc` maps the durable runtime's `RecordStore` onto PostgreSQL. It is a
 *mapping*, not a driver: it decides what a scope row is, what a record row is, how a page becomes
 an index range and how a commit is fenced by a revision compare-and-set. A driver supplies
 `SqlSession` — four methods — and holds no decisions.
@@ -11,7 +11,7 @@ a database, and what only a server can answer lives in `tests/schema_live.rs` be
 
 ## 1. Tables
 
-The whole schema is `crates/agentscope-durable-postgres/schema.sql` (`SCHEMA_SQL`, split into
+The whole schema is `crates/agentscope-durable-jdbc/schema.sql` (`SCHEMA_SQL`, split into
 statements by `schema::statements()`). Every statement is `CREATE … IF NOT EXISTS`, so applying it
 on each connect is safe and there is no migration table for this version.
 
@@ -129,19 +129,19 @@ event log unless it prunes explicitly — the honest state, not a silent one.
 
 ## 6. Running the live tests
 
-The offline suite (`cargo test -p agentscope-durable-postgres`) needs nothing. The server-side
+The offline suite (`cargo test -p agentscope-durable-jdbc`) needs nothing. The server-side
 suite needs `psql` on `PATH` and a database:
 
 ```powershell
 # PowerShell
 $env:DATABASE_URL = 'postgresql://postgres:postgres@127.0.0.1:5432/agentscope_test'
-cargo test -p agentscope-durable-postgres --test schema_live -- --test-threads=1
+cargo test -p agentscope-durable-jdbc --test schema_live -- --test-threads=1
 ```
 
 ```bash
 # bash
 export DATABASE_URL='postgresql://postgres:postgres@127.0.0.1:5432/agentscope_test'
-cargo test -p agentscope-durable-postgres --test schema_live -- --test-threads=1
+cargo test -p agentscope-durable-jdbc --test schema_live -- --test-threads=1
 ```
 
 With `DATABASE_URL` unset, or `psql` missing, each test prints what it skipped and passes, so a
