@@ -21,7 +21,7 @@ pub(super) fn turn(store: &dyn RecordStore, thread: &ThreadKey, turn_id: &str) -
 pub(super) fn thread_state(store: &dyn RecordStore, thread: &ThreadKey) -> Result<ThreadStateView> {
     with_session(store, &thread.session, |txn| {
         let data = require_thread(txn, thread)?;
-        let current = current_turn(txn, &thread.thread_id)?;
+        let current = current_turn(txn, &data)?;
         Ok(ThreadStateView {
             definition: data.definition.clone(),
             status: data.status,

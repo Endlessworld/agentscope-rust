@@ -15,7 +15,7 @@ use crate::types::*;
 pub(crate) const CURRENT_FORMAT: u32 = 1;
 
 pub(crate) fn hash(value: &str) -> String {
-    json::hash(&Value::String(value.to_string()))
+    json::hash_text(value)
 }
 
 /// Zero-padded order key so that lexicographic order is numeric order.
@@ -139,7 +139,17 @@ pub(crate) struct ThreadData {
     pub status: Lifecycle,
     /// Number of turns admitted to this thread.
     pub admitted: u64,
-    /// Materialized prefix of terminal turns.
+    /// Materialized prefix of this thread's queue: how many leading queue slots hold a turn that
+    /// has already reached a terminal status.
+    ///
+    /// This is the turn axis, and it is what lets a reader skip the finished front of a
+    /// conversation instead of reading it turn by turn to find the live one (`current_turn`). It
+    /// is deliberately *not* the event retention watermark (`SessionState::retained_after`), which
+    /// drops public events by sequence and says nothing about which turns are finished.
+    ///
+    /// `serde(default)` so that a thread record written before the prefix was materialized loads
+    /// as `0`: readers then scan from the start, which is exactly the old behaviour.
+    #[serde(default)]
     pub settled: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_metadata: Option<CheckpointMetadata>,
@@ -391,5 +401,36 @@ mod tests {
         assert_eq!(state.retained_after, 2);
         assert_eq!(state.compacted_bytes, 0, "no trim has been measured");
         assert!(!state.compact_pending);
+    }
+
+    /// The settled prefix is a new field on an old record: a thread written before it existed
+    /// must load as "nothing materialized yet", which is what makes readers scan from the start
+    /// exactly as they used to.
+    #[test]
+    fn a_thread_record_from_before_the_settled_prefix_still_loads() {
+        let record = serde_json::json!({
+            "definition": {
+                "key": {
+                    "session": { "namespace": "ns", "sessionId": "s" },
+                    "threadId": "main",
+                },
+                "binding": {
+                    "harness": "harness-a",
+                    "definitionVersion": "def-1",
+                    "stateVersion": "state-1",
+                },
+            },
+            "status": "OPEN",
+            "admitted": 12,
+            "checkpoint_position": 0,
+            "journal_position": 0,
+            "journal_branch": "initial",
+            "epoch": 0,
+            "resource_position": 0,
+        });
+        let thread: ThreadData =
+            serde_json::from_value(record).expect("a thread record without the prefix loads");
+        assert_eq!(thread.admitted, 12);
+        assert_eq!(thread.settled, 0, "an old record materializes nothing");
     }
 }

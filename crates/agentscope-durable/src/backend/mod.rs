@@ -162,7 +162,16 @@ pub(super) fn load_json<T: DeserializeOwned>(txn: &dyn Txn, part: &str) -> Resul
 }
 
 pub(super) fn digest_of<T: Serialize>(value: &T) -> Result<String> {
-    Ok(json::hash(&serde_json::to_value(value)?))
+    Ok(json::hash(&serde_json::to_value(value)?)?)
+}
+
+/// Whether a persisted digest still describes `value`.
+///
+/// Digests written before the RFC 8785 switch are accepted under the legacy rendering too, so
+/// sessions, admissions, receipts and failures persisted by an older build keep verifying.
+/// New digests are always RFC 8785.
+pub(super) fn digest_matches<T: Serialize>(stored: &str, value: &T) -> Result<bool> {
+    Ok(json::matches(stored, &serde_json::to_value(value)?))
 }
 
 pub(super) fn load_state(txn: &dyn Txn) -> Result<Option<SessionState>> {
@@ -316,16 +325,35 @@ pub(super) fn scan_keys(
 
 /// The turn a writer would work on: the first non-terminal one in admission order.
 ///
-/// Stops at the first non-terminal turn, so the common case costs one page; a thread with a
-/// hundred thousand finished turns is still askable on every tick.
-pub(super) fn current_turn(txn: &dyn Txn, thread_id: &str) -> Result<Option<TurnData>> {
-    let mut after: Option<String> = None;
+/// Starts at the thread's materialized prefix of settled turns (see [`advance_settled`]): a
+/// conversation whose finished front has been materialized costs one page and one turn read,
+/// however many turns it already holds.
+pub(super) fn current_turn(txn: &dyn Txn, thread: &ThreadData) -> Result<Option<TurnData>> {
+    current_turn_after(txn, &thread.definition.key.thread_id, thread.settled)
+}
+
+/// [`current_turn`] for a caller that knows only the id, and so starts at `settled`.
+///
+/// `settled` is only ever a *lower bound* on the finished front: starting below it re-reads turns
+/// that are already known to be terminal, starting above it would skip work. A caller without
+/// the thread record passes `0` and pays the full scan.
+pub(super) fn current_turn_after(
+    txn: &dyn Txn,
+    thread_id: &str,
+    settled: u64,
+) -> Result<Option<TurnData>> {
+    let mut after = (settled > 0).then(|| queue_part(thread_id, settled));
     let mut read = 0usize;
     loop {
         let (page, next) = queue_page(txn, thread_id, after.as_deref())?;
         read += page.len();
-        if read > QUEUE_MAX_TURNS {
-            return Err(queue_over_limit(read));
+        // The bound is on the whole queue, not just the part scanned here: it exists to stop a
+        // walk of unknown length inside one transaction, and it is reported, never applied
+        // silently. The prefix does not raise it.
+        if read.saturating_add(usize::try_from(settled).unwrap_or(usize::MAX)) > QUEUE_MAX_TURNS {
+            return Err(queue_over_limit(
+                read.saturating_add(usize::try_from(settled).unwrap_or(usize::MAX)),
+            ));
         }
         for turn_id in page {
             let turn = require_turn(txn, &turn_id)?;
@@ -338,6 +366,45 @@ pub(super) fn current_turn(txn: &dyn Txn, thread_id: &str) -> Result<Option<Turn
             None => return Ok(None),
         }
     }
+}
+
+/// How many queue slots one write may materialize into [`ThreadData::settled`].
+///
+/// A commit settles the head of the unsettled suffix, so the walk below stops at the first live
+/// turn and normally costs one read. The cap bounds the *upgrade* case: a thread written before
+/// the prefix was materialized starts at zero and would otherwise walk its whole finished history
+/// inside one transaction (and one lock). Readers scan from the prefix and stay correct while it
+/// catches up, so a few commits are enough, and the prefix never overshoots.
+const SETTLED_WALK: u64 = 64;
+
+/// Advances the materialized prefix of settled turns as far as the queue agrees.
+///
+/// `settled` counts leading queue slots whose turn is terminal. Because a turn only becomes
+/// terminal through a commit (or a cancellation of a turn no writer holds), advancing it exactly
+/// when this write is about to store the thread record costs no extra transaction: the prefix
+/// rides the document this commit rewrites anyway.
+///
+/// Only a prefix ever advances: the walk stops at the first non-terminal turn, so a turn that
+/// settles out of order (a queued turn cancelled behind a running one) does not push the prefix
+/// past work that is still pending. Returns how many slots it materialized, for tests.
+pub(super) fn advance_settled(txn: &dyn Txn, thread: &mut ThreadData) -> Result<u64> {
+    let thread_id = thread.definition.key.thread_id.clone();
+    let mut advanced = 0;
+    while advanced < SETTLED_WALK {
+        let part = queue_part(&thread_id, thread.settled + 1);
+        let Some(turn_id) = load_json::<String>(txn, &part)? else {
+            break;
+        };
+        let Some(turn) = load_turn(txn, &turn_id)? else {
+            break;
+        };
+        if !turn.status.terminal() {
+            break;
+        }
+        thread.settled += 1;
+        advanced += 1;
+    }
+    Ok(advanced)
 }
 
 fn waiting_satisfied(turn: &TurnData, key: &str) -> bool {
@@ -764,7 +831,7 @@ mod queue_tests {
         })?;
         assert_eq!(ids.len(), total, "every admitted turn is listed");
         let current = crate::store::txn(&store, "session", |txn: &mut dyn Txn| {
-            current_turn(txn, thread)
+            current_turn_after(txn, thread, 0)
         })?;
         assert_eq!(
             current.map(|turn| turn.turn_id),
@@ -808,5 +875,251 @@ mod queue_tests {
                 "{status:?} is not work"
             );
         }
+    }
+
+    fn thread_record(id: &str) -> ThreadData {
+        let definition = ThreadSpec {
+            key: ThreadKey::new(SessionKey::new("ns", "s").expect("session"), id).expect("thread"),
+            binding: ThreadBinding::new("harness-a", "def-1", "state-1").expect("binding"),
+        };
+        ThreadData::new(definition)
+    }
+
+    /// Writes a thread record plus one turn per status, in admission order, the way `submit` does.
+    fn seed(store: &InMemoryStore, id: &str, statuses: &[TurnStatus]) -> Result<ThreadData> {
+        let mut record = thread_record(id);
+        record.admitted = statuses.len() as u64;
+        crate::store::txn(store, "session", |txn: &mut dyn Txn| -> Result<()> {
+            save_thread(txn, &record)?;
+            for (index, status) in statuses.iter().enumerate() {
+                let turn_id = format!("turn-{index:05}");
+                store_json(txn, &queue_part(id, index as u64 + 1), &turn_id)?;
+                let mut turn = TurnData::new(turn_id, id.to_string(), Value::Null, 0);
+                turn.status = *status;
+                save_turn(txn, &turn)?;
+            }
+            Ok(())
+        })?;
+        Ok(record)
+    }
+
+    fn advance(store: &InMemoryStore, record: &mut ThreadData) -> Result<u64> {
+        crate::store::txn(store, "session", |txn: &mut dyn Txn| {
+            advance_settled(txn, record)
+        })
+    }
+
+    /// Every field a reader can compare, so "the same turn" means the same turn.
+    fn assert_same_turn(left: &TurnData, right: &TurnData) {
+        assert_eq!(left.turn_id, right.turn_id);
+        assert_eq!(left.status, right.status);
+        assert_eq!(left.revision, right.revision);
+        assert_eq!(left.invocation_count, right.invocation_count);
+        assert_eq!(left.tool_order, right.tool_order);
+        assert_eq!(left.run_order, right.run_order);
+        assert_eq!(left.output, right.output);
+        assert_eq!(left.error, right.error);
+    }
+
+    /// The prefix is materialized where the turn ends: three finished turns and a live one leave
+    /// `settled` at three, ending the fourth moves it to four, and an empty queue materializes
+    /// nothing.
+    #[test]
+    fn the_settled_prefix_advances_as_the_front_of_the_queue_ends() -> Result<()> {
+        let store = InMemoryStore::new();
+        let mut record = seed(
+            &store,
+            "thread-settling",
+            &[
+                TurnStatus::Succeeded,
+                TurnStatus::Failed,
+                TurnStatus::Cancelled,
+                TurnStatus::Queued,
+            ],
+        )?;
+        assert_eq!(advance(&store, &mut record)?, 3, "three finished turns");
+        assert_eq!(record.settled, 3);
+        // The live turn ends: the prefix takes it and stops at the end of the queue.
+        crate::store::txn(&store, "session", |txn: &mut dyn Txn| -> Result<()> {
+            let mut turn = require_turn(txn, "turn-00003")?;
+            turn.status = TurnStatus::Succeeded;
+            save_turn(txn, &turn)
+        })?;
+        assert_eq!(advance(&store, &mut record)?, 1);
+        assert_eq!(record.settled, 4);
+        assert_eq!(
+            advance(&store, &mut record)?,
+            0,
+            "nothing left to materialize"
+        );
+        assert_eq!(record.settled, 4);
+        Ok(())
+    }
+
+    /// A turn that ends out of order (a queued turn cancelled behind a running one) must not push
+    /// the prefix past work that is still pending: the walk only counts a *prefix*.
+    #[test]
+    fn a_turn_that_ends_out_of_order_does_not_move_the_prefix() -> Result<()> {
+        let store = InMemoryStore::new();
+        let mut record = seed(
+            &store,
+            "thread-out-of-order",
+            &[
+                TurnStatus::Running,
+                TurnStatus::Cancelled,
+                TurnStatus::Queued,
+            ],
+        )?;
+        assert_eq!(advance(&store, &mut record)?, 0);
+        assert_eq!(record.settled, 0, "the head is still work");
+        Ok(())
+    }
+
+    /// A thread record written before the prefix existed has no field; it must load as "nothing
+    /// materialized" and answer exactly what it answered before: a scan from the start.
+    #[test]
+    fn a_thread_without_the_materialized_prefix_answers_as_before() -> Result<()> {
+        let store = InMemoryStore::new();
+        let record = seed(
+            &store,
+            "thread-legacy",
+            &[
+                TurnStatus::Succeeded,
+                TurnStatus::Succeeded,
+                TurnStatus::Queued,
+            ],
+        )?;
+        // Rewrite the thread record the way an older build stored it: no `settled` at all.
+        let mut legacy = serde_json::to_value(&record)?;
+        legacy
+            .as_object_mut()
+            .expect("a thread record is an object")
+            .remove("settled");
+        crate::store::txn(&store, "session", |txn: &mut dyn Txn| -> Result<()> {
+            txn.put(&thread_part("thread-legacy", "definition"), Some(legacy))?;
+            Ok(())
+        })?;
+        let key = ThreadKey::new(SessionKey::new("ns", "s")?, "thread-legacy")?;
+        let loaded = crate::store::txn(&store, "session", |txn: &mut dyn Txn| {
+            require_thread(txn, &key)
+        })?;
+        assert_eq!(loaded.settled, 0, "an old record materializes nothing");
+        let current = crate::store::txn(&store, "session", |txn: &mut dyn Txn| {
+            current_turn(txn, &loaded)
+        })?
+        .expect("the queued turn is work");
+        assert_eq!(current.turn_id, "turn-00002");
+        assert_eq!(current.status, TurnStatus::Queued);
+        Ok(())
+    }
+
+    /// The prefix is a starting cursor, not a different answer: the turn the prefix finds is the
+    /// turn a full scan of the same queue finds, field by field.
+    ///
+    /// The scan also becomes O(1) in the length of the finished front, which is the point of
+    /// materializing it. A page holds [`QUEUE_PAGE`] ids, so a full walk of a front longer than
+    /// that costs one `keys()` per page *plus* one turn read per finished turn, while the
+    /// prefixed walk asks for one page starting at the live turn.
+    #[test]
+    fn a_settled_prefix_finds_the_same_turn_as_a_full_scan() -> Result<()> {
+        let store = InMemoryStore::new();
+        let finished = 3 * QUEUE_PAGE;
+        let mut statuses = vec![TurnStatus::Succeeded; finished];
+        statuses.push(TurnStatus::Queued);
+        let mut record = seed(&store, "thread-with-a-front", &statuses)?;
+        // One write materializes at most `SETTLED_WALK` slots, so a long history catches up over a
+        // few writes instead of walking itself inside one transaction.
+        while advance(&store, &mut record)? > 0 {}
+        assert_eq!(record.settled, finished as u64, "the whole front");
+
+        crate::traffic::reset_read_stats();
+        let prefixed = crate::store::txn(&store, "session", |txn: &mut dyn Txn| {
+            current_turn(txn, &record)
+        })?
+        .expect("a live turn");
+        let after = crate::traffic::read_stats();
+
+        crate::traffic::reset_read_stats();
+        let full = crate::store::txn(&store, "session", |txn: &mut dyn Txn| {
+            current_turn_after(txn, "thread-with-a-front", 0)
+        })?
+        .expect("a live turn");
+        let before = crate::traffic::read_stats();
+
+        assert_same_turn(&prefixed, &full);
+        // One page is asked for as `QUEUE_PAGE + 1` keys (the extra one says whether a next page
+        // exists), so a full walk of the front costs a key per finished turn plus one per page.
+        assert_eq!(
+            after.keys_returned, 1,
+            "the prefix starts the page at the live turn"
+        );
+        assert_eq!(
+            before.keys_returned,
+            finished as u64 + 1 + (finished / QUEUE_PAGE) as u64,
+            "a full scan walks the finished front"
+        );
+        Ok(())
+    }
+
+    /// A compaction rewrites the same document the prefix lives in, and must neither move it nor
+    /// change the answer derived from it.
+    #[test]
+    fn a_compaction_keeps_the_prefix_and_the_answer_it_produces() -> Result<()> {
+        let store = InMemoryStore::new();
+        let session = SessionKey::new("ns", "compact-settled")?;
+        identity::create(
+            &store,
+            SessionSpec {
+                key: session.clone(),
+                primary_binding: ThreadBinding::new("harness-a", "def-1", "state-1")?,
+                metadata: Value::Null,
+            },
+        )?;
+        let key = ThreadKey::new(session.clone(), "main")?;
+        let scope = session.storage_key();
+        let record = crate::store::txn(&store, &scope, |txn: &mut dyn Txn| {
+            let mut record = require_thread(txn, &key)?;
+            for (index, status) in [
+                TurnStatus::Succeeded,
+                TurnStatus::Succeeded,
+                TurnStatus::Queued,
+            ]
+            .iter()
+            .enumerate()
+            {
+                let turn_id = format!("turn-{index:05}");
+                store_json(txn, &queue_part("main", index as u64 + 1), &turn_id)?;
+                let mut turn = TurnData::new(turn_id, "main".to_string(), Value::Null, 0);
+                turn.status = *status;
+                save_turn(txn, &turn)?;
+            }
+            record.admitted = 3;
+            advance_settled(txn, &mut record)?;
+            save_thread(txn, &record)?;
+            Ok(record)
+        })?;
+        assert_eq!(record.settled, 2);
+        let before = crate::store::txn(&store, &scope, |txn: &mut dyn Txn| {
+            current_turn(txn, &record)
+        })?
+        .expect("the queued turn is work");
+
+        let retained = crate::store::txn(&store, &scope, |txn: &mut dyn Txn| {
+            let mut state = require_state(txn)?;
+            let thread = require_thread(txn, &key)?;
+            compact::run(txn, &mut state, &thread, 1)?;
+            let retained = state.retained_after;
+            save_state(txn, &state)?;
+            Ok(retained)
+        })?;
+        assert!(retained > 0, "the compaction pruned the event log");
+        let after = crate::store::txn(&store, &scope, |txn: &mut dyn Txn| {
+            let record = require_thread(txn, &key)?;
+            assert_eq!(record.settled, 2, "the compaction left the prefix alone");
+            current_turn(txn, &record)
+        })?
+        .expect("the queued turn is still work");
+        assert_same_turn(&before, &after);
+        Ok(())
     }
 }

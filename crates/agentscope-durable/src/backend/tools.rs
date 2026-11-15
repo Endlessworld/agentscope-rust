@@ -299,8 +299,8 @@ pub(super) fn apply_result(
     }
     if let Some(existing) = &tool.result {
         if existing.state.terminal() {
-            if json::hash(&serde_json::to_value(existing)?)
-                == json::hash(&serde_json::to_value(result)?)
+            if json::hash(&serde_json::to_value(existing)?)?
+                == json::hash(&serde_json::to_value(result)?)?
             {
                 return Ok(tool.view());
             }
@@ -311,7 +311,7 @@ pub(super) fn apply_result(
     // The event is keyed by the result it records, not by the clock: two results for one
     // execution inside the same millisecond used to share an event id and the second one was
     // rejected as `Event identity changed`.
-    let fingerprint = json::hash(&serde_json::to_value(result)?);
+    let fingerprint = json::hash(&serde_json::to_value(result)?)?;
     tool.result = Some(result.clone());
     turn.next_attempt_at = 0;
     let origin = turn

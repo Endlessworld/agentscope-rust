@@ -11,7 +11,7 @@ pub(super) fn create(store: &dyn RecordStore, spec: SessionSpec) -> Result<Sessi
     let digest = digest_of(&spec)?;
     with_session(store, &session, |txn| {
         if let Some(state) = load_state(txn)? {
-            if state.creation_digest != digest {
+            if !digest_matches(&state.creation_digest, &spec)? {
                 return Err(DurableError::conflict("Session specification changed"));
             }
             return Ok(state.session);
@@ -81,7 +81,9 @@ pub(super) fn close_session(store: &dyn RecordStore, key: &SessionKey) -> Result
             return Ok(state.session);
         }
         for thread_id in thread_ids(txn)? {
-            if current_turn(txn, &thread_id)?.is_some() {
+            // Only the ids are at hand here, so the scan starts at zero: `settled` is a lower
+            // bound a reader may use, never a fact it must have.
+            if current_turn_after(txn, &thread_id, 0)?.is_some() {
                 return Err(DurableError::conflict("Session has unfinished turns"));
             }
         }
@@ -164,7 +166,7 @@ pub(super) fn close_thread(store: &dyn RecordStore, key: &ThreadKey) -> Result<T
                 status: thread.status,
             });
         }
-        if current_turn(txn, &key.thread_id)?.is_some() {
+        if current_turn(txn, &thread)?.is_some() {
             return Err(DurableError::conflict("Thread has unfinished turns"));
         }
         thread.status = Lifecycle::Closed;

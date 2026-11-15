@@ -29,7 +29,7 @@ pub(super) fn commit(
         }
         // A committed replay must answer even for a writer that already lost the lease.
         if let Some(existing) = turn.receipts.get(&command.commit_id) {
-            if existing.digest != digest {
+            if !digest_matches(&existing.digest, &command)? {
                 return Err(DurableError::conflict("Commit content changed"));
             }
             return Ok(existing.clone());
@@ -152,6 +152,11 @@ pub(super) fn commit(
             .insert(command.commit_id.clone(), receipt.clone());
         schedule_thread(txn, &thread, Some(&turn), now)?;
         save_turn(txn, &turn)?;
+        // A terminal turn advances the materialized prefix. The thread record is written by this
+        // same commit, so materializing it costs no extra transaction and no extra document.
+        if next.terminal() {
+            advance_settled(txn, &mut thread)?;
+        }
         // The scope is one document that this commit is rewriting anyway, so trimming it here
         // costs no extra write: the bytes it drops are bytes this write would otherwise carry.
         if trim {
@@ -496,7 +501,7 @@ fn write_checkpoint(
     command: &Commit,
     next: TurnStatus,
 ) -> Result<()> {
-    let digest = json::hash(&command.checkpoint);
+    let digest = json::hash(&command.checkpoint)?;
     if thread.checkpoint_metadata.is_some() && command.checkpoint.is_null() {
         return Err(DurableError::invalid("Cannot discard native state"));
     }
@@ -513,7 +518,7 @@ fn write_checkpoint(
     let unchanged = thread
         .checkpoint_metadata
         .as_ref()
-        .is_some_and(|metadata| metadata.digest == digest)
+        .is_some_and(|metadata| json::matches(&metadata.digest, &command.checkpoint))
         && previous
             .as_ref()
             .is_some_and(|record| record.resource_position == thread.resource_position);

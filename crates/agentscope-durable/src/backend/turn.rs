@@ -34,7 +34,7 @@ pub(super) fn submit(
         }
         let digest = digest_of(&(thread_key, &input))?;
         if let Some(admission) = load_json::<AdmissionRecord>(txn, &admission_part(request_id))? {
-            if admission.digest != digest {
+            if !digest_matches(&admission.digest, &(thread_key, &input))? {
                 return Err(DurableError::conflict("Input changed for this request"));
             }
             return Ok(admission.receipt);
@@ -173,11 +173,11 @@ pub(super) fn control(
     json::text(&command.request_id, "requestId")?;
     with_session(store, &thread_key.session, |txn| {
         let mut state = require_state(txn)?;
-        let thread = require_thread(txn, thread_key)?;
+        let mut thread = require_thread(txn, thread_key)?;
         let identity = format!("control:{}", command.request_id);
         let digest = digest_of(&(thread_key, &command))?;
         if let Some(existing) = load_json::<CommandRecord>(txn, &command_part(&identity))? {
-            if existing.digest != digest {
+            if !digest_matches(&existing.digest, &(thread_key, &command))? {
                 return Err(DurableError::conflict("Control identity changed"));
             }
             return load_json::<CommandReceipt>(txn, &control_receipt_part(&command.request_id))?
@@ -195,6 +195,9 @@ pub(super) fn control(
             ));
         }
         let mut status = "accepted";
+        // Set when this control makes the turn terminal: the settled prefix then has one more
+        // candidate at its head, and the record is written by this same transaction.
+        let mut settles = false;
         let now = txn.now();
         match command.kind {
             // Input adjustment is only meaningful for the turn a worker is executing: it is
@@ -204,7 +207,7 @@ pub(super) fn control(
                     return Err(DurableError::conflict("Turn is terminal"));
                 }
                 let active = turn.epoch != 0
-                    && current_turn(txn, &thread_key.thread_id)?
+                    && current_turn(txn, &thread)?
                         .is_some_and(|current| current.turn_id == turn.turn_id);
                 if !active {
                     return Err(DurableError::conflict(
@@ -237,6 +240,7 @@ pub(super) fn control(
                     turn.next_attempt_at = 0;
                     if turn.epoch == 0 {
                         turn.status = TurnStatus::Cancelled;
+                        settles = true;
                     } else {
                         turn.status = TurnStatus::Cancelling;
                     }
@@ -350,6 +354,12 @@ pub(super) fn control(
         };
         store_json(txn, &command_part(&identity), &CommandRecord { digest })?;
         store_json(txn, &control_receipt_part(&command.request_id), &receipt)?;
+        if settles {
+            // Cancelling a turn no writer held ends it, so it can move the prefix exactly as a
+            // commit does — inside the transaction this control already writes.
+            advance_settled(txn, &mut thread)?;
+            save_thread(txn, &thread)?;
+        }
         schedule_thread(txn, &thread, Some(&turn), now)?;
         save_turn(txn, &turn)?;
         save_state(txn, &state)?;
@@ -376,7 +386,7 @@ pub(super) fn claim(
         let mut state = require_state(txn)?;
         let mut thread = require_thread(txn, thread_key)?;
         let now = txn.now();
-        let Some(mut turn) = current_turn(txn, &thread_key.thread_id)? else {
+        let Some(mut turn) = current_turn(txn, &thread)? else {
             schedule_thread(txn, &thread, None, now)?;
             save_thread(txn, &thread)?;
             save_state(txn, &state)?;
@@ -557,7 +567,7 @@ pub(super) fn record_failure(
 ) -> Result<RecoveryView> {
     with_session(store, &lease.thread.session, |txn| {
         let mut state = require_state(txn)?;
-        let thread = require_thread(txn, &lease.thread)?;
+        let mut thread = require_thread(txn, &lease.thread)?;
         let mut turn = require_turn(txn, &lease.turn_id)?;
         let part = format!(
             "failure:{}",
@@ -566,7 +576,7 @@ pub(super) fn record_failure(
         let digest = digest_of(&(lease, &failure))?;
         let now = txn.now();
         if let Some(existing) = load_json::<FailureRecord>(txn, &part)? {
-            if existing.digest != digest {
+            if !digest_matches(&existing.digest, &(lease, &failure))? {
                 return Err(DurableError::conflict("Failure report changed"));
             }
             // A replay of a failure that can never be retried must still end the turn: the
@@ -593,7 +603,10 @@ pub(super) fn record_failure(
                 turn.expires_at = 0;
                 turn.revision += 1;
                 abandon_runs(&mut turn, RunStatus::Stopped, "failure", now);
-                let thread = require_thread(txn, &lease.thread)?;
+                // The repair ends the turn right here, so the prefix is advanced in the same
+                // transaction — otherwise a session whose only writer died never materializes it.
+                advance_settled(txn, &mut thread)?;
+                save_thread(txn, &thread)?;
                 schedule_thread(txn, &thread, Some(&turn), now)?;
                 save_turn(txn, &turn)?;
             }
@@ -655,6 +668,12 @@ pub(super) fn record_failure(
         )?;
         schedule_thread(txn, &thread, Some(&turn), now)?;
         save_turn(txn, &turn)?;
+        if turn.status.terminal() {
+            // A failure with nothing left to retry ends the turn without a commit; the prefix
+            // rides the thread record this same transaction writes.
+            advance_settled(txn, &mut thread)?;
+            save_thread(txn, &thread)?;
+        }
         store_json(
             txn,
             &part,
