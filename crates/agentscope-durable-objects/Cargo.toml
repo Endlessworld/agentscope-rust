@@ -1,0 +1,18 @@
+[package]
+name = "agentscope-durable-objects"
+description = "AgentScope Rust - Content-addressed object storage for durable blobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# No dependency on `agentscope-durable`: the durable store is meant to sit *above* this crate
+# (a blob backend), and depending on it here would make that wiring a dependency cycle.
+# `sha2` is already a workspace dependency and is what names the objects.
+[dependencies]
+sha2.workspace = true
