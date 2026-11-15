@@ -224,3 +224,37 @@ async fn an_unsettled_tool_blocks_a_terminal_commit_until_it_is_applied() {
     let view = backend.turn(&thread, &receipt.turn_id).await.expect("turn");
     assert_eq!(view.status, TurnStatus::Succeeded);
 }
+
+/// A failure nothing may retry has to end the turn.
+///
+/// Leaving it `waiting` parked it forever: a waiting turn is re-claimed as soon as its
+/// `next_attempt_at` passes, so a non-retryable failure failed again on every pass and no writer
+/// ever settled it — the client then saw neither a result nor an error.
+#[tokio::test]
+async fn an_unrecoverable_failure_ends_the_turn_instead_of_waiting_forever() {
+    let (backend, thread, receipt, lease) = running().await;
+    let failure = Failure::new(
+        false,
+        "journal: explicit reconciliation required for unknown tool outcomes",
+        RecoveryPolicy::defaults(),
+    );
+    let recovery = backend
+        .record_failure(&lease, failure.clone())
+        .await
+        .expect("record");
+    assert!(!recovery.retry_allowed());
+
+    let turn = backend.turn(&thread, &receipt.turn_id).await.expect("turn");
+    assert_eq!(turn.status, TurnStatus::Failed);
+    assert_eq!(turn.error.as_deref(), Some(recovery.message.as_str()));
+
+    // A restarted process replays the same report: the stored record answers, and the turn has to
+    // stay settled instead of going back to `waiting`.
+    let replay = backend
+        .record_failure(&lease, failure)
+        .await
+        .expect("replay");
+    assert_eq!(replay, recovery);
+    let turn = backend.turn(&thread, &receipt.turn_id).await.expect("turn");
+    assert_eq!(turn.status, TurnStatus::Failed);
+}

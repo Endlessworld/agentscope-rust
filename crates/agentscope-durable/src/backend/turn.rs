@@ -511,13 +511,30 @@ pub(super) fn record_failure(
             model::hash(&format!("{}:{}", lease.turn_id, lease.epoch))
         );
         let digest = digest_of(&(lease, &failure))?;
+        let now = txn.now();
         if let Some(existing) = load_json::<FailureRecord>(txn, &part)? {
             if existing.digest != digest {
                 return Err(DurableError::conflict("Failure report changed"));
             }
+            // A replay of a failure that can never be retried must still end the turn: the
+            // record above is idempotent, so without this an unrecoverable turn written by an
+            // older build stays `waiting` and no writer ever moves it again.
+            if !existing.recovery.retry_allowed()
+                && turn.status == TurnStatus::Waiting
+                && turn.waiting.is_none()
+                && !turn.cancel
+            {
+                turn.status = TurnStatus::Failed;
+                turn.owner = None;
+                turn.expires_at = 0;
+                turn.revision += 1;
+                abandon_runs(&mut turn, RunStatus::Stopped, "failure", now);
+                let thread = require_thread(txn, &lease.thread)?;
+                schedule_thread(txn, &thread, Some(&turn), now)?;
+                save_turn(txn, &turn)?;
+            }
             return Ok(existing.recovery);
         }
-        let now = txn.now();
         assert_owned(&turn, lease, now)?;
         let previous = turn.recovery.clone();
         let policy = previous
@@ -552,7 +569,10 @@ pub(super) fn record_failure(
         if turn.status == TurnStatus::Pausing {
             complete_pause(txn, &mut state, &lease.thread, &mut turn, now)?;
         } else if !retry_allowed && !turn.cancel && !turn.status.terminal() {
-            turn.status = TurnStatus::Waiting;
+            // Nothing will retry this turn, so waiting would park it forever: a `waiting` turn
+            // is re-tried as soon as its `next_attempt_at` passes, which for a non-retryable
+            // failure means failing again on every pass. End it and keep the message.
+            turn.status = TurnStatus::Failed;
         }
         turn.owner = None;
         turn.expires_at = 0;

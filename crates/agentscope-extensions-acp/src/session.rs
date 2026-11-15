@@ -3052,6 +3052,13 @@ impl AcpAgentSession {
         // is 30s), so the deadline must be comfortably longer than that or a normal restart
         // looks like a hang.
         const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+        // How long a turn may sit in `waiting` before the prompt reports the block.
+        //
+        // A waiting turn is not ready, so the tick loop hands it back and nothing else advances
+        // it. A run that needs a signal nobody ever sends kept the prompt open forever, and the
+        // client saw neither a result nor an error. Waiting on a real signal is legitimate, so
+        // the bound is generous; only a permanent block reaches it.
+        const WAITING_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
         // How long receipt reads may keep failing before the prompt reports a stall.
         //
         // This is a *duration*, not a tick count: the previous "40 ignored polls" meant two
@@ -3092,6 +3099,11 @@ impl AcpAgentSession {
             // When the current `queued` wait started, so a progress notice can report how long
             // the prompt has been waiting behind the previous turn.
             let mut queued_since: Option<std::time::Instant> = None;
+            // When the current `waiting` stretch started. A waiting turn is re-claimed as soon as
+            // its `next_attempt_at` passes, so a turn that stays here is waiting on something that
+            // will never arrive; without this clock the prompt below never leaves the ticker loop
+            // and the client sees neither a result nor an error.
+            let mut waiting_since: Option<std::time::Instant> = None;
             let mut first_poll_failure: Option<std::time::Instant> = None;
             let mut stall: Option<String> = None;
             // A persistent ticker, not a fresh `sleep` per iteration: re-creating the timer every
@@ -3118,6 +3130,8 @@ impl AcpAgentSession {
                                         admission_deadline =
                                             std::time::Instant::now() + ADMISSION_TIMEOUT;
                                         queued_since = (status == "queued")
+                                            .then(std::time::Instant::now);
+                                        waiting_since = (status == "waiting")
                                             .then(std::time::Instant::now);
                                     }
                                     if current.status.terminal() {
@@ -3158,6 +3172,24 @@ impl AcpAgentSession {
                                         )));
                                         admission_deadline =
                                             std::time::Instant::now() + ADMISSION_TIMEOUT;
+                                    } else if current.status == TurnStatus::Waiting
+                                        && waiting_since
+                                            .is_some_and(|since| since.elapsed() >= WAITING_STALL_TIMEOUT)
+                                    {
+                                        // A waiting turn is not ready, so the tick loop hands it
+                                        // back and nothing else will touch it. Report the block
+                                        // instead of holding the prompt open forever: the run needs
+                                        // a signal or a reconciliation no writer can supply.
+                                        stall = Some(format!(
+                                            "the turn has been waiting for {}s without a signal \
+                                             (status `waiting`): {}",
+                                            WAITING_STALL_TIMEOUT.as_secs(),
+                                            current
+                                                .error
+                                                .clone()
+                                                .unwrap_or_else(|| "no reason recorded".to_string())
+                                        ));
+                                        break;
                                     }
                                 }
                                 Err(error) => {
