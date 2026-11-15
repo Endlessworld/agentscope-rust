@@ -57,6 +57,21 @@ async fn local_write_read_edit_delete() {
 }
 
 #[tokio::test]
+async fn local_sync_flushes_a_freshly_written_file() {
+    let dir = temp_dir("sync").await;
+    let fs = LocalFilesystem::sandboxed(&dir);
+
+    fs.write(&ctx(), "/journal.json", "{\"seq\":1}")
+        .await
+        .unwrap();
+    // Windows `FlushFileBuffers` rejects a read-only handle with `ERROR_ACCESS_DENIED`
+    // (os error 5), so a reopen-for-fsync must open the file for writing.
+    fs.sync(&ctx(), "/journal.json").await.unwrap();
+    // A directory target stays a no-op on every platform.
+    fs.sync(&ctx(), "/").await.unwrap();
+}
+
+#[tokio::test]
 async fn read_clamps_offset_past_eof_instead_of_erroring() {
     let dir = temp_dir("read_past_eof").await;
     let fs = LocalFilesystem::sandboxed(&dir);

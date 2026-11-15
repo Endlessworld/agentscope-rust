@@ -517,7 +517,12 @@ impl Filesystem for LocalFilesystem {
             return Ok(());
         }
         tokio::task::spawn_blocking(move || {
-            std::fs::File::open(&resolved)
+            // The handle must carry write access: Windows `FlushFileBuffers` fails with
+            // `ERROR_ACCESS_DENIED` (os error 5) on a read-only handle, so reopening the file
+            // just to flush it used to fail on every call and left the journal unflushed.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&resolved)
                 .and_then(|file| file.sync_all())
                 .map_err(Error::Io)
         })

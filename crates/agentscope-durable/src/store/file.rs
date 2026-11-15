@@ -26,7 +26,17 @@ use crate::{DurableError, Result};
 const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCK_RETRY: Duration = Duration::from_millis(10);
 const LOCK_STALE: Duration = Duration::from_secs(30);
-const RENAME_RETRIES: u32 = 3;
+
+// How many times a write that replaces an existing file is retried.
+//
+// On Windows `rename` and `File::create` answer `ERROR_ACCESS_DENIED` while any other process
+// holds the target — an indexer, a virus scanner, an editor that opened it without
+// `FILE_SHARE_DELETE`. The old loop waited 5 ms three times, but the journal of a live ACP run
+// only recovered when the recorder retried the whole batch after 100 ms, so the wait now doubles
+// from `WRITE_RETRY_BACKOFF` up to its cap.
+const WRITE_RETRIES: u32 = 6;
+const WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+const WRITE_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(200);
 
 /// Scope maps and the readiness index backed by plain files under one directory.
 pub struct FileStore {
@@ -310,27 +320,42 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     let temporary = path.with_file_name(format!(".{name}.{}-{sequence}.tmp", std::process::id()));
-    if let Err(error) = fs::write(&temporary, bytes) {
+    if let Err(error) = retry_while_held(|| fs::write(&temporary, bytes)) {
         let _ = fs::remove_file(&temporary);
         return Err(error.into());
     }
-    let mut last: Option<std::io::Error> = None;
-    for attempt in 0..=RENAME_RETRIES {
-        match fs::rename(&temporary, path) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last = Some(error);
-                if attempt < RENAME_RETRIES {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+    if let Err(error) = retry_while_held(|| fs::rename(&temporary, path)) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// Retries an operation while Windows reports that another process holds the file.
+///
+/// Only the two sharing answers are retried: `ERROR_ACCESS_DENIED` (5, also what a target held
+/// without `FILE_SHARE_DELETE` produces) and `ERROR_SHARING_VIOLATION` (32). Rust maps 5 to
+/// `PermissionDenied` and 32 to no dedicated kind, so the raw codes are the only reliable test —
+/// and anything else, a read-only directory for instance, must fail on the first attempt instead
+/// of burning half a second.
+fn retry_while_held<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut backoff = WRITE_RETRY_BACKOFF;
+    let mut attempt = 0;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < WRITE_RETRIES && is_transient_hold(&error) => {
+                attempt += 1;
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(WRITE_RETRY_BACKOFF_MAX);
             }
+            Err(error) => return Err(error),
         }
     }
-    let _ = fs::remove_file(&temporary);
-    match last {
-        Some(error) => Err(error.into()),
-        None => Err(DurableError::unavailable("commit renamed nothing")),
-    }
+}
+
+fn is_transient_hold(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5) | Some(32))
 }
 
 /// Held for the lifetime of one transaction; removal happens on every exit path.
@@ -497,6 +522,46 @@ mod lock_liveness_tests {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_the_windows_sharing_answers_are_retried() {
+        // 5 = ERROR_ACCESS_DENIED (also a target held without FILE_SHARE_DELETE),
+        // 32 = ERROR_SHARING_VIOLATION.
+        assert!(is_transient_hold(&std::io::Error::from_raw_os_error(5)));
+        assert!(is_transient_hold(&std::io::Error::from_raw_os_error(32)));
+        // A full disk (112), a missing path (2) and a read-only directory (19) do not clear on
+        // their own: retrying them would only delay the error.
+        for code in [2, 19, 112] {
+            assert!(!is_transient_hold(&std::io::Error::from_raw_os_error(code)));
+        }
+    }
+
+    #[test]
+    fn a_held_target_is_retried_but_a_hard_error_is_not() {
+        let mut attempts = 0;
+        let recovered = retry_while_held(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from_raw_os_error(5))
+            } else {
+                Ok(attempts)
+            }
+        });
+        assert_eq!(
+            recovered.unwrap(),
+            3,
+            "the write must survive a held handle"
+        );
+
+        let mut attempts = 0;
+        let error = retry_while_held(|| -> std::io::Result<()> {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(19))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1, "a read-only directory must fail at once");
+        assert_eq!(error.raw_os_error(), Some(19));
+    }
 
     /// Removes the tree even when a test fails or returns early.
     struct TempRoot(PathBuf);
