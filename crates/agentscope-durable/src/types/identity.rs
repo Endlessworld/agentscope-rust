@@ -31,8 +31,8 @@ impl SessionKey {
     pub fn storage_key(&self) -> String {
         format!(
             "session:{}:{}",
-            json::hash(&Value::String(self.namespace.clone())),
-            json::hash(&Value::String(self.session_id.clone()))
+            json::hash_text(&self.namespace),
+            json::hash_text(&self.session_id)
         )
     }
 }
@@ -55,7 +55,7 @@ impl ThreadKey {
         format!(
             "{}:thread:{}",
             self.session.storage_key(),
-            json::hash(&Value::String(self.thread_id.clone()))
+            json::hash_text(&self.thread_id)
         )
     }
 }

@@ -273,7 +273,7 @@ impl CheckpointMetadata {
         let position_valid = !self.position.is_empty()
             && !self.position.starts_with('0')
             && self.position.chars().all(|c| c.is_ascii_digit());
-        if !position_valid || json::hash(checkpoint) != self.digest {
+        if !position_valid || !json::matches(&self.digest, checkpoint) {
             return Err(DurableError::invalid("Checkpoint integrity check failed"));
         }
         Ok(())
