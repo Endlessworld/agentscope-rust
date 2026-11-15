@@ -18,7 +18,12 @@ use sha2::{Digest, Sha256};
 use super::{RecordStore, Txn, WorkItem};
 use crate::{DurableError, Result};
 
-const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+// How long a contender waits for the scope lock before giving up.
+//
+// It has to cover a stale-lock reclaim: a lock whose holder died is only recognised as stale
+// after `LOCK_STALE`, so a shorter deadline reports `scope is locked` for a lock nobody holds —
+// and every write rewrites the whole scope, which for a long session is tens of megabytes.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCK_RETRY: Duration = Duration::from_millis(10);
 const LOCK_STALE: Duration = Duration::from_secs(30);
 const RENAME_RETRIES: u32 = 3;
