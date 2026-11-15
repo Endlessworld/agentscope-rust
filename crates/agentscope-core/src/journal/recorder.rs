@@ -2125,6 +2125,68 @@ mod tests {
         }
     }
 
+    /// A journal whose lease renewals can be made to fail on demand.
+    ///
+    /// The heartbeat has to tell two failures apart: a store that is temporarily unavailable
+    /// (retry, the lease is still ours) and a journal that fenced the writer (stop, the slot
+    /// belongs to somebody else). Both halves are exercised through this wrapper.
+    struct FlakyRenewals {
+        inner: Arc<dyn ThreadJournal>,
+        /// Renewals still to reject; `usize::MAX` rejects every one of them.
+        failures_left: AtomicUsize,
+        /// How many renewals were attempted, including the rejected ones.
+        attempts: AtomicUsize,
+        /// The failure every rejected renewal answers with.
+        message: String,
+    }
+
+    #[async_trait]
+    impl ThreadJournal for FlakyRenewals {
+        async fn head(&self) -> crate::error::Result<crate::journal::Head> {
+            self.inner.head().await
+        }
+
+        async fn acquire(&self, owner: &str, lease: Duration) -> crate::error::Result<Writer> {
+            self.inner.acquire(owner, lease).await
+        }
+
+        async fn renew(&self, writer: &Writer, lease: Duration) -> crate::error::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let left = self.failures_left.load(Ordering::SeqCst);
+            if left > 0 {
+                if left != usize::MAX {
+                    self.failures_left.store(left - 1, Ordering::SeqCst);
+                }
+                return Err(journal_error(self.message.clone()));
+            }
+            self.inner.renew(writer, lease).await
+        }
+
+        async fn release(&self, writer: &Writer) -> crate::error::Result<()> {
+            self.inner.release(writer).await
+        }
+
+        async fn commit(
+            &self,
+            writer: &Writer,
+            batch_id: &str,
+            expected_seq: u64,
+            events: &[JournalEvent],
+        ) -> crate::error::Result<crate::journal::Head> {
+            self.inner
+                .commit(writer, batch_id, expected_seq, events)
+                .await
+        }
+
+        async fn read_after(
+            &self,
+            after: u64,
+            limit: usize,
+        ) -> crate::error::Result<Vec<JournalEvent>> {
+            self.inner.read_after(after, limit).await
+        }
+    }
+
     async fn journal() -> (Arc<dyn ThreadJournal>, Arc<dyn AtomicJournalStorage>) {
         let storage: Arc<dyn AtomicJournalStorage> = Arc::new(MemoryJournalStorage::new());
         let log: Arc<dyn ThreadJournal> =
@@ -3047,6 +3109,84 @@ mod tests {
         // Another run can take the session, which is what a closed recorder promises.
         let next = log.acquire("run-2", lease).await.unwrap();
         log.release(&next).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_transient_renewal_failure_does_not_cost_the_lease() {
+        // A renewal answered by a *busy* store is not a lost lease. The heartbeat must retry it
+        // and keep the writer owned; treating it as fatal ends a healthy run with "session
+        // commit failed permanently" over a single storage hiccup.
+        let (log, _storage) = journal().await;
+        let flaky = Arc::new(FlakyRenewals {
+            inner: Arc::clone(&log),
+            failures_left: AtomicUsize::new(2),
+            attempts: AtomicUsize::new(0),
+            message: "Session storage is busy (i/o timeout)".to_string(),
+        });
+        let lease = Duration::from_millis(200);
+        let recorder = InvocationRecorder::open_with_lease(
+            Arc::clone(&flaky) as Arc<dyn ThreadJournal>,
+            Some("t1"),
+            "run-1",
+            None,
+            lease,
+        )
+        .await
+        .unwrap();
+
+        // Four lease lifetimes of renewals: the first two fail, the rest go through.
+        tokio::time::sleep(lease * 4).await;
+        let attempts = flaky.attempts.load(Ordering::SeqCst);
+        assert!(
+            attempts > 2,
+            "the heartbeat gave up instead of retrying a transient failure: {attempts} attempt(s)"
+        );
+        assert_eq!(log.head().await.unwrap().owner.as_deref(), Some("run-1"));
+
+        // The proof that it still owns the session: a fact recorded now commits.
+        recorder
+            .append("step/start", &serde_json::json!({}))
+            .unwrap();
+        recorder.flush().await.unwrap();
+        assert_eq!(log.head().await.unwrap().seq, 1);
+        recorder.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_fenced_renewal_stops_the_heartbeat_instead_of_retrying_forever() {
+        // The other half of the same rule: a journal that answers FENCED really has handed the
+        // writer slot away. Retrying would fight the new owner, so the heartbeat must stop.
+        let (log, _storage) = journal().await;
+        let flaky = Arc::new(FlakyRenewals {
+            inner: Arc::clone(&log),
+            failures_left: AtomicUsize::new(usize::MAX),
+            attempts: AtomicUsize::new(0),
+            message: "journal: FENCED: Execution ownership expired or changed".to_string(),
+        });
+        let lease = Duration::from_millis(200);
+        let recorder = InvocationRecorder::open_with_lease(
+            Arc::clone(&flaky) as Arc<dyn ThreadJournal>,
+            Some("t1"),
+            "run-1",
+            None,
+            lease,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(lease * 2).await;
+        let after_first = flaky.attempts.load(Ordering::SeqCst);
+        assert_eq!(
+            after_first, 1,
+            "a fenced renewal must not be retried: {after_first} attempt(s)"
+        );
+        tokio::time::sleep(lease * 2).await;
+        assert_eq!(
+            flaky.attempts.load(Ordering::SeqCst),
+            after_first,
+            "the heartbeat kept polling a journal that already fenced it"
+        );
+        recorder.close().await;
     }
 
     #[tokio::test]
