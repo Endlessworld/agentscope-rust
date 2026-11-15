@@ -239,7 +239,24 @@ impl ThreadJournal for BackendThreadJournal {
         }
         // Idempotency is decided here, not by the durable receipt: a retry reads a new turn
         // revision, so the same batch would otherwise look like changed content.
-        let existing = self.read_after(expected_seq, events.len()).await?;
+        //
+        // A batch can be longer than one page (`read_journal` caps a page at 1000 entries), so the
+        // stored events are paged in rather than requested in one call.
+        const JOURNAL_PAGE: usize = 1000;
+        let mut existing = Vec::with_capacity(events.len().min(JOURNAL_PAGE));
+        let mut after = expected_seq;
+        while existing.len() < events.len() {
+            let wanted = (events.len() - existing.len()).min(JOURNAL_PAGE);
+            let page = self.read_after(after, wanted).await?;
+            let full_page = page.len() == wanted;
+            if let Some(last) = page.last() {
+                after = last.seq;
+            }
+            existing.extend(page);
+            if !full_page {
+                break;
+            }
+        }
         if !existing.is_empty() {
             let same_batch = existing.len() == events.len()
                 && existing
