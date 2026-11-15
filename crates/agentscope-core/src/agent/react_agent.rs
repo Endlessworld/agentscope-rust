@@ -2606,6 +2606,11 @@ async fn reasoning_phase(
         );
     if !synthesized_stop {
         state.context_mut().push(final_msg.clone());
+        // The reply has to reach the shared state too. It is pushed after the last
+        // `publish_context`, so without this the persisted conversation ends at the *input* of
+        // the final iteration: the next turn reads that tail as the newest message and answers
+        // it again, which is what turns an injected background event into a permanent loop.
+        publish_context(core, state);
     }
     Ok(final_msg)
 }

@@ -168,6 +168,39 @@ impl Middleware for InboxMiddleware {
                 }
             }
 
+            // A hint that already reached the context must not be injected again.
+            //
+            // The notification is written to `state.context` as well as to this step's messages
+            // (see below), and `state.context` is replayed on every model call, so any re-entry —
+            // a resumed run, a re-executed step, a refreshed session — used to re-announce the
+            // same background completion as if it had just arrived.
+            if let Some(state) = state.as_ref() {
+                let delivered: std::collections::HashSet<String> = {
+                    // Scoped so the std::sync::Mutex guard is never held across an await.
+                    let guard = match state.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard
+                        .context
+                        .iter()
+                        .filter_map(|message| {
+                            message
+                                .metadata()
+                                .get(METADATA_HINT_ID)
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .collect()
+                };
+                hints.retain(|hint| {
+                    hint.id
+                        .as_ref()
+                        .map(|id| !delivered.contains(id))
+                        .unwrap_or(true)
+                });
+            }
+
             if hints.is_empty() {
                 return next(input);
             }
