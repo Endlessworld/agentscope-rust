@@ -3,7 +3,7 @@
 //!
 //! Mirrors `AgiAgentSession` from the Kotlin `AgiHarnessAgent`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -17,8 +17,8 @@ use agent_client_protocol::v1::schema::{
 use agent_client_protocol::{v1::ConnectionTo, Client};
 use agentscope_core::agent::CallableAgent;
 use agentscope_core::event::{AgentEvent, ConfirmResult};
-use agentscope_core::journal::{JournalProjection, ThreadJournal};
-use agentscope_core::message::{ChatUsage, Msg, ToolResultBlock, ToolResultState, ToolUseBlock};
+use agentscope_core::journal::{ThreadJournal, TurnViews};
+use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
 use agentscope_core::model::catalog::ModelDescriptor;
 use agentscope_core::model::{GenerateOptions, DEFAULT_CONTEXT_WINDOW};
 use agentscope_core::permission::{PermissionBehavior, PermissionRule};
@@ -627,60 +627,41 @@ struct SessionRuntime {
 /// such an outcome can never arrive later: recording it as interrupted (never as success, never
 /// re-executed) is what lets the session continue.
 async fn reconcile_abandoned_tool_calls(journal: &Arc<dyn ThreadJournal>) {
-    let projection = match JournalProjection::read(&**journal).await {
-        Ok(projection) => projection,
-        Err(error) => {
-            // A session that was never written has no projection; nothing to settle.
-            tracing::debug!(%error, "no journal projection to reconcile before opening");
-            return;
-        }
-    };
-    if projection.uncertain_tool_calls.is_empty() {
-        return;
-    }
-    // The name is only informational: the dispatch that left the call uncertain may predate the
-    // last checkpoint, and then the restored state no longer holds the call at all.
-    let names: BTreeMap<String, String> = projection
-        .restore()
-        .ok()
-        .flatten()
-        .map(|state| {
-            state
-                .context
-                .iter()
-                .flat_map(|message| message.tool_use_blocks())
-                .map(|call| (call.id.clone(), call.name.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut outcomes: BTreeMap<String, ToolResultBlock> = BTreeMap::new();
-    for id in &projection.uncertain_tool_calls {
-        let name = names.get(id).map(String::as_str).unwrap_or("unknown");
-        outcomes.insert(
-            id.clone(),
-            ToolResultBlock::new(
-                id,
-                name,
-                vec![agentscope_core::message::ContentBlock::Text(
-                    agentscope_core::message::TextBlock::new(ABANDONED_ON_RESUME_MESSAGE),
-                )],
-            )
-            .with_state(ToolResultState::Interrupted),
-        );
-    }
-    tracing::warn!(
-        calls = ?projection.uncertain_tool_calls,
-        "recording tool calls whose outcome was never committed as interrupted"
-    );
-    if let Err(error) = agentscope_core::journal::recovery::reconcile(
+    match agentscope_core::journal::recovery::settle_uncertain_tool_outcomes(
         Arc::clone(journal),
-        outcomes,
+        ABANDONED_ON_RESUME_MESSAGE,
         RECONCILE_REASON,
     )
     .await
     {
-        tracing::warn!(%error, "could not settle the tool calls left uncertain by a dead run");
+        Ok(settled) if !settled.is_empty() => tracing::warn!(
+            calls = ?settled,
+            "recording tool calls whose outcome was never committed as interrupted"
+        ),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not settle the tool calls left uncertain by a dead run")
+        }
     }
+}
+
+/// Settles the tool calls a *finished* turn left uncertain.
+///
+/// A cancelled or stopped acting phase can end the turn while one of its dispatches never got a
+/// result. [`reconcile_abandoned_tool_calls`] runs once, when the runtime is built; a session
+/// that hit this later in the same process would fail every following prompt with "Explicit
+/// reconciliation required", because the recorder refuses to open the journal. An unfinished
+/// turn is left alone: it owns its uncertainty, and resuming it must not find synthetic results.
+async fn settle_finished_turn_uncertainties(journal: &Arc<dyn ThreadJournal>) {
+    match TurnViews::read(&**journal).await {
+        Ok(turns) if turns.latest().map(|turn| !turn.ended()).unwrap_or(false) => return,
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(%error, "could not read the turns to look for stranded tool calls");
+            return;
+        }
+    }
+    reconcile_abandoned_tool_calls(journal).await;
 }
 
 /// A request id for a durable control command.
@@ -3012,6 +2993,16 @@ impl AcpAgentSession {
                     sink.push(event);
                 }
             }));
+        // A turn that already ended can still hold a dispatch without a result: a cancelled or
+        // stopped acting phase, or a run that failed after dispatch. The recorder refuses to
+        // open such a journal, and `open_runtime` reconciles only once, when it builds the
+        // runtime — so every later prompt in this process used to fail with "Explicit
+        // reconciliation required". No run of this thread is in flight here (the prompt lock is
+        // held and the turn below has not been admitted yet), which is what makes settling the
+        // leftover uncertainty safe.
+        if matches!(runtime.session.active().await, Ok(None)) {
+            settle_finished_turn_uncertainties(&runtime.journal).await;
+        }
         // A turn left unfinished by an earlier prompt still owns the thread: the runtime always
         // advances the oldest unfinished turn, so a new admission would sit behind it forever.
         // `Paused` is the one state that needs a nudge (it is deliberately not ready); a turn a
@@ -4019,6 +4010,98 @@ mod tests {
         .await
         .expect("the session opens once the abandoned call is settled");
         recorder.close().await;
+    }
+
+    /// Regression: a turn that *ended* while one of its dispatches had no result left the
+    /// journal unopenable for the rest of the process — `build_runtime` reconciles once, when it
+    /// builds the runtime, so every later prompt failed with "Explicit reconciliation required".
+    /// A finished turn's leftovers are settled before the next prompt; an unfinished turn keeps
+    /// its uncertainty because resuming it must not find synthetic results.
+    #[tokio::test]
+    async fn a_finished_turns_stranded_dispatch_is_settled_before_the_next_prompt() {
+        use agentscope_core::journal::{
+            AtomicThreadJournal, JournalEvent, JournalProjection, MemoryJournalStorage,
+            ThreadJournal,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        fn event(seq: u64, kind: &str, payload: serde_json::Value) -> JournalEvent {
+            JournalEvent::new(
+                format!("e{seq}"),
+                seq,
+                0,
+                kind,
+                Some("run-1".to_string()),
+                Some("t1".to_string()),
+                true,
+                payload.to_string(),
+            )
+            .unwrap()
+        }
+
+        async fn seed(ending: bool) -> Arc<dyn ThreadJournal> {
+            let log: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(
+                Arc::new(MemoryJournalStorage::new()),
+                "acp/test",
+            ));
+            let state = agentscope_core::state::AgentState::builder()
+                .session_id("s1")
+                .build();
+            let mut facts = vec![
+                event(
+                    1,
+                    "state/checkpoint",
+                    serde_json::json!({ "stateJson": state.to_json().unwrap() }),
+                ),
+                event(2, "run/start", serde_json::json!({})),
+                event(
+                    3,
+                    "tool/dispatch",
+                    serde_json::json!({ "toolCallId": "call-1" }),
+                ),
+            ];
+            if ending {
+                facts.push(event(
+                    4,
+                    "turn/cancelled",
+                    serde_json::json!({ "status": "cancelled" }),
+                ));
+            }
+            let writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
+            let head = log.head().await.unwrap();
+            log.commit(&writer, "batch-1", head.seq, &facts)
+                .await
+                .unwrap();
+            log.release(&writer).await.unwrap();
+            log
+        }
+
+        // A cancelled turn left a dispatch unanswered: the next prompt would be refused unless
+        // the leftover outcome is settled.
+        let finished = seed(true).await;
+        super::settle_finished_turn_uncertainties(&finished).await;
+        assert!(
+            JournalProjection::read(&*finished)
+                .await
+                .unwrap()
+                .uncertain_tool_calls
+                .is_empty(),
+            "the ended turn's stranded dispatch must be settled"
+        );
+
+        // A turn that is still open owns its uncertainty: resuming it must not find results that
+        // were never observed.
+        let open = seed(false).await;
+        super::settle_finished_turn_uncertainties(&open).await;
+        assert_eq!(
+            JournalProjection::read(&*open)
+                .await
+                .unwrap()
+                .uncertain_tool_calls,
+            ["call-1".to_string()].into_iter().collect(),
+            "an unfinished turn's dispatch must stay uncertain"
+        );
     }
 
     /// Regression: a strict OpenAI-compatible gateway rejects vendor-specific

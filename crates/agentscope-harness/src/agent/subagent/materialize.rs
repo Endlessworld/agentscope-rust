@@ -596,9 +596,26 @@ impl SubagentFactory for LeafFactory {
 /// produce a result. The journal keeps that call as an unknown outcome and refuses to open the
 /// session again until it is settled. Repairing through `abandon_turn` records the unknown
 /// outcomes as `interrupted` (never as success) so the same `agent_key` stays usable.
-struct HarnessSessionRepair {
+pub(crate) struct HarnessSessionRepair {
     agent: Arc<HarnessAgent>,
 }
+
+#[cfg(test)]
+impl HarnessSessionRepair {
+    /// The repair hook of one child instance, for the spawn-path regression test.
+    pub(crate) fn for_agent(agent: Arc<HarnessAgent>) -> Arc<dyn SubagentSessionRepair> {
+        Arc::new(Self { agent })
+    }
+}
+
+/// Message recorded for a subagent tool call whose outcome the aborted turn never observed.
+const SUBAGENT_ABANDONED_MESSAGE: &str = "This tool call was dispatched by a subagent turn that \
+     was cancelled or stopped before its result was recorded; external side effects, if any, \
+     were not verified. It was not retried.";
+
+/// Why a subagent session settles the tool calls it found unsettled.
+const SUBAGENT_RECONCILE_REASON: &str =
+    "subagent: tool calls an aborted turn left without a recorded outcome";
 
 impl SubagentSessionRepair for HarnessSessionRepair {
     fn repair(&self) -> futures::future::BoxFuture<'_, agentscope_core::error::Result<bool>> {
@@ -609,14 +626,26 @@ impl SubagentSessionRepair for HarnessSessionRepair {
                 return Ok(false);
             };
             let turns = agentscope_core::journal::TurnViews::read(&*log).await?;
-            let Some(latest) = turns.latest() else {
-                return Ok(false);
-            };
-            if latest.ended() {
-                return Ok(false);
+            match turns.latest() {
+                // An open turn still owns its uncertainty: closing it settles the dispatch and
+                // ends the turn in one step.
+                Some(latest) if !latest.ended() => {
+                    let turn_id = latest.turn_id.clone();
+                    agentscope_core::journal::abandon_turn(log, &turn_id).await
+                }
+                // A cancelled or failed turn can end with a dispatch that never got a result.
+                // There is no open turn left to close, but the recorder still refuses to open
+                // the session, so the leftover outcome is settled here instead.
+                _ => Ok(
+                    !agentscope_core::journal::recovery::settle_uncertain_tool_outcomes(
+                        log,
+                        SUBAGENT_ABANDONED_MESSAGE,
+                        SUBAGENT_RECONCILE_REASON,
+                    )
+                    .await?
+                    .is_empty(),
+                ),
             }
-            let turn_id = latest.turn_id.clone();
-            agentscope_core::journal::abandon_turn(log, &turn_id).await
         })
     }
 }
@@ -893,6 +922,108 @@ mod tests {
         );
 
         // Repaired: the same instance accepts a prompt again.
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_repair_settles_a_stranded_dispatch_of_an_ended_turn() {
+        // Regression: a cancelled/stopped acting phase can end the turn while one of its
+        // dispatches never got a result. `abandon_turn` declines ("no open turn"), so repair
+        // reported "nothing to do" while the recorder kept refusing the session — the child's
+        // `agent_key` stayed unusable for the rest of the process.
+        use agentscope_core::journal::{
+            InMemoryThreadJournalStore, JournalEvent, ThreadJournalStore,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "agentscope_subagent_stranded_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn ThreadJournalStore> = Arc::new(InMemoryThreadJournalStore::new());
+        let agent = Arc::new(
+            HarnessAgent::builder()
+                .name("child")
+                .model(Arc::new(StubModel) as Arc<dyn Model>)
+                .cwd(dir.clone())
+                .workspace(dir.join("ws"))
+                .session_log_store(Arc::clone(&store))
+                .max_iters(2)
+                .build(),
+        );
+        let log = agent
+            .session_log(&RuntimeContext::new())
+            .await
+            .expect("journal");
+        let state = agentscope_core::state::AgentState::builder().build();
+        let facts: Vec<JournalEvent> = vec![
+            JournalEvent::new(
+                "e1",
+                1,
+                0,
+                "state/checkpoint",
+                None,
+                None,
+                true,
+                serde_json::json!({ "stateJson": state.to_json().unwrap() }).to_string(),
+            )
+            .unwrap(),
+            JournalEvent::new(
+                "e2",
+                2,
+                0,
+                "run/start",
+                Some("run-0".into()),
+                Some("t1".into()),
+                true,
+                "{}",
+            )
+            .unwrap(),
+            JournalEvent::new(
+                "e3",
+                3,
+                0,
+                "tool/dispatch",
+                Some("run-0".into()),
+                Some("t1".into()),
+                true,
+                r#"{"toolCallId":"call-1"}"#,
+            )
+            .unwrap(),
+            // The turn itself ended (a cancel), which is exactly what made repair give up.
+            JournalEvent::new(
+                "e4",
+                4,
+                0,
+                "turn/cancelled",
+                Some("run-0".into()),
+                Some("t1".into()),
+                true,
+                r#"{"status":"cancelled"}"#,
+            )
+            .unwrap(),
+        ];
+        let writer = log
+            .acquire("run-0", std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
+        log.commit(&writer, "seed", 0, &facts).await.unwrap();
+        log.release(&writer).await.unwrap();
+
+        let err = agent.call(vec![Msg::user("hi")]).await.unwrap_err();
+        assert!(err.to_string().contains("reconciliation required"), "{err}");
+
+        let repair = HarnessSessionRepair {
+            agent: Arc::clone(&agent),
+        };
+        assert!(
+            repair.repair().await.unwrap(),
+            "the stranded dispatch must be settled even though no turn is open"
+        );
+
         let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
         assert_eq!(reply.text_content(), "ok");
         let _ = std::fs::remove_dir_all(&dir);

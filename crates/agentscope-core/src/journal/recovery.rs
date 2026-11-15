@@ -301,6 +301,56 @@ async fn reject_steering(log: &Arc<dyn ThreadJournal>, turn_id: &str) -> crate::
     Ok(())
 }
 
+/// Records every uncertain tool outcome as `interrupted`, so a session that holds a dispatch
+/// without a result can be opened again.
+///
+/// Unlike [`cancel_pending`] and [`abandon_turn`] this does not need an unfinished turn: the
+/// uncertainty may have been left by a turn that already ended (a cancelled or stopped acting
+/// phase, a run that failed after dispatch) or by a process that is gone. The recorder refuses
+/// any later open while one `tool/dispatch` stays unanswered, and the outcome can never arrive
+/// later, so recording it as `interrupted` (never as success, never re-executed) is what lets
+/// the session continue.
+///
+/// `message` is the text recorded as the synthetic tool result, `reason` the audit reason
+/// stored on `recovery/applied`. Returns the ids that were settled; empty when nothing was
+/// uncertain (in which case the journal is not written at all).
+pub async fn settle_uncertain_tool_outcomes(
+    log: Arc<dyn ThreadJournal>,
+    message: &str,
+    reason: &str,
+) -> crate::error::Result<BTreeSet<String>> {
+    let projection = JournalProjection::read(&*log).await?;
+    if projection.uncertain_tool_calls.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    // The name is only informational: the dispatch that left the call uncertain may predate the
+    // last checkpoint, and then the restored state no longer holds the call at all.
+    let names: BTreeMap<String, String> = projection
+        .restore()
+        .ok()
+        .flatten()
+        .map(|state| {
+            state
+                .context
+                .iter()
+                .flat_map(|message| message.tool_use_blocks())
+                .map(|call| (call.id.clone(), call.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut outcomes: BTreeMap<String, ToolResultBlock> = BTreeMap::new();
+    for id in &projection.uncertain_tool_calls {
+        let name = names.get(id).map(String::as_str).unwrap_or("unknown");
+        outcomes.insert(
+            id.clone(),
+            ToolResultBlock::new(id, name, vec![ContentBlock::Text(TextBlock::new(message))])
+                .with_state(ToolResultState::Interrupted),
+        );
+    }
+    reconcile(Arc::clone(&log), outcomes, reason).await?;
+    Ok(projection.uncertain_tool_calls)
+}
+
 /// Records verified outcomes for exactly the uncertain tool calls, then checkpoints.
 ///
 /// Reconciliation never executes the tools again; continuation stays explicit.

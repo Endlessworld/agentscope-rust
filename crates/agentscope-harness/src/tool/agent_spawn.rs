@@ -921,7 +921,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    use agentscope_core::agent::Agent;
+    use agentscope_core::agent::{Agent, RuntimeContext};
     use agentscope_core::formatter::JsonSchema;
     use agentscope_core::state::AgentState;
     use agentscope_core::tool::Toolkit;
@@ -1063,6 +1063,133 @@ mod tests {
 
         assert!(err.to_string().contains("boom"), "{err}");
         assert_eq!(repairs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_child_whose_ended_turn_left_a_dispatch_unanswered_is_spawned_again() {
+        // Regression: the child's journal holds a `tool/dispatch` with no result and the turn
+        // that owned it already ended (a cancel stopped the acting phase). The recorder refuses
+        // to open such a session, and the repair hook used to decline because no turn was open,
+        // so every later spawn/send to that key came back as
+        // "journal: Explicit reconciliation required for unknown tool outcomes".
+        use agentscope_core::journal::{
+            InMemoryThreadJournalStore, JournalEvent, ThreadJournalStore,
+        };
+        use agentscope_core::message::{ContentBlock, TextBlock};
+        use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
+
+        use crate::agent::subagent::materialize::HarnessSessionRepair;
+        use crate::agent::HarnessAgent;
+
+        struct StubModel;
+
+        #[async_trait]
+        impl Model for StubModel {
+            fn stream(
+                &self,
+                _messages: Vec<Msg>,
+                _tools: Vec<ToolSchema>,
+                _options: GenerateOptions,
+            ) -> futures::stream::BoxStream<'_, Result<ChatResponse>> {
+                Box::pin(futures::stream::once(async {
+                    Ok(ChatResponse::builder()
+                        .content(vec![ContentBlock::Text(TextBlock::new("ok"))])
+                        .build())
+                }))
+            }
+
+            fn model_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("agentscope_spawn_stranded_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn ThreadJournalStore> = Arc::new(InMemoryThreadJournalStore::new());
+        let child = Arc::new(
+            HarnessAgent::builder()
+                .name("child")
+                .model(Arc::new(StubModel) as Arc<dyn Model>)
+                .cwd(dir.clone())
+                .workspace(dir.join("ws"))
+                .session_log_store(Arc::clone(&store))
+                .max_iters(2)
+                .build(),
+        );
+        let log = child
+            .session_log(&RuntimeContext::new())
+            .await
+            .expect("journal");
+        let state = AgentState::builder().build();
+        let facts: Vec<JournalEvent> = vec![
+            JournalEvent::new(
+                "e1",
+                1,
+                0,
+                "state/checkpoint",
+                None,
+                None,
+                true,
+                serde_json::json!({ "stateJson": state.to_json().unwrap() }).to_string(),
+            )
+            .unwrap(),
+            JournalEvent::new(
+                "e2",
+                2,
+                0,
+                "run/start",
+                Some("run-0".into()),
+                Some("t1".into()),
+                true,
+                "{}",
+            )
+            .unwrap(),
+            JournalEvent::new(
+                "e3",
+                3,
+                0,
+                "tool/dispatch",
+                Some("run-0".into()),
+                Some("t1".into()),
+                true,
+                r#"{"toolCallId":"call-1"}"#,
+            )
+            .unwrap(),
+            JournalEvent::new(
+                "e4",
+                4,
+                0,
+                "turn/cancelled",
+                Some("run-0".into()),
+                Some("t1".into()),
+                true,
+                r#"{"status":"cancelled"}"#,
+            )
+            .unwrap(),
+        ];
+        let writer = log
+            .acquire("run-0", std::time::Duration::from_secs(30))
+            .await
+            .unwrap();
+        log.commit(&writer, "seed", 0, &facts).await.unwrap();
+        log.release(&writer).await.unwrap();
+
+        let repair = HarnessSessionRepair::for_agent(Arc::clone(&child));
+        let out = run_child_turn(
+            Arc::clone(&child) as Arc<dyn CallableAgent>,
+            Some(repair),
+            "go".to_string(),
+            "sub-test".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("the spawn path settles the leftover outcome instead of reporting it");
+
+        assert_eq!(out, "ok");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A child that reports progress through the sink it is handed, like a real agent.
