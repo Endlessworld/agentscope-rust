@@ -136,7 +136,8 @@ impl Broker for InMemoryBroker {
     }
 
     async fn fetch(&self, cursor: &str, max: usize) -> Result<Vec<Message>, BrokerError> {
-        let cursor = Cursor::parse(cursor).map_err(|error| BrokerError::invalid(error.to_string()))?;
+        let cursor =
+            Cursor::parse(cursor).map_err(|error| BrokerError::invalid(error.to_string()))?;
         let start = usize::try_from(cursor.offset())
             .map_err(|_| BrokerError::invalid(format!("cursor {cursor} is out of range")))?;
         let messages = self.messages();
@@ -185,7 +186,10 @@ mod tests {
         assert_eq!(first.len(), 1);
         let second = block_on(broker.fetch("1", 10)).expect("fetch");
         assert_eq!(second.len(), 1);
-        assert_eq!(Envelope::decode(&second[0].body).expect("decode").sequence, 2);
+        assert_eq!(
+            Envelope::decode(&second[0].body).expect("decode").sequence,
+            2
+        );
         assert!(block_on(broker.fetch("2", 10)).expect("fetch").is_empty());
     }
 

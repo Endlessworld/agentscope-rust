@@ -198,7 +198,11 @@ mod tests {
             Err(crate::BrokerError::unavailable("offline"))
         }
 
-        async fn fetch(&self, _cursor: &str, _max: usize) -> Result<Vec<Message>, crate::BrokerError> {
+        async fn fetch(
+            &self,
+            _cursor: &str,
+            _max: usize,
+        ) -> Result<Vec<Message>, crate::BrokerError> {
             Err(crate::BrokerError::unavailable("offline"))
         }
     }

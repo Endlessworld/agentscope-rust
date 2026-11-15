@@ -134,7 +134,10 @@ fn a_redelivery_in_a_later_batch_is_dropped_and_still_advances_the_cursor() {
     block_on(broker.publish(first.clone())).expect("publish");
 
     let mut consumer = Consumer::new(broker.clone(), session.clone());
-    assert_eq!(sequences(&block_on(consumer.poll(1)).expect("poll")), vec![1]);
+    assert_eq!(
+        sequences(&block_on(consumer.poll(1)).expect("poll")),
+        vec![1]
+    );
 
     // The broker hands the same message over again at a new offset.
     block_on(broker.publish(first)).expect("redeliver");
@@ -152,7 +155,10 @@ fn a_sequence_regression_is_an_error_not_a_silent_accept() {
     publish(&broker, &session, 1);
 
     let mut consumer = Consumer::new(broker, session);
-    assert_eq!(sequences(&block_on(consumer.poll(1)).expect("poll")), vec![2]);
+    assert_eq!(
+        sequences(&block_on(consumer.poll(1)).expect("poll")),
+        vec![2]
+    );
 
     match block_on(consumer.poll(1)) {
         Err(ConsumeError::OutOfOrder {

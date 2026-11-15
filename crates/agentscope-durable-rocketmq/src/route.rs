@@ -160,6 +160,10 @@ mod tests {
     #[test]
     fn a_long_namespace_is_bounded() {
         let topic = topic_for_namespace(&"n".repeat(300));
-        assert!(topic.len() <= 64, "topic must stay short: {} chars", topic.len());
+        assert!(
+            topic.len() <= 64,
+            "topic must stay short: {} chars",
+            topic.len()
+        );
     }
 }

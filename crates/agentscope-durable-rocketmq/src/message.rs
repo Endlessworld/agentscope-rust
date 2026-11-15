@@ -79,7 +79,9 @@ mod serde_bytes_hex {
             return Err(serde::de::Error::custom("message body hex is not ASCII"));
         }
         if hex.len() % 2 != 0 {
-            return Err(serde::de::Error::custom("message body hex has an odd length"));
+            return Err(serde::de::Error::custom(
+                "message body hex has an odd length",
+            ));
         }
         (0..hex.len())
             .step_by(2)

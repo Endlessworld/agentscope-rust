@@ -39,7 +39,9 @@ impl Cursor {
         if text.is_empty() {
             return Ok(Self::START);
         }
-        text.parse::<u64>().map(Self).map_err(|_| CursorError::new(text))
+        text.parse::<u64>()
+            .map(Self)
+            .map_err(|_| CursorError::new(text))
     }
 }
 
