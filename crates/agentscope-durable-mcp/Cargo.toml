@@ -1,6 +1,6 @@
 [package]
 name = "agentscope-durable-mcp"
-description = "AgentScope Rust - durable adapter for MCP (Model Context Protocol) execution transport (skeleton, Java parity)"
+description = "AgentScope Rust - durable adapter for MCP (Model Context Protocol) execution transport"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,3 +13,12 @@ categories.workspace = true
 
 [dependencies]
 agentscope-durable = { version = "0.2.0", path = "../agentscope-durable" }
+# `raw_value` keeps request params byte-for-byte as the typed struct encoded them, so the
+# field order of `InitializeParams`/`ToolsCallParams` survives instead of being re-sorted
+# through a `serde_json::Value` map.
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
