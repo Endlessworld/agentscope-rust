@@ -13,3 +13,10 @@ categories.workspace = true
 
 [dependencies]
 agentscope-durable = { version = "0.2.0", path = "../agentscope-durable" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# No HTTP client here: the transport is injected, so this crate owns only the wire shapes.
+[dev-dependencies]
+tokio.workspace = true

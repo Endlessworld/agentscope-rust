@@ -149,6 +149,10 @@ name = "agentscope-durable-http"
 version = "0.2.0"
 dependencies = [
  "agentscope-durable",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -165,6 +169,10 @@ name = "agentscope-durable-mcp"
 version = "0.2.0"
 dependencies = [
  "agentscope-durable",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -179,6 +187,9 @@ name = "agentscope-durable-rocketmq"
 version = "0.2.0"
 dependencies = [
  "agentscope-durable",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -186,6 +197,9 @@ name = "agentscope-durable-sandbox"
 version = "0.2.0"
 dependencies = [
  "agentscope-durable",
+ "async-trait",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
