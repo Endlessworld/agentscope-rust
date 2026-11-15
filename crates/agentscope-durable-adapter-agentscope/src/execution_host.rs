@@ -416,18 +416,41 @@ async fn read_events(
     thread: &ThreadKey,
     journal_position: u64,
 ) -> Result<Vec<JournalEvent>> {
-    if journal_position == 0 {
-        return Ok(Vec::new());
+    // The backend reads at most one page per call (`Page limit must be 1..=1000`). A thread whose
+    // committed history is longer than a page therefore has to be read page by page: asking for
+    // `journal_position` entries in one call asked for a page size the backend refuses as soon as
+    // the thread passed 1,000 entries, which failed every `open` of that thread.
+    const PAGE: usize = 1000;
+    let mut events = Vec::new();
+    let mut after = 0u64;
+    while after < journal_position {
+        let entries = backend
+            .read_journal(thread, after, PAGE)
+            .await
+            .map_err(convert)?;
+        if entries.is_empty() {
+            break;
+        }
+        let full_page = entries.len() == PAGE;
+        let mut progress = false;
+        for entry in entries {
+            // `seq` is the entry's journal position, and it is what the next page starts after;
+            // it is read from the envelope so an entry the codec cannot decode still advances.
+            if let Some(seq) = entry.get("seq").and_then(Value::as_u64) {
+                if seq > after {
+                    after = seq;
+                    progress = true;
+                }
+            }
+            if let Ok(event) = serde_json::from_value::<JournalEvent>(entry) {
+                events.push(event);
+            }
+        }
+        if !full_page || !progress {
+            break;
+        }
     }
-    let limit = journal_position.min(usize::MAX as u64) as usize;
-    let entries = backend
-        .read_journal(thread, 0, limit)
-        .await
-        .map_err(convert)?;
-    Ok(entries
-        .into_iter()
-        .filter_map(|entry| serde_json::from_value::<JournalEvent>(entry).ok())
-        .collect())
+    Ok(events)
 }
 
 /// Codecs for the two host facts, so a required event type is never unknown to recovery.

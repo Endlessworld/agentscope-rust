@@ -282,6 +282,35 @@ async fn a_committed_iteration_position_continues_the_budget() {
 }
 
 #[tokio::test]
+async fn a_thread_past_one_journal_page_still_opens() {
+    let (backend, thread, lease) = running_turn().await;
+    // The backend serves journal reads one page (1,000 entries) at a time, so a thread past that
+    // page has to be read in more than one call. The fact that matters is the *last* one, which a
+    // one-page read would never reach.
+    let mut facts: Vec<(&str, Value)> = (0..1000)
+        .map(|index| ("alpha.message", json!({ "index": index })))
+        .collect();
+    facts.push(("step/start", json!({ "stepId": "step-7", "iteration": 7 })));
+    seed(&backend, &thread, &lease, facts).await;
+    let state = backend.thread_state(&thread).await.expect("thread state");
+    assert_eq!(state.journal_position, 1001, "one fact past a page");
+
+    let host = AgentScopeExecutionHost::open(
+        Arc::clone(&backend) as Arc<dyn SessionBackend>,
+        thread.clone(),
+        lease.clone(),
+        "run-1",
+    )
+    .await
+    .expect("a thread longer than one page still opens");
+    assert_eq!(
+        host.position(),
+        AgentExecutionPosition::new(7, 6),
+        "every page is read, not only the first"
+    );
+}
+
+#[tokio::test]
 async fn a_committed_reply_resumes_finalization_without_a_model_call() {
     let (backend, thread, lease) = running_turn().await;
     let produced = Msg::assistant("already answered");

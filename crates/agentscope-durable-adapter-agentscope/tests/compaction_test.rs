@@ -389,6 +389,89 @@ async fn agent_events(fixture: &Fixture) -> Vec<JournalEvent> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn paging_after_a_prune_returns_every_retained_event_exactly_once() {
+    let fixture = Fixture::open("prune-pages").await;
+    let state = big_state(1, 10);
+    for index in 0..8 {
+        fixture
+            .commit_state(&format!("batch-{index}"), &state)
+            .await;
+    }
+    let total: u64 = fixture
+        .backend
+        .snapshot(&fixture.thread.session)
+        .await
+        .expect("snapshot")
+        .sequence
+        .parse()
+        .expect("sequence");
+    assert!(total >= 8, "the commits wrote public events: {total}");
+
+    let keep = 5;
+    let watermark = total - keep;
+    let dropped = fixture
+        .backend
+        .prune_events(&fixture.thread.session, keep)
+        .await
+        .expect("prune");
+    assert_eq!(dropped, watermark, "everything up to the watermark");
+
+    // What survived, read in one page, is the reference the paged walk has to reproduce.
+    let retained = fixture
+        .backend
+        .events(&fixture.thread.session, None, 100)
+        .await
+        .expect("the retained window");
+    let expected: Vec<u64> = retained
+        .events
+        .iter()
+        .map(|event| event.sequence.parse::<u64>().expect("sequence"))
+        .collect();
+    assert_eq!(
+        expected,
+        (watermark + 1..=total).collect::<Vec<u64>>(),
+        "exactly the newest window is retained"
+    );
+
+    // Two events at a time, from the retained start, following the cursor: no page may ask for a
+    // limit the backend rejects, and the walk must be complete, ordered and duplicate-free.
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..32 {
+        let page = fixture
+            .backend
+            .events(&fixture.thread.session, cursor.as_deref(), 2)
+            .await
+            .expect("a page after the prune");
+        assert!(page.events.len() <= 2, "a page honours its limit");
+        for event in &page.events {
+            seen.push(event.sequence.parse::<u64>().expect("sequence"));
+        }
+        let next = page.cursor.clone();
+        if page.events.is_empty() || next == cursor {
+            break;
+        }
+        cursor = next;
+    }
+    assert_eq!(seen, expected, "every retained event once, in order");
+
+    // A cursor into the pruned prefix is still refused, so a client learns to load a snapshot
+    // instead of silently missing the events it had not read yet.
+    let stale = format!("{}:1", fixture.thread.session.storage_key());
+    let refused = fixture
+        .backend
+        .events(&fixture.thread.session, Some(&stale), 2)
+        .await
+        .expect_err("a cursor below the watermark is refused");
+    assert!(
+        format!("{refused}").contains("snapshot"),
+        "the refusal says what to do: {refused}"
+    );
+
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}
+
+#[tokio::test]
 async fn pruning_events_keeps_the_newest_window_and_refuses_a_stale_cursor() {
     let fixture = Fixture::open("prune-events").await;
     let state = big_state(1, 10);
