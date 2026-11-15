@@ -24,7 +24,7 @@ use agentscope_durable::backend::TxnBackend;
 use agentscope_durable::types::*;
 use agentscope_durable::SessionBackend;
 use agentscope_durable_adapter_agentscope::{
-    pin, AgentScopeExecutionHost, FINALIZATION_COMPLETED, FINALIZATION_STARTED,
+    pin, AgentScopeExecutionHost, FINALIZATION_COMPLETED, FINALIZATION_STARTED, STATE_VERSION,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -179,7 +179,7 @@ async fn running_turn() -> (Arc<TxnBackend>, ThreadKey, Lease) {
     backend
         .create(SessionSpec {
             key: key.clone(),
-            primary_binding: ThreadBinding::new("durable-host", "def-1", "state-1")
+            primary_binding: ThreadBinding::new("durable-host", "def-1", STATE_VERSION)
                 .expect("binding"),
             metadata: Value::Null,
         })
@@ -563,4 +563,116 @@ async fn pin_exposes_the_host_and_its_position_on_the_context() {
     );
     // The completion fact is what makes the next invocation ordinary again.
     assert_eq!(FINALIZATION_COMPLETED, "durable/finalization_completed");
+}
+
+/// A reply the host already finalized is not written again, but the host still runs the
+/// continuation: it is what publishes the loop state core keeps outside the checkpoint. The
+/// early return used to leave the shared state one invocation behind while the durable reply
+/// claimed the turn was over.
+#[tokio::test]
+async fn replaying_a_finalized_reply_still_runs_the_continuation() {
+    let (backend, thread, lease) = running_turn().await;
+    let host = AgentScopeExecutionHost::open(
+        Arc::clone(&backend) as Arc<dyn SessionBackend>,
+        thread.clone(),
+        lease.clone(),
+        "run-1",
+    )
+    .await
+    .expect("host");
+    let agent = fixture("done", 5);
+    let key_context = RuntimeContext::new();
+    let key = agent.agent.session_key(&key_context).expect("journal key");
+    let log = agent.store.open(&key, &key_context).await.expect("journal");
+    let recorder = Arc::new(
+        InvocationRecorder::open(Arc::clone(&log), Some("turn-1"))
+            .await
+            .expect("recorder"),
+    );
+    let mut context = RuntimeContext::new();
+    context.state = Some(Arc::new(Mutex::new(
+        AgentState::builder().session_id("s-durable").build(),
+    )));
+    context
+        .extensions
+        .insert_arc(RECORDER_CONTEXT_KEY, Arc::clone(&recorder));
+
+    let continuations = Arc::new(AtomicUsize::new(0));
+    let reply = Msg::assistant("already answered");
+    for _ in 0..2 {
+        let counter = Arc::clone(&continuations);
+        let continuation: FinishContinuation<'_> = Box::pin(async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        host.finish(&context, &reply, continuation)
+            .await
+            .expect("finish");
+    }
+    assert_eq!(
+        continuations.load(Ordering::SeqCst),
+        2,
+        "the replay must still run the continuation, or the loop state is never published"
+    );
+
+    // Nothing was written twice: one start, one completion.
+    recorder.flush().await.expect("flush");
+    let events = log.read_after(0, 100).await.expect("events");
+    let count = |event_type: &str| {
+        events
+            .iter()
+            .filter(|event| event.event_type == event_type)
+            .count()
+    };
+    assert_eq!(
+        count(FINALIZATION_STARTED),
+        1,
+        "the reply is persisted once"
+    );
+    assert_eq!(count(FINALIZATION_COMPLETED), 1, "and completed once");
+}
+
+/// A checkpoint written under another state version describes another shape: it must be refused
+/// instead of being decoded into this one.
+#[tokio::test]
+async fn a_checkpoint_from_another_state_version_is_not_restored() {
+    let backend = Arc::new(TxnBackend::in_memory());
+    let key = SessionKey::new("ns", "s-foreign").expect("session key");
+    backend
+        .create(SessionSpec {
+            key: key.clone(),
+            primary_binding: ThreadBinding::new("durable-host", "def-1", "agentscope/state/0")
+                .expect("binding"),
+            metadata: Value::Null,
+        })
+        .await
+        .expect("create session");
+    let thread = ThreadKey::new(key, "main").expect("thread key");
+    backend
+        .submit(&thread, "req-1", json!({ "text": "go" }))
+        .await
+        .expect("submit");
+    let lease = backend
+        .claim(&thread, "owner-a", Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("a claimable turn");
+    let state = AgentState::builder().session_id("s-durable").build();
+    let mut commit = Commit::new("checkpoint", 0, TurnStatus::Running);
+    commit.checkpoint = serde_json::to_value(&state).expect("state json");
+    backend.commit(&lease, commit).await.expect("checkpoint");
+
+    let error = AgentScopeExecutionHost::open(
+        Arc::clone(&backend) as Arc<dyn SessionBackend>,
+        thread,
+        lease,
+        "run-1",
+    )
+    .await
+    .err()
+    .expect("a foreign state version must be refused");
+    assert!(
+        error.to_string().contains("state version"),
+        "the refusal names the versions: {error}"
+    );
 }

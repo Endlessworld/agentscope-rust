@@ -218,13 +218,15 @@ pub(super) fn threads(
     })
 }
 
-fn thread_ids(txn: &dyn Txn) -> Result<Vec<String>> {
-    let parts = txn.keys(&thread_prefix(), None, 10_000)?;
-    let mut ids = Vec::with_capacity(parts.len());
-    for part in parts {
-        if let Some(thread) = load_json::<ThreadData>(txn, &part)? {
+fn thread_ids(txn: &mut dyn Txn) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    // Paged rather than capped: the caller uses this to decide whether a session may close, and a
+    // truncated list silently forgets the threads past the cap.
+    scan_keys(txn, &thread_prefix(), None, |txn, part| {
+        if let Some(thread) = load_json::<ThreadData>(txn, part)? {
             ids.push(thread.definition.key.thread_id);
         }
-    }
+        Ok(true)
+    })?;
     Ok(ids)
 }

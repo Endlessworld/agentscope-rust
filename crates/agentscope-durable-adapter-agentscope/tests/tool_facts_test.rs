@@ -15,7 +15,9 @@ use agentscope_core::state::AgentState;
 use agentscope_durable::backend::TxnBackend;
 use agentscope_durable::types::*;
 use agentscope_durable::{ErrorCode, SessionBackend};
-use agentscope_durable_adapter_agentscope::{AgentScopeExecutionHost, BackendThreadJournal};
+use agentscope_durable_adapter_agentscope::{
+    AgentScopeExecutionHost, BackendThreadJournal, STATE_VERSION,
+};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -28,7 +30,8 @@ async fn session() -> (Arc<TxnBackend>, ThreadKey, TurnReceipt, Lease) {
     backend
         .create(SessionSpec {
             key: key.clone(),
-            primary_binding: ThreadBinding::new("harness-a", "def-1", "state-1").expect("binding"),
+            primary_binding: ThreadBinding::new("harness-a", "def-1", STATE_VERSION)
+                .expect("binding"),
             metadata: Value::Null,
         })
         .await
@@ -106,6 +109,53 @@ fn resulted(seq: u64, call_id: &str, state: ToolResultState) -> JournalEvent {
         .output(ContentBlock::Text(TextBlock::new("ok")))
         .state(state)
         .build();
+    let message = Msg::builder()
+        .role(MsgRole::Tool)
+        .content(vec![ContentBlock::ToolResult(block)])
+        .build();
+    JournalEvent::from_payload(
+        format!("evt-{seq}"),
+        seq,
+        1_700_000_000_000 + seq as i64,
+        "tool/result",
+        None,
+        None,
+        true,
+        &json!({ "message": message }),
+    )
+    .expect("event")
+}
+
+/// A provider-side call: core never dispatches it, so it owns no attempt to record.
+fn server_requested(seq: u64, call_id: &str) -> JournalEvent {
+    let mut call = ToolUseBlock::new(call_id, "google_search", Default::default());
+    call.metadata
+        .insert(ToolUseBlock::METADATA_SERVER_TOOL.to_string(), json!(true));
+    JournalEvent::from_payload(
+        format!("evt-{seq}"),
+        seq,
+        1_700_000_000_000 + seq as i64,
+        "tool/requested",
+        None,
+        None,
+        true,
+        &json!({ "messageId": "msg-1", "toolCallId": call_id, "call": call }),
+    )
+    .expect("event")
+}
+
+/// The inline answer of that provider-side call.
+fn server_resulted(seq: u64, call_id: &str) -> JournalEvent {
+    let mut block = ToolResultBlock::builder()
+        .id(call_id)
+        .name("google_search")
+        .output(ContentBlock::Text(TextBlock::new("inline")))
+        .state(ToolResultState::Success)
+        .build();
+    block.metadata.insert(
+        ToolResultBlock::METADATA_SERVER_TOOL.to_string(),
+        json!(true),
+    );
     let message = Msg::builder()
         .role(MsgRole::Tool)
         .content(vec![ContentBlock::ToolResult(block)])
@@ -495,5 +545,30 @@ async fn a_dispatch_the_durable_turn_never_recorded_still_settles_as_interrupted
             .expect("turn")
             .status,
         TurnStatus::Running
+    );
+}
+
+/// A provider-side call has no local attempt, so recording its inline result would make the
+/// whole batch fail with `Execution has not been dispatched`. Both halves are skipped, and the
+/// batch commits.
+#[tokio::test]
+async fn a_server_tool_result_is_not_recorded_as_a_local_fact() {
+    let (backend, journal, thread, lease) = journaled().await;
+    let writer = journal
+        .acquire("owner-a", Duration::from_secs(60))
+        .await
+        .expect("acquire");
+    let batch = [server_requested(1, "s1"), server_resulted(2, "s1")];
+    journal
+        .commit(&writer, "batch-1", 0, &batch)
+        .await
+        .expect("a provider-side call must not fail the batch");
+    assert_eq!(journal.head().await.expect("head").seq, 2);
+    assert!(
+        backend
+            .execution(&thread, &execution_id(&lease, "s1"))
+            .await
+            .is_err(),
+        "a provider-side call owns no durable record"
     );
 }

@@ -1940,12 +1940,13 @@ async fn run_agent_loop(
         .notify_agent_state_ready(ctx, &mut state, &messages);
 
     // Mirrors Java `doCallInner`: when the previous turn left unresolved tool calls,
-    // decide how to proceed *before* appending the new input. Two of Java's four
-    // branches are ported — recovery (patch orphans) and the fail-fast guard below.
-    // Java's "resume" branch (act on the pending tools without another reasoning
-    // step) is not migrated, and Java's ASKING branch is unreachable here because
-    // this loop never persists `ToolCallState::Asking` (HITL is resolved inline by
-    // the confirm handler during the acting phase).
+    // decide how to proceed *before* appending the new input. Three of Java's four
+    // branches are ported — recovery (patch orphans), the fail-fast guard below, and
+    // the *resume* branch, which continues the pending calls in the acting phase from
+    // the host's `AgentExecutionPosition::acting_iteration` (see `resumeAgent` below)
+    // instead of asking the model for the same decision again. Java's ASKING branch is
+    // unreachable here because this loop never persists `ToolCallState::Asking` (HITL is
+    // resolved inline by the confirm handler during the acting phase).
     let mut pending = extract_pending_tool_calls(&state);
     if !pending.is_empty() {
         if core.enable_pending_tool_recovery {

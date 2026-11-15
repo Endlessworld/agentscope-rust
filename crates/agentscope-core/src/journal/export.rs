@@ -11,7 +11,11 @@ use super::{JournalEvent, ThreadJournal};
 /// [`JournalExportSinkHandle`] under this key makes every recorder the agent opens export
 /// its committed events through [`JournalExporter`]; without it, exporting stays off and
 /// the run behaves exactly as before.
-pub const JOURNAL_EXPORT_SINK_CONTEXT_KEY: &str = "agentscope.session.exportSink";
+///
+/// The key names the journal subsystem, not the retired session layer: extensions are per-run
+/// in-memory slots (`RuntimeContext::extensions`), never persisted, so a key is free to follow
+/// the module it belongs to.
+pub const JOURNAL_EXPORT_SINK_CONTEXT_KEY: &str = "agentscope.journal.exportSink";
 
 /// A committed-event sink. Implementations must deduplicate by native event id.
 ///

@@ -196,17 +196,23 @@ pub(super) fn checkpoints(
         require_thread(txn, thread)?;
         let prefix = checkpoint_history_prefix(&thread.thread_id);
         let mut positions = Vec::new();
-        for part in txn.keys(&prefix, None, 10_000)? {
-            if let Some(position) = part
+        // The cursor is a position, and positions are the tail of the key in order: the walk
+        // starts at the one the caller already read and stops as soon as the page is full,
+        // instead of reading a fixed ten thousand keys and truncating them.
+        let from = checkpoint_history_part(&thread.thread_id, after);
+        scan_keys(txn, &prefix, Some(&from), |_txn, part| {
+            let Some(position) = part
                 .rsplit(':')
                 .next()
                 .and_then(|value| value.parse::<u64>().ok())
-            {
-                if position > after {
-                    positions.push(position);
-                }
+            else {
+                return Ok(true);
+            };
+            if position > after {
+                positions.push(position);
             }
-        }
+            Ok(positions.len() < limit)
+        })?;
         positions.sort_unstable();
         positions.truncate(limit);
         Ok(positions)
@@ -298,9 +304,11 @@ pub(super) fn snapshot(store: &dyn RecordStore, session: &SessionKey) -> Result<
     with_session(store, session, |txn| {
         let state = require_state(txn)?;
         let mut turns = Vec::new();
-        for part in txn.keys(&turn_order_prefix(), None, 100_000)? {
-            let Some(turn_id) = load_json::<String>(txn, &part)? else {
-                continue;
+        // Paged: a snapshot asks for every turn a session ever admitted, so the walk has no
+        // limit — but it also must not be truncated at a fixed count.
+        scan_keys(txn, &turn_order_prefix(), None, |txn, part| {
+            let Some(turn_id) = load_json::<String>(txn, part)? else {
+                return Ok(true);
             };
             let turn = require_turn(txn, &turn_id)?;
             let thread = require_thread(
@@ -308,7 +316,8 @@ pub(super) fn snapshot(store: &dyn RecordStore, session: &SessionKey) -> Result<
                 &ThreadKey::new(session.clone(), turn.thread_id.clone())?,
             )?;
             turns.push(turn.view(&thread.definition.key));
-        }
+            Ok(true)
+        })?;
         Ok(Snapshot {
             session: state.session.key.clone(),
             turns,

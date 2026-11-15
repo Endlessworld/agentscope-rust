@@ -74,6 +74,19 @@ impl ToolCall {
     }
 }
 
+/// Longest an execution id can be: a turn id and a call id, each bounded by [`json::text`], plus
+/// the separator between them.
+///
+/// The identity is *derived*, so it has to be validated against the room its parts may take: a
+/// call id of 256 characters (which a legal `ToolCall` may have) plus a 69-character turn id is
+/// 326, and checking that against the 256 of a leaf identity made a legal call fail the commit as
+/// `INVALID`.
+pub const EXECUTION_ID_MAX_CHARS: usize = 256 + 1 + 256;
+
+pub(super) fn check_execution_id(value: &str) -> Result<()> {
+    json::text_bounded(value, "executionId", EXECUTION_ID_MAX_CHARS)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionRequest {
@@ -92,7 +105,7 @@ impl ExecutionRequest {
     ) -> Result<Self> {
         let execution_id = execution_id.into();
         let turn_id = turn_id.into();
-        json::text(&execution_id, "executionId")?;
+        check_execution_id(&execution_id)?;
         json::text(&turn_id, "turnId")?;
         Ok(Self {
             execution_id,
@@ -193,7 +206,7 @@ impl ToolResultRecord {
     }
 
     pub fn validate(&self) -> Result<()> {
-        json::text(&self.execution_id, "executionId")?;
+        check_execution_id(&self.execution_id)?;
         if self.result.state == ExecutionState::NotFound {
             return Err(DurableError::invalid(
                 "NOT_FOUND is not a recordable execution result",

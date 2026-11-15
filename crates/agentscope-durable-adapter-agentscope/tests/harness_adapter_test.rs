@@ -23,7 +23,7 @@ use agentscope_durable::harness_adapter::settle_turn;
 use agentscope_durable::types::*;
 use agentscope_durable::{DurableRuntime, Result as DurableResult, SessionBackend, TickOutcome};
 use agentscope_durable_adapter_agentscope::{
-    AgentScopeHarnessAdapter, BackendThreadJournal, FINALIZATION_STARTED,
+    AgentScopeHarnessAdapter, BackendThreadJournal, FINALIZATION_STARTED, STATE_VERSION,
 };
 use agentscope_harness::HarnessAgent;
 use futures::stream::BoxStream;
@@ -238,7 +238,7 @@ async fn fixture_of(model: Arc<ScriptedModel>, max_iters: i32) -> Fixture {
     runtime
         .ensure_session(SessionSpec {
             key: key.clone(),
-            primary_binding: ThreadBinding::new(HARNESS, "def-1", "state-1").expect("binding"),
+            primary_binding: ThreadBinding::new(HARNESS, "def-1", STATE_VERSION).expect("binding"),
             metadata: Value::Null,
         })
         .await
@@ -565,7 +565,7 @@ async fn a_thread_without_an_adapter_is_a_non_retryable_failure() -> DurableResu
     runtime
         .ensure_session(SessionSpec {
             key: key.clone(),
-            primary_binding: ThreadBinding::new(HARNESS, "def-1", "state-1").expect("binding"),
+            primary_binding: ThreadBinding::new(HARNESS, "def-1", STATE_VERSION).expect("binding"),
             metadata: Value::Null,
         })
         .await?;

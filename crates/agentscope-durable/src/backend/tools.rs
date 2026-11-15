@@ -15,18 +15,22 @@ pub(super) fn prepare_run(
         let mut turn = require_turn(txn, &lease.turn_id)?;
         let now = txn.now();
         assert_owned(&turn, lease, now)?;
-        if let Some(current) = turn.current_run() {
-            if current.status == RunStatus::Prepared || current.status == RunStatus::Running {
-                if current.request_id == request_id {
-                    return Ok(current.clone());
-                }
-                return Err(DurableError::conflict("Previous run is still open"));
-            }
-        }
         let run_id = format!(
             "run_{}",
             digest_of(&(&lease.thread, &turn.turn_id, request_id, lease.epoch))?
         );
+        // One invocation has exactly one run, and its id is derived from the lease's epoch: a
+        // second prepare for the same invocation answers what the first one recorded. Re-deriving
+        // the record instead used to overwrite a run that already ended and push its id onto
+        // `run_order` a second time, at the cost of rewriting the whole turn.
+        if let Some(existing) = turn.runs.get(&run_id) {
+            return Ok(existing.clone());
+        }
+        if let Some(current) = turn.current_run() {
+            if current.status == RunStatus::Prepared || current.status == RunStatus::Running {
+                return Err(DurableError::conflict("Previous run is still open"));
+            }
+        }
         let view = RunView {
             thread: lease.thread.clone(),
             turn_id: turn.turn_id.clone(),

@@ -7,7 +7,7 @@ use agentscope_core::journal::{JournalEvent, ThreadJournal};
 use agentscope_durable::backend::TxnBackend;
 use agentscope_durable::types::*;
 use agentscope_durable::SessionBackend;
-use agentscope_durable_adapter_agentscope::BackendThreadJournal;
+use agentscope_durable_adapter_agentscope::{BackendThreadJournal, STATE_VERSION};
 use serde_json::{json, Value};
 
 async fn fixture() -> (
@@ -21,7 +21,8 @@ async fn fixture() -> (
     backend
         .create(SessionSpec {
             key: session.clone(),
-            primary_binding: ThreadBinding::new("harness-a", "def-1", "state-1").expect("binding"),
+            primary_binding: ThreadBinding::new("harness-a", "def-1", STATE_VERSION)
+                .expect("binding"),
             metadata: Value::Null,
         })
         .await
@@ -131,4 +132,34 @@ async fn a_second_writer_cannot_acquire_an_active_lease() {
         .acquire("owner-b", Duration::from_secs(30))
         .await
         .expect("takeover after release");
+}
+
+/// A replay is idempotent only when it is the same batch: an id match alone must not swallow a
+/// fact whose content changed under the same id.
+#[tokio::test]
+async fn a_replay_with_the_same_ids_but_changed_content_is_rejected() {
+    let (_backend, journal, _thread, _receipt) = fixture().await;
+    let writer = journal
+        .acquire("owner-a", Duration::from_secs(30))
+        .await
+        .expect("acquire");
+    journal
+        .commit(&writer, "batch-1", 0, &[event(1)])
+        .await
+        .expect("commit");
+
+    let mut changed = event(1);
+    changed.payload_json = json!({ "seq": 1, "changed": true }).to_string();
+    let replay = journal.commit(&writer, "batch-1", 0, &[changed]).await;
+    assert!(
+        replay.is_err(),
+        "the same id with different content is not a replay"
+    );
+    let events = journal.read_after(0, 10).await.expect("read");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].payload_json,
+        json!({ "seq": 1 }).to_string(),
+        "the committed fact is untouched"
+    );
 }

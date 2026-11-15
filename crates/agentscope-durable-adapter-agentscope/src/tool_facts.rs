@@ -37,6 +37,9 @@ pub(crate) fn execution_id(turn_id: &str, call_id: &str) -> String {
 pub(crate) fn from_batch(turn_id: &str, events: &[JournalEvent]) -> Result<ToolFacts> {
     let mut facts = ToolFacts::default();
     let mut seen: HashSet<String> = HashSet::new();
+    // Calls a provider executed: they never got an intent, so they must never get a result
+    // either (see the `tool/result` arm).
+    let mut server_calls: HashSet<String> = HashSet::new();
     for event in events {
         let data = event.data().unwrap_or(Value::Null);
         match event.event_type.as_str() {
@@ -45,6 +48,7 @@ pub(crate) fn from_batch(turn_id: &str, events: &[JournalEvent]) -> Result<ToolF
             "tool/requested" => {
                 let call = decode_call(&data)?;
                 if call.is_server_tool() {
+                    server_calls.insert(call.id.clone());
                     continue;
                 }
                 let intent = tool_call(&call)?;
@@ -67,6 +71,14 @@ pub(crate) fn from_batch(turn_id: &str, events: &[JournalEvent]) -> Result<ToolF
                     let call_id = block.id.as_deref().ok_or_else(|| {
                         journal_error("A tool result without a call id cannot be recorded")
                     })?;
+                    // Skip results, not only intents, of a provider-side call: the local turn
+                    // never dispatched it, so the backend would reject the whole batch with
+                    // `Execution has not been dispatched`. The skip is decided by the call
+                    // itself as well as by what this batch saw, because the result block can
+                    // arrive in a later batch than the request that named the call.
+                    if block.is_server_tool() || server_calls.contains(call_id) {
+                        continue;
+                    }
                     let id = execution_id(turn_id, call_id);
                     let result = result_of(block);
                     match facts.results.iter_mut().find(|r| r.execution_id == id) {

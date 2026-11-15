@@ -23,7 +23,7 @@ use crate::middleware::ModelCallInput;
 use crate::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 
 /// Runtime-context key carrying the active [`ModelCallPolicy`].
-pub const MODEL_POLICY_CONTEXT_KEY: &str = "agentscope.session.modelPolicy";
+pub const MODEL_POLICY_CONTEXT_KEY: &str = "agentscope.journal.modelPolicy";
 
 /// Optional hosted admission/accounting policy, shared with inherited child contexts.
 ///

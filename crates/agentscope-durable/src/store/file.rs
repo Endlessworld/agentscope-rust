@@ -183,10 +183,12 @@ impl FileStore {
         // about what a lock path *is* — one store would take the other's live lock for an orphan.
         // The fallback keeps a store usable where canonicalising is refused.
         let root = fs::canonicalize(&root).unwrap_or(root);
-        Ok(Self {
+        let store = Self {
             root,
             picked: Mutex::new(HashMap::new()),
-        })
+        };
+        store.adopt_flat_work_records()?;
+        Ok(store)
     }
 
     fn scope_path(&self, scope: &str) -> PathBuf {
@@ -196,10 +198,58 @@ impl FileStore {
     }
 
     fn work_path(&self, queue: &str, work_id: &str) -> PathBuf {
-        let key = format!("{queue}\u{0}{work_id}");
-        self.root
-            .join("work")
-            .join(format!("{}.json", digest(&key)))
+        self.work_dir(queue)
+            .join(format!("{}.json", digest(work_id)))
+    }
+
+    /// One directory per queue, so `ready` reads the threads of one queue.
+    ///
+    /// The readiness index used to be one flat directory keyed by `(queue, work id)`, which meant
+    /// every `ready(queue, ..)` had to read and parse *every* work record in the root before it
+    /// could throw away the ones belonging to another queue: a tick cost the whole deployment's
+    /// thread count. Sharding makes that scan the size of the queue it asks about.
+    fn work_dir(&self, queue: &str) -> PathBuf {
+        self.root.join("work").join(digest(queue))
+    }
+
+    /// Adopts the work records a pre-shard build left in the flat directory.
+    ///
+    /// A record nobody rewrites is a thread nothing schedules, so adopting them is what keeps an
+    /// existing root usable. It runs from [`FileStore::open`] because that is the single point
+    /// every process passes through before it reads the index, it is idempotent (the record is
+    /// copied, then the old name dropped), and two hosts doing it at once write the same bytes.
+    /// A root that has already been adopted costs one directory listing.
+    fn adopt_flat_work_records(&self) -> Result<()> {
+        let flat = self.root.join("work");
+        let entries = match retry_while_held(|| fs::read_dir(&flat)) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = match retry_while_held(|| fs::read(&path)) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let record: WorkRecord = serde_json::from_slice(&bytes)
+                .map_err(|error| DurableError::invalid(format!("{}: {error}", path.display())))?;
+            if record.ready_at >= 0 {
+                let dir = self.work_dir(&record.queue);
+                retry_while_held(|| fs::create_dir_all(&dir))?;
+                write_json(&self.work_path(&record.queue, &record.work_id), &record)?;
+            }
+            match retry_while_held(|| fs::remove_file(&path)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     fn lock_path(&self, scope: &str) -> PathBuf {
@@ -365,6 +415,7 @@ impl FileStore {
                     }
                     continue;
                 }
+                retry_while_held(|| fs::create_dir_all(self.work_dir(&entry.queue)))?;
                 write_json(
                     &path,
                     &WorkRecord {
@@ -429,8 +480,9 @@ impl RecordStore for FileStore {
         let mut due: Vec<WorkItem> = Vec::new();
         // Reading needs no index lock: every document is replaced by an atomic rename, so a
         // reader sees either the whole previous record or the whole next one. It does need the
-        // retry, because the file being replaced is briefly held by its writer.
-        let entries = match retry_while_held(|| fs::read_dir(self.root.join("work"))) {
+        // retry, because the file being replaced is briefly held by its writer. The directory is
+        // the queue's own, so this opens that queue's records and nothing else.
+        let entries = match retry_while_held(|| fs::read_dir(self.work_dir(queue))) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
@@ -1564,6 +1616,39 @@ mod tests {
         let due = store.ready("queue", 1000, 10)?;
         let ids: Vec<&str> = due.iter().map(|item| item.work_id.as_str()).collect();
         assert_eq!(ids, vec!["b"]);
+        Ok(())
+    }
+
+    /// A work record written by the pre-shard layout is adopted, not lost.
+    ///
+    /// The readiness index is one directory per queue now, so a record left in the flat directory
+    /// by an older build would be invisible — and a thread nothing schedules never runs again.
+    #[test]
+    fn a_record_from_the_flat_index_is_adopted_at_open() -> Result<()> {
+        let root = TempRoot::new("work-adopt");
+        let legacy = root.path().join("work");
+        fs::create_dir_all(&legacy)?;
+        let record = WorkRecord {
+            queue: "thread:h".to_string(),
+            work_id: "main".to_string(),
+            ready_at: 1,
+            payload: Some(json!({ "legacy": true })),
+        };
+        let name = digest(&format!("thread:h\u{0}main"));
+        fs::write(
+            legacy.join(format!("{name}.json")),
+            serde_json::to_vec(&record)?,
+        )?;
+
+        let store = FileStore::open(root.path())?;
+        let due = store.ready("thread:h", 10, 10)?;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].payload, Some(json!({ "legacy": true })));
+        assert_eq!(
+            file_count(&legacy),
+            1,
+            "only the queue directory is left behind"
+        );
         Ok(())
     }
 

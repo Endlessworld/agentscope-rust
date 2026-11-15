@@ -29,11 +29,11 @@ use crate::message::{ContentBlock, GenerateReason, Msg, MsgRole, ToolResultBlock
 use crate::state::AgentState;
 
 /// Runtime-context key carrying the active [`InvocationRecorder`].
-pub const RECORDER_CONTEXT_KEY: &str = "agentscope.session.recorder";
+pub const RECORDER_CONTEXT_KEY: &str = "agentscope.journal.recorder";
 /// Runtime-context key carrying the turn id pinned for this execution.
-pub const TURN_ID_CONTEXT_KEY: &str = "agentscope.session.turnId";
+pub const TURN_ID_CONTEXT_KEY: &str = "agentscope.journal.turnId";
 /// Runtime-context key carrying the parent session recorder.
-pub const PARENT_CONTEXT_KEY: &str = "agentscope.session.parent";
+pub const PARENT_CONTEXT_KEY: &str = "agentscope.journal.parent";
 
 /// The execution writer lease duration.
 ///

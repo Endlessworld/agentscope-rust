@@ -220,7 +220,7 @@ impl Commit {
             tool.validate()?;
         }
         for execution_id in &self.dispatches {
-            json::text(execution_id, "executionId")?;
+            super::execution::check_execution_id(execution_id)?;
         }
         for record in &self.results {
             record.validate()?;

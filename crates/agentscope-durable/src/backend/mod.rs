@@ -14,7 +14,7 @@ pub(crate) mod turn;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
@@ -35,11 +35,31 @@ use model::*;
 /// keep a process that claims thousands of turns from growing a map forever.
 const GRANTED_MEMO_ENTRIES: usize = 64;
 
+/// A lease extension this process observed, and the local instant it was observed at.
+///
+/// `remaining` is measured on the *store's* clock (the `now` of the transaction that granted it),
+/// `since` is a local monotonic instant, and together they answer "how much of the lease is left
+/// now" without ever comparing the two clocks. Comparing them is what the memo used to do, and it
+/// is wrong in both directions for a store on another host: a server clock running ahead makes a
+/// fresh lease look nearly expired (one redundant write) while one running behind makes a lapsed
+/// lease look fresh — which skips the renewal that keeps the fence and costs the turn its lease.
+struct Grant {
+    remaining_millis: i64,
+    since: Instant,
+}
+
+impl Grant {
+    fn remaining(&self) -> i64 {
+        let elapsed = self.since.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        self.remaining_millis.saturating_sub(elapsed)
+    }
+}
+
 /// Backend over any [`RecordStore`]. Use [`TxnBackend::in_memory`] for tests and
 /// [`TxnBackend::with_store`] for a durable store.
 pub struct TxnBackend {
     store: Arc<dyn RecordStore>,
-    /// The expiry this process last granted, keyed by session scope and thread epoch.
+    /// The lease this process last observed, keyed by session scope and thread epoch.
     ///
     /// A lease extension that is already in force needs neither a read nor a write, and one
     /// session document is the whole conversation: skipping the transaction is what keeps a
@@ -48,7 +68,7 @@ pub struct TxnBackend {
     /// is the behaviour without the memo — and a stale value can only be *older* than the store's
     /// (nothing in this process shortens a lease it granted), so the worst case is one redundant
     /// write, never a lease that lapses unextended.
-    granted: Mutex<HashMap<(String, u64), i64>>,
+    granted: Mutex<HashMap<(String, u64), Grant>>,
 }
 
 impl TxnBackend {
@@ -70,7 +90,8 @@ impl TxnBackend {
         (lease.thread.session.storage_key(), lease.epoch)
     }
 
-    fn remember(&self, lease: &Lease) {
+    /// Records how long the store said was left on the lease, as of now.
+    fn remember(&self, lease: &Lease, remaining_millis: i64) {
         if let Ok(mut granted) = self.granted.lock() {
             // Bounded: one entry per claim, and a long-lived process claims once per turn. A map
             // that grows past this is cleared wholesale — an empty memo only means the next renew
@@ -78,7 +99,13 @@ impl TxnBackend {
             if granted.len() >= GRANTED_MEMO_ENTRIES {
                 granted.clear();
             }
-            granted.insert(Self::lease_key(lease), lease.expires_at);
+            granted.insert(
+                Self::lease_key(lease),
+                Grant {
+                    remaining_millis,
+                    since: Instant::now(),
+                },
+            );
         }
     }
 
@@ -94,12 +121,12 @@ impl TxnBackend {
         let Ok(granted) = self.granted.lock() else {
             return false;
         };
-        let Some(expires_at) = granted.get(&Self::lease_key(lease)) else {
+        let Some(grant) = granted.get(&Self::lease_key(lease)) else {
             return false;
         };
-        // The caller's own copy of the lease is older than what the store granted, so the memo is
-        // the only one that can answer this; the headroom rule itself lives in `turn::renew`.
-        expires_at - crate::now_millis() > turn::renew_headroom(ttl)
+        // The headroom rule itself lives in `turn::renew`; the memo only answers it with the
+        // store's own measurement of what is left.
+        grant.remaining() > turn::renew_headroom(ttl)
     }
 
     pub fn store(&self) -> &Arc<dyn RecordStore> {
@@ -248,6 +275,45 @@ pub(super) fn queue_ids(txn: &dyn Txn, thread_id: &str) -> Result<Vec<String>> {
     }
 }
 
+/// How many keys one [`scan_keys`] page reads.
+///
+/// Scans used to ask for a hundred thousand keys in a single call: the page was materialized in
+/// full, and a prefix with more than that was silently truncated — a caller then worked on a
+/// prefix it believed it had seen completely. Paging bounds the memory of one step and removes
+/// the ceiling.
+const SCAN_PAGE: usize = 1_000;
+
+/// Walks every key under `prefix` in order, one page at a time.
+///
+/// `visit` may read and write through the transaction and returns `false` to stop the walk (a
+/// scan bounded by a watermark, for instance). Deletions are safe: the next page is asked for
+/// with the last key this one returned as its cursor, and a key that is already gone only makes
+/// the store start further along.
+pub(super) fn scan_keys(
+    txn: &mut dyn Txn,
+    prefix: &str,
+    start: Option<&str>,
+    mut visit: impl FnMut(&mut dyn Txn, &str) -> Result<bool>,
+) -> Result<()> {
+    let mut after = start.map(str::to_string);
+    loop {
+        let page = txn.keys(prefix, after.as_deref(), SCAN_PAGE)?;
+        let full = page.len() == SCAN_PAGE;
+        let Some(last) = page.last().cloned() else {
+            return Ok(());
+        };
+        for part in &page {
+            if !visit(&mut *txn, part)? {
+                return Ok(());
+            }
+        }
+        if !full {
+            return Ok(());
+        }
+        after = Some(last);
+    }
+}
+
 /// The turn a writer would work on: the first non-terminal one in admission order.
 ///
 /// Stops at the first non-terminal turn, so the common case costs one page; a thread with a
@@ -287,7 +353,13 @@ pub(super) fn ready_at(thread: &ThreadData, turn: Option<&TurnData>, now: i64) -
     let Some(turn) = turn else {
         return -1;
     };
-    if thread.status != Lifecycle::Open || turn.status == TurnStatus::Paused {
+    // A settled turn is not work. Leaving it in the index is what made every settle cost one more
+    // claim — and one more rewrite of the whole session document — that could only find out there
+    // is nothing to do, because `current_turn` skips terminal turns anyway.
+    if thread.status != Lifecycle::Open
+        || turn.status == TurnStatus::Paused
+        || turn.status.terminal()
+    {
         return -1;
     }
     if let Some(owner) = &turn.owner {
@@ -520,22 +592,19 @@ impl SessionBackend for TxnBackend {
     }
 
     async fn claim(&self, thread: &ThreadKey, owner: &str, ttl: Duration) -> Result<Option<Lease>> {
-        let lease = turn::claim(self.store.as_ref(), thread, owner, ttl)?;
-        if let Some(lease) = &lease {
-            self.remember(lease);
+        let claimed = turn::claim(self.store.as_ref(), thread, owner, ttl)?;
+        if let Some((lease, remaining)) = &claimed {
+            self.remember(lease, *remaining);
         }
-        Ok(lease)
+        Ok(claimed.map(|(lease, _)| lease))
     }
 
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<()> {
         if self.already_granted(lease, ttl) {
             return Ok(());
         }
-        turn::renew(self.store.as_ref(), lease, ttl)?;
-        self.remember(&Lease {
-            expires_at: crate::now_millis() + ttl.as_millis().min(i64::MAX as u128) as i64,
-            ..lease.clone()
-        });
+        let remaining = turn::renew(self.store.as_ref(), lease, ttl)?;
+        self.remember(lease, remaining);
         Ok(())
     }
 
@@ -703,5 +772,41 @@ mod queue_tests {
             "the turn past the first page is the one to run"
         );
         Ok(())
+    }
+
+    /// A settled turn is not work, and saying so is what removes it from the index.
+    ///
+    /// `ready_at` used to answer with the time the turn settled, so every settle left the thread
+    /// scheduled: the next scan claimed it (a whole-document write) only to find that
+    /// `current_turn` skips terminal turns and unindex it again.
+    #[test]
+    fn a_settled_turn_asks_for_no_writer() {
+        let definition = ThreadSpec {
+            key: ThreadKey::new(SessionKey::new("ns", "s").expect("session"), "main")
+                .expect("thread"),
+            binding: ThreadBinding::new("harness-a", "def-1", "state-1").expect("binding"),
+        };
+        let thread = ThreadData::new(definition);
+        let mut turn = TurnData::new("turn-1".to_string(), "main".to_string(), Value::Null, 0);
+        turn.next_attempt_at = 0;
+        for status in [TurnStatus::Queued, TurnStatus::Running, TurnStatus::Waiting] {
+            turn.status = status;
+            assert!(
+                ready_at(&thread, Some(&turn), 10) >= 0,
+                "{status:?} still wants a writer"
+            );
+        }
+        for status in [
+            TurnStatus::Succeeded,
+            TurnStatus::Failed,
+            TurnStatus::Cancelled,
+        ] {
+            turn.status = status;
+            assert_eq!(
+                ready_at(&thread, Some(&turn), 10),
+                -1,
+                "{status:?} is not work"
+            );
+        }
     }
 }

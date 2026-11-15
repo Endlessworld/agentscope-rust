@@ -20,7 +20,7 @@ use agentscope_durable::backend::TxnBackend;
 use agentscope_durable::traffic::{read_stats, reset_read_stats};
 use agentscope_durable::types::*;
 use agentscope_durable::{DurableRuntime, SessionBackend, TickOutcome};
-use agentscope_durable_adapter_agentscope::AgentScopeHarnessAdapter;
+use agentscope_durable_adapter_agentscope::{AgentScopeHarnessAdapter, STATE_VERSION};
 use agentscope_harness::HarnessAgent;
 use futures::stream::BoxStream;
 use serde_json::{json, Value};
@@ -117,7 +117,7 @@ async fn an_idle_stream_polls_control_on_a_backing_off_interval() {
     runtime
         .ensure_session(SessionSpec {
             key: key.clone(),
-            primary_binding: ThreadBinding::new(HARNESS, "def-1", "state-1").expect("binding"),
+            primary_binding: ThreadBinding::new(HARNESS, "def-1", STATE_VERSION).expect("binding"),
             metadata: Value::Null,
         })
         .await

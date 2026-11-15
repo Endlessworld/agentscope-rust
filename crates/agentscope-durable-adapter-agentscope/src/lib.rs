@@ -11,6 +11,7 @@ pub mod harness_adapter;
 mod tool_facts;
 
 pub use backend_thread_journal::BackendThreadJournal;
+pub use checkpoint::STATE_VERSION;
 pub use execution_host::{
     pin, AgentScopeExecutionHost, FINALIZATION_COMPLETED, FINALIZATION_STARTED,
 };

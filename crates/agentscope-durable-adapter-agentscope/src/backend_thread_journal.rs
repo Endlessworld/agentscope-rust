@@ -264,12 +264,26 @@ impl ThreadJournal for BackendThreadJournal {
             }
         }
         if !existing.is_empty() {
-            let same_batch = existing.len() == events.len()
+            let same_ids = existing.len() == events.len()
                 && existing
                     .iter()
                     .zip(events)
                     .all(|(stored, incoming)| stored.event_id == incoming.event_id);
-            if same_batch {
+            // A replay is idempotent only when it is *the same batch*: an id match alone would
+            // silently swallow a fact whose content changed under the same id (a rebuilt event,
+            // a batch re-based onto another position), which is exactly the corruption this
+            // check exists to catch. The durable receipt compares digests for the same reason.
+            let same_content = same_ids
+                && existing
+                    .iter()
+                    .zip(events)
+                    .all(|(stored, incoming)| stored == incoming);
+            if same_ids && !same_content {
+                return Err(journal_error(
+                    "Journal batch was replayed with different content",
+                ));
+            }
+            if same_content {
                 return self.head().await;
             }
             return Err(journal_error("Journal position was taken by another batch"));

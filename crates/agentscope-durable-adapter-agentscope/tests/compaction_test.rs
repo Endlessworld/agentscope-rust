@@ -19,7 +19,7 @@ use agentscope_durable::store::file::FileStore;
 use agentscope_durable::store::RecordStore;
 use agentscope_durable::types::*;
 use agentscope_durable::SessionBackend;
-use agentscope_durable_adapter_agentscope::BackendThreadJournal;
+use agentscope_durable_adapter_agentscope::{BackendThreadJournal, STATE_VERSION};
 use serde_json::{json, Value};
 
 const SESSION: &str = "compaction";
@@ -64,7 +64,8 @@ impl Fixture {
         backend
             .create(SessionSpec {
                 key: key.clone(),
-                primary_binding: ThreadBinding::new(HARNESS, "def-1", "state-1").expect("binding"),
+                primary_binding: ThreadBinding::new(HARNESS, "def-1", STATE_VERSION)
+                    .expect("binding"),
                 metadata: Value::Null,
             })
             .await

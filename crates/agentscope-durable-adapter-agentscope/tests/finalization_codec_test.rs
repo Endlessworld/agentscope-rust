@@ -24,7 +24,7 @@ use agentscope_durable::store::file::FileStore;
 use agentscope_durable::store::RecordStore;
 use agentscope_durable::types::*;
 use agentscope_durable::{DurableRuntime, SessionBackend};
-use agentscope_durable_adapter_agentscope::AgentScopeHarnessAdapter;
+use agentscope_durable_adapter_agentscope::{AgentScopeHarnessAdapter, STATE_VERSION};
 use agentscope_harness::HarnessAgent;
 use futures::stream::BoxStream;
 use serde_json::{json, Value};
@@ -114,7 +114,7 @@ async fn run_round(round: u32, root: PathBuf) {
     runtime
         .ensure_session(SessionSpec {
             key: key.clone(),
-            primary_binding: ThreadBinding::new(HARNESS, "def-1", "state-1").expect("binding"),
+            primary_binding: ThreadBinding::new(HARNESS, "def-1", STATE_VERSION).expect("binding"),
             metadata: Value::Null,
         })
         .await

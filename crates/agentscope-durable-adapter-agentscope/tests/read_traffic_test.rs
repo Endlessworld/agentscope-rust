@@ -19,7 +19,7 @@ use agentscope_durable::backend::TxnBackend;
 use agentscope_durable::traffic::{read_stats, reset_read_stats};
 use agentscope_durable::types::*;
 use agentscope_durable::SessionBackend;
-use agentscope_durable_adapter_agentscope::AgentScopeExecutionHost;
+use agentscope_durable_adapter_agentscope::{AgentScopeExecutionHost, STATE_VERSION};
 use serde_json::json;
 
 /// How many facts the thread committed before the invocation this test opens.
@@ -31,7 +31,7 @@ async fn running_turn() -> (Arc<TxnBackend>, ThreadKey, Lease) {
     backend
         .create(SessionSpec {
             key: key.clone(),
-            primary_binding: ThreadBinding::new("durable-host", "def-1", "state-1")
+            primary_binding: ThreadBinding::new("durable-host", "def-1", STATE_VERSION)
                 .expect("binding"),
             metadata: serde_json::Value::Null,
         })

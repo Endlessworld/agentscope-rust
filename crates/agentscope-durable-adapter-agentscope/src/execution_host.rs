@@ -10,9 +10,9 @@
 //! * `input/steer` | `input/inject` signals are folded into the context and marked delivered:
 //!   the `consumed_signals` marker rides the same commit as the state that carries the messages,
 //!   so a signal is folded exactly once and never re-enters the conversation.
-//! * A runtime restart is only resumed up to the committed iteration; the acting continuation
-//!   (`acting_iteration`) has no consumer because core does not implement the pending-tool resume
-//!   branch.
+//! * A runtime restart resumes from the committed position: the native iteration, plus the
+//!   acting pass core opens when that position names tool calls a previous tick had already
+//!   committed (`AgentExecutionPosition::acting_iteration`, Java `resumeAgent`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
@@ -88,7 +88,7 @@ impl AgentScopeExecutionHost {
                     .checkpoint(&thread, committed)
                     .await
                     .map_err(convert)?;
-                let state = checkpoint::decode(&view.checkpoint)?;
+                let state = checkpoint::decode(&view.checkpoint, &view.metadata.state_version)?;
                 let iteration = state.cur_iter().max(0) as u32;
                 covered = view.journal_position;
                 (
@@ -216,7 +216,11 @@ impl AgentScopeExecutionHost {
 
     /// Verifies this writer still owns the turn and nobody asked it to stop.
     ///
-    /// A lost fence means another writer owns the run: that is a pause, not a failure.
+    /// A lost fence means another writer owns the run: that is a pause, not a failure. A cancel
+    /// request is the opposite — the turn must not be resumed — so it ends the invocation as a
+    /// cancellation instead of a yield. The tick still owns the terminal status (it is the only
+    /// writer allowed to write one), but it no longer has to infer the reason from the frame: a
+    /// run that ends `Cancelled` *is* the cancel.
     async fn check_control(&self) -> Result<()> {
         let lease = self.lease()?;
         let frame = match self.backend.frame(&lease).await {
@@ -224,7 +228,12 @@ impl AgentScopeExecutionHost {
             Err(error) if error.code() == ErrorCode::Fenced => return Err(Error::HostPaused),
             Err(error) => return Err(convert(error)),
         };
-        if frame.turn.cancellation_requested || frame.turn.status == TurnStatus::Pausing {
+        if frame.turn.cancellation_requested {
+            return Err(Error::Cancelled(
+                "the turn was cancelled by the caller".into(),
+            ));
+        }
+        if frame.turn.status == TurnStatus::Pausing {
             return Err(Error::HostPaused);
         }
         Ok(())
@@ -359,20 +368,17 @@ impl AgentExecutionHost for AgentScopeExecutionHost {
         if RunOutcome::from_result(result).status() != RunOutcomeStatus::Completed {
             return continuation.await;
         }
+        // A reply this host already finalized must not be written a second time, but the
+        // continuation still has to run: it is what publishes the loop state core keeps outside
+        // the checkpoint (`commit_loop_state`). Returning early left the shared state one
+        // invocation behind while the durable reply claimed the turn was over.
         if self.completed.load(Ordering::SeqCst) {
-            return Ok(());
+            return continuation.await;
         }
         self.check_control().await?;
         let recorder = InvocationRecorder::from_context(context)
             .ok_or_else(|| journal_error("Durable finalization requires a native recorder"))?;
-        let state = |context: &RuntimeContext| {
-            context
-                .state
-                .as_ref()
-                .map(|state| state.lock().unwrap().clone())
-        };
-        let before = state(context)
-            .ok_or_else(|| journal_error("Durable finalization requires an agent state"))?;
+        let before = current_state(context)?;
         let frame_id = self.frame_id();
         let position = self.position;
         let has_frame = self
@@ -399,7 +405,10 @@ impl AgentExecutionHost for AgentScopeExecutionHost {
         }
         continuation.await?;
         recorder.append(FINALIZATION_COMPLETED, &json!({ "id": frame_id }))?;
-        if let Some(after) = state(context) {
+        // The continuation may have replaced the state (finish middleware runs after the reply
+        // is committed), so read it again rather than persisting the pre-finalization copy.
+        if context.state.is_some() {
+            let after = current_state(context)?;
             recorder
                 .checkpoint_now(&after, "durable_finalization_completed")
                 .await?;
@@ -435,6 +444,21 @@ fn signal_text(value: &Value) -> Option<String> {
 
 fn convert(error: DurableError) -> Error {
     journal_error(format!("{error}"))
+}
+
+/// Clones the agent state the runtime published for this invocation.
+///
+/// A poisoned lock is an error, not a panic: finalization runs inside a live turn, and taking
+/// the process down there would lose the reply the checkpoint is about to commit.
+fn current_state(context: &RuntimeContext) -> Result<AgentState> {
+    let shared = context
+        .state
+        .as_ref()
+        .ok_or_else(|| journal_error("Durable finalization requires an agent state"))?;
+    let state = shared
+        .lock()
+        .map_err(|_| journal_error("The agent state lock is poisoned"))?;
+    Ok(state.clone())
 }
 
 /// Committed native journal entries of `thread`, in order.

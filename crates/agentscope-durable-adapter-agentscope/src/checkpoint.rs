@@ -14,6 +14,13 @@ use serde_json::Value;
 /// projection (`state/checkpoint`, a baseline, an explicit restore).
 const STATE_EVENTS: [&str; 3] = ["state/checkpoint", "migration/baseline", "state/restored"];
 
+/// Version of the native state a checkpoint carries (a `core::state::AgentState` snapshot).
+///
+/// Advertised through [`AdapterCapabilities::state_version`](agentscope_durable::harness_adapter::AdapterCapabilities)
+/// and frozen into the thread binding, so a checkpoint can be told apart from one written
+/// under a different state shape before it is decoded into this one.
+pub const STATE_VERSION: &str = "agentscope/state/1";
+
 /// Encodes a state snapshot as the checkpoint value of a commit.
 pub(crate) fn encode(state: &AgentState) -> Result<Value> {
     serde_json::to_value(state)
@@ -21,9 +28,33 @@ pub(crate) fn encode(state: &AgentState) -> Result<Value> {
 }
 
 /// Decodes a committed checkpoint back into a state.
-pub(crate) fn decode(value: &Value) -> Result<AgentState> {
-    serde_json::from_value(value.clone())
-        .map_err(|error| journal_error(format!("Committed checkpoint is not a state: {error}")))
+///
+/// `state_version` is the version the checkpoint was written under
+/// ([`CheckpointMetadata::state_version`](agentscope_durable::CheckpointMetadata)). A snapshot
+/// from another version describes another shape, so decoding it as this one would silently
+/// misread it: it is refused instead, naming both versions.
+pub(crate) fn decode(value: &Value, state_version: &str) -> Result<AgentState> {
+    if state_version != STATE_VERSION {
+        return Err(journal_error(format!(
+            "Committed checkpoint was written under state version `{state_version}`, \
+             which this adapter cannot restore (expected `{STATE_VERSION}`)"
+        )));
+    }
+    let mut state: AgentState = serde_json::from_value(value.clone())
+        .map_err(|error| journal_error(format!("Committed checkpoint is not a state: {error}")))?;
+    // A snapshot written before the ids were serialized with a default decodes with empty
+    // values. Every consumer assumes an id names something (the thread key falls back to it),
+    // so mint the missing ones instead of carrying an unnamed state forward.
+    if state.session_id.trim().is_empty() || state.reply_id.trim().is_empty() {
+        let fresh = AgentState::default();
+        if state.session_id.trim().is_empty() {
+            state.session_id = fresh.session_id;
+        }
+        if state.reply_id.trim().is_empty() {
+            state.reply_id = fresh.reply_id;
+        }
+    }
+    Ok(state)
 }
 
 /// The snapshot a journal batch commits, when the batch carries one.

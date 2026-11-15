@@ -49,6 +49,7 @@ use agentscope_durable::types::*;
 use agentscope_durable::SessionBackend;
 use agentscope_durable_adapter_agentscope::{
     AgentScopeExecutionHost, BackendThreadJournal, FINALIZATION_COMPLETED, FINALIZATION_STARTED,
+    STATE_VERSION,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -61,13 +62,11 @@ const CALL_ID: &str = "job";
 const TOOL: &str = "record";
 const SESSION: &str = "three-process";
 const HARNESS: &str = "durable-host";
-
-/// D7 asks for one model call across the whole scenario. The core loop resumes at the reasoning
-/// phase only (`AgentExecutionPosition::acting_iteration` has no consumer), so the resuming
-/// process has to ask the model for the same tool decision the checkpoint already holds; it is
-/// a repeat of a decision, not a replay of a tool effect. Java's `ProcessRecoveryTest` asserts
-/// the same two calls. With an acting-phase resume branch the resume would call the model zero
-/// times and the total would be one.
+/// D7 asks for one model call across the whole scenario. The failing tick halts inside the acting
+/// phase, but the position its checkpoint carries still names the reasoning iteration (an acting
+/// pass is identified by `acting_iteration > 0`), so the resuming process reasons once for the
+/// same tool decision the checkpoint already holds — a repeat of a decision, not a replay of a
+/// tool effect. Java's `ProcessRecoveryTest` asserts the same two calls.
 const MODEL_CALLS: usize = 2;
 
 // ---------------------------------------------------------------------------
@@ -342,7 +341,7 @@ async fn admit(store: &Arc<dyn RecordStore>) -> (ThreadKey, String) {
     backend
         .create(SessionSpec {
             key: key.clone(),
-            primary_binding: ThreadBinding::new(HARNESS, "def-1", "state-1").expect("binding"),
+            primary_binding: ThreadBinding::new(HARNESS, "def-1", STATE_VERSION).expect("binding"),
             metadata: Value::Null,
         })
         .await

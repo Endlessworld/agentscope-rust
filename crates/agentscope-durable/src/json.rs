@@ -7,9 +7,18 @@ use crate::{DurableError, Result};
 
 /// Identity fields are opaque but must be present and bounded (mirrors `DurableJson.text`).
 pub fn text(value: &str, name: &str) -> Result<()> {
-    if value.trim().is_empty() || value.chars().count() > 256 {
+    text_bounded(value, name, 256)
+}
+
+/// The same rule for a field whose bound is not the default one.
+///
+/// An identity composed of two bounded identities is legitimately longer than either of them (a
+/// derived execution id is a turn id, a separator and a call id), and validating it against the
+/// bound of its *parts* rejected legal input instead of malformed input.
+pub fn text_bounded(value: &str, name: &str, max: usize) -> Result<()> {
+    if value.trim().is_empty() || value.chars().count() > max {
         return Err(DurableError::invalid(format!(
-            "{name} must contain 1..256 characters"
+            "{name} must contain 1..{max} characters"
         )));
     }
     Ok(())

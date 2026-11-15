@@ -31,7 +31,9 @@ use agentscope_durable::store::file::{reset_write_stats, write_stats, FileStore,
 use agentscope_durable::store::RecordStore;
 use agentscope_durable::types::*;
 use agentscope_durable::SessionBackend;
-use agentscope_durable_adapter_agentscope::{AgentScopeExecutionHost, BackendThreadJournal};
+use agentscope_durable_adapter_agentscope::{
+    AgentScopeExecutionHost, BackendThreadJournal, STATE_VERSION,
+};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -152,7 +154,7 @@ async fn admit(store: &Arc<dyn RecordStore>) -> (ThreadKey, String) {
     backend
         .create(SessionSpec {
             key: key.clone(),
-            primary_binding: ThreadBinding::new(HARNESS, "def-1", "state-1").expect("binding"),
+            primary_binding: ThreadBinding::new(HARNESS, "def-1", STATE_VERSION).expect("binding"),
             metadata: Value::Null,
         })
         .await

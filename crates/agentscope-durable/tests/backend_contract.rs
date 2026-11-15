@@ -312,3 +312,88 @@ async fn an_unknown_tool_outcome_allows_failure_but_never_success() {
     let view = backend.turn(&thread, &receipt.turn_id).await.expect("turn");
     assert_eq!(view.status, TurnStatus::Failed);
 }
+
+/// An answer is a signal: one record per id, and none once the turn has ended.
+///
+/// `Respond` used to write the signal itself, bypassing the acceptance rules every other signal
+/// goes through: a repeated answer appended a second event under the same id (rejected as
+/// `Event identity changed`), and an answer for a settled turn was accepted.
+#[tokio::test]
+async fn an_answer_is_recorded_once_and_not_after_the_turn_ended() {
+    let (backend, thread, receipt, lease) = running().await;
+    let frame = backend.frame(&lease).await.expect("frame");
+    let mut wait = Commit::new("c-wait", frame.turn.revision, TurnStatus::Waiting);
+    wait.waiting = Some(WaitCondition::new("question-1", 0).expect("wait condition"));
+    backend.commit(&lease, wait).await.expect("wait");
+
+    let respond = ControlCommand {
+        turn_id: receipt.turn_id.clone(),
+        request_id: "answer-1".to_string(),
+        kind: ControlKind::Respond,
+        target: Some("question-1".to_string()),
+        value: json!({ "ok": true }),
+        expected_revision: 0,
+    };
+    backend
+        .control(&thread, respond.clone())
+        .await
+        .expect("first answer is accepted");
+    backend.control(&thread, respond).await.expect("replay");
+
+    // A waiting turn has no owner, so it is resumed the way a host resumes it: by claiming it
+    // again once the answered wait condition makes it due.
+    let lease = backend
+        .claim(&thread, "owner-b", Duration::from_secs(30))
+        .await
+        .expect("claim")
+        .expect("the answered turn is due");
+    let frame = backend.frame(&lease).await.expect("frame");
+    assert_eq!(frame.signals.len(), 1, "the answer is one signal");
+
+    let revision = frame.turn.revision;
+    let terminal = Commit::new("c-done", revision, TurnStatus::Cancelled);
+    backend.commit(&lease, terminal).await.expect("cancel");
+
+    let late = ControlCommand {
+        turn_id: receipt.turn_id.clone(),
+        request_id: "answer-2".to_string(),
+        kind: ControlKind::Respond,
+        target: Some("question-1".to_string()),
+        value: json!({ "ok": false }),
+        expected_revision: 0,
+    };
+    let refused = backend.control(&thread, late).await;
+    assert_eq!(refused.expect_err("terminal").code(), ErrorCode::Conflict);
+}
+
+/// A call id may be 256 characters, so the execution id derived from it is longer than one leaf
+/// identity: validating it as if it were a leaf rejected a legal tool call as `INVALID`.
+#[tokio::test]
+async fn a_call_with_the_longest_allowed_id_can_be_committed() {
+    let (backend, thread, receipt, lease) = running().await;
+    let call_id = "c".repeat(256);
+    let call = ToolCall::new(call_id.clone(), "local", "write", json!({})).expect("legal call");
+    let revision = backend.frame(&lease).await.expect("frame").turn.revision;
+    let mut intent = Commit::new("c-long", revision, TurnStatus::Running);
+    intent.tools = vec![call];
+    backend
+        .commit(&lease, intent)
+        .await
+        .expect("long call intent");
+
+    let execution_id = backend.frame(&lease).await.expect("frame").tools[0]
+        .request
+        .execution_id
+        .clone();
+    assert_eq!(execution_id, format!("{}:{call_id}", receipt.turn_id));
+    assert!(execution_id.chars().count() > 256);
+    backend
+        .begin_dispatch(&lease, &execution_id)
+        .await
+        .expect("dispatch a long id");
+    let execution = backend
+        .execution(&thread, &execution_id)
+        .await
+        .expect("execution");
+    assert!(execution.dispatch_attempted);
+}

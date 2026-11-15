@@ -327,24 +327,18 @@ pub(super) fn control(
                 }
             }
             ControlKind::Respond => {
+                if turn.status.terminal() {
+                    return Err(DurableError::conflict("Turn is terminal"));
+                }
                 let key = command
                     .target
                     .clone()
                     .unwrap_or_else(|| "response".to_string());
                 let signal = Signal::new(command.request_id.clone(), key, command.value.clone())?;
-                turn.signals.insert(signal.id.clone(), signal);
-                turn.next_attempt_at = 0;
-                append_event(
-                    txn,
-                    &mut state,
-                    thread_key,
-                    &turn.turn_id,
-                    None,
-                    None,
-                    &format!("signal.{}", command.request_id),
-                    "signal.accepted",
-                    json!({ "requestId": command.request_id }),
-                )?;
+                // Through the same door as every other signal: an answer has an identity, and a
+                // withdrawn id must not come back — answering twice used to append a second
+                // event under the same id and be rejected as `Event identity changed` instead.
+                accept_signal(txn, &mut state, thread_key, &mut turn, signal)?;
             }
         }
         let receipt = CommandReceipt {
@@ -375,7 +369,7 @@ pub(super) fn claim(
     thread_key: &ThreadKey,
     owner: &str,
     ttl: Duration,
-) -> Result<Option<Lease>> {
+) -> Result<Option<(Lease, i64)>> {
     json::text(owner, "owner")?;
     let ttl = ttl_millis(ttl)?;
     with_session(store, &thread_key.session, |txn| {
@@ -389,13 +383,16 @@ pub(super) fn claim(
             return Ok(None);
         };
         if turn.owner.as_deref() == Some(owner) && turn.expires_at > now {
-            return Ok(Some(Lease {
-                thread: thread_key.clone(),
-                turn_id: turn.turn_id.clone(),
-                owner: owner.to_string(),
-                epoch: turn.epoch,
-                expires_at: turn.expires_at,
-            }));
+            return Ok(Some((
+                Lease {
+                    thread: thread_key.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    owner: owner.to_string(),
+                    epoch: turn.epoch,
+                    expires_at: turn.expires_at,
+                },
+                turn.expires_at - now,
+            )));
         }
         let ready = ready_at(&thread, Some(&turn), now);
         if ready < 0 || ready > now {
@@ -408,7 +405,7 @@ pub(super) fn claim(
         thread.epoch += 1;
         turn.owner = Some(owner.to_string());
         turn.epoch = thread.epoch;
-        turn.expires_at = now + ttl;
+        turn.expires_at = now.saturating_add(ttl);
         if turn.status == TurnStatus::Queued {
             turn.status = TurnStatus::Running;
             append_event(
@@ -434,11 +431,15 @@ pub(super) fn claim(
         save_turn(txn, &turn)?;
         save_thread(txn, &thread)?;
         save_state(txn, &state)?;
-        Ok(Some(lease))
+        // The caller keeps how much time the store granted, not the absolute expiry: that is the
+        // number its memo can compare against a monotonic clock, and the store's clock is the
+        // only one that knows when the lease actually runs out.
+        Ok(Some((lease, ttl)))
     })
 }
 
-pub(super) fn renew(store: &dyn RecordStore, lease: &Lease, ttl: Duration) -> Result<()> {
+/// Extends one lease, answering how much of it is left on the store's clock.
+pub(super) fn renew(store: &dyn RecordStore, lease: &Lease, ttl: Duration) -> Result<i64> {
     let ttl = ttl_millis(ttl)?;
     with_session(store, &lease.thread.session, |txn| {
         let thread = require_thread(txn, &lease.thread)?;
@@ -458,11 +459,12 @@ pub(super) fn renew(store: &dyn RecordStore, lease: &Lease, ttl: Duration) -> Re
         // single write trying to save it.
         let headroom = renew_headroom(ttl);
         if turn.expires_at - now > headroom {
-            return Ok(());
+            return Ok(turn.expires_at - now);
         }
-        turn.expires_at = now + ttl;
+        turn.expires_at = now.saturating_add(ttl);
         schedule_thread(txn, &thread, Some(&turn), now)?;
-        save_turn(txn, &turn)
+        save_turn(txn, &turn)?;
+        Ok(ttl)
     })
 }
 
@@ -480,7 +482,7 @@ pub(super) fn release(store: &dyn RecordStore, lease: &Lease, delay: Duration) -
             abandon_runs(&mut turn, RunStatus::Stopped, "host_released", now);
             turn.owner = None;
             turn.expires_at = 0;
-            turn.next_attempt_at = turn.next_attempt_at.max(now + delay);
+            turn.next_attempt_at = turn.next_attempt_at.max(now.saturating_add(delay));
         }
         schedule_thread(txn, &thread, Some(&turn), now)?;
         save_turn(txn, &turn)?;
@@ -575,6 +577,17 @@ pub(super) fn record_failure(
                 && turn.waiting.is_none()
                 && !turn.cancel
             {
+                // The record is keyed by the epoch that reported it, but the turn can still
+                // belong to someone else: a claim that bumped the epoch and then failed to
+                // record its own report leaves this writer's stale record readable. Settling a
+                // turn another writer owns is not a repair, so the epoch has to still be ours.
+                // (`assert_owned` cannot be used here: a turn with a failure recorded has no
+                // owner by construction, which is exactly the state this branch repairs.)
+                if turn.epoch != lease.epoch {
+                    return Err(DurableError::fenced(
+                        "Execution ownership expired or changed",
+                    ));
+                }
                 turn.status = TurnStatus::Failed;
                 turn.owner = None;
                 turn.expires_at = 0;
@@ -595,7 +608,8 @@ pub(super) fn record_failure(
         let failures = previous.as_ref().map(|view| view.failures + 1).unwrap_or(1);
         let retryable = failure.retryable;
         let retry_allowed = retryable && failures <= policy.max_retries;
-        let retry_at = retry_allowed.then(|| now + policy.delay_millis(failures) as i64);
+        let retry_at =
+            retry_allowed.then(|| now.saturating_add(policy.delay_millis(failures) as i64));
         let view = RecoveryView {
             failures,
             policy,
@@ -613,7 +627,7 @@ pub(super) fn record_failure(
         } else if retry_allowed {
             retry_at.unwrap_or(now)
         } else if failures > policy.max_retries {
-            now + policy.max_delay_millis as i64
+            now.saturating_add(policy.max_delay_millis as i64)
         } else {
             now
         };

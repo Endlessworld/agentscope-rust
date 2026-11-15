@@ -15,9 +15,13 @@ categories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 sha2.workspace = true
+
+# `tokio` is only used by the unit tests in `runtime.rs` (`#[tokio::test]`): keeping it a
+# dev-dependency stops every dependent crate from pulling the runtime in through this one.
+[dev-dependencies]
+tokio.workspace = true
 
 # Liveness of the process that owns a scope lock file.
 [target.'cfg(unix)'.dependencies]

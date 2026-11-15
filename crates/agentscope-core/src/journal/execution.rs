@@ -17,7 +17,7 @@ use crate::message::Msg;
 use crate::state::AgentState;
 
 /// Runtime-context key carrying the [`SessionExecution`] for this run.
-pub const EXECUTION_CONTEXT_KEY: &str = "agentscope.session.execution";
+pub const EXECUTION_CONTEXT_KEY: &str = "agentscope.journal.execution";
 
 /// A precomputed committed view for admission.
 ///

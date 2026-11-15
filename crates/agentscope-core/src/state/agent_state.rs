@@ -11,12 +11,17 @@ use super::context::{PlanModeContextState, TaskContextState, ToolContextState};
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct AgentState {
+    /// Decodes with an empty id when a snapshot predates the field instead of failing; the
+    /// durable adapter mints a fresh id for such a state, because a state that names no session
+    /// would be carried forward as an unnamed one.
+    #[serde(default)]
     pub session_id: String,
     pub user_id: Option<String>,
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
     pub context: Vec<Msg>,
+    #[serde(default)]
     pub reply_id: String,
     #[serde(default)]
     pub cur_iter: i32,

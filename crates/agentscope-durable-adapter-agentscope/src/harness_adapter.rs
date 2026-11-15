@@ -39,10 +39,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 
+use crate::checkpoint::STATE_VERSION;
 use crate::{AgentScopeExecutionHost, BackendThreadJournal};
-
-/// Version of the native state a checkpoint carries (a `core::state::AgentState` snapshot).
-const STATE_VERSION: &str = "agentscope/state/1";
 
 /// Model calls one tick may start.
 const MODEL_CALLS_PER_TICK: usize = 1;
@@ -213,6 +211,10 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
         let mut reply: Option<Msg> = None;
         let mut failure: Option<String> = None;
         let mut yielded = false;
+        // The invocation itself can end as cancelled: the host turns a cancel request into
+        // `Error::Cancelled` at its next phase boundary. That is an ending this tick observed,
+        // not a fact to re-derive from the frame — the turn must not be resumed after it.
+        let mut invocation_cancelled = false;
         let mut drain = false;
         // A model call may never return (a provider streaming nothing, a hung socket). The only
         // place a cancel can be noticed then is here: poll the committed control facts while
@@ -282,10 +284,13 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
                         ctx.publish(&value);
                     }
                 }
-                // The signal did its job: a cancelled run is an ending, not a failure. The turn's
-                // own status is settled below, from the frame, so a cancel that raced a
-                // successful reply still wins.
-                Err(Error::Cancelled(_)) => break,
+                // The signal did its job: a cancelled run is an ending, not a failure, and the
+                // reason is carried by the error itself instead of being inferred later from
+                // the frame.
+                Err(Error::Cancelled(_)) => {
+                    invocation_cancelled = true;
+                    break;
+                }
                 // A pause is the tick's yield, not a failure: the turn stays runnable and the
                 // next tick continues from the step the loop had already opened.
                 Err(Error::HostPaused) => {
@@ -340,7 +345,7 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
         // before reading the frame, so a finished effect can be applied and an unknowable one
         // ends the turn honestly instead of parking it.
         let frame = resolve_offloaded_effects(ctx).await?;
-        let cancelled = frame.turn.cancellation_requested;
+        let cancelled = frame.turn.cancellation_requested || invocation_cancelled;
         let paused = frame.turn.status == TurnStatus::Pausing || yielded || interrupted;
 
         // An effect whose outcome is unknown can never be applied, so this turn must not report
@@ -706,7 +711,7 @@ mod tests {
 
     use super::{
         answer_known_tool_results, resolve_offloaded_effects, settle_cancelled_effects,
-        HarnessContext,
+        HarnessContext, STATE_VERSION,
     };
 
     fn state_with_tool_call(call_id: &str) -> AgentState {
@@ -809,7 +814,7 @@ mod tests {
         backend
             .create(SessionSpec {
                 key: key.clone(),
-                primary_binding: ThreadBinding::new("harness-a", "def-1", "state-1")
+                primary_binding: ThreadBinding::new("harness-a", "def-1", STATE_VERSION)
                     .expect("binding"),
                 metadata: Value::Null,
             })

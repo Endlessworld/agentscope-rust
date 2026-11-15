@@ -98,27 +98,29 @@ fn reclaim_payloads(
     let thread_id = &thread.definition.key.thread_id;
     let prefix = journal_prefix(thread_id, &thread.journal_branch);
     // Two passes rather than one: the newest payload has to be known before an older one can be
-    // judged superseded, and it is the last entry of the branch.
+    // judged superseded, and it is the last entry of the branch. Both passes page: the walk is
+    // over the whole branch, and asking for it in one call truncated a long journal silently.
     let mut newest: Option<String> = None;
     let mut stale: Vec<String> = Vec::new();
-    for part in txn.keys(&prefix, None, 100_000)? {
-        let Some(entry) = txn.get(&part)? else {
-            continue;
+    scan_keys(txn, &prefix, None, |txn, part| {
+        let Some(entry) = txn.get(part)? else {
+            return Ok(true);
         };
         if entry.get("type").and_then(Value::as_str) != Some(CHECKPOINT_EVENT) {
-            continue;
+            return Ok(true);
         }
         let Some(payload) = entry.get("payloadJson").and_then(Value::as_str) else {
-            continue;
+            return Ok(true);
         };
         // Already reclaimed: the fold ignores it, and rewriting it again would only cost a write.
         if !carries_state(payload) {
-            continue;
+            return Ok(true);
         }
-        if let Some(previous) = newest.replace(part) {
+        if let Some(previous) = newest.replace(part.to_string()) {
             stale.push(previous);
         }
-    }
+        Ok(true)
+    })?;
     for part in stale {
         let Some(mut entry) = txn.get(&part)? else {
             continue;
@@ -148,47 +150,63 @@ fn drop_history(
     outcome: &mut CompactOutcome,
 ) -> Result<()> {
     let thread_id = &thread.definition.key.thread_id;
-    for part in txn.keys(&checkpoint_history_prefix(thread_id), None, 100_000)? {
-        let Some(position) = part
-            .rsplit(':')
-            .next()
-            .and_then(|raw| raw.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        if position >= thread.checkpoint_position {
-            continue;
-        }
-        txn.put(&part, None)?;
-        outcome.checkpoints += 1;
-    }
+    // Positions are zero-padded in the key, so the walk is in order and everything from the
+    // current position on is kept: the scan stops at the first one instead of reading the whole
+    // history it is about to leave alone.
+    scan_keys(
+        txn,
+        &checkpoint_history_prefix(thread_id),
+        None,
+        |txn, part| {
+            let Some(position) = part
+                .rsplit(':')
+                .next()
+                .and_then(|raw| raw.parse::<u64>().ok())
+            else {
+                return Ok(true);
+            };
+            if position >= thread.checkpoint_position {
+                return Ok(false);
+            }
+            txn.put(part, None)?;
+            outcome.checkpoints += 1;
+            Ok(true)
+        },
+    )?;
     Ok(())
 }
 
 /// Drops every public event outside the newest `keep` and advances the watermark.
 ///
-/// The `event-id` marker of a dropped event is kept on purpose: it is what makes a replayed
-/// commit idempotent, and it is two orders of magnitude smaller than the event it describes.
+/// The `event-id` marker of a dropped event goes with it. It exists to make a *replayed* commit
+/// idempotent, and a marker without its event can only do the opposite: the replay would append
+/// the dropped event again under a new sequence. Keeping the markers instead made the session
+/// document grow by one key per event forever, which is the growth pruning exists to stop.
 pub(super) fn prune(txn: &mut dyn Txn, state: &mut SessionState, keep: u64) -> Result<u64> {
     let floor = state.sequence.saturating_sub(keep);
     if floor <= state.retained_after {
         return Ok(0);
     }
     let mut dropped = 0u64;
-    for part in txn.keys(&event_prefix(), None, 100_000)? {
+    scan_keys(txn, &event_prefix(), None, |txn, part| {
         let Some(sequence) = part
             .rsplit(':')
             .next()
             .and_then(|raw| raw.parse::<u64>().ok())
         else {
-            continue;
+            return Ok(true);
         };
         if sequence > floor {
-            continue;
+            // Sequence order is key order: nothing after this one is prunable either.
+            return Ok(false);
         }
-        txn.put(&part, None)?;
+        if let Some(event) = load_json::<PublicEvent>(txn, part)? {
+            txn.put(&event_id_part(&event.event_id), None)?;
+        }
+        txn.put(part, None)?;
         dropped += 1;
-    }
+        Ok(true)
+    })?;
     state.retained_after = floor;
     Ok(dropped)
 }

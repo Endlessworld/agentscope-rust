@@ -22,7 +22,9 @@ use agentscope_core::state::{
 use agentscope_durable::backend::TxnBackend;
 use agentscope_durable::types::*;
 use agentscope_durable::SessionBackend;
-use agentscope_durable_adapter_agentscope::{pin, AgentScopeExecutionHost, BackendThreadJournal};
+use agentscope_durable_adapter_agentscope::{
+    pin, AgentScopeExecutionHost, BackendThreadJournal, STATE_VERSION,
+};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -45,7 +47,7 @@ async fn fixture() -> Fixture {
     backend
         .create(SessionSpec {
             key: key.clone(),
-            primary_binding: ThreadBinding::new("durable-host", "def-1", "state-1")
+            primary_binding: ThreadBinding::new("durable-host", "def-1", STATE_VERSION)
                 .expect("binding"),
             metadata: Value::Null,
         })
