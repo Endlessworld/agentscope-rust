@@ -603,7 +603,7 @@ fn backoff(view: &RecoveryView) -> Duration {
 fn settled_effect(tool: &ToolExecution) -> bool {
     tool.result
         .as_ref()
-        .is_some_and(|result| result.state.terminal())
+        .is_some_and(|result| result.state.concluded())
 }
 
 /// The executor a runtime carries when the host configured none.

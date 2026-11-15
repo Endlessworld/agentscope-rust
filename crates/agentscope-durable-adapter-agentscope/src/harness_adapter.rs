@@ -27,7 +27,7 @@ use agentscope_core::journal::{InvocationRecorder, ThreadJournal, RECORDER_CONTE
 use agentscope_core::message::{GenerateReason, Msg};
 use agentscope_core::state::AgentState;
 use agentscope_durable::harness_adapter::{AdapterCapabilities, HarnessAdapter, HarnessContext};
-use agentscope_durable::{DurableError, Lease, Result, TurnStatus};
+use agentscope_durable::{DurableError, ExecutionState, Lease, Result, TurnStatus};
 use agentscope_harness::HarnessAgent;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -59,6 +59,19 @@ const STREAM_CONTROL_POLL: std::time::Duration = std::time::Duration::from_milli
 /// un-terminated, so the tick stops waiting and settles the cancellation itself.
 const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The synthetic result recorded for a tool call a previous run dispatched but never answered.
+const STRANDED_OUTCOME_MESSAGE: &str = "This tool call was dispatched by an earlier attempt of \
+     this turn, but that attempt ended before its result was recorded. It was not retried; its \
+     outcome is unknown.";
+
+/// Why a retry settles the tool calls the failed attempt left unanswered.
+const STRANDED_RECONCILE_REASON: &str = "retry: unsettled tool outcomes of the failed run";
+
+/// Why a turn holding a tool call whose outcome is unknown cannot report success.
+const UNKNOWN_OUTCOME: &str = "The turn cannot report success because a tool call of this turn \
+     has an unknown outcome: an earlier attempt was interrupted before its result was recorded \
+     and it was not re-executed, so its effect may or may not have happened.";
+
 /// Runs turns of one harness definition by building the agent that executes them.
 ///
 /// The factory is called once per tick: an invocation runs over the committed state and never
@@ -89,6 +102,36 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
     async fn execute(&self, ctx: &HarnessContext) -> Result<()> {
         let lease = &ctx.lease;
         let backend = Arc::clone(&ctx.backend);
+        // The journal writes under the lease this tick already holds; it must not claim.
+        let journal = Arc::new(
+            BackendThreadJournal::new(Arc::clone(&backend), lease.thread.clone())
+                .attach_lease(lease.clone()),
+        );
+        // A retry runs over the journal the attempt that just failed left behind, and the
+        // recorder refuses to open one that holds a dispatched call without a result. Nothing is
+        // dispatched by this invocation yet, so such a call belonged to a run that already
+        // ended: its outcome can never arrive, and recording it as interrupted (never as
+        // success, never re-executed) is what lets the retry run at all.
+        let stranded = agentscope_core::journal::recovery::settle_uncertain_tool_outcomes(
+            Arc::clone(&journal) as Arc<dyn ThreadJournal>,
+            STRANDED_OUTCOME_MESSAGE,
+            STRANDED_RECONCILE_REASON,
+        )
+        .await
+        .map_err(|error| {
+            DurableError::invalid(format!(
+                "The tool calls the failed attempt left unanswered cannot be settled: {error}"
+            ))
+        })?;
+        if !stranded.is_empty() {
+            tracing::warn!(
+                calls = ?stranded,
+                "recorded the tool calls of the failed attempt as interrupted"
+            );
+        }
+
+        // Opened after the settlement, so the committed state this tick continues already carries
+        // the interrupted results instead of the pending calls they replace.
         let host = Arc::new(
             AgentScopeExecutionHost::open(
                 Arc::clone(&backend),
@@ -112,11 +155,6 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
                 committed.clone();
         }
 
-        // The journal writes under the lease this tick already holds; it must not claim.
-        let journal = Arc::new(
-            BackendThreadJournal::new(Arc::clone(&backend), lease.thread.clone())
-                .attach_lease(lease.clone()),
-        );
         let recorder = Arc::new(
             InvocationRecorder::open_with(
                 Arc::clone(&journal) as Arc<dyn ThreadJournal>,
@@ -260,6 +298,24 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
         let frame = ctx.backend.frame(lease).await?;
         let cancelled = frame.turn.cancellation_requested;
         let paused = frame.turn.status == TurnStatus::Pausing || yielded || interrupted;
+
+        // An effect whose outcome is unknown can never be applied, so this turn must not report
+        // success: a reply is not evidence that the effect happened. Answering honestly with a
+        // failure that names the calls that stayed unknown is what keeps a retry from looping
+        // and from claiming work nobody can verify.
+        if !cancelled && !paused {
+            let unknown: Vec<&str> = frame
+                .tools
+                .iter()
+                .filter(|tool| {
+                    tool.result.as_ref().map(|result| result.state) == Some(ExecutionState::Unknown)
+                })
+                .map(|tool| tool.request.execution_id.as_str())
+                .collect();
+            if failure.is_none() && !unknown.is_empty() {
+                failure = Some(format!("{UNKNOWN_OUTCOME} Calls: {}.", unknown.join(", ")));
+            }
+        }
 
         // Close the native run with the status this invocation really reached: a host renders
         // the journal, and a run it never sees ending is indistinguishable from one that hung.

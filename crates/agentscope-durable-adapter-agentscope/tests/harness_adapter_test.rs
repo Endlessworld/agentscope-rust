@@ -12,8 +12,11 @@ use std::time::Duration;
 
 use agentscope_core::journal::{JournalEvent, ThreadJournal};
 use agentscope_core::message::JsonMap;
-use agentscope_core::message::{ContentBlock, Msg, TextBlock, ToolResultBlock, ToolUseBlock};
+use agentscope_core::message::{
+    ContentBlock, Msg, TextBlock, ToolResultBlock, ToolResultState, ToolUseBlock,
+};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
+use agentscope_core::state::AgentState;
 use agentscope_core::tool::{FunctionTool, Tool, ToolExecutionContext, Toolkit};
 use agentscope_durable::backend::TxnBackend;
 use agentscope_durable::harness_adapter::settle_turn;
@@ -798,4 +801,157 @@ async fn a_cancelled_turn_is_terminal_and_repeating_the_settle_is_a_no_op() {
     assert_eq!(outcome, TickOutcome::Idle, "a cancelled turn is never run");
     assert_eq!(fixture.model.calls(), 0);
     assert_eq!(fixture.turn().await.status, TurnStatus::Cancelled);
+}
+
+// ---------------------------------------------------------------------------
+// A retry runs over the journal the failed attempt left behind
+// ---------------------------------------------------------------------------
+
+/// Seeds a turn whose previous attempt dispatched `m1` and died before recording its result.
+///
+/// That is the state a transient store failure leaves: the batch holding the dispatch landed,
+/// the batch holding the outcome did not. The journal goes through the bridge the recorder
+/// itself writes with, so the uncertainty is exactly the one a later open refuses.
+async fn strand_a_dispatched_tool(fixture: &Fixture) {
+    let lease = fixture
+        .backend
+        .claim(&fixture.thread, "runtime", LEASE)
+        .await
+        .expect("claim")
+        .expect("a claimable turn");
+    let journal = BackendThreadJournal::new(
+        Arc::clone(&fixture.backend) as Arc<dyn SessionBackend>,
+        fixture.thread.clone(),
+    )
+    .attach_lease(lease.clone());
+    let writer = journal
+        .acquire("seed", LEASE)
+        .await
+        .expect("the tick's lease is adopted");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default();
+    let state = AgentState::default();
+
+    let checkpoint = JournalEvent::from_payload(
+        "seed-checkpoint",
+        1,
+        now,
+        "state/checkpoint",
+        None,
+        Some(fixture.turn_id.clone()),
+        true,
+        &json!({ "stateJson": state.to_json().expect("state json") }),
+    )
+    .expect("checkpoint event");
+    let requested = JournalEvent::from_payload(
+        "seed-request",
+        2,
+        now,
+        "tool/requested",
+        None,
+        Some(fixture.turn_id.clone()),
+        true,
+        &json!({ "call": ToolUseBlock::new("m1", TOOL, JsonMap::new()) }),
+    )
+    .expect("request event");
+    journal
+        .commit(&writer, "seed-1", 0, &[checkpoint, requested])
+        .await
+        .expect("the state and the tool intent are committed");
+
+    let dispatch = JournalEvent::from_payload(
+        "seed-dispatch",
+        3,
+        now,
+        "tool/dispatch",
+        None,
+        Some(fixture.turn_id.clone()),
+        true,
+        &json!({ "toolCallId": "m1" }),
+    )
+    .expect("dispatch event");
+    journal
+        .commit(&writer, "seed-2", 2, &[dispatch])
+        .await
+        .expect("the dispatch lands without its result");
+
+    // The attempt then failed the way a transient store error fails: retryable, ownership
+    // released so the retry can claim the turn again.
+    fixture
+        .backend
+        .record_failure(
+            &lease,
+            Failure::new(true, "transient store failure", RecoveryPolicy::defaults()),
+        )
+        .await
+        .expect("record the retryable failure");
+}
+
+/// A retry has to settle what the failed attempt left unanswered before it can run at all.
+///
+/// The recorder refuses to open a journal holding a dispatched call without a result, so the
+/// retry records that outcome as interrupted — never as success, never re-executed — and then
+/// ends honestly: the effect may or may not have happened, so the turn reports a failure naming
+/// the call instead of claiming work nobody can verify. It stops instead of looping.
+#[tokio::test]
+async fn a_retry_settles_the_tool_call_the_failed_attempt_left_unanswered() {
+    let fixture = fixture_of(ScriptedModel::new(&[]), 6).await;
+    strand_a_dispatched_tool(&fixture).await;
+
+    let mut ticks = 0;
+    let turn = loop {
+        fixture.runtime.tick(&fixture.thread).await.expect("tick");
+        ticks += 1;
+        let turn = fixture.turn().await;
+        if turn.status.terminal() {
+            break turn;
+        }
+        assert!(
+            ticks < 40,
+            "the retry must settle instead of looping: {turn:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    };
+
+    assert_eq!(
+        turn.status,
+        TurnStatus::Failed,
+        "an unknown effect never reports success: {turn:?}"
+    );
+    let error = turn.error.clone().unwrap_or_default();
+    assert!(
+        error.contains("unknown outcome"),
+        "the ending names what is unknown: {error}"
+    );
+    assert!(
+        !error.contains("Explicit reconciliation"),
+        "the retry no longer dies on the recorder refusing to open: {error}"
+    );
+    assert!(
+        fixture.model.calls() >= 1,
+        "the retry really ran the invocation"
+    );
+
+    // The call the failed attempt left behind is settled as interrupted, not as a success and
+    // not by running it again.
+    let settled: Vec<ToolResultBlock> = fixture
+        .journal()
+        .await
+        .iter()
+        .filter(|event| event.event_type == "tool/result")
+        .filter_map(|event| event.data().ok())
+        .filter_map(|data| data.get("message").cloned())
+        .filter_map(|message| serde_json::from_value::<Msg>(message).ok())
+        .flat_map(|message| {
+            message
+                .tool_result_blocks()
+                .cloned()
+                .collect::<Vec<ToolResultBlock>>()
+        })
+        .collect();
+    assert_eq!(settled.len(), 1, "one synthetic outcome: {settled:?}");
+    assert_eq!(settled[0].state, ToolResultState::Interrupted);
+    assert_eq!(settled[0].id.as_deref(), Some("m1"));
 }

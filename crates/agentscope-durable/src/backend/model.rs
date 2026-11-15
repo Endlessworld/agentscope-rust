@@ -296,13 +296,23 @@ impl TurnData {
     pub fn unsettled_tool(&self) -> bool {
         self.tools
             .values()
-            .any(|tool| !tool.result_state().terminal() && tool.attempted)
+            .any(|tool| !tool.result_state().concluded() && tool.attempted)
     }
 
     pub fn any_unsettled_tool(&self) -> bool {
         self.tools
             .values()
-            .any(|tool| !tool.result_state().terminal())
+            .any(|tool| !tool.result_state().concluded())
+    }
+
+    /// Tools whose effect may or may not have happened.
+    ///
+    /// Such an effect can never be applied, so a turn holding one must not report success; it
+    /// can only be accepted as unknown and ended as failed or cancelled.
+    pub fn unknown_tool(&self) -> bool {
+        self.tools
+            .values()
+            .any(|tool| tool.result_state() == ExecutionState::Unknown)
     }
 
     pub fn unapplied_tool(&self) -> bool {

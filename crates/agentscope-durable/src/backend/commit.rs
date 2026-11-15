@@ -410,6 +410,11 @@ fn derive_status(turn: &TurnData, command: &Commit) -> Result<TurnStatus> {
     if next.terminal() && turn.any_unsettled_tool() {
         return Err(DurableError::invalid("External operations are not settled"));
     }
+    if next == TurnStatus::Succeeded && turn.unknown_tool() {
+        return Err(DurableError::invalid(
+            "A tool outcome is unknown; the turn cannot report success",
+        ));
+    }
     if next == TurnStatus::Succeeded && turn.unapplied_tool() {
         return Err(DurableError::invalid("Results have not been applied"));
     }

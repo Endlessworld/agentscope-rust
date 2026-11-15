@@ -258,3 +258,57 @@ async fn an_unrecoverable_failure_ends_the_turn_instead_of_waiting_forever() {
     let turn = backend.turn(&thread, &receipt.turn_id).await.expect("turn");
     assert_eq!(turn.status, TurnStatus::Failed);
 }
+
+/// Settling a dispatched call whose result never arrived records it as unknown: the effect may
+/// or may not have happened.
+///
+/// Such an outcome is never applied and can never be verified, so waiting for it would park the
+/// turn forever while reporting success would claim work nobody can vouch for. It may only be
+/// accepted explicitly, and then the turn ends failed.
+#[tokio::test]
+async fn an_unknown_tool_outcome_allows_failure_but_never_success() {
+    let (backend, thread, receipt, lease) = running().await;
+    let frame = backend.frame(&lease).await.expect("frame");
+    let call = ToolCall::new("call-1", "local", "write", json!({ "path": "a" })).expect("call");
+    let mut intent = Commit::new("c-intent", frame.turn.revision, TurnStatus::Running);
+    intent.tools = vec![call];
+    backend.commit(&lease, intent).await.expect("tool intent");
+    let execution_id = backend.frame(&lease).await.expect("frame").tools[0]
+        .request
+        .execution_id
+        .clone();
+
+    backend
+        .begin_dispatch(&lease, &execution_id)
+        .await
+        .expect("dispatch");
+    backend
+        .accept_result(
+            &thread,
+            &execution_id,
+            ExecutionResult::unknown("the run ended before its result was recorded"),
+        )
+        .await
+        .expect("unknown result");
+
+    // The effect is settled (nothing is in flight) but not applied, so success is refused.
+    let revision = backend.frame(&lease).await.expect("frame").turn.revision;
+    let succeeded = Commit::new("c-succeeded", revision, TurnStatus::Succeeded);
+    let refused = backend.commit(&lease, succeeded).await;
+    let refused = refused.expect_err("an unknown outcome must not succeed");
+    assert_eq!(refused.code(), ErrorCode::Invalid);
+    assert!(
+        refused.message().contains("unknown"),
+        "the refusal names the unknown outcome: {}",
+        refused.message()
+    );
+
+    // Failing is how an unknown outcome is accepted; the turn stops instead of being retried.
+    let failed = Commit::new("c-failed", revision, TurnStatus::Failed);
+    backend
+        .commit(&lease, failed)
+        .await
+        .expect("an accepted unknown effect can fail the turn");
+    let view = backend.turn(&thread, &receipt.turn_id).await.expect("turn");
+    assert_eq!(view.status, TurnStatus::Failed);
+}

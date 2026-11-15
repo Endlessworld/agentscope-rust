@@ -119,6 +119,16 @@ impl ExecutionState {
     pub fn terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
+
+    /// Whether nothing is still in flight for this effect.
+    ///
+    /// `Unknown` is a business outcome, not a signal to keep waiting: the effect may or may not
+    /// have happened and only an explicit reconciliation can turn it into a known state, so a
+    /// turn waiting for it would wait forever. It is *not* [`terminal`](Self::terminal) though:
+    /// a turn must never report success while an effect is unknown.
+    pub fn concluded(self) -> bool {
+        self.terminal() || self == Self::Unknown
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
