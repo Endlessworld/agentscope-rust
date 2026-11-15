@@ -108,7 +108,26 @@ pub(super) fn close_session(store: &dyn RecordStore, key: &SessionKey) -> Result
 }
 
 pub(super) fn create_thread(store: &dyn RecordStore, spec: ThreadSpec) -> Result<ThreadView> {
+    create_thread_in_branch(store, spec, None)
+}
+
+/// [`create_thread`] with a lineage label for the timeline it starts.
+///
+/// The label is a journal branch: it names the history this thread's entries are written to, and
+/// a delegation/restoration uses it to say where the timeline came from. It is only ever applied
+/// to a thread this call creates — an existing thread already has a history, and renaming its
+/// branch would strand the entries already committed under the old one.
+pub(super) fn create_thread_in_branch(
+    store: &dyn RecordStore,
+    spec: ThreadSpec,
+    branch: Option<&str>,
+) -> Result<ThreadView> {
     let session = spec.key.session.clone();
+    if let Some(branch) = branch {
+        if branch.is_empty() || branch.len() > 64 || branch.contains(':') {
+            return Err(DurableError::invalid("Invalid journal branch"));
+        }
+    }
     with_session(store, &session, |txn| {
         let mut state = require_state(txn)?;
         if state.session.status != Lifecycle::Open {
@@ -124,7 +143,10 @@ pub(super) fn create_thread(store: &dyn RecordStore, spec: ThreadSpec) -> Result
                 status: existing.status,
             });
         }
-        let thread = ThreadData::new(spec.clone());
+        let mut thread = ThreadData::new(spec.clone());
+        if let Some(branch) = branch {
+            thread.journal_branch = branch.to_string();
+        }
         save_thread(txn, &thread)?;
         append_event(
             txn,

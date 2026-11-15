@@ -106,6 +106,43 @@ pub(crate) fn thread_prefix() -> String {
     "thread:".to_string()
 }
 
+/// The identity a resource is addressed by: its namespace path and key, never ambiguous when a
+/// namespace part or the key contains the separator the path is rendered with.
+fn resource_identity(namespace: &[String], key: &str) -> String {
+    let mut identity = namespace.join("\u{0}");
+    identity.push('\u{0}');
+    identity.push_str(key);
+    identity
+}
+
+/// One private resource value, stored on its own.
+///
+/// Resources are not embedded in the session root: a resource write would then rewrite the whole
+/// conversation, and a session document already grows with the conversation. One part per value
+/// keeps a resource mutation proportional to the value.
+pub(crate) fn resource_part(namespace: &[String], key: &str) -> String {
+    format!("resource:{}", hash(&resource_identity(namespace, key)))
+}
+
+pub(crate) fn resource_prefix() -> String {
+    "resource:".to_string()
+}
+
+/// The answer one mutation produced, so a replayed request costs a read and no second write.
+pub(crate) fn resource_receipt_part(request_id: &str) -> String {
+    format!("resource-receipt:{}", hash(request_id))
+}
+
+/// The result of one installed restoration, keyed by its request id.
+pub(crate) fn restore_part(request_id: &str) -> String {
+    format!("restore:{}", hash(request_id))
+}
+
+/// The lineage one registered delegation produced, keyed by its request id.
+pub(crate) fn delegation_part(request_id: &str) -> String {
+    format!("delegation:{}", hash(request_id))
+}
+
 /// Root record of one session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionState {

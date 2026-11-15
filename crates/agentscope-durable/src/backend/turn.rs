@@ -22,6 +22,22 @@ pub(super) fn submit(
     request_id: &str,
     input: Value,
 ) -> Result<TurnReceipt> {
+    submit_with_parent(store, thread_key, request_id, input, None)
+}
+
+/// [`submit`] for a turn a parent tool call started.
+///
+/// The parent identity is written once, with the turn: a recovered parent finds the child it
+/// started instead of starting a second one. The admission digest deliberately does not cover it
+/// — the parent is derivable from the request identity, and covering it would change the digest
+/// of every turn already admitted.
+pub(super) fn submit_with_parent(
+    store: &dyn RecordStore,
+    thread_key: &ThreadKey,
+    request_id: &str,
+    input: Value,
+    parent: Option<DelegationParent>,
+) -> Result<TurnReceipt> {
     json::text(request_id, "requestId")?;
     with_session(store, &thread_key.session, |txn| {
         let mut state = require_state(txn)?;
@@ -50,6 +66,7 @@ pub(super) fn submit(
         let turn_id = format!("turn_{}", digest_of(&(thread_key, request_id))?);
         let mut turn = TurnData::new(turn_id.clone(), thread_key.thread_id.clone(), input, now);
         turn.next_attempt_at = now;
+        turn.parent = parent;
         state.admitted += 1;
         thread.admitted += 1;
         store_json(

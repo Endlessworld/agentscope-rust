@@ -31,6 +31,7 @@ pub(super) fn thread_state(store: &dyn RecordStore, thread: &ThreadKey) -> Resul
             lease_until: current.as_ref().map(|turn| turn.expires_at).unwrap_or(0),
             current_turn_id: current.as_ref().map(|turn| turn.turn_id.clone()),
             checkpoint_metadata: data.checkpoint_metadata.clone(),
+            resource_position: data.resource_position,
         })
     })
 }

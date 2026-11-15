@@ -158,6 +158,13 @@ pub struct ThreadStateView {
     pub current_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_metadata: Option<CheckpointMetadata>,
+    /// Generation of the session's private resources this thread has observed.
+    ///
+    /// A checkpoint records the generation it was taken at, so a baseline and the resources it
+    /// depends on stay paired. `serde(default)` keeps a thread written before resources existed
+    /// readable: it observed generation zero, which is what it did.
+    #[serde(default)]
+    pub resource_position: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -4,11 +4,13 @@
 //! `request_id`/`commit_id`/`execution_id` authenticates everything else. The only clock
 //! is `Txn::now()`.
 
+pub(crate) mod branch;
 pub(crate) mod commit;
 pub(crate) mod compact;
 pub(crate) mod identity;
 pub(crate) mod model;
 pub(crate) mod query;
+pub(crate) mod resource;
 pub(crate) mod tools;
 pub(crate) mod turn;
 
@@ -803,6 +805,28 @@ impl SessionBackend for TxnBackend {
 
     async fn prune_events(&self, session: &SessionKey, keep_newest: u64) -> Result<u64> {
         query::prune_events(self.store.as_ref(), session, keep_newest)
+    }
+
+    async fn resources(
+        &self,
+        lease: &Lease,
+        request: ResourceRequest,
+    ) -> Result<Vec<ResourceValue>> {
+        resource::apply(self.store.as_ref(), lease, request)
+    }
+
+    async fn delegate(
+        &self,
+        lease: &Lease,
+        execution_id: &str,
+        request_id: &str,
+        target: DelegationTarget,
+    ) -> Result<DelegationView> {
+        branch::delegate(self.store.as_ref(), lease, execution_id, request_id, target)
+    }
+
+    async fn restore(&self, restoration: Restoration) -> Result<ThreadView> {
+        branch::restore(self.store.as_ref(), restoration)
     }
 }
 
