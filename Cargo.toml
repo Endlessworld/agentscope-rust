@@ -52,9 +52,7 @@ rust-version = "1.88.0"
 # 内部 crate：`path` 供本地开发，`version` 供 crates.io 发布（发布时 cargo 会丢掉 path）。
 # 注意：成员侧写 `default-features = false` 在继承模式下会被 cargo 忽略，故
 # `agentscope-extensions-acp` 对 `agentscope-harness` 仍用显式 `{ version, path, default-features }`。
-agentscope-rs = { version = "0.2.0", path = "crates/agentscope-rs" }
 agentscope-core = { version = "0.2.0", path = "crates/agentscope-core" }
-agentscope-macros = { version = "0.2.0", path = "crates/agentscope-macros" }
 agentscope-harness = { version = "0.2.0", path = "crates/agentscope-harness" }
 agentscope-durable = { version = "0.2.0", path = "crates/agentscope-durable" }
 agentscope-durable-adapter-agentscope = { version = "0.2.0", path = "crates/agentscope-durable-adapter-agentscope" }
@@ -126,7 +124,6 @@ rust-mcp-sdk = { version = "1.0.1", default-features = false }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 # 真实后端驱动（存储/技能模块 P1；由各 crate 以可选依赖 + feature 引入，默认仍走内存实现）。
-sqlx = "0.9"
 mysql_async = "0.37"
 tokio-postgres = "0.7"
 mongodb = "3"
