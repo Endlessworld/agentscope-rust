@@ -54,6 +54,12 @@ pub struct BackendThreadJournal {
 
 impl BackendThreadJournal {
     pub fn new(backend: Arc<dyn SessionBackend>, thread: ThreadKey) -> Self {
+        // The facts this journal carries include `required` extension events (the finalization
+        // frames of `execution_host`), and a reader that does not know their codec stops
+        // recovery: `settle_uncertain_tool_outcomes` replays the committed prefix before any
+        // execution host is opened, so registering at the journal is the only place that covers
+        // every reader — a second prompt in a fresh process, a session reload, a host resume.
+        crate::execution_host::register_event_codecs();
         Self {
             backend,
             thread,

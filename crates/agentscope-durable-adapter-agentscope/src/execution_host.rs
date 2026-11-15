@@ -73,7 +73,7 @@ impl AgentScopeExecutionHost {
         lease: Lease,
         run_id: impl Into<String>,
     ) -> Result<Self> {
-        ensure_event_codecs();
+        register_event_codecs();
         let turn_id = lease.turn_id.clone();
         let thread_state = backend.thread_state(&thread).await.map_err(convert)?;
         // The committed checkpoint is the only source of the previous invocation's state, and
@@ -469,7 +469,16 @@ impl JournalEventCodec for FinalizationCodec {
     }
 }
 
-fn ensure_event_codecs() {
+/// Registers the codecs for the two host facts, so a required event type is never unknown to
+/// recovery.
+///
+/// Whoever reads the journal has to know these types: they are `required`, so an unregistered
+/// reader stops recovery instead of skipping them. [`crate::BackendThreadJournal::new`] does this
+/// for every journal over a durable store, because the first thing a resumed turn does is replay
+/// the committed prefix (settling the tool calls a previous attempt left unanswered) — before any
+/// execution host is opened. Registering only in [`AgentScopeExecutionHost::open`] left a
+/// process unable to read a journal an earlier prompt of the same session had written.
+pub(crate) fn register_event_codecs() {
     static REGISTERED: Once = Once::new();
     REGISTERED.call_once(|| {
         let registry = JournalEventCodecRegistry::default_registry();

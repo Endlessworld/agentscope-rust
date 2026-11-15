@@ -524,3 +524,87 @@ async fn pruning_events_keeps_the_newest_window_and_refuses_a_stale_cursor() {
 
     let _ = std::fs::remove_dir_all(&fixture.root);
 }
+
+// ---------------------------------------------------------------------------
+// Required extension facts
+// ---------------------------------------------------------------------------
+
+/// A compaction must keep the finalization frames a replay needs.
+///
+/// They are `required` extension events, so a reader that does not find them (or cannot decode
+/// them) stops recovery instead of continuing with half a turn. Nothing about them is
+/// reclaimable: they are journal entries, not `state/checkpoint` payloads, checkpoint history
+/// records or public `event:` rows, which are the only three things a compaction gives up.
+#[tokio::test]
+async fn a_compaction_keeps_the_finalization_frames_a_replay_needs() {
+    use agentscope_durable_adapter_agentscope::{FINALIZATION_COMPLETED, FINALIZATION_STARTED};
+
+    let fixture = Fixture::open("compaction-finalization").await;
+    let state = big_state(4, 30_000);
+    let state_bytes = serde_json::to_string(&state).expect("state json").len() as u64;
+    let reply = Msg::assistant("first");
+
+    // The facts a finished prompt leaves: the reply frame, the state it belongs to, and the
+    // completion of that frame.
+    fixture
+        .commit(
+            "batch-finalization",
+            &[
+                (
+                    FINALIZATION_STARTED,
+                    json!({ "id": "frame-1", "result": reply }),
+                ),
+                ("message/assistant", message_payload("first")),
+                ("state/checkpoint", checkpoint_payload(&state)),
+                (FINALIZATION_COMPLETED, json!({ "id": "frame-1" })),
+            ],
+        )
+        .await;
+
+    // Push the scope past the mebibyte threshold, exactly as a long session does.
+    let mut previous_bytes = fixture.scope_bytes();
+    let mut compacted = false;
+    for index in 0..24 {
+        fixture
+            .commit_state(&format!("batch-{index}"), &state)
+            .await;
+        let bytes = fixture.scope_bytes();
+        if bytes + 4 * state_bytes < previous_bytes {
+            compacted = true;
+            break;
+        }
+        previous_bytes = bytes;
+    }
+    assert!(compacted, "a compaction must have run");
+
+    // Both frames are still journal entries, still in order, still naming the same frame.
+    let frames: Vec<(String, String)> = agent_events(&fixture)
+        .await
+        .into_iter()
+        .filter(|event| event.event_type.starts_with("durable/"))
+        .map(|event| {
+            let id = event
+                .data()
+                .ok()
+                .and_then(|data| data.get("id").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_default();
+            (event.event_type, id)
+        })
+        .collect();
+    assert_eq!(
+        frames,
+        [
+            (FINALIZATION_STARTED.to_string(), "frame-1".to_string()),
+            (FINALIZATION_COMPLETED.to_string(), "frame-1".to_string()),
+        ],
+        "the opening frame survives with the completion it pairs with"
+    );
+
+    // And the replay that used to stop still folds over them: required facts are validated
+    // while the folded prefix is read, so a dropped or unregistered one fails here.
+    JournalProjection::read(&*fixture.reopen())
+        .await
+        .expect("a replay after compaction still reads the required frames");
+
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}
