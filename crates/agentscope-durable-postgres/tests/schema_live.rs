@@ -126,7 +126,11 @@ fn the_collation_orders_keys_the_way_rust_does() {
     // Byte order: uppercase before lowercase, ASCII before Latin-1. A server-configured collation
     // would answer `aAbZá` or similar, and the journal pages would silently disagree with the
     // in-memory store about where a page ends.
-    assert_eq!(order.trim(), "AZabá", "the key column is not ordered by bytes");
+    assert_eq!(
+        order.trim(),
+        "AZabá",
+        "the key column is not ordered by bytes"
+    );
 }
 
 #[test]
@@ -169,7 +173,11 @@ fn the_revision_compare_and_set_moves_one_row_or_none() {
         &database,
         "SELECT revision FROM agentscope_scope WHERE scope_key = 'live:cas'",
     );
-    assert_eq!(revision.trim(), "2", "the revision is not the number of writes");
+    assert_eq!(
+        revision.trim(),
+        "2",
+        "the revision is not the number of writes"
+    );
 }
 
 #[test]
@@ -186,8 +194,11 @@ fn a_work_entry_is_due_once_and_its_removal_is_a_deleted_row() {
     );
     let due = run(
         &database,
-        &format!("PREPARE due(text, bigint, int) AS {};\
-                  EXECUTE due('live:queue', 10, 10);", sql::READY),
+        &format!(
+            "PREPARE due(text, bigint, int) AS {};\
+                  EXECUTE due('live:queue', 10, 10);",
+            sql::READY
+        ),
     );
     let lines: Vec<&str> = due.lines().filter(|line| !line.is_empty()).collect();
     assert_eq!(lines.len(), 2, "not the due entries: {due}");
@@ -199,7 +210,10 @@ fn a_work_entry_is_due_once_and_its_removal_is_a_deleted_row() {
     );
     let removed = run(
         &database,
-        &format!("PREPARE drop(text, text) AS {};\nEXECUTE drop('live:queue', 'b');", sql::DELETE_WORK),
+        &format!(
+            "PREPARE drop(text, text) AS {};\nEXECUTE drop('live:queue', 'b');",
+            sql::DELETE_WORK
+        ),
     );
     assert!(removed.contains("DELETE 1"), "{removed}");
     let empty = run(
