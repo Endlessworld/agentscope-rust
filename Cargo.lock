@@ -121,11 +121,13 @@ name = "agentscope-durable"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

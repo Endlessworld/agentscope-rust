@@ -375,12 +375,121 @@ fn acquire_lock(path: &Path) -> Result<ScopeLock> {
 }
 
 fn is_stale(path: &Path) -> bool {
+    // A lock whose writer already exited can be taken over at once: waiting out `LOCK_STALE`
+    // would report `scope is locked` to every contender for the whole grace period.
+    if holder_alive(path) == Some(false) {
+        return true;
+    }
+    // Same-process holders and locks without a readable pid still fall back to the mtime rule.
     match fs::metadata(path).and_then(|meta| meta.modified()) {
         Ok(modified) => modified
             .elapsed()
             .map(|elapsed| elapsed > LOCK_STALE)
             .unwrap_or(false),
         Err(_) => true,
+    }
+}
+
+/// Whether the process that wrote the lock file still runs; `None` when the pid is unreadable.
+fn holder_alive(path: &Path) -> Option<bool> {
+    let body = fs::read_to_string(path).ok()?;
+    let pid: u32 = body.split_whitespace().next()?.parse().ok()?;
+    Some(process_alive(pid))
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // `kill(pid, 0)` performs the existence/permission check without delivering a signal;
+    // `EPERM` means the process exists but belongs to somebody else.
+    match unsafe { libc::kill(pid as libc::pid_t, 0) } {
+        0 => true,
+        _ => std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM),
+    }
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // A pid that no longer exists cannot be opened at all; a process owned by somebody else
+    // answers `ERROR_ACCESS_DENIED`, which still means alive.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() != ERROR_INVALID_PARAMETER;
+        }
+        let mut code = 0u32;
+        let queried = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        // `STILL_ACTIVE` is 259: the process has not exited yet.
+        !queried || code == 259
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
+#[cfg(test)]
+mod lock_liveness_tests {
+    use super::*;
+
+    /// `u32::MAX - 1` is above the maximum pid on every platform, so no process owns it.
+    const DEAD_PID: u32 = 2_147_483_646;
+
+    fn lock_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agentscope-durable-lock-{}-{}-{name}",
+            std::process::id(),
+            crate::now_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("scope.lock")
+    }
+
+    fn cleanup(path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_lock_from_a_dead_holder_is_reclaimed_without_waiting() {
+        let path = lock_file("dead");
+        fs::write(&path, format!("{DEAD_PID} 0")).unwrap();
+        assert!(is_stale(&path), "a lock whose holder exited must be stale");
+
+        let started = Instant::now();
+        let lock = acquire_lock(&path).unwrap();
+        drop(lock);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a dead holder must be reclaimed at once, not after LOCK_STALE"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_lock_held_by_a_live_process_is_not_stale() {
+        let path = lock_file("live");
+        fs::write(&path, format!("{} 0", std::process::id())).unwrap();
+        assert!(!is_stale(&path));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_lock_without_a_readable_pid_falls_back_to_the_mtime_rule() {
+        let path = lock_file("garbage");
+        fs::write(&path, "not-a-pid").unwrap();
+        assert!(
+            !is_stale(&path),
+            "an unreadable body must not be treated as dead"
+        );
+        cleanup(&path);
     }
 }
 
