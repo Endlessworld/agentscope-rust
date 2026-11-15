@@ -330,3 +330,60 @@ Cloudflare 侧（DO 状态机移植、Worker 网关、Queues、部署流水线�
 4. 对应能力登记到 gap tracker；
 5. 文档更新（架构文档的契约或本文的任务状态）。
 6. 若动到端口或 Driver：同一组契约测试在本地实现与边缘实现上均全绿，且无「仅出现在单个 Driver」的业务分支。
+
+---
+
+## 13. M6：WASM / Workers 与 `durable-cf-*` 任务（2026-11-16 新增）
+
+依据：`CF_DEPLOYMENT_ARCHITECTURE.md` §20。总体结论是「agent 主循环可上 Worker + WASM，Container
+降级为按需（仅供工具执行）」，但前提是 ACP 换 WS、`Clock` 端口落地、`tokio`/`std::fs` 做 wasm 分裂。
+
+### 13.1 前置判定（必须先做，P0）
+
+- [ ] **M6-0** `cargo build -p agentscope-durable --target wasm32-unknown-unknown`
+  - 记录：是否通过、产物体积、`cargo tree` 中 wasm 不兼容依赖清单（tokio net/process/fs、
+    `std::process`、`std::fs`、`reqwest`、`instant` 类依赖）。
+  - 判据：体积 < 2 MB 且无不可解阻塞；**不通过则不排后续任务**。
+
+### 13.2 端口补全（离线可验收，不依赖 CF 环境）
+
+- [ ] **M6-1** `agentscope-durable` 增加 `std-fs` feature：file store / 本地路径相关代码可摘除；
+      wasm 构建零 `std::fs`。判据：`cargo build --target wasm32-unknown-unknown --no-default-features`
+      通过，且 `ready_at` 五分支测试仍绿（不许放松断言）。
+- [ ] **M6-2** 落地 `Clock` 端口（七端口里唯一既未实现又必然要碰的）：tick 内 `now` 全部改为
+      从 `Clock` 取；native 实现用系统时钟，wasm 实现用 `Date.now()`。判据：R4 测试——把时钟
+      冻结后 tick 行为可预测（不依赖 sleep 后立刻继续）。
+- [ ] **M6-3** `durable-objects` 增加 R2/S3 兼容签名层（SigV4 纯计算）。判据：公开测试向量
+      逐字节一致；离线可跑。
+- [ ] **M6-4** `durable-http` 的 `Transport` 增加 service binding 语义实现（同 isolate 零网络跳、
+      错误以异常返回而非状态码）。判据：路径/头/错误映射断言全绿，不引新依赖。
+- [ ] **M6-5** `durable-worker` 增加 `Dispatcher` trait：`next_wakeup(thread) -> Option<Instant>`；
+      `LocalDriver` 返回 `None`（常驻），`EdgeDriver` 返回 alarm 时间点。判据：双驱动等价测试扩展后仍绿。
+
+### 13.3 CF 绑定实现（依赖 CF 环境或账号）
+
+- [ ] **M6-6** `durable-cf-do`：`SessionBackend` 走 DO storage（SQLite 后端）。单写者天然承接
+      claim/fence；**file store 的整文档重写必须改为行级写**（否则 128 MB 下 OOM）。
+- [ ] **M6-7** `durable-cf-clock` + alarm 接线：`ready_at` → alarm 时间点；一次 alarm 一次 tick。
+- [ ] **M6-8** `durable-cf-r2`：`BlobStore` 走 R2；conditional put 取代 temp+rename；保留
+      `BLOB_GC_GRACE` 保护「先读文档后读 blob」的读者。
+- [ ] **M6-9** `durable-cf-queues`（按需）：`EventChannel` 走 WS + Queues。**顺序权威留在 DO**，
+      Queues 只携带 `eventId` 做幂等投递；`delaySeconds` 映射 `ready_at`，DLQ 映射不可重试失败。
+      若单会话场景 DO alarm 已足够，本项可降级或取消。
+- [ ] **M6-10** `durable-cf-workspace`：`WorkspaceFs` 走 R2 + 容器临时盘；路径映射与 grep/glob 客户端实现。
+- [ ] **M6-11** `durable-cf-executor`：`Executor` 走 Containers 或远端 MCP；仅在需要任意代码执行时启用。
+- [ ] **M6-12** ACP over WebSocket + DO hibernation；验证断连后 `session/resume` 能续。
+
+### 13.4 硬约束（违反即视为设计缺陷）
+
+1. 平台差异只允许出现在**端口实现内部**，禁止渗进业务逻辑；`cfg` 不得散落到 core/harness 业务分支。
+2. 任何只在某个 Driver 里出现的业务分支都算缺陷（沿用 §20.8 的判据）。
+3. 禁止用 Queues 承担 turn 顺序权威。
+4. 禁止把任意工具执行搬到 Workers 上（无进程、无文件系统）。
+5. 迁移前后必须重跑 `cargo test --workspace -j 2 --no-fail-fast`，口径为「无 `failures:` 段且 EXIT=0」。
+
+### 13.5 DoD 补充
+
+- 每个 `durable-cf-*` crate 必须提供：端口实现 + 至少一条「契约测试」复用现有 backend/executor
+  测试套件（同一套断言在 native 与 CF 实现上都跑），不得只为 CF 单独写一套更宽松的断言。
+- 无法离线验证的部分（真实 DO/R2/Queues 行为）必须在文档中显式标注为「未验证」，不得默认成立。

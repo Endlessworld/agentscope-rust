@@ -570,3 +570,122 @@ tests/contract/recovery_contract.rs   → 六个恢复场景（崩溃点 × 三�
 | 6 | 容器镜像是否需要 GPU（当前结论：不需要） | 成本与地域覆盖 |
 | 7 | `BlobStore` 的缓存层是否允许（可丢弃的加速缓存，不得成为真值） | 本地性能 vs 正确性 |
 | 8 | `EdgeDriver` 的 tick 粒度：一次 alarm 推进一个 turn 还是扫一批 | 吞吐 vs 单次执行预算 |
+
+---
+
+## 20. WASM / Workers 可行性调查（2026-11-16）
+
+调查目的：若实现 `durable-cf-*` 系列，能否把 ACP agent 直接编译到 `wasm32-unknown-unknown`
+跑在 CF Worker 上，从而省掉 CF Containers。
+
+### 20.1 结论
+
+**agent 主循环可以在 Worker + WASM 上跑，不需要 Container；但不是「编译一下就行」。** 两个前提
+必须同时成立：
+
+1. **ACP 的 stdio 传输必须换成 WebSocket**（§18 已规划的 WS + hibernation 方案即为此）；
+2. **任意代码执行类工具（sandbox）在 Workers 上物理不可能**，必须外置到 Containers 或远端
+   MCP server。省掉的是「agent 进程」的容器，不是「工具执行」的容器。
+
+### 20.2 Workers 约束 vs 现有依赖（静态推断，待 P0 证伪）
+
+| 约束 | Workers 现实 | 本项目冲突点 |
+|---|---|---|
+| 线程 | 无（无 pthreads、无跨 isolate 共享内存） | `tokio` 的 `rt-multi-thread` / `spawn_blocking`、任何 `std::thread` |
+| 进程 | 无 | `std::process::Command`（sandbox 执行器）、MCP stdio 传输 |
+| 文件系统 | 无 | file store 的 `std::fs`、workspace 本地 FS、`LocalFilesystem` |
+| 网络 | 只能 `fetch` | `reqwest`（模型 HTTP 客户端） |
+| 内存 | 128 MB | scope 整文档重写（实测可见 27 MB 级）→ 依赖 §6.1-4 与 L1-c 的 blob 外置 + 分页读 |
+| CPU | 默认 30s 上限 | `LocalDriver` 的 `max_steps = 16` 会超预算 |
+| 时间 | `std::time::Instant` 不可直接用 | tick 内的超时判断全部依赖 wall clock（见 R4） |
+| 产物目标 | `wasm32-unknown-unknown`（V8 isolate） | **不是** `wasm32-wasip1`，构建目标不可混用 |
+
+### 20.3 三个硬阻塞（按风险排序）
+
+**① `tokio` feature 分裂（最难，改动面最大）**
+`agentscope-durable` 本身轻（单 `tick`，符合 R2），但 `agentscope-core` + `agentscope-harness`
+依赖 `tokio::spawn`、`spawn_blocking`、`net`、`fs`。需要在两个 crate 内做
+`cfg(target_arch = "wasm32")` 的 feature 分裂，并要求 13 个 harness middleware 全部不再假设后台任务存在。
+
+**② `Clock` 端口缺失（七端口里唯一既未实现又必然要碰的）**
+CF 上只能用 `Date.now()`。R4（禁止时钟依赖）必须先落地，否则 tick 内的超时/退避/`ready_at`
+判定全部失效。
+
+**③ `EventChannel` 换 WS（而非 Queues）**
+ACP 是 stdio 协议，CF 上只有 WS。`platform_channel.rs` 已是 WS 形状，ACP 的
+`session/load`（重放）与 `session/resume`（不重放）语义正好对应 DO hibernation + WS 唤醒；
+但这是传输层重写，不是编译选项。
+
+### 20.4 已经就绪的部分
+
+- `durable-worker` 的 `Worker::step` = 一次 tick，天然 Workers 友好（无常驻循环）。
+- **`LocalDriver` 在 Workers 上不可用，只能 `EdgeDriver`**（每次唤醒 1 step）。L5 的双驱动等价
+  测试已证明这是纯调度选择，不是业务分支。
+- 六个适配器均为注入式端口（`Transport` / `Broker` / `Sandbox` / `ObjectStore` /
+  `McpTransport`），CF 实现是**新增 impl**，不改现有代码。`durable-http` 的 `Transport`
+  可直接接 service binding（同 isolate 零网络跳）。
+- L2 的模型事实（554 B/次，仅元数据）在 128 MB 下是必需而非可选。
+
+### 20.5 切分方案：薄 Worker + 外部 Executor
+
+```
+Worker (WASM) —— 薄
+  durable 状态机 + EdgeDriver + Brain/Hands 协调
+  = agentscope-durable + durable-cf-do(DO) + durable-cf-clock(alarm) + durable-cf-queues
+  单次 tick 一次模型调用，CPU 预算内
+
+外部 —— 厚
+  Executor 走 durable-mcp（远端 MCP server）或 durable-cf-executor（Containers）
+  任意代码执行、CPU 密集、需要进程的全部在这里
+```
+
+即：Container 从「必须」降级为「按需」，由 `Executor` 端口选择，不写进业务分支。
+
+### 20.6 六个 `durable-cf-*` 模块规划
+
+| 端口 | 现有实现 | CF 绑定 | 建议 crate | 可离线验证部分 |
+|---|---|---|---|---|
+| `SessionBackend` | `durable-jdbc` / `-http` | DO storage（SQLite 后端；单写者天然承接 claim/fence） | `durable-cf-do` | tick 状态机、事件序列化、CAS 语义退化 |
+| `BlobStore` | `durable-objects` | R2 | `durable-cf-r2` | SigV4 签名（公开测试向量）、key 布局、conditional put |
+| `EventChannel` | `durable-rocketmq` | WS + Queues | `durable-cf-queues` | 信封、eventId 幂等、延迟/批量映射 |
+| `Clock` | **缺**（隐式 `now`） | DO alarm | `durable-cf-clock` | `ready_at` 五分支计算 |
+| `WorkspaceFs` | **缺**（harness 本地 FS trait） | R2 + 容器临时盘 | `durable-cf-workspace` | 路径映射、grep/glob 客户端实现 |
+| `Executor` | `durable-mcp` / `-sandbox` | Containers / service binding | `durable-cf-executor` | 三态映射、超时 |
+| `Dispatcher` | `durable-worker` | alarm / 请求内 tick | 已在 `durable-worker` | 双驱动等价 |
+
+**命名与依赖方向**：另建 `agentscope-durable-cf-*` 命名空间，不要把 CF 实现塞进现有
+`durable-*` 的 feature。理由：CF 版不依赖 file store 那条链（`std::fs`），依赖方向不同。
+
+### 20.7 Queues 与 `durable-rocketmq` 的语义差异
+
+| `durable-rocketmq` 现状 | Cloudflare Queues | 处理 |
+|---|---|---|
+| `Cursor` = offset（`u64`，顺序化） | 无 offset，ack-based | **cursor 权威移入 DO**（§18 已定：事件 cursor 存 DO），Queues 只携带 `eventId` |
+| 乱序 → `OutOfOrder` 报错 | 无 FIFO 保证，批量乱序投递 | 顺序校验放消费侧，与 DO 内 `sequence` 比对；**不得用 Queues 顺序做 turn 顺序权威** |
+| 失败批次不提交进度（不跳号） | 批量投递 + 自动重试 | 保留「批内幂等 + 失败不推进」，语义一致，现有测试可复用 |
+| — | `delaySeconds` / `max_batch_size` / DLQ | 分别映射 `ready_at` 五分支、`limit 1..=1000` 纪律、不可重试失败直接 `Failed` |
+
+**重要判断**：CF 上唤醒的第一选择是 **DO alarm**（单写者、无额外投递语义、无重复消费）。
+Queues 只在「跨对象 fan-out / 解耦消费」时才需要。**Queues 不应排在前面。**
+
+### 20.8 验证路线（每步单独可判定，不依赖全栈就绪）
+
+| 阶段 | 做什么 | 判据 |
+|---|---|---|
+| **P0** | `cargo build -p agentscope-durable --target wasm32-unknown-unknown` | 是否通过 + WASM 体积（目标 < 2 MB）+ 依赖树中 wasm 不兼容项清单 |
+| P1 | 给 `agentscope-durable` 加 `std-fs` feature（file store 可摘除）+ 落地 `Clock` trait | wasm 构建零 `std::fs`；`ready_at` 五分支测试仍绿 |
+| P2 | `worker-rs` 跑最小 agent：1 次模型调用 + 1 个 MCP 工具 | 单次 tick 在 CPU 预算内返回 |
+| P3 | ACP over WS + DO hibernation | 客户端断连后 `session/resume` 能续 |
+| P4 | 评估 `core`/`harness` 的 tokio 分裂成本 | 决定「全量上 Worker」还是「Worker 只放状态机 + 驱动」 |
+
+**P0 是唯一能立刻判定可行性的一步**，且不改变任何现有代码。P0 不成立则后续讨论无意义。
+
+### 20.9 风险与明确不做什么
+
+- **不留**「WASM 条件编译」与「原生路径」两套并行实现的分支扩散：所有平台差异必须收敛到
+  §18 的七个端口 + `cfg` 只出现在端口实现内部，禁止渗进业务逻辑。
+- **不做** 把任意工具执行搬到 Workers 上（无进程、无 FS）。
+- **不做** 用 Queues 承担顺序权威。
+- 已知结构冲突：file store 的「整文档重写」在 DO 上必然 OOM，必须改成 SQLite 行级写 +
+  L1-c blob 外置；R2 无 rename，temp+rename 原子写要改为 conditional put；
+  DO storage 与 R2 无跨事务，blob 引用靠 `BLOB_GC_GRACE` 保护读者。

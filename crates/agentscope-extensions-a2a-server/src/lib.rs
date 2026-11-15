@@ -2910,6 +2910,107 @@ mod tests {
         assert_eq!(task.status.state, TaskState::Completed);
     }
 
+    // Java #4176 (`BaseReActAgentRunner`): a follow-up on one task id must not race the cleanup of
+    // the previous stream. Java waits up to 2s for the released slot before failing; the Rust
+    // runner drops its cache guard when the run ends, and the relay does that before it publishes
+    // the terminal frame, so the slot is already free when the caller sees the run finish.
+    #[test]
+    fn the_task_slot_is_released_before_the_terminal_frame_reaches_the_caller() {
+        use futures::StreamExt;
+
+        /// Emits one result, so a streamed run finishes after a single artifact.
+        struct OneShotAgent;
+
+        impl TaskAgent for OneShotAgent {
+            fn name(&self) -> String {
+                "one-shot".to_string()
+            }
+
+            fn description(&self) -> String {
+                "finishes after one event".to_string()
+            }
+
+            fn stream_events(
+                &self,
+                _messages: Vec<Msg>,
+            ) -> BoxStream<'static, Result<AgentEvent, A2aError>> {
+                let mut data = EventData::default();
+                data.fields.insert(
+                    "content".to_string(),
+                    serde_json::json!([{ "type": "text", "text": "done" }]),
+                );
+                Box::pin(futures::stream::iter(vec![Ok(AgentEvent::AgentResult(
+                    data,
+                ))]))
+            }
+
+            fn interrupt(&self) {}
+        }
+
+        struct OneShotFactory;
+
+        impl TaskAgentFactory for OneShotFactory {
+            fn build(&self) -> Result<Arc<dyn TaskAgent>, A2aError> {
+                Ok(Arc::new(OneShotAgent))
+            }
+        }
+
+        let runner = Arc::new(BaseReActAgentRunner::new(OneShotFactory));
+        let handler = A2aRequestHandler::new(
+            runner.clone(),
+            AgentCard::new("one-shot", "http://localhost"),
+            registry(),
+        );
+
+        let finished = rt().block_on(async {
+            let mut stream = handler
+                .stream_responses(&stream_request(task_message("t-1")))
+                .expect("streaming request");
+            let working = stream.next().await.expect("the run starts");
+            assert!(working.error.is_none(), "{working:?}");
+            assert!(
+                runner.is_cached("t-1"),
+                "the running task keeps its slot, so the check below is meaningful"
+            );
+            let mut saw_final = false;
+            while let Some(response) = stream.next().await {
+                let Some(result) = response.result else {
+                    continue;
+                };
+                let Ok(update) = serde_json::from_value::<
+                    agentscope_extensions_a2a_client::model::TaskStatusUpdateEvent,
+                >(result) else {
+                    continue;
+                };
+                if update.is_final {
+                    saw_final = true;
+                    break;
+                }
+            }
+            assert!(saw_final, "the relay ends with a terminal status frame");
+            assert!(
+                !runner.is_cached("t-1"),
+                "the run released its slot before the caller saw the terminal frame"
+            );
+            // The caller keeps its stream: dropping it later must not matter.
+            stream
+        });
+
+        // The follow-up starts a fresh run instead of reporting "Agent already exists".
+        let mut follow_up = handler
+            .stream_responses(&stream_request(task_message("t-1")))
+            .expect("streaming request");
+        let working = rt()
+            .block_on(follow_up.next())
+            .expect("the follow-up starts");
+        assert!(
+            working.error.is_none(),
+            "the follow-up run is accepted: {working:?}"
+        );
+        drop(follow_up);
+        drop(finished);
+    }
+
     #[test]
     fn require_inner_message_gates_tool_output() {
         /// Emits one text delta and one tool-result delta.

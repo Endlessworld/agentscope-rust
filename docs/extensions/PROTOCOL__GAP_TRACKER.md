@@ -385,3 +385,15 @@ cargo test -p agentscope-extensions-protocol -p agentscope-extensions-a2a-client
   - 测试：`agent::tests::a_cancelled_stream_stops_the_remote_stream_and_the_task`（半开流的桩 transport：断言不再转发事件、确实发出 `tasks/cancel`、以取消提示结束）；反向验证：短路 :940 的取消检查后该用例不再结束（挂起），证明依赖该检查。
   - 偏差：Java 新增 `StreamTrackingHttpClient`（174 行）跟踪并取消 HTTP 流，Rust 以「丢弃帧流即关闭响应体」表达同等语义，不新增客户端类型、不改公共 API。
   - 验证：`cargo test -p agentscope-extensions-a2a-client --lib` → 90 passed / 0 failed。
+
+### 2026-11-16 迁移批次（Java 2c935368a..30dc84b59）
+
+- `2c935368a` fix(a2a,durable,rocketmq): fix the four flaky tests that fail unrelated builds — **部分迁移（a2a 加守卫用例）；其余 3 项不适用**
+  - a2a：Java 的 `BaseReActAgentRunner#streamEvents` 由「`containsKey` 立即抛 `Agent already exists for taskId`」改为「取到旧 `RunningTask` 时最多等 2s 的 `release` 再抛 `IllegalStateException`」，并在 `stop()` 里补 `task.release()`；根因是 Reactor 的 `doFinally`（移除缓存）在下游收到终止信号之后才执行，紧跟终态发起的新请求会撞上空窗。Rust 侧不需要等待：`crates/agentscope-extensions-a2a-server/src/runner.rs` 的 `CacheGuard` 在 `Drop` 时同步移除，且 `src/lib.rs` 的流式中继把 `StreamPhase::Running { events, .. }` 解构取值后才发终止帧，槽位先于终态帧释放。改以用例固定该顺序：`the_task_slot_is_released_before_the_terminal_frame_reaches_the_caller`（运行中 `is_cached` 为真 → 终止帧到达时已释放 → 同一 taskId 的后续请求能再开一轮）。
+  - 反向验证：让 `CacheGuard::drop` 直接返回（模拟「晚释放」）→ 该用例 FAILED（`the run released its slot before the caller saw the terminal frame`）；恢复后通过。
+  - 不适用项：①`ProcessRecoveryTest` 的 `pause()`（吞掉线程唤醒中断）——Rust 没有 `InterruptedException` 打断 sleep 的现象；②`HttpServerApplicationTest` 的 `@DirtiesContext`——Spring 测试上下文缓存问题，Rust 无 Spring；③`RocketMqExecutionTest` 的假 broker ack 超时 50ms→1000ms 与 `await` 诊断——`crates/agentscope-durable-rocketmq` 的 `Broker` 端口没有 ack/重投（游标推进 + `eventId` 去重），测试全同步、无 sleep。
+  - 验证：`cargo test -p agentscope-extensions-a2a-server -j 2` → 93 passed / 0 failed（lib）+ 0 passed（doc target）；`cargo fmt --all -- --check` 干净。
+
+- `30dc84b59` chore(deps): bump a2a-java-sdk.version from 1.5.0.Final to 1.5.1.Final — **不可迁移**
+  - 只改 `agentscope-dependencies-bom/pom.xml` 的 Maven 版本属性；Rust 的 A2A 为自研实现（`agentscope-extensions-a2a-client` / `agentscope-extensions-a2a-server`），不依赖该 SDK，无对应改动。
+
