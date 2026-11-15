@@ -294,6 +294,9 @@ pub(super) fn prune_events(
         let mut state = require_state(txn)?;
         let dropped = compact::prune(txn, &mut state, keep_newest)?;
         if dropped > 0 {
+            // An explicit prune is a trim as well: let the next commit record the size it left, so
+            // the automatic trim is not evaluated against a size the scope no longer has.
+            state.compact_pending = true;
             save_state(txn, &state)?;
         }
         Ok(dropped)

@@ -272,6 +272,7 @@ build-acp-embedded.bat
 | --- | --- |
 | `docs/MIGRATION_PLAN.md` | 迁移方案：可行性、依赖映射、技术难点、测试策略 |
 | `docs/MIGRATION_GAP_TRACKER.md` | core / harness 迁移进度与缺口清单 |
+| `docs/MIGRATION_0.2.0.md` | 0.2.0 迁移须知：会话格式 v2 硬切、重命名/删除的 API、升级与回退 |
 | `docs/extensions/EXTENSIONS_MIGRATION_PLAN.md` | 27 个扩展 crate 的迁移编排与回执约定 |
 | `docs/extensions/*__GAP_TRACKER.md` | 各扩展模块的进度 tracker（单一事实来源） |
 | `docs/ENVIRONMENT.md` | 全部环境变量参考 |

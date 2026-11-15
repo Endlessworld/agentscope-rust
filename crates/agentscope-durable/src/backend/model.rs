@@ -117,6 +117,20 @@ pub(crate) struct SessionState {
     /// Session-wide public event sequence.
     pub sequence: u64,
     pub retained_after: u64,
+    /// Bytes the scope held after the last compaction, as measured by the commit that followed
+    /// it (`0` when no compaction has been measured yet).
+    ///
+    /// A compaction runs inside the transaction that rewrites the document, so it cannot see how
+    /// big the result will be; the next commit reads the size it wrote and stores it here. The
+    /// value is what lets [`super::compact::worth_compacting`] refuse to re-walk a scope that
+    /// hardly grew since its last trim. `serde(default)` so that a scope written before this
+    /// field existed still loads.
+    #[serde(default)]
+    pub compacted_bytes: u64,
+    /// Set by a compaction whose resulting size has not been recorded yet; cleared by the commit
+    /// that records it.
+    #[serde(default)]
+    pub compact_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,4 +362,34 @@ pub(crate) struct CheckpointRecord {
     pub journal_position: u64,
     pub resource_position: u64,
     pub settled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scope document outlives releases, so a root record written before the compaction guard
+    /// existed must still load: the two new fields default, and nothing else moves.
+    #[test]
+    fn a_root_record_from_before_the_compaction_guard_still_loads() {
+        let record = serde_json::json!({
+            "format": CURRENT_FORMAT,
+            "session": {
+                "key": { "namespace": "ns", "sessionId": "s" },
+                "primaryThreadId": "main",
+                "status": "OPEN",
+                "metadata": null,
+            },
+            "creation_digest": "digest",
+            "admitted": 3,
+            "sequence": 7,
+            "retained_after": 2,
+        });
+        let state: SessionState = serde_json::from_value(record).expect("an older record loads");
+        assert_eq!(state.admitted, 3);
+        assert_eq!(state.sequence, 7);
+        assert_eq!(state.retained_after, 2);
+        assert_eq!(state.compacted_bytes, 0, "no trim has been measured");
+        assert!(!state.compact_pending);
+    }
 }

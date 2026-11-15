@@ -147,6 +147,25 @@ impl Fixture {
             .sum()
     }
 
+    /// The session root record of the one scope this fixture writes.
+    ///
+    /// What a compaction measured is durable metadata the session API does not expose, so a test
+    /// that asks whether the *next* commit paid for another trim has to read it.
+    fn root_record(&self) -> Value {
+        let path = std::fs::read_dir(self.root.join("scopes"))
+            .expect("scopes")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .expect("one scope document");
+        let document: Value =
+            serde_json::from_slice(&std::fs::read(path).expect("scope")).expect("json");
+        document
+            .get("")
+            .cloned()
+            .expect("the root record is the empty part")
+    }
+
     /// A reader that shares nothing with the writer but the directory, i.e. a restart.
     fn reopen(&self) -> Arc<BackendThreadJournal> {
         let store: Arc<dyn RecordStore> =
@@ -606,6 +625,76 @@ async fn a_compaction_keeps_the_finalization_frames_a_replay_needs() {
     JournalProjection::read(&*fixture.reopen())
         .await
         .expect("a replay after compaction still reads the required frames");
+
+    let _ = std::fs::remove_dir_all(&fixture.root);
+}
+
+// ---------------------------------------------------------------------------
+// The cost of a trim
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_scope_that_cannot_shrink_is_not_walked_again_for_a_few_kilobytes() {
+    let fixture = Fixture::open("trim-guard").await;
+    // One checkpoint of a little over a mebibyte and no later one: nothing here is superseded and
+    // no event is old enough to prune, so a trim can give up almost nothing. This is the scope
+    // that used to pay for three key walks on every commit and get smaller by nothing.
+    let state = big_state(1, 1_150_000);
+    fixture.commit_state("batch-big", &state).await;
+    let over = fixture.scope_bytes();
+    assert!(over > 1 << 20, "the scope is over the threshold: {over}");
+
+    // The commit that finds it over the threshold trims, and cannot know what it left behind.
+    fixture
+        .commit(
+            "batch-trim",
+            &[("message/assistant", message_payload("one"))],
+        )
+        .await;
+    let mid = fixture.root_record();
+    assert_eq!(
+        mid["compacted_bytes"].as_u64(),
+        Some(0),
+        "a trim cannot measure its own result"
+    );
+    assert_eq!(mid["compact_pending"].as_bool(), Some(true));
+
+    // The commit after it does, and is what the next trim is measured against.
+    fixture
+        .commit(
+            "batch-measure",
+            &[("message/assistant", message_payload("two"))],
+        )
+        .await;
+    let recorded = fixture.root_record();
+    let after = recorded["compacted_bytes"]
+        .as_u64()
+        .expect("the commit after a trim records its size");
+    assert_eq!(recorded["compact_pending"].as_bool(), Some(false));
+    assert!(after > 1 << 20, "this scope did not shrink: {after}");
+
+    // Two more commits of a few hundred bytes each. Neither is a tenth of the scope, so neither
+    // pays for the three walks again: the recorded size stands unchanged while the scope is still
+    // over the threshold, which is what makes the skip the guard and not the threshold.
+    for index in 0..2 {
+        fixture
+            .commit(
+                &format!("batch-small-{index}"),
+                &[("message/assistant", message_payload("growth"))],
+            )
+            .await;
+        let now = fixture.root_record();
+        assert_eq!(
+            now["compacted_bytes"].as_u64(),
+            Some(after),
+            "no trim may run for a few hundred bytes"
+        );
+        assert_eq!(now["compact_pending"].as_bool(), Some(false));
+        assert!(
+            fixture.scope_bytes() > 1 << 20,
+            "still over the threshold, so the growth guard is what skipped the trim"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&fixture.root);
 }

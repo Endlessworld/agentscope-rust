@@ -35,6 +35,8 @@ pub(super) fn create(store: &dyn RecordStore, spec: SessionSpec) -> Result<Sessi
             admitted: 0,
             sequence: 0,
             retained_after: 0,
+            compacted_bytes: 0,
+            compact_pending: false,
         };
         let key = thread.definition.key.clone();
         append_event(

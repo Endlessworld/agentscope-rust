@@ -17,6 +17,12 @@
 //! What is deliberately *never* dropped: journal entries that name a tool outcome (dispatch,
 //! result, uncertainty), message entries a transcript is rebuilt from, baseline/restore entries,
 //! and any event a client has not been told a replacement for.
+//!
+//! A trim is not free: it walks three key ranges of the document. A scope that cannot shrink — a
+//! transcript longer than the event window, a baseline it must keep — would be walked again on
+//! every commit and give back almost nothing, which is a permanent fee on a session that simply
+//! is big. [`worth_compacting`] therefore asks for the scope to have grown by a tenth since the
+//! previous trim measured its result before it pays for another one.
 
 use serde_json::Value;
 
@@ -39,6 +45,32 @@ pub(super) const COMPACT_THRESHOLD_BYTES: u64 = 1 << 20;
 /// replay for a streaming client, and the watermark keeps an old cursor from silently reading a
 /// gap.
 pub(super) const EVENT_RETENTION: u64 = 1024;
+
+/// How much a scope must have grown since its last trim, as a fraction of its current size, for
+/// another trim to be worth its scans.
+///
+/// The growth since the last trim is an upper bound on what a new trim can free: the payloads and
+/// checkpoint history it gave up are gone, and what came back is the events written since. Below a
+/// tenth the three key walks would cost what they cost the first time and free next to nothing, so
+/// the trim waits — the scope is then still bounded by "last result plus a tenth", the same order
+/// as the threshold itself.
+const MIN_GAIN_DIVISOR: u64 = 10;
+
+/// Whether a scope of `bytes` is worth compacting, given the size the last trim left behind.
+///
+/// `after` is the scope size recorded by the commit that followed the last trim, or `0` when no
+/// trim has been measured yet (a scope written before the field existed, or one whose compaction
+/// is still the newest commit): nothing is known to be gone, so the first scope over the
+/// threshold is trimmed.
+///
+/// A store that cannot measure the scope never gets here — the caller only asks when
+/// `RecordStore::scope_bytes` answered `Some`.
+pub(super) fn worth_compacting(bytes: u64, after: u64) -> bool {
+    if bytes <= COMPACT_THRESHOLD_BYTES {
+        return false;
+    }
+    after == 0 || bytes.saturating_sub(after) >= bytes / MIN_GAIN_DIVISOR
+}
 
 /// The journal payload a superseded checkpoint is reduced to.
 ///
@@ -214,6 +246,33 @@ pub(super) fn prune(txn: &mut dyn Txn, state: &mut SessionState, keep: u64) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scope_under_the_threshold_is_never_compacted() {
+        assert!(!worth_compacting(0, 0));
+        assert!(!worth_compacting(COMPACT_THRESHOLD_BYTES, 0));
+    }
+
+    #[test]
+    fn the_first_scope_over_the_threshold_is_compacted() {
+        assert!(worth_compacting(COMPACT_THRESHOLD_BYTES + 1, 0));
+    }
+
+    #[test]
+    fn a_scope_that_hardly_grew_since_its_last_trim_is_left_alone() {
+        // A scope the last trim could not shrink stays just over the threshold; walking it again
+        // for a few kilobytes is the permanent fee this guard exists to stop.
+        let after = COMPACT_THRESHOLD_BYTES + 300 * 1024;
+        assert!(!worth_compacting(after + after / 20, after));
+        assert!(!worth_compacting(after, after));
+        // Shrunk since (another writer pruned, or an explicit `prune_events`): nothing to do
+        // until it grows back past a tenth again.
+        assert!(!worth_compacting(after - 1, after));
+        // The rule is a tenth of the scope *now*, so it fires at ten ninths of the last result.
+        let grown = after + after / 9;
+        assert!(!worth_compacting(grown - 1, after));
+        assert!(worth_compacting(grown, after));
+    }
 
     #[test]
     fn the_reclaimed_payload_is_valid_json_without_a_state() {

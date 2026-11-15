@@ -14,12 +14,10 @@ pub(super) fn commit(
 ) -> Result<CommitReceipt> {
     command.validate()?;
     let digest = digest_of(&command)?;
-    // Decided before the transaction: the store answers "how big is this scope", the backend
+    // Measured before the transaction: the store answers "how big is this scope", the backend
     // decides what may be dropped. A store that cannot measure (in memory, remote KV) never
     // triggers this and keeps every fact.
-    let trim = store
-        .scope_bytes(&lease.thread.session.storage_key())?
-        .is_some_and(|bytes| bytes > compact::COMPACT_THRESHOLD_BYTES);
+    let scope_bytes = store.scope_bytes(&lease.thread.session.storage_key())?;
     with_session(store, &lease.thread.session, |txn| {
         let mut state = require_state(txn)?;
         let mut thread = require_thread(txn, &lease.thread)?;
@@ -38,6 +36,18 @@ pub(super) fn commit(
         }
         let now = txn.now();
         assert_owned(&turn, lease, now)?;
+        // A compaction cannot see how big the document it trimmed will be, so the commit after it
+        // records the size it wrote — this one, when the last commit did not trim. A concurrent
+        // writer may have grown the scope in between, which only makes the recorded size larger
+        // and the next trim later: conservative, never wrong about what is safe to drop.
+        if state.compact_pending {
+            if let Some(bytes) = scope_bytes {
+                state.compacted_bytes = bytes;
+                state.compact_pending = false;
+            }
+        }
+        let trim = scope_bytes
+            .is_some_and(|bytes| compact::worth_compacting(bytes, state.compacted_bytes));
         apply_journal(txn, &mut thread, &command)?;
         if command.expected_revision != turn.revision {
             return Err(DurableError::conflict("Revision changed"));
@@ -145,6 +155,9 @@ pub(super) fn commit(
         // The scope is one document that this commit is rewriting anyway, so trimming it here
         // costs no extra write: the bytes it drops are bytes this write would otherwise carry.
         if trim {
+            // Whatever the trim frees (nothing, when the scope cannot shrink), the resulting size
+            // is measured by the next commit: `compact_pending` says the recorded size is stale.
+            state.compact_pending = true;
             match compact::run(txn, &mut state, &thread, compact::EVENT_RETENTION) {
                 Ok(outcome) if !outcome.is_empty() => tracing::debug!(
                     session = %lease.thread.session.storage_key(),

@@ -53,12 +53,18 @@ agentscope-harness  ──→  core             # 不得依赖 durable
 
 已严格实现的不可退让不变量：范围事务原子性、receipt 先于围栏的重放、revision CAS、thread 级 epoch 围栏、终态不可逆、效果结算前置（`Succeeded` 需全部 applied）、adherence 到 `appliedAt` 不可变、事件按条目递增序号 + eventId 幂等 + 游标绑定 session、checkpoint 不丢弃/相同内容不产生新位置、就绪五分支语义、工具三态（attempted/result/applied）与 `NOT_FOUND` 不可记录。
 
-**M2 有意留下的缺口**（后续里程碑补齐，均已在此登记）：
+**M2 有意留下的缺口**（后续里程碑补齐，均已在此登记；✅/⚠️ 标注为 2026-11-16 按
+`docs/DURABLE_MIGRATION_REVIEW.md` §4 重核的结果）：
 
-1. `history()` 返回空页——消息投影由 adapter（M3）写入，backend 暂未存 message part。
-2. `resources`/`delegate`/`restore`/`prune_events` 未入 trait（原语已预留 `resource_position`、`journal_branch`）。
-3. 模型事实（`ModelCall/ModelRequest/TokenUsage`）只有类型，未接线（M3+）。
-4. `Steer`/`Inject` 控制返回 `unavailable`（ACP 不需要；M3 与 adapter 输入队列一起做）。
+1. ✅ **已补齐**：`history()` 不再返回空页——它按队列序号投影 turn 输出
+   （`session_test::history_projects_the_committed_outputs_in_queue_order`）。**仍缺**的是消息转录：backend
+   没有 message part，转录仍由 adapter/journal 提供。
+2. ⚠️ **部分补齐**：`prune_events` 已入 `SessionBackend` trait（`query::prune_events`，带 `retained_after`
+   水位）；`resources`/`delegate`/`restore` 仍未接线（`resource_position`/`journal_branch` 恒为预留值）。
+3. 🔹 **仍成立**（本条**未**过期，审查 §8 写「第 1、3、4 条已过期」为编号笔误，实际是 1、2、4）：模型事实
+   （`ModelCallView`/`ModelRequestView`/`TokenUsage`）只有类型，无生产者也无消费者。
+4. ✅ **已补齐**：`Steer`/`Inject` 不再返回 `unavailable`，信号会落在活跃 turn 上
+   （`session_test::{a_steer_reaches_the_turn_the_writer_holds, an_inject_lands_on_the_active_turn_under_its_own_key}`）。
 5. 大对象外置（>16 KiB → object store）未做：`checkpoint` 全量内联存放。
 6. `settled` 前缀未物化（`current_turn` 每次队列扫描），`receipt`/`tool` 内嵌在 `TurnData` 而非独立 part。
 7. digest 用「键排序 canonical JSON + SHA-256」，与 Java RFC 8785（含 `{"value":…}` 外壳）不等价——两边数据不互通，故不影响正确性；如需跨语言互通再对齐。
