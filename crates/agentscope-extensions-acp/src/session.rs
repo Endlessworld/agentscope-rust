@@ -3,7 +3,7 @@
 //!
 //! Mirrors `AgiAgentSession` from the Kotlin `AgiHarnessAgent`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -17,8 +17,8 @@ use agent_client_protocol::v1::schema::{
 use agent_client_protocol::{v1::ConnectionTo, Client};
 use agentscope_core::agent::CallableAgent;
 use agentscope_core::event::{AgentEvent, ConfirmResult};
-use agentscope_core::journal::ThreadJournal;
-use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
+use agentscope_core::journal::{JournalProjection, ThreadJournal};
+use agentscope_core::message::{ChatUsage, Msg, ToolResultBlock, ToolResultState, ToolUseBlock};
 use agentscope_core::model::catalog::ModelDescriptor;
 use agentscope_core::model::{GenerateOptions, DEFAULT_CONTEXT_WINDOW};
 use agentscope_core::permission::{PermissionBehavior, PermissionRule};
@@ -600,6 +600,12 @@ const DURABLE_NAMESPACE: &str = "acp";
 const TICK_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
 /// How long a prompt waits for a tick in flight before it stops waiting for it.
 const DRIVER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Message recorded for a tool call whose outcome was lost with the process that dispatched it.
+const ABANDONED_ON_RESUME_MESSAGE: &str = "This tool call was dispatched, but its outcome was \
+     never recorded (the process ended or the run was interrupted). It was not retried; issue the \
+     call again if it is still needed.";
+/// Why a resumed session settles the tool calls it found unsettled.
+const RECONCILE_REASON: &str = "resume: abandoned tool calls whose outcome was never recorded";
 
 /// The durable runtime that drives this session's turns.
 ///
@@ -612,6 +618,69 @@ struct SessionRuntime {
     session: Arc<DurableSession>,
     control: Arc<DurableRuntime>,
     journal: Arc<dyn ThreadJournal>,
+}
+
+/// Settles the tool calls a dead run left uncertain, so the session can be opened again.
+///
+/// The recorder refuses to open a journal that holds a dispatched call without a result, which
+/// made a session whose process died mid-tool unopenable forever. Tools run in this process, so
+/// such an outcome can never arrive later: recording it as interrupted (never as success, never
+/// re-executed) is what lets the session continue.
+async fn reconcile_abandoned_tool_calls(journal: &Arc<dyn ThreadJournal>) {
+    let projection = match JournalProjection::read(&**journal).await {
+        Ok(projection) => projection,
+        Err(error) => {
+            // A session that was never written has no projection; nothing to settle.
+            tracing::debug!(%error, "no journal projection to reconcile before opening");
+            return;
+        }
+    };
+    if projection.uncertain_tool_calls.is_empty() {
+        return;
+    }
+    // The name is only informational: the dispatch that left the call uncertain may predate the
+    // last checkpoint, and then the restored state no longer holds the call at all.
+    let names: BTreeMap<String, String> = projection
+        .restore()
+        .ok()
+        .flatten()
+        .map(|state| {
+            state
+                .context
+                .iter()
+                .flat_map(|message| message.tool_use_blocks())
+                .map(|call| (call.id.clone(), call.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut outcomes: BTreeMap<String, ToolResultBlock> = BTreeMap::new();
+    for id in &projection.uncertain_tool_calls {
+        let name = names.get(id).map(String::as_str).unwrap_or("unknown");
+        outcomes.insert(
+            id.clone(),
+            ToolResultBlock::new(
+                id,
+                name,
+                vec![agentscope_core::message::ContentBlock::Text(
+                    agentscope_core::message::TextBlock::new(ABANDONED_ON_RESUME_MESSAGE),
+                )],
+            )
+            .with_state(ToolResultState::Interrupted),
+        );
+    }
+    tracing::warn!(
+        calls = ?projection.uncertain_tool_calls,
+        "recording tool calls whose outcome was never committed as interrupted"
+    );
+    if let Err(error) = agentscope_core::journal::recovery::reconcile(
+        Arc::clone(journal),
+        outcomes,
+        RECONCILE_REASON,
+    )
+    .await
+    {
+        tracing::warn!(%error, "could not settle the tool calls left uncertain by a dead run");
+    }
 }
 
 /// A request id for a durable control command.
@@ -1240,6 +1309,9 @@ impl AcpAgentSession {
             Arc::clone(&backend),
             thread.clone(),
         ));
+        // Before any tick opens a recorder: a session that a dead process left with an unknown
+        // tool outcome is otherwise refused at every open, permanently.
+        reconcile_abandoned_tool_calls(&journal).await;
         Ok(SessionRuntime {
             session: Arc::new(DurableSession::new(runtime, thread)),
             control,
@@ -3860,6 +3932,93 @@ mod tests {
         let opts = thought_level_params("auto");
         assert!(opts.reasoning_effort.is_none());
         assert!(opts.additional_body_params.is_empty());
+    }
+
+    /// A tool call dispatched by a process that died before recording its outcome used to poison
+    /// the session: the recorder refused every open with "Explicit reconciliation required".
+    /// Opening a runtime settles it once, as interrupted, so the session opens again.
+    #[tokio::test]
+    async fn an_uncertain_tool_call_is_settled_before_the_session_opens() {
+        use agentscope_core::journal::{
+            AtomicThreadJournal, InvocationRecorder, JournalEvent, JournalProjection,
+            MemoryJournalStorage, ThreadJournal,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        fn event(seq: u64, kind: &str, payload: serde_json::Value) -> JournalEvent {
+            JournalEvent::new(
+                format!("e{seq}"),
+                seq,
+                0,
+                kind,
+                Some("run-1".to_string()),
+                Some("t1".to_string()),
+                true,
+                payload.to_string(),
+            )
+            .unwrap()
+        }
+
+        let log: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(
+            Arc::new(MemoryJournalStorage::new()),
+            "acp/test",
+        ));
+        let state = agentscope_core::state::AgentState::builder()
+            .session_id("s1")
+            .build();
+        let facts = [
+            event(
+                1,
+                "state/checkpoint",
+                serde_json::json!({ "stateJson": state.to_json().unwrap() }),
+            ),
+            event(
+                2,
+                "tool/dispatch",
+                serde_json::json!({ "toolCallId": "call-1" }),
+            ),
+        ];
+        let writer = log.acquire("run-1", Duration::from_secs(60)).await.unwrap();
+        let head = log.head().await.unwrap();
+        log.commit(&writer, "batch-1", head.seq, &facts)
+            .await
+            .unwrap();
+        log.release(&writer).await.unwrap();
+
+        // The symptom: while the outcome is unknown the recorder refuses to open the session.
+        match InvocationRecorder::open_with(
+            Arc::clone(&log),
+            None,
+            &uuid::Uuid::new_v4().to_string(),
+            None,
+        )
+        .await
+        {
+            Err(error) => assert!(
+                error.to_string().contains("Explicit reconciliation"),
+                "an unknown tool outcome is what blocks the recorder: {error}"
+            ),
+            Ok(_) => panic!("an unknown tool outcome must block the recorder"),
+        }
+
+        super::reconcile_abandoned_tool_calls(&log).await;
+
+        let projection = JournalProjection::read(&*log).await.unwrap();
+        assert!(
+            projection.uncertain_tool_calls.is_empty(),
+            "the abandoned call is settled: {:?}",
+            projection.uncertain_tool_calls
+        );
+        let recorder = InvocationRecorder::open_with(
+            Arc::clone(&log),
+            None,
+            &uuid::Uuid::new_v4().to_string(),
+            None,
+        )
+        .await
+        .expect("the session opens once the abandoned call is settled");
+        recorder.close().await;
     }
 
     /// Regression: a strict OpenAI-compatible gateway rejects vendor-specific
