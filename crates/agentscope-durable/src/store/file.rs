@@ -20,25 +20,38 @@ use crate::{DurableError, Result};
 
 // How long a contender waits for the scope lock before giving up.
 //
-// It has to cover a stale-lock reclaim: a lock whose holder died is only recognised as stale
-// after `LOCK_STALE`, so a shorter deadline reports `scope is locked` for a lock nobody holds —
-// and every write rewrites the whole scope, which for a long session is tens of megabytes.
+// It is a contention bound, not a stale-lock grace: whether a lock is abandoned is decided by the
+// owner's liveness, so the wait only has to cover transactions that really run. Every write
+// rewrites the whole scope, which for a long session is tens of megabytes, so it has to be
+// generous.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCK_RETRY: Duration = Duration::from_millis(10);
-const LOCK_STALE: Duration = Duration::from_secs(30);
 
-// How many times a write that replaces an existing file is retried.
+// How long a lock whose owner cannot be identified by pid is left alone.
 //
-// On Windows `rename` and `File::create` answer `ERROR_ACCESS_DENIED` while any other process
-// holds the target — an indexer, a virus scanner, an editor that opened it without
-// `FILE_SHARE_DELETE`. The old loop waited 5 ms three times, but the journal of a live ACP run
-// only recovered when the recorder retried the whole batch after 100 ms, so the wait now doubles
-// from `WRITE_RETRY_BACKOFF` up to its cap.
-const WRITE_RETRIES: u32 = 6;
-const WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(10);
-const WRITE_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(200);
+// Liveness is the authority (see `is_stale`); this only covers a body that names no readable
+// pid at all. It is far larger than any transaction, because reclaiming a live lock is a lost
+// update, not a hiccup.
+const LOCK_STALE_UNKNOWN: Duration = Duration::from_secs(30 * 60);
+
+// The retry budget of one file operation another process holds.
+//
+// On Windows a read, a `rename`, a `File::create` and a `remove_file` all answer
+// `ERROR_ACCESS_DENIED` while any other process holds the target — a writer of this very store
+// replacing the file, an indexer, a virus scanner, an editor that opened it without
+// `FILE_SHARE_DELETE`. Sharing is transient, so every operation that can hit it retries: ten
+// attempts with a doubling wait from `HELD_RETRY_BACKOFF` up to `HELD_RETRY_BACKOFF_MAX` (about
+// 2.8 s in total) is long enough for a whole scope commit by another host to finish, while still
+// failing a real error on the first attempt.
+const HELD_RETRIES: u32 = 10;
+const HELD_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+const HELD_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(400);
 
 /// Scope maps and the readiness index backed by plain files under one directory.
+///
+/// Any number of hosts (processes) may open the same root at the same time: exclusion is per
+/// scope through `locks/*.lock`, and every document is replaced atomically, so readers always see
+/// a complete previous or complete next document.
 pub struct FileStore {
     root: PathBuf,
 }
@@ -47,7 +60,9 @@ impl FileStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         for dir in ["scopes", "work", "locks"] {
-            fs::create_dir_all(root.join(dir))?;
+            // Creating a directory two hosts need at the same moment answers "already exists",
+            // which is success; a transient hold on the parent is retried like any other.
+            retry_while_held(|| fs::create_dir_all(root.join(dir)))?;
         }
         Ok(Self { root })
     }
@@ -71,8 +86,15 @@ impl FileStore {
             .join(format!("{}.lock", digest(scope)))
     }
 
+    /// One lock for the whole readiness index; see [`FileStore::commit`].
+    fn work_lock_path(&self) -> PathBuf {
+        self.root.join("locks").join("work-index.lock")
+    }
+
     fn read_scope(&self, scope: &str) -> Result<BTreeMap<String, Value>> {
-        match fs::read(self.scope_path(scope)) {
+        // A share violation from the host that is replacing the document right now is transient;
+        // a missing document is not, and is answered at once.
+        match retry_while_held(|| fs::read(self.scope_path(scope))) {
             Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
             Err(error) => Err(error.into()),
@@ -103,25 +125,34 @@ impl FileStore {
             }
             touched = true;
         }
-        for entry in scheduled.values() {
-            let path = self.work_path(&entry.queue, &entry.work_id);
-            if entry.ready_at < 0 {
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
+        // The readiness index is not part of any scope: two scopes — in this process or in
+        // another host — can schedule the same work id, and one commit can both write one item
+        // and drop another, so without a lock a reader (`ready`) may see half of that batch and a
+        // later writer may put the removed item back. The lock is always taken *after* the scope
+        // lock (this function runs inside `transaction`), so there is one lock order and no cycle
+        // is possible.
+        if !scheduled.is_empty() {
+            let _index = acquire_lock(&self.work_lock_path())?;
+            for entry in scheduled.values() {
+                let path = self.work_path(&entry.queue, &entry.work_id);
+                if entry.ready_at < 0 {
+                    match retry_while_held(|| fs::remove_file(&path)) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    continue;
                 }
-                continue;
+                write_json(
+                    &path,
+                    &WorkRecord {
+                        queue: entry.queue.clone(),
+                        work_id: entry.work_id.clone(),
+                        ready_at: entry.ready_at,
+                        payload: entry.payload.clone(),
+                    },
+                )?;
             }
-            write_json(
-                &path,
-                &WorkRecord {
-                    queue: entry.queue.clone(),
-                    work_id: entry.work_id.clone(),
-                    ready_at: entry.ready_at,
-                    payload: entry.payload.clone(),
-                },
-            )?;
         }
         if touched {
             write_json(&self.scope_path(scope), &committed)?;
@@ -157,7 +188,10 @@ impl RecordStore for FileStore {
 
     fn ready(&self, queue: &str, now: i64, limit: usize) -> Result<Vec<WorkItem>> {
         let mut due: Vec<WorkItem> = Vec::new();
-        let entries = match fs::read_dir(self.root.join("work")) {
+        // Reading needs no index lock: every document is replaced by an atomic rename, so a
+        // reader sees either the whole previous record or the whole next one. It does need the
+        // retry, because the file being replaced is briefly held by its writer.
+        let entries = match retry_while_held(|| fs::read_dir(self.root.join("work"))) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
@@ -167,7 +201,7 @@ impl RecordStore for FileStore {
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let bytes = match fs::read(&path) {
+            let bytes = match retry_while_held(|| fs::read(&path)) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
@@ -311,43 +345,45 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_atomic(path, &bytes)
 }
 
-/// Temporary file plus rename, retried because Windows may briefly hold the target.
+/// Temporary file plus rename, retried because another host may briefly hold the target.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = next_sequence();
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     let temporary = path.with_file_name(format!(".{name}.{}-{sequence}.tmp", std::process::id()));
     if let Err(error) = retry_while_held(|| fs::write(&temporary, bytes)) {
-        let _ = fs::remove_file(&temporary);
+        let _ = retry_while_held(|| fs::remove_file(&temporary));
         return Err(error.into());
     }
     if let Err(error) = retry_while_held(|| fs::rename(&temporary, path)) {
-        let _ = fs::remove_file(&temporary);
+        let _ = retry_while_held(|| fs::remove_file(&temporary));
         return Err(error.into());
     }
     Ok(())
 }
 
-/// Retries an operation while Windows reports that another process holds the file.
+/// Retries an operation while the file system says another process holds the file.
 ///
 /// Only the two sharing answers are retried: `ERROR_ACCESS_DENIED` (5, also what a target held
 /// without `FILE_SHARE_DELETE` produces) and `ERROR_SHARING_VIOLATION` (32). Rust maps 5 to
 /// `PermissionDenied` and 32 to no dedicated kind, so the raw codes are the only reliable test —
-/// and anything else, a read-only directory for instance, must fail on the first attempt instead
-/// of burning half a second.
+/// and anything else, a read-only directory or a missing file for instance, must fail on the
+/// first attempt instead of being swallowed by a retry loop.
+///
+/// Every operation on a shared document goes through it: writing the temporary file, the rename
+/// that publishes it, removing a work record, reading a scope or a work record, removing a lock.
 fn retry_while_held<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
-    let mut backoff = WRITE_RETRY_BACKOFF;
+    let mut backoff = HELD_RETRY_BACKOFF;
     let mut attempt = 0;
     loop {
         match operation() {
             Ok(value) => return Ok(value),
-            Err(error) if attempt < WRITE_RETRIES && is_transient_hold(&error) => {
+            Err(error) if attempt < HELD_RETRIES && is_transient_hold(&error) => {
                 attempt += 1;
                 std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(WRITE_RETRY_BACKOFF_MAX);
+                backoff = (backoff * 2).min(HELD_RETRY_BACKOFF_MAX);
             }
             Err(error) => return Err(error),
         }
@@ -358,14 +394,30 @@ fn is_transient_hold(error: &std::io::Error) -> bool {
     matches!(error.raw_os_error(), Some(5) | Some(32))
 }
 
+/// A per-process counter, so two temporary names of the same process never collide.
+fn next_sequence() -> u64 {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Held for the lifetime of one transaction; removal happens on every exit path.
 struct ScopeLock {
     path: PathBuf,
+    /// The exact body this holder wrote, so the exit path cannot delete a successor's lock.
+    stamp: String,
 }
 
 impl Drop for ScopeLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Only the lock this transaction created: a lock written by a later holder belongs to it,
+        // and removing it would let a third writer in while that one is still writing the scope.
+        // The read is retried like the removal: a transient hold here must not leave a lock
+        // behind that blocks the scope until its timeout.
+        let ours = retry_while_held(|| fs::read_to_string(&self.path))
+            .is_ok_and(|body| body == self.stamp);
+        if ours {
+            let _ = retry_while_held(|| fs::remove_file(&self.path));
+        }
     }
 }
 
@@ -383,14 +435,27 @@ fn acquire_lock(path: &Path) -> Result<ScopeLock> {
                 let _ = file.flush();
                 return Ok(ScopeLock {
                     path: path.to_path_buf(),
+                    stamp,
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if is_stale(path) {
-                    let _ = fs::remove_file(path);
+                // Only a lock whose owner is provably gone may be taken over; a live owner —
+                // including another thread of this process — is always waited for.
+                if let Some(observed) = stale_body(path) {
+                    reclaim_stale(path, &observed);
                 }
                 if Instant::now() >= deadline {
                     return Err(DurableError::unavailable("scope is locked"));
+                }
+                std::thread::sleep(LOCK_RETRY);
+            }
+            // A path another host is creating or removing right now answers `ACCESS_DENIED`:
+            // Windows keeps a just-deleted file "pending delete" for a moment, and `create_new` on
+            // such a path is refused with 5 instead of `AlreadyExists`. It clears on its own, so
+            // it is retried with the same deadline as a held lock.
+            Err(error) if is_transient_hold(&error) => {
+                if Instant::now() >= deadline {
+                    return Err(error.into());
                 }
                 std::thread::sleep(LOCK_RETRY);
             }
@@ -399,27 +464,104 @@ fn acquire_lock(path: &Path) -> Result<ScopeLock> {
     }
 }
 
-fn is_stale(path: &Path) -> bool {
-    // A lock whose writer already exited can be taken over at once: waiting out `LOCK_STALE`
-    // would report `scope is locked` to every contender for the whole grace period.
-    if holder_alive(path) == Some(false) {
-        return true;
+/// Takes a stale lock away from nobody.
+///
+/// Two contenders can both find the same lock stale, so reclaiming with `remove_file` is unsafe:
+/// the loser deletes the *fresh* lock the winner has just created, and both then write the same
+/// scope — the lost update this lock exists to prevent. Here the file is moved aside first
+/// (`rename` moves a given path at most once, so it picks one winner) and the moved body is
+/// compared with the one the caller saw as stale: if they differ, the winner had already
+/// recovered and that lock is put back exactly as it was, never replacing a lock that appeared in
+/// the meantime.
+fn reclaim_stale(path: &Path, observed: &str) {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let aside = path.with_file_name(format!(
+        ".{name}.{}-{}.stale",
+        std::process::id(),
+        next_sequence()
+    ));
+    // Somebody else won the reclaim, or the file is gone: the loop decides with `create_new`.
+    if retry_while_held(|| fs::rename(path, &aside)).is_err() {
+        return;
     }
-    // Same-process holders and locks without a readable pid still fall back to the mtime rule.
-    match fs::metadata(path).and_then(|meta| meta.modified()) {
-        Ok(modified) => modified
-            .elapsed()
-            .map(|elapsed| elapsed > LOCK_STALE)
-            .unwrap_or(false),
-        Err(_) => true,
+    match retry_while_held(|| fs::read_to_string(&aside)) {
+        Ok(body) if body == observed => {
+            let _ = retry_while_held(|| fs::remove_file(&aside));
+        }
+        Ok(body) => {
+            // A lock somebody else had just created. `create_new` puts it back without ever
+            // overwriting a lock a third contender may have created in the meantime. It is retried
+            // like every other file operation: a transient hold here would lose a live lock.
+            if let Ok(mut file) = retry_while_held(|| {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+            }) {
+                let _ = file.write_all(body.as_bytes());
+                let _ = file.flush();
+            }
+            let _ = retry_while_held(|| fs::remove_file(&aside));
+        }
+        Err(_) => {
+            let _ = retry_while_held(|| fs::remove_file(&aside));
+        }
     }
 }
 
-/// Whether the process that wrote the lock file still runs; `None` when the pid is unreadable.
-fn holder_alive(path: &Path) -> Option<bool> {
+/// Whether a lock may be taken away from its owner; see [`stale_body`] for the rule.
+#[cfg(test)]
+fn is_stale(path: &Path) -> bool {
+    stale_body(path).is_some()
+}
+
+/// The body of a lock that may be taken over; `None` while its owner is alive.
+///
+/// The owner's liveness is the authority, not the clock. A transaction rewrites its whole scope,
+/// so a live commit easily outlives any grace period a clock could give it, and reclaiming a live
+/// lock means two writers on one scope — a lost update, not a hiccup. The mtime rule survives
+/// only for a lock whose owner cannot be identified at all (an unreadable body), with a threshold
+/// far beyond any transaction.
+///
+/// No heartbeat is maintained while the lock is held: it would cost a write per transaction (or a
+/// background thread per store) and would still mis-rank a holder that is alive but slow, while
+/// the pid answer is exact on both supported platforms. A live-but-stuck holder cannot block a
+/// scope silently either — `acquire_lock` gives up after `LOCK_TIMEOUT` and reports
+/// `scope is locked`, so the stall is reported instead of hidden.
+///
+/// The body is returned so a reclaim can prove it moved *the* lock it judged stale.
+fn stale_body(path: &Path) -> Option<String> {
     let body = fs::read_to_string(path).ok()?;
+    match holder_alive(&body) {
+        // Another thread of this very process is a live owner too: waiting is correct.
+        Some(true) => None,
+        // A lock whose writer already exited can be taken over at once: waiting out a grace
+        // period would report `scope is locked` to every contender for its whole length.
+        Some(false) => Some(body),
+        // No readable pid: only age can decide, and it has to be beyond any transaction.
+        None => is_old(path).then_some(body),
+    }
+}
+
+/// Whether the process that wrote this lock body still runs; `None` when the pid is unreadable.
+fn holder_alive(body: &str) -> Option<bool> {
     let pid: u32 = body.split_whitespace().next()?.parse().ok()?;
     Some(process_alive(pid))
+}
+
+/// Whether a lock nobody can attribute is old enough to be considered abandoned.
+fn is_old(path: &Path) -> bool {
+    match fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(modified) => modified
+            .elapsed()
+            .map(|elapsed| elapsed > LOCK_STALE_UNKNOWN)
+            .unwrap_or(false),
+        // The file is gone already: the next `create_new` decides who gets the scope.
+        Err(_) => true,
+    }
 }
 
 #[cfg(unix)]
@@ -461,6 +603,9 @@ fn process_alive(_pid: u32) -> bool {
 
 #[cfg(test)]
 mod lock_liveness_tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
     use super::*;
 
     /// `u32::MAX - 1` is above the maximum pid on every platform, so no process owns it.
@@ -506,13 +651,141 @@ mod lock_liveness_tests {
         cleanup(&path);
     }
 
+    /// Ages a file, so the mtime rule can be exercised without waiting for it.
+    fn make_old(path: &Path, age: Duration) {
+        let modified = std::time::SystemTime::now() - age;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
     #[test]
-    fn a_lock_without_a_readable_pid_falls_back_to_the_mtime_rule() {
-        let path = lock_file("garbage");
+    fn a_lock_of_a_live_owner_is_never_reclaimed_by_age() {
+        // A transaction that rewrites a tens-of-megabytes scope outlives any grace period a clock
+        // could give it. Taking the lock away from a live owner is a lost update, so age must not
+        // decide while the owner can be identified.
+        let path = lock_file("live-old");
+        fs::write(&path, format!("{} 0", std::process::id())).unwrap();
+        make_old(&path, Duration::from_secs(3600));
+        assert!(
+            !is_stale(&path),
+            "a live owner keeps its lock however old the file is"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_lock_without_a_readable_pid_is_reclaimed_only_after_the_large_grace() {
+        let path = lock_file("garbage-old");
+        fs::write(&path, "not-a-pid").unwrap();
+        make_old(&path, Duration::from_secs(3600));
+        assert!(
+            is_stale(&path),
+            "an unidentifiable lock is reclaimed once it is far older than any transaction"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_lock_without_a_readable_pid_and_a_fresh_mtime_is_not_stale() {
+        // No pid to ask, and the file was just written: nothing says the owner is gone, so the
+        // lock stands until it is far older than any transaction.
+        let path = lock_file("garbage-fresh");
         fs::write(&path, "not-a-pid").unwrap();
         assert!(
             !is_stale(&path),
-            "an unreadable body must not be treated as dead"
+            "an unidentifiable lock is not stale while it is young"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_lock_held_by_a_thread_of_this_process_is_waited_for() {
+        // `process_alive` answers true for our own pid, so a lock another thread of this process
+        // holds must be waited for — reclaiming it would put two writers on one scope. The age is
+        // shrunk only through `make_old`, the wait itself uses the real retry interval.
+        let path = lock_file("same-process");
+        fs::write(&path, format!("{} 0", std::process::id())).unwrap();
+        make_old(&path, Duration::from_secs(3600));
+        let held = path.clone();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            fs::remove_file(&held).unwrap();
+        });
+        let started = Instant::now();
+        let lock = acquire_lock(&path).expect("the release must be waited for");
+        holder.join().unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "a lock of a live holder must not be reclaimed early: {:?}",
+            started.elapsed()
+        );
+        drop(lock);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_late_reclaim_never_deletes_the_lock_a_winner_created() {
+        let path = lock_file("late-reclaim");
+        fs::write(&path, format!("{DEAD_PID} 0")).unwrap();
+        let observed = stale_body(&path).expect("a lock of a dead owner is reclaimable");
+        // The winner already reclaimed it and created its own lock while the loser still held the
+        // stale body — the interleaving two contenders produce. Only the verification inside
+        // `reclaim_stale` keeps the winner's lock alive.
+        let winner = format!("{} 42", std::process::id());
+        fs::write(&path, &winner).unwrap();
+        reclaim_stale(&path, &observed);
+        assert_eq!(
+            fs::read_to_string(&path).ok(),
+            Some(winner),
+            "a late reclaim must not delete the lock the winner created"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn only_one_contender_reclaims_a_stale_lock() {
+        // Two contenders that both find the lock stale must not both "reclaim" it: the second one
+        // would delete the fresh lock the first created and both would write the scope.
+        let path = lock_file("contended");
+        fs::write(&path, format!("{DEAD_PID} 0")).unwrap();
+        let holding = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let errors = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let path = path.clone();
+            let holding = Arc::clone(&holding);
+            let peak = Arc::clone(&peak);
+            let errors = Arc::clone(&errors);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..5 {
+                    match acquire_lock(&path) {
+                        Ok(lock) => {
+                            let now = holding.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(2));
+                            holding.fetch_sub(1, Ordering::SeqCst);
+                            drop(lock);
+                        }
+                        Err(_) => {
+                            errors.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(errors.load(Ordering::SeqCst), 0, "no contender gives up");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "the scope lock is exclusive even while stale locks are reclaimed"
         );
         cleanup(&path);
     }
@@ -520,6 +793,8 @@ mod lock_liveness_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use serde_json::json;
 
@@ -531,9 +806,21 @@ mod tests {
         assert!(is_transient_hold(&std::io::Error::from_raw_os_error(32)));
         // A full disk (112), a missing path (2) and a read-only directory (19) do not clear on
         // their own: retrying them would only delay the error.
-        for code in [2, 19, 112] {
+        for code in [2, 13, 19, 112] {
             assert!(!is_transient_hold(&std::io::Error::from_raw_os_error(code)));
         }
+    }
+
+    #[test]
+    fn an_error_that_is_not_a_sharing_answer_is_raised_at_once() {
+        let mut attempts = 0;
+        let error = retry_while_held(|| -> std::io::Result<()> {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(13))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1, "only 5 and 32 are retried");
+        assert_eq!(error.raw_os_error(), Some(13));
     }
 
     #[test]
@@ -580,7 +867,6 @@ mod tests {
             &self.0
         }
     }
-
     impl Drop for TempRoot {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
@@ -718,6 +1004,157 @@ mod tests {
         let due = reopened.ready("queue", 10, 10)?;
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].payload, Some(json!("payload")));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Several hosts on one root
+    // -----------------------------------------------------------------------
+
+    /// How long a concurrent test may run before it is reported as a deadlock.
+    const CONCURRENCY_TIMEOUT: Duration = Duration::from_secs(120);
+
+    /// Runs `worker` on `threads` threads and fails the test instead of hanging forever.
+    ///
+    /// A store that never returns the scope lock is a deadlock, not a slow test, so the deadline
+    /// is explicit: a hung run reports it instead of blocking the suite.
+    fn run_concurrently(
+        threads: usize,
+        worker: impl Fn(usize) -> std::result::Result<(), String> + Send + Sync + 'static,
+    ) {
+        let worker = Arc::new(worker);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut handles = Vec::new();
+        for thread in 0..threads {
+            let worker = Arc::clone(&worker);
+            let sender = sender.clone();
+            handles.push(std::thread::spawn(move || {
+                let _ = sender.send(worker(thread));
+            }));
+        }
+        drop(sender);
+        let deadline = Instant::now() + CONCURRENCY_TIMEOUT;
+        let mut done = 0;
+        while done < threads {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(left) {
+                Ok(Ok(())) => done += 1,
+                Ok(Err(message)) => panic!("{message}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("deadlock: no progress in {CONCURRENCY_TIMEOUT:?}")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("a worker panicked before reporting")
+                }
+            }
+        }
+        for handle in handles {
+            handle.join().expect("worker thread");
+        }
+    }
+
+    #[test]
+    fn two_hosts_on_one_root_never_lose_an_update() -> Result<()> {
+        // Two stores, one root: exactly what two agent processes on one workspace look like, and
+        // the case the per-scope lock exists for. Every host increments the same counter through
+        // a read-modify-write inside one transaction, so a lock that admits both writers at once
+        // loses increments.
+        let root = TempRoot::new("two-hosts");
+        let hosts: Vec<Arc<FileStore>> = (0..2)
+            .map(|_| FileStore::open(root.path()).map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 50;
+        run_concurrently(THREADS, move |thread| {
+            let store = Arc::clone(&hosts[thread % hosts.len()]);
+            for round in 0..ROUNDS {
+                store
+                    .transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+                        let current = txn
+                            .get("counter")?
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0);
+                        txn.put("counter", Some(json!(current + 1)))?;
+                        txn.put(
+                            &format!("host{}-round{round}", thread % 2),
+                            Some(json!(thread)),
+                        )
+                    })
+                    .map_err(|error| format!("host {thread} round {round}: {error}"))?;
+            }
+            Ok(())
+        });
+
+        let reader = FileStore::open(root.path())?;
+        let counter = read_value(&reader, "session", "counter")?;
+        assert_eq!(
+            counter,
+            Some(json!((THREADS * ROUNDS) as u64)),
+            "every increment survived: no write was lost"
+        );
+        // Both hosts of every round are present: no host's document replaced the other's.
+        for host in 0..2 {
+            (0..ROUNDS).for_each(|round| {
+                assert!(
+                    read_value(&reader, "session", &format!("host{host}-round{round}"))
+                        .expect("read")
+                        .is_some(),
+                    "host {host} round {round} is missing"
+                );
+            });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn two_hosts_scheduling_the_same_work_item_keep_a_valid_record() -> Result<()> {
+        // The readiness index lives outside every scope, so two hosts on two scopes can schedule
+        // the same work id at the same time. The record is replaced atomically, so whichever
+        // scheduling wins the last write, the index stays readable and consistent.
+        let root = TempRoot::new("work-index");
+        let hosts: Vec<Arc<FileStore>> = (0..2)
+            .map(|_| FileStore::open(root.path()).map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+        run_concurrently(4, move |thread| {
+            let store = Arc::clone(&hosts[thread % hosts.len()]);
+            for round in 0..25u64 {
+                let scope = if thread % 2 == 0 {
+                    "scope-a"
+                } else {
+                    "scope-b"
+                };
+                store
+                    .transaction(scope, &mut |txn: &mut dyn Txn| -> Result<()> {
+                        txn.schedule(
+                            "queue",
+                            "shared",
+                            round as i64 + 1,
+                            Some(json!({ "by": thread })),
+                        )?;
+                        txn.schedule("queue", &format!("own-{thread}-{round}"), 1, None)
+                    })
+                    .map_err(|error| format!("thread {thread} round {round}: {error}"))?;
+            }
+            Ok(())
+        });
+
+        let reader = FileStore::open(root.path())?;
+        let due = reader.ready("queue", i64::MAX, 1000)?;
+        assert_eq!(
+            due.iter().filter(|item| item.work_id == "shared").count(),
+            1,
+            "the shared item is one record, not a duplicate"
+        );
+        // Every host's own item landed: the index lock does not drop a neighbour's write.
+        for thread in 0..4 {
+            for round in 0..25 {
+                assert!(
+                    due.iter()
+                        .any(|item| item.work_id == format!("own-{thread}-{round}")),
+                    "own-{thread}-{round} is missing"
+                );
+            }
+        }
         Ok(())
     }
 }
