@@ -1,8 +1,16 @@
 .idea
-.agentscope
+# Agent state: track the long-term memory only, ignore everything else.
+.agentscope/*
+!.agentscope/workspace/
+.agentscope/workspace/*
+!.agentscope/workspace/MEMORY.md
+!.agentscope/workspace/memory/
+# Per-crate/test-created state directories stay ignored.
+/crates/**/.agentscope/
 .openidea
+.idea
 agents
-/target/**
+target
 /MEMORY.md
 /large_tool_results/
 # Test artifacts: some harness tests build a default workspace rooted at the

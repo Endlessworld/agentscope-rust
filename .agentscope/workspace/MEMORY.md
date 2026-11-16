@@ -1150,3 +1150,20 @@
 - 建议修复批次（文档末节）：P0 安全（5 条）、P1 分布式（7）、P2 生命周期（7）、P3 工具治理（5）、P4 沙箱（6）、P5 数据正确性（4）。
 - 第 7 轮（最后一轮，36 条）新增「存在」：#1284（DashScope 三处显式丢弃 Thinking，`reasoning_content` 全仓无写入点）、#3248（MySQL 技能库 SQL 标识符无引号）、#3213（`createIfNotExist=false` 仍 `ALTER TABLE`）、#2165（Redis Lua 跨 slot）、#3305（空白 chunk 进 embedding）、#1516（RAGFlow threshold 死配置 0.5）、#1095（embedding 无批量/维度保护）。
 - 方法论沉淀（本任务七轮验证有效）：①子智能体提示里先声明「已存在台账 N 条 + 已知同根清单」，能显著减少重复推理并让新发现更聚焦；②每轮 4–5 个 × 9–10 条是稳定吞吐；③`task_output(block=true)` 第一次常返回「已转后台」，再调一次即拿到结果，不必反复轮询；④收到完成通知后应立即取结果并落盘，否则下一轮通知会把旧任务重复推送淹没当前任务。
+
+## 2026-11-17 按 `docs/JAVA_BUG_PARITY.md` 批量修复（dev 线性、无 merge、未 push）
+- 提交 **`3619a71`**（主体，103 文件 / +11637−1101，覆盖 core、harness 与 8 个 extension crate）+ **`64d8344`**（ACP cwd/workspace 双根）。
+- 台账追加「## 本轮已落地修复（2026-11-16 / 17）」约 61 行，按 issue 逐条列出修复点，并分节：安全与路径解析 / 上下文与记忆 / 工具技能会话 / 沙箱与扩展 / 明确保持原样。
+- **新验证基线口径**：`cargo test --workspace -j 2 --no-fail-fast` → **231 targets / 6817 passed / 0 failed**；`cargo fmt --all -- --check` 干净（取代此前 212/6437 口径）。
+- **已修 issue（按类）**：
+  - 安全路由：#3258 #2065 #3378（RemoteFilesystemSpec + HarnessAgent 默认后端改 workspace-rooted）、#3253 #770 #2690（composite `route_for_path` 先规范化，`/`/`.` 不再落默认后端根）、#2918 #2091 #2182 #2691 #2693 #4140（补齐 `.agentscope/` 前缀路由，session/journal/bus 不再静默写本地）、#3975（async_tool 记录路径折叠重复斜杠）、#3388（`read_with_override` 投影层不被 shell 写入的 AGENTS.md/SKILL.md 越过）。
+  - 上下文记忆：#1740 #1969（溢出压缩多轮，上限 3 轮、无进展退出）、#2276 #1094 #3059（记忆 flush/maintenance 改为回合流结束后 `spawn` + 每 session 串行队列，订阅者不再等 LLM）、#2692（远程 `ls` 无 mtime 不再判全过期）、#3088 #2937（日文件与条目时间戳同源本地时钟；session id 单段编码，含 `:` / `/` 的 id 可写）、#1403（中间件注入消息带 `agentscope.internal_message` 标记，不再被当检索 query）、#3305（RAG 空白 chunk 过滤）。
+  - 工具技能会话：#1577（子智能体取消：`CancelOutcome`/`request_cancel`/`cancel_session_tasks` + 父级传播 + 回执 CAS）、#2962（模型空响应重试后显式报错）、#2419 #2420（skill 仓库 `freshness()` 之前漏转发）、#2664（空 catalog 仍跑 staging GC；同仓库共享命名空间）、#2169（load_skill 先判存在再判授权）、#2683（knowledge 清单只列文件）、#1438（frontmatter 块序列）、#1211（`StreamOptions.incremental=false` 接线累积快照）、#1036（工具执行阶段中断检查）。
+  - 沙箱扩展：#2564 #2329（隔离键与租约，同 isolation-key 不再互相覆盖）、#1674（沙箱 glob `**` 递归语义）、#2216（remote 先建目录再 hydrate）、#755 #912（MCP TLS 注入；全局锁不跨 await）、#2165（Redis Lua 跨 slot）、#3248 #3213（skills/mysql SQL 标识符加引号；`createIfNotExist=false` 不再 ALTER TABLE）、#3042（跨后端 move 保留 encoding）、#2448（overlay grep 不残留旧匹配）。
+- **明确保持原样（独立改造面）**：#3780（`flush_before_compact`/`offload_before_compact` 仍是死配置，provider `ContextLength` 无消费者）、#3815（`open_with` 仍无取消守卫，writer 租约最长泄 30s）、#3178（子代理 toolkit 仍是 build 时快照，ACP 之后桥接的 MCP 工具不可见）。
+- **`64d8344` 的关键设计（后续改动必须遵守）**：`HarnessAgent::build()` 默认后端拆成**同树不同锚点**的两个 Rooted 视图——`filesystem`（agent 状态：相对路径锚 workspace，AGENTS.md/MEMORY.md/memory/skills/sessions/bus 语义不变）与 `project_filesystem`（工具：相对路径锚 `cwd`，注册给 filesystem 工具、shell sandbox、`@path` 展开）；**两者都以 `cwd` + `workspace` 为可接受根**（绝对路径跨两者可读），宿主其它目录仍拒绝；显式传入的 filesystem/spec 不走拆分。
+  - 工具结果卸载（eviction）目录改为**绝对路径** `<workspace>/large_tool_results`（不再落项目根，占位符路径仍能被 `read_file` 命中）。
+  - `LocalFilesystem::ls`/`grep` 把 `"/"` 与空串视为 filesystem root —— 修 Rooted 下 `grep_files`/`glob_files` 默认 `path="/"` 报 `Path outside root: /`。
+  - workspace prompt 在 cwd≠workspace 时同时声明 `Your working directory is: <cwd>` 与 `Agent state (...) lives in: <workspace>`。
+  - 回归用例：`the_default_filesystem_accepts_the_project_directory_beside_the_workspace`、`the_tool_result_spill_directory_stays_inside_the_workspace`、`the_workspace_prompt_names_the_project_directory_and_the_state_directory`。
+- **踩坑（新增，重要）**：默认后端变 Rooted 后，`read_file`/`write_file` 工具读写 **`C:\Users\...\AppData\Local\Temp`** 会报 `Path outside root`；临时产物必须落 workspace 内（或用 shell 命令 + `Get-Content`）。
