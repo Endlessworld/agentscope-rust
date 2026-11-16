@@ -2,7 +2,7 @@
 //!
 //! This module provides the declarative config surface and a registrar implementation
 //! that can be wired to `rust-mcp-sdk` for real MCP client management.
-use agentscope_core::error::Result;
+use agentscope_core::error::{Error, Result};
 
 // Re-export from mcp_client_manager for backward compatibility
 pub use super::mcp_client_manager::{McpClientManager, McpServerConfig, McpToolInfo};
@@ -145,7 +145,7 @@ impl Registrar for McpServerRegistrar {
                         client_id,
                         config.name
                     );
-                    match client_manager.connect(&client_id).await {
+                    match connect_with_retry(&client_manager, &client_id, &config.name).await {
                         Ok(()) => {
                             if let Some(l) = &listener {
                                 l.on_registration_result(McpServerRegistrationResult::success(
@@ -182,6 +182,73 @@ impl Registrar for McpServerRegistrar {
 
         Ok(())
     }
+}
+
+/// Registration attempts, including the first one.
+const MCP_CONNECT_ATTEMPTS: u32 = 3;
+
+/// Base backoff between registration attempts; doubled per retry.
+const MCP_CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Connects a freshly created client, retrying a transient handshake failure.
+///
+/// Registration used to be a single best-effort attempt, so a server that was still
+/// starting up (a locally spawned `npx` server, a container warming up) was dropped for
+/// the whole session and its tools silently went missing (#912). Connecting is
+/// idempotent — it returns immediately once the client is connected — so a retry cannot
+/// duplicate a session; only a genuine configuration error burns all attempts.
+async fn connect_with_retry(
+    client_manager: &super::mcp_client_manager::McpClientManager,
+    client_id: &str,
+    server_name: &str,
+) -> Result<()> {
+    retry_connect(
+        server_name,
+        MCP_CONNECT_ATTEMPTS,
+        MCP_CONNECT_BACKOFF,
+        move || {
+            let client_manager = client_manager;
+            let client_id = client_id;
+            async move { client_manager.connect(client_id).await }
+        },
+    )
+    .await
+}
+
+/// Runs `connect` up to `attempts` times with an exponentially growing backoff.
+async fn retry_connect<F, Fut>(
+    server_name: &str,
+    attempts: u32,
+    base_backoff: std::time::Duration,
+    mut connect: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut delay = base_backoff;
+    let mut last_error = None;
+    for attempt in 1..=attempts.max(1) {
+        match connect().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if attempt < attempts {
+                    tracing::warn!(
+                        "MCP server '{}' registration attempt {}/{} failed: {}; retrying in {:?}",
+                        server_name,
+                        attempt,
+                        attempts,
+                        error,
+                        delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| Error::Other("connect failed".to_string())))
 }
 
 /// Per-registration metadata-propagation options, mirroring Java
@@ -581,5 +648,53 @@ impl McpToolSource for McpClientSource {
                 "MCP tool '{tool_name}' returned an unparseable result: {e}"
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn registration_retries_a_transient_connect_failure() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&attempts);
+        let result = retry_connect("srv", 3, std::time::Duration::from_millis(1), move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                // Fail twice, then succeed: the third attempt must be the winner.
+                if counter.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(Error::Other("handshake failed".to_string()))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn registration_gives_up_after_the_last_attempt() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&attempts);
+        let result = retry_connect("srv", 3, std::time::Duration::from_millis(1), move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(Error::Other("still down".to_string()))
+            }
+        })
+        .await;
+
+        match result {
+            Err(error) => assert!(error.to_string().contains("still down")),
+            Ok(()) => panic!("a permanently failing connect must not report success"),
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 }

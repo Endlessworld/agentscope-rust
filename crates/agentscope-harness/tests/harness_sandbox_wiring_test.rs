@@ -186,6 +186,10 @@ async fn builder_installs_the_sandbox_lifecycle_middleware() {
         .cwd(dir.clone())
         .workspace(dir.join("ws"))
         .disable_web_tools()
+        // The lifecycle middleware only acquires when the call can actually reach the
+        // sandbox, so the agent needs a sandbox-bound tool (`execute`) for this test to
+        // exercise the acquire path at all (#2564).
+        .register_shell_tool(true)
         .sandbox_manager(Arc::clone(&manager))
         .sandbox_context(SandboxContext::builder().build())
         .build();

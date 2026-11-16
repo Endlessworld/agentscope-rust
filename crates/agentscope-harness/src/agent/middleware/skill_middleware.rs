@@ -80,6 +80,8 @@ struct SkillCache {
     catalog: Option<SkillCatalog>,
     index: Option<HashMap<String, PathBuf>>,
     names: Option<HashMap<String, String>>,
+    /// 构建时各仓库的轻量新鲜度指纹（目录条目数 + 顶层 mtime）；变化则整份缓存失效。
+    freshness: Option<u64>,
 }
 
 impl HarnessSkillMiddleware {
@@ -137,6 +139,7 @@ impl HarnessSkillMiddleware {
     /// 惰性构建：首次调用时全量扫描并缓存，后续直接返回缓存。
     pub fn load_index(&self) -> HashMap<String, PathBuf> {
         let mut guard = self.cache.lock().unwrap();
+        self.revalidate_locked(&mut guard);
         if let Some(index) = &guard.index {
             return index.clone();
         }
@@ -148,10 +151,42 @@ impl HarnessSkillMiddleware {
     /// (`CapabilitySurface` speaks skill *names*, one entry covering every copy).
     pub fn load_name_index(&self) -> HashMap<String, String> {
         let mut guard = self.cache.lock().unwrap();
+        self.revalidate_locked(&mut guard);
         if guard.names.is_none() {
             self.scan_index(&mut guard);
         }
         guard.names.clone().unwrap_or_default()
+    }
+
+    /// Combined cheap freshness stamp over every repository, or `None` when no repository can
+    /// summarise itself (caches then never auto-invalidate, as before).
+    fn repo_freshness(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut any = false;
+        for repo in &self.repos {
+            if let Some(stamp) = repo.freshness() {
+                any = true;
+                repo.repo_id().hash(&mut hasher);
+                stamp.hash(&mut hasher);
+            }
+        }
+        any.then(|| hasher.finish())
+    }
+
+    /// Drops the lazy cache when the repositories' freshness stamp changed.
+    ///
+    /// `invalidate()` alone only fires for writes made through `skill_manage`; a `SKILL.md`
+    /// created or edited by another process would otherwise stay invisible for the whole agent
+    /// lifetime (#2419 / #2420). The stamp is one `read_dir` per repository, never a re-read.
+    fn revalidate_locked(&self, guard: &mut SkillCache) {
+        let stamp = self.repo_freshness();
+        if stamp.is_some() && guard.freshness.is_some() && guard.freshness != stamp {
+            guard.catalog = None;
+            guard.index = None;
+            guard.names = None;
+        }
+        guard.freshness = stamp;
     }
 
     /// Scans every repository once and caches both the on-disk index and the name map.
@@ -174,6 +209,7 @@ impl HarnessSkillMiddleware {
     /// 惰性构建并缓存渲染目录（首次 on_system_prompt 时才扫描磁盘）。
     pub fn cached_catalog(&self) -> SkillCatalog {
         let mut guard = self.cache.lock().unwrap();
+        self.revalidate_locked(&mut guard);
         if let Some(catalog) = &guard.catalog {
             return catalog.clone();
         }
@@ -188,14 +224,15 @@ impl HarnessSkillMiddleware {
         guard.catalog = None;
         guard.index = None;
         guard.names = None;
+        guard.freshness = None;
     }
 
     /// Builds the catalog with shell-reachable `filesRoot` resolved per skill.
     fn build_rendered_catalog(&self) -> SkillCatalog {
         let entries = build_skill_entries(&self.repos, &self.filter, self.visibility.as_ref());
-        if entries.is_empty() {
-            return SkillCatalog::of(entries);
-        }
+        // No early return on an empty set: staging an empty visible set is what triggers
+        // `garbage_collect_orphans`, so `.skills-cache` still drops a skill that was deleted
+        // from its repository (#2664).
         let bound: Vec<RepoBound> = entries
             .iter()
             .map(|e| {
@@ -210,7 +247,26 @@ impl HarnessSkillMiddleware {
             })
             .collect();
         let kinds: Vec<SkillRepo> = bound.iter().map(|b| b.repo.clone()).collect();
-        let ns = stager::resolve_source_namespaces(&kinds);
+        // `resolve_source_namespaces` numbers *repositories*, so it must see each repository
+        // once: handing it one entry per skill gave every skill of one repository its own
+        // numbered folder (`user_1`, `user_2`, ...).
+        let mut unique: Vec<SkillRepo> = Vec::new();
+        for kind in &kinds {
+            if !unique.contains(kind) {
+                unique.push(kind.clone());
+            }
+        }
+        let repo_ns = stager::resolve_source_namespaces(&unique);
+        let ns: Vec<String> = kinds
+            .iter()
+            .map(|kind| {
+                unique
+                    .iter()
+                    .position(|candidate| candidate == kind)
+                    .and_then(|idx| repo_ns.get(idx).cloned())
+                    .unwrap_or_default()
+            })
+            .collect();
         let stage_map =
             stager::stage(self.workspace_root.as_deref(), &bound, &ns).unwrap_or_default();
 
@@ -413,6 +469,51 @@ mod tests {
             )),
         );
         ctx
+    }
+
+    #[test]
+    fn an_external_skill_write_invalidates_the_cached_catalog() {
+        let (mw, root) = two_skill_middleware("freshness");
+        assert_eq!(mw.cached_catalog().all().len(), 2);
+
+        // Another process adds a skill: no `skill_manage` write callback runs here (#2419).
+        write_skill(&root, "xlsx", "# XLSX\n");
+        let catalog = mw.cached_catalog();
+        assert_eq!(
+            catalog.all().len(),
+            3,
+            "a skill added outside skill_manage must become visible"
+        );
+        assert!(catalog.all().iter().any(|e| e.skill().name() == "xlsx"));
+
+        // Removing one is seen just as promptly.
+        std::fs::remove_dir_all(root.join("xlsx")).unwrap();
+        assert_eq!(mw.cached_catalog().all().len(), 2);
+    }
+
+    #[test]
+    fn deleting_a_skill_collects_its_staged_cache_on_both_entry_paths() {
+        let (mw, root) = two_skill_middleware("gc");
+        assert_eq!(mw.cached_catalog().all().len(), 2);
+        let cache = root.join(crate::agent::skill::stager::CACHE_DIR);
+        let staged_pdf = cache.join("user").join("pdf");
+        assert!(staged_pdf.join("SKILL.md").is_file());
+
+        // Non-empty entry: the remaining skill's pass drops the orphan.
+        std::fs::remove_dir_all(root.join("pdf")).unwrap();
+        assert_eq!(mw.cached_catalog().all().len(), 1);
+        assert!(
+            !staged_pdf.exists(),
+            "an orphan staged directory must be collected"
+        );
+
+        // Empty entry: deleting the last skill still runs orphan GC (#2664).
+        std::fs::remove_dir_all(root.join("docx")).unwrap();
+        assert!(mw.cached_catalog().is_empty());
+        assert!(
+            !cache.join("user").exists(),
+            "an empty catalog must still clear the staging cache"
+        );
     }
 
     #[tokio::test]

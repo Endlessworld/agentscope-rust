@@ -279,3 +279,21 @@ async fn task_tool_output_list_cancel() {
 
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn task_cancel_reports_a_missing_task_instead_of_success() {
+    // `task_cancel` answered "Cancellation requested successfully" for every id, so a caller
+    // could not tell a cancelled run from a typo.
+    let dir = temp_dir("tool_cancel_missing").await;
+    let repo = Arc::new(new_repo(&dir));
+    let tool = TaskTool::new(repo);
+
+    let mut args = JsonMap::new();
+    args.insert("task_id".to_string(), serde_json::json!("nope"));
+    let out = tool.cancel_tool().call(args, tctx("sess")).await.unwrap();
+    let text = out.text_content();
+    assert!(text.contains("No background task found"), "{text}");
+    assert!(!text.contains("successfully"), "{text}");
+
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}

@@ -71,6 +71,12 @@ impl HarnessPlatformTools {
         // Skills self-learning
         "skill_manage",
         "propose_skill",
+        // Skill disclosure. `load_skill_through_path` is registered *before* `ToolFilter::apply`,
+        // so an `allow` list in `tools.json` would otherwise strip it while
+        // `<available_skills>` keeps advertising the skills it loads (#1602).
+        "load_skill_through_path",
+        // On-demand tool disclosure (only registered when the host opts in)
+        "tool_search",
     ];
 
     /// `true` when `tool_name` is a harness platform tool.
@@ -430,6 +436,38 @@ mod tests {
             names,
             vec!["read_file".to_string(), "task_list".to_string()]
         );
+    }
+
+    #[test]
+    fn apply_keeps_the_skill_load_tool_outside_allow() {
+        // #1602: the skill prompt keeps advertising `load_skill_through_path`, so an `allow`
+        // list must not strip the tool that loads those skills.
+        let toolkit = toolkit_with(&["read_file", "load_skill_through_path", "skill_manage"]);
+        let config = ToolsConfig {
+            allow: vec!["read_file".into()],
+            deny: vec![],
+            mcp_servers: Default::default(),
+        };
+        ToolFilter::apply(&toolkit, &config);
+        let mut names = toolkit.tool_names();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "load_skill_through_path".to_string(),
+                "read_file".to_string(),
+                "skill_manage".to_string()
+            ]
+        );
+        // An explicit deny still wins.
+        assert!(!ToolFilter::is_allowed(
+            "load_skill_through_path",
+            Some(&ToolsConfig {
+                allow: vec![],
+                deny: vec!["load_skill_through_path".into()],
+                mcp_servers: Default::default(),
+            })
+        ));
     }
 
     #[test]

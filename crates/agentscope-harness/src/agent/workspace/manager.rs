@@ -6,13 +6,16 @@
 //! content is used (filesystem overrides). Otherwise the local workspace disk is
 //! read as a fallback.
 //!
+//! **Exception:** `AGENTS.md` and `knowledge/` are read from the host workspace **first**
+//! and the filesystem only as a fallback, so a sandbox-side shell write can never shadow or
+//! outlive the host definition.
+//!
 //! **Write path:** All writes (memory, sessions, tasks) go through the `Filesystem`.
 //!
 //! **Listing:** File listings (memory files, knowledge files, session logs) union
 //! results from both the filesystem layer and local disk, deduplicating by relative
 //! path.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -28,8 +31,58 @@ use super::constants::{
 use super::index::WorkspaceIndex;
 use super::namespace::NamespaceFactory;
 
-/// A per-path lock for workspace-relative files, keyed by relative path.
-type PathLocks = std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>;
+/// Workspace paths whose content is **host-authoritative**.
+///
+/// The host is the source of these definitions: the projection copies them into the sandbox,
+/// and the host copy wins over whatever the sandbox copy says. Without this, a
+/// `echo > AGENTS.md` through the sandbox shell shadowed the host definition for every later
+/// read and survived into the next session because a restorable snapshot skips
+/// re-projection (#3388).
+///
+/// Deliberately narrow:
+/// * `MEMORY.md` / `memory/` are agent-owned — the agent writes them through the filesystem
+///   layer, so they must keep filesystem precedence.
+/// * `skills/`, `subagents/` and `.skills-cache/` are also written by the agent
+///   (`skill_manage`, subagent materialization, skill staging), so host-first reads would hide
+///   legitimate writes. Their shell-written copies are reset by re-playing the projection on
+///   every sandbox start (see `DockerSandbox::replay_host_projection`).
+const HOST_AUTHORITATIVE_ROOTS: [&str; 2] = [AGENTS_MD, KNOWLEDGE_DIR];
+
+/// Whether `relative_path` is a host-authoritative definition file.
+fn is_host_authoritative(relative_path: &str) -> bool {
+    let normalized = relative_path.replace('\\', "/");
+    let normalized = normalized.trim_start_matches("./").trim_start_matches('/');
+    HOST_AUTHORITATIVE_ROOTS.iter().any(|root| {
+        let root: &str = *root;
+        normalized == root
+            || (normalized.len() > root.len()
+                && normalized.starts_with(root)
+                && normalized.as_bytes()[root.len()] == b'/')
+    })
+}
+
+/// A per-path lock for workspace-relative files.
+///
+/// A fixed stripe table, not a map keyed by path: the key comes from paths the model writes,
+/// so a map kept one entry per path for the lifetime of the agent (#2486). Two paths sharing a
+/// stripe serialise against each other, which is stricter than before and still correct.
+const PATH_LOCK_STRIPES: usize = 256;
+
+type PathLocks = [Arc<tokio::sync::Mutex<()>>; PATH_LOCK_STRIPES];
+
+fn path_lock_table() -> PathLocks {
+    std::array::from_fn(|_| Arc::new(tokio::sync::Mutex::new(())))
+}
+
+/// Stripe index of `rel` (FNV-1a: stable across runs, cheap for short paths).
+fn stripe_of(rel: &str) -> usize {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in rel.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash as usize) % PATH_LOCK_STRIPES
+}
 
 /// Stateless accessor for workspace content using a two-layer read architecture.
 pub struct WorkspaceManager {
@@ -59,7 +112,7 @@ impl WorkspaceManager {
             index,
             namespace_factory: None,
             owns_index: true,
-            path_locks: std::sync::Mutex::new(BTreeMap::new()),
+            path_locks: path_lock_table(),
             warned_legacy_root_copies: Default::default(),
         }
     }
@@ -76,7 +129,7 @@ impl WorkspaceManager {
             index,
             namespace_factory: None,
             owns_index: false,
-            path_locks: std::sync::Mutex::new(BTreeMap::new()),
+            path_locks: path_lock_table(),
             warned_legacy_root_copies: Default::default(),
         }
     }
@@ -94,7 +147,7 @@ impl WorkspaceManager {
             index,
             namespace_factory,
             owns_index: false,
-            path_locks: std::sync::Mutex::new(BTreeMap::new()),
+            path_locks: path_lock_table(),
             warned_legacy_root_copies: Default::default(),
         }
     }
@@ -122,11 +175,7 @@ impl WorkspaceManager {
 
     /// Acquires the per-path lock guard for the given relative path.
     fn lock_for(&self, rel: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.path_locks.lock().unwrap();
-        locks
-            .entry(rel.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        Arc::clone(&self.path_locks[stripe_of(rel)])
     }
 
     /// Validates the workspace exists and key files are present. Logs warnings for
@@ -236,11 +285,14 @@ impl WorkspaceManager {
         if let Some(fs) = &self.filesystem {
             if let Ok(matches) = fs.glob(ctx, "*", KNOWLEDGE_DIR).await {
                 for fi in matches {
-                    if !fi.path.trim().is_empty() {
-                        let rel = normalize_relative_path(fi.path.trim());
-                        if !rel.is_empty() {
-                            relative_paths.insert(rel);
-                        }
+                    // The listing is a menu of paths the model passes to `read_file`: a directory
+                    // entry cannot be read back, so only files are published (#2683).
+                    if fi.is_directory || fi.path.trim().is_empty() {
+                        continue;
+                    }
+                    let rel = normalize_relative_path(fi.path.trim());
+                    if !rel.is_empty() {
+                        relative_paths.insert(rel);
                     }
                 }
             }
@@ -298,7 +350,13 @@ impl WorkspaceManager {
                     Err(_) => String::new(),
                 };
                 let merged = format!("{existing}{content}");
-                let _ = write_through_fs(fs.as_ref(), ctx, &normalized, &merged).await;
+                if let Err(error) = write_through_fs(fs.as_ref(), ctx, &normalized, &merged).await {
+                    tracing::warn!(
+                        path = %normalized,
+                        %error,
+                        "workspace append did not reach the filesystem"
+                    );
+                }
             }
         }
     }
@@ -326,14 +384,27 @@ impl WorkspaceManager {
                 if let Some(index) = &self.index {
                     index.upsert(&normalized, content.len() as i64, None);
                 }
-                let _ = write_through_fs(fs.as_ref(), ctx, &normalized, content).await;
+                if let Err(error) = write_through_fs(fs.as_ref(), ctx, &normalized, content).await {
+                    tracing::warn!(
+                        path = %normalized,
+                        %error,
+                        "workspace write did not reach the filesystem"
+                    );
+                }
             }
         }
     }
 
     /// Returns the workspace-relative path of a task record store.
+    ///
+    /// The session id becomes one path segment through [`encode_path_segment`]: a raw id with
+    /// `:`, `/` or a space is rejected by NTFS (and escapes the directory on other systems),
+    /// and the previous code then lost the record silently (#2937).
     fn task_record_path(&self, agent_id: &str, session_id: &str) -> String {
-        format!("{AGENTS_DIR}/{agent_id}/{TASKS_DIR}/{session_id}.json")
+        format!(
+            "{AGENTS_DIR}/{agent_id}/{TASKS_DIR}/{}.json",
+            encode_path_segment(session_id)
+        )
     }
 
     /// Reads the task record map for the given relative path (empty when absent/unreadable).
@@ -540,8 +611,19 @@ impl WorkspaceManager {
             .replace('\\', "/")
     }
 
-    /// Two-layer read: filesystem first (namespaced), local disk fallback.
+    /// Two-layer read: filesystem first (namespaced), local disk fallback — except for the
+    /// host-authoritative definition paths, where the host copy wins and the filesystem is
+    /// only the fallback (see [`HOST_AUTHORITATIVE_ROOTS`]).
     async fn read_with_override(&self, ctx: &RuntimeContext, relative_path: &str) -> String {
+        if is_host_authoritative(relative_path) {
+            // `join` with an absolute-looking path would escape the workspace, so the host
+            // read uses the normalized (workspace-relative) spelling.
+            let normalized = normalize_relative_path(relative_path);
+            let host_content = read_file_quietly(&self.workspace.join(&normalized));
+            if !host_content.is_empty() {
+                return host_content;
+            }
+        }
         let fs_content = self.read_text_through_filesystem(ctx, relative_path).await;
         if !fs_content.is_empty() {
             return fs_content;
@@ -712,6 +794,27 @@ fn normalize_relative_path(relative_path: &str) -> String {
         .to_string()
 }
 
+/// Encodes an identity (session id, and anything else used as one path segment) safely.
+///
+/// An id made of `[A-Za-z0-9._-]` keeps its exact spelling, so task records written by an
+/// earlier build stay addressable. Anything else — a `:` from a composite session id, a `/`,
+/// a space — is prefixed with `enc_` and base64url-encoded: one segment, no separator, and
+/// nothing the OS can reject (#2937).
+pub(crate) fn encode_path_segment(value: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let plain = !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if plain {
+        return value.to_string();
+    }
+    format!("enc_{}", URL_SAFE_NO_PAD.encode(value.as_bytes()))
+}
+
 /// Validates and normalizes a relative path, rejecting `..` traversal.
 fn require_safe_relative_path(relative_path: &str) -> Result<String> {
     let normalized = normalize_relative_path(relative_path);
@@ -760,6 +863,96 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("as_ws_mgr_{name}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn stripe_locks_stay_bounded() {
+        let wm = WorkspaceManager::new(temp_dir("stripes"));
+        let mut seen = std::collections::HashSet::new();
+        for index in 0..10_000usize {
+            let lock = wm.lock_for(&format!("memory/day-{index}.md"));
+            seen.insert(Arc::as_ptr(&lock));
+        }
+        assert!(
+            seen.len() <= PATH_LOCK_STRIPES,
+            "lock table must stay bounded, saw {}",
+            seen.len()
+        );
+        // The same path always maps to the same lock.
+        assert!(Arc::ptr_eq(
+            &wm.lock_for("memory/same.md"),
+            &wm.lock_for("memory/same.md")
+        ));
+    }
+
+    #[tokio::test]
+    async fn task_records_with_an_unsafe_session_id_round_trip() {
+        let workspace = temp_dir("task_session_id");
+        let fs: Arc<dyn Filesystem> = Arc::new(crate::filesystem::LocalFilesystem::with_mode(
+            workspace.clone(),
+            crate::filesystem::LocalFsMode::Rooted,
+            10,
+        ));
+        let wm = WorkspaceManager::with_fs(workspace.clone(), Some(fs));
+        let ctx = RuntimeContext::new();
+        // `:` is rejected by NTFS and `/` escapes the directory, so the record used to be lost
+        // silently along with the swallowed write error (#2937).
+        let session_id = "agent:session/1";
+        let record = serde_json::json!({"status": "running"});
+        wm.write_task_record_json(&ctx, "agent-x", session_id, "task-1", &record)
+            .await;
+        assert_eq!(
+            wm.read_task_record_json(&ctx, "agent-x", session_id, "task-1")
+                .await,
+            Some(record)
+        );
+        let rel = wm.task_record_path("agent-x", session_id);
+        assert!(rel.contains("enc_"), "{rel}");
+        assert!(!rel.contains(':'), "{rel}");
+        assert_eq!(rel.matches('/').count(), 3, "{rel}");
+    }
+
+    /// The host definition files win over a (possibly sandbox-poisoned) filesystem copy, so a
+    /// `echo > AGENTS.md` through the sandbox shell cannot shadow what the host declares
+    /// (#3388). `MEMORY.md` stays filesystem-first: the agent owns it.
+    #[tokio::test]
+    async fn host_definitions_win_over_a_polluted_sandbox_copy() {
+        let host = temp_dir("host_authority");
+        let sandbox = temp_dir("host_authority_sandbox");
+        std::fs::write(host.join(AGENTS_MD), "# Host rules").unwrap();
+        std::fs::write(sandbox.join(AGENTS_MD), "# Sandbox rules").unwrap();
+        std::fs::write(sandbox.join(MEMORY_MD), "# Sandbox memory").unwrap();
+        std::fs::create_dir_all(sandbox.join(KNOWLEDGE_DIR)).unwrap();
+        std::fs::write(
+            sandbox.join(KNOWLEDGE_DIR).join(KNOWLEDGE_MD),
+            "# Sandbox knowledge",
+        )
+        .unwrap();
+        std::fs::create_dir_all(sandbox.join("skills/demo")).unwrap();
+        std::fs::write(sandbox.join("skills/demo/SKILL.md"), "# Poisoned skill").unwrap();
+
+        let fs: Arc<dyn Filesystem> = Arc::new(crate::filesystem::LocalFilesystem::with_mode(
+            sandbox.clone(),
+            crate::filesystem::LocalFsMode::Rooted,
+            10,
+        ));
+        let wm = WorkspaceManager::with_fs(host.clone(), Some(fs));
+        let ctx = RuntimeContext::new();
+
+        assert_eq!(wm.read_agents_md(&ctx).await, "# Host rules");
+        // No host copy → the filesystem copy is still served.
+        assert_eq!(wm.read_knowledge_md(&ctx).await, "# Sandbox knowledge");
+        // Agent-owned runtime data keeps filesystem precedence.
+        assert_eq!(wm.read_memory_md(&ctx).await, "# Sandbox memory");
+
+        // `AGENTS.md` and `knowledge/` are host-authoritative; agent-writable roots are not.
+        assert!(!is_host_authoritative("skills/demo/SKILL.md"));
+        assert!(is_host_authoritative("./knowledge/KNOWLEDGE.md"));
+        assert!(is_host_authoritative("/AGENTS.md"));
+        assert!(!is_host_authoritative("memory/2026-01-01.md"));
+        assert!(!is_host_authoritative("tools.json"));
+        let _ = std::fs::remove_dir_all(&host);
+        let _ = std::fs::remove_dir_all(&sandbox);
     }
 
     #[tokio::test]

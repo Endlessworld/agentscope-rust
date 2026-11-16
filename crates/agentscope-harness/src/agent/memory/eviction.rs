@@ -21,6 +21,8 @@ pub const DEFAULT_EVICTION_PATH: &str = "large_tool_results";
 ///
 /// `session_search` is deliberately absent: its match count is capped, but each match
 /// carries a whole stored message, so a few matches can exceed the threshold.
+/// `memory_search` is absent too: its output is capped by `maxResults` and per-line previews,
+/// so an oversized result there means a pathological workspace that eviction must still catch.
 pub fn default_excluded_tools() -> HashSet<String> {
     [
         "read_file",
@@ -29,7 +31,6 @@ pub fn default_excluded_tools() -> HashSet<String> {
         "grep_files",
         "glob_files",
         "list_files",
-        "memory_search",
         "memory_get",
     ]
     .into_iter()
@@ -159,6 +160,16 @@ mod tests {
         assert!(cfg.should_evict("session_search", 100_000));
         // Small results stay inline.
         assert!(!cfg.should_evict("session_search", 1_000));
+    }
+
+    #[test]
+    fn oversized_memory_search_results_are_evictable() {
+        // `memory_search` caps its own result count and previews, so it is no longer treated as
+        // self-paginating: a result this large means a pathological workspace.
+        let cfg = ToolResultEvictionConfig::defaults();
+        assert!(!cfg.excluded_tool_names.contains("memory_search"));
+        assert!(cfg.should_evict("memory_search", 100_000));
+        assert!(!cfg.should_evict("memory_search", 1_000));
     }
 
     #[test]

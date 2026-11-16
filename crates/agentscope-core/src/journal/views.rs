@@ -643,7 +643,12 @@ pub fn realign_tool_results(
         .filter_map(|result| result.id.clone())
         .collect();
     for (id, result) in results {
-        if existing.contains(id) || result.is_suspended() {
+        // A *suspended* result is a committed outcome as well, and skipping it re-opened the
+        // bug the realignment exists to prevent: the call looked unanswered, so the next acting
+        // phase re-entered a tool whose work had already been handed to an external executor
+        // (#4104). The block keeps `state = Suspended`, so the model still sees that no result
+        // exists yet — it is the request being replayed, not a fabricated answer.
+        if existing.contains(id) {
             continue;
         }
         let mut block = result.clone();
@@ -1428,6 +1433,50 @@ mod tests {
             .filter(|m| m.id.starts_with("recovered_call-1"))
             .collect();
         assert_eq!(recovered.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_committed_suspended_result_is_realigned_so_the_tool_is_not_run_again() {
+        // #4104: a suspended call has no result the model can use, but its request *was*
+        // dispatched and is waiting on an external executor. Leaving it out of the recovered
+        // context made the next acting phase enter the tool a second time.
+        let (_storage, log, writer) = journal().await;
+        let state = crate::state::AgentState::builder().session_id("s1").build();
+        let result = ToolResultBlock::new("call-1", "await_approval", text_blocks("pending"))
+            .with_state(ToolResultState::Suspended);
+        commit(
+            &*log,
+            &writer,
+            "b1",
+            &[
+                event(
+                    1,
+                    "state/checkpoint",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "stateJson": state.to_json().unwrap() }),
+                ),
+                event(
+                    2,
+                    "action/end",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "toolCallId": "call-1", "result": serde_json::to_value(&result).unwrap() }),
+                ),
+                event(3, "run/end", Some("run-1"), Some("t1"), serde_json::json!({ "status": "suspended" })),
+            ],
+        )
+        .await;
+
+        let projection = JournalProjection::read(&*log).await.unwrap();
+        let restored = projection.restore().unwrap().unwrap();
+        let replayed = restored
+            .context
+            .iter()
+            .flat_map(|message| message.tool_result_blocks())
+            .find(|block| block.id.as_deref() == Some("call-1"))
+            .expect("the suspended request must be replayed into the context");
+        assert!(replayed.is_suspended());
     }
 
     #[tokio::test]

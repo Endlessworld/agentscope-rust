@@ -18,7 +18,7 @@ use super::policy::{ApproximateEstimator, EstimateInput, TokenEstimator};
 /// The manifest method string when the count is anchored on provider usage.
 pub const PROVIDER_METHOD: &str = "provider-usage-anchored-v1";
 /// The manifest method string when only the local estimator is available.
-pub const LOCAL_METHOD: &str = "mixed-text-2.5chars-media-sized-v2";
+pub const LOCAL_METHOD: &str = "mixed-text-weighted-media-sized-v3";
 
 /// Which authority produced a [`ContextUsage`] count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

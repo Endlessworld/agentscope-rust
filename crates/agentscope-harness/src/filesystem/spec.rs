@@ -192,7 +192,7 @@ impl RemoteFilesystemSpec {
     }
 
     /// When `true`, the default backend serves the workspace root directly (sandboxed paths,
-    /// no per-user layout) instead of the unrestricted local backend.
+    /// no per-user layout) instead of the rooted local backend.
     pub fn shared_local_workspace(mut self, shared: bool) -> Self {
         self.shared_local_workspace = shared;
         self
@@ -208,7 +208,14 @@ impl RemoteFilesystemSpec {
         let default_backend: Arc<dyn Filesystem> = if self.shared_local_workspace {
             Arc::new(LocalFilesystem::sandboxed(workspace))
         } else {
-            Arc::new(LocalFilesystem::new(workspace))
+            // Rooted, not unrestricted: an unrestricted backend resolved any host path, so
+            // `read_file("/etc/passwd")` / `list_files("/tmp")` read the host filesystem while
+            // the workspace stayed reachable through workspace-relative paths (#3258).
+            Arc::new(LocalFilesystem::with_mode(
+                workspace,
+                LocalFsMode::Rooted,
+                10,
+            ))
         };
         let workspace_template = || -> Arc<dyn Filesystem> {
             Arc::new(LocalFilesystem::sandboxed(workspace)) as Arc<dyn Filesystem>
@@ -220,7 +227,13 @@ impl RemoteFilesystemSpec {
         for file in ROOT_SHARED_FILES {
             routes.push((
                 file.to_string(),
-                self.overlay_route("root", None, agent_id, workspace_template()),
+                self.overlay_route(
+                    self.isolation_scope,
+                    "root",
+                    None,
+                    agent_id,
+                    workspace_template(),
+                ),
             ));
         }
         for prefix in SHARED_PREFIXES {
@@ -230,6 +243,22 @@ impl RemoteFilesystemSpec {
         routes.push(self.prefix_route(workspace, &sessions, "sessions", agent_id));
         let tasks = format!("agents/{agent_id}/tasks/");
         routes.push(self.prefix_route(workspace, &tasks, "tasks", agent_id));
+        // Session journals live under `.agentscope/sessions/<agent>/<user>/<session>`
+        // (`ThreadKey::storage_path`), outside every route above, so a shared-store deployment
+        // still wrote them to replica-local disk and a second replica saw no history
+        // (#2918/#2091). The route stays user-scoped when the store is session-scoped: the
+        // path already carries the session id, and `ThreadJournalStore::list` must see every
+        // session of the namespace.
+        routes.push((
+            ".agentscope/".to_string(),
+            self.overlay_route(
+                IsolationScope::User,
+                "session-log",
+                Some("session-log"),
+                agent_id,
+                Arc::new(LocalFilesystem::sandboxed(workspace.join(".agentscope"))),
+            ),
+        ));
         for prefix in &self.extra_shared_prefixes {
             routes.push(self.prefix_route(workspace, prefix, route_segment(prefix), agent_id));
         }
@@ -248,19 +277,26 @@ impl RemoteFilesystemSpec {
         let lower = Arc::new(LocalFilesystem::sandboxed(template)) as Arc<dyn Filesystem>;
         (
             prefix.to_string(),
-            self.overlay_route(prefix, Some(namespace_segment), agent_id, lower),
+            self.overlay_route(
+                self.isolation_scope,
+                prefix,
+                Some(namespace_segment),
+                agent_id,
+                lower,
+            ),
         )
     }
 
     fn overlay_route(
         &self,
+        scope: IsolationScope,
         route_segment: &str,
         namespace_segment: Option<&str>,
         agent_id: &str,
         lower: Arc<dyn Filesystem>,
     ) -> Arc<dyn Filesystem> {
         let namespace: Arc<dyn NamespaceFactory> = Arc::new(ScopedRouteNamespace {
-            scope: self.isolation_scope,
+            scope,
             agent_id: agent_id.to_string(),
             anonymous_user_id: self.anonymous_user_id.clone(),
             segment: namespace_segment
@@ -352,6 +388,7 @@ pub struct SandboxFilesystemSpec {
     isolation_scope: Option<IsolationScope>,
     workspace_projection_enabled: bool,
     workspace_projection_roots: Vec<String>,
+    reuse_on_release: bool,
 }
 
 impl std::fmt::Debug for SandboxFilesystemSpec {
@@ -368,6 +405,7 @@ impl std::fmt::Debug for SandboxFilesystemSpec {
                 "workspace_projection_roots",
                 &self.workspace_projection_roots,
             )
+            .field("reuse_on_release", &self.reuse_on_release)
             .finish()
     }
 }
@@ -385,6 +423,7 @@ impl SandboxFilesystemSpec {
                 .iter()
                 .map(|root| root.to_string())
                 .collect(),
+            reuse_on_release: false,
         }
     }
 
@@ -415,6 +454,20 @@ impl SandboxFilesystemSpec {
 
     pub fn get_isolation_scope(&self) -> Option<IsolationScope> {
         self.isolation_scope
+    }
+
+    /// Keeps the sandbox backend (container / K8s claim) alive between calls.
+    ///
+    /// Without it every call ends with `close()`, i.e. the claim is deleted and the next call
+    /// rebuilds the whole sandbox (#2979). Reuse is opt-in because it trades cleanliness for
+    /// speed: the resource is only removed by an explicit close or by its expiry.
+    pub fn reuse_on_release(mut self, reuse: bool) -> Self {
+        self.reuse_on_release = reuse;
+        self
+    }
+
+    pub fn get_reuse_on_release(&self) -> bool {
+        self.reuse_on_release
     }
 
     pub fn workspace_projection_enabled(mut self, enabled: bool) -> Self {
@@ -453,9 +506,11 @@ impl SandboxFilesystemSpec {
     /// Consumes the spec into a [`SandboxContext`] (Java `toSandboxContext`).
     pub fn into_sandbox_context(self, host_workspace_root: Option<&Path>) -> SandboxContext {
         let workspace_spec = self.workspace_spec(host_workspace_root);
+        let reuse_on_release = self.reuse_on_release;
         let mut builder = SandboxContext::builder()
             .client(self.client)
-            .workspace_spec(workspace_spec);
+            .workspace_spec(workspace_spec)
+            .reuse_on_release(reuse_on_release);
         if let Some(options) = self.client_options {
             builder = builder.client_options(options);
         }
@@ -566,6 +621,64 @@ mod tests {
             "local"
         );
         assert_eq!(store.size(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn remote_spec_default_backend_stays_inside_the_workspace() {
+        let root = temp_dir("remote_host_paths");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("notes.md"), "workspace notes").unwrap();
+
+        let store = Arc::new(InMemoryStore::new());
+        let fs = RemoteFilesystemSpec::new(store).build(&workspace, "agent-x");
+        let ctx = RuntimeContext::default().with_user_id("u1");
+
+        // Workspace files stay reachable through both spellings.
+        for path in ["notes.md", "/notes.md"] {
+            assert_eq!(
+                fs.read(&ctx, path, 0, 100).await.unwrap().content,
+                "workspace notes",
+                "{path}"
+            );
+        }
+        // A host path is anchored to the workspace instead of reading the host filesystem.
+        let error = fs
+            .read(&ctx, "/etc/passwd", 0, 100)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains("root:x:"),
+            "host content leaked through the default backend: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn session_journals_route_to_the_shared_store() {
+        // Journals live under `.agentscope/sessions/...`. Without a route they were written to
+        // replica-local disk, so a second replica saw no history (#2918/#2091).
+        let root = temp_dir("session_route");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let store: Arc<dyn BaseStore> = Arc::new(InMemoryStore::new());
+        let writer = RemoteFilesystemSpec::new(Arc::clone(&store)).build(&first, "agent-x");
+        let reader = RemoteFilesystemSpec::new(Arc::clone(&store)).build(&second, "agent-x");
+
+        let ctx = RuntimeContext::default().with_user_id("u1");
+        let path = ".agentscope/sessions/s_agent/s_u1/s_session/head.json";
+        writer.write(&ctx, path, "{\"seq\":1}").await.unwrap();
+        assert_eq!(
+            reader.read(&ctx, path, 0, 100).await.unwrap().content,
+            "{\"seq\":1}"
+        );
+        // The journal never hit the replica-local workspace.
+        assert!(!first.join(path).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -699,5 +812,18 @@ mod tests {
         );
         assert!(context.client().is_some());
         assert!(context.workspace_spec().is_some());
+    }
+
+    /// The reuse flag decides whether `release` closes the backend or only stops it (K8s
+    /// claims / containers survive), so it must reach the context (#2979).
+    #[test]
+    fn sandbox_spec_carries_the_reuse_flag_into_the_context() {
+        let default_spec = SandboxFilesystemSpec::new(Box::new(NoopSandboxClient));
+        assert!(!default_spec.get_reuse_on_release());
+        assert!(!default_spec.into_sandbox_context(None).reuse_on_release());
+
+        let reusable =
+            SandboxFilesystemSpec::new(Box::new(NoopSandboxClient)).reuse_on_release(true);
+        assert!(reusable.into_sandbox_context(None).reuse_on_release());
     }
 }

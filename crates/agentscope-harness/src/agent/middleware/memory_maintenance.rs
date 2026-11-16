@@ -22,13 +22,13 @@ use crate::filesystem::Filesystem;
 /// Default minimum gap between two maintenance runs (30 minutes).
 pub const DEFAULT_MIN_GAP_SECS: i64 = 1800;
 
-/// Upper bound on the idle window of a session journal, in days.
+/// Default idle window of a session journal, in days, when the host does not configure one.
 ///
 /// The event log carries a full-context checkpoint per model call, so a journal grows with the
 /// conversation while a single-file transcript did not: an abandoned sub-agent namespace reached
-/// tens of gigabytes. Journals therefore age out faster than `session_retention_days` (180 by
-/// default); `AGENTSCOPE_JOURNAL_RETENTION_DAYS` overrides the window for hosts that want to keep
-/// (or drop) them sooner.
+/// tens of gigabytes. Journals therefore default to a shorter window than
+/// `session_retention_days` (180); `AGENTSCOPE_JOURNAL_RETENTION_DAYS` overrides it, and a
+/// host-configured `session_retention_days` is used as configured (never capped by this value).
 pub const DEFAULT_JOURNAL_RETENTION_DAYS: i64 = 30;
 
 /// Environment override for the idle window applied to session journals, in days.
@@ -52,6 +52,27 @@ const MAX_JOURNAL_DEPTH: usize = 4;
 /// Process-wide per-isolation-key maintenance timestamps (millis).
 static SHARED_LAST_RUN_AT: std::sync::Mutex<Vec<(String, i64)>> = std::sync::Mutex::new(Vec::new());
 
+/// Per-key serial queues for the background maintenance pass.
+///
+/// The pass used to be chained onto the agent stream, so every subscriber waited for the
+/// consolidator's model call before `onComplete`. It now runs in its own task; the queue
+/// keeps two runs of the same key from consolidating concurrently.
+static MAINTENANCE_QUEUES: std::sync::Mutex<Vec<(String, Arc<tokio::sync::Mutex<()>>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The serial queue for `key`, created on first use.
+fn maintenance_queue(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut queues = MAINTENANCE_QUEUES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, queue)) = queues.iter().find(|(candidate, _)| candidate == key) {
+        return Arc::clone(queue);
+    }
+    let queue = Arc::new(tokio::sync::Mutex::new(()));
+    queues.push((key.to_string(), Arc::clone(&queue)));
+    queue
+}
+
 /// Middleware that performs periodic memory maintenance after each agent call.
 pub struct MemoryMaintenanceMiddleware {
     fs: Arc<dyn Filesystem>,
@@ -60,6 +81,9 @@ pub struct MemoryMaintenanceMiddleware {
     session_retention_days: i64,
     min_gap: chrono::Duration,
     isolation_scope: IsolationScope,
+    /// Whether the memory steps (daily-file expiry, consolidation) run. Session pruning is
+    /// storage governance and keeps running even when the memory hooks are disabled.
+    memory_steps: bool,
 }
 
 impl MemoryMaintenanceMiddleware {
@@ -92,7 +116,18 @@ impl MemoryMaintenanceMiddleware {
             session_retention_days,
             min_gap,
             isolation_scope,
+            memory_steps: true,
         }
+    }
+
+    /// Keeps only the storage-governance step (session pruning).
+    ///
+    /// `disable_memory_hooks` used to drop this middleware entirely, so turning the memory
+    /// hooks off also stopped pruning abandoned journals.
+    pub fn sessions_only(mut self) -> Self {
+        self.memory_steps = false;
+        self.consolidator = None;
+        self
     }
 
     /// Minimum gap enforced between two maintenance runs.
@@ -121,28 +156,31 @@ impl MemoryMaintenanceMiddleware {
         let key = format!("{:?}:{}", self.isolation_scope, self.timer_key_for(ctx));
         let now = chrono::Utc::now().timestamp_millis();
         let gap_ms = self.min_gap.num_milliseconds();
-        let mut map = SHARED_LAST_RUN_AT.lock().unwrap();
-        let last = map
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, t)| *t)
-            .unwrap_or(0);
+        let mut map = SHARED_LAST_RUN_AT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(last) = map.iter().find(|(k, _)| *k == key).map(|(_, t)| *t) else {
+            // Cold start: no timestamp is not the epoch. `now - 0` always exceeded the gap,
+            // so the first call of every session ran a consolidation unconditionally.
+            map.push((key, now));
+            return false;
+        };
         if now.saturating_sub(last) < gap_ms.max(0) {
             return false;
         }
         if let Some(slot) = map.iter_mut().find(|(k, _)| *k == key) {
             slot.1 = now;
-        } else {
-            map.push((key, now));
         }
         true
     }
 
     /// Runs the maintenance steps: expire daily files, consolidate, prune sessions.
     async fn run_maintenance(&self, ctx: &RuntimeContext) {
-        self.expire_daily_files(ctx).await;
-        if let Some(consolidator) = &self.consolidator {
-            let _ = consolidator.consolidate(ctx).await;
+        if self.memory_steps {
+            self.expire_daily_files(ctx).await;
+            if let Some(consolidator) = &self.consolidator {
+                let _ = consolidator.consolidate(ctx).await;
+            }
         }
         self.prune_old_sessions(ctx).await;
     }
@@ -216,17 +254,17 @@ impl MemoryMaintenanceMiddleware {
         }
     }
 
-    /// Idle window applied to journals: the configured session retention, capped by
-    /// [`DEFAULT_JOURNAL_RETENTION_DAYS`] unless the environment says otherwise.
+    /// Idle window applied to journals: the configured session retention, overridable by
+    /// [`JOURNAL_RETENTION_ENV`].
+    ///
+    /// The value is taken as configured: silently capping it at the journal default made a
+    /// deliberately longer window (180 days) behave like 30.
     fn journal_retention(&self) -> chrono::Duration {
         let days = std::env::var(JOURNAL_RETENTION_ENV)
             .ok()
             .and_then(|value| value.trim().parse::<i64>().ok())
             .filter(|days| *days >= 0)
-            .unwrap_or_else(|| {
-                self.session_retention_days
-                    .min(DEFAULT_JOURNAL_RETENTION_DAYS)
-            });
+            .unwrap_or(self.session_retention_days.max(0));
         chrono::Duration::days(days)
     }
 }
@@ -271,12 +309,14 @@ impl Middleware for MemoryMaintenanceMiddleware {
         let consolidator = self.consolidator.clone();
         let daily = self.daily_file_retention_days;
         let session = self.session_retention_days;
+        let memory_steps = self.memory_steps;
         let should_run = self.should_run_now(&ctx);
+        let queue_key = format!("{:?}:{}", self.isolation_scope, self.timer_key_for(&ctx));
 
-        let downstream = next(input);
-        let tail = async move {
+        let fut = async move {
+            let downstream = next(input);
             if !should_run {
-                return Vec::new();
+                return downstream;
             }
             let mw = MemoryMaintenanceMiddleware {
                 fs,
@@ -285,17 +325,42 @@ impl Middleware for MemoryMaintenanceMiddleware {
                 session_retention_days: session,
                 min_gap: chrono::Duration::zero(),
                 isolation_scope: IsolationScope::User,
+                memory_steps,
             };
-            mw.run_maintenance(&ctx).await;
-            Vec::new()
-        };
-        Box::pin(
-            downstream.chain(
-                futures::stream::once(tail)
+            let maintenance = async move { mw.run_maintenance(&ctx).await };
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    // Same rule as the flush: the sweep can call the model (consolidation), so it
+                    // starts only once this turn's stream is finished. Spawning keeps the
+                    // completion event immediate.
+                    let tail_handle = handle.clone();
+                    let queue = maintenance_queue(&queue_key);
+                    let start = futures::stream::once(async move {
+                        tail_handle.spawn(async move {
+                            let _serial = queue.lock().await;
+                            maintenance.await;
+                        });
+                        Vec::new()
+                    })
                     .map(futures::stream::iter)
-                    .flatten(),
-            ),
-        )
+                    .flatten();
+                    let out: EventStream = Box::pin(downstream.chain(start));
+                    out
+                }
+                // No runtime: the inline path is the only way to keep the sweep.
+                Err(_) => Box::pin(
+                    downstream.chain(
+                        futures::stream::once(async move {
+                            maintenance.await;
+                            Vec::new()
+                        })
+                        .map(futures::stream::iter)
+                        .flatten(),
+                    ),
+                ),
+            }
+        };
+        Box::pin(futures::stream::once(fut).flatten())
     }
 }
 
@@ -329,6 +394,7 @@ mod tests {
             session_retention_days: 180,
             min_gap: chrono::Duration::zero(),
             isolation_scope: IsolationScope::User,
+            memory_steps: true,
         };
         mw.expire_daily_files(&ctx).await;
 
@@ -365,12 +431,12 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Only the head file is inspected for idleness, so age it like an abandoned session.
+        // Only the head file is inspected for idleness, so age it past the 180-day window.
         let head = std::fs::File::options()
             .write(true)
             .open(Path::new(&dir).join(&idle).join("head.json"))
             .unwrap();
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(200 * 86_400);
         head.set_times(std::fs::FileTimes::new().set_modified(old))
             .unwrap();
         drop(head);
@@ -382,6 +448,7 @@ mod tests {
             session_retention_days: 180,
             min_gap: chrono::Duration::zero(),
             isolation_scope: IsolationScope::User,
+            memory_steps: true,
         };
         mw.prune_old_sessions(&ctx).await;
 
@@ -401,10 +468,11 @@ mod tests {
         );
     }
 
-    /// The days-window for journals is capped by the journal default and overridable, because a
-    /// journal grows per model call and cannot ride the 180-day transcript window.
+    /// The days-window for journals follows the configured session retention, and the
+    /// environment still overrides it. Capping it at the journal default made a deliberately
+    /// longer window (180 days) behave like 30.
     #[tokio::test]
-    async fn journal_retention_is_capped_and_overridable() {
+    async fn journal_retention_follows_the_configured_window() {
         let mw = MemoryMaintenanceMiddleware {
             fs: Arc::new(LocalFilesystem::sandboxed(std::env::temp_dir())),
             consolidator: None,
@@ -412,11 +480,9 @@ mod tests {
             session_retention_days: 180,
             min_gap: chrono::Duration::zero(),
             isolation_scope: IsolationScope::User,
+            memory_steps: true,
         };
-        assert_eq!(
-            mw.journal_retention(),
-            chrono::Duration::days(DEFAULT_JOURNAL_RETENTION_DAYS)
-        );
+        assert_eq!(mw.journal_retention(), chrono::Duration::days(180));
         let shorter = MemoryMaintenanceMiddleware {
             fs: Arc::clone(&mw.fs),
             consolidator: None,
@@ -424,6 +490,7 @@ mod tests {
             session_retention_days: 7,
             min_gap: chrono::Duration::zero(),
             isolation_scope: IsolationScope::User,
+            memory_steps: true,
         };
         assert_eq!(shorter.journal_retention(), chrono::Duration::days(7));
     }
@@ -442,8 +509,55 @@ mod tests {
             session_retention_days: 180,
             min_gap: chrono::Duration::seconds(3600),
             isolation_scope: IsolationScope::User,
+            memory_steps: true,
         };
-        assert!(mw.should_run_now(&ctx));
+        // The first call only opens the throttle window: "no timestamp" must not mean "the
+        // epoch", which made every session's first call run a consolidation.
+        assert!(!mw.should_run_now(&ctx));
         assert!(!mw.should_run_now(&ctx)); // within gap
+        let fresh = MemoryMaintenanceMiddleware {
+            fs: Arc::new(LocalFilesystem::sandboxed(std::env::temp_dir())),
+            consolidator: None,
+            daily_file_retention_days: 90,
+            session_retention_days: 180,
+            min_gap: chrono::Duration::zero(),
+            isolation_scope: IsolationScope::User,
+            memory_steps: true,
+        };
+        assert!(fresh.should_run_now(&ctx));
+    }
+
+    /// Session pruning is storage governance, not a memory hook: turning the hooks off used
+    /// to stop abandoned journals being dropped entirely.
+    #[tokio::test]
+    async fn sessions_only_skips_the_memory_steps() {
+        let dir =
+            std::env::temp_dir().join(format!("agentscope_maint_only_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(dir));
+        let ctx = RuntimeContext::new();
+        fs.write(&ctx, &format!("{MEMORY_DIR}/2020-01-01.md"), "old")
+            .await
+            .unwrap();
+        let mw = MemoryMaintenanceMiddleware {
+            fs: fs.clone(),
+            consolidator: None,
+            daily_file_retention_days: 90,
+            session_retention_days: 180,
+            min_gap: chrono::Duration::zero(),
+            isolation_scope: IsolationScope::User,
+            memory_steps: true,
+        }
+        .sessions_only();
+
+        mw.run_maintenance(&ctx).await;
+
+        assert!(
+            fs.exists(&ctx, &format!("{MEMORY_DIR}/2020-01-01.md"))
+                .await
+                .unwrap(),
+            "disabling the memory hooks must not archive the daily ledger"
+        );
     }
 }

@@ -133,6 +133,12 @@ impl CapabilitySurface {
     /// `is_system` marks framework capabilities (meta tools), which bypass trimming exactly like
     /// an unrestricted surface: revoking them would break the agent's own bookkeeping rather
     /// than withhold a user capability.
+    ///
+    /// A granted skill also grants its companion tool list (`<skillId>_skill_tools`): granting a
+    /// skill without its tools left the model able to see the skill but unable to call anything
+    /// it documents, reported as the indistinguishable "tool not found" (#2169). A bare
+    /// `<skillId>_` prefix is deliberately *not* used: it would also admit unrelated siblings
+    /// such as `pdf_export_v2_merge` when only `pdf_export` is granted.
     pub fn grants_tool(&self, name: &str, groups: &[String], is_system: bool) -> bool {
         if is_system || self.is_unrestricted() {
             return true;
@@ -144,7 +150,22 @@ impl CapabilitySurface {
         {
             return true;
         }
+        if self.grants_skill_tools(name) {
+            return true;
+        }
         groups.iter().any(|group| self.grants_tool_group(group))
+    }
+
+    /// Whether a granted skill owns `tool` through the `<skillId>_skill_tools` convention.
+    fn grants_skill_tools(&self, tool: &str) -> bool {
+        let Some(skills) = &self.allowed_skills else {
+            return false;
+        };
+        skills.iter().any(|skill| {
+            tool.len() == skill.len() + "_skill_tools".len()
+                && tool.starts_with(skill.as_str())
+                && tool[skill.len()..] == *"_skill_tools"
+        })
     }
 }
 
@@ -245,6 +266,22 @@ mod tests {
         // Layers are independent: granting a skill says nothing about tool groups/names.
         let surface = CapabilitySurface::new(Some(names(&["pdf_export"])), Some(names(&[])), None);
         assert!(!surface.grants_tool("web_read", &[], false));
+    }
+
+    #[test]
+    fn a_skill_grant_admits_its_companion_tool_list() {
+        // `<skillId>_skill_tools` belongs to the skill (#2169).
+        let surface =
+            CapabilitySurface::new(Some(names(&["pdf_export"])), Some(names(&["search"])), None);
+        assert!(surface.grants_tool("pdf_export_skill_tools", &[], false));
+        // A bare prefix would also admit unrelated siblings, so prefixed tools stay withheld.
+        assert!(!surface.grants_tool("pdf_export_merge", &[], false));
+        assert!(!surface.grants_tool("pdf_export_v2_merge", &[], false));
+        assert!(!surface.grants_tool("pdfexport_merge", &[], false));
+        assert!(!surface.grants_tool("web_read", &[], false));
+        // An explicit positive group grant and the system mark keep working.
+        assert!(surface.grants_tool("anything", &groups(&["search"]), false));
+        assert!(surface.grants_tool("reset_equipped_tools", &[], true));
     }
 
     #[test]

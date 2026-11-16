@@ -6,6 +6,7 @@
 //! workspace / filesystem / memory / subagent / plan-mode orchestration. Use
 //! [`HarnessAgentBuilder`] to configure. For plain ReAct usage without any of the above,
 //! use `ReActAgent::builder()` directly.
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,8 +30,8 @@ use agentscope_core::state::ConflictPolicy;
 use agentscope_core::tool::{Tool, Toolkit};
 
 use crate::filesystem::{
-    CompositeFilesystem, Filesystem, LocalFilesystem, LocalFilesystemSpec, RemoteFilesystemSpec,
-    SandboxFilesystemSpec,
+    CompositeFilesystem, Filesystem, FilesystemKind, LocalFilesystem, LocalFilesystemSpec,
+    LocalFsMode, RemoteFilesystemSpec, SandboxFilesystemSpec,
 };
 use crate::tool::CompactConfig;
 
@@ -53,6 +54,7 @@ use super::middleware::{
     ToolCallPairSanitizerMiddleware, ToolResultEvictionMiddleware, WorkspaceContextMiddleware,
 };
 use super::sandbox::{SandboxContext, SandboxManager};
+use super::session::WorkspaceThreadJournalStore;
 use super::shutdown::GracefulShutdownController;
 use super::skill::{
     build_promoter, compose_skill_repositories, default_gate, AuditEntry,
@@ -65,7 +67,7 @@ use super::subagent::task::repository::TaskRepository;
 use super::subagent::task::WorkspaceTaskRepository;
 use super::subagent::{
     CustomSubagentFactory, DefaultAgentManager, SharedModelSlot, SubagentBlueprint,
-    SubagentDeclaration, SubagentEntry,
+    SubagentDeclaration, SubagentEntry, ToolkitProviderSlot,
 };
 use super::team::{TeamClient, TeamContext};
 use super::tools::{ToolFilter, ToolsConfig, ToolsConfigLoader};
@@ -145,6 +147,15 @@ pub struct HarnessAgent {
     /// The core agent owns the recorder/persistence path; this handle is only used by read
     /// APIs (`session/list`) that need to enumerate sessions from the same backend.
     session_log_store: Option<Arc<dyn ThreadJournalStore>>,
+    /// The concrete workspace store behind [`Self::session_log_store`], when this build created
+    /// it (a caller-supplied store stays opaque). Deletion needs it because
+    /// `ThreadJournalStore::delete` has no runtime context.
+    workspace_journal_store: Option<Arc<WorkspaceThreadJournalStore>>,
+    /// Which history authority this agent runs (journal vs. state-store snapshot).
+    session_history_mode: SessionHistoryMode,
+    /// The state store that owns history in [`SessionHistoryMode::Legacy`], so
+    /// `session/delete` can remove the snapshot there.
+    legacy_state_store: Option<Arc<dyn AgentStateStore>>,
     /// 该 agent 的优雅关闭管理器（默认每个 agent 一个独立实例）。
     shutdown_manager: Arc<GracefulShutdownManager>,
     /// Shared slot bridging runtime model switches to subagent factories: when
@@ -161,6 +172,10 @@ pub struct HarnessAgent {
 
 /// The default maximum reasoning→acting iterations used when none is configured.
 const DEFAULT_MAX_ITERS: i32 = 10;
+
+/// Default maximum size of a single workspace file read through the filesystem tools (`10 MiB,
+/// the `LocalFilesystemSpec` default).
+const DEFAULT_MAX_FILE_SIZE_MB: usize = 10;
 
 /// Default workspace-relative directory for plan files.
 const DEFAULT_PLAN_DIR: &str = "plans";
@@ -556,12 +571,19 @@ impl HarnessAgent {
         store.list(context).await
     }
 
-    /// Deletes the persisted journal of the session bound to `context`.
+    /// Deletes the persisted history of the session bound to `context`.
     ///
     /// `session/delete` needs this: a journal that survives the deletion keeps the session
     /// discoverable (and loadable) after the client asked for it to be gone. A backend without
     /// deletion reports the error instead of pretending the history is gone.
+    ///
+    /// In [`SessionHistoryMode::Legacy`] the state-store snapshot is the history authority, so
+    /// the deletion targets that record and succeeds once it is gone (there is no journal to
+    /// delete, which is not an error).
     pub async fn delete_session(&self, context: &RuntimeContext) -> crate::Result<()> {
+        if self.session_history_mode == SessionHistoryMode::Legacy {
+            return self.delete_legacy_session(context).await;
+        }
         let store = self
             .session_log_store
             .as_ref()
@@ -569,7 +591,37 @@ impl HarnessAgent {
         let key = self.session_key(context).ok_or_else(|| {
             crate::Error::Journal("native session history is not enabled for this agent".into())
         })?;
-        store.delete(&key).await
+        match &self.workspace_journal_store {
+            // The workspace store addresses the caller's namespace; the trait method would
+            // delete in the anonymous one (#2918).
+            Some(workspace) => workspace.delete_in(&key, context).await,
+            None => store.delete(&key).await,
+        }
+    }
+
+    /// Deletes the legacy-mode session snapshot for `context`.
+    ///
+    /// Failure is propagated: a caller told the session is gone while its snapshot is still
+    /// there would reload the deleted conversation on the next call.
+    async fn delete_legacy_session(&self, context: &RuntimeContext) -> crate::Result<()> {
+        let Some(store) = &self.legacy_state_store else {
+            // No state store means nothing was ever persisted for this session.
+            return Ok(());
+        };
+        let session_id = context
+            .session_id()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                crate::Error::Journal("a session id is required to delete a session".into())
+            })?;
+        store
+            .try_delete(context.user_id(), session_id)
+            .await
+            .map_err(|error| {
+                crate::Error::Journal(format!(
+                    "could not delete the legacy session state: {error}"
+                ))
+            })
     }
 
     /// Reads the replayable transcript of the session bound to `context`. Mirrors Java
@@ -814,10 +866,13 @@ impl HarnessAgent {
     /// `agentscope-extensions-acp` 的 `spawn_shutdown_handler`）在收到 Ctrl-C /
     /// SIGTERM 后调用本方法即可。返回 `true` 表示已经到达 `Terminated`。
     pub async fn shutdown(&self) -> bool {
-        // Keep the last resolvable copy of every live background task. A record write that
+        // Closing is a write barrier: the repository's heartbeat rewrites the task store every
+        // 30 s in the background, so a write landing after close could resurrect records the
+        // host already considers gone. `shutdown` persists the live handles (a record write that
         // failed while the process was healthy must not turn a finished result into "not found"
-        // after the next restart.
-        self.task_repository.flush_live().await;
+        // after the next restart) and then stops the maintenance tasks — this hook had no
+        // caller at all.
+        self.task_repository.shutdown().await;
         GracefulShutdownController::new(Arc::clone(&self.shutdown_manager))
             .shutdown()
             .await
@@ -972,7 +1027,8 @@ pub struct HarnessAgentBuilder {
     /// Optional persistent state store wired into a checkpoint middleware.
     state_store: Option<Arc<dyn AgentStateStore>>,
     /// How a checkpoint save that loses the CAS race is resolved. Mirrors Java
-    /// `HarnessAgent.Builder.conflictPolicy` (default `OVERWRITE`).
+    /// `HarnessAgent.Builder.conflictPolicy`, but the default is `FAIL`: two writers used to
+    /// overwrite each other silently (the in-process turn gate cannot see another host).
     conflict_policy: ConflictPolicy,
     /// Stable session key used for checkpoint save/restore (restart-resume).
     session_id: Option<String>,
@@ -1038,6 +1094,9 @@ pub struct HarnessAgentBuilder {
     promotion_gate: Option<Arc<dyn SkillPromotionGate>>,
     visibility_filter: Option<Arc<dyn SkillVisibilityFilter>>,
     skill_filter: SkillFilter,
+    /// `Some(always_visible)` when the host opted into on-demand tool disclosure
+    /// (`tool_search`). `None` keeps every registered tool visible, as before.
+    tool_search_always_visible: Option<Vec<String>>,
     confirm_handler: Option<agentscope_core::ConfirmHandler>,
     /// Optional initial permission context forwarded to the embedded ReActAgent.
     permission_context: Option<agentscope_core::PermissionContextState>,
@@ -1151,7 +1210,11 @@ impl Default for HarnessAgentBuilder {
             disable_at_path_expansion: false,
             disable_memory_hooks: false,
             disable_tool_result_eviction: false,
-            record_model_requests: true,
+            // Off by default: the per-call `request/prepared` snapshot is the largest payload
+            // the journal writes (a full prompt per model call), and the checkpoint plus the
+            // `model/dispatch` facts already make recovery work. Hosts that need the exact
+            // request for debugging opt in with `record_model_requests(true)`.
+            record_model_requests: false,
             disable_compaction: false,
             disable_subagents: false,
             disable_dynamic_subagents: false,
@@ -1181,6 +1244,7 @@ impl Default for HarnessAgentBuilder {
             promotion_gate: None,
             visibility_filter: None,
             skill_filter: SkillFilter::all(),
+            tool_search_always_visible: None,
             confirm_handler: None,
             permission_context: None,
             capability_resolver: None,
@@ -1361,10 +1425,13 @@ impl HarnessAgentBuilder {
 
     /// Sets how a checkpoint save resolves an optimistic-concurrency conflict.
     ///
-    /// Defaults to [`ConflictPolicy::Overwrite`] (last-writer-wins, no error). Prefer
-    /// [`ConflictPolicy::Fail`] when a distributed turn gate already serialises writers,
-    /// and [`ConflictPolicy::AppendMerge`] for append-only turns. Mirrors Java
-    /// `HarnessAgent.Builder.conflictPolicy`.
+    /// Defaults to [`ConflictPolicy::Fail`]: a lost CAS race is reported
+    /// ([`Error::ConcurrentSessionModification`]) instead of overwriting the other writer.
+    /// Use [`ConflictPolicy::Overwrite`] only when the caller really owns the slot (a single
+    /// host that already serialises writers), and [`ConflictPolicy::AppendMerge`] for
+    /// append-only turns. Mirrors Java `HarnessAgent.Builder.conflictPolicy`.
+    ///
+    /// [`Error::ConcurrentSessionModification`]: agentscope_core::error::Error::ConcurrentSessionModification
     pub fn conflict_policy(mut self, policy: ConflictPolicy) -> Self {
         self.conflict_policy = policy;
         self
@@ -1735,6 +1802,17 @@ impl HarnessAgentBuilder {
         self
     }
 
+    /// Opts into on-demand tool disclosure (`tool_search`).
+    ///
+    /// `always_visible` names are exposed without discovery; the framework's own orchestration
+    /// tools and the skill tools are added automatically, because a narrowed surface must not
+    /// hide the tools the agent needs to answer at all. Without this call every registered tool
+    /// stays visible (no behaviour change).
+    pub fn enable_tool_search(mut self, always_visible: Vec<String>) -> Self {
+        self.tool_search_always_visible = Some(always_visible);
+        self
+    }
+
     /// Opts out of the default read-only workspace skill repository (Layer 4).
     pub fn disable_default_workspace_skills(mut self) -> Self {
         self.disable_default_workspace_skills = true;
@@ -2080,10 +2158,11 @@ impl HarnessAgentBuilder {
 
     /// Journals (or not) the full payload of every model call as `request/prepared`.
     ///
-    /// On by default, matching the Java recorder. Turning it off keeps the checkpoints and the
-    /// `model/dispatch` boundary facts, so recovery and interrupted-output replay keep working;
-    /// only the per-call request snapshot goes away, which is an audit fact and the largest
-    /// payload the journal writes.
+    /// Off by default: the per-call request snapshot is an audit fact and the largest payload
+    /// the journal writes, so recording it by default is pure write amplification. The
+    /// checkpoints and the `model/dispatch` boundary facts stay, so recovery and
+    /// interrupted-output replay keep working. Turn it on when the exact request body has to
+    /// be inspectable after the fact.
     pub fn record_model_requests(mut self, enabled: bool) -> Self {
         self.record_model_requests = enabled;
         self
@@ -2156,6 +2235,9 @@ impl HarnessAgentBuilder {
         let agent_id = self.agent_id.clone().unwrap_or_else(|| name.clone());
         // Spec-built filesystems need the resolved workspace root, so they are assembled here
         // rather than by the caller (Java `Builder.filesystem(Local/RemoteFilesystemSpec)`).
+        // Java's default is a rooted backend. `LocalFilesystem::new` is `Unrestricted`, so an
+        // absolute path from the model (`C:\Users\...`, `/etc/passwd`) resolved against the
+        // host filesystem instead of the workspace (#2065).
         let filesystem = self
             .filesystem
             .clone()
@@ -2169,7 +2251,13 @@ impl HarnessAgentBuilder {
                     .as_ref()
                     .map(|spec| spec.build(&resolved_workspace, &agent_id))
             })
-            .unwrap_or_else(|| Arc::new(LocalFilesystem::new(cwd.clone())));
+            .unwrap_or_else(|| {
+                Arc::new(LocalFilesystem::with_mode(
+                    resolved_workspace.clone(),
+                    LocalFsMode::Rooted,
+                    DEFAULT_MAX_FILE_SIZE_MB,
+                ))
+            });
         // Extra routes layer over whichever backend was resolved above; longest prefix wins.
         let filesystem: Arc<dyn Filesystem> = if self.filesystem_routes.is_empty() {
             filesystem
@@ -2202,7 +2290,24 @@ impl HarnessAgentBuilder {
         let generate_options_defaults = self.effective_generate_options();
 
         // ---- Workspace + filesystem orchestration ----
-        let workspace_index = WorkspaceIndex::open(&resolved_workspace);
+        // The SQLite index only indexes the local disk. With a remote/shared store the
+        // authoritative copy is the store, so the index would be a replica-local cache that
+        // every route bypasses: building it anyway left an `.index/workspace.db` where a
+        // deployment that never reads it accumulates files (#2182).
+        let remote_filesystem = self.remote_filesystem_spec.is_some()
+            || matches!(
+                filesystem.kind(),
+                FilesystemKind::Composite | FilesystemKind::Remote
+            );
+        let workspace_index = if remote_filesystem {
+            tracing::warn!(
+                workspace = %resolved_workspace.display(),
+                "skipping the workspace index: a remote/shared filesystem owns workspace content"
+            );
+            None
+        } else {
+            WorkspaceIndex::open(&resolved_workspace)
+        };
         let workspace_manager = Arc::new(WorkspaceManager::with_index(
             resolved_workspace.clone(),
             Some(Arc::clone(&filesystem)),
@@ -2214,18 +2319,31 @@ impl HarnessAgentBuilder {
         // History is journal-backed by default. Resolving the store once keeps the ReAct
         // agent and the session tools on the exact same backend, so a tool can never read a
         // different store than the one the agent wrote (Java `HarnessAgent.build()`).
-        let session_log_store: Option<Arc<dyn ThreadJournalStore>> =
-            if self.session_history_mode == SessionHistoryMode::EventLog {
-                Some(self.session_log_store.clone().unwrap_or_else(|| {
-                    Arc::new(super::session::WorkspaceThreadJournalStore::new(
-                        Arc::clone(&filesystem),
-                    )) as Arc<dyn ThreadJournalStore>
-                }))
-            } else {
-                None
-            };
+        //
+        // The default store is also kept as a concrete handle: `ThreadJournalStore::delete`
+        // carries no runtime context, so deleting a session has to go through the workspace
+        // store's context-aware entry point (`delete_session`).
+        let mut workspace_journal_store: Option<Arc<WorkspaceThreadJournalStore>> = None;
+        let session_log_store: Option<Arc<dyn ThreadJournalStore>> = if self.session_history_mode
+            == SessionHistoryMode::EventLog
+        {
+            match self.session_log_store.clone() {
+                Some(store) => Some(store),
+                None => {
+                    let store = Arc::new(WorkspaceThreadJournalStore::new(Arc::clone(&filesystem)));
+                    workspace_journal_store = Some(Arc::clone(&store));
+                    Some(store as Arc<dyn ThreadJournalStore>)
+                }
+            }
+        } else {
+            None
+        };
 
         // ---- Middleware chain ----
+        // What the host configured, before the harness's own middlewares are appended below.
+        // Subagents inherit exactly this: the harness rebuilds its own layer per child, and
+        // appending it twice would double-run tool governance on the child.
+        let inherited_middleware = self.middleware.clone().unwrap_or_default();
         let mut middleware = self.middleware.unwrap_or_default();
 
         // ---- Graceful shutdown ----
@@ -2339,37 +2457,71 @@ impl HarnessAgentBuilder {
         }
 
         // ---- Memory pipeline (flush + consolidation + maintenance) ----
+        // The compactor (when configured) is resolved first so the flush middleware can honour
+        // `flushBeforeCompact` / `offloadBeforeCompact`: it runs before compaction rewrites the
+        // history away.
+        let compaction_pieces: Option<(Arc<ConversationCompactor>, CompactionConfig)> = if self
+            .disable_compaction
+        {
+            None
+        } else {
+            self.conversation_compaction_config
+                .clone()
+                .zip(self.model.clone())
+                .map(|(config, model)| (Arc::new(ConversationCompactor::with_model(model)), config))
+        };
+
         let memory_config = self.memory_config.clone().unwrap_or_default();
         let memory_model = memory_config.model.clone().or_else(|| self.model.clone());
-        if !self.disable_memory_hooks {
-            if let Some(memory_model) = memory_model {
+        let memory_hooks = !self.disable_memory_hooks;
+        if memory_hooks {
+            if let Some(memory_model) = memory_model.clone() {
                 let flush_prompt = memory_config
                     .flush_prompt
                     .clone()
                     .unwrap_or_else(|| MemoryFlushManager::default_flush_prompt());
-                middleware.add(Box::new(MemoryFlushMiddleware::new_with_config(
+                let mut flush_middleware = MemoryFlushMiddleware::new_with_config(
                     Arc::clone(&filesystem),
                     Arc::clone(&memory_model),
                     flush_prompt,
                     memory_config.flush_trigger.clone(),
                     IsolationScope::User,
-                )));
-                let consolidator = MemoryConsolidator::new_with_prompt(
-                    Arc::clone(&filesystem),
-                    Arc::clone(&memory_model),
-                    memory_config.consolidation_prompt.clone(),
-                    memory_config.consolidation_max_tokens,
                 );
-                middleware.add(Box::new(MemoryMaintenanceMiddleware::new_with_config(
-                    Arc::clone(&filesystem),
-                    Some(Arc::new(consolidator)),
-                    memory_config.daily_file_retention_days,
-                    memory_config.session_retention_days,
-                    memory_config.consolidation_min_gap,
-                    IsolationScope::User,
-                )));
+                if let Some((compactor, config)) = &compaction_pieces {
+                    flush_middleware =
+                        flush_middleware.with_pre_compaction(Arc::clone(compactor), config.clone());
+                }
+                middleware.add(Box::new(flush_middleware));
             }
         }
+
+        // Session pruning is storage governance, not a memory hook: gating the whole
+        // middleware on `disable_memory_hooks` also stopped abandoned journals being dropped.
+        let consolidator = if memory_hooks {
+            memory_model.map(|memory_model| {
+                Arc::new(MemoryConsolidator::new_with_prompt(
+                    Arc::clone(&filesystem),
+                    memory_model,
+                    memory_config.consolidation_prompt.clone(),
+                    memory_config.consolidation_max_tokens,
+                ))
+            })
+        } else {
+            None
+        };
+        let maintenance = MemoryMaintenanceMiddleware::new_with_config(
+            Arc::clone(&filesystem),
+            consolidator,
+            memory_config.daily_file_retention_days,
+            memory_config.session_retention_days,
+            memory_config.consolidation_min_gap,
+            IsolationScope::User,
+        );
+        middleware.add(Box::new(if memory_hooks {
+            maintenance
+        } else {
+            maintenance.sessions_only()
+        }));
 
         // ---- Conversation compaction ----
         // Java `CompactionMiddleware` performs the real summarize-and-replace pass.
@@ -2382,24 +2534,19 @@ impl HarnessAgentBuilder {
         let mut overflow_compaction: Option<(Arc<ConversationCompactor>, CompactionConfig)> = None;
         let mut compaction_request: Option<Arc<AtomicBool>> = None;
         let mut compaction: Option<(Arc<ConversationCompactor>, CompactionConfig)> = None;
-        if !self.disable_compaction {
-            if let Some(cfg) = self.conversation_compaction_config.clone() {
-                if let Some(model) = self.model.clone() {
-                    let compactor = Arc::new(ConversationCompactor::with_model(model));
-                    let compaction_middleware = ConversationCompactionMiddleware::new(
-                        Arc::clone(&compactor),
-                        cfg.clone(),
-                        name.clone(),
-                    );
-                    // The tool (and a host shortcut) request a compaction through this handle;
-                    // the middleware performs it on the next step so the journal and the
-                    // pending TOOL results stay consistent.
-                    compaction_request = Some(compaction_middleware.request_handle());
-                    middleware.add(Box::new(compaction_middleware));
-                    compaction = Some((Arc::clone(&compactor), cfg.clone()));
-                    overflow_compaction = Some((compactor, cfg));
-                }
-            }
+        if let Some((compactor, cfg)) = compaction_pieces.clone() {
+            let compaction_middleware = ConversationCompactionMiddleware::new(
+                Arc::clone(&compactor),
+                cfg.clone(),
+                name.clone(),
+            );
+            // The tool (and a host shortcut) request a compaction through this handle;
+            // the middleware performs it on the next step so the journal and the
+            // pending TOOL results stay consistent.
+            compaction_request = Some(compaction_middleware.request_handle());
+            middleware.add(Box::new(compaction_middleware));
+            compaction = Some((Arc::clone(&compactor), cfg.clone()));
+            overflow_compaction = Some((compactor, cfg));
         }
 
         // ---- Tool-result eviction ----
@@ -2498,21 +2645,41 @@ impl HarnessAgentBuilder {
                 resolved_workspace.join(&sm_config.drafts_dir)
             };
 
-            // Replace the read-only workspace layer (Layer 4) with a writable main repo.
-            let mut main_writable: Option<Arc<dyn SkillRepository>> = None;
-            for i in (0..ordered_skill_repos.len()).rev() {
-                if ordered_skill_repos[i].repo_id() == "workspace-namespaced"
-                    && !ordered_skill_repos[i].is_writeable()
-                {
-                    main_writable = Some(Arc::new(WorkspaceSkillRepository::new_writable(
-                        main_dir.clone(),
-                        "workspace-writable",
-                    )));
-                    ordered_skill_repos[i] = Arc::clone(main_writable.as_ref().unwrap());
-                    break;
+            // Pick the writable main repository. A caller-supplied writable repository wins
+            // (#2441): the builder used to hardcode a workspace repository, so `skill_manage`
+            // writes landed there while the user's repository stayed a read-only source. The
+            // ordered read list is left untouched in that case — the repository already sits in
+            // it at its configured priority.
+            let user_writable: Option<Arc<dyn SkillRepository>> = self
+                .skill_repositories
+                .iter()
+                .rev()
+                .find(|repo| repo.is_writeable())
+                .cloned();
+            let mut main_writable: Option<Arc<dyn SkillRepository>> = user_writable;
+            if main_writable.is_none() {
+                // Replace the read-only workspace layer (Layer 4) with a writable main repo.
+                for i in (0..ordered_skill_repos.len()).rev() {
+                    if ordered_skill_repos[i].repo_id() == "workspace-namespaced"
+                        && !ordered_skill_repos[i].is_writeable()
+                    {
+                        main_writable = Some(Arc::new(WorkspaceSkillRepository::new_writable(
+                            main_dir.clone(),
+                            "workspace-writable",
+                        )));
+                        ordered_skill_repos[i] = Arc::clone(main_writable.as_ref().unwrap());
+                        break;
+                    }
                 }
             }
             if main_writable.is_none() {
+                if !self.skill_repositories.is_empty() {
+                    tracing::warn!(
+                        "none of the {} user skill repositories is writable; skill_manage \
+                         writes to the workspace skills directory instead",
+                        self.skill_repositories.len()
+                    );
+                }
                 main_writable = Some(Arc::new(WorkspaceSkillRepository::new_writable(
                     main_dir.clone(),
                     "workspace-writable",
@@ -2717,6 +2884,16 @@ impl HarnessAgentBuilder {
             toolkit.register_tool(Arc::new(meta));
         }
 
+        // ---- Tool groups + opt-in on-demand disclosure (`tool_search`) ----
+        // Groups are registered only for a host that asked for disclosure, because a META group
+        // is subject to `reset_equipped_tools` replacement semantics: grouping a default agent
+        // that also has the meta tool would let one model call hide every tool. The visible set
+        // of a host that did not opt in is therefore untouched (#2653).
+        let tool_search_enabled = self.tool_search_always_visible.is_some();
+        if tool_search_enabled {
+            register_source_tool_groups(&toolkit);
+        }
+
         // ---- Subagent orchestration ----
         // Mirrors Java `buildStaticSubagentEntries` + `buildDynamicSubagentsMiddleware`:
         // `general-purpose` is always registered; declarations, custom factories and the
@@ -2754,6 +2931,8 @@ impl HarnessAgentBuilder {
                 // Snapshot taken before the agent tools join the toolkit: a child must not
                 // inherit `agent_spawn`, since it is a leaf worker.
                 toolkit: toolkit.copy(),
+                toolkit_provider: ToolkitProviderSlot::default(),
+                inherited_middleware: inherited_middleware.clone(),
                 cwd: self.cwd.clone(),
                 main_workspace: resolved_workspace.clone(),
                 max_iters: if self.max_iters > 0 {
@@ -2845,6 +3024,7 @@ impl HarnessAgentBuilder {
             let exposure_sink = SubagentExposureSink::new();
             let mut spawn_builder = AgentSpawnTool::new(Arc::clone(&manager))
                 .with_task_repository(Arc::clone(&task_repo))
+                .with_toolkit_provider_slot(blueprint.toolkit_provider.clone())
                 .with_exposure_sink(exposure_sink.clone());
             if let Some(events) = self.subagent_events.clone() {
                 spawn_builder = spawn_builder.with_event_sink(events);
@@ -2930,6 +3110,36 @@ impl HarnessAgentBuilder {
                     Arc::clone(store),
                     self.conflict_policy,
                 )));
+            }
+        }
+        // Kept so `session/delete` can remove the legacy snapshot; in this mode the state
+        // store, not the journal, is the history authority (#3567).
+        let legacy_state_store = if self.session_history_mode == SessionHistoryMode::Legacy {
+            state_store.clone()
+        } else {
+            None
+        };
+
+        // The discovery tool is registered *after* the subagent toolkit snapshot, so a child
+        // never inherits a `tool_search` it has no middleware for.
+        if tool_search_enabled {
+            let mut visible: Vec<String> = self
+                .tool_search_always_visible
+                .as_ref()
+                .map(|names| names.clone())
+                .unwrap_or_default();
+            for name in super::tools::HarnessPlatformTools::NAMES {
+                visible.push((*name).to_string());
+            }
+            visible.push(agentscope_core::tool::search::TOOL_SEARCH_TOOL_NAME.to_string());
+            match agentscope_core::tool::ToolSearchMiddleware::with_options(
+                &toolkit,
+                Arc::new(agentscope_core::tool::KeywordToolSearchStrategy::new()),
+                visible,
+                agentscope_core::model::ToolSearchMode::Function,
+            ) {
+                Ok(tool_search) => middleware.add(Box::new(tool_search)),
+                Err(e) => tracing::warn!("tool_search not enabled: {e}"),
             }
         }
 
@@ -3109,6 +3319,9 @@ impl HarnessAgentBuilder {
             skill_curator: pending_skill_curator,
             skill_audit_log: pending_skill_audit_log,
             session_log_store,
+            workspace_journal_store,
+            session_history_mode: self.session_history_mode,
+            legacy_state_store,
             shutdown_manager,
             subagent_model_slot,
             spawn_tool,
@@ -3123,6 +3336,62 @@ impl HarnessAgentBuilder {
 
         built
     }
+}
+
+/// Groups the registered tools by their name prefix (the library they come from: `web_*`,
+/// `memory_*`, `mcp_*`, …) plus one `skills` group for the skill tools, then activates them
+/// through [`Toolkit::update_tool_groups`] (#2653).
+///
+/// The groups are META-scoped and active, so membership alone never hides a tool; what changes
+/// is that a capability grant, a host, or `tool_search` can reason about a tool *source*
+/// instead of enumerating names. A tool that shares no prefix with a sibling stays ungrouped,
+/// and an ungrouped tool is always active.
+fn register_source_tool_groups(toolkit: &Toolkit) {
+    let mut by_group: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for name in toolkit.tool_names() {
+        let group = skill_tool_group(&name).unwrap_or_else(|| source_prefix(&name));
+        by_group.entry(group).or_default().push(name);
+    }
+    let mut registered: Vec<String> = Vec::new();
+    for (group, tools) in by_group {
+        let keep_singleton = group == SKILL_TOOL_GROUP;
+        if group.is_empty() || (tools.len() < 2 && !keep_singleton) {
+            continue;
+        }
+        let mut builder = agentscope_core::tool::ToolGroup::builder()
+            .name(group.as_str())
+            .description(format!("Tools from the '{group}' source"))
+            .active(false);
+        for tool in tools {
+            builder = builder.add_tool(tool);
+        }
+        toolkit.register_tool_group(builder.build());
+        registered.push(group);
+    }
+    if !registered.is_empty() {
+        // Declared inactive above, switched on here: `update_tool_groups` is the one activation
+        // path, so a host can turn a source off later without touching the toolkit again.
+        toolkit.update_tool_groups(&registered, true);
+    }
+}
+
+/// Group name owning the skill disclosure / self-learning tools.
+const SKILL_TOOL_GROUP: &str = "skills";
+
+/// Skill tools share no common prefix, so they are recognised by name.
+fn skill_tool_group(name: &str) -> Option<String> {
+    matches!(
+        name,
+        "load_skill_through_path" | "skill_manage" | "propose_skill"
+    )
+    .then(|| SKILL_TOOL_GROUP.to_string())
+}
+
+/// The `<prefix>_` segment of a tool name, or `""` when the name has no prefix.
+fn source_prefix(name: &str) -> String {
+    name.split_once('_')
+        .map(|(prefix, _)| prefix.to_string())
+        .unwrap_or_default()
 }
 
 /// Returns a sandbox filesystem wrapper when the configured filesystem can be promoted to
@@ -3148,6 +3417,49 @@ mod tests {
     use super::*;
     use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
     use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
+
+    #[test]
+    fn source_tool_groups_are_registered_and_active() {
+        // #2653: harness used to leave `register_tool_group`/`update_tool_groups` untouched.
+        let toolkit = Toolkit::new();
+        for name in [
+            "web_search",
+            "web_fetch",
+            "memory_get",
+            "memory_save",
+            "load_skill_through_path",
+            "execute",
+        ] {
+            toolkit.register_tool(Arc::new(agentscope_core::tool::SchemaOnlyTool::new(
+                ToolSchema::new(name, "d"),
+            )));
+        }
+        register_source_tool_groups(&toolkit);
+
+        assert_eq!(
+            toolkit.get_tool_group("web").map(|g| g.tools().len()),
+            Some(2)
+        );
+        assert_eq!(
+            toolkit
+                .get_tool_group(SKILL_TOOL_GROUP)
+                .map(|g| g.tools().len()),
+            Some(1),
+            "the skill group survives as a singleton"
+        );
+        // Every group is active, so membership alone hides nothing.
+        let active = toolkit.get_active_groups();
+        assert!(active.iter().any(|g| g == "web"));
+        assert!(active.iter().any(|g| g == "memory"));
+        assert!(active.iter().any(|g| g == SKILL_TOOL_GROUP));
+        // A prefixless tool stays ungrouped (and therefore always active).
+        assert!(toolkit.tool_groups_for("execute").is_empty());
+        assert_eq!(
+            toolkit.tool_schemas().len(),
+            6,
+            "the visible set is unchanged by grouping"
+        );
+    }
 
     #[test]
     fn prompt_cache_reaches_the_generation_defaults() {
@@ -3210,6 +3522,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// The default filesystem is rooted at the workspace: an absolute host path must not
+    /// resolve, or `read_file("C:\\Users\\...")` reads the host (#2065).
+    #[tokio::test]
+    async fn default_filesystem_is_rooted_at_the_workspace() {
+        let root = temp_root("rooted_default");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("notes.md"), "workspace notes").unwrap();
+
+        let agent = HarnessAgent::builder()
+            .cwd(root.clone())
+            .workspace(workspace.clone())
+            .model(Arc::new(NoopModel))
+            .build();
+        let ctx = RuntimeContext::new();
+        let fs = agent.filesystem();
+        assert_eq!(
+            fs.read(&ctx, "notes.md", 0, 100).await.unwrap().content,
+            "workspace notes"
+        );
+        let host_file = root.join("outside.md");
+        std::fs::write(&host_file, "host only").unwrap();
+        let error = fs
+            .read(&ctx, &host_file.to_string_lossy(), 0, 100)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A remote/shared filesystem owns workspace content, so no replica-local SQLite index is
+    /// created for it (#2182).
+    #[test]
+    fn a_remote_filesystem_does_not_open_a_workspace_index() {
+        let root = temp_root("no_index_remote");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let index_dir = workspace.join(".index");
+
+        let local = HarnessAgent::builder()
+            .cwd(root.clone())
+            .workspace(workspace.clone())
+            .model(Arc::new(NoopModel))
+            .build();
+        assert!(local.workspace_manager().is_some());
+        #[cfg(feature = "rusqlite")]
+        assert!(
+            local
+                .workspace_manager()
+                .and_then(|wm| wm.index())
+                .is_some(),
+            "a local workspace keeps its index"
+        );
+        let _ = std::fs::remove_dir_all(&index_dir);
+
+        let remote = HarnessAgent::builder()
+            .cwd(root.clone())
+            .workspace(workspace.clone())
+            .model(Arc::new(NoopModel))
+            .remote_filesystem(RemoteFilesystemSpec::new(Arc::new(
+                crate::filesystem::InMemoryStore::new(),
+            )))
+            .build();
+        assert!(remote.workspace_manager().is_some());
+        assert!(
+            !index_dir.is_dir(),
+            "a remote filesystem must not leave a replica-local index behind"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Legacy mode keeps its history in the state store, so `session/delete` has to remove
+    /// that snapshot (a journal error would make deletion impossible) (#3567).
+    #[tokio::test]
+    async fn deleting_a_legacy_session_clears_the_state_store() {
+        let root = temp_root("legacy_delete");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = Arc::new(agentscope_core::state::InMemoryAgentStateStore::new());
+        let agent = HarnessAgent::builder()
+            .cwd(root.clone())
+            .workspace(workspace.clone())
+            .session_history_mode(SessionHistoryMode::Legacy)
+            .state_store(Arc::clone(&store) as Arc<dyn AgentStateStore>)
+            .model(Arc::new(NoopModel))
+            .build();
+
+        let ctx = RuntimeContext::new().with_session_id("sess-1");
+        store
+            .save(None, "sess-1", "agent_state", serde_json::json!({}))
+            .await;
+        assert!(store.get(None, "sess-1", "agent_state").await.is_some());
+
+        agent
+            .delete_session(&ctx)
+            .await
+            .expect("legacy delete succeeds");
+        assert!(
+            store.get(None, "sess-1", "agent_state").await.is_none(),
+            "the snapshot is gone"
+        );
+
+        // Without a session id there is nothing to address: the caller must see an error
+        // instead of a success that deleted nothing.
+        let error = agent
+            .delete_session(&RuntimeContext::new())
+            .await
+            .expect_err("a missing session id cannot delete anything");
+        assert!(error.to_string().contains("session id"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

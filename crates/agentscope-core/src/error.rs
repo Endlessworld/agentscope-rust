@@ -127,11 +127,20 @@ impl Error {
     /// Transport-level failures ([`Error::Http`], e.g. a dropped Wi-Fi
     /// connection or a read timeout) are always retryable so the model call is
     /// re-established once the network returns.
+    ///
+    /// A timeout or a dropped connection also surfaces as a plain
+    /// [`Error::Tool`] / [`Error::Model`] error (the framework's own execution
+    /// timeout, a provider SDK reporting a stalled stream), so a *transient*
+    /// failure message is retryable too. Classification is deliberately narrow:
+    /// business failures ("Tool not found", a schema mismatch, a refused call)
+    /// never match, because retrying them either repeats a side effect or fails
+    /// identically.
     pub fn is_retryable(&self) -> bool {
         match self {
             Error::HttpStatus { status, .. } => *status == 429 || *status >= 500,
             Error::Http(_) => true,
             Error::Io(_) => true,
+            Error::Tool(message) | Error::Model(message) => is_transient_failure(message),
             _ => false,
         }
     }
@@ -143,6 +152,32 @@ impl Error {
             _ => None,
         }
     }
+}
+
+/// Markers of a transient failure inside a [`Error::Tool`] / [`Error::Model`] message.
+///
+/// Covers the framework's own timeout wrapper (`Tool execution timeout after …`),
+/// the wording of `tokio`/`reqwest` (`timed out`, `deadline has elapsed`) and the
+/// socket failures providers re-wrap (`connection reset`, `broken pipe`).
+const TRANSIENT_FAILURE_MARKERS: &[&str] = &[
+    "timed out",
+    "timeout",
+    "deadline has elapsed",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "connection closed",
+    "broken pipe",
+    "unexpected eof",
+    "temporarily unavailable",
+];
+
+/// Whether `message` describes a transient failure worth retrying.
+pub(crate) fn is_transient_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    TRANSIENT_FAILURE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 /// Information about a single agent failure within a [`CompositeAgentException`].
@@ -249,5 +284,39 @@ mod tests {
     fn empty_causes_render_base_message() {
         let ex = CompositeAgentException::new("only message", vec![]);
         assert_eq!(ex.to_string(), "only message");
+    }
+
+    #[test]
+    fn a_timeout_wrapped_as_a_tool_or_model_error_is_retryable() {
+        // The execution timeout is raised as `Error::Tool` and a stalled provider
+        // stream as `Error::Model`; neither carries an HTTP status, so without the
+        // message classification the retry loops never fired for them.
+        assert!(
+            Error::Tool("Tool execution timeout after 5s for 'search'".to_string()).is_retryable()
+        );
+        assert!(Error::Model("request timed out".to_string()).is_retryable());
+        assert!(Error::Tool("connection reset by peer".to_string()).is_retryable());
+        assert!(Error::Model("stream deadline has elapsed".to_string()).is_retryable());
+        // The existing classifications are untouched.
+        assert!(Error::http_status(429, "slow down").is_retryable());
+        assert!(Error::Http("dropped".to_string()).is_retryable());
+    }
+
+    #[test]
+    fn a_business_tool_failure_is_not_retryable() {
+        // Retrying these would repeat a side effect or fail identically.
+        for message in [
+            "Tool not found: nope",
+            "Parameter validation failed: 'a' is a required property",
+            "Unauthorized tool call: x is not available",
+            "Tool 'x' is external and cannot be executed by the framework",
+        ] {
+            assert!(
+                !Error::Tool(message.to_string()).is_retryable(),
+                "{message}"
+            );
+        }
+        assert!(!Error::Model("model 'x' does not accept image input".into()).is_retryable());
+        assert!(!Error::http_status(400, "bad request").is_retryable());
     }
 }

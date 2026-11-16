@@ -5,13 +5,17 @@
 //!
 //! For each item with namespace `[a, b, c]` and key `k`, two Redis keys are used:
 //!
-//! * **Item hash** `<prefix>item:<ns>\0<k>` — Redis hash with fields `value` (JSON-encoded
+//! * **Item hash** `{<tag>}item:<ns>\0<k>` — Redis hash with fields `value` (JSON-encoded
 //!   object) and `version` (stringified integer).
-//! * **Namespace index** `<prefix>idx:<ns>` — sorted set (all scores `0`) holding every `k`
+//! * **Namespace index** `{<tag>}idx:<ns>` — sorted set (all scores `0`) holding every `k`
 //!   written under that namespace, enabling lexicographic search via `ZRANGEBYLEX` without
 //!   scanning the keyspace.
 //!
-//! `<ns>` is the namespace components joined with `"\0"`.
+//! `<ns>` is the namespace components joined with `"\0"`, and `<tag>` is the key prefix with
+//! braces stripped. The shared `{…}` hash tag keeps both keys in **one Redis Cluster slot**, so
+//! the atomic Lua `EVAL` below is accepted by a cluster (#2165). Single-node behaviour is
+//! unchanged; only the key names gain the tag, so a pre-existing untagged keyspace is not read
+//! back (it has to be re-populated or renamed).
 //!
 //! ## Concurrency
 //!
@@ -357,16 +361,34 @@ impl RedisStore {
 
     // ---- key helpers -------------------------------------------------------
 
+    /// Tag shared by the item hash and the namespace index of every item (#2165).
+    ///
+    /// Cluster mode refuses a Lua `EVAL` whose keys hash to different slots, so both keys
+    /// embed the same `{…}` tag. The tag is derived from the key prefix (distinct prefixes
+    /// stay in distinct slots) with braces stripped, because braces delimit the tag itself.
+    fn hash_tag(&self) -> String {
+        let tag: String = self
+            .key_prefix
+            .chars()
+            .filter(|c| *c != '{' && *c != '}')
+            .collect();
+        if tag.is_empty() {
+            "agentscope".to_string()
+        } else {
+            tag
+        }
+    }
+
     fn item_key(&self, namespace: &[String], key: &str) -> String {
         format!(
-            "{}item:{}{NS_SEPARATOR}{key}",
-            self.key_prefix,
+            "{{{}}}item:{}{NS_SEPARATOR}{key}",
+            self.hash_tag(),
             namespace_path(namespace)
         )
     }
 
     fn index_key(&self, namespace: &[String]) -> String {
-        format!("{}idx:{}", self.key_prefix, namespace_path(namespace))
+        format!("{{{}}}idx:{}", self.hash_tag(), namespace_path(namespace))
     }
 
     fn to_item(key: &str, hash: &HashMap<String, String>) -> StoreItem {
@@ -576,17 +598,32 @@ mod tests {
     }
 
     #[test]
-    fn item_and_index_keys_use_prefix_and_separator() {
+    fn item_and_index_keys_share_one_cluster_hash_tag() {
+        let commands = Arc::new(MemoryStoreCommands::new());
+        let store = RedisStore::from_commands(commands, "p:");
         let ns = vec!["ns1".to_string(), "ns2".to_string()];
-        // Pure string-format key helpers (no live connection required).
-        assert_eq!(
-            format!("{}item:{}{NS_SEPARATOR}key", "p:", namespace_path(&ns)),
-            format!("p:item:{}\0key", namespace_path(&ns)),
-        );
-        assert_eq!(
-            format!("{}idx:{}", "p:", namespace_path(&ns)),
-            "p:idx:ns1\0ns2",
-        );
+        let item = store.item_key(&ns, "key");
+        let index = store.index_key(&ns);
+
+        assert_eq!(item, "{p:}item:ns1\0ns2\0key");
+        assert_eq!(index, "{p:}idx:ns1\0ns2");
+        // Both keys must hash to the same cluster slot: the substring between the first `{`
+        // and the first following `}` has to be identical.
+        let tag = |key: &str| {
+            let start = key.find('{').expect("hash tag open brace") + 1;
+            let end = key[start..].find('}').expect("hash tag close brace") + start;
+            key[start..end].to_string()
+        };
+        assert_eq!(tag(&item), tag(&index));
+    }
+
+    #[test]
+    fn a_brace_in_the_prefix_does_not_break_the_hash_tag() {
+        let commands = Arc::new(MemoryStoreCommands::new());
+        let store = RedisStore::from_commands(commands, "{weird}:");
+        let ns = ns(&["files"]);
+        assert_eq!(store.item_key(&ns, "a"), "{weird:}item:files\0a");
+        assert_eq!(store.index_key(&ns), "{weird:}idx:files");
     }
 
     #[test]
@@ -616,12 +653,12 @@ mod tests {
         assert_eq!(item.value.get("size"), Some(&json!(1)));
         assert_eq!(item.version, 1, "version starts at 1 on first write");
         assert_eq!(
-            commands.index_members("t:idx:files"),
+            commands.index_members("{t:}idx:files"),
             vec!["a.txt".to_string()]
         );
         assert_eq!(
             commands
-                .hash_of("t:item:files\0a.txt")
+                .hash_of("{t:}item:files\0a.txt")
                 .get("version")
                 .map(String::as_str),
             Some("1")
@@ -638,7 +675,7 @@ mod tests {
         assert_eq!(store.get(&ns, "a").unwrap().version, 2);
         assert_eq!(store.get(&ns, "a").unwrap().value.get("n"), Some(&json!(2)));
         assert_eq!(
-            commands.index_members("t:idx:files"),
+            commands.index_members("{t:}idx:files"),
             vec!["a".to_string()],
             "ZADD is idempotent"
         );
@@ -732,7 +769,7 @@ mod tests {
         let (store, commands) = store();
         let ns = ns(&["ns"]);
         // Index entry with no backing hash simulates an externally deleted item.
-        commands.seed_index("t:idx:ns", "ghost");
+        commands.seed_index("{t:}idx:ns", "ghost");
         store.put(&ns, "real", value("n", 1));
         let found: Vec<String> = store
             .search(&ns, 10, 0)
@@ -751,8 +788,8 @@ mod tests {
         store.delete(&ns, "a");
 
         assert!(store.get(&ns, "a").is_none());
-        assert!(!commands.contains("t:item:ns\0a"));
-        assert_eq!(commands.index_members("t:idx:ns"), vec!["b".to_string()]);
+        assert!(!commands.contains("{t:}item:ns\0a"));
+        assert_eq!(commands.index_members("{t:}idx:ns"), vec!["b".to_string()]);
         assert!(store.get(&ns, "b").is_some(), "unrelated item untouched");
     }
 
@@ -781,7 +818,7 @@ mod tests {
     fn corrupt_stored_json_degrades_to_empty_map() {
         let (store, commands) = store();
         let ns = ns(&["ns"]);
-        commands.seed_item("t:item:ns\0k", "{not json", 4);
+        commands.seed_item("{t:}item:ns\0k", "{not json", 4);
         let item = store.get(&ns, "k").expect("hash exists");
         assert!(item.value.is_empty());
         assert_eq!(item.version, 4, "version is still surfaced");

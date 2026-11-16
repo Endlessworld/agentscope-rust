@@ -12,8 +12,15 @@ use agentscope_core::tool::{Tool, ToolExecutionContext, Toolkit};
 use async_trait::async_trait;
 
 use crate::agent::subagent::task::{
-    task_session_key_from_runtime, BackgroundTask, TaskRepository, TaskStatus,
+    task_session_key_from_runtime, BackgroundTask, CancelOutcome, TaskRepository, TaskStatus,
 };
+
+/// Reply status for "the task is terminal already; nothing changed".
+const STATUS_UNCHANGED: &str = "unchanged";
+/// Reply status for "the run stopped / will report nothing".
+const STATUS_CANCELLED: &str = "cancelled";
+/// Reply status for "cancellation was delivered; the run may still be unwinding".
+const STATUS_CANCEL_REQUESTED: &str = "cancel_requested";
 
 /// Shared core for the three task tools.
 pub struct TaskTool {
@@ -277,22 +284,43 @@ impl Tool for TaskCancelTool {
         };
         let session = session_from_ctx(&ctx);
         let rc = runtime_for(&session);
-        let Some(bg) = self.tool.repo.get_task(&rc, &session, &task_id).await else {
-            return Ok(ToolResultBlock::error(format!(
-                "Error: No background task found with ID: {task_id}. Its record may have been \
-                 lost after a restart; nothing is left to cancel."
-            )));
+        // `request_cancel` reports what actually happened. The tool used to answer
+        // "Cancellation requested successfully" unconditionally: a missing task, an already
+        // finished one and a refused remote cancel all read as success.
+        let outcome = self.tool.repo.request_cancel(&rc, &session, &task_id).await;
+        let (status, note) = match &outcome {
+            CancelOutcome::NotFound => {
+                return Ok(ToolResultBlock::error(format!(
+                    "Error: No background task found with ID: {task_id}. Its record may have been \
+                     lost after a restart; nothing is left to cancel."
+                )))
+            }
+            CancelOutcome::AlreadyTerminal(status) => (
+                STATUS_UNCHANGED,
+                format!(
+                    "Task is already in a terminal state ({}), so nothing was cancelled.",
+                    status.as_str().to_lowercase()
+                ),
+            ),
+            CancelOutcome::Terminated => (
+                STATUS_CANCELLED,
+                "The task stopped; no result will be reported.".to_string(),
+            ),
+            CancelOutcome::Requested => (
+                STATUS_CANCEL_REQUESTED,
+                "Cancellation was delivered. Local blocking work cannot be aborted, so the \
+                 execution may still be unwinding."
+                    .to_string(),
+            ),
+            CancelOutcome::Failed(error) => {
+                return Ok(ToolResultBlock::error(format!(
+                    "Error: task '{task_id}' could not be cancelled: {error}. It may still be \
+                     running remotely."
+                )))
+            }
         };
-        let current = bg.get_task_status();
-        if current.is_terminal() {
-            return Ok(ToolResultBlock::text(format!(
-                "task_id: {task_id}\nstatus: {}\nnote: Task already in terminal state, cannot cancel.",
-                current.as_str().to_lowercase()
-            )));
-        }
-        self.tool.repo.cancel_task(&rc, &session, &task_id).await;
         Ok(ToolResultBlock::text(format!(
-            "task_id: {task_id}\nstatus: cancelled\nCancellation requested successfully."
+            "task_id: {task_id}\nstatus: {status}\n{note}"
         )))
     }
 }

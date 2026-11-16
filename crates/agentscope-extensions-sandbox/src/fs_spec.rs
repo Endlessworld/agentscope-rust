@@ -569,6 +569,90 @@ pub fn build_read_command(absolute_path: &str, offset: usize, limit: usize) -> S
     }
 }
 
+/// Builds the `read` command that returns the line window base64-encoded.
+///
+/// Exec stdout travels as text, so a binary file read through the plain text path is
+/// lossy-replaced before this process ever sees it. Piping the remote window through `base64`
+/// keeps the bytes intact for the caller to decode (plain `base64`, not `-w0`: the wrapped
+/// output is whitespace-stripped on the way in, and BusyBox `base64` rejects `-w`).
+pub fn build_read_base64_command(absolute_path: &str, offset: usize, limit: usize) -> String {
+    format!(
+        "{} | base64",
+        build_read_command(absolute_path, offset, limit)
+    )
+}
+
+/// Maximum base64 characters per write command.
+///
+/// The script is delivered as a single `sh -c <cmd>` argument (Docker/Kubernetes exec) and a
+/// single argument is capped at 32 KiB (`MAX_ARG_STRLEN`), so a whole file encoded into one
+/// `printf` overflows on files above ~24 KiB. Chunks stay far below the cap.
+pub const WRITE_CHUNK_B64_BYTES: usize = 4096;
+
+/// Builds the script that writes `content` to `absolute` in base64 chunks.
+///
+/// Every line decodes one chunk — the first truncating the target, the rest appending — so the
+/// whole write is one exec call while each individual command stays small.
+pub fn build_write_script(absolute: &str, content: &[u8]) -> String {
+    use base64::Engine as _;
+    let path = shell_quote(absolute);
+    if content.is_empty() {
+        return format!(": > {path}");
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(content);
+    let mut commands = Vec::with_capacity(encoded.len() / WRITE_CHUNK_B64_BYTES + 1);
+    for (index, chunk) in encoded.as_bytes().chunks(WRITE_CHUNK_B64_BYTES).enumerate() {
+        let chunk = String::from_utf8_lossy(chunk);
+        let redirection = if index == 0 { ">" } else { ">>" };
+        commands.push(format!(
+            "printf %s {} | base64 -d {redirection} {path}",
+            shell_quote(&chunk)
+        ));
+    }
+    commands.join("\n")
+}
+
+/// Returns the basename a glob pattern ends with.
+///
+/// `find -name` and `grep --include` only ever compare a file's basename, so a `**` or `dir/`
+/// pattern has to be reduced before either tool can use it.
+fn glob_basename(pattern: &str) -> &str {
+    pattern.rsplit('/').next().unwrap_or(pattern).trim()
+}
+
+/// Builds a `find` invocation that honours `**` and `dir/` glob patterns.
+///
+/// `find -name` matches the basename only, so handing it `**/*.md` (a pattern the tool
+/// description advertises) never matched anything. The basename goes to `-name`, which `find`
+/// applies at every depth, and a pattern carrying a directory part adds a `-path` filter
+/// anchored at the search root; `**` collapses to `*` there because `find -path` lets `*` cross
+/// `/`.
+pub fn build_glob_command(target: &str, pattern: &str) -> String {
+    let pattern = pattern.trim();
+    let (dir_part, name) = match pattern.rsplit_once('/') {
+        Some((dir, name)) => (dir.trim_matches('/'), name.trim()),
+        None => ("", pattern),
+    };
+    let name = if name.is_empty() { "*" } else { name };
+    let mut command = format!("find {} -name {}", shell_quote(target), shell_quote(name));
+    // A directory part made only of `**` means "any depth", which `-name` already covers.
+    let only_globstar = !dir_part.is_empty() && dir_part.split('/').all(|s| s.trim() == "**");
+    let dir_pattern = dir_part.trim_matches('/').replace("**", "*");
+    let dir_pattern = dir_pattern.trim_matches('/');
+    if !only_globstar && !dir_pattern.is_empty() && dir_pattern != "." {
+        command.push_str(&format!(
+            " -path {}",
+            shell_quote(&format!(
+                "{}/{}/*",
+                target.trim_end_matches('/'),
+                dir_pattern
+            ))
+        ));
+    }
+    command.push_str(" -printf '%y\\t%s\\t%p\\n' 2>/dev/null");
+    command
+}
+
 /// Parses `grep -rn` output (`path:line:text`) into [`GrepMatch`] entries.
 pub fn parse_grep_output(output: &str) -> Vec<GrepMatch> {
     let mut matches = Vec::new();
@@ -627,12 +711,24 @@ fn file_data_from_bytes(bytes: &[u8], offset: usize, limit: usize) -> FileData {
     }
 }
 
+/// Decodes a base64 payload into raw bytes.
+///
+/// ASCII whitespace is stripped first: `base64` wraps its output at 76 columns by default, so a
+/// strictly-decoded payload with line breaks would otherwise fail (#3966).
+fn decode_base64_bytes(content: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let compact: String = content
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(compact.as_bytes())
+        .map_err(|e| Error::Tool(format!("invalid base64 file content: {e}")))
+}
+
 fn decode_text(data: &FileData) -> Result<String> {
     if data.encoding == "base64" {
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(data.content.as_bytes())
-            .map_err(|e| Error::Tool(format!("invalid base64 file content: {e}")))?;
+        let bytes = decode_base64_bytes(&data.content)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     } else {
         Ok(data.content.clone())
@@ -693,15 +789,11 @@ impl Filesystem for SandboxFilesystemAdapter {
         if !self.exists(ctx, &absolute).await? {
             return Err(Error::Tool(format!("File '{path}' not found")));
         }
-        let command = build_read_command(&absolute, offset, limit);
+        // The fallback (no native file API) still has to preserve raw bytes: exec stdout is text,
+        // so the window comes back base64-encoded and is decoded here (#3966).
+        let command = build_read_base64_command(&absolute, offset, limit);
         let output = self.run_checked(&command, "read", 60).await?;
-        if output.as_bytes().contains(&0) {
-            use base64::Engine as _;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(output.as_bytes());
-            Ok(FileData::binary(encoded))
-        } else {
-            Ok(FileData::text(output))
-        }
+        Ok(file_data_from_bytes(&decode_base64_bytes(&output)?, 0, 0))
     }
 
     async fn write(&self, _ctx: &RuntimeContext, path: &str, content: &str) -> Result<()> {
@@ -719,13 +811,9 @@ impl Filesystem for SandboxFilesystemAdapter {
             self.run_checked(&format!("mkdir -p {}", shell_quote(&parent)), "mkdir", 60)
                 .await?;
         }
-        use base64::Engine as _;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
-        let script = format!(
-            "printf %s {} | base64 -d > {}",
-            shell_quote(&encoded),
-            shell_quote(&absolute)
-        );
+        // Chunked on purpose: a single `printf` carrying the whole file overflows the 32 KiB
+        // single-argument limit of `exec` (Docker/Kubernetes `sh -c`) on larger files.
+        let script = build_write_script(&absolute, content.as_bytes());
         self.run_checked(&script, "write", 60).await?;
         Ok(())
     }
@@ -769,8 +857,12 @@ impl Filesystem for SandboxFilesystemAdapter {
         glob: Option<&str>,
     ) -> Result<Vec<GrepMatch>> {
         let target = self.resolve_path(path.unwrap_or("."));
+        // `grep --include` compares basenames only, so a `**/` or `dir/` pattern must be reduced
+        // to its last segment or it would silently match nothing (#1674).
         let include = glob
-            .map(|g| format!(" --include={}", shell_quote(g)))
+            .map(|g| glob_basename(g).to_string())
+            .filter(|g| !g.is_empty())
+            .map(|g| format!(" --include={}", shell_quote(&g)))
             .unwrap_or_default();
         let command = format!(
             "grep -rn{include} -e {} {} 2>/dev/null",
@@ -795,11 +887,7 @@ impl Filesystem for SandboxFilesystemAdapter {
         path: &str,
     ) -> Result<Vec<FileInfo>> {
         let target = self.resolve_path(path);
-        let command = format!(
-            "find {} -name {} -printf '%y\\t%s\\t%p\\n' 2>/dev/null",
-            shell_quote(&target),
-            shell_quote(pattern)
-        );
+        let command = build_glob_command(&target, pattern);
         let response = self.run(&command, 60).await?;
         if response.exit_code > 1 {
             return Err(Error::Tool(format!(
@@ -1197,11 +1285,101 @@ mod tests {
             "sed -n '6,10p' /w/f.txt"
         );
         assert_eq!(build_read_command("/w/f.txt", 2, 0), "tail -n +3 /w/f.txt");
+        // #3966: the exec fallback keeps raw bytes by encoding the window remotely.
+        assert_eq!(
+            build_read_base64_command("/w/f.txt", 0, 10),
+            "sed -n '1,10p' /w/f.txt | base64"
+        );
     }
 
     #[test]
     fn ls_command_is_quoted() {
         assert!(build_ls_command("/w with space").contains("'/w with space'"));
+    }
+
+    /// #2135/#1560: the whole payload used to ride in one `printf`, overflowing the 32 KiB
+    /// single-argument cap. Each chunk must stay small and the concatenation must round-trip.
+    #[test]
+    fn write_script_chunks_stay_small_and_decode_to_the_original() {
+        use base64::Engine as _;
+        let content: Vec<u8> = (0..100usize * 1024).map(|i| (i % 251) as u8).collect();
+        let script = build_write_script("/workspace/big.bin", &content);
+        let mut decoded = Vec::new();
+        for (index, command) in script.lines().enumerate() {
+            assert!(
+                command.len() < 8192,
+                "chunk {index} is {} bytes long",
+                command.len()
+            );
+            let (prefix, rest) = command.split_once(" | base64 -d ").expect("decode pipe");
+            let payload = prefix
+                .strip_prefix("printf %s ")
+                .expect("printf payload")
+                .trim_matches('\'');
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .expect("chunk is valid base64");
+            decoded.extend_from_slice(&bytes);
+            // The first chunk truncates, the rest append: exactly one non-appending write.
+            assert_eq!(rest.starts_with("> "), index == 0, "{command}");
+        }
+        assert_eq!(decoded, content);
+        assert!(script.lines().count() > 1, "a 100 KiB payload must chunk");
+
+        // An empty payload truncates the target without any base64 command.
+        assert_eq!(
+            build_write_script("/workspace/empty", b""),
+            ": > /workspace/empty"
+        );
+    }
+
+    /// #1674: `find -name` only compares basenames, so `**/*.md` never matched. Both the plain and
+    /// the globstar form must reach files directly under the root *and* at any depth.
+    #[test]
+    fn glob_patterns_reach_every_depth() {
+        let shallow = build_glob_command("/workspace", "*.md");
+        assert_eq!(
+            shallow,
+            "find /workspace -name '*.md' -printf '%y\\t%s\\t%p\\n' 2>/dev/null"
+        );
+        let deep = build_glob_command("/workspace", "**/*.md");
+        assert_eq!(deep, shallow, "`**/` degrades to a recursive -name match");
+
+        // A pattern with a real directory part keeps it as a `-path` anchor.
+        let scoped = build_glob_command("/workspace", "skills/*.md");
+        assert!(scoped.contains("-name '*.md'"), "{scoped}");
+        assert!(scoped.contains("-path '/workspace/skills/*'"), "{scoped}");
+        let globstar_scoped = build_glob_command("/workspace", "**/skills/*.md");
+        assert!(
+            globstar_scoped.contains("-path '/workspace/*/skills/*'"),
+            "{globstar_scoped}"
+        );
+    }
+
+    /// #1674: `grep --include` compares basenames too, so `**/*.md` has to be reduced.
+    #[test]
+    fn grep_include_uses_the_basename() {
+        assert_eq!(glob_basename("**/*.md"), "*.md");
+        assert_eq!(glob_basename("skills/**/*.rs"), "*.rs");
+        assert_eq!(glob_basename("*.md"), "*.md");
+        assert_eq!(glob_basename("**/"), "");
+    }
+
+    /// #3966: `base64` wraps at 76 columns by default, so a payload with line breaks must still
+    /// decode.
+    #[test]
+    fn decode_text_tolerates_line_wrapped_payloads() {
+        use base64::Engine as _;
+        let raw = "hello world";
+        let wrapped = base64::engine::general_purpose::STANDARD
+            .encode(raw)
+            .as_bytes()
+            .chunks(4)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let data = FileData::binary(format!("{wrapped}\n"));
+        assert_eq!(decode_text(&data).unwrap(), raw);
     }
 
     #[test]
@@ -1507,6 +1685,8 @@ mod tests {
     #[derive(Default)]
     struct FakeSandbox {
         commands: std::sync::Mutex<Vec<String>>,
+        /// Canned stdout returned by every `exec` (empty by default).
+        stdout: String,
     }
 
     impl Debug for FakeSandbox {
@@ -1537,7 +1717,7 @@ mod tests {
         ) -> Result<ExecResult> {
             self.commands.lock().unwrap().push(command.to_string());
             Ok(ExecResult {
-                stdout: String::new(),
+                stdout: self.stdout.clone(),
                 stderr: String::new(),
                 exit_code: 0,
                 truncated: false,
@@ -1688,6 +1868,33 @@ mod tests {
         // limit == 0 reads to the end.
         let rest = Filesystem::read(&fs, &ctx, "a.txt", 1, 0).await.unwrap();
         assert_eq!(rest.content, "l2\nl3\n");
+    }
+
+    #[tokio::test]
+    async fn adapter_read_without_transfer_keeps_raw_bytes() {
+        // #3966: without a native file API the window comes back base64-encoded, so a binary
+        // payload survives the text-only exec channel instead of being lossy-replaced.
+        use base64::Engine as _;
+        let raw: &[u8] = b"\x00\xff\x10binary";
+        let sandbox = Arc::new(FakeSandbox {
+            stdout: base64::engine::general_purpose::STANDARD.encode(raw),
+            ..Default::default()
+        });
+        let fs = SandboxFilesystemAdapter::new(sandbox.clone(), "/workspace", ".");
+        let ctx = RuntimeContext::new();
+        let data = Filesystem::read(&fs, &ctx, "bin.dat", 0, 0).await.unwrap();
+        assert_eq!(data.encoding, "base64");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&data.content)
+                .unwrap(),
+            raw
+        );
+        let commands = sandbox.commands.lock().unwrap().clone();
+        assert!(
+            commands.iter().any(|c| c.ends_with("| base64")),
+            "read must go through base64: {commands:?}"
+        );
     }
 
     #[tokio::test]

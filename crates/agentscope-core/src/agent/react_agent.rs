@@ -65,6 +65,29 @@ type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 pub type ConfirmHandler =
     Arc<dyn Fn(ToolUseBlock) -> Pin<Box<dyn Future<Output = ConfirmResult> + Send>> + Send + Sync>;
 
+/// [`ToolUseBlock`] metadata key carrying the `Ask` decision's explanation to the
+/// confirmation handler.
+///
+/// The handler only receives the tool call, so the human-facing reason ([`PermissionDecision::message`],
+/// e.g. "Permission required for shell") travels as call metadata instead of being dropped
+/// (#3315). A host renders its own wording (AG-UI interrupt text, ACP `RequestPermission`)
+/// from it and falls back to a fixed text when the key is absent.
+pub const CONFIRM_MESSAGE_METADATA_KEY: &str = "permissionConfirmMessage";
+
+/// [`ToolUseBlock`] metadata key carrying the `Ask` decision's suggested rules, serialized as
+/// a `[PermissionRule]` array.
+///
+/// A host that offers "always allow" can persist the suggestion verbatim instead of inventing
+/// an unconditional rule for the whole tool (#3243).
+pub const CONFIRM_SUGGESTED_RULES_METADATA_KEY: &str = "permissionSuggestedRules";
+
+/// Per-run extension key stamping the session a call belongs to.
+///
+/// A caller that runs several sessions through one agent instance sets it on the run's
+/// extensions: the value scopes the call's journal key and is the per-session serialization
+/// key, so two sessions no longer queue behind each other (#2256).
+pub const SESSION_ID_CONTEXT_KEY: &str = "session_id";
+
 /// Default maximum number of reasoning→acting iterations per call.
 pub const DEFAULT_MAX_ITERS: i32 = 10;
 
@@ -222,6 +245,20 @@ impl Drop for RunGuard {
     }
 }
 
+/// The per-call serialization key.
+///
+/// The agent's own state is a single slot shared by every caller of a singleton agent, so
+/// keying the call gate on it put two different sessions into one FIFO (#2256). A caller that
+/// stamps [`SESSION_ID_CONTEXT_KEY`] on the run's extensions gets per-session concurrency;
+/// without a stamp the call falls back to the agent state (the previous behaviour).
+fn call_gate_key(core: &AgentCore, extensions: &crate::agent::Extensions) -> String {
+    extensions
+        .get::<String>(SESSION_ID_CONTEXT_KEY)
+        .map(|session_id| session_id.as_str().to_string())
+        .filter(|session_id| !session_id.trim().is_empty())
+        .unwrap_or_else(|| core.state.lock().unwrap().session_id().to_string())
+}
+
 /// Accumulates streamed model chunks into a single assistant message.
 #[derive(Debug, Default)]
 struct ReasoningContext {
@@ -291,6 +328,20 @@ impl ReasoningContext {
         } else {
             self.thinking = Some(chunk);
         }
+    }
+
+    /// Whether the model produced nothing at all: no text, no thinking, no tool call.
+    ///
+    /// A provider can end a stream with zero content chunks (an empty `stop`); such a response
+    /// must not become the turn's answer (#2962).
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+            && self
+                .thinking
+                .as_ref()
+                .is_none_or(|block| block.thinking.is_empty())
+            && self.tool_calls.is_empty()
+            && self.tool_results.is_empty()
     }
 
     /// Whether the response stopped at its output-token limit.
@@ -789,7 +840,7 @@ impl ReActAgent {
         // so any `todo_write` mutations survive.
         let seed = self.core.state.lock().unwrap().tasks_context.clone();
         *self.core.tasks.lock().unwrap() = seed;
-        let key = self.core.state.lock().unwrap().session_id().to_string();
+        let key = call_gate_key(&self.core, &extensions);
         let gate = Arc::clone(&self.core.call_gate);
         let this = self.clone();
         let run_status = Arc::clone(&run);
@@ -980,6 +1031,15 @@ impl ReActAgent {
         // Layer the per-run services on top of the build-time ones: assigning would silently
         // drop everything the agent was configured with (recorders, observers).
         ctx.extensions.extend(&extensions);
+        // A caller that stamps the session this call belongs to makes the run scoped to it
+        // (#2256): the value reaches the middlewares (inbox, async tools), the journal key and
+        // the per-session call gate.
+        if let Some(session_id) = extensions.get::<String>(SESSION_ID_CONTEXT_KEY) {
+            let session_id = session_id.as_str().to_string();
+            if !session_id.trim().is_empty() {
+                ctx.session_id = Some(session_id);
+            }
+        }
         // Per-call model selection (Java `RuntimeContext.modelId`). A run receives its services
         // as extensions rather than as a caller-built context, so the selection is lifted onto
         // the context the middlewares read. Read from the *per-run* bag only: a build-time
@@ -1162,15 +1222,18 @@ impl ReActAgent {
         extensions: crate::agent::Extensions,
     ) -> EventStream {
         let (stream, _slot) = self.run_stream_with_extensions(messages, None, extensions);
+        // `incremental = false` asks for whole-text deltas: the adapter accumulates the streamed
+        // chunks so each delta carries the text so far instead of only its own increment (#1211).
+        let mut cumulative =
+            crate::agent::stream_options::CumulativeDelta::new(options.incremental());
         Box::pin(stream.filter_map(move |res| {
             let opts = options.clone();
-            async move {
-                match res {
-                    Ok(ev) if opts.should_stream(&ev) => Some(Ok(ev)),
-                    Ok(_) => None,
-                    Err(e) => Some(Err(e)),
-                }
-            }
+            let item = match res {
+                Ok(ev) if opts.should_stream(&ev) => Some(Ok(cumulative.adapt(ev))),
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            };
+            futures::future::ready(item)
         }))
     }
 
@@ -2183,6 +2246,10 @@ async fn execute_iteration(
     system_msg: Option<&Msg>,
     mut continue_acting: bool,
 ) -> Result<Msg> {
+    // Whether a provider-side "unknown tool" rejection was already answered and retried in this
+    // pass. One retry is enough to break the loop: a second identical rejection is a real
+    // configuration error, not a bad model choice (#3102).
+    let mut unknown_tool_retried = false;
     loop {
         // A resumed invocation enters in the acting phase (Java `resumeAgent`): the last
         // assistant message already carries the calls the previous turn never ran, and the
@@ -2194,7 +2261,24 @@ async fn execute_iteration(
             Vec::new()
         };
         let (msg, has_tool_calls, round_calls) = if resumed.is_empty() {
-            let msg = reasoning_phase(core, ctx, state, iter, system_msg).await?;
+            let msg = match reasoning_phase(core, ctx, state, iter, system_msg).await {
+                Ok(msg) => msg,
+                // A provider that refuses the request because the call it was asked to run names
+                // a tool it does not know is reporting a bad tool call, not an outage. Answer it
+                // and reason again instead of ending the whole turn (#3102).
+                Err(error) if !unknown_tool_retried && is_unknown_tool_error(&error) => {
+                    unknown_tool_retried = true;
+                    tracing::warn!(
+                        error = %error,
+                        "model provider rejected an unknown tool call; retrying once"
+                    );
+                    state
+                        .context_mut()
+                        .push(unknown_tool_recovery_message(&error));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let has_tool_calls = has_actionable_tool_calls(&msg);
             // The calls this round asked for, captured before the acting phase so the
             // all-denied check below does not have to re-read the assistant message.
@@ -3114,17 +3198,81 @@ struct BlockLifecycle {
     reply_id: String,
     text_started: bool,
     thinking_started: bool,
+    /// Set when this attempt replays a thinking block the consumer already saw: the block is
+    /// neither started nor ended again (#2478).
+    thinking_suppressed: bool,
     started_tool_calls: std::collections::HashMap<String, String>,
+    /// Tool-call ids whose block was already delivered on an earlier attempt of the same model
+    /// call; their start/delta/end events are not re-sent.
+    delivered_tool_calls: std::collections::HashSet<String>,
+    /// What was already closed, so a replay closes a block the failed attempt left open exactly
+    /// once and never re-closes one that already ended (#2478).
+    closed_thinking: bool,
+    closed_tool_calls: std::collections::HashSet<String>,
+}
+
+/// Blocks whose output already reached the consumer on an earlier attempt of one model call.
+///
+/// A retry replays the request from scratch, so re-emitting a block the caller has already
+/// rendered would duplicate it (#2478). Text is not tracked here: a retry after a text delta is
+/// suppressed outright (the consumer would see the same prefix twice). The `*_closed` fields
+/// record which block ends were already delivered.
+#[derive(Debug, Clone, Default)]
+struct DeliveredBlocks {
+    thinking: bool,
+    thinking_closed: bool,
+    tool_calls: std::collections::HashSet<String>,
+    tool_calls_closed: std::collections::HashSet<String>,
 }
 
 impl BlockLifecycle {
-    fn new(reply_id: String) -> Self {
+    fn with_delivered(reply_id: String, delivered: DeliveredBlocks) -> Self {
         Self {
             reply_id,
             text_started: false,
             thinking_started: false,
+            thinking_suppressed: delivered.thinking,
             started_tool_calls: std::collections::HashMap::new(),
+            delivered_tool_calls: delivered.tool_calls,
+            closed_thinking: delivered.thinking_closed,
+            closed_tool_calls: delivered.tool_calls_closed,
         }
+    }
+
+    /// Folds this attempt's delivery bookkeeping into the bag the next attempt starts from.
+    ///
+    /// Blocks count as delivered only when the events actually reached a consumer
+    /// (`reaches_consumer`); a discarded emitter must keep its retries intact.
+    fn carry_into(&self, delivered: &mut DeliveredBlocks, reaches_consumer: bool) {
+        if !reaches_consumer {
+            return;
+        }
+        delivered.thinking |= self.thinking_suppressed;
+        delivered.thinking_closed |= self.closed_thinking;
+        // A block is delivered once it was started (even without arguments) or carried over
+        // from an earlier attempt.
+        delivered
+            .tool_calls
+            .extend(self.delivered_tool_calls.iter().cloned());
+        delivered
+            .tool_calls
+            .extend(self.started_tool_calls.keys().cloned());
+        delivered
+            .tool_calls
+            .extend(self.closed_tool_calls.iter().cloned());
+        delivered
+            .tool_calls_closed
+            .extend(self.closed_tool_calls.iter().cloned());
+    }
+
+    /// Whether a thinking delta may be forwarded on this attempt.
+    fn allows_thinking_delta(&self) -> bool {
+        !self.thinking_suppressed
+    }
+
+    /// Whether a tool-call delta for `tool_id` may be forwarded on this attempt.
+    fn allows_tool_delta(&self, tool_id: &str) -> bool {
+        !self.delivered_tool_calls.contains(tool_id)
     }
 
     fn block_field(block_type: &str) -> serde_json::Value {
@@ -3149,6 +3297,11 @@ impl BlockLifecycle {
     }
 
     fn start_thinking(&mut self, emit: &mut impl FnMut(Result<AgentEvent>)) {
+        if self.thinking_suppressed {
+            // Nothing to show, but a block the failed attempt left open is still owed its end.
+            self.thinking_started = !self.closed_thinking;
+            return;
+        }
         if !self.thinking_started {
             self.thinking_started = true;
             let mut fields = JsonMap::new();
@@ -3173,9 +3326,19 @@ impl BlockLifecycle {
         if tool_id.is_empty() || self.started_tool_calls.contains_key(tool_id) {
             return;
         }
+        // Any block still open ends here, delivered or not.
         self.flush_text(emit);
         self.flush_thinking(emit);
         self.flush_all_tool_calls(emit);
+        if self.delivered_tool_calls.contains(tool_id) {
+            // Same as a suppressed thinking block: the call was already shown to the consumer, so
+            // only close it once when the failed attempt did not get that far.
+            if !self.closed_tool_calls.contains(tool_id) {
+                self.started_tool_calls
+                    .insert(tool_id.to_string(), tool_name.to_string());
+            }
+            return;
+        }
         let visible = !tool_name.starts_with("__");
         if visible && !self.started_tool_calls.contains_key(tool_id) {
             self.started_tool_calls
@@ -3219,6 +3382,7 @@ impl BlockLifecycle {
     fn flush_thinking(&mut self, emit: &mut impl FnMut(Result<AgentEvent>)) {
         if self.thinking_started {
             self.thinking_started = false;
+            self.closed_thinking = true;
             let mut fields = JsonMap::new();
             fields.insert(
                 "reply_id".to_string(),
@@ -3234,6 +3398,7 @@ impl BlockLifecycle {
 
     fn flush_all_tool_calls(&mut self, emit: &mut impl FnMut(Result<AgentEvent>)) {
         for (tool_id, tool_name) in self.started_tool_calls.drain() {
+            self.closed_tool_calls.insert(tool_id.clone());
             let mut fields = JsonMap::new();
             fields.insert(
                 "reply_id".to_string(),
@@ -3308,14 +3473,22 @@ async fn model_call_impl(
     // argument deltas are likewise excluded to keep the suppression as narrow as the
     // problem it fixes.
     let mut visible_output_emitted = false;
+    // Blocks already rendered for the consumer by an earlier attempt of *this* call. A retry
+    // replays the stream from the beginning, so thinking / tool-call output that was already
+    // delivered must not be sent a second time (#2478).
+    let mut delivered = DeliveredBlocks::default();
 
     let mut attempt: u32 = 0;
+    // Whether an empty (content-less) completion was already retried; an answer that stays
+    // empty must fail instead of being persisted as an empty assistant turn (#2962).
+    let mut empty_retried = false;
     // Whether the call already switched from the primary model to the fallback; the chain
     // switches at most once per model call.
     let mut using_fallback = false;
     loop {
         let mut acc = ReasoningContext::default();
-        let mut block_lifecycle = BlockLifecycle::new(reply_id.clone());
+        let mut block_lifecycle =
+            BlockLifecycle::with_delivered(reply_id.clone(), delivered.clone());
 
         // Emit ModelCallStart at the beginning of each attempt.
         {
@@ -3362,10 +3535,15 @@ async fn model_call_impl(
                         ContentBlock::Thinking(t) => {
                             block_lifecycle.start_thinking(&mut emit);
                             if !t.thinking.is_empty() {
-                                emit(Ok(delta_event(
-                                    AgentEventType::ThinkingBlockDelta,
-                                    &t.thinking,
-                                )));
+                                if block_lifecycle.allows_thinking_delta() {
+                                    emit(Ok(delta_event(
+                                        AgentEventType::ThinkingBlockDelta,
+                                        &t.thinking,
+                                    )));
+                                }
+                                if emit_reaches_consumer {
+                                    delivered.thinking = true;
+                                }
                             }
                         }
                         ContentBlock::ToolUse(tu) => {
@@ -3390,10 +3568,15 @@ async fn model_call_impl(
                                 );
                                 fields
                                     .insert("delta".to_string(), serde_json::Value::String(delta));
-                                emit(Ok(AgentEvent::with_fields(
-                                    AgentEventType::ToolCallDelta,
-                                    fields,
-                                )));
+                                if block_lifecycle.allows_tool_delta(&tu.id) {
+                                    emit(Ok(AgentEvent::with_fields(
+                                        AgentEventType::ToolCallDelta,
+                                        fields,
+                                    )));
+                                    if emit_reaches_consumer {
+                                        delivered.tool_calls.insert(tu.id.clone());
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -3410,6 +3593,28 @@ async fn model_call_impl(
 
         match consume.await {
             Ok(()) => {
+                // A stream that ends without a single content chunk is not an answer: persisting
+                // it used to append an empty assistant turn and end the request as if the model
+                // had spoken (#2962). Retry once (nothing was streamed, so a replay cannot
+                // duplicate output), then fail loudly instead of returning an empty reply.
+                if acc.is_empty() {
+                    tracing::info!(
+                        model = model.model_name(),
+                        attempt,
+                        empty_retried,
+                        "model call completed without any content"
+                    );
+                    if !empty_retried {
+                        empty_retried = true;
+                        drop(stream);
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(Error::Model(format!(
+                        "model '{}' returned an empty response",
+                        model.model_name()
+                    )));
+                }
                 // Flush all remaining blocks and emit ModelCallEnd.
                 block_lifecycle.flush_all(&mut emit);
                 {
@@ -3433,6 +3638,9 @@ async fn model_call_impl(
             Err(e) => {
                 // The stream borrows the model: release it before a possible switch.
                 drop(stream);
+                // Carry what this attempt delivered — including which blocks it closed — into
+                // the replay, so the retry neither duplicates nor fails to close them (#2478).
+                block_lifecycle.carry_into(&mut delivered, emit_reaches_consumer);
                 attempt += 1;
                 // Retrying is only safe while nothing has been shown to the user.
                 // Once visible text has been streamed, re-running the request would
@@ -3988,6 +4196,23 @@ impl ActingBatch<'_> {
         crate::observation::observe(self.ctx, call, self.core.toolkit.call_tool(call, tctx)).await
     }
 
+    /// Runs one tool under the observation boundary, giving up when the run is interrupted.
+    ///
+    /// A tool is the slowest part of a turn (a shell command, an MCP call, a sub-agent), and a
+    /// bare `await` kept the run — and its journal writer lease — alive until the tool finished,
+    /// no matter how early the caller asked to stop (#1741 / #1036). Racing the interrupt drops
+    /// the in-flight call instead; the caller answers it with an interrupted result.
+    async fn observe_interruptibly(
+        &self,
+        call: &ToolUseBlock,
+        tctx: ToolExecutionContext,
+    ) -> Option<Result<ToolResultBlock>> {
+        tokio::select! {
+            result = self.observe(call, tctx) => Some(result),
+            _ = interrupt_pending(self.core, Some(self.ctx)) => None,
+        }
+    }
+
     /// Whether `call` may join a concurrent batch: it must be executable (not
     /// malformed), not denied by plan mode, approved by the permission engine, and the
     /// tool itself must declare concurrent invocations safe.
@@ -4134,7 +4359,18 @@ async fn run_acting_calls(
                 );
                 // Record the action lifecycle around the real tool call. An acknowledgement
                 // failure is a run-level error: it must never become a retryable tool result.
-                match run.observe(call, tctx).await {
+                let observed = match run.observe_interruptibly(call, tctx).await {
+                    Some(observed) => observed,
+                    None => {
+                        record_interrupted_call(&run, call, results);
+                        // The interruption ends the batch. The run keeps its precise
+                        // classification because the next phase boundary re-checks the signal;
+                        // returning the error here would surface it as a failed turn instead of
+                        // a resumable interrupted one (#1741 / #1036).
+                        break;
+                    }
+                };
+                match observed {
                     Ok(rb) => {
                         // Emit text delta for non-streaming results (streaming tools
                         // emit their own deltas via the emitter callback).
@@ -4219,12 +4455,34 @@ async fn run_acting_calls(
                 index += 1;
             }
             PermissionBehavior::Ask => {
+                // Validate the arguments *before* anyone is asked to approve them (#3320):
+                // the executor only checks the schema after the confirmation, so a call that
+                // can never run used to pop a human prompt first. Report it as an ordinary
+                // tool error and keep the batch moving.
+                if let Some(invalid) = invalid_call_input(run.core, run.ctx, call) {
+                    emit_tool_result_start(&run.ctx.delta_tx, &call.id, &call.name);
+                    emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, &invalid);
+                    results.record(error_result(call, &invalid), false);
+                    emit_tool_result_end(
+                        &run.ctx.delta_tx,
+                        &call.id,
+                        &call.name,
+                        ToolResultState::Error,
+                        &JsonMap::new(),
+                    );
+                    index += 1;
+                    continue;
+                }
                 let handler = run.core.confirm_handler.lock().unwrap().clone();
                 if let Some(handler) = handler {
                     // Emit ToolResultStart so ACP clients know this tool is being
                     // processed (even though it's waiting for user confirmation).
                     emit_tool_result_start(&run.ctx.delta_tx, &call.id, &call.name);
-                    let confirm_result = handler(call.clone()).await;
+                    // The handler only sees the call, so the decision's explanation and its
+                    // suggested rules travel as call metadata (#3315 / #3243). A host that
+                    // renders its own prompt reads them; one that does not is unaffected.
+                    let confirm_call = confirm_call_with_decision(call, &decision);
+                    let confirm_result = handler(confirm_call).await;
                     if confirm_result.is_confirmed() {
                         // Remember the rules the user accepted ("always allow/reject"). They go
                         // into the engine *and* into the call-scoped state: with a state store
@@ -4261,7 +4519,16 @@ async fn run_acting_calls(
                         );
                         // Same observation boundary as the allow path: a failed
                         // acknowledgement is a run-level error, never a tool result.
-                        match run.observe(effective_call, tctx).await {
+                        let observed = match run.observe_interruptibly(effective_call, tctx).await {
+                            Some(observed) => observed,
+                            None => {
+                                record_interrupted_call(&run, effective_call, results);
+                                // Same contract as the allow path: end the batch and let the next
+                                // phase boundary classify the interruption.
+                                break;
+                            }
+                        };
+                        match observed {
                             Ok(rb) => {
                                 let mut result_text = String::new();
                                 for block in &rb.output {
@@ -4431,7 +4698,18 @@ async fn run_parallel_batch(
             }
         }
     });
-    let outcomes = futures::future::join_all(futures).await;
+    let outcomes = tokio::select! {
+        outcomes = futures::future::join_all(futures) => outcomes,
+        _ = interrupt_pending(run.core, Some(run.ctx)) => {
+            // The interrupt ends the batch: the calls still in flight are dropped (their side
+            // effects are uncertain) and answered as interrupted, and the next phase boundary
+            // classifies the signal (#1741 / #1036).
+            for call in calls {
+                record_interrupted_call(run, call, results);
+            }
+            return Ok(());
+        }
+    };
     for outcome in outcomes {
         match outcome {
             Ok((call, rb)) => {
@@ -4813,12 +5091,12 @@ fn patch_pending_tool_calls(state: &mut AgentState, messages: &[Msg]) {
 /// Reconciles an interrupted turn and returns the recovery message.
 ///
 /// The assistant message written by the interrupted reasoning phase may carry
-/// tool_use blocks that never ran; those are answered with synthetic error
+/// tool_use blocks that never ran; those are answered with synthetic interrupted
 /// results (so the persisted context has no dangling tool call), then an
 /// assistant recovery message is appended. Mirrors Java `handleInterrupt`.
 fn reconcile_interrupted(state: &mut AgentState) -> Msg {
     for call in extract_pending_tool_calls(state) {
-        let result = error_result(
+        let result = interrupted_result(
             &call,
             &format!(
                 "Tool execution was interrupted before it could run. Tool: {}",
@@ -4857,6 +5135,48 @@ const PLAN_MODE_ALWAYS_ALLOWED: &[&str] = &[
 const PLAN_MODE_DENY_MESSAGE: &str = "Blocked: you are in PLAN mode (read-only). You may \
 investigate and run read-only tools, record your plan with plan_write, and call plan_exit when \
 ready to execute. Do not modify files or run mutating commands until the plan is approved.";
+
+/// Whether a model failure is the provider rejecting a tool call it does not know.
+///
+/// DashScope answers such a request with `LLM is trying to invoke a non-exist tool`; other
+/// providers word it differently (`unknown tool`, `tool not found`). All of them report a bad
+/// tool call rather than an outage, so the turn can answer it and continue.
+fn is_unknown_tool_error(error: &Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("tool")
+        && [
+            "non-exist",
+            "non exist",
+            "does not exist",
+            "unknown",
+            "not found",
+            "invalid",
+            "not supported",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+}
+
+/// Answers a provider-side "unknown tool" rejection: the offending call never ran, so the model
+/// must reissue it with one of the tools this request actually defines.
+fn unknown_tool_recovery_message(error: &Error) -> Msg {
+    let mut metadata = JsonMap::new();
+    metadata.insert(
+        crate::message::keys::metadata_keys::SYNTHETIC.to_string(),
+        serde_json::json!(true),
+    );
+    Msg::builder()
+        .role(MsgRole::User)
+        .name("system")
+        .text_content(format!(
+            "The model provider rejected the previous tool call because it names a tool that is \
+             not available: {}. The call was not executed. Reissue it using only the tools \
+             defined for this request.",
+            error
+        ))
+        .metadata(metadata)
+        .build()
+}
 
 /// Result text for a truncated call (mirrors Java `OUTPUT_LIMIT_TOOL_ARGUMENTS`).
 const OUTPUT_LIMIT_TOOL_ARGUMENTS: &str =
@@ -4905,8 +5225,21 @@ fn plan_mode_denies(core: &Arc<AgentCore>, state: &AgentState, call: &ToolUseBlo
     !is_read_only
 }
 
+/// Whether plan mode is active on the agent's shared state.
+///
+/// The loop runs on a private state clone, but the plan-control tools write through the shared
+/// handle; reading it here is what lets the permission gate observe a plan that was entered
+/// (or exited) mid-turn.
+fn plan_mode_active(core: &Arc<AgentCore>) -> bool {
+    core.state.lock().unwrap().plan_mode_context.plan_active
+}
+
 /// Evaluates the permission decision for a single tool invocation.
 fn evaluate_permission(core: &Arc<AgentCore>, call: &ToolUseBlock) -> PermissionDecision {
+    // Read the plan flag before taking the engine lock: the permission engine and the shared
+    // state are never nested in the other order anywhere else.
+    let plan_allows =
+        plan_mode_active(core) && PLAN_MODE_ALWAYS_ALLOWED.contains(&call.name.as_str());
     // An unconfigured (trivial) permission context allows all tool calls, so a
     // default ReActAgent works out of the box without explicit rules.
     let engine = core.permission_engine.lock().unwrap();
@@ -4922,7 +5255,75 @@ fn evaluate_permission(core: &Arc<AgentCore>, call: &ToolUseBlock) -> Permission
         let serialized = serde_json::to_string(input).unwrap_or_default();
         serialized.contains(pattern)
     };
-    engine.check_permission(&call.name, is_read_only, &call.input, matcher)
+    let decision = engine.check_permission(&call.name, is_read_only, &call.input, matcher);
+    // Plan mode (#1910): the plan-control and orchestration tools stay permitted while a plan
+    // is active even when the mode's tool check would deny them (`Explore` denies every
+    // non-read-only tool, so `plan_write` used to be denied outright). Only a denial is
+    // overridden: a mode that already allows the tool is left as it is.
+    if plan_allows && decision.behavior == PermissionBehavior::Deny {
+        return PermissionDecision::allow(format!(
+            "Permission granted for {} (plan mode)",
+            call.name
+        ))
+        .with_decision_reason("Plan mode allows the plan-control and orchestration tools");
+    }
+    decision
+}
+
+/// Returns the schema-validation error of `call`'s arguments, or `None` when there is nothing
+/// to report (valid input, unknown tool, or an external schema-only tool the framework never
+/// executes itself).
+///
+/// Mirrors the executor's step 5 so the `Ask` branch can refuse an impossible call **before**
+/// a human is asked to approve it (#3320): the executor only validates after the approval, so
+/// the user used to confirm calls that could never run.
+fn invalid_call_input(
+    core: &AgentCore,
+    ctx: &crate::agent::RuntimeContext,
+    call: &ToolUseBlock,
+) -> Option<String> {
+    let request_config = ctx
+        .extension::<crate::tool::ToolRequestConfig>(crate::tool::TOOL_REQUEST_CONFIG_CONTEXT_KEY);
+    let tool = core
+        .toolkit
+        .get_tool_with(&call.name, request_config.as_deref())?;
+    if tool.is_external() {
+        return None;
+    }
+    let schema = if tool.is_strict() {
+        crate::tool::schema::effective_parameters(&tool.parameters_schema(), true)
+    } else {
+        tool.parameters_schema()
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let input = serde_json::Value::Object(call.input.clone());
+    crate::tool::ToolValidator::validate_input(&schema, &input)
+        .map(|error| format!("Parameter validation failed: {}", error))
+}
+
+/// Copies `call` for the confirmation handler, carrying the `Ask` decision's explanation and
+/// suggested rules as metadata (#3315 / #3243).
+///
+/// The handler signature only receives the tool call, so this is the channel the extra context
+/// travels on; the original call (the one the assistant message holds) is never touched.
+fn confirm_call_with_decision(call: &ToolUseBlock, decision: &PermissionDecision) -> ToolUseBlock {
+    let mut confirm_call = call.clone();
+    if !decision.message.trim().is_empty() {
+        confirm_call.metadata.insert(
+            CONFIRM_MESSAGE_METADATA_KEY.to_string(),
+            serde_json::Value::String(decision.message.clone()),
+        );
+    }
+    if let Some(rules) = &decision.suggested_rules {
+        if let Ok(value) = serde_json::to_value(rules) {
+            confirm_call
+                .metadata
+                .insert(CONFIRM_SUGGESTED_RULES_METADATA_KEY.to_string(), value);
+        }
+    }
+    confirm_call
 }
 
 /// Binds a tool's raw result block back to the originating call.
@@ -5101,6 +5502,40 @@ fn error_result(call: &ToolUseBlock, message: &str) -> ToolResultBlock {
         metadata: Default::default(),
         state: ToolResultState::Error,
     }
+}
+
+/// Builds an interrupted result block for a call.
+///
+/// `Interrupted` rather than `Error`: the tool may already have had side effects, so the call is
+/// neither a success nor a retryable failure. Mirrors the state the journal recovery path uses.
+fn interrupted_result(call: &ToolUseBlock, message: &str) -> ToolResultBlock {
+    let mut block = error_result(call, message);
+    block.state = ToolResultState::Interrupted;
+    block
+}
+
+/// Answers a tool call whose execution was cut short by an interrupt.
+///
+/// The result is recorded as `Interrupted`: the turn's recovery must see the call as unfinished
+/// work instead of a retryable failure.
+fn record_interrupted_call(
+    run: &ActingBatch<'_>,
+    call: &ToolUseBlock,
+    results: &ActingResultsHandle,
+) {
+    let message = format!(
+        "Tool execution was interrupted before it finished. Tool: {}",
+        call.name
+    );
+    emit_tool_result_text_delta(&run.ctx.delta_tx, &call.id, &call.name, &message);
+    results.record(interrupted_result(call, &message), false);
+    emit_tool_result_end(
+        &run.ctx.delta_tx,
+        &call.id,
+        &call.name,
+        ToolResultState::Interrupted,
+        &JsonMap::new(),
+    );
 }
 
 #[cfg(test)]
@@ -11101,5 +11536,618 @@ mod tests {
             "the first reasoning iteration still opens its own step"
         );
         recorder.close().await;
+    }
+
+    /// A tool declared with a required argument, counting its invocations.
+    fn required_argument_tool(counter: Arc<Mutex<u32>>) -> Arc<dyn Tool> {
+        Arc::new(crate::tool::FunctionTool::new(
+            "create_note",
+            "creates a note",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"title": {"type": "string"}},
+                "required": ["title"]
+            }),
+            Box::new(move |_args: JsonMap, _ctx: ToolExecutionContext| {
+                *counter.lock().unwrap() += 1;
+                Ok(ToolResultBlock::text("created"))
+            }),
+        ))
+    }
+
+    #[tokio::test]
+    async fn an_ask_on_invalid_arguments_never_reaches_the_confirm_handler() {
+        // #3320: the executor validates after the permission gate, so an `Ask` used to send a
+        // schema-invalid call to the user and only fail afterwards. Validate first.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(required_argument_tool(Arc::clone(&counter)));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "create_note", JsonMap::new()),
+                text_response("retry later"),
+            ],
+        ));
+        let ctx = crate::permission::PermissionContextState::builder()
+            .add_ask_rule(
+                "create_note",
+                crate::permission::PermissionRule::new(
+                    "create_note",
+                    None,
+                    crate::permission::PermissionBehavior::Ask,
+                    "test",
+                ),
+            )
+            .build();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let asked_clone = Arc::clone(&asked);
+        let handler: ConfirmHandler = Arc::new(move |_call: ToolUseBlock| {
+            let asked = Arc::clone(&asked_clone);
+            Box::pin(async move {
+                asked.fetch_add(1, Ordering::SeqCst);
+                ConfirmResult::allowed()
+            })
+        });
+        let agent = ReActAgent::builder()
+            .name("t-ask-invalid")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(ctx)
+            .confirm_handler(handler)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("note")]).await.unwrap();
+        assert_eq!(reply.text_content(), "retry later");
+        assert_eq!(*counter.lock().unwrap(), 0, "the tool must not run");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "an impossible call must not ask the user"
+        );
+        let state = agent.agent_state();
+        let reported = state
+            .context()
+            .iter()
+            .flat_map(|message| message.tool_result_blocks())
+            .any(|block| {
+                block.id.as_deref() == Some("c1") && block.state == ToolResultState::Error
+            });
+        assert!(reported, "the model must be told the call was invalid");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_does_not_deny_a_whitelisted_tool_in_explore_mode() {
+        // #1910: `Explore` denies every non-read-only tool, so the plan-control tools were
+        // denied while a plan was active — which made the plan flow unusable.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let ran = Arc::clone(&counter);
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "plan_write",
+            "records the plan",
+            serde_json::json!({"type": "object"}),
+            Box::new(move |_args: JsonMap, _ctx: ToolExecutionContext| {
+                *ran.lock().unwrap() += 1;
+                Ok(ToolResultBlock::text("plan recorded"))
+            }),
+        )));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![
+                tool_use_response("c1", "plan_write", JsonMap::new()),
+                text_response("done"),
+            ],
+        ));
+        let ctx = crate::permission::PermissionContextState::builder()
+            .mode(crate::permission::PermissionMode::Explore)
+            .build();
+        let agent = ReActAgent::builder()
+            .name("t-plan-whitelist")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(ctx)
+            .build()
+            .unwrap();
+        agent
+            .state_handle()
+            .lock()
+            .unwrap()
+            .plan_mode_context
+            .set_plan_active(true);
+
+        let reply = agent.call(vec![Msg::user("plan")]).await.unwrap();
+        assert_eq!(reply.text_content(), "done");
+        assert_eq!(
+            *counter.lock().unwrap(),
+            1,
+            "a whitelisted plan tool must run while a plan is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_request_carries_the_decision_message_and_rules() {
+        // #3315 / #3243: the handler only receives the call, so the `Ask` decision's message
+        // and suggested rules travel as call metadata instead of being dropped.
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let mut input = JsonMap::new();
+        input.insert("a".to_string(), serde_json::json!(1));
+        input.insert("b".to_string(), serde_json::json!(2));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response("c1", "add", input), text_response("done")],
+        ));
+        let ctx = crate::permission::PermissionContextState::builder()
+            .add_ask_rule(
+                "add",
+                crate::permission::PermissionRule::new(
+                    "add",
+                    None,
+                    crate::permission::PermissionBehavior::Ask,
+                    "test",
+                ),
+            )
+            .build();
+        let captured: Arc<Mutex<Option<ToolUseBlock>>> = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&captured);
+        let handler: ConfirmHandler = Arc::new(move |call: ToolUseBlock| {
+            *slot.lock().unwrap() = Some(call);
+            Box::pin(async move { ConfirmResult::allowed() })
+        });
+        let agent = ReActAgent::builder()
+            .name("t-confirm-metadata")
+            .model(model)
+            .toolkit(toolkit)
+            .permission_context(ctx)
+            .confirm_handler(handler)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
+        assert_eq!(reply.text_content(), "done");
+        let seen = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the handler saw the call");
+        assert_eq!(
+            seen.metadata
+                .get(CONFIRM_MESSAGE_METADATA_KEY)
+                .and_then(|value| value.as_str()),
+            Some("Permission required for add")
+        );
+        let rules = seen
+            .metadata
+            .get(CONFIRM_SUGGESTED_RULES_METADATA_KEY)
+            .and_then(|value| value.as_array())
+            .expect("the suggestion travels with the call");
+        assert_eq!(rules.len(), 1);
+    }
+
+    /// A model whose first attempt fails with a provider-side "unknown tool" error.
+    struct UnknownToolErrorModel {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl Model for UnknownToolErrorModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            let attempt = *calls;
+            drop(calls);
+            Box::pin(futures::stream::iter(if attempt == 1 {
+                vec![Err(Error::Model(
+                    "LLM is trying to invoke a non-exist tool: search_web".into(),
+                ))]
+            } else {
+                vec![Ok(text_response("recovered"))]
+            }))
+        }
+
+        fn model_name(&self) -> &str {
+            "unknown-tool-error"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_unknown_tool_error_is_answered_and_the_turn_continues() {
+        // #3102: the provider rejects a call that names a tool it does not know. That is a bad
+        // tool call, not an outage: answer it and reason again instead of ending the turn.
+        let model = Arc::new(UnknownToolErrorModel {
+            calls: Arc::new(Mutex::new(0)),
+        });
+        let calls = Arc::clone(&model.calls);
+        let agent = ReActAgent::builder()
+            .name("t-unknown-tool")
+            .model(model)
+            .build()
+            .unwrap();
+        agent.set_generate_options_defaults(fast_retry_options(1));
+
+        let reply = agent.call(vec![Msg::user("search")]).await.unwrap();
+        assert_eq!(reply.text_content(), "recovered");
+        assert_eq!(*calls.lock().unwrap(), 2, "the turn retried once");
+        let state = agent.agent_state();
+        assert!(
+            state
+                .context()
+                .iter()
+                .any(|message| message.text_content().contains("not available")),
+            "the model is told which call was rejected"
+        );
+    }
+
+    /// Emits a thinking block and a tool call, then fails retryably. The retry replays the same
+    /// two blocks before the stream finally completes; the third call answers with text.
+    #[derive(Default)]
+    struct ReplayingStreamModel {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    impl ReplayingStreamModel {
+        /// The blocks a replayed attempt emits: the same thinking text and the same call id.
+        fn thinking_and_call() -> Vec<Result<ChatResponse>> {
+            let mut input = JsonMap::new();
+            input.insert("a".to_string(), serde_json::json!(1));
+            input.insert("b".to_string(), serde_json::json!(2));
+            let mut tool_call = ToolUseBlock::new("t1", "add", input);
+            tool_call.content = Some("{\"a\":1,\"b\":2}".to_string());
+            vec![
+                Ok(ChatResponse::builder()
+                    .content(vec![ContentBlock::Thinking(ThinkingBlock::new("hmm"))])
+                    .build()),
+                Ok(ChatResponse::builder()
+                    .content(vec![ContentBlock::ToolUse(tool_call)])
+                    .build()),
+            ]
+        }
+    }
+
+    #[async_trait]
+    impl Model for ReplayingStreamModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            let attempt = *calls;
+            drop(calls);
+            let items = match attempt {
+                1 => {
+                    let mut items = Self::thinking_and_call();
+                    items.push(Err(Error::http_status(503, "upstream unavailable")));
+                    items
+                }
+                2 => Self::thinking_and_call(),
+                _ => vec![Ok(text_response("done"))],
+            };
+            Box::pin(futures::stream::iter(items))
+        }
+
+        fn model_name(&self) -> &str {
+            "replaying-stream"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_does_not_deliver_the_same_thinking_or_tool_chunks_twice() {
+        // #2478: a retry replays the stream from the beginning, so the thinking block and the
+        // tool-call arguments the consumer already rendered must not be sent again — and the
+        // tool must run once, for the attempt that actually completed.
+        let model = Arc::new(ReplayingStreamModel::default());
+        let calls = Arc::clone(&model.calls);
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(add_tool(Arc::clone(&counter)));
+        let agent = ReActAgent::builder()
+            .name("t-retry-chunks")
+            .model(model)
+            .toolkit(toolkit)
+            .build()
+            .unwrap();
+        agent.set_generate_options_defaults(fast_retry_options(3));
+
+        let items: Vec<Result<AgentEvent>> = agent
+            .stream_events(
+                vec![Msg::user("hi")],
+                crate::agent::stream_options::StreamOptions::defaults(),
+            )
+            .collect()
+            .await;
+        let count = |wanted: AgentEventType| {
+            items
+                .iter()
+                .filter_map(|item| item.as_ref().ok())
+                .filter(|event| event.event_type() == wanted)
+                .count()
+        };
+        assert_eq!(count(AgentEventType::ThinkingBlockStart), 1);
+        assert_eq!(count(AgentEventType::ThinkingBlockDelta), 1);
+        assert_eq!(count(AgentEventType::ToolCallStart), 1);
+        assert_eq!(count(AgentEventType::ToolCallDelta), 1);
+        // The replayed block is still closed exactly once, so the stream stays well formed.
+        assert_eq!(count(AgentEventType::ThinkingBlockEnd), 1);
+        assert_eq!(count(AgentEventType::ToolCallEnd), 1);
+        assert_eq!(*calls.lock().unwrap(), 3, "the retry still happened");
+        assert_eq!(
+            *counter.lock().unwrap(),
+            1,
+            "the replayed call must run once"
+        );
+    }
+
+    /// A tool that reports when it started and then blocks far longer than any test waits.
+    struct SlowTool {
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for SlowTool {
+        fn name(&self) -> &str {
+            "slow_tool"
+        }
+        fn description(&self) -> &str {
+            "waits for a long time"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn call(
+            &self,
+            _args: JsonMap,
+            _ctx: ToolExecutionContext,
+        ) -> Result<ToolResultBlock> {
+            self.started.store(true, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(ToolResultBlock::text("late"))
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupting_during_a_tool_run_abandons_the_wait() {
+        // #1741 / #1036: the model stream was interruptible, the tool call was a bare await, so
+        // a long tool kept the run (and its lease) alive until it finished.
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(SlowTool {
+            started: Arc::clone(&started),
+        }));
+        let model = Arc::new(MockModel::new(
+            "mock",
+            vec![tool_use_response("c1", "slow_tool", JsonMap::new())],
+        ));
+        let agent = Arc::new(
+            ReActAgent::builder()
+                .name("t-slow-tool")
+                .model(model)
+                .toolkit(toolkit)
+                .build()
+                .unwrap(),
+        );
+        let call = tokio::spawn({
+            let agent = Arc::clone(&agent);
+            async move { agent.call(vec![Msg::user("run it")]).await }
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !started.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the tool never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        agent.interrupt();
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .expect("the interrupt must end the tool wait")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.generate_reason(), GenerateReason::Interrupted);
+        let state = agent.agent_state();
+        let answered = state
+            .context()
+            .iter()
+            .flat_map(|message| message.tool_result_blocks())
+            .any(|block| {
+                block.id.as_deref() == Some("c1") && block.state == ToolResultState::Interrupted
+            });
+        assert!(
+            answered,
+            "the interrupted tool call must be answered as Interrupted"
+        );
+    }
+
+    /// Streams the answer in two chunks.
+    #[derive(Default)]
+    struct TwoChunkModel {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl Model for TwoChunkModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            *self.calls.lock().unwrap() += 1;
+            Box::pin(futures::stream::iter(vec![
+                Ok(text_response("ab")),
+                Ok(text_response("cd")),
+            ]))
+        }
+
+        fn model_name(&self) -> &str {
+            "two-chunk"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_incremental_stream_delivers_cumulative_deltas() {
+        // #1211: `StreamOptions::incremental` was a dead field. With it off, each delta carries
+        // the text so far so a renderer that cannot append can replace its buffer.
+        let model = Arc::new(TwoChunkModel::default());
+        let agent = ReActAgent::builder()
+            .name("t-cumulative")
+            .model(model)
+            .build()
+            .unwrap();
+        let options = crate::agent::stream_options::StreamOptions::builder()
+            .incremental(false)
+            .build();
+
+        let items: Vec<Result<AgentEvent>> = agent
+            .stream_events(vec![Msg::user("hi")], options)
+            .collect()
+            .await;
+        let deltas: Vec<String> = items
+            .iter()
+            .filter_map(|item| item.as_ref().ok())
+            .filter(|event| event.event_type() == AgentEventType::TextBlockDelta)
+            .filter_map(|event| {
+                event
+                    .data()
+                    .fields
+                    .get("delta")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(deltas, vec!["ab".to_string(), "abcd".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn the_call_gate_key_prefers_the_session_of_the_run() {
+        // #2256: keying the gate on the agent's own state put every caller of a singleton agent
+        // into one FIFO. A run that names its session gets per-session concurrency.
+        let model = Arc::new(MockModel::new("mock", vec![text_response("hi")]));
+        let agent = ReActAgent::builder()
+            .name("t-gate-key")
+            .model(model)
+            .state(AgentState::builder().session_id("s-agent").build())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            call_gate_key(&agent.core, &crate::agent::Extensions::new()),
+            "s-agent",
+            "without a stamp the agent state scopes the call"
+        );
+        let mut extensions = crate::agent::Extensions::new();
+        extensions.insert(SESSION_ID_CONTEXT_KEY, "s-call".to_string());
+        assert_eq!(call_gate_key(&agent.core, &extensions), "s-call");
+        // A blank stamp is not a session.
+        let mut blank = crate::agent::Extensions::new();
+        blank.insert(SESSION_ID_CONTEXT_KEY, "  ".to_string());
+        assert_eq!(call_gate_key(&agent.core, &blank), "s-agent");
+    }
+
+    /// Returns `count` empty chunks: a provider that ends the stream with no content.
+    struct EmptyThenTextModel {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl Model for EmptyThenTextModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            let attempt = *calls;
+            drop(calls);
+            Box::pin(futures::stream::iter(vec![Ok(if attempt == 1 {
+                text_response("")
+            } else {
+                text_response("second attempt")
+            })]))
+        }
+
+        fn model_name(&self) -> &str {
+            "empty-then-text"
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_completion_is_retried_once() {
+        // #2962: a stream that ends with no content used to become an empty assistant message
+        // and end the turn as if the model had answered.
+        let model = Arc::new(EmptyThenTextModel {
+            calls: Arc::new(Mutex::new(0)),
+        });
+        let calls = Arc::clone(&model.calls);
+        let agent = ReActAgent::builder()
+            .name("t-empty-retry")
+            .model(model)
+            .build()
+            .unwrap();
+
+        let reply = agent.call(vec![Msg::user("hi")]).await.unwrap();
+        assert_eq!(reply.text_content(), "second attempt");
+        assert_eq!(*calls.lock().unwrap(), 2, "one retry");
+    }
+
+    /// Always answers with an empty completion (one chunk, no content).
+    struct AlwaysEmptyModel {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl Model for AlwaysEmptyModel {
+        fn stream(
+            &self,
+            _messages: Vec<Msg>,
+            _tools: Vec<crate::model::ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, Result<ChatResponse>> {
+            *self.calls.lock().unwrap() += 1;
+            Box::pin(futures::stream::iter(vec![Ok(text_response(""))]))
+        }
+
+        fn model_name(&self) -> &str {
+            "always-empty"
+        }
+    }
+
+    #[tokio::test]
+    async fn an_always_empty_completion_fails_instead_of_answering_nothing() {
+        let model = Arc::new(AlwaysEmptyModel {
+            calls: Arc::new(Mutex::new(0)),
+        });
+        let calls = Arc::clone(&model.calls);
+        let agent = ReActAgent::builder()
+            .name("t-empty-fail")
+            .model(model)
+            .build()
+            .unwrap();
+
+        let error = agent.call(vec![Msg::user("hi")]).await.unwrap_err();
+        assert!(
+            error.to_string().contains("empty response"),
+            "the error must name the cause; got: {error}"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "an empty answer is retried exactly once"
+        );
     }
 }

@@ -5,7 +5,9 @@
 //! harness composes an ordered list (low-to-high priority) and, when the skill
 //! self-learning loop is enabled, swaps the read-only workspace layer for a writable
 //! one so `skill_manage` can persist drafts and promoted skills.
-use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +32,16 @@ pub trait SkillRepository: Send + Sync {
 
     /// The repository classification used by the [`super::stager`].
     fn repo_kind(&self) -> SkillRepo;
+
+    /// Cheap change signal for [`Self::load`]: `Some` when the repository can summarise its
+    /// current state (entry count + newest top-level modification time), `None` when it cannot.
+    ///
+    /// The skill middleware compares this stamp before reusing its lazily-built catalog, so a
+    /// `SKILL.md` written by another process (not through `skill_manage`) becomes visible
+    /// without a full re-scan on every call (#2419 / #2420).
+    fn freshness(&self) -> Option<u64> {
+        None
+    }
 
     /// Loads every skill currently available from this repository.
     fn load(&self) -> Vec<AgentSkill>;
@@ -98,6 +110,9 @@ impl SkillRepository for DirSkillRepository {
     fn load(&self) -> Vec<AgentSkill> {
         load_skills_from_dir(&self.root, &self.source)
     }
+    fn freshness(&self) -> Option<u64> {
+        dir_freshness(&self.root)
+    }
     fn write_skill(&self, skill: &AgentSkill) -> std::io::Result<()> {
         if !self.writeable {
             return Err(std::io::Error::new(
@@ -122,15 +137,58 @@ impl SkillRepository for DirSkillRepository {
         }
     }
     fn skill_dir(&self, name: &str) -> Option<std::path::PathBuf> {
+        // Single-skill layout: the root *is* the skill directory, not its parent.
+        if self.root.join("SKILL.md").is_file()
+            && self
+                .root
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().as_ref() == name)
+        {
+            return Some(self.root.clone());
+        }
         Some(self.root.join(name))
     }
 }
 
+/// Summarises a skills directory without reading any file: entry count plus the newest
+/// top-level modification time. `None` when the directory cannot be listed.
+fn dir_freshness(root: &Path) -> Option<u64> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut count: u64 = 0;
+    let mut newest: u128 = 0;
+    for entry in entries.flatten() {
+        count += 1;
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let since = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok());
+        if let Some(since) = since {
+            newest = newest.max(since.as_nanos());
+        }
+    }
+    let mut hasher = DefaultHasher::new();
+    count.hash(&mut hasher);
+    newest.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 /// Reads every skill subdirectory under `root` that contains a `SKILL.md`.
+///
+/// A root that holds `SKILL.md` itself is a *single-skill* layout (`<root>/SKILL.md`): it is
+/// its own skill directory, so it loads as exactly one skill instead of an empty catalog (#1790).
 pub fn load_skills_from_dir(root: &Path, source: &str) -> Vec<AgentSkill> {
     let mut skills = Vec::new();
     if !root.is_dir() {
         return skills;
+    }
+    if root.join("SKILL.md").is_file() {
+        if let Some(skill) = load_skill_from_dir(root, source) {
+            skills.push(skill);
+            return skills;
+        }
     }
     let Ok(entries) = std::fs::read_dir(root) else {
         return skills;
@@ -180,27 +238,68 @@ pub fn load_skill_from_dir(dir: &Path, source: &str) -> Option<AgentSkill> {
     Some(builder.build())
 }
 
+/// Cap on the total resources collected for one skill (16 MiB), bounding the in-memory
+/// `base64:` expansion of a binary-heavy skill directory (#1906).
+///
+/// A single large resource is limited only by this total: a per-file cap made a skill whose
+/// largest asset exceeded it silently lose that asset, so `get_skill` no longer returned the
+/// resources the directory actually holds.
+const MAX_RESOURCE_TOTAL_BYTES: u64 = 16 << 20;
+
 fn collect_resources(dir: &Path) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut stack = vec![PathBuf::new()];
+    // Canonicalised directories already walked: a symlink loop (or a `..` alias) must not
+    // keep the stack growing forever.
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut total: u64 = 0;
     while let Some(rel) = stack.pop() {
         let abs = dir.join(&rel);
+        let canonical = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&abs) else {
             continue;
         };
         for entry in entries.flatten() {
-            let entry_rel = rel.join(entry.file_name());
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // `.git` and any other hidden entry: never part of a skill's published resources.
+            if name_str.starts_with('.') {
+                continue;
+            }
+            let entry_rel = rel.join(&name);
             let entry_abs = dir.join(&entry_rel);
-            if entry_abs.is_dir() {
+            let Ok(meta) = entry_abs.symlink_metadata() else {
+                continue;
+            };
+            let file_type = meta.file_type();
+            // Symlinks are skipped entirely: following one can leave the skill directory.
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(entry_rel);
-            } else if entry_abs.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&entry_abs) {
-                    let rel_str = entry_rel.to_string_lossy().replace('\\', "/");
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            if total.saturating_add(meta.len()) > MAX_RESOURCE_TOTAL_BYTES {
+                continue;
+            }
+            let rel_str = entry_rel.to_string_lossy().replace('\\', "/");
+            let Ok(bytes) = std::fs::read(&entry_abs) else {
+                continue;
+            };
+            total = total.saturating_add(bytes.len() as u64);
+            match String::from_utf8(bytes) {
+                Ok(content) => {
                     out.insert(rel_str, content);
-                } else if let Ok(bytes) = std::fs::read(&entry_abs) {
-                    use base64::Engine as _;
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-                    let rel_str = entry_rel.to_string_lossy().replace('\\', "/");
+                }
+                Err(e) => {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(e.as_bytes());
                     out.insert(rel_str, format!("base64:{b64}"));
                 }
             }
@@ -294,6 +393,9 @@ impl SkillRepository for FileSystemSkillRepository {
     fn load(&self) -> Vec<AgentSkill> {
         self.inner.load()
     }
+    fn freshness(&self) -> Option<u64> {
+        self.inner.freshness()
+    }
     fn skill_dir(&self, name: &str) -> Option<std::path::PathBuf> {
         self.inner.skill_dir(name)
     }
@@ -360,6 +462,9 @@ impl SkillRepository for WorkspaceSkillRepository {
     }
     fn load(&self) -> Vec<AgentSkill> {
         self.inner.load()
+    }
+    fn freshness(&self) -> Option<u64> {
+        self.inner.freshness()
     }
     fn skill_dir(&self, name: &str) -> Option<std::path::PathBuf> {
         self.inner.skill_dir(name)
@@ -497,6 +602,69 @@ mod tests {
         write_skill(&root, "beta", "# Beta skill\n");
         let repo = WorkspaceSkillRepository::new_read_only(&root);
         assert_eq!(repo.skill_dir("beta"), Some(root.join("beta")));
+    }
+
+    #[test]
+    fn a_root_that_is_itself_a_skill_loads_as_one_skill() {
+        // Single-skill layout: `<root>/SKILL.md` with no `skills/` layer (#1790).
+        let root = temp_dir("single_root");
+        std::fs::write(root.join("SKILL.md"), "# Lone skill\n").unwrap();
+        std::fs::write(root.join("notes.md"), "notes").unwrap();
+
+        let repo = FileSystemSkillRepository::new(&root, "market");
+        let skills = repo.load();
+        assert_eq!(
+            skills.len(),
+            1,
+            "a single-skill root loads exactly one skill"
+        );
+        let name = root.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(skills[0].name(), name);
+        assert!(skills[0].description().starts_with("Lone skill"));
+        assert_eq!(
+            skills[0].resources().get("notes.md").map(String::as_str),
+            Some("notes")
+        );
+        // The load tool's index must point at the root itself, not `<root>/<root-name>`.
+        assert_eq!(repo.skill_dir(&name), Some(root.clone()));
+
+        // A root holding no `SKILL.md` still enumerates subdirectories as before.
+        let parent = temp_dir("single_root_parent");
+        write_skill(&parent, "alpha", "# Alpha skill\n");
+        assert_eq!(FileSystemSkillRepository::new(&parent, "m").load().len(), 1);
+    }
+
+    #[test]
+    fn collect_resources_skips_hidden_oversized_and_looping_entries() {
+        let root = temp_dir("resources");
+        write_skill(&root, "alpha", "# Alpha skill\n");
+        let skill = root.join("alpha");
+        std::fs::create_dir_all(skill.join(".git")).unwrap();
+        std::fs::write(skill.join(".git").join("config"), "secret").unwrap();
+        std::fs::write(skill.join(".hidden"), "hidden").unwrap();
+        std::fs::write(
+            skill.join("big.bin"),
+            vec![b'x'; (MAX_RESOURCE_TOTAL_BYTES + 1) as usize],
+        )
+        .unwrap();
+        // A self-referential link must be skipped, not followed (creation may need privileges
+        // on Windows; the assertion below only cares that nothing loops or panics).
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&skill, skill.join("loop"));
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::os::windows::fs::symlink_dir(&skill, skill.join("loop"));
+        }
+
+        let loaded = load_skill_from_dir(&skill, "market").expect("alpha loads");
+        let keys: Vec<&String> = loaded.resources().keys().collect();
+        assert!(keys.iter().any(|k| k.as_str() == "SKILL.md"));
+        assert!(!keys.iter().any(|k| k.contains(".git")), "{keys:?}");
+        assert!(!keys.iter().any(|k| k.as_str() == ".hidden"), "{keys:?}");
+        assert!(!keys.iter().any(|k| k.as_str() == "big.bin"), "{keys:?}");
+        assert!(keys.len() <= 2, "resource set stays bounded: {keys:?}");
     }
 
     #[test]

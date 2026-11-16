@@ -3208,7 +3208,9 @@ mod tests {
 
         let original = ReActAgent::builder()
             .name("prod")
-            .model(Arc::new(model_support::FakeModel))
+            // A production call must produce an answer: since #2962 an empty model reply is an
+            // error, so the driver model has to speak.
+            .model(Arc::new(model_support::ReplyModel))
             .build()
             .unwrap();
         let shadow = AgentCloner::clone_with_model(

@@ -250,7 +250,10 @@ impl BackgroundTask {
     }
 
     pub fn is_completed(&self) -> bool {
-        matches!(*self.state.status.lock().unwrap(), TaskInner::Done(_))
+        // A cancellation is terminal for observation: no result will ever be reported for the
+        // task. The backing execution may still be unwinding (see `is_execution_finished`).
+        self.cancelled.load(Ordering::Relaxed)
+            || matches!(*self.state.status.lock().unwrap(), TaskInner::Done(_))
     }
 
     /// Returns the structured `TaskStatus`, reflecting the underlying execution and any
@@ -289,6 +292,13 @@ impl BackgroundTask {
 
     /// Non-blocking error peek.
     pub fn get_error(&self) -> Option<String> {
+        if self.cancelled.load(Ordering::Relaxed)
+            && !matches!(*self.state.status.lock().unwrap(), TaskInner::Done(_))
+        {
+            // Same wording a reconstructed record reports, so a live cancellation and a
+            // replay of one read the same.
+            return Some("task cancelled".to_string());
+        }
         match &*self.state.status.lock().unwrap() {
             TaskInner::Done(Err(e)) => Some(e.clone()),
             _ => None,
@@ -296,18 +306,33 @@ impl BackgroundTask {
     }
 
     /// Marks the task cancelled and aborts the backing execution, if any.
+    ///
+    /// A blocking local execution runs on the blocking pool, which `abort()` cannot stop: the
+    /// wrapper task is gone but the closure keeps running. Recording `Done` here used to lie
+    /// about that — callers were told the work had terminated when all that happened is that
+    /// cancellation was requested. The task therefore stays *not finished*
+    /// (`is_execution_finished`) while `get_task_status` already reports `Cancelled`, and only
+    /// the real completion path records `Done`.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.lock().unwrap().take() {
             h.abort();
         }
-        {
-            let mut st = self.state.status.lock().unwrap();
-            if matches!(*st, TaskInner::Running) {
-                *st = TaskInner::Done(Err("task cancelled".to_string()));
-            }
-        }
+        // Wake waiters: the status changed from Running to Cancelled even though the work may
+        // still be unwinding.
         self.state.condvar.notify_all();
+    }
+
+    /// Whether cancellation was requested (and no result will be reported).
+    pub fn is_cancellation_requested(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Whether the backing execution actually reached a terminal state.
+    ///
+    /// A cancelled blocking task can stay `false` for as long as its closure runs.
+    pub fn is_execution_finished(&self) -> bool {
+        matches!(*self.state.status.lock().unwrap(), TaskInner::Done(_))
     }
 
     /// Blocks until the task completes or the timeout elapses.
@@ -316,6 +341,11 @@ impl BackgroundTask {
         let mut st = self.state.status.lock().unwrap();
         let start = std::time::Instant::now();
         while matches!(*st, TaskInner::Running) {
+            // Cancellation settles the observation even when the blocking work keeps running;
+            // waiting for it would park the caller for as long as an unkillable closure takes.
+            if self.cancelled.load(Ordering::Relaxed) {
+                return true;
+            }
             let elapsed = start.elapsed();
             if elapsed >= timeout {
                 return false;
@@ -334,6 +364,31 @@ impl BackgroundTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelling_a_blocked_task_does_not_claim_its_execution_ended() {
+        // Regression: `cancel()` used to write `Done(Err("task cancelled"))` immediately. A
+        // local task runs on the blocking pool, which `abort()` cannot stop, so that made the
+        // tool report a terminated execution while the closure was still running.
+        let task = BackgroundTask::controlled("t1", "sub");
+        task.cancel();
+        assert_eq!(task.get_task_status(), TaskStatus::Cancelled);
+        assert!(task.is_cancellation_requested());
+        assert!(
+            task.is_completed(),
+            "cancellation is terminal for observation"
+        );
+        assert!(
+            !task.is_execution_finished(),
+            "the blocking closure was never stopped, so it has not finished"
+        );
+        assert_eq!(task.get_error().as_deref(), Some("task cancelled"));
+
+        // The real completion still lands, and it does not resurrect the task as successful.
+        task.set_done(Ok("late result".into()));
+        assert!(task.is_execution_finished());
+        assert_eq!(task.get_task_status(), TaskStatus::Cancelled);
+    }
 
     #[test]
     fn from_record_preserves_created_at() {

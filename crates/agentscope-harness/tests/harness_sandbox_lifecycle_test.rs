@@ -13,6 +13,8 @@ use agentscope_harness::agent::{
     SandboxClientOptions, SandboxContext, SandboxManager, SandboxSnapshotSpec, SandboxState,
     WorkspaceSpec,
 };
+use agentscope_harness::filesystem::{LocalFilesystem, SandboxBackedFilesystem, SandboxFilesystem};
+use agentscope_harness::tool::ShellExecuteTool;
 
 #[derive(Debug)]
 struct CountingSandbox {
@@ -119,6 +121,7 @@ async fn acquires_and_persists_around_call() {
     let mw = SandboxLifecycleMiddleware::new(Arc::clone(&manager), context);
 
     let ctx = RuntimeContext::default().with_session_id("s1");
+    let ctx = with_shell_tool(ctx);
     let input = AgentInput::new(vec![]);
     let next: Next<AgentInput> = Box::new(move |_in| {
         futures::stream::iter(vec![Ok(AgentEvent::new(AgentEventType::AgentEnd))]).boxed()
@@ -131,4 +134,77 @@ async fn acquires_and_persists_around_call() {
         1,
         "sandbox should be created once"
     );
+}
+
+/// Registers the sandbox-bound shell tool on the call's toolkit.
+fn with_shell_tool(mut ctx: RuntimeContext) -> RuntimeContext {
+    let dir = std::env::temp_dir().join(format!("as_lifecycle_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sandbox = Arc::new(SandboxBackedFilesystem::new(
+        Arc::new(LocalFilesystem::new(dir)) as Arc<dyn agentscope_harness::filesystem::Filesystem>,
+        std::env::temp_dir(),
+    )) as Arc<dyn SandboxFilesystem>;
+    let toolkit = agentscope_core::tool::Toolkit::new();
+    toolkit.register_tool(Arc::new(ShellExecuteTool::new(sandbox)));
+    ctx.toolkit = Some(toolkit);
+    ctx
+}
+
+/// A pure-chat turn exposes no sandbox-bound tool, so the lifecycle middleware must not pay
+/// for a guard lease + resume/create (#2564).
+#[tokio::test]
+async fn pure_chat_does_not_acquire_a_sandbox() {
+    let client = Arc::new(CountingClient {
+        created: std::sync::atomic::AtomicUsize::new(0),
+        sandbox_started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let store = Arc::new(InMemorySandboxStateStore::new());
+    let manager = Arc::new(SandboxManager::new(
+        Arc::clone(&client) as Arc<dyn SandboxClient>,
+        store.clone(),
+        "agent-lc",
+    ));
+    let mw =
+        SandboxLifecycleMiddleware::new(Arc::clone(&manager), SandboxContext::builder().build());
+
+    let ctx = RuntimeContext::default().with_session_id("s-chat");
+    let input = AgentInput::new(vec![]);
+    let next: Next<AgentInput> = Box::new(move |_in| {
+        futures::stream::iter(vec![Ok(AgentEvent::new(AgentEventType::AgentEnd))]).boxed()
+    });
+
+    let events: Vec<_> = mw.on_agent(&ctx, input, next).collect().await;
+    assert_eq!(events.len(), 1, "the turn still runs");
+    assert_eq!(
+        client.created.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a pure-chat turn must not create a sandbox"
+    );
+}
+
+/// `with_always_acquire` keeps the old unconditional behaviour for hosts whose sandbox is
+/// reached through tools this middleware cannot recognise.
+#[tokio::test]
+async fn always_acquire_overrides_the_capability_check() {
+    let client = Arc::new(CountingClient {
+        created: std::sync::atomic::AtomicUsize::new(0),
+        sandbox_started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let manager = Arc::new(SandboxManager::new(
+        Arc::clone(&client) as Arc<dyn SandboxClient>,
+        Arc::new(InMemorySandboxStateStore::new()),
+        "agent-lc",
+    ));
+    let mw = SandboxLifecycleMiddleware::new(manager, SandboxContext::builder().build())
+        .with_always_acquire(true);
+
+    let ctx = RuntimeContext::default().with_session_id("s-always");
+    let next: Next<AgentInput> = Box::new(move |_in| {
+        futures::stream::iter(vec![Ok(AgentEvent::new(AgentEventType::AgentEnd))]).boxed()
+    });
+    let _: Vec<_> = mw
+        .on_agent(&ctx, AgentInput::new(vec![]), next)
+        .collect()
+        .await;
+    assert_eq!(client.created.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

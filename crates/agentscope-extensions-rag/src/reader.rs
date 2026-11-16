@@ -160,6 +160,19 @@ pub(crate) fn input_path_bytes(input: &ReaderInput) -> Result<Vec<u8>> {
         .map_err(|e| RagError::Reader(format!("Failed to read {}: {e}", path.display())))
 }
 
+/// Drops chunks that are blank once trimmed (#3305).
+///
+/// The chunkers keep Java's boundary behaviour — a whitespace-only document or a window that
+/// happens to hold only separators still produces a chunk — but such a chunk must never reach
+/// the embedding pipeline: it burns provider quota and stores a useless vector. Non-blank
+/// chunks keep their contents, order and boundaries.
+pub(crate) fn drop_blank_chunks(chunks: Vec<String>) -> Vec<String> {
+    chunks
+        .into_iter()
+        .filter(|chunk| !chunk.trim().is_empty())
+        .collect()
+}
+
 /// Chunks `text` and builds one [`Document`] per chunk, with `doc_id` and chunk ids `"0"`, `"1"`, ...
 ///
 /// Shared by [`TextReader::create_documents`] and the binary format readers ([`pdf::PdfReader`],
@@ -171,7 +184,7 @@ pub(crate) fn chunk_documents(
     strategy: SplitStrategy,
     overlap_size: usize,
 ) -> Result<Vec<Document>> {
-    let chunks = chunk_text(text, chunk_size, strategy, overlap_size)?;
+    let chunks = drop_blank_chunks(chunk_text(text, chunk_size, strategy, overlap_size)?);
     Ok(chunks
         .iter()
         .enumerate()
@@ -205,7 +218,8 @@ pub fn validate_chunking_parameters(chunk_size: usize, overlap_size: usize) -> R
 /// Splits `text` into chunks according to `strategy`.
 ///
 /// Ports Java `TextChunker.chunkText`, including the validation errors, the empty-string
-/// special case (`[""]`) and the per-strategy algorithms.
+/// special case (`[""]`) and the per-strategy algorithms. Chunks that are blank once trimmed
+/// are dropped (#3305): they would otherwise reach the embedding pipeline as empty vectors.
 pub fn chunk_text(
     text: &str,
     chunk_size: usize,
@@ -218,7 +232,7 @@ pub fn chunk_text(
         return Ok(vec![String::new()]);
     }
 
-    Ok(match strategy {
+    Ok(drop_blank_chunks(match strategy {
         SplitStrategy::Character => chunk_by_character(text, chunk_size, overlap_size),
         SplitStrategy::Paragraph => chunk_by_paragraph(text, chunk_size, overlap_size),
         SplitStrategy::Token => chunk_by_character(
@@ -227,7 +241,7 @@ pub fn chunk_text(
             overlap_size * CHARS_PER_TOKEN,
         ),
         SplitStrategy::Semantic => chunk_by_paragraph(text, chunk_size, overlap_size),
-    })
+    }))
 }
 
 /// Splits `text` into overlapping character windows.
@@ -410,12 +424,12 @@ impl TextReader {
 impl Reader for TextReader {
     async fn read(&self, input: ReaderInput) -> Result<Vec<Document>> {
         let text = input.as_string()?;
-        let chunks = chunk_text(
+        let chunks = drop_blank_chunks(chunk_text(
             &text,
             self.chunk_size,
             self.split_strategy,
             self.overlap_size,
-        )?;
+        )?);
         let doc_id = doc_id_for_input(&input);
         Ok(self.create_documents(&doc_id, &chunks))
     }
@@ -488,6 +502,26 @@ mod tests {
         let text = "aaa\n\nbbb";
         let chunks = chunk_text(text, 100, SplitStrategy::Paragraph, 0).unwrap();
         assert_eq!(chunks, vec!["aaa\n\nbbb"]);
+    }
+
+    #[test]
+    fn whitespace_only_text_yields_no_chunks() {
+        let chunks = chunk_text("  \n\t ", 10, SplitStrategy::Character, 0).unwrap();
+        assert!(chunks.is_empty(), "chunks={chunks:?}");
+        let chunks = chunk_text("   ", 10, SplitStrategy::Paragraph, 0).unwrap();
+        assert!(chunks.is_empty(), "chunks={chunks:?}");
+    }
+
+    #[test]
+    fn blank_chunks_are_dropped_from_the_document_pipeline() {
+        // The character splitter turns the two separator spaces of `a  b` into their own
+        // chunks; the pipeline must not turn those into documents (and embeddings).
+        let documents = chunk_documents("a  b", "doc", 1, SplitStrategy::Character, 0).unwrap();
+        let contents: Vec<String> = documents
+            .iter()
+            .map(|doc| doc.metadata.content_text())
+            .collect();
+        assert_eq!(contents, vec!["a", "b"]);
     }
 
     #[test]

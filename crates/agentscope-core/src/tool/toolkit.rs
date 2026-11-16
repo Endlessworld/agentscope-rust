@@ -245,6 +245,13 @@ impl Toolkit {
                 if !self.groups.is_active_tool_for(name, &active_groups) {
                     continue;
                 }
+                // A tool an active EXTERNAL group owns is not part of the unrestricted caller's
+                // surface (#1953): the group exists for host code and sub-agent whitelists,
+                // which carry a capability surface and are filtered by the grant check below
+                // instead.
+                if surface.is_none() && self.groups.is_tool_hidden_from_parent(name) {
+                    continue;
+                }
                 if let Some(surface) = surface {
                     let groups = self.groups.tool_group_names_for(name);
                     if !surface.grants_tool(name, &groups, tool.is_system()) {
@@ -297,6 +304,7 @@ impl Toolkit {
         call: &ToolUseBlock,
         ctx: crate::tool::ToolExecutionContext,
     ) -> Result<ToolResultBlock> {
+        self.reject_if_hidden_from_parent(&call.name, &ctx)?;
         self.executor
             .execute(self, call, ctx, self.config.execution_config.as_ref())
             .await
@@ -309,7 +317,28 @@ impl Toolkit {
         ctx: crate::tool::ToolExecutionContext,
         config: Option<&ExecutionConfig>,
     ) -> Result<ToolResultBlock> {
+        self.reject_if_hidden_from_parent(&call.name, &ctx)?;
         self.executor.execute(self, call, ctx, config).await
+    }
+
+    /// Rejects a call to a tool an active EXTERNAL group keeps off the parent's surface.
+    ///
+    /// The parent agent runs without a capability surface, so this entry check is what keeps an
+    /// EXTERNAL group's tools out of its reach; a caller that *does* carry a surface (a
+    /// sub-agent with a whitelist) is left to the grant gate (#1953). The call is reported the
+    /// same way a missing tool is, so the model cannot probe for tools it was never shown.
+    fn reject_if_hidden_from_parent(
+        &self,
+        name: &str,
+        ctx: &crate::tool::ToolExecutionContext,
+    ) -> Result<()> {
+        if ctx.capability_surface().is_some() || !self.groups.is_tool_hidden_from_parent(name) {
+            return Ok(());
+        }
+        Err(crate::error::Error::Tool(format!(
+            "Tool not found: {}",
+            name
+        )))
     }
 
     /// Executes multiple tool calls, honoring the toolkit's parallel flag.
@@ -581,6 +610,7 @@ impl Toolkit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ToolExecutionContext;
 
     #[test]
     fn tool_schemas_are_sorted_by_name() {
@@ -669,6 +699,53 @@ mod tests {
             names,
             vec!["reset_equipped_tools"],
             "the system meta tool must survive a deny-all surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_active_external_group_is_hidden_from_an_unrestricted_caller() {
+        // #1953: an EXTERNAL group is a host-managed surface (sub-agent whitelists, host code).
+        // Activating it must not add its tools to the parent agent's model-facing schemas, and
+        // a call that names one must look like a missing tool rather than a permission error.
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(Arc::new(crate::tool::FunctionTool::new(
+            "spawn_worker",
+            "host-managed",
+            serde_json::json!({"type": "object"}),
+            Box::new(|_, _| Ok(ToolResultBlock::text("ok"))),
+        )));
+        toolkit.create_tool_group_with_scope(
+            "worker",
+            "host managed",
+            true,
+            crate::tool::ToolGroupScope::External,
+        );
+        toolkit.add_tool_to_group("worker", "spawn_worker");
+
+        assert!(
+            toolkit.tool_schemas_for_call(None, None).is_empty(),
+            "the parent's surface must not carry the external tool"
+        );
+        let granted = surface(Some(&["worker"]), None);
+        let visible: Vec<String> = toolkit
+            .tool_schemas_for_call(None, Some(&granted))
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        assert_eq!(
+            visible,
+            vec!["spawn_worker"],
+            "a capability surface that grants the group still reaches the tool"
+        );
+
+        let call = ToolUseBlock::new("c1", "spawn_worker", crate::message::JsonMap::new());
+        let error = toolkit
+            .call_tool(&call, ToolExecutionContext::default())
+            .await
+            .expect_err("the unrestricted caller must not run it");
+        assert!(
+            error.to_string().contains("Tool not found"),
+            "the rejection must not leak the tool's existence; got: {error}"
         );
     }
 }

@@ -466,6 +466,47 @@ impl Drop for InvocationRecorder {
     }
 }
 
+/// Releases the writer lease if the recorder-open future is dropped before it finishes.
+///
+/// `InvocationRecorder::open_with_*` acquired the lease and relied on its error returns to
+/// release it; a future dropped mid-open (a cancelled run, a panic in the caller) never
+/// reached those returns, so the session stayed owned by a dead run for the whole lease and
+/// the next turn failed to acquire it.
+struct WriterLeaseGuard {
+    log: Arc<dyn ThreadJournal>,
+    writer: Option<Writer>,
+}
+
+impl WriterLeaseGuard {
+    fn new(log: Arc<dyn ThreadJournal>, writer: Writer) -> Self {
+        Self {
+            log,
+            writer: Some(writer),
+        }
+    }
+
+    /// Hands the lease to the caller (the recorder itself or an explicit error release).
+    fn disarm(&mut self) {
+        self.writer = None;
+    }
+}
+
+impl Drop for WriterLeaseGuard {
+    fn drop(&mut self) {
+        let Some(writer) = self.writer.take() else {
+            return;
+        };
+        // `release` is async and `Drop` is not, so hand it to the runtime. Without one the
+        // process is going away and the lease dies with it.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let log = Arc::clone(&self.log);
+            handle.spawn(async move {
+                let _ = log.release(&writer).await;
+            });
+        }
+    }
+}
+
 /// Renews the execution writer lease while the recorder is open.
 ///
 /// Mirrors the renewal half of Java's `InvocationRecorder` heartbeat thread. It deliberately does
@@ -808,6 +849,11 @@ impl InvocationRecorder {
         }
 
         let writer = log.acquire(run_id, lease).await?;
+        // From here on the lease is held by an async function: if the future is dropped (a
+        // cancelled run, a panic in the caller) before the recorder exists, nothing would ever
+        // release it and the session stays owned for the whole lease, so the next turn fails to
+        // acquire. The guard releases on drop unless the normal path disarms it.
+        let mut lease_guard = WriterLeaseGuard::new(Arc::clone(&log), writer.clone());
         // Renew from the moment the lease is held: the replay below can take longer than the
         // lease on a large journal, and starting the heartbeat only after the recorder is
         // constructed lets the writer expire during recovery.
@@ -818,6 +864,7 @@ impl InvocationRecorder {
                 if let Some(heartbeat) = heartbeat {
                     heartbeat.shutdown().await;
                 }
+                lease_guard.disarm();
                 let _ = log.release(&writer).await;
                 return Err(error);
             }
@@ -970,6 +1017,7 @@ impl InvocationRecorder {
                     if let Some(heartbeat) = heartbeat {
                         heartbeat.shutdown().await;
                     }
+                    lease_guard.disarm();
                     let _ = log.release(&writer).await;
                     return Err(error);
                 }
@@ -987,6 +1035,10 @@ impl InvocationRecorder {
             Some(json) => serde_json::from_str(json)?,
             None => CheckpointFields::default(),
         };
+
+        // The recorder now owns the lease and releases it from its own `Drop`;
+        // the guard must not release it as well.
+        lease_guard.disarm();
 
         Ok(Self {
             replay_ms,

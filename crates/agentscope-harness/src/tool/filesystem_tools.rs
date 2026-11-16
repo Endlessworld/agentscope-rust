@@ -42,6 +42,33 @@ fn with_diffs(mut result: ToolResultBlock, diffs: Vec<serde_json::Value>) -> Too
     result
 }
 
+/// Rebuilds the caller's storage identity from the tool call's runtime map.
+///
+/// `ToolExecutionContext` hands a tool only the flat runtime map (session / user / agent ids).
+/// Building a fresh `RuntimeContext` instead resolved every path against the *anonymous*
+/// namespace, so a file the caller wrote through this tool landed in
+/// `agents/<agent>/users/<anonymous>/…` while the reply still showed the logical path — the
+/// session that asked could never read it back.
+fn runtime_from_ctx(ctx: &ToolExecutionContext) -> RuntimeContext {
+    let mut rt = RuntimeContext::default();
+    if let Some(session_id) = ctx.runtime.get("sessionId").and_then(|v| v.as_str()) {
+        if !session_id.trim().is_empty() {
+            rt = rt.with_session_id(session_id);
+        }
+    }
+    if let Some(user_id) = ctx.runtime.get("userId").and_then(|v| v.as_str()) {
+        if !user_id.trim().is_empty() {
+            rt = rt.with_user_id(user_id);
+        }
+    }
+    if let Some(agent_id) = ctx.runtime.get("agentId").and_then(|v| v.as_str()) {
+        if !agent_id.trim().is_empty() {
+            rt = rt.with_agent_id(agent_id);
+        }
+    }
+    rt
+}
+
 /// Deserializes a field that may arrive either as a single value or as a list.
 ///
 /// Models routinely send `filePath` as a bare string even though the schema
@@ -437,8 +464,8 @@ impl Tool for FilesystemTool {
         self.schema.clone()
     }
 
-    async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
-        let rt = RuntimeContext::default();
+    async fn call(&self, args: JsonMap, ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
+        let rt = runtime_from_ctx(&ctx);
         let output = match self.name.as_str() {
             "read_file" => {
                 let params: ReadFileParams =
@@ -637,5 +664,90 @@ impl Tool for FilesystemTool {
             }
         };
         Ok(ToolResultBlock::text(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filesystem::remote::store::{InMemoryStore, NamespaceFactory};
+    use crate::filesystem::remote::RemoteFilesystem;
+
+    /// Mirrors the harness namespace layout: agent → user.
+    struct UserNamespace;
+
+    impl NamespaceFactory for UserNamespace {
+        fn get_namespace(&self, ctx: &RuntimeContext) -> Vec<String> {
+            vec![
+                "agents".to_string(),
+                ctx.agent_id().unwrap_or("anon").to_string(),
+                "users".to_string(),
+                ctx.user_id().unwrap_or("_default").to_string(),
+            ]
+        }
+    }
+
+    fn tool_ctx(user: &str) -> ToolExecutionContext {
+        let mut ctx = ToolExecutionContext::default();
+        ctx.runtime
+            .insert("agentId".to_string(), serde_json::json!("a1"));
+        ctx.runtime
+            .insert("userId".to_string(), serde_json::json!(user));
+        ctx.runtime
+            .insert("sessionId".to_string(), serde_json::json!("s1"));
+        ctx
+    }
+
+    fn args(value: serde_json::Value) -> JsonMap {
+        value.as_object().cloned().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn reads_and_writes_stay_in_the_callers_namespace() {
+        let fs: Arc<dyn Filesystem> = Arc::new(RemoteFilesystem::new(
+            Arc::new(InMemoryStore::new()),
+            Arc::new(UserNamespace),
+        ));
+        let write = FilesystemTool::write_file(fs.clone());
+        let read = FilesystemTool::read_file(fs);
+
+        write
+            .call(
+                args(serde_json::json!({
+                    "operations": [{"path": "/notes.md", "content": "hello"}]
+                })),
+                tool_ctx("alice"),
+            )
+            .await
+            .expect("write");
+
+        // The same caller context resolves to the same namespace, so it reads its own write.
+        let own = read
+            .call(
+                args(serde_json::json!({"filePath": "/notes.md"})),
+                tool_ctx("alice"),
+            )
+            .await
+            .expect("read");
+        assert!(
+            own.text_content().contains("hello"),
+            "unexpected result: {}",
+            own.text_content()
+        );
+
+        // A different user must not see it: the write went to alice's namespace, not the
+        // anonymous one.
+        let other = read
+            .call(
+                args(serde_json::json!({"filePath": "/notes.md"})),
+                tool_ctx("bob"),
+            )
+            .await
+            .expect("read");
+        assert!(
+            other.text_content().contains("ERROR"),
+            "bob must not read alice's file: {}",
+            other.text_content()
+        );
     }
 }

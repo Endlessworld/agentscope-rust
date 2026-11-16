@@ -47,6 +47,23 @@ fn opt_str_arg(args: &JsonMap, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Rebuilds the call-scoped identity the runtime hands to tools.
+///
+/// `ToolExecutionContext` carries session / user as plain runtime entries; a sandbox
+/// filesystem needs them to resolve the isolation-scoped working directory, so the tool
+/// must forward them instead of passing `RuntimeContext::default()` (which loses the
+/// identity and pins every caller to the shared root).
+fn runtime_context(runtime: &JsonMap) -> RuntimeContext {
+    let mut rt = RuntimeContext::default();
+    if let Some(session) = runtime.get("sessionId").and_then(|value| value.as_str()) {
+        rt = rt.with_session_id(session);
+    }
+    if let Some(user) = runtime.get("userId").and_then(|value| value.as_str()) {
+        rt = rt.with_user_id(user);
+    }
+    rt
+}
+
 /// Renders a finished command into the tool result the model sees.
 ///
 /// Kept separate from [`Tool::call`] so the output shaping (exit-code header,
@@ -183,7 +200,7 @@ impl Tool for ShellExecuteTool {
     }
 
     async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
-        let rt = RuntimeContext::default();
+        let rt = runtime_context(&_ctx.runtime);
         let command = args
             .get("command")
             .and_then(|v| v.as_str())

@@ -150,12 +150,18 @@ fn convert_media_block_to_text_reference(source: &Source, media_type: &str) -> S
 }
 
 /// Saves base64-encoded data to a temporary file and returns its absolute path.
+///
+/// The file name is the content digest (plus the media-type extension) instead of
+/// a random UUID: the same history formatted twice must render the **same** path,
+/// otherwise every replay invalidates the provider's prompt/prefix cache and
+/// leaves one extra temp file behind per formatting pass.
 pub fn save_base64_data_to_temp_file(
     media_type: &str,
     base64_data: &str,
 ) -> std::io::Result<String> {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
+    use sha2::Digest as _;
 
     // Extract extension from MIME type (e.g. "image/png" -> "png").
     let extension = if media_type.contains('/') {
@@ -164,13 +170,22 @@ pub fn save_base64_data_to_temp_file(
         media_type
     };
 
-    let mut path = std::env::temp_dir();
-    path.push(format!("agentscope_{}", uuid::Uuid::new_v4()));
-    path.set_extension(extension);
-
     let decoded = BASE64
         .decode(base64_data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let digest = sha2::Sha256::digest(&decoded);
+    let digest_hex = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("agentscope_{digest_hex}"));
+    path.set_extension(extension);
+    // Identical content already rendered: reuse the file instead of rewriting it.
+    if path.exists() {
+        return Ok(path.to_string_lossy().into_owned());
+    }
     std::fs::write(&path, decoded)?;
     Ok(path.to_string_lossy().into_owned())
 }
@@ -343,5 +358,21 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "hello");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_same_base64_payload_renders_the_same_temp_path() {
+        // A random name per call changed the rendered reference on every replay,
+        // which broke the provider's prompt/prefix cache and leaked temp files.
+        let first = save_base64_data_to_temp_file("image/png", "aGVsbG8=").unwrap();
+        let second = save_base64_data_to_temp_file("image/png", "aGVsbG8=").unwrap();
+        assert_eq!(first, second);
+        assert!(first.contains("agentscope_"), "{first}");
+        // Same bytes, different payload => different path.
+        let other = save_base64_data_to_temp_file("image/png", "d29ybGQ=").unwrap();
+        assert_ne!(first, other);
+        for path in [&first, &other] {
+            std::fs::remove_file(path).ok();
+        }
     }
 }

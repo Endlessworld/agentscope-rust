@@ -19,6 +19,13 @@ pub struct TodoItem {
     pub status: String,
     #[serde(default)]
     pub priority: Option<String>,
+    /// Longer explanation of the task. Falls back to `content` when the model omits it (#1696).
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Any other field the model sent: merged into the [`Task`] metadata instead of being
+    /// dropped silently (#1696).
+    #[serde(flatten)]
+    pub extra: JsonMap,
 }
 
 const DESCRIPTION: &str = "Create and maintain a structured task list for the current session. \
@@ -73,6 +80,7 @@ impl Tool for TodoWriteTool {
                         "type": "object",
                         "properties": {
                             "content": {"type": "string", "description": "Brief, specific, actionable description of the task."},
+                            "description": {"type": "string", "description": "Optional longer explanation of the task; defaults to the content."},
                             "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
                             "priority": {"type": "string", "enum": ["high", "medium", "low"]}
                         },
@@ -133,12 +141,23 @@ impl Tool for TodoWriteTool {
             if let Some(p) = &prior {
                 metadata = p.metadata.clone();
             }
+            // Fields the model sent beyond `content` / `description` / `status` / `priority`
+            // are kept in the metadata rather than dropped (#1696).
+            for (key, value) in &item.extra {
+                metadata.insert(key.clone(), value.clone());
+            }
             if let Some(priority) = normalize_priority(item.priority.as_deref()) {
                 metadata.insert("priority".to_string(), serde_json::json!(priority));
             }
+            let description = item
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .unwrap_or(item.content.as_str());
             let mut b = Task::builder()
                 .subject(&item.content)
-                .description(&item.content)
+                .description(description)
                 .state(parsed)
                 .metadata(metadata);
             if let Some(p) = prior {
@@ -316,6 +335,53 @@ mod tests {
         assert_eq!(state.revision(), 2);
         assert_eq!(state.tasks().len(), 1);
         assert_eq!(state.tasks()[0].state, TaskState::Completed);
+    }
+
+    #[tokio::test]
+    async fn description_and_extra_fields_are_kept_on_the_task() {
+        let tasks = Arc::new(Mutex::new(TaskContextState::new()));
+        let tool = TodoWriteTool::new(Arc::clone(&tasks));
+        let result = tool
+            .call(
+                args(serde_json::json!([{
+                    "content": "step one",
+                    "description": "  the longer explanation  ",
+                    "status": "pending",
+                    "notes": "context the model added"
+                }])),
+                ToolExecutionContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.state, ToolResultState::Success);
+
+        let state = tasks.lock().unwrap();
+        let task = &state.tasks()[0];
+        assert_eq!(task.subject, "step one");
+        assert_eq!(
+            task.description, "the longer explanation",
+            "the description wins over the content"
+        );
+        assert_eq!(
+            task.metadata.get("notes"),
+            Some(&serde_json::json!("context the model added")),
+            "unknown fields are kept in the metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_description_falls_back_to_the_content() {
+        let tasks = Arc::new(Mutex::new(TaskContextState::new()));
+        let tool = TodoWriteTool::new(Arc::clone(&tasks));
+        tool.call(
+            args(serde_json::json!([{"content": "step one", "status": "pending"}])),
+            ToolExecutionContext::default(),
+        )
+        .await
+        .unwrap();
+
+        let state = tasks.lock().unwrap();
+        assert_eq!(state.tasks()[0].description, "step one");
     }
 
     #[tokio::test]

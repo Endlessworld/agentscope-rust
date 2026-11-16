@@ -37,6 +37,13 @@ pub trait SandboxFilesystem: Filesystem {
 pub struct SandboxBackedFilesystem {
     inner: Arc<dyn Filesystem>,
     cwd: PathBuf,
+    /// Isolation scope the shell working directory is scoped by (Java parity gap #2329).
+    ///
+    /// `None` keeps the historical behaviour: every caller executes in `cwd`. With a scope
+    /// set, `execute` runs in `cwd/<namespace segments>` — the same per-user / per-session
+    /// sub-directory the filesystem layer namespaces file access by, so two users sharing
+    /// one sandbox do not execute in one another's directory.
+    isolation_scope: Option<super::super::agent::IsolationScope>,
 }
 
 impl SandboxBackedFilesystem {
@@ -44,7 +51,14 @@ impl SandboxBackedFilesystem {
         Self {
             inner,
             cwd: cwd.into(),
+            isolation_scope: None,
         }
+    }
+
+    /// Scopes shell execution by the given isolation scope.
+    pub fn with_isolation_scope(mut self, scope: super::super::agent::IsolationScope) -> Self {
+        self.isolation_scope = Some(scope);
+        self
     }
 
     pub fn inner(&self) -> &dyn Filesystem {
@@ -54,6 +68,20 @@ impl SandboxBackedFilesystem {
     /// Directory shell commands run from.
     pub fn cwd(&self) -> &PathBuf {
         &self.cwd
+    }
+
+    /// Directory shell commands run from for this call.
+    ///
+    /// Resolves the isolation namespace (user / session) under [`cwd`](Self::cwd) when a
+    /// scope is configured; without a scope, or without identifiers, it is `cwd` itself.
+    pub fn scoped_cwd(&self, ctx: &RuntimeContext) -> PathBuf {
+        let Some(scope) = self.isolation_scope else {
+            return self.cwd.clone();
+        };
+        let namespace = scope.namespace(ctx.user_id(), ctx.session_id());
+        namespace
+            .iter()
+            .fold(self.cwd.clone(), |path, segment| path.join(segment))
     }
 }
 
@@ -170,10 +198,14 @@ pub(crate) fn kill_process_tree(pid: u32) {
 impl SandboxFilesystem for SandboxBackedFilesystem {
     async fn execute(
         &self,
-        _ctx: &RuntimeContext,
+        ctx: &RuntimeContext,
         command: &str,
         timeout_seconds: u32,
     ) -> Result<ExecuteResponse> {
+        let scoped_cwd = self.scoped_cwd(ctx);
+        // The per-scope directory is created on demand: the shell is the first caller for a
+        // fresh user/session, and `Command::current_dir` fails on a missing directory.
+        let _ = std::fs::create_dir_all(&scoped_cwd);
         // `build_windows_command` 只在 Windows 下存在，所以这里必须用 `#[cfg]` 分支，
         // 不能用 `if cfg!(windows)`：后者两个分支都会被编译，Windows 专属函数在
         // 非 Windows 目标上会直接 `cannot find function` 编译失败。
@@ -190,7 +222,7 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
             c.arg("-c").arg(command);
             c
         };
-        cmd.current_dir(&self.cwd)
+        cmd.current_dir(&scoped_cwd)
             // Never inherit the parent's stdin: when the agent runs over ACP
             // stdio, stdin is a pipe the client keeps open, and an inherited
             // pipe makes pwsh wait for input instead of exiting.
@@ -400,8 +432,14 @@ impl PinnedSandboxFilesystem {
 
 #[async_trait]
 impl Filesystem for PinnedSandboxFilesystem {
+    /// Returns the **inner** sandbox backend, not this wrapper.
+    ///
+    /// Prompt building looks for a `SandboxBackedFilesystem` to report the sandbox root; a
+    /// wrapper that only answered for itself made that lookup fail and fall back to the
+    /// host workspace, so the prompt named the host directory while telling the model that
+    /// the host is unreachable (contradiction). Forwarding keeps the sandbox root visible.
     fn as_any(&self) -> &dyn std::any::Any {
-        self
+        self.inner.as_any()
     }
 
     fn kind(&self) -> FilesystemKind {
@@ -524,8 +562,9 @@ impl RoutedSandboxFilesystem {
 
 #[async_trait]
 impl Filesystem for RoutedSandboxFilesystem {
+    /// Returns the **primary** sandbox backend (see `PinnedSandboxFilesystem::as_any`).
     fn as_any(&self) -> &dyn std::any::Any {
-        self
+        self.primary.as_any()
     }
 
     fn kind(&self) -> FilesystemKind {
@@ -621,6 +660,58 @@ mod tests {
             Arc::new(LocalFilesystem::sandboxed(dir)),
             dir,
         ))
+    }
+
+    /// The shell working directory is resolved per isolation scope so two users sharing one
+    /// sandbox do not execute in one another's directory (#2329).
+    #[test]
+    fn scoped_cwd_follows_the_isolation_scope() {
+        let root = temp_dir("scoped_cwd");
+        let build = || -> SandboxBackedFilesystem {
+            SandboxBackedFilesystem::new(
+                Arc::new(LocalFilesystem::sandboxed(&root)) as Arc<dyn Filesystem>,
+                root.clone(),
+            )
+        };
+        let ctx = RuntimeContext::default()
+            .with_session_id("s-1")
+            .with_user_id("u-1");
+
+        // No scope configured: the historical shared root is kept.
+        assert_eq!(build().scoped_cwd(&ctx), root);
+
+        let session = build().with_isolation_scope(crate::agent::IsolationScope::Session);
+        assert_eq!(session.scoped_cwd(&ctx), root.join("s-1"));
+
+        let user = build().with_isolation_scope(crate::agent::IsolationScope::User);
+        assert_eq!(user.scoped_cwd(&ctx), root.join("u-1"));
+
+        // An anonymous caller (no identifiers) falls back to the shared root.
+        let anonymous = build().with_isolation_scope(crate::agent::IsolationScope::Session);
+        assert_eq!(anonymous.scoped_cwd(&RuntimeContext::default()), root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Wrappers forward `as_any` to the inner sandbox backend so a caller can still find the
+    /// sandbox root (and cannot be answered with the wrapper type instead).
+    #[test]
+    fn sandbox_wrappers_expose_the_inner_backend() {
+        let dir = temp_dir("as_any");
+        let inner = sandbox_fs(&dir);
+        let pinned = PinnedSandboxFilesystem::new(Arc::clone(&inner));
+        assert!(
+            pinned
+                .as_any()
+                .downcast_ref::<SandboxBackedFilesystem>()
+                .is_some(),
+            "a pinned filesystem must answer for its sandbox backend"
+        );
+        let routed = RoutedSandboxFilesystem::new(Arc::clone(&inner), Vec::new());
+        assert!(routed
+            .as_any()
+            .downcast_ref::<SandboxBackedFilesystem>()
+            .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

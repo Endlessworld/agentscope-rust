@@ -71,13 +71,39 @@ pub fn build_retrieve_request(
         );
     }
 
-    if let Some(filters) = config.search_filters.as_ref().filter(|f| !f.is_empty()) {
-        request.search_filters = Some(filters.clone());
+    if let Some(filters) = normalize_search_filters(config.search_filters.as_deref()) {
+        request.search_filters = Some(filters);
     }
 
     request.save_retriever_history = config.save_retriever_history;
 
     request
+}
+
+/// Normalises the configured tag filters (#527).
+///
+/// Blank keys / values are dropped, empty maps are skipped and duplicates keep their first
+/// position, so a configuration with an empty tag no longer sends `{"tag": ""}` (which the
+/// service rejects) and a repeated filter entry is not sent twice. `None` when nothing
+/// survives — the request then omits `search_filters` entirely.
+fn normalize_search_filters(
+    filters: Option<&[std::collections::HashMap<String, String>]>,
+) -> Option<Vec<std::collections::HashMap<String, String>>> {
+    let mut normalized: Vec<std::collections::HashMap<String, String>> = Vec::new();
+    for filter in filters? {
+        let mut entry = std::collections::HashMap::new();
+        for (key, value) in filter {
+            if key.trim().is_empty() || value.trim().is_empty() {
+                continue;
+            }
+            entry.insert(key.clone(), value.clone());
+        }
+        if entry.is_empty() || normalized.contains(&entry) {
+            continue;
+        }
+        normalized.push(entry);
+    }
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 /// `Some(value)` when the string is non-blank, otherwise `None` (Java `StringUtils.isEmpty`).
@@ -257,6 +283,39 @@ mod tests {
             .access_key_secret("sk")
             .workspace_id("w")
             .search_filters(vec![])
+            .build()
+            .unwrap();
+        let request = build_retrieve_request(&cfg, "idx", "q", None, None);
+        assert_eq!(request.search_filters, None);
+    }
+
+    #[test]
+    fn blank_and_duplicate_tags_are_normalised() {
+        let mut blank = HashMap::new();
+        blank.insert("tag".to_string(), "   ".to_string());
+        let mut kept = HashMap::new();
+        kept.insert("tag".to_string(), "a".to_string());
+        let mut blank_key = HashMap::new();
+        blank_key.insert(" ".to_string(), "b".to_string());
+        let cfg = BailianConfig::builder()
+            .access_key_id("ak")
+            .access_key_secret("sk")
+            .workspace_id("w")
+            .search_filters(vec![blank.clone(), kept.clone(), blank_key, kept.clone()])
+            .build()
+            .unwrap();
+
+        let request = build_retrieve_request(&cfg, "idx", "q", None, None);
+        let sent = request.search_filters.as_ref().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0], kept);
+
+        // Nothing survives: the field is omitted instead of sent empty.
+        let cfg = BailianConfig::builder()
+            .access_key_id("ak")
+            .access_key_secret("sk")
+            .workspace_id("w")
+            .search_filters(vec![blank])
             .build()
             .unwrap();
         let request = build_retrieve_request(&cfg, "idx", "q", None, None);

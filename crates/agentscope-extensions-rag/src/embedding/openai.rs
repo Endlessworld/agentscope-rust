@@ -33,6 +33,22 @@ pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const EMBEDDINGS_ENDPOINT: &str = "/embeddings";
 /// Provider label used in error messages / logs.
 pub const PROVIDER: &str = "openai";
+/// Maximum number of inputs OpenAI accepts in one `/embeddings` request.
+///
+/// Larger batches are split into consecutive requests of at most this size (#1095).
+pub const MAX_BATCH_SIZE: usize = 2048;
+
+/// Outcome of [`OpenAiTextEmbedding::embed_batch`].
+///
+/// OpenAI rejects a whole request when one of its inputs is invalid, so failures are reported
+/// per batch instead of discarding the vectors the other batches produced (#1095).
+#[derive(Debug)]
+pub struct EmbedBatchOutcome {
+    /// One entry per input text, in input order; `None` when that text's batch failed.
+    pub embeddings: Vec<Option<Vec<f64>>>,
+    /// `(batch index, index of the batch's first input, error)` for every failed batch.
+    pub failures: Vec<(usize, usize, RagError)>,
+}
 
 /// OpenAI text embedding model (`text-embedding-3-*`, `text-embedding-ada-002`).
 ///
@@ -180,12 +196,12 @@ impl OpenAiTextEmbedding {
         let parsed: OpenAiEmbeddingResponseBody = parse_body(&response.body)?;
         let embedding = parsed.first_embedding()?;
         if embedding.len() != self.dimensions {
-            tracing::warn!(
-                model = %self.model_name,
-                expected = self.dimensions,
-                actual = embedding.len(),
-                "OpenAI embedding dimension mismatch"
-            );
+            return Err(RagError::Embedding(format!(
+                "OpenAI embedding dimension mismatch: expected {}, got {} (model={}, provider={PROVIDER})",
+                self.dimensions,
+                embedding.len(),
+                self.model_name
+            )));
         }
 
         let model = parsed
@@ -195,6 +211,63 @@ impl OpenAiTextEmbedding {
             .unwrap_or_else(|| self.model_name.clone());
         Ok(EmbeddingResponse::new(embedding, parsed.to_usage(), model)
             .with_elapsed(started.elapsed()))
+    }
+
+    /// Embeds `texts` in requests of at most [`MAX_BATCH_SIZE`] inputs.
+    ///
+    /// Every returned vector is validated against the configured dimensions, and a failing
+    /// batch is reported in [`EmbedBatchOutcome::failures`] together with its batch index —
+    /// the vectors produced by the other batches are kept (#1095).
+    pub async fn embed_batch(&self, texts: &[String]) -> EmbedBatchOutcome {
+        let mut embeddings: Vec<Option<Vec<f64>>> = vec![None; texts.len()];
+        let mut failures = Vec::new();
+        for (batch_index, batch) in texts.chunks(MAX_BATCH_SIZE).enumerate() {
+            let first = batch_index * MAX_BATCH_SIZE;
+            match self.embed_chunk(batch).await {
+                Ok(vectors) => {
+                    for (offset, vector) in vectors.into_iter().enumerate() {
+                        embeddings[first + offset] = Some(vector);
+                    }
+                }
+                Err(error) => failures.push((batch_index, first, error)),
+            }
+        }
+        EmbedBatchOutcome {
+            embeddings,
+            failures,
+        }
+    }
+
+    /// Embeds one provider-sized chunk in a single request.
+    async fn embed_chunk(&self, texts: &[String]) -> Result<Vec<Vec<f64>>> {
+        self.ensure_open()?;
+        let body = json!({
+            "model": self.model_name,
+            "input": texts,
+            "dimensions": self.dimensions,
+            "encoding_format": "float",
+        });
+        let body = serde_json::to_string(&body)
+            .map_err(|e| RagError::Embedding(format!("failed to serialize request: {e}")))?;
+        let request = HttpRequest::post_json(join_url(&self.base_url, EMBEDDINGS_ENDPOINT), body)
+            .with_bearer_token(&self.api_key);
+        let response = self
+            .execution
+            .apply(&self.model_name, PROVIDER, "Embedding", || async {
+                let response = self.transport.execute(request.clone()).await?;
+                if !response.is_success() {
+                    return Err(map_http_error(response.status_code, &response.body));
+                }
+                Ok(response)
+            })
+            .await?;
+
+        let parsed: OpenAiEmbeddingResponseBody = parse_body(&response.body)?;
+        let vectors = parsed.ordered_embeddings(texts.len(), self.dimensions, &self.model_name)?;
+        if let Some(listener) = &self.usage_listener {
+            listener(&parsed.to_usage());
+        }
+        Ok(vectors)
     }
 }
 
@@ -263,6 +336,58 @@ impl OpenAiEmbeddingResponseBody {
         }
     }
 
+    /// Orders a batch response by `data[].index` and validates every vector.
+    ///
+    /// Mirrors [`Self::first_embedding`] for the batch path: a missing / short response, an
+    /// empty vector and a dimension mismatch are all explicit errors naming the item index.
+    fn ordered_embeddings(
+        &self,
+        expected: usize,
+        dimensions: usize,
+        model_name: &str,
+    ) -> Result<Vec<Vec<f64>>> {
+        if self.data.len() != expected {
+            return Err(RagError::Embedding(format!(
+                "OpenAI embedding batch returned {} vector(s) for {expected} input(s) (model={model_name}, provider={PROVIDER})",
+                self.data.len()
+            )));
+        }
+        let mut ordered: Vec<Option<Vec<f64>>> = vec![None; expected];
+        for (position, item) in self.data.iter().enumerate() {
+            let index = item.index.unwrap_or(position);
+            let Some(slot) = ordered.get_mut(index) else {
+                return Err(RagError::Embedding(format!(
+                    "OpenAI embedding batch index {index} is out of range for {expected} input(s) (model={model_name}, provider={PROVIDER})"
+                )));
+            };
+            let values = match &item.embedding {
+                Some(values) if !values.is_empty() => values.clone(),
+                _ => {
+                    return Err(RagError::Embedding(format!(
+                        "Empty embedding vector in response at index {index} (model={model_name}, provider={PROVIDER})"
+                    )))
+                }
+            };
+            if values.len() != dimensions {
+                return Err(RagError::Embedding(format!(
+                    "OpenAI embedding dimension mismatch at index {index}: expected {dimensions}, got {} (model={model_name}, provider={PROVIDER})",
+                    values.len()
+                )));
+            }
+            *slot = Some(values);
+        }
+        ordered
+            .into_iter()
+            .map(|vector| {
+                vector.ok_or_else(|| {
+                    RagError::Embedding(format!(
+                        "Missing embedding vector in response (model={model_name}, provider={PROVIDER})"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn to_usage(&self) -> EmbeddingUsage {
         match &self.usage {
             Some(usage) => {
@@ -284,6 +409,9 @@ impl OpenAiEmbeddingResponseBody {
 struct OpenAiEmbeddingItem {
     #[serde(default)]
     embedding: Option<Vec<f64>>,
+    /// Position of the vector in the request's `input` array.
+    #[serde(default)]
+    index: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -742,5 +870,94 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("closed"), "err={err}");
+    }
+
+    /// A response of the wrong width is a hard error: storing it would silently corrupt the
+    /// vector index (#1095).
+    #[tokio::test]
+    async fn a_dimension_mismatch_is_rejected() {
+        let body = json!({
+            "data": [{"index": 0, "embedding": [0.1, 0.2]}],
+        })
+        .to_string();
+        let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(200, body)]);
+        let model = model(transport);
+        let err = model
+            .embed(&ContentBlock::Text(TextBlock::new("hi")))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension mismatch: expected 3, got 2"),
+            "err={err}"
+        );
+    }
+
+    fn batch_body(count: usize) -> String {
+        let data: Vec<Value> = (0..count)
+            .map(|index| json!({"index": index, "embedding": [0.1, 0.2, 0.3]}))
+            .collect();
+        json!({"data": data}).to_string()
+    }
+
+    fn texts(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("text {i}")).collect()
+    }
+
+    #[tokio::test]
+    async fn embed_batch_splits_at_the_provider_limit() {
+        // LIFO script: the first request is served the last pushed response.
+        let transport = ScriptedTransport::with_responses(vec![
+            HttpResponse::new(200, batch_body(1)),
+            HttpResponse::new(200, batch_body(MAX_BATCH_SIZE)),
+        ]);
+        let model = model(transport.clone());
+        let outcome = model.embed_batch(&texts(MAX_BATCH_SIZE + 1)).await;
+
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert_eq!(outcome.embeddings.len(), MAX_BATCH_SIZE + 1);
+        assert!(outcome.embeddings.iter().all(Option::is_some));
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        let first: Value = serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(first["input"].as_array().unwrap().len(), MAX_BATCH_SIZE);
+        let second: Value = serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
+        assert_eq!(second["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn embed_batch_keeps_successful_batches_and_reports_the_failed_one() {
+        let transport = ScriptedTransport::with_responses(vec![
+            HttpResponse::new(200, batch_body(1)),
+            HttpResponse::new(500, "boom"),
+            HttpResponse::new(200, batch_body(MAX_BATCH_SIZE)),
+        ]);
+        let model = model(transport);
+        let total = MAX_BATCH_SIZE * 2 + 1;
+        let outcome = model.embed_batch(&texts(total)).await;
+
+        assert_eq!(outcome.failures.len(), 1);
+        let (batch, first, error) = &outcome.failures[0];
+        assert_eq!((*batch, *first), (1, MAX_BATCH_SIZE));
+        assert!(error.to_string().contains("boom"), "err={error}");
+        assert!(outcome.embeddings[0].is_some());
+        assert!(outcome.embeddings[MAX_BATCH_SIZE].is_none());
+        assert!(outcome.embeddings[MAX_BATCH_SIZE * 2].is_some());
+    }
+
+    #[tokio::test]
+    async fn embed_batch_rejects_a_dimension_mismatch() {
+        let body = json!({"data": [{"index": 0, "embedding": [0.1, 0.2]}]}).to_string();
+        let transport = ScriptedTransport::with_responses(vec![HttpResponse::new(200, body)]);
+        let model = model(transport);
+        let outcome = model.embed_batch(&texts(1)).await;
+
+        assert_eq!(outcome.failures.len(), 1);
+        assert!(outcome.embeddings[0].is_none());
+        assert!(outcome.failures[0]
+            .2
+            .to_string()
+            .contains("dimension mismatch at index 0: expected 3, got 2"));
     }
 }

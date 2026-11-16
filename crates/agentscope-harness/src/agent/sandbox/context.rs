@@ -33,6 +33,9 @@ pub struct SandboxContext {
 
     /// Isolation scope for this sandbox.
     isolation_scope: Option<IsolationScope>,
+
+    /// Whether `release` keeps the backend resource alive between calls.
+    reuse_on_release: bool,
 }
 
 impl std::fmt::Debug for SandboxContext {
@@ -45,6 +48,7 @@ impl std::fmt::Debug for SandboxContext {
             .field("external_sandbox", &self.external_sandbox.is_some())
             .field("external_sandbox_state", &self.external_sandbox_state)
             .field("isolation_scope", &self.isolation_scope)
+            .field("reuse_on_release", &self.reuse_on_release)
             .finish()
     }
 }
@@ -60,6 +64,7 @@ impl Clone for SandboxContext {
             external_sandbox: None,
             external_sandbox_state: self.external_sandbox_state.clone(),
             isolation_scope: self.isolation_scope,
+            reuse_on_release: self.reuse_on_release,
         }
     }
 }
@@ -100,6 +105,12 @@ impl SandboxContext {
         self.external_sandbox_state.as_ref()
     }
 
+    /// Whether the sandbox backend survives `release` (see
+    /// [`SandboxContextBuilder::reuse_on_release`]).
+    pub fn reuse_on_release(&self) -> bool {
+        self.reuse_on_release
+    }
+
     /// Returns the isolation scope.
     pub fn isolation_scope(&self) -> Option<&IsolationScope> {
         self.isolation_scope.as_ref()
@@ -115,6 +126,7 @@ pub struct SandboxContextBuilder {
     external_sandbox: Option<Box<dyn Sandbox>>,
     external_sandbox_state: Option<SandboxState>,
     isolation_scope: Option<IsolationScope>,
+    reuse_on_release: bool,
 }
 
 impl std::fmt::Debug for SandboxContextBuilder {
@@ -127,6 +139,7 @@ impl std::fmt::Debug for SandboxContextBuilder {
             .field("external_sandbox", &self.external_sandbox.is_some())
             .field("external_sandbox_state", &self.external_sandbox_state)
             .field("isolation_scope", &self.isolation_scope)
+            .field("reuse_on_release", &self.reuse_on_release)
             .finish()
     }
 }
@@ -141,6 +154,7 @@ impl Default for SandboxContextBuilder {
             external_sandbox: None,
             external_sandbox_state: None,
             isolation_scope: None,
+            reuse_on_release: false,
         }
     }
 }
@@ -181,6 +195,15 @@ impl SandboxContextBuilder {
         self
     }
 
+    /// Keeps the sandbox backend (container / K8s claim) alive across calls.
+    ///
+    /// `release` then stops the sandbox (persisting its snapshot) instead of closing it, so
+    /// the next call resumes it. Opt-in: the default still tears the backend down.
+    pub fn reuse_on_release(mut self, reuse: bool) -> Self {
+        self.reuse_on_release = reuse;
+        self
+    }
+
     pub fn build(self) -> SandboxContext {
         SandboxContext {
             client: self.client,
@@ -190,6 +213,7 @@ impl SandboxContextBuilder {
             external_sandbox: self.external_sandbox,
             external_sandbox_state: self.external_sandbox_state,
             isolation_scope: self.isolation_scope,
+            reuse_on_release: self.reuse_on_release,
         }
     }
 }

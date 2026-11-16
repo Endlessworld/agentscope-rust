@@ -38,10 +38,12 @@
 //!   retrieval is cached per `RuntimeContext::run_id` so a later iteration of the same
 //!   turn neither searches again nor appends a second USER message after a tool result
 //!   (which strict providers reject).
-//! * Java's optional `asyncRecord` mode (fire-and-forget on a bounded scheduler) is not
-//!   ported: the record runs after the turn has produced its reply, so the caller already
-//!   has the answer; blocking the (already finished) call for one more request is simpler
-//!   than owning a background scheduler, and it keeps the failure visible in the log.
+//! * Java's optional `asyncRecord` mode (fire-and-forget on a bounded scheduler) is ported as
+//!   a per-middleware serial background task: the record still runs after the turn has
+//!   produced its reply, but it no longer sits on the event stream, so a slow memory backend
+//!   (60s HTTP timeout) cannot delay the caller's completion event. Records are serialized so
+//!   the append order stays exactly what the synchronous version produced. Failures are logged
+//!   and swallowed, like every other `*_lossy` path.
 //! * Log lines go through `tracing::warn!` (like the crate's other `*_lossy` paths)
 //!   instead of SLF4J.
 
@@ -63,6 +65,14 @@ use crate::reme::memory::ReMeLongTermMemory;
 /// (Java `Msg.builder().name("long_term_memory")`).
 pub const LONG_TERM_MEMORY_MESSAGE_NAME: &str = "long_term_memory";
 
+/// Metadata key that marks a message a middleware injected into the model request.
+///
+/// Must stay in sync with `agentscope_extensions_rag::message::INTERNAL_MESSAGE_METADATA_KEY`
+/// (the crates do not depend on each other). [`last_user_message`] skips marked messages so
+/// an outer middleware's injection (retrieved knowledge, another memory hook) never becomes
+/// this hook's retrieval query (#1403).
+pub const INTERNAL_MESSAGE_METADATA_KEY: &str = "agentscope.internal_message";
+
 /// Prefix of the wrapped memory text (Java `LongTermMemoryTools.wrap`, verbatim).
 pub const LONG_TERM_MEMORY_PREFIX: &str = "Below is content retrieved from the long-term memory associated with the current user, Please extract useful information from it in the context of the current conversation.\n<long_term_memory>\n";
 
@@ -83,6 +93,7 @@ pub fn long_term_memory_message(text: &str) -> Msg {
         .role(MsgRole::User)
         .name(LONG_TERM_MEMORY_MESSAGE_NAME)
         .text_content(wrap_long_term_memory(text))
+        .metadata_entry(INTERNAL_MESSAGE_METADATA_KEY, serde_json::json!(true))
         .build()
 }
 
@@ -157,6 +168,8 @@ pub struct MemLongTermMemoryMiddleware {
     /// cache keeps that contract without an unbounded map: a different run id simply
     /// replaces the entry.
     cache: Arc<Mutex<Option<(String, String)>>>,
+    /// Serializes the background records so the append order matches the synchronous path.
+    record_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl MemLongTermMemoryMiddleware {
@@ -165,6 +178,7 @@ impl MemLongTermMemoryMiddleware {
         Self {
             backend,
             cache: Arc::new(Mutex::new(None)),
+            record_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -229,8 +243,21 @@ impl Middleware for MemLongTermMemoryMiddleware {
         let downstream = next(input);
         let tail = async move {
             let conversation = this.conversation(&ctx).unwrap_or(input_messages);
-            if !conversation.is_empty() {
+            if conversation.is_empty() {
+                return Vec::new();
+            }
+            // Fire-and-forget: the record must not hold the caller's completion event
+            // hostage to one memory-backend round-trip (the HTTP client allows 60s).
+            let record = async move {
+                let _serial = this.record_lock.lock().await;
                 this.backend.record_lossy(&conversation).await;
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(record);
+                }
+                // No runtime to schedule on: record inline rather than losing the turn.
+                Err(_) => futures::executor::block_on(record),
             }
             Vec::new()
         };
@@ -275,13 +302,24 @@ impl Middleware for MemLongTermMemoryMiddleware {
     }
 }
 
-/// The most recent USER message, mirroring `extractLastUserMessageIndex`.
+/// The most recent user-authored USER message, mirroring `extractLastUserMessageIndex`.
+///
+/// Messages carrying [`INTERNAL_MESSAGE_METADATA_KEY`] were injected by a middleware and are
+/// skipped: they wrap retrieved content, not a question from the user (#1403).
 fn last_user_message(messages: &[Msg]) -> Option<Msg> {
     messages
         .iter()
         .rev()
-        .find(|message| message.role() == MsgRole::User)
+        .find(|message| message.role() == MsgRole::User && !is_internal_message(message))
         .cloned()
+}
+
+/// Whether `msg` was injected by a middleware rather than typed by the user.
+fn is_internal_message(msg: &Msg) -> bool {
+    msg.metadata()
+        .get(INTERNAL_MESSAGE_METADATA_KEY)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 /// Appends the memory message to the reasoning request; an empty retrieval is a no-op.
@@ -340,6 +378,19 @@ mod tests {
             "second"
         );
         assert!(last_user_message(&[Msg::assistant("only")]).is_none());
+    }
+
+    #[test]
+    fn last_user_message_skips_middleware_injected_messages() {
+        let messages = vec![
+            Msg::user("real question"),
+            long_term_memory_message("stale memory"),
+        ];
+        assert_eq!(
+            last_user_message(&messages).unwrap().text_content(),
+            "real question"
+        );
+        assert!(last_user_message(&[long_term_memory_message("only memory")]).is_none());
     }
 
     #[test]

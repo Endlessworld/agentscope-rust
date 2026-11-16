@@ -9,10 +9,66 @@ use crate::reme::dto::{ReMeAddRequest, ReMeAddResponse, ReMeSearchRequest, ReMeS
 use crate::retry::{RetryPolicy, RetryTransport};
 use crate::telemetry::{InstrumentedTransport, MemMetrics};
 
-/// Add-memory endpoint.
+/// Add-memory endpoint used when no override is configured.
 pub const SUMMARY_ENDPOINT: &str = "/summary_personal_memory";
-/// Search-memory endpoint.
+/// Search-memory endpoint used when no override is configured.
 pub const RETRIEVE_ENDPOINT: &str = "/retrieve_personal_memory";
+
+/// Endpoint paths used by [`ReMeClient`].
+///
+/// ReMe 0.4.x routes both operations to the job path (`POST /{job_name}`), which the
+/// hard-coded defaults do not match; construct the client with [`ReMeEndpoints::for_job`] and
+/// [`ReMeClient::with_endpoints`] to talk to that layout (#2005).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReMeEndpoints {
+    /// Path used by [`ReMeClient::add`].
+    pub summary: String,
+    /// Path used by [`ReMeClient::search`].
+    pub retrieve: String,
+}
+
+impl Default for ReMeEndpoints {
+    fn default() -> Self {
+        Self {
+            summary: SUMMARY_ENDPOINT.to_string(),
+            retrieve: RETRIEVE_ENDPOINT.to_string(),
+        }
+    }
+}
+
+impl ReMeEndpoints {
+    /// Both operations on one job path (`POST /{job_name}`), the ReMe 0.4.x layout.
+    ///
+    /// Fails with [`MemError::Config`] when `job_name` is blank.
+    pub fn for_job(job_name: &str) -> Result<Self> {
+        let job_name = job_name.trim().trim_matches('/');
+        if job_name.is_empty() {
+            return Err(MemError::Config("job_name is required".into()));
+        }
+        let path = format!("/{job_name}");
+        Ok(Self {
+            summary: path.clone(),
+            retrieve: path,
+        })
+    }
+
+    /// Ensures both paths are absolute (a leading `/`), as the URL is built by concatenation.
+    fn normalized(self) -> Self {
+        Self {
+            summary: normalize_endpoint(&self.summary),
+            retrieve: normalize_endpoint(&self.retrieve),
+        }
+    }
+}
+
+fn normalize_endpoint(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
 
 /// HTTP client for the ReMe service.
 ///
@@ -20,6 +76,8 @@ pub const RETRIEVE_ENDPOINT: &str = "/retrieve_personal_memory";
 pub struct ReMeClient {
     transport: Arc<dyn HttpTransport>,
     api_base_url: String,
+    /// Endpoint paths (defaults: [`SUMMARY_ENDPOINT`] / [`RETRIEVE_ENDPOINT`]).
+    endpoints: ReMeEndpoints,
     /// Present for the `reqwest`-backed constructors, so a host can scrape counters.
     metrics: Option<Arc<MemMetrics>>,
 }
@@ -87,8 +145,22 @@ impl ReMeClient {
         Ok(Self {
             transport,
             api_base_url,
+            endpoints: ReMeEndpoints::default(),
             metrics: None,
         })
+    }
+
+    /// Overrides the endpoint paths (e.g. [`ReMeEndpoints::for_job`] for ReMe 0.4.x).
+    ///
+    /// The paths are made absolute, so `"my_job"` and `"/my_job"` are equivalent.
+    pub fn with_endpoints(mut self, endpoints: ReMeEndpoints) -> Self {
+        self.endpoints = endpoints.normalized();
+        self
+    }
+
+    /// The endpoint paths currently in use.
+    pub fn endpoints(&self) -> &ReMeEndpoints {
+        &self.endpoints
     }
 
     /// The counters fed by the instrumented transport, when the client was built by
@@ -122,20 +194,20 @@ impl ReMeClient {
         Ok(raw)
     }
 
-    /// Adds memories: `POST /summary_personal_memory`.
+    /// Adds memories: `POST {summary endpoint}` (default `/summary_personal_memory`).
     pub async fn add(&self, request: &ReMeAddRequest) -> Result<ReMeAddResponse> {
         let body = serde_json::to_string(request)?;
         let raw = self
-            .post("summary_personal_memory", SUMMARY_ENDPOINT, &body)
+            .post("summary_personal_memory", &self.endpoints.summary, &body)
             .await?;
         Ok(parse_or_default::<ReMeAddResponse>(&raw)?)
     }
 
-    /// Searches memories: `POST /retrieve_personal_memory`.
+    /// Searches memories: `POST {retrieve endpoint}` (default `/retrieve_personal_memory`).
     pub async fn search(&self, request: &ReMeSearchRequest) -> Result<ReMeSearchResponse> {
         let body = serde_json::to_string(request)?;
         let raw = self
-            .post("retrieve_personal_memory", RETRIEVE_ENDPOINT, &body)
+            .post("retrieve_personal_memory", &self.endpoints.retrieve, &body)
             .await?;
         Ok(parse_or_default::<ReMeSearchResponse>(&raw)?)
     }
@@ -181,6 +253,65 @@ mod tests {
             ReMeClient::with_transport(Arc::new(MockTransport::new()), "  https://reme.test/  ")
                 .unwrap();
         assert_eq!(client.api_base_url(), "https://reme.test");
+    }
+
+    #[test]
+    fn default_endpoints_use_the_legacy_paths() {
+        let client =
+            ReMeClient::with_transport(Arc::new(MockTransport::new()), "https://reme.test")
+                .unwrap();
+        assert_eq!(client.endpoints().summary, SUMMARY_ENDPOINT);
+        assert_eq!(client.endpoints().retrieve, RETRIEVE_ENDPOINT);
+    }
+
+    #[tokio::test]
+    async fn job_endpoints_route_both_operations_to_the_job_path() {
+        let mock = MockTransport::new();
+        mock.push_body("{}");
+        mock.push_body("{}");
+        let client = ReMeClient::with_transport(Arc::new(mock.clone()), "https://reme.test")
+            .unwrap()
+            .with_endpoints(ReMeEndpoints::for_job("jobs/demo").unwrap());
+
+        client
+            .add(&ReMeAddRequest::new("ws", Vec::new()))
+            .await
+            .unwrap();
+        client.search(&ReMeSearchRequest::new()).await.unwrap();
+
+        let urls: Vec<String> = mock.requests().into_iter().map(|r| r.0).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://reme.test/jobs/demo".to_string(),
+                "https://reme.test/jobs/demo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_overrides_are_made_absolute() {
+        let client =
+            ReMeClient::with_transport(Arc::new(MockTransport::new()), "https://reme.test")
+                .unwrap()
+                .with_endpoints(ReMeEndpoints {
+                    summary: "add".to_string(),
+                    retrieve: "/retrieve".to_string(),
+                });
+        assert_eq!(client.endpoints().summary, "/add");
+        assert_eq!(client.endpoints().retrieve, "/retrieve");
+    }
+
+    #[test]
+    fn blank_job_name_is_rejected() {
+        assert!(matches!(
+            ReMeEndpoints::for_job("   "),
+            Err(MemError::Config(_))
+        ));
+        assert!(matches!(
+            ReMeEndpoints::for_job("/"),
+            Err(MemError::Config(_))
+        ));
     }
 
     #[tokio::test]

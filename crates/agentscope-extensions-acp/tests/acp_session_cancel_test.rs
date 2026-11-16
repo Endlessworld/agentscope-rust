@@ -24,6 +24,7 @@ use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::AcpAgentSession;
 use agentscope_harness::agent::HarnessAgent;
+use agentscope_harness::{TaskRunSpec, TaskStatus};
 
 /// A model whose stream never yields, so the turn only ends when it is cancelled.
 struct HangingModel {
@@ -158,6 +159,58 @@ async fn closing_a_session_stops_a_running_turn_instead_of_stalling_it() {
         !handle.is_running(),
         "the closed session must not report a running prompt"
     );
+}
+
+#[tokio::test]
+async fn a_prompt_cancel_also_cancels_the_sessions_subagent_tasks() {
+    // #2408 / #2074: a cancelled prompt stopped alone. The subagents it spawned kept running
+    // (and billing) with nobody left to receive their result.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let session = build_session(
+        "cascade",
+        Arc::new(HangingModel {
+            calls: Arc::clone(&calls),
+        }),
+    );
+    let repo = Arc::clone(session.agent().task_repository());
+    let ctx =
+        agentscope_core::agent::RuntimeContext::new().with_session_id("s-cascade".to_string());
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = Arc::new(std::sync::Mutex::new(released));
+    let child = repo
+        .put_task(
+            &ctx,
+            "child-1",
+            "sub",
+            "s-cascade",
+            TaskRunSpec::local(move || {
+                let _ = released.lock().unwrap().recv();
+                Ok("late".to_string())
+            }),
+        )
+        .await;
+    assert!(!child.is_completed());
+
+    let handle = session.clone();
+    let mut running = session;
+    let turn = tokio::spawn(async move { running.run_prompt(prompt("go"), |_| {}).await });
+    wait_for_first_model_call(&calls).await;
+
+    handle.cancel();
+
+    let stop = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the cancel must end the turn")
+        .expect("the prompt task must not panic");
+    assert_eq!(stop, StopReason::Cancelled);
+    assert_eq!(
+        child.get_task_status(),
+        TaskStatus::Cancelled,
+        "the child task must be cancelled along with the prompt"
+    );
+    // Let the blocked worker unwind before the test process ends.
+    let _ = release.send(());
+    handle.close();
 }
 
 #[tokio::test]

@@ -166,15 +166,24 @@ impl MemoryFlushManager {
         if extracted.is_empty() || extracted == "NO_REPLY" {
             return Ok(());
         }
-        let timestamp = chrono::Utc::now().to_rfc3339();
+        // The daily ledger is named from the local calendar, so the entry timestamp must be
+        // local too: one file, one clock. A UTC stamp in a local-dated file made entries look
+        // hours old (or dated a day ahead) to a reader that trusted the file name.
+        let timestamp = chrono::Local::now().to_rfc3339();
         let daily_entry = format!("\n## Memory Flush — {timestamp}\n{extracted}\n");
         fileio::append_text(&self.fs, ctx, &daily_rel, &daily_entry).await?;
         Ok(())
     }
 
     /// Resolves the workspace-relative path where a session's full history is offloaded.
+    ///
+    /// `agent_id` stays verbatim: the filesystem routes are registered under it. The session id
+    /// becomes one encoded segment so an id containing `:` or `/` is still writable (#2937).
     pub fn resolve_offload_path(&self, agent_id: &str, session_id: &str) -> String {
-        format!("agents/{agent_id}/sessions/{session_id}.jsonl")
+        format!(
+            "agents/{agent_id}/sessions/{}.jsonl",
+            crate::agent::workspace::manager::encode_path_segment(session_id)
+        )
     }
 
     /// Runs the memory-extraction auxiliary call and returns its concatenated text.

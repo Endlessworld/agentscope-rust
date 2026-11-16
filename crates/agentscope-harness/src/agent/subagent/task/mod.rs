@@ -20,7 +20,10 @@ pub use protocol_client::{
     RemoteSubmitContext, RemoteSubmitContextBuilder, RemoteTarget, RemoteTaskStatus,
 };
 pub use record::TaskRecord;
-pub use repository::{TaskCompletionCallback, TaskRepository, SUPPRESS_COMPLETION_CALLBACK};
+pub use repository::{
+    CancelOutcome, TaskCompletionCallback, TaskRepository, CANCELLED_RESULT_PREFIX,
+    SUPPRESS_COMPLETION_CALLBACK,
+};
 pub use spec::TaskRunSpec;
 pub use status::TaskStatus;
 pub use workspace::WorkspaceTaskRepository;

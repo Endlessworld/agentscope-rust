@@ -292,14 +292,24 @@ fn base64_data_url(media_type: &str, data: &str) -> String {
 ///
 /// Local files are inlined as `data:` URLs because the HTTP API cannot read the
 /// client filesystem; remote URLs are forwarded verbatim.
+///
+/// A declared MIME type (a `URLSource.mimeType` hint) is authoritative and wins
+/// over the file extension: signed CDN links and `?format=png` endpoints carry no
+/// usable extension, so checking it first rejected URLs whose type was already
+/// known (the extension check is the fallback).
 fn source_url(source: &Source, validate: fn(&str) -> Result<()>) -> Result<String> {
     match source {
         Source::Base64(b) => Ok(base64_data_url(&b.media_type, &b.data)),
         Source::Url(u) => {
-            validate(&u.url)?;
-            if is_local_file(&u.url) || u.url.starts_with("file:") {
+            let declared = u.mime_type.as_deref().filter(|mime| !mime.trim().is_empty());
+            if declared.is_none() {
+                validate(&u.url)?;
+            }
+            if is_local_file(&u.url) {
                 let path = u.url.strip_prefix("file://").unwrap_or(&u.url);
-                let mime = determine_media_type(path);
+                let mime = declared
+                    .map(str::to_string)
+                    .unwrap_or_else(|| determine_media_type(path));
                 let data = file_to_base64(path)?;
                 Ok(base64_data_url(&mime, &data))
             } else {
@@ -465,22 +475,87 @@ fn multimodal_parts(blocks: &[ContentBlock], role: MsgRole) -> Vec<DashScopeCont
     parts
 }
 
-fn simple_message(msg: &Msg) -> DashScopeMessage {
+/// Concatenates a message's thinking blocks into the provider's
+/// `reasoning_content`.
+///
+/// Qwen3 thinking mode rejects/ignores a multi-turn history whose assistant
+/// turns dropped their reasoning, so the text is replayed verbatim (mirroring the
+/// OpenAI path's `inject_reasoning_content`).
+fn reasoning_text(msg: &Msg) -> Option<String> {
+    let text = msg
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking(thinking) => Some(thinking.thinking.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Builds a `tool` message for a tool result.
+///
+/// DashScope's chat template requires **both** `name` and `tool_call_id` on a
+/// `tool` message; one without them is rejected as a template error
+/// (`'dict object' has no attribute 'name'`), so an incomplete pair is refused
+/// here instead of being sent.
+fn tool_message(
+    tr: &agentscope_core::ToolResultBlock,
+    content: DashScopeContent,
+) -> Result<DashScopeMessage> {
+    let id = tr
+        .id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| missing_tool_identity(tr))?;
+    let name = tr
+        .name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| missing_tool_identity(tr))?;
+    Ok(DashScopeMessage {
+        role: Some("tool".to_string()),
+        tool_call_id: Some(id),
+        name: Some(name),
+        content: Some(content),
+        ..Default::default()
+    })
+}
+
+fn missing_tool_identity(tr: &agentscope_core::ToolResultBlock) -> agentscope_core::Error {
+    agentscope_core::Error::Other(format!(
+        "DashScope requires name and tool_call_id on every tool message, but this tool result \
+         carries name={:?} and tool_call_id={:?}; fill them in (the assistant tool call owns both) \
+         before sending the history",
+        tr.name, tr.id
+    ))
+}
+
+/// Error for a `tool`-role message that has no tool result to name.
+fn tool_message_without_result() -> agentscope_core::Error {
+    agentscope_core::Error::Other(
+        "a tool-role message without a ToolResultBlock has no name or tool_call_id, which \
+         DashScope requires for the 'tool' role; convert it to a text message instead"
+            .to_string(),
+    )
+}
+
+fn simple_message(msg: &Msg) -> Result<DashScopeMessage> {
     // A tool-role (or system) message carrying a tool result is sent as `tool`.
     if let Some(tr) = msg.content.iter().find_map(|b| match b {
         ContentBlock::ToolResult(tr) => Some(tr),
         _ => None,
     }) {
         if matches!(msg.role, MsgRole::Tool | MsgRole::System) {
-            return DashScopeMessage {
-                role: Some("tool".to_string()),
-                tool_call_id: tr.id.clone(),
-                name: tr.name.clone(),
-                content: Some(DashScopeContent::Text(convert_tool_result_to_string(
-                    &tr.output,
-                ))),
-                ..Default::default()
-            };
+            return tool_message(
+                tr,
+                DashScopeContent::Text(convert_tool_result_to_string(&tr.output)),
+            );
         }
     }
 
@@ -488,20 +563,26 @@ fn simple_message(msg: &Msg) -> DashScopeMessage {
         role: Some(role_str(msg.role).to_string()),
         ..Default::default()
     };
+    if msg.role == MsgRole::Tool {
+        // Same rejection as the multimodal path: a tool message without a
+        // name/tool_call_id pair is not a shape DashScope accepts.
+        return Err(tool_message_without_result());
+    }
     if msg.role == MsgRole::Assistant {
+        out.reasoning_content = reasoning_text(msg);
         let calls = to_dashscope_tool_calls(msg);
         if !calls.is_empty() {
             let text = simple_text(msg);
             out.content = Some(DashScopeContent::Text(text));
             out.tool_calls = Some(calls);
-            return out;
+            return Ok(out);
         }
     }
     out.content = Some(DashScopeContent::Text(simple_text(msg)));
-    out
+    Ok(out)
 }
 
-fn tool_role_multimodal_message(msg: &Msg) -> DashScopeMessage {
+fn tool_role_multimodal_message(msg: &Msg) -> Result<DashScopeMessage> {
     if let Some(tr) = msg.content.iter().find_map(|b| match b {
         ContentBlock::ToolResult(tr) => Some(tr),
         _ => None,
@@ -521,24 +602,15 @@ fn tool_role_multimodal_message(msg: &Msg) -> DashScopeMessage {
                 &tr.output,
             ))]
         };
-        return DashScopeMessage {
-            role: Some("tool".to_string()),
-            tool_call_id: tr.id.clone(),
-            name: tr.name.clone(),
-            content: Some(DashScopeContent::Parts(content)),
-            ..Default::default()
-        };
+        return tool_message(tr, DashScopeContent::Parts(content));
     }
-    DashScopeMessage {
-        role: Some("tool".to_string()),
-        content: Some(DashScopeContent::Parts(vec![DashScopeContentPart::text(
-            extract_text_content(msg),
-        )])),
-        ..Default::default()
-    }
+    // A tool-role message with no tool result cannot be shaped as a valid `tool`
+    // message (no `tool_call_id`, no `name`); the chat template rejects that
+    // shape, so refuse it instead of emitting it.
+    Err(tool_message_without_result())
 }
 
-fn multimodal_message(msg: &Msg) -> DashScopeMessage {
+fn multimodal_message(msg: &Msg) -> Result<DashScopeMessage> {
     if msg.role == MsgRole::Tool {
         return tool_role_multimodal_message(msg);
     }
@@ -551,12 +623,13 @@ fn multimodal_message(msg: &Msg) -> DashScopeMessage {
         ..Default::default()
     };
     if msg.role == MsgRole::Assistant {
+        out.reasoning_content = reasoning_text(msg);
         let calls = to_dashscope_tool_calls(msg);
         if !calls.is_empty() {
             out.tool_calls = Some(calls);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Converts messages into DashScope DTOs.
@@ -583,16 +656,40 @@ fn to_dashscope_messages_flagged(
     }
     let mut out: Vec<DashScopeMessage> = Vec::new();
     let mut injected: Vec<bool> = Vec::new();
-    for msg in messages {
+    // `tool_use id -> tool name`, so a tool result that lost its `name` (an older
+    // history, an externally injected message) is completed from the assistant turn
+    // that issued the call instead of being sent as a nameless `tool` message.
+    let mut tool_names: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for mut msg in messages {
+        if msg.role == MsgRole::Assistant {
+            for block in &msg.content {
+                if let ContentBlock::ToolUse(tool_use) = block {
+                    if !tool_use.id.is_empty() && !tool_use.name.trim().is_empty() {
+                        tool_names.insert(tool_use.id.clone(), tool_use.name.clone());
+                    }
+                }
+            }
+        } else if msg.role == MsgRole::Tool {
+            for block in msg.content.iter_mut() {
+                if let ContentBlock::ToolResult(tr) = block {
+                    if tr.name.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                        if let Some(name) = tr.id.as_ref().and_then(|id| tool_names.get(id)) {
+                            tr.name = Some(name.clone());
+                        }
+                    }
+                }
+            }
+        }
         let documents = document_messages(&msg)?;
         injected.extend(std::iter::repeat(true).take(documents.len()));
         out.extend(documents);
         let explicit = metadata_cache_directive(&msg) == Some(true);
         let mut converted =
             if force_multimodal || has_media_content(&msg) || has_url_document_on_user_turn(&msg) {
-                multimodal_message(&msg)
+                multimodal_message(&msg)?
             } else {
-                simple_message(&msg)
+                simple_message(&msg)?
             };
         // Explicit `Msg` metadata markers are emitted as supplied; the
         // automatic pass (if enabled) only fills in unmarked boundaries.
@@ -1272,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_blocks_are_dropped() {
+    fn thinking_blocks_are_dropped_from_the_text_content_but_replayed_as_reasoning() {
         let mut msg = Msg::user("x");
         msg.content
             .push(ContentBlock::Thinking(agentscope_core::ThinkingBlock::new(
@@ -1283,7 +1380,114 @@ mod tests {
             msgs[0].content.as_ref().and_then(|c| c.as_text()),
             Some("x")
         );
+        // A user turn has no reasoning channel: the thinking stays out of the request.
         assert!(!serde_json::to_string(&msgs[0]).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn an_assistant_thinking_block_round_trips_as_reasoning_content() {
+        // Qwen3 thinking mode needs the assistant turn's reasoning back on the
+        // next request; dropping it (`Thinking(_) => {}`) lost the history.
+        for force_multimodal in [false, true] {
+            let mut msg = Msg::assistant("answer");
+            msg.content.insert(
+                0,
+                ContentBlock::Thinking(agentscope_core::ThinkingBlock::new("let me think")),
+            );
+            let msgs = convert(vec![msg], force_multimodal);
+            assert_eq!(
+                msgs[0].reasoning_content.as_deref(),
+                Some("let me think"),
+                "force_multimodal={force_multimodal}"
+            );
+            let wire = serde_json::to_value(&msgs[0]).unwrap();
+            assert_eq!(wire["reasoning_content"], serde_json::json!("let me think"));
+            // The visible content never carries the reasoning text.
+            assert!(!msgs[0]
+                .content
+                .as_ref()
+                .map(|c| c.text_joined())
+                .unwrap_or_default()
+                .contains("let me think"));
+        }
+    }
+
+    #[test]
+    fn a_tool_result_without_a_name_is_completed_from_the_assistant_turn() {
+        // A `tool` message without `name` serialized the field away and the chat
+        // template rejected the request ("'dict object' has no attribute 'name'").
+        let mut assistant = Msg::assistant("");
+        assistant
+            .content
+            .push(ContentBlock::ToolUse(ToolUseBlock::new(
+                "call_1",
+                "get_weather",
+                agentscope_core::JsonMap::new(),
+            )));
+        let mut result = agentscope_core::ToolResultBlock::new(
+            "call_1",
+            "",
+            vec![ContentBlock::Text(TextBlock::new("sunny"))],
+        );
+        result.name = None;
+        let mut tool = Msg::tool("call_1", "", "");
+        tool.content = vec![ContentBlock::ToolResult(result)];
+
+        let msgs = convert(vec![assistant, tool], false);
+        assert_eq!(msgs[1].role.as_deref(), Some("tool"));
+        assert_eq!(msgs[1].name.as_deref(), Some("get_weather"));
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("call_1"));
+        let wire = serde_json::to_value(&msgs[1]).unwrap();
+        assert_eq!(wire["name"], serde_json::json!("get_weather"));
+        assert_eq!(wire["tool_call_id"], serde_json::json!("call_1"));
+    }
+
+    #[test]
+    fn a_tool_message_that_cannot_be_named_is_refused() {
+        // Neither the record nor the history can supply the identity: refuse it
+        // instead of emitting a shape the template rejects.
+        let mut result = agentscope_core::ToolResultBlock::new(
+            "call_9",
+            "",
+            vec![ContentBlock::Text(TextBlock::new("x"))],
+        );
+        result.name = None;
+        let mut tool = Msg::tool("call_9", "", "");
+        tool.content = vec![ContentBlock::ToolResult(result)];
+        let err = to_dashscope_messages(vec![tool], false)
+            .expect_err("a nameless tool message must not be sent");
+        let text = format!("{err}");
+        assert!(text.contains("name and tool_call_id"), "{text}");
+
+        // A tool-role message with no tool result at all is refused too.
+        let mut empty = Msg::assistant("");
+        empty.role = MsgRole::Tool;
+        empty.content = vec![ContentBlock::Text(TextBlock::new("orphan"))];
+        let err = to_dashscope_messages(vec![empty], true).expect_err("no tool_call_id");
+        assert!(format!("{err}").contains("tool-role message"), "{err}");
+    }
+
+    #[test]
+    fn a_declared_mime_type_wins_over_a_missing_extension() {
+        // A signed CDN link has no file extension; the MIME hint already says the
+        // type, so the extension check must not reject it (it fell back to a text
+        // placeholder before).
+        let mut msg = Msg::user("look");
+        msg.content
+            .push(ContentBlock::Image(ImageBlock::new(Source::Url(
+                agentscope_core::URLSource {
+                    url: "https://cdn.example.com/render?id=42".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                },
+            ))));
+        let msgs = convert(vec![msg], false);
+        match msgs[0].content.as_ref().unwrap() {
+            DashScopeContent::Parts(parts) => assert_eq!(
+                parts[1].image.as_deref(),
+                Some("https://cdn.example.com/render?id=42")
+            ),
+            other => panic!("expected parts, got {other:?}"),
+        }
     }
 
     #[test]

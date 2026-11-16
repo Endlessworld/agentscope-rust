@@ -97,6 +97,56 @@ async fn cancel_task_marks_cancelled() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cancel_session_tasks_cancels_every_live_child() {
+    // #1577: a cancelled parent stopped alone, so the children it spawned kept running (and
+    // billing) with nobody left to collect their result.
+    let dir = temp_dir("cancel_session").await;
+    let repo = new_repo(&dir);
+    let mut releases = Vec::new();
+    let mut children = Vec::new();
+    for id in ["t1", "t2"] {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let bg = repo
+            .put_task(
+                &ctx(),
+                id,
+                "sub1",
+                "sess1",
+                TaskRunSpec::local(move || {
+                    let _ = rx.lock().unwrap().recv();
+                    Ok("late".to_string())
+                }),
+            )
+            .await;
+        releases.push(tx);
+        children.push(bg);
+    }
+    // A finished task in the same session must not be touched.
+    let finished = repo
+        .put_task(
+            &ctx(),
+            "t3",
+            "sub1",
+            "sess1",
+            TaskRunSpec::local(|| Ok("done".to_string())),
+        )
+        .await;
+    assert!(finished.wait_for_completion(5000));
+
+    let signalled = repo.cancel_session_tasks(&ctx(), "sess1").await;
+    assert_eq!(signalled, 2, "both live children must be cancelled");
+    for child in &children {
+        assert_eq!(child.get_task_status(), TaskStatus::Cancelled);
+    }
+    assert_eq!(finished.get_task_status(), TaskStatus::Completed);
+    for tx in releases {
+        let _ = tx.send(());
+    }
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn list_tasks_filters_by_status() {
     let dir = temp_dir("list").await;
     let repo = new_repo(&dir);

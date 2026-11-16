@@ -1,6 +1,7 @@
 //! Permission evaluation engine and related types, mirroring
 //! `io.agentscope.core.permission`.
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -273,6 +274,108 @@ fn same_rule(a: &PermissionRule, b: &PermissionRule) -> bool {
         && a.rule_content.as_deref().unwrap_or("") == b.rule_content.as_deref().unwrap_or("")
 }
 
+/// Whether an input key names a filesystem path.
+///
+/// Only path-shaped arguments take part in the `AcceptEdits` working-directory check; every
+/// other argument is ignored, so a tool that also carries a query string is not judged by it.
+fn is_path_key(key: &str) -> bool {
+    matches!(
+        key,
+        "path" | "file_path" | "filePath" | "dir" | "directory" | "cwd" | "target" | "source"
+    ) || key.ends_with("_path")
+        || key.ends_with("Path")
+        || key.ends_with("_dir")
+        || key.ends_with("Dir")
+}
+
+/// Resolves `raw` against the process working directory and normalizes `.`/`..` lexically.
+///
+/// Deliberately lexical, not `canonicalize`: the target of an edit usually does not exist yet,
+/// and following symlinks would let a link inside the workspace point the check outside it.
+fn resolve_path(raw: &str) -> PathBuf {
+    let path = Path::new(raw);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    normalize_lexically(&absolute)
+}
+
+/// Drops `.` components and folds `..` into the parent, without touching the filesystem.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The path-like arguments of a tool input (top level only).
+fn path_arguments(input: &JsonMap) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for (key, value) in input {
+        if !is_path_key(key) {
+            continue;
+        }
+        let Some(raw) = value.as_str().map(str::trim).filter(|raw| !raw.is_empty()) else {
+            continue;
+        };
+        out.push(resolve_path(raw));
+    }
+    out
+}
+
+/// The rule an `Ask` decision suggests for a "always allow" answer: the same tool narrowed to
+/// this invocation's command prefix or path.
+///
+/// Mirrors Java `PermissionDecision.suggestedRules`: the host can persist the suggestion
+/// verbatim instead of inventing an unconditional allow for the whole tool.
+/// Attaches the "always allow" suggestion to an `Ask` decision (#3243).
+///
+/// The suggestion travels with the decision instead of being dropped: a host that offers
+/// "always allow" can persist exactly the rule it shows the user. Every `Ask` path (an explicit
+/// ask rule, the mode's tool check, or the default branch) goes through here so none of them
+/// loses the suggestion.
+fn ensure_ask_suggestion(
+    decision: PermissionDecision,
+    tool_name: &str,
+    input: &JsonMap,
+) -> PermissionDecision {
+    if decision.behavior == PermissionBehavior::Ask && decision.suggested_rules.is_none() {
+        decision.with_suggested_rules(Some(vec![suggested_rule(tool_name, input)]))
+    } else {
+        decision
+    }
+}
+
+fn suggested_rule(tool: &str, input: &JsonMap) -> PermissionRule {
+    let command = ["command", "cmd"]
+        .iter()
+        .find_map(|key| input.get(*key).and_then(|value| value.as_str()))
+        .map(|command| {
+            command
+                .split_whitespace()
+                .next()
+                .unwrap_or(command)
+                .to_string()
+        });
+    let content = command.or_else(|| {
+        input
+            .iter()
+            .find(|(key, _)| is_path_key(key))
+            .and_then(|(_, value)| value.as_str())
+            .map(str::to_string)
+    });
+    PermissionRule::new(tool, content, PermissionBehavior::Allow, "suggested")
+}
+
 /// Evaluates tool execution requests against configured permission rules.
 #[derive(Debug, Clone)]
 pub struct PermissionEngine {
@@ -335,9 +438,9 @@ impl PermissionEngine {
             return d;
         }
         if let Some(d) = self.check_ask_rules(tool_name, input, &matcher) {
-            return d;
+            return ensure_ask_suggestion(d, tool_name, input);
         }
-        if let Some(d) = self.tool_check(tool_name, is_read_only) {
+        if let Some(d) = self.tool_check(tool_name, is_read_only, input) {
             return d;
         }
         if let Some(d) = self.check_allow_rules(tool_name, input, &matcher) {
@@ -357,11 +460,48 @@ impl PermissionEngine {
             ))
             .with_decision_reason("User is not available to answer permission prompts");
         }
-        PermissionDecision::ask(format!("Permission required for {}", tool_name))
-            .with_decision_reason(format!("Mode: {:?}", self.context.mode))
+        ensure_ask_suggestion(
+            PermissionDecision::ask(format!("Permission required for {}", tool_name))
+                .with_decision_reason(format!("Mode: {:?}", self.context.mode)),
+            tool_name,
+            input,
+        )
     }
 
-    fn tool_check(&self, tool_name: &str, is_read_only: bool) -> Option<PermissionDecision> {
+    /// Whether every path-like argument of `input` lies inside the working scope: the process
+    /// workspace root (the directory relative paths resolve against) plus every configured
+    /// [`PermissionContextState::working_directories`] entry.
+    ///
+    /// Fail-closed: an input with no recognisable path argument is **not** in scope, so a tool
+    /// whose target cannot be proven keeps asking. Used by `AcceptEdits`, which auto-approves
+    /// edits inside the working directories instead of ignoring them (#2870).
+    fn within_working_directories(&self, input: &JsonMap) -> bool {
+        let paths = path_arguments(input);
+        if paths.is_empty() {
+            return false;
+        }
+        let mut roots = vec![std::env::current_dir()
+            .map(|dir| normalize_lexically(&dir))
+            .unwrap_or_default()];
+        roots.extend(
+            self.context
+                .working_directories
+                .values()
+                .map(|dir| resolve_path(&dir.path)),
+        );
+        paths.iter().all(|path| {
+            roots
+                .iter()
+                .any(|root| !root.as_os_str().is_empty() && path.starts_with(root))
+        })
+    }
+
+    fn tool_check(
+        &self,
+        tool_name: &str,
+        is_read_only: bool,
+        input: &JsonMap,
+    ) -> Option<PermissionDecision> {
         match self.context.mode {
             PermissionMode::Explore => {
                 if is_read_only {
@@ -390,6 +530,16 @@ impl PermissionEngine {
                             tool_name
                         ))
                         .with_decision_reason("Accept edits mode allows read-only operations"),
+                    )
+                } else if self.within_working_directories(input) {
+                    Some(
+                        PermissionDecision::allow(format!(
+                            "Permission granted for {} (accept edits mode - working directory)",
+                            tool_name
+                        ))
+                        .with_decision_reason(
+                            "Accept edits mode allows edits inside the working directories",
+                        ),
                     )
                 } else {
                     None
@@ -535,5 +685,98 @@ mod tests {
         engine.add_rule(rule.clone());
         engine.add_rule(rule);
         assert_eq!(engine.context().allow_rules["add"].len(), 1);
+    }
+
+    fn accept_edits_engine() -> PermissionEngine {
+        PermissionEngine::new(
+            PermissionContextState::builder()
+                .mode(PermissionMode::AcceptEdits)
+                .add_working_directory(
+                    "extra",
+                    AdditionalWorkingDirectory::new("/tmp/workspace-extra", "test"),
+                )
+                .build(),
+        )
+    }
+
+    fn path_input(path: &str) -> JsonMap {
+        let mut input = JsonMap::new();
+        input.insert("path".to_string(), serde_json::json!(path));
+        input
+    }
+
+    #[test]
+    fn accept_edits_allows_an_edit_inside_the_working_directories() {
+        let engine = accept_edits_engine();
+
+        // The workspace root (where relative paths resolve) is in scope.
+        let workspace_file = std::env::current_dir().unwrap().join("notes.md");
+        let inside = path_input(&workspace_file.to_string_lossy());
+        assert_eq!(
+            engine
+                .check_permission("write_file", false, &inside, |_, _| false)
+                .behavior,
+            PermissionBehavior::Allow
+        );
+
+        // So is a configured additional directory, and `..` cannot climb out of it.
+        assert_eq!(
+            engine
+                .check_permission(
+                    "write_file",
+                    false,
+                    &path_input("/tmp/workspace-extra/src/main.rs"),
+                    |_, _| false
+                )
+                .behavior,
+            PermissionBehavior::Allow
+        );
+        assert_eq!(
+            engine
+                .check_permission(
+                    "write_file",
+                    false,
+                    &path_input("/tmp/workspace-extra/../elsewhere/passwd"),
+                    |_, _| false
+                )
+                .behavior,
+            PermissionBehavior::Ask
+        );
+        // No path argument means nothing can be proven: keep asking.
+        assert_eq!(
+            engine
+                .check_permission("shell", false, &JsonMap::new(), |_, _| false)
+                .behavior,
+            PermissionBehavior::Ask
+        );
+    }
+
+    #[test]
+    fn an_ask_decision_suggests_a_rule_for_this_invocation() {
+        let engine = PermissionEngine::new(PermissionContextState::default());
+        let decision = engine.check_permission(
+            "write_file",
+            false,
+            &path_input("/outside/a.txt"),
+            |_, _| false,
+        );
+        assert_eq!(decision.behavior, PermissionBehavior::Ask);
+        let rules = decision
+            .suggested_rules
+            .expect("an ask decision carries its suggestion");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tool_name, "write_file");
+        assert_eq!(rules[0].rule_content.as_deref(), Some("/outside/a.txt"));
+        assert_eq!(rules[0].behavior, PermissionBehavior::Allow);
+
+        // A command tool is narrowed to its program, not the whole command line.
+        let mut command = JsonMap::new();
+        command.insert(
+            "command".to_string(),
+            serde_json::json!("git push origin main"),
+        );
+        let decision = engine.check_permission("shell", false, &command, |_, _| false);
+        let rules = decision.suggested_rules.expect("a suggestion");
+        assert_eq!(rules[0].rule_content.as_deref(), Some("git"));
     }
 }

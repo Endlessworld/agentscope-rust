@@ -876,3 +876,66 @@
 
 
 
+
+## 本轮已落地修复（2026-11-16 / 17）
+
+上面的清单是**比对结论**；本节记录其中已经在 Rust 侧落地、并通过全量回归的修复。改动覆盖 `agentscope-core`、`agentscope-harness` 与 8 个 extension crate。
+
+验证口径：
+
+- `cargo test --workspace -j 2 --no-fail-fast` → **231 targets / 6817 passed / 0 failed**（既有 ignored 为文档示例与 live 集成用例）
+- `cargo fmt --all -- --check` 干净
+
+### 安全与路径解析
+
+| issue | 修复 |
+|---|---|
+| #3258 #2065 #3378 | `RemoteFilesystemSpec` 的默认后端从 `LocalFilesystem::new`（`Unrestricted`）改为 workspace-rooted `with_mode(Rooted)`；`HarnessAgent` 默认后端同步。`read_file("/etc/passwd")` 不再逃出工作区 |
+| #3253 #770 #2690 | `composite.rs` 的 `route_for_path` 先规范化再路由：`/`、`.` 不再落到默认后端根，宿主绝对路径不会被前缀劫持 |
+| #2918 #2091 #2182 #2691 #2693 #4140 | 补齐 `.agentscope/` 前缀路由（session / journal / bus），不再静默写在本地 |
+| #3975 | `bus/async_tool.rs` 折叠路径中的重复斜杠：`update_status` 不再静默空操作，hint 不再每轮重复 |
+| #3388 | `read_with_override` 的投影层不再被 shell 写入的 `AGENTS.md` / `SKILL.md` 越过 |
+
+### 上下文与记忆
+
+| issue | 修复 |
+|---|---|
+| #1740 #1969 | 溢出压缩改为多轮（上限 3 轮、无进展即退出）：压缩后仍超预算时不再把超限请求发给 provider |
+| #2276 #1094 #3059 | 记忆 flush / maintenance 不再串在事件流尾部：**回合流结束后**再 `spawn`（订阅者不必等 LLM 调用即可收到完成事件），每 session 一条串行队列避免重复抽取 |
+| #2692 | 远程 `ls` 缺 `mtime` 时不再被判定为「全部过期」而全量重喂 LLM |
+| #3088 #2937 | 记忆日文件与条目时间戳同源用本地时钟；session id 作为单个路径段编码，含 `:` / `/` 的 id 可写 |
+| #1403 | 中间件注入的 `long_term_memory` / RAG 消息带 `agentscope.internal_message` 标记，不再被当成检索 query |
+| #3305 | RAG 空白 chunk 过滤，embedding 不再把空白文本送模型 |
+
+### 工具、技能与会话
+
+| issue | 修复 |
+|---|---|
+| #1577 | 子智能体任务取消：新增 `CancelOutcome` / `request_cancel` / `cancel_session_tasks`，父级取消遍历子任务，回执持久化走 CAS |
+| #2962 | 模型返回空内容不再被当作回答：重试一次后显式报错，避免写入空 assistant turn |
+| #2419 #2420 | skill 目录缓存按**仓库** freshness 失效：`FileSystemSkillRepository` / `WorkspaceSkillRepository` 之前漏转发 `freshness()`（trait 默认返回 `None`），外部写入的 `SKILL.md` 永不生效 |
+| #2664 | catalog 为空时仍执行 staging 目录 GC；同一仓库的多个技能共享一个命名空间（此前每个技能各占 `user_1` / `user_2`，顺序变化即重复 stage） |
+| #2169 | `load_skill_through_path` 先判 id 是否存在再判授权；未授权与拼错 id 的答复区分开 |
+| #2683 | knowledge 清单只列文件（列出目录必然让 `read_file` not-found） |
+| #1438 | frontmatter 解析支持块序列（`key:` + `- item`），不再丢键 |
+| #1211 | `StreamOptions.incremental = false` 接线为累积快照（`CumulativeDelta`） |
+| #1036 | 工具执行阶段的中断检查 |
+
+### 沙箱与扩展
+
+| issue | 修复 |
+|---|---|
+| #2564 #2329 | 沙箱隔离键与租约：同 isolation-key 并发不再互相覆盖，无条件 acquire 改为有界等待 |
+| #1674 | 沙箱 `glob` 不再退化为 `find -name`，`**` 递归语义恢复 |
+| #2216 | 沙箱 remote 先建目录再 hydrate |
+| #755 #912 | MCP TLS 配置注入；全局锁不再跨 `await` 持有 |
+| #2165 | Redis Lua 脚本跨 slot |
+| #3248 #3213 | skills/mysql 的 SQL 标识符加引号；`createIfNotExist = false` 不再 `ALTER TABLE` |
+| #3042 | 跨后端 move 保留 `encoding`，二进制不再被当作 base64 文本改写 |
+| #2448 | overlay `grep` 不再以上层 `path:line` 合并出残留的旧匹配 |
+
+### 明确保持原样（独立改造面）
+
+- `#3780`：`flush_before_compact` / `offload_before_compact` 仍是死配置（provider 侧 `ContextLength` 无消费者）。
+- `#3815`：`open_with` 仍无取消守卫，writer 租约最长泄漏 30s。
+- `#3178`：子代理 toolkit 在 build 时快照，ACP 之后桥接的 MCP 工具仍不可见。

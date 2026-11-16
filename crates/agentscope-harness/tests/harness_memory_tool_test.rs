@@ -211,3 +211,54 @@ async fn memory_search_finds_across_memory_files() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// #3266: results are bounded per call and each preview line is truncated.
+#[tokio::test]
+async fn memory_search_caps_results_and_truncates_previews() {
+    let (dir, wm) = make_workspace("search_cap");
+    let search = MemorySearchTool::new(Arc::clone(&wm));
+
+    let padding = "x".repeat(400);
+    let mut body = String::new();
+    for i in 0..50 {
+        body.push_str(&format!("- needle {i} {padding}\n"));
+    }
+    std::fs::write(dir.join("MEMORY.md"), body).unwrap();
+
+    let out = run(&search, tool_args(&[("query", str_arg("needle"))])).await;
+    assert!(out.starts_with("Found 50 matches"), "got: {out}");
+    assert_eq!(
+        out.matches("Source: MEMORY.md#").count(),
+        30,
+        "the default cap is 30 results, not one per matching line"
+    );
+    assert!(out.contains("maxResults"), "got: {out}");
+    let longest = out.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    assert!(
+        longest <= "Source: MEMORY.md#50: ".chars().count() + 200 + 3,
+        "a preview line must be truncated to 200 chars, got {longest}"
+    );
+
+    let five = run(
+        &search,
+        tool_args(&[
+            ("query", str_arg("needle")),
+            ("maxResults", serde_json::json!(5)),
+        ]),
+    )
+    .await;
+    assert_eq!(five.matches("Source: MEMORY.md#").count(), 5);
+
+    // An oversized `maxResults` is capped at 200; all 50 matches still fit.
+    let capped = run(
+        &search,
+        tool_args(&[
+            ("query", str_arg("needle")),
+            ("maxResults", serde_json::json!(1000)),
+        ]),
+    )
+    .await;
+    assert_eq!(capped.matches("Source: MEMORY.md#").count(), 50);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

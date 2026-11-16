@@ -260,6 +260,29 @@ impl ToolGroupManager {
         }
     }
 
+    /// Whether the tool is hidden from the *parent* agent's surface.
+    ///
+    /// A tool is hidden when it belongs to groups and **every** one of them is an *active*
+    /// [`ToolGroupScope::External`] group. An EXTERNAL group is host-managed: it exists so a
+    /// sub-agent whitelist (a capability surface, which does carry grants) or host code can
+    /// reach the tools, not so the parent's model can pick them. Activation is what opts the
+    /// group in, so an inactive EXTERNAL group leaves its tools on the ordinary path.
+    pub fn is_tool_hidden_from_parent(&self, name: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let Some(groups) = inner.tools_to_groups.get(name) else {
+            return false;
+        };
+        if groups.is_empty() {
+            return false;
+        }
+        groups.iter().all(|name| {
+            inner
+                .tool_groups
+                .get(name)
+                .is_some_and(|group| group.scope() == ToolGroupScope::External && group.is_active())
+        })
+    }
+
     /// Whether the tool is active within the given (call-slot) group set.
     pub fn is_active_tool_for(&self, name: &str, active_groups: &[String]) -> bool {
         let inner = self.inner.lock().unwrap();

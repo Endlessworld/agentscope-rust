@@ -237,13 +237,18 @@ async fn execute_with_policy(
     let mut attempt: u32 = 0;
     loop {
         let fut = tool.call(input.clone(), ctx.clone());
+        // A timeout is an attempt failure, not an exit: `?` here used to leave the
+        // retry loop, so `max_attempts` was unreachable for the one failure mode a
+        // hung tool actually produces. The error is `Error::Tool`, which
+        // `Error::is_retryable` classifies as transient because of its wording.
         let result = match timeout {
-            Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
-                Error::Tool(format!(
+            Some(d) => match tokio::time::timeout(d, fut).await {
+                Ok(result) => result,
+                Err(_) => Err(Error::Tool(format!(
                     "Tool execution timeout after {:?} for '{}'",
                     d, call.name
-                ))
-            })?,
+                ))),
+            },
             None => fut.await,
         };
         match result {
@@ -255,9 +260,20 @@ async fn execute_with_policy(
             }
             Err(e) => {
                 attempt += 1;
-                if attempt >= max_attempts || !e.is_retryable() {
+                // Only transient failures are retried: a business error (unknown
+                // tool, invalid arguments, a refused call) would fail identically and
+                // a tool that already had a side effect would apply it twice.
+                let retryable = e.is_retryable();
+                if attempt >= max_attempts || !retryable {
                     return Err(e);
                 }
+                tracing::warn!(
+                    tool = %call.name,
+                    attempt,
+                    max_attempts,
+                    error = %e,
+                    "tool call failed transiently; retrying"
+                );
                 tokio::time::sleep(cfg.backoff_for(attempt - 1)).await;
             }
         }
@@ -340,6 +356,110 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    /// Times out on its first `sleeps` attempts, then answers immediately.
+    struct FlakySlowTool {
+        sleeps: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Tool for FlakySlowTool {
+        fn name(&self) -> &str {
+            "flaky_slow"
+        }
+        fn description(&self) -> &str {
+            "times out once, then answers"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn call(
+            &self,
+            _args: JsonMap,
+            _ctx: ToolExecutionContext,
+        ) -> crate::error::Result<ToolResultBlock> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.sleeps.fetch_sub(1, Ordering::SeqCst) > 0 {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+            Ok(ToolResultBlock::text("done"))
+        }
+    }
+
+    /// Always fails with a business error (never transient).
+    struct BrokenTool {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Tool for BrokenTool {
+        fn name(&self) -> &str {
+            "broken"
+        }
+        fn description(&self) -> &str {
+            "fails with a business error"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn call(
+            &self,
+            _args: JsonMap,
+            _ctx: ToolExecutionContext,
+        ) -> crate::error::Result<ToolResultBlock> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Tool("Tool not found: broken".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_timeout_is_retried_until_the_attempt_budget_runs_out() {
+        // The timeout used to escape the retry loop through `?`, so `max_attempts`
+        // never applied to the only failure a hung tool produces.
+        let tool = Arc::new(FlakySlowTool {
+            sleeps: std::sync::atomic::AtomicUsize::new(1),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(tool.clone());
+        let call = ToolUseBlock::new("c1", "flaky_slow", JsonMap::new());
+        let cfg = ExecutionConfig::builder()
+            .timeout(Duration::from_millis(20))
+            .max_attempts(2)
+            .initial_backoff(Duration::from_millis(1))
+            .build();
+        let out = ToolExecutor::new()
+            .execute(&toolkit, &call, ToolExecutionContext::default(), Some(&cfg))
+            .await
+            .expect("the second attempt must run and answer");
+        assert_eq!(out.text_content(), "done");
+        assert_eq!(tool.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_business_tool_error_is_not_retried() {
+        // Retrying it would repeat the failure (and, for a tool that already ran,
+        // its side effects).
+        let tool = Arc::new(BrokenTool {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let toolkit = Toolkit::new();
+        toolkit.register_tool(tool.clone());
+        let call = ToolUseBlock::new("c1", "broken", JsonMap::new());
+        let cfg = ExecutionConfig::builder()
+            .timeout(Duration::from_millis(200))
+            .max_attempts(3)
+            .initial_backoff(Duration::from_millis(1))
+            .build();
+        let err = ToolExecutor::new()
+            .execute(&toolkit, &call, ToolExecutionContext::default(), Some(&cfg))
+            .await
+            .expect_err("a business failure is surfaced immediately");
+        assert!(matches!(err, Error::Tool(ref msg) if msg.contains("Tool not found")));
+        assert_eq!(tool.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// 一个声明了必填参数的 strict 工具：strict 模式下未声明的入参必须被拒绝。

@@ -15,7 +15,7 @@ use agentscope_core::agent::{CallableAgent, RuntimeContext};
 use agentscope_core::error::Result;
 use agentscope_core::event::{AgentEvent, AgentEventType};
 use agentscope_core::formatter::render_message_text;
-use agentscope_core::message::{JsonMap, Msg, ToolResultBlock};
+use agentscope_core::message::{JsonMap, Msg, MsgRole, ToolResultBlock};
 use agentscope_core::tool::{Tool, ToolExecutionContext};
 use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
@@ -25,7 +25,7 @@ use crate::agent::subagent::task::background::BackgroundTask;
 use crate::agent::subagent::task::repository::TaskRepository;
 use crate::agent::subagent::task::spec::TaskRunSpec;
 use crate::agent::subagent::task::{task_session_key_from_runtime, RemoteSubmitContext};
-use crate::agent::subagent::{SubagentDeclaration, SubagentSessionRepair};
+use crate::agent::subagent::{SubagentDeclaration, SubagentSessionRepair, ToolkitProviderSlot};
 
 /// A subagent instance spawned by [`AgentSpawnTool`], addressable via its
 /// `agent_key` (and optionally its `label`) for follow-up `agent_send` turns.
@@ -36,6 +36,97 @@ pub struct SpawnedAgent {
     pub agent: Arc<dyn CallableAgent>,
     /// Settles a session left unusable by a cancelled turn, when the factory supplies one.
     pub repair: Option<Arc<dyn SubagentSessionRepair>>,
+    /// Set once the child's last background run settled. A finished entry is still addressable
+    /// (a follow-up `agent_send` reuses its session) but is the first thing evicted when the
+    /// registry reaches its capacity.
+    finished: bool,
+    /// Monotonic use counter, so eviction drops the least recently used finished entry.
+    last_used: u64,
+}
+
+/// Live-subagent bookkeeping, shared with the children's background tasks.
+///
+/// The map used to grow without bound: every spawn inserted an `Arc<dyn CallableAgent>` and
+/// nothing ever removed it, so a long-lived parent pinned every child (and its toolkit, model
+/// and journal handles) until the process exited. The task's completion now marks the entry
+/// finished and evicts the least recently used finished entries beyond [`MAX_LIVE_SUBAGENTS`].
+#[derive(Default)]
+struct LiveRegistry {
+    entries: HashMap<String, SpawnedAgent>,
+    /// Canonical (lowercased) label → `agent_key`.
+    labels: HashMap<String, String>,
+    clock: u64,
+}
+
+/// How many live subagents one parent keeps addressable before finished ones are evicted.
+///
+/// Only finished entries are evicted: dropping a running entry would lose the only mapping from
+/// its `agent_key` to the agent, while a finished one can still be reached through its task
+/// record (`agent_list` reports those).
+const MAX_LIVE_SUBAGENTS: usize = 64;
+
+impl LiveRegistry {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn insert(&mut self, key: String, mut spawned: SpawnedAgent) {
+        spawned.last_used = self.tick();
+        if let Some(label) = &spawned.label {
+            self.labels.insert(label.to_lowercase(), key.clone());
+        }
+        self.entries.insert(key, spawned);
+        self.evict_over_capacity();
+    }
+
+    /// Marks a child's last run finished and drops the oldest finished entries over capacity.
+    fn finish(&mut self, key: &str) {
+        let now = self.tick();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.finished = true;
+            entry.last_used = now;
+        }
+        self.evict_over_capacity();
+    }
+
+    fn touch(&mut self, key: &str) {
+        let now = self.tick();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.finished = false;
+            entry.last_used = now;
+        }
+    }
+
+    fn remove(&mut self, key: &str) -> Option<SpawnedAgent> {
+        let removed = self.entries.remove(key)?;
+        if let Some(label) = &removed.label {
+            let canonical = label.to_lowercase();
+            if self.labels.get(&canonical).is_some_and(|k| k == key) {
+                self.labels.remove(&canonical);
+            }
+        }
+        Some(removed)
+    }
+
+    fn evict_over_capacity(&mut self) {
+        if self.entries.len() <= MAX_LIVE_SUBAGENTS {
+            return;
+        }
+        let mut finished: Vec<(u64, String)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.finished)
+            .map(|(key, entry)| (entry.last_used, key.clone()))
+            .collect();
+        finished.sort();
+        for (_, key) in finished {
+            if self.entries.len() <= MAX_LIVE_SUBAGENTS {
+                break;
+            }
+            self.remove(&key);
+        }
+    }
 }
 
 /// One subagent exposed as a user-addressable entry point, mirroring Java
@@ -173,11 +264,18 @@ pub struct AgentSpawnTool {
     propagate_plan_mode: bool,
     counter: AtomicU64,
     /// Locally spawned background tasks keyed by `session:task_id`, for cancel/end.
-    active_local: Mutex<HashMap<String, Arc<BackgroundTask>>>,
-    /// Live subagents keyed by `agent_key` (`agent:<agent_id>:<uuid>`).
-    live: Mutex<HashMap<String, SpawnedAgent>>,
-    /// Canonical (lowercased) label → `agent_key`.
-    labels: Mutex<HashMap<String, String>>,
+    active_local: Arc<Mutex<HashMap<String, Arc<BackgroundTask>>>>,
+    /// Live subagents keyed by `agent_key` (`agent:<agent_id>:<uuid>`), plus their labels.
+    ///
+    /// Shared with each child's background task (an `Arc`) so the task can release its own
+    /// entry when it settles; a plain field could not be reached from the detached task.
+    live: Arc<Mutex<LiveRegistry>>,
+    /// Reads the parent's *current* toolkit at spawn time, so a child sees tools registered
+    /// after this agent was built (e.g. MCP servers a host bridges into the live toolkit).
+    ///
+    /// The slot is shared with the subagent blueprint: this tool writes it, every leaf factory
+    /// built from the blueprint reads it at spawn time.
+    toolkit_provider: ToolkitProviderSlot,
 }
 
 impl AgentSpawnTool {
@@ -192,9 +290,9 @@ impl AgentSpawnTool {
             allowed_agents: HashSet::new(),
             propagate_plan_mode: true,
             counter: AtomicU64::new(0),
-            active_local: Mutex::new(HashMap::new()),
-            live: Mutex::new(HashMap::new()),
-            labels: Mutex::new(HashMap::new()),
+            active_local: Arc::new(Mutex::new(HashMap::new())),
+            live: Arc::new(Mutex::new(LiveRegistry::default())),
+            toolkit_provider: ToolkitProviderSlot::default(),
         }
     }
 
@@ -210,6 +308,22 @@ impl AgentSpawnTool {
     /// The attached task repository, when one was configured.
     pub fn task_repository(&self) -> Option<Arc<dyn TaskRepository>> {
         self.tasks.clone()
+    }
+
+    /// Installs the reader of the parent's live toolkit.
+    ///
+    /// A child is built when it is spawned, but the parent's toolkit keeps growing after the
+    /// agent is built (a host bridges MCP servers into it). Reading the toolkit at spawn time
+    /// is what lets a child see those tools; the build-time snapshot alone left them invisible.
+    pub fn set_toolkit_provider(&self, provider: crate::agent::subagent::ToolkitProvider) {
+        self.toolkit_provider.set(provider);
+    }
+
+    /// Shares the blueprint's provider slot, so a host that reaches this tool also reaches the
+    /// leaf factories materialised from the blueprint.
+    pub fn with_toolkit_provider_slot(mut self, slot: ToolkitProviderSlot) -> Self {
+        self.toolkit_provider = slot;
+        self
     }
 
     /// Records every spawned subagent into `sink`, so the subagent middleware can emit the
@@ -283,22 +397,21 @@ impl AgentSpawnTool {
         let uuid = uuid::Uuid::new_v4();
         let key = format!("agent:{agent_id}:{uuid}");
         let session_id = format!("sub-{uuid}");
-        if let Some(l) = label {
-            self.labels
-                .lock()
-                .unwrap()
-                .insert(l.to_lowercase(), key.clone());
-        }
-        self.live.lock().unwrap().insert(
-            key.clone(),
-            SpawnedAgent {
-                agent_id: agent_id.to_string(),
-                session_id: session_id.clone(),
-                label: label.map(str::to_string),
-                agent,
-                repair,
-            },
-        );
+        self.live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                key.clone(),
+                SpawnedAgent {
+                    agent_id: agent_id.to_string(),
+                    session_id: session_id.clone(),
+                    label: label.map(str::to_string),
+                    agent,
+                    repair,
+                    finished: false,
+                    last_used: 0,
+                },
+            );
         (key, session_id)
     }
 
@@ -313,9 +426,10 @@ impl AgentSpawnTool {
             (None, None) => Err("Error: Either agent_key or label is required.".into()),
             (Some(k), None) => Ok(k.trim().to_string()),
             (None, Some(l)) => self
-                .labels
+                .live
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .labels
                 .get(&l.trim().to_lowercase())
                 .cloned()
                 .ok_or_else(|| format!("Error: Unknown label: {l}")),
@@ -327,7 +441,8 @@ impl AgentSpawnTool {
         let mut out: Vec<_> = self
             .live
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
             .iter()
             .map(|(k, v)| {
                 (
@@ -351,14 +466,55 @@ impl AgentSpawnTool {
         Arc<dyn CallableAgent>,
         Option<Arc<dyn SubagentSessionRepair>>,
     )> {
-        self.live.lock().unwrap().get(key).map(|s| {
-            (
-                s.agent_id.clone(),
-                s.session_id.clone(),
-                Arc::clone(&s.agent),
-                s.repair.clone(),
-            )
-        })
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = live.entries.get(key)?;
+        let out = (
+            entry.agent_id.clone(),
+            entry.session_id.clone(),
+            Arc::clone(&entry.agent),
+            entry.repair.clone(),
+        );
+        // A follow-up turn is about to run: the entry is live again, not a finished one that
+        // eviction may drop.
+        live.touch(key);
+        Some(out)
+    }
+
+    /// Marks a child's last run finished, releasing it from the registry's eviction budget.
+    ///
+    /// Called from the child's own background task, which is why the registry is an `Arc`: a
+    /// long-lived parent otherwise kept a strong reference to every child it had ever spawned.
+    fn mark_finished(live: &Mutex<LiveRegistry>, key: &str) {
+        live.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .finish(key);
+    }
+
+    /// Interrupts every live subagent (parent-level cancel; mirrors a prompt cancellation
+    /// reaching the children too). Returns how many were signalled.
+    pub fn interrupt_all(&self) -> usize {
+        let agents: Vec<Arc<dyn CallableAgent>> = {
+            let mut live = self
+                .live
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let keys: Vec<String> = live.entries.keys().cloned().collect();
+            let mut agents = Vec::with_capacity(keys.len());
+            for key in keys {
+                if let Some(entry) = live.entries.get_mut(&key) {
+                    entry.last_used = 0;
+                    agents.push(Arc::clone(&entry.agent));
+                }
+            }
+            agents
+        };
+        for agent in &agents {
+            agent.interrupt();
+        }
+        agents.len()
     }
 
     /// Interrupts the live subagent that owns `child_session` (a client cancel addressed to the
@@ -371,7 +527,8 @@ impl AgentSpawnTool {
         let agent = self
             .live
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
             .values()
             .find(|spawned| spawned.session_id == child_session)
             .map(|spawned| Arc::clone(&spawned.agent));
@@ -391,9 +548,10 @@ impl AgentSpawnTool {
 
     /// A label must be unique across the subagents this tool owns.
     fn label_in_use(&self, label: &str) -> bool {
-        self.labels
+        self.live
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .labels
             .contains_key(&label.to_lowercase())
     }
 
@@ -401,7 +559,12 @@ impl AgentSpawnTool {
     /// whether a running task was found and cancelled.
     pub fn end_spawn(&self, session_id: &str, task_id: &str) -> bool {
         let key = format!("{session_id}:{task_id}");
-        let task = self.active_local.lock().unwrap().get(&key).cloned();
+        let task = self
+            .active_local
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned();
         match task {
             Some(t) => {
                 t.cancel();
@@ -425,6 +588,19 @@ impl AgentSpawnTool {
 
 fn opt_str<'a>(args: &'a JsonMap, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
+}
+
+/// Metadata of the most recent parent message that carries any.
+///
+/// A subagent receives the parent's request context, not just its text: tenant/user routing and
+/// trace correlation live in the message metadata.
+fn parent_message_metadata(ctx: &ToolExecutionContext) -> JsonMap {
+    ctx.conversation_history()
+        .into_iter()
+        .rev()
+        .find(|message| !message.metadata().is_empty())
+        .map(|message| message.metadata().clone())
+        .unwrap_or_default()
 }
 
 #[async_trait]
@@ -527,7 +703,20 @@ impl Tool for AgentSpawnTool {
             .unwrap_or_else(|| self.next_task_id("spawn"));
 
         let mut header = String::new();
+        // The spawning message's metadata (tenant, trace id, ...) travels with the child prompt:
+        // a subagent that only received the text lost the parent's request context.
+        let parent_metadata = parent_message_metadata(&ctx);
         let spec = if let Some(decl) = remote {
+            if !parent_metadata.is_empty() {
+                // The remote spec only carries `input`, so the metadata cannot be forwarded
+                // without inventing a protocol field: say so instead of dropping it silently.
+                tracing::warn!(
+                    agent = %agent_id,
+                    keys = ?parent_metadata.keys().collect::<Vec<_>>(),
+                    "remote subagent run has no metadata channel; the parent message metadata \
+                     is not forwarded"
+                );
+            }
             remote_spec(decl, &agent_id, &effective_prompt)
         } else {
             let (exec_agent, repair) = local_agent.expect("local agent");
@@ -568,15 +757,27 @@ impl Tool for AgentSpawnTool {
                 });
             }
             header = format!("{}\n", spawn_header(&key, &agent_id, &child_session));
+            let live = Arc::clone(&self.live);
+            let finished_key = key.clone();
+            let event_sink = self.event_sink.clone();
+            let task_child_session = child_session.clone();
             TaskRunSpec::Adopted {
-                future: tokio::spawn(run_child_turn(
-                    exec_agent,
-                    repair,
-                    effective_prompt,
-                    child_session.clone(),
-                    parent,
-                    self.event_sink.clone(),
-                )),
+                future: tokio::spawn(async move {
+                    let outcome = run_child_turn(
+                        exec_agent,
+                        repair,
+                        effective_prompt,
+                        parent_metadata,
+                        task_child_session,
+                        parent,
+                        event_sink,
+                    )
+                    .await;
+                    // The child's run is over: release the registry slot so a long-lived parent
+                    // does not keep every child it ever spawned alive.
+                    AgentSpawnTool::mark_finished(&live, &finished_key);
+                    outcome
+                }),
                 // Persist the live card id: `session/load` replays this exact child instead of
                 // inventing a different one from the task id.
                 child_session: Some(child_session.clone()),
@@ -596,10 +797,16 @@ impl Tool for AgentSpawnTool {
             )));
         }
 
-        self.active_local
-            .lock()
-            .unwrap()
-            .insert(format!("{session_id}:{task_id}"), bg);
+        {
+            // Drop the handles of tasks that already settled: the map used to keep every
+            // spawned/sent task for the parent's whole lifetime.
+            let mut active = self
+                .active_local
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active.retain(|_, task| !task.is_completed());
+            active.insert(format!("{session_id}:{task_id}"), bg);
+        }
 
         Ok(ToolResultBlock::text(format!(
             "{header}\ntask_id: {task_id}\nSubagent '{agent_id}' started in the background. Its \
@@ -618,6 +825,7 @@ async fn run_child_turn(
     agent: Arc<dyn CallableAgent>,
     repair: Option<Arc<dyn SubagentSessionRepair>>,
     prompt: String,
+    metadata: JsonMap,
     child_session: String,
     parent: Option<String>,
     sink: Option<SubagentEventSink>,
@@ -625,6 +833,7 @@ async fn run_child_turn(
     let outcome = match child_turn(
         &agent,
         prompt.clone(),
+        metadata.clone(),
         &child_session,
         parent.as_deref(),
         sink.as_ref(),
@@ -644,6 +853,7 @@ async fn run_child_turn(
                     child_turn(
                         &agent,
                         prompt,
+                        metadata,
                         &child_session,
                         parent.as_deref(),
                         sink.as_ref(),
@@ -669,11 +879,23 @@ async fn run_child_turn(
 async fn child_turn(
     agent: &Arc<dyn CallableAgent>,
     prompt: String,
+    metadata: JsonMap,
     child_session: &str,
     parent: Option<&str>,
     sink: Option<&SubagentEventSink>,
 ) -> Result<String> {
-    let messages = vec![Msg::user(prompt)];
+    let message = if metadata.is_empty() {
+        Msg::user(prompt)
+    } else {
+        // The parent's message metadata (tenant, trace id, ...) is part of the request context
+        // the child must run under; sending only the text dropped it.
+        Msg::builder()
+            .role(MsgRole::User)
+            .text_content(prompt)
+            .metadata(metadata)
+            .build()
+    };
+    let messages = vec![message];
     match sink {
         Some(events) => {
             let events = events.clone();
@@ -833,6 +1055,7 @@ impl Tool for AgentSendTool {
         let session_id = task_session_key_from_runtime(&ctx.runtime);
         let task_id = self.spawn.next_task_id("send");
         let child_for_record = child_session.clone();
+        let metadata = parent_message_metadata(&ctx);
         repo.put_task(
             &rt,
             &task_id,
@@ -843,6 +1066,7 @@ impl Tool for AgentSendTool {
                     agent,
                     repair,
                     message,
+                    metadata,
                     child_session,
                     self.spawn.host_session(),
                     self.spawn.event_sink.clone(),
@@ -969,6 +1193,33 @@ mod tests {
     use agentscope_core::state::AgentState;
     use agentscope_core::tool::Toolkit;
 
+    /// #680: the child prompt carries the parent message's metadata (tenant, trace id, ...).
+    ///
+    /// Sending only the text dropped the request context the child is supposed to run under.
+    #[test]
+    fn the_parent_message_metadata_is_carried_into_the_child_prompt() {
+        let mut metadata = JsonMap::new();
+        metadata.insert("tenant".to_string(), serde_json::json!("acme"));
+        metadata.insert("trace_id".to_string(), serde_json::json!("t-1"));
+        let history = vec![
+            Msg::user("earlier"),
+            Msg::builder()
+                .role(MsgRole::User)
+                .text_content("delegate this")
+                .metadata(metadata)
+                .build(),
+        ];
+        let mut ctx = agentscope_core::tool::ToolExecutionContext::default();
+        ctx.runtime.insert(
+            agentscope_core::tool::CONVERSATION_HISTORY_KEY.to_string(),
+            serde_json::to_value(&history).unwrap(),
+        );
+
+        let captured = parent_message_metadata(&ctx);
+        assert_eq!(captured.get("tenant"), Some(&serde_json::json!("acme")));
+        assert_eq!(captured.get("trace_id"), Some(&serde_json::json!("t-1")));
+    }
+
     /// A child whose first turn is refused because the journal still holds an unknown tool
     /// outcome (what an aborted turn leaves behind).
     struct UnreconciledOnce {
@@ -1042,6 +1293,7 @@ mod tests {
             agent,
             Some(Arc::new(CountingRepair(Arc::clone(&repairs)))),
             "go".to_string(),
+            JsonMap::new(),
             "sub-test".to_string(),
             None,
             None,
@@ -1097,6 +1349,7 @@ mod tests {
             agent,
             Some(Arc::new(CountingRepair(Arc::clone(&repairs)))),
             "go".to_string(),
+            JsonMap::new(),
             "sub-test".to_string(),
             None,
             None,
@@ -1224,6 +1477,7 @@ mod tests {
             Arc::clone(&child) as Arc<dyn CallableAgent>,
             Some(repair),
             "go".to_string(),
+            JsonMap::new(),
             "sub-test".to_string(),
             None,
             None,
@@ -1310,6 +1564,7 @@ mod tests {
             streaming_child(Arc::clone(&streaming_calls), Arc::clone(&plain_calls)),
             None,
             "go".to_string(),
+            JsonMap::new(),
             "sub-1".to_string(),
             Some("sub-parent".to_string()),
             Some(tx),
@@ -1354,6 +1609,7 @@ mod tests {
             streaming_child(Arc::clone(&streaming_calls), Arc::clone(&plain_calls)),
             None,
             "go".to_string(),
+            JsonMap::new(),
             "sub-1".to_string(),
             None,
             None,
@@ -1398,6 +1654,138 @@ mod tests {
         async fn call_with_schema(&self, messages: Vec<Msg>, _schema: JsonSchema) -> Result<Msg> {
             self.call(messages).await
         }
+    }
+
+    #[test]
+    fn the_live_registry_evicts_finished_subagents_and_keeps_running_ones() {
+        // Regression: every spawn inserted into `live` and nothing ever removed it, so a
+        // long-lived parent kept a strong reference to every child it had ever spawned.
+        let mut live = LiveRegistry::default();
+        for i in 0..(MAX_LIVE_SUBAGENTS + 4) {
+            let key = format!("agent:explorer:{i}");
+            live.insert(
+                key.clone(),
+                SpawnedAgent {
+                    agent_id: "explorer".into(),
+                    session_id: format!("sub-{i}"),
+                    label: Some(format!("label-{i}")),
+                    agent: Arc::new(EchoChild(Toolkit::new())),
+                    repair: None,
+                    finished: false,
+                    last_used: 0,
+                },
+            );
+            live.finish(&key);
+        }
+        assert_eq!(
+            live.entries.len(),
+            MAX_LIVE_SUBAGENTS,
+            "finished entries are evicted once the registry is over capacity"
+        );
+        assert!(!live.entries.contains_key("agent:explorer:0"));
+        assert!(
+            live.labels.get("label-0").is_none(),
+            "an evicted entry must not leave a dangling label"
+        );
+
+        // A still-running child is never evicted: its `agent_key` is the only handle to it.
+        live.insert(
+            "agent:explorer:running".into(),
+            SpawnedAgent {
+                agent_id: "explorer".into(),
+                session_id: "sub-running".into(),
+                label: None,
+                agent: Arc::new(EchoChild(Toolkit::new())),
+                repair: None,
+                finished: false,
+                last_used: 0,
+            },
+        );
+        for i in 0..(MAX_LIVE_SUBAGENTS + 4) {
+            let key = format!("agent:explorer:late-{i}");
+            live.insert(
+                key.clone(),
+                SpawnedAgent {
+                    agent_id: "explorer".into(),
+                    session_id: format!("sub-late-{i}"),
+                    label: None,
+                    agent: Arc::new(EchoChild(Toolkit::new())),
+                    repair: None,
+                    finished: false,
+                    last_used: 0,
+                },
+            );
+            live.finish(&key);
+        }
+        assert!(
+            live.entries.contains_key("agent:explorer:running"),
+            "a running subagent must survive eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_receives_the_parent_message_metadata() {
+        // agent-as-tool used to send `Msg::user(prompt)` only, dropping tenant/trace metadata
+        // the parent ran under.
+        struct RecordingChild {
+            toolkit: Toolkit,
+            seen: Arc<Mutex<Vec<JsonMap>>>,
+        }
+
+        #[async_trait]
+        impl Agent for RecordingChild {
+            fn agent_id(&self) -> &str {
+                "child"
+            }
+            fn name(&self) -> &str {
+                "child"
+            }
+            fn description(&self) -> &str {
+                "child"
+            }
+            fn interrupt(&self) {}
+            fn agent_state(&self) -> AgentState {
+                AgentState::default()
+            }
+            fn toolkit(&self) -> &Toolkit {
+                &self.toolkit
+            }
+        }
+
+        #[async_trait]
+        impl CallableAgent for RecordingChild {
+            async fn call(&self, messages: Vec<Msg>) -> Result<Msg> {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend(messages.iter().map(|m| m.metadata().clone()));
+                Ok(Msg::assistant("ok"))
+            }
+            async fn call_with_schema(
+                &self,
+                messages: Vec<Msg>,
+                _schema: JsonSchema,
+            ) -> Result<Msg> {
+                self.call(messages).await
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let agent: Arc<dyn CallableAgent> = Arc::new(RecordingChild {
+            toolkit: Toolkit::new(),
+            seen: Arc::clone(&seen),
+        });
+        let mut metadata = JsonMap::new();
+        metadata.insert("tenant".to_string(), serde_json::json!("acme"));
+        child_turn(&agent, "go".to_string(), metadata, "sub-meta", None, None)
+            .await
+            .expect("the child turn succeeds");
+        let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            seen[0].get("tenant").and_then(|v| v.as_str()),
+            Some("acme"),
+            "the child prompt must carry the parent's metadata"
+        );
     }
 
     #[test]

@@ -342,6 +342,16 @@ pub trait RemoteBackend: Send + Sync + std::fmt::Debug {
     /// Creates a new remote sandbox and returns its handle.
     async fn create_sandbox(&self, session_id: &str) -> SandboxResult<RemoteSandboxHandle>;
 
+    /// Adopts an already-created remote sandbox for `session_id`, when one exists.
+    ///
+    /// Backends with a deterministic sandbox id (AgentRun derives it from `session_id`) override
+    /// this so a start that was not preceded by an explicit create — for instance the MCP
+    /// `initialize` triggered by the first exec — reuses the live instance instead of issuing a
+    /// second `CreateSandbox`. The default reports "nothing to reuse".
+    async fn reuse_sandbox(&self, _session_id: &str) -> SandboxResult<Option<RemoteSandboxHandle>> {
+        Ok(None)
+    }
+
     /// Connects to an existing remote sandbox, verifying it is alive.
     async fn connect_sandbox(&self, sandbox_id: &str) -> SandboxResult<RemoteSandboxHandle>;
 
@@ -454,11 +464,15 @@ pub fn build_b64_append_script(path: &str, chunk: &str) -> String {
 }
 
 /// Builds the python one-liner that decodes `path` and extracts the tar into `target_dir`.
+///
+/// `target_dir` is created first: hydration runs before the workspace setup script on a fresh
+/// sandbox (Java `AgentRunSandbox#doHydrateWorkspace` ordering), so `tar -C` would otherwise fail
+/// with `Cannot open: No such file or directory` on the very first restore.
 pub fn build_b64_extract_script(target_dir: &str, path: &str) -> String {
     let dir_lit = serde_json::to_string(target_dir).unwrap_or_else(|_| "\".\"".to_string());
     let path_lit = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".to_string());
     let py = format!(
-        "import base64,pathlib,subprocess; raw=base64.standard_b64decode(pathlib.Path({path_lit}).read_text()); subprocess.run(['tar','xf','-','-C',{dir_lit}],input=raw,check=True)"
+        "import base64,pathlib,subprocess; pathlib.Path({dir_lit}).mkdir(parents=True,exist_ok=True); raw=base64.standard_b64decode(pathlib.Path({path_lit}).read_text()); subprocess.run(['tar','xf','-','-C',{dir_lit}],input=raw,check=True)"
     );
     format!("python3 -c {}", shell_quote(&py))
 }
@@ -586,10 +600,21 @@ impl RemoteSandbox {
 
     async fn ensure_handle(&mut self) -> Result<&RemoteSandboxHandle> {
         if self.handle.is_none() {
-            let handle = self
+            // Reuse an already-created instance when the backend can find one, so a start that
+            // was not preceded by an explicit create never issues a second `CreateSandbox`
+            // (Java `AgentRunSandboxClient#resolveOrCreate`).
+            let handle = match self
                 .backend
-                .create_sandbox(&self.core.data.session_id)
-                .await?;
+                .reuse_sandbox(&self.core.data.session_id)
+                .await?
+            {
+                Some(handle) => handle,
+                None => {
+                    self.backend
+                        .create_sandbox(&self.core.data.session_id)
+                        .await?
+                }
+            };
             self.adopt_handle(handle);
             self.core.data.workspace_root_ready = false;
             self.core.data.workspace_projection_hash = None;
@@ -1066,6 +1091,12 @@ mod tests {
         let extract = build_b64_extract_script("/workspace", "/tmp/x.b64");
         assert!(extract.contains("standard_b64decode"));
         assert!(extract.contains("/workspace"));
+        // #2216: the extraction target must exist before `tar -C` runs, because hydrate happens
+        // before the workspace setup script on a fresh sandbox.
+        assert!(
+            extract.contains("mkdir(parents=True,exist_ok=True)"),
+            "extract must create the target dir first: {extract}"
+        );
     }
 
     #[test]
@@ -1230,6 +1261,69 @@ mod tests {
             }
             Ok(RemoteExecOutput::new(0, String::new(), String::new()))
         }
+    }
+
+    /// Backend whose only job is proving `start` adopts a reusable instance (#2070).
+    #[derive(Debug)]
+    struct ReuseBackend {
+        creates: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteBackend for ReuseBackend {
+        fn backend_name(&self) -> &'static str {
+            "reuse"
+        }
+        fn endpoint_base(&self) -> String {
+            "memory://reuse".to_string()
+        }
+        fn workspace_root(&self) -> &str {
+            "/workspace"
+        }
+        async fn create_sandbox(&self, _session_id: &str) -> SandboxResult<RemoteSandboxHandle> {
+            *self.creates.lock().unwrap() += 1;
+            Ok(RemoteSandboxHandle::new("created", BTreeMap::new()))
+        }
+        async fn reuse_sandbox(
+            &self,
+            _session_id: &str,
+        ) -> SandboxResult<Option<RemoteSandboxHandle>> {
+            Ok(Some(RemoteSandboxHandle::new("reused", BTreeMap::new())))
+        }
+        async fn connect_sandbox(&self, sandbox_id: &str) -> SandboxResult<RemoteSandboxHandle> {
+            Ok(RemoteSandboxHandle::new(sandbox_id, BTreeMap::new()))
+        }
+        async fn kill_sandbox(&self, _sandbox_id: &str) -> SandboxResult<()> {
+            Ok(())
+        }
+        async fn exec_in(
+            &self,
+            _handle: &RemoteSandboxHandle,
+            _command: &str,
+            _cwd: Option<&str>,
+            _timeout_seconds: u64,
+        ) -> SandboxResult<RemoteExecOutput> {
+            Ok(RemoteExecOutput::new(0, String::new(), String::new()))
+        }
+    }
+
+    #[tokio::test]
+    async fn start_adopts_a_reusable_sandbox_instead_of_creating_one() {
+        let backend = Arc::new(ReuseBackend {
+            creates: Mutex::new(0),
+        });
+        let client = RemoteSandboxClient::new(backend.clone());
+        let mut sandbox = client
+            .create(&WorkspaceSpec::new("/workspace"), None, None)
+            .await
+            .unwrap();
+        sandbox.start().await.unwrap();
+        assert_eq!(
+            *backend.creates.lock().unwrap(),
+            0,
+            "the live instance is adopted, never re-created"
+        );
+        assert!(sandbox.is_running());
     }
 
     #[tokio::test]

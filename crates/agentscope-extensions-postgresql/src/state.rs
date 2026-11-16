@@ -89,13 +89,15 @@ impl PostgresAgentStateStoreBuilder {
                 sessions_ddl(&full_table)
             );
             self.client.execute_batch(&ddl)?;
+            // Back-fill the `version` column for tables created before versioning existed.
+            self.client
+                .execute_batch(&ensure_version_column_ddl(&full_table))?;
         } else {
+            // Verifying mode must not run any DDL: a read-only account would fail to start
+            // (#3213). A pre-versioning table then simply lacks the column.
             verify_schema_exists(self.client.as_ref(), &self.schema)?;
             verify_table_exists(self.client.as_ref(), &self.schema, &self.table)?;
         }
-        // Back-fill the `version` column for tables created before versioning existed.
-        self.client
-            .execute_batch(&ensure_version_column_ddl(&full_table))?;
         Ok(PostgresAgentStateStore {
             client: self.client,
             schema: self.schema,
@@ -1017,6 +1019,27 @@ mod tests {
         assert_eq!(s.table_name(), DEFAULT_TABLE_NAME);
         assert!(SCHEMA_EXISTS_QUERY.contains("INFORMATION_SCHEMA.SCHEMATA"));
         assert!(TABLE_EXISTS_QUERY.contains("INFORMATION_SCHEMA.TABLES"));
+    }
+
+    /// #3213: `create_if_not_exist(false)` must not execute any DDL - a read-only account
+    /// cannot run `ALTER TABLE` and would fail to start.
+    #[test]
+    fn build_without_auto_create_executes_no_ddl() {
+        let c = client();
+        let _ = store(&c);
+        let before = c.ddl_statements().len();
+
+        PostgresAgentStateStore::builder(c.clone())
+            .create_if_not_exist(false)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            c.ddl_statements().len(),
+            before,
+            "verifying mode must not execute DDL: {:?}",
+            c.ddl_statements()
+        );
     }
 
     // Java: PostgresAgentStateStoreTest#builderWithDefaultsCreatesStore

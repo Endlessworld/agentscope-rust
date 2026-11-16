@@ -327,6 +327,38 @@ impl SandboxSnapshotSpec for NoopSnapshotSpec {
     }
 }
 
+/// Snapshot spec that ignores the id its caller passes and uses a fixed one.
+///
+/// The sandbox client keys snapshots by the sandbox session id it just generated, which
+/// changes whenever a container is rebuilt or the state store is lost — the new container
+/// then never finds the archive of the previous one. Wrapping the configured spec with a
+/// deterministic id (the isolation scope) makes the archive follow the scope instead.
+#[derive(Debug)]
+pub struct KeyedSnapshotSpec {
+    inner: Arc<dyn SandboxSnapshotSpec>,
+    id: String,
+}
+
+impl KeyedSnapshotSpec {
+    pub fn new(inner: Arc<dyn SandboxSnapshotSpec>, id: impl Into<String>) -> Self {
+        Self {
+            inner,
+            id: id.into(),
+        }
+    }
+
+    /// The deterministic snapshot id this wrapper enforces.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl SandboxSnapshotSpec for KeyedSnapshotSpec {
+    fn build(&self, _snapshot_id: &str) -> Result<Arc<dyn SandboxSnapshot>> {
+        self.inner.build(&self.id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +468,38 @@ mod tests {
     async fn remote_snapshot_without_client_errors() {
         let snap = RemoteSandboxSnapshot::with_id("x");
         assert!(snap.persist(b"x").await.is_err());
+    }
+
+    /// Records the id every `build` call receives.
+    #[derive(Debug, Default)]
+    struct RecordingSpec {
+        ids: Mutex<Vec<String>>,
+    }
+
+    impl SandboxSnapshotSpec for RecordingSpec {
+        fn build(&self, snapshot_id: &str) -> Result<Arc<dyn SandboxSnapshot>> {
+            self.ids.lock().unwrap().push(snapshot_id.to_string());
+            Ok(Arc::new(NoopSandboxSnapshot))
+        }
+    }
+
+    /// The sandbox client passes the session id it just generated; a keyed spec replaces it
+    /// with the scope-derived id so a rebuilt container resumes the same archive (#1632).
+    #[tokio::test]
+    async fn keyed_snapshot_spec_ignores_the_generated_session_id() {
+        let inner = Arc::new(RecordingSpec::default());
+        let spec = KeyedSnapshotSpec::new(
+            Arc::clone(&inner) as Arc<dyn SandboxSnapshotSpec>,
+            "user_alice",
+        );
+        assert_eq!(spec.id(), "user_alice");
+
+        spec.build("container-a").unwrap();
+        spec.build("container-b").unwrap();
+
+        assert_eq!(
+            *inner.ids.lock().unwrap(),
+            vec!["user_alice".to_string(), "user_alice".to_string()]
+        );
     }
 }

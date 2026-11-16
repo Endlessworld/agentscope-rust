@@ -1,8 +1,9 @@
 //! `load_skill_through_path` tool, mirroring `SkillLoadTool`. Resolves a skill id
 //! to its on-disk directory and reads a file inside it (defaults to `SKILL.md`).
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use agentscope_core::error::Result;
 use agentscope_core::message::{JsonMap, ToolResultBlock};
@@ -11,6 +12,62 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::model::SkillCatalogSnapshot;
+
+/// Upper bound on tracked load receipts. Process-wide; a long-lived host serves many sessions
+/// from one process, so the set needs a ceiling (FIFO eviction).
+const LOAD_RECEIPT_CAPACITY: usize = 4096;
+
+/// `agent|session|skill|file` receipts of text already returned in this process.
+static LOAD_RECEIPTS: LazyLock<Mutex<LoadReceipts>> =
+    LazyLock::new(|| Mutex::new(LoadReceipts::default()));
+
+#[derive(Default)]
+struct LoadReceipts {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl LoadReceipts {
+    /// Records `key`; `true` when it had not been recorded yet.
+    fn insert(&mut self, key: String) -> bool {
+        if !self.seen.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > LOAD_RECEIPT_CAPACITY {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+}
+
+/// Records one successful text read and reports whether it is new for this agent + session.
+///
+/// A repeated `load_skill_through_path` for the same file used to re-emit the whole body
+/// (2000+ tokens); the second read now answers with a short notice (#1569). The key carries the
+/// resolved file, so a different resource of the same skill still reads in full.
+fn note_loaded(ctx: &ToolExecutionContext, skill_id: &str, target: &Path) -> bool {
+    let field = |key: &str| {
+        ctx.runtime
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let key = format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        field("agentId"),
+        field("sessionId"),
+        skill_id,
+        target.display()
+    );
+    LOAD_RECEIPTS
+        .lock()
+        .map(|mut guard| guard.insert(key))
+        .unwrap_or(true)
+}
 
 /// Tool that loads a skill's documentation or resource by `skillId`.
 pub struct LoadSkillTool {
@@ -66,8 +123,15 @@ impl LoadSkillTool {
         surface.grants_skill(name, Some(skill_id))
     }
 
-    /// The not-found answer, byte-identical for an unknown and an un-granted skill so the model
-    /// cannot distinguish existence. Only granted skills are listed.
+    /// The refusal for a skill that exists but is not granted to this caller.
+    ///
+    /// Distinct from [`Self::unknown_skill`] on purpose: a bare "not found" made a missing grant
+    /// look like a typo, so the model retried ids instead of reporting a capability gap (#2169).
+    fn ungranted_skill(&self, skill_id: &str) -> String {
+        format!("Skill '{skill_id}' is not granted to this caller.")
+    }
+
+    /// The not-found answer for an id no repository published. Only granted skills are listed.
     fn unknown_skill(&self, skill_id: &str, ctx: &ToolExecutionContext) -> String {
         let mut available: Vec<&String> = self
             .index
@@ -132,20 +196,23 @@ impl Tool for LoadSkillTool {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "SKILL.md".to_string());
 
+        // An id no repository published is a not-found answer whatever the grants say: the
+        // grant check below only tells an authorization gap from a typo for skills that exist
+        // (#2169).
+        let Some(dir) = self.index.get(&skill_id) else {
+            return Ok(ToolResultBlock::error(self.unknown_skill(&skill_id, &ctx)));
+        };
+
         // Capability gate (defense in depth on top of the grant-filtered catalog): a skill the
-        // caller is not granted answers with the *not found* wording, so the model cannot tell
-        // "exists but ungranted" from "missing". The available list is the granted view only.
+        // caller is not granted is refused as an authorization gap, not as a missing id. The
+        // available list is the granted view only.
         if !self.granted(&skill_id, &ctx) {
             tracing::info!(
                 "skill load denied by capability grant: skillId='{}'",
                 skill_id
             );
-            return Ok(ToolResultBlock::error(self.unknown_skill(&skill_id, &ctx)));
+            return Ok(ToolResultBlock::error(self.ungranted_skill(&skill_id)));
         }
-
-        let Some(dir) = self.index.get(&skill_id) else {
-            return Ok(ToolResultBlock::error(self.unknown_skill(&skill_id, &ctx)));
-        };
         let rel_normalized = rel.replace('\\', "/");
         if rel_normalized.starts_with('/') || rel_normalized.contains("..") {
             return Ok(ToolResultBlock::error(
@@ -191,7 +258,15 @@ impl Tool for LoadSkillTool {
         }
         let byte_len = bytes.len();
         match String::from_utf8(bytes) {
-            Ok(text) => Ok(ToolResultBlock::text(text)),
+            Ok(text) => {
+                if !note_loaded(&ctx, &skill_id, &target) {
+                    return Ok(ToolResultBlock::text(format!(
+                        "Already loaded {rel_normalized} of skill '{skill_id}' in this session; \
+                         content omitted (identical to the earlier read)."
+                    )));
+                }
+                Ok(ToolResultBlock::text(text))
+            }
             Err(_) => Ok(ToolResultBlock::text(format!(
                 "[binary file {rel_normalized} in skill '{skill_id}', {} bytes — use the shell/filesystem tools to process it]",
                 byte_len
@@ -317,7 +392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_ungranted_skill_reads_exactly_like_an_unknown_one() {
+    async fn an_ungranted_skill_is_refused_as_unauthorized() {
         let dir = skill_dir("grant");
         let tool = tool(&dir);
 
@@ -328,26 +403,18 @@ mod tests {
             .unwrap();
         assert!(text(&ok).contains("# body"), "{}", text(&ok));
 
-        // Another name grants nothing here, and the answer neither leaks the skill nor a list.
+        // Another name grants nothing here: the refusal names the missing grant (#2169) and
+        // does not list a skill the caller may not use.
         let denied = tool
             .call(args("pdf_user"), ctx_granting(Some(&["docx"])))
             .await
             .unwrap();
-        let denied_text = text(&denied);
-        assert!(
-            denied_text.contains("Unknown skillId 'pdf_user'"),
-            "{denied_text}"
-        );
-        assert!(
-            !denied_text.contains("pdf_user,"),
-            "no available-list leak: {denied_text}"
-        );
         assert_eq!(
-            denied_text,
-            "Error: Unknown skillId 'pdf_user'. Available skills: "
+            text(&denied),
+            "Error: Skill 'pdf_user' is not granted to this caller."
         );
 
-        // An unknown id under the same surface answers in the same shape.
+        // An unknown id stays a not-found answer.
         let unknown = tool
             .call(args("nope"), ctx_granting(Some(&["docx"])))
             .await
@@ -355,10 +422,37 @@ mod tests {
         assert!(text(&unknown).starts_with("Error: Unknown skillId 'nope'. Available skills: "));
 
         // A call that never entered an agent funnel has no surface: trusted assembler code.
-        let direct = tool
-            .call(args("pdf_user"), ctx_granting(None))
-            .await
-            .unwrap();
+        // The load receipt is keyed by session, so a fresh one keeps this call from being
+        // deduplicated against the successful load above.
+        let mut direct_ctx = ctx_granting(None);
+        direct_ctx.runtime.insert(
+            "sessionId".to_string(),
+            serde_json::Value::String("direct".to_string()),
+        );
+        let direct = tool.call(args("pdf_user"), direct_ctx).await.unwrap();
         assert!(text(&direct).contains("# body"), "{}", text(&direct));
+    }
+
+    #[tokio::test]
+    async fn a_repeated_load_returns_a_short_notice_instead_of_the_body() {
+        let dir = skill_dir("dedupe");
+        let tool = tool(&dir);
+        let mut ctx = ToolExecutionContext::default();
+        ctx.runtime.insert("agentId".to_string(), json!("a1"));
+        ctx.runtime.insert("sessionId".to_string(), json!("s1"));
+
+        let first = tool.call(args("pdf_user"), ctx.clone()).await.unwrap();
+        assert!(text(&first).contains("# body"), "{}", text(&first));
+
+        let second = tool.call(args("pdf_user"), ctx.clone()).await.unwrap();
+        let second_text = text(&second);
+        assert!(second_text.contains("Already loaded"), "{second_text}");
+        assert!(!second_text.contains("# body"), "{second_text}");
+
+        // Another session shares nothing with the first.
+        let mut other = ctx;
+        other.runtime.insert("sessionId".to_string(), json!("s2"));
+        let third = tool.call(args("pdf_user"), other).await.unwrap();
+        assert!(text(&third).contains("# body"), "{}", text(&third));
     }
 }

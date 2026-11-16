@@ -165,6 +165,17 @@ pub struct McpServerConfig {
     /// servers advertising the same tool name cannot overwrite each other. Mirrors Java
     /// `McpServerConfig.prefixToolNames` (default `false`).
     pub prefix_tool_names: bool,
+    /// Whether connecting opens the streamable-HTTP server-to-client stream (a
+    /// standalone `GET` to the MCP endpoint) up front.
+    ///
+    /// The transport used to open that stream unconditionally. A server that does not
+    /// implement it answers `405`, and the failure happened *before* the initialization
+    /// handshake, so a perfectly usable server could not be registered at all (#2003).
+    /// With the default `false` messages travel over the `POST` responses, which every
+    /// streamable-HTTP server supports; enable it for servers that push notifications
+    /// between calls (`notifications/tools/list_changed`, resource updates, ...).
+    /// Ignored by the stdio and SSE transports.
+    pub open_connection_on_startup: bool,
 }
 
 impl McpServerConfig {
@@ -177,6 +188,7 @@ impl McpServerConfig {
             propagate_meta: true,
             transport: None,
             prefix_tool_names: false,
+            open_connection_on_startup: false,
         }
     }
 
@@ -215,6 +227,15 @@ impl McpServerConfig {
     /// `McpServerConfig.setPrefixToolNames`.
     pub fn prefix_tool_names(mut self, prefix: bool) -> Self {
         self.prefix_tool_names = prefix;
+        self
+    }
+
+    /// Opens the streamable-HTTP server-to-client stream at connect time.
+    ///
+    /// Off by default so servers without a standalone stream (they answer `405` to the
+    /// `GET`) can still be registered; see the field documentation above.
+    pub fn open_connection_on_startup(mut self, open: bool) -> Self {
+        self.open_connection_on_startup = open;
         self
     }
 }
@@ -264,14 +285,21 @@ impl McpClientManager {
     /// This method establishes the connection to the MCP server and
     /// performs the initialization handshake.
     pub async fn connect(&self, client_id: &str) -> Result<()> {
-        let mut clients = self.clients.lock().await;
-        let client = clients
-            .get_mut(client_id)
-            .ok_or_else(|| Error::Other(format!("Client '{}' not found", client_id)))?;
+        // Snapshot the configuration, then drop the registry lock: the handshake and the
+        // tool discovery await the network, and holding the lock across them stalled
+        // every other operation on every other server (a slow `initialize` on one server
+        // blocked `list_tools`/`call_tool` for all of them).
+        let config = {
+            let clients = self.clients.lock().await;
+            let client = clients
+                .get(client_id)
+                .ok_or_else(|| Error::Other(format!("Client '{}' not found", client_id)))?;
 
-        if client.connected {
-            return Ok(());
-        }
+            if client.connected {
+                return Ok(());
+            }
+            client.config.clone()
+        };
 
         // Create client details
         let client_details = InitializeRequestParams {
@@ -293,13 +321,12 @@ impl McpClientManager {
 
         // Choose the transport: an explicit `transport` pin wins, otherwise sniff the
         // config (`command` -> stdio, `/sse` URL -> SSE, other URL -> Streamable HTTP).
-        let planned = plan_transport(&client.config)?;
-        let headers_map = if client.config.headers.is_empty() {
+        let planned = plan_transport(&config)?;
+        let headers_map = if config.headers.is_empty() {
             None
         } else {
             Some(
-                client
-                    .config
+                config
                     .headers
                     .iter()
                     .cloned()
@@ -358,10 +385,19 @@ impl McpClientManager {
                         ..RequestOptions::default()
                     },
                 };
-                let transport = ClientStreamableTransport::new(&transport_options, None, true)
-                    .map_err(|e| {
-                        Error::Other(format!("Failed to create streamable HTTP transport: {}", e))
-                    })?;
+                // `standalone` makes the transport open the server-to-client SSE stream
+                // with a `GET` as soon as it starts. A server that does not implement it
+                // answers `405`, which fails the whole connection *before* the
+                // initialization handshake even though plain `POST` would have worked, so
+                // it is opt-in rather than hardcoded (#2003).
+                let transport = ClientStreamableTransport::new(
+                    &transport_options,
+                    None,
+                    config.open_connection_on_startup,
+                )
+                .map_err(|e| {
+                    Error::Other(format!("Failed to create streamable HTTP transport: {}", e))
+                })?;
                 client_runtime::create_client(McpClientOptions {
                     client_details,
                     transport,
@@ -380,20 +416,10 @@ impl McpClientManager {
             .await
             .map_err(|e| Error::Other(format!("Failed to start MCP client: {}", e)))?;
 
-        // Update client instance
-        client.connected = true;
-        client.client = Some(mcp_client);
-
         // Discover the server's tools so they can be bridged into a Toolkit.
         // Without this, `list_tools`/`call_tool` would see an empty tool list.
-        let server_name = client.config.name.clone();
-        let discovered = match client
-            .client
-            .as_ref()
-            .unwrap()
-            .request_tool_list(None)
-            .await
-        {
+        let server_name = config.name.clone();
+        let discovered = match mcp_client.request_tool_list(None).await {
             Ok(result) => result
                 .tools
                 .into_iter()
@@ -404,13 +430,42 @@ impl McpClientManager {
                 Vec::new()
             }
         };
-        client.tools = discovered;
+
+        // Publish the connection. `connect` may have run concurrently for this id, in
+        // which case the first one wins and this transport is shut down outside the lock.
+        let (published, known, tool_count) = {
+            let mut clients = self.clients.lock().await;
+            let published = match clients.get_mut(client_id) {
+                Some(client) if !client.connected => {
+                    client.connected = true;
+                    client.client = Some(mcp_client.clone());
+                    client.tools = discovered;
+                    true
+                }
+                _ => false,
+            };
+            let known = clients.contains_key(client_id);
+            let tool_count = clients
+                .get(client_id)
+                .map(|client| client.tools.len())
+                .unwrap_or(0);
+            (published, known, tool_count)
+        };
+        if !known || !published {
+            if let Err(error) = mcp_client.shut_down().await {
+                tracing::warn!("Failed to shut down a duplicate MCP client: {}", error);
+            }
+            if !known {
+                return Err(Error::Other(format!("Client '{}' not found", client_id)));
+            }
+            return Ok(());
+        }
 
         tracing::info!(
             "MCP client '{}' connected to server '{}' ({} tools)",
             client_id,
-            client.config.name,
-            client.tools.len()
+            config.name,
+            tool_count
         );
 
         Ok(())
@@ -418,31 +473,36 @@ impl McpClientManager {
 
     /// Disconnects from an MCP server.
     pub async fn disconnect(&self, client_id: &str) -> Result<()> {
-        let mut clients = self.clients.lock().await;
-        let client = clients
-            .get_mut(client_id)
-            .ok_or_else(|| Error::Other(format!("Client '{}' not found", client_id)))?;
+        // Take the handle out of the registry first so the shutdown (which awaits the
+        // server) does not hold the registry lock and block the other servers.
+        let (mcp_client, server_name) = {
+            let mut clients = self.clients.lock().await;
+            let client = clients
+                .get_mut(client_id)
+                .ok_or_else(|| Error::Other(format!("Client '{}' not found", client_id)))?;
 
-        if !client.connected {
-            return Ok(());
-        }
+            if !client.connected {
+                return Ok(());
+            }
+            let server_name = client.config.name.clone();
+            client.connected = false;
+            client.tools.clear();
+            (client.client.take(), server_name)
+        };
 
         // Shutdown the client
-        if let Some(mcp_client) = &client.client {
-            mcp_client
-                .shut_down()
-                .await
-                .map_err(|e| Error::Other(format!("Failed to shut down MCP client: {}", e)))?;
+        if let Some(mcp_client) = mcp_client {
+            if let Err(error) = mcp_client.shut_down().await {
+                // The local state is already cleared: a failed shutdown must not leave the
+                // connection marked as live, otherwise every later call targets a dead one.
+                tracing::warn!("Failed to shut down MCP client '{}': {}", client_id, error);
+            }
         }
-
-        client.connected = false;
-        client.tools.clear();
-        client.client = None;
 
         tracing::info!(
             "MCP client '{}' disconnected from server '{}'",
             client_id,
-            client.config.name
+            server_name
         );
 
         Ok(())
@@ -514,50 +574,52 @@ impl McpClientManager {
         arguments: serde_json::Value,
         meta: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<serde_json::Value> {
-        let clients = self.clients.lock().await;
-        let client = clients
-            .get(client_id)
-            .ok_or_else(|| Error::Other(format!("Client '{}' not found", client_id)))?;
+        // Snapshot the connection and its metadata switch, then release the registry
+        // lock: the tool call awaits the remote server, and a slow call on one server
+        // used to block every other server's operations (#665).
+        let (mcp_client, propagate_meta) = {
+            let clients = self.clients.lock().await;
+            let client = clients
+                .get(client_id)
+                .ok_or_else(|| Error::Other(format!("Client '{}' not found", client_id)))?;
 
-        if !client.connected {
-            return Err(Error::Other(format!(
-                "Client '{}' is not connected",
-                client_id
-            )));
-        }
+            if !client.connected {
+                return Err(Error::Other(format!(
+                    "Client '{}' is not connected",
+                    client_id
+                )));
+            }
 
-        if let Some(mcp_client) = &client.client {
-            // The connection-level switch is authoritative and read live on every call,
-            // so a caller cannot leak metadata to a server configured as untrusted: the
-            // meta is dropped here, before it reaches the SDK. `None` omits `_meta`.
-            let meta = if client.config.propagate_meta {
-                meta
-            } else {
-                None
-            };
-            // Convert arguments to MCP tool call params
-            let params = rust_mcp_sdk::schema::CallToolRequestParams {
-                name: tool_name.to_string(),
-                arguments: Some(arguments.as_object().cloned().unwrap_or_default()),
-                meta: meta.map(|extra| rust_mcp_sdk::schema::CallToolMeta {
-                    progress_token: None,
-                    extra: Some(extra),
-                }),
-                task: None,
-            };
+            match &client.client {
+                Some(mcp_client) => (mcp_client.clone(), client.config.propagate_meta),
+                None => return Err(Error::Other("Client not initialized".to_string())),
+            }
+        };
 
-            // Call the tool
-            let result = mcp_client
-                .request_tool_call(params)
-                .await
-                .map_err(|e| Error::Other(format!("Tool call failed: {}", e)))?;
+        // The connection-level switch is authoritative and read live on every call,
+        // so a caller cannot leak metadata to a server configured as untrusted: the
+        // meta is dropped here, before it reaches the SDK. `None` omits `_meta`.
+        let meta = if propagate_meta { meta } else { None };
+        // Convert arguments to MCP tool call params
+        let params = rust_mcp_sdk::schema::CallToolRequestParams {
+            name: tool_name.to_string(),
+            arguments: Some(arguments.as_object().cloned().unwrap_or_default()),
+            meta: meta.map(|extra| rust_mcp_sdk::schema::CallToolMeta {
+                progress_token: None,
+                extra: Some(extra),
+            }),
+            task: None,
+        };
 
-            // Convert result to serde_json::Value
-            Ok(serde_json::to_value(result)
-                .map_err(|e| Error::Other(format!("Failed to serialize result: {}", e)))?)
-        } else {
-            Err(Error::Other("Client not initialized".to_string()))
-        }
+        // Call the tool
+        let result = mcp_client
+            .request_tool_call(params)
+            .await
+            .map_err(|e| Error::Other(format!("Tool call failed: {}", e)))?;
+
+        // Convert result to serde_json::Value
+        serde_json::to_value(result)
+            .map_err(|e| Error::Other(format!("Failed to serialize result: {}", e)))
     }
 
     /// Finds the connected client id for the given server name.
@@ -923,6 +985,8 @@ mod tests {
     struct RecordingClient {
         client_info: InitializeRequestParams,
         calls: std::sync::Mutex<Vec<rust_mcp_sdk::schema::CallToolRequestParams>>,
+        /// How long a `request_tool_call` pretends to take, for concurrency tests.
+        delay: Option<std::time::Duration>,
     }
 
     impl RecordingClient {
@@ -942,7 +1006,14 @@ mod tests {
                     meta: None,
                 },
                 calls: std::sync::Mutex::new(Vec::new()),
+                delay: None,
             }
+        }
+
+        /// Makes every recorded call sleep first, standing in for a slow server.
+        fn with_delay(mut self, delay: std::time::Duration) -> Self {
+            self.delay = Some(delay);
+            self
         }
 
         fn last_meta(&self) -> Option<rust_mcp_sdk::schema::CallToolMeta> {
@@ -1022,6 +1093,10 @@ mod tests {
             &self,
             params: rust_mcp_sdk::schema::CallToolRequestParams,
         ) -> SdkResult<rust_mcp_sdk::schema::CallToolResult> {
+            // The real call awaits the server; the registry lock must not be held meanwhile.
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
             self.calls.lock().unwrap().push(params);
             Ok(rust_mcp_sdk::schema::CallToolResult {
                 content: Vec::new(),
@@ -1062,6 +1137,73 @@ mod tests {
             serde_json::json!("call-1"),
         );
         meta
+    }
+
+    /// Registers a client for `server`, marked connected and backed by `client`.
+    async fn register_connected(
+        manager: &McpClientManager,
+        server: &str,
+        client: Arc<RecordingClient>,
+    ) -> String {
+        let client_id = manager
+            .create_client(McpServerConfig::new(server).url("http://mcp.example.com/mcp"))
+            .await
+            .unwrap();
+        let mut clients = manager.clients.lock().await;
+        let instance = clients.get_mut(&client_id).unwrap();
+        instance.connected = true;
+        instance.client = Some(client);
+        client_id
+    }
+
+    #[tokio::test]
+    async fn a_slow_tool_call_does_not_block_the_other_servers() {
+        // A slow `tools/call` on one server used to hold the registry lock for the whole
+        // round trip, freezing every other server (#665).
+        let manager = Arc::new(McpClientManager::new());
+        let slow =
+            Arc::new(RecordingClient::new().with_delay(std::time::Duration::from_millis(250)));
+        let slow_id = register_connected(&manager, "slow", slow.clone()).await;
+        let fast_id = register_connected(&manager, "fast", Arc::new(RecordingClient::new())).await;
+
+        let in_flight = {
+            let manager = Arc::clone(&manager);
+            let slow_id = slow_id.clone();
+            tokio::spawn(async move {
+                manager
+                    .call_tool(&slow_id, "remote", serde_json::json!({}))
+                    .await
+            })
+        };
+        // Let the call reach its await.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        let tools = manager.list_tools(&fast_id).await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(tools.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_millis(150),
+            "listing an idle server waited {elapsed:?} behind another server's call"
+        );
+
+        in_flight.await.unwrap().unwrap();
+        assert_eq!(slow.call_count(), 1);
+    }
+
+    #[test]
+    fn the_startup_stream_is_opt_in() {
+        // The streamable transport used to open the server-to-client stream
+        // unconditionally, which fails `initialize` on servers that answer 405 to it
+        // (#2003).
+        let config = McpServerConfig::new("srv").url("http://mcp.example.com/mcp");
+        assert!(!config.open_connection_on_startup);
+        assert!(
+            McpServerConfig::new("srv")
+                .url("http://mcp.example.com/mcp")
+                .open_connection_on_startup(true)
+                .open_connection_on_startup
+        );
     }
 
     #[tokio::test]

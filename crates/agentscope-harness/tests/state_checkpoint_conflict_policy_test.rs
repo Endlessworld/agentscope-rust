@@ -87,12 +87,12 @@ async fn stored_texts(store: &Arc<dyn AgentStateStore>, session: &str) -> Vec<St
 }
 
 #[tokio::test]
-async fn overwrite_policy_is_the_default_and_wins_last() {
+async fn overwrite_policy_keeps_last_writer_wins() {
     let store: Arc<dyn AgentStateStore> = Arc::new(InMemoryAgentStateStore::new());
     let agent = agent(
         Arc::clone(&store),
         "sess-overwrite",
-        ConflictPolicy::default(),
+        ConflictPolicy::Overwrite,
     );
 
     assert!(run(&agent, "first").await.is_none());
@@ -106,6 +106,38 @@ async fn overwrite_policy_is_the_default_and_wins_last() {
         !texts.iter().any(|t| t.contains("from another process")),
         "OVERWRITE must replace the competing write, got {texts:?}"
     );
+}
+
+#[tokio::test]
+async fn the_default_conflict_policy_reports_the_conflict() {
+    // #2146: last-writer-wins used to be the default, so on the non-durable path (where the
+    // turn gate only serialises this process) a later write silently replaced another
+    // writer's history.
+    let store: Arc<dyn AgentStateStore> = Arc::new(InMemoryAgentStateStore::new());
+    let agent = HarnessAgent::builder()
+        .name("policy-default")
+        .model(Arc::new(ScriptedModel))
+        .session_history_mode(SessionHistoryMode::Legacy)
+        .state_store(Arc::clone(&store))
+        .session_id("sess-default")
+        .max_iters(2)
+        .build();
+
+    assert!(run(&agent, "first").await.is_none());
+    competing_write(&store, "sess-default", "from another process").await;
+    let before = stored_texts(&store, "sess-default").await;
+
+    let error = run(&agent, "second")
+        .await
+        .expect("the default policy must surface the conflict");
+    assert!(
+        matches!(
+            error,
+            agentscope_core::error::Error::ConcurrentSessionModification { .. }
+        ),
+        "expected a conflict error, got {error:?}"
+    );
+    assert_eq!(stored_texts(&store, "sess-default").await, before);
 }
 
 #[tokio::test]

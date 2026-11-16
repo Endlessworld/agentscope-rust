@@ -84,6 +84,11 @@ impl AgentProtocolConstants {
 /// Mirrors Java `AgentProtocolTaskStore.AWAITING_CONFIRM_SENTINEL`.
 pub const AWAITING_CONFIRM_SENTINEL: &str = "__awaiting_confirm__";
 
+/// Error recorded on a task whose run died with the process (or replica) that
+/// started it, instead of leaving it `running` forever.
+pub const INTERRUPTED_ERROR: &str =
+    "task run interrupted: the process running this task ended before it finished";
+
 /// Configuration for the AgentScope task HTTP protocol endpoints.
 ///
 /// Mirrors Java `AgentProtocolProperties` (`agentscope.agent-protocol.*`).
@@ -583,6 +588,16 @@ pub trait ProtocolTaskRepository: Send + Sync {
 
     /// Returns the task with the given id, or `None` if unknown.
     fn find(&self, task_id: &str) -> Option<TaskRecord>;
+
+    /// Every record the repository currently holds.
+    ///
+    /// Used only by startup recovery, which must finish records whose run died
+    /// with the previous process instead of leaving them "running" forever. A
+    /// repository that cannot enumerate returns nothing (the default), so the
+    /// trait stays implementable by a pure key/value store.
+    fn active_records(&self) -> Vec<TaskRecord> {
+        Vec::new()
+    }
 }
 
 /// In-memory [`ProtocolTaskRepository`], the default used by the task store.
@@ -628,6 +643,10 @@ impl ProtocolTaskRepository for InMemoryProtocolTaskRepository {
 
     fn find(&self, task_id: &str) -> Option<TaskRecord> {
         self.records.lock().unwrap().get(task_id).cloned()
+    }
+
+    fn active_records(&self) -> Vec<TaskRecord> {
+        InMemoryProtocolTaskRepository::active_records(self)
     }
 }
 
@@ -689,7 +708,7 @@ impl AgentProtocolTaskStore {
                 properties.sse_replay_buffer_size,
             ))
         });
-        Self {
+        let store = Self {
             agent_factory,
             task_repository,
             event_bus,
@@ -699,7 +718,43 @@ impl AgentProtocolTaskStore {
             task_locks: (0..TASK_LOCK_STRIPE_COUNT)
                 .map(|_| Mutex::new(()))
                 .collect(),
+        };
+        // Recover whatever the previous process left behind: its runs died with it,
+        // but the records still say `Pending`/`Running`, so a client polling the
+        // task would wait forever.
+        store.reclaim_interrupted(store.task_repository.active_records());
+        store
+    }
+
+    /// Finishes the records whose run did not survive the process (or the replica)
+    /// that started it.
+    ///
+    /// A record that is paused for HITL confirmation is deliberately kept: its
+    /// `awaiting_confirm` state and pending decisions are persisted, so
+    /// [`resume`](Self::resume) can continue it after a restart.
+    ///
+    /// Returns the ids that were reclaimed.
+    pub fn reclaim_interrupted(&self, records: Vec<TaskRecord>) -> Vec<String> {
+        let mut reclaimed = Vec::new();
+        for mut record in records {
+            if record.status.is_terminal() || record.awaiting_confirm {
+                continue;
+            }
+            record.status = TaskStatus::Failed;
+            record.error_message = Some(INTERRUPTED_ERROR.to_string());
+            record.touch();
+            self.task_repository.save(&record);
+            self.event_bus.complete(&record.task_id);
+            reclaimed.push(record.task_id);
         }
+        if !reclaimed.is_empty() {
+            tracing::warn!(
+                tasks = reclaimed.len(),
+                "reclaimed agent-protocol tasks whose run did not survive a restart: {:?}",
+                reclaimed
+            );
+        }
+        reclaimed
     }
 
     /// Convenience constructor mirroring Java `AgentProtocolTaskStore(AgentFactory, repo)`.
@@ -721,6 +776,9 @@ impl AgentProtocolTaskStore {
         properties: AgentProtocolProperties,
         runtime_context_customizers: Vec<Arc<dyn RuntimeContextCustomizer>>,
     ) -> Self {
+        // A file-backed store is the restart case the recovery in [`Self::new`] exists
+        // for: `active_records` reads the records of the previous process back, and the
+        // runs behind them died with it.
         let task_repository: Arc<dyn ProtocolTaskRepository> = Arc::new(
             WorkspaceProtocolTaskRepository::new(properties.resolved_task_store_path()),
         );
@@ -1743,6 +1801,100 @@ mod tests {
             Arc::new(FixedAgentFactory::new(agent)),
             Arc::new(InMemoryProtocolTaskRepository::new()),
         ))
+    }
+
+    #[test]
+    fn a_task_left_running_by_a_previous_process_is_finished_at_startup() {
+        // The run is a `tokio::spawn` handle that dies with the process, while the
+        // record keeps saying `Running`: without recovery the client polls forever.
+        let repository = Arc::new(InMemoryProtocolTaskRepository::new());
+        let task_repository: Arc<dyn ProtocolTaskRepository> = repository.clone();
+        let mut running = TaskRecord::new(
+            "task-running",
+            "agent-1",
+            AgentProtocolConstants::PROTOCOL_AGENT_ID,
+            AgentProtocolConstants::PROTOCOL_SESSION_ID,
+        );
+        running.status = TaskStatus::Running;
+        repository.save(&running);
+        let mut pending = TaskRecord::new(
+            "task-pending",
+            "agent-1",
+            AgentProtocolConstants::PROTOCOL_AGENT_ID,
+            AgentProtocolConstants::PROTOCOL_SESSION_ID,
+        );
+        pending.status = TaskStatus::Pending;
+        repository.save(&pending);
+        // A finished task and a HITL pause are untouched.
+        let mut done = TaskRecord::new(
+            "task-done",
+            "agent-1",
+            AgentProtocolConstants::PROTOCOL_AGENT_ID,
+            AgentProtocolConstants::PROTOCOL_SESSION_ID,
+        );
+        done.status = TaskStatus::Completed;
+        repository.save(&done);
+
+        let store = AgentProtocolTaskStore::with_repository(
+            Arc::new(FixedAgentFactory::new(Arc::new(ResultAgent {
+                reply: reply_msg("hi"),
+            }))),
+            task_repository,
+        );
+
+        for task_id in ["task-running", "task-pending"] {
+            let record = store.task_repository().find(task_id).expect("record kept");
+            assert_eq!(record.status, TaskStatus::Failed, "{task_id}");
+            assert_eq!(record.error_message.as_deref(), Some(INTERRUPTED_ERROR));
+        }
+        let finished = store.task_repository().find("task-done").unwrap();
+        assert_eq!(finished.status, TaskStatus::Completed);
+        // The reclaimed tasks report their terminal status through the snapshot API.
+        let snapshot = store.snapshot("task-running").expect("snapshot");
+        assert_eq!(snapshot["status"], serde_json::json!("error"));
+    }
+
+    #[test]
+    fn a_hitl_pause_survives_a_restart() {
+        // `awaiting_confirm` + the pending decisions are persisted with the record, so
+        // the pause is resumable after a restart instead of being reclaimed as failed.
+        let repository = Arc::new(InMemoryProtocolTaskRepository::new());
+        let task_repository: Arc<dyn ProtocolTaskRepository> = repository.clone();
+        let mut paused = TaskRecord::new(
+            "task-paused",
+            "agent-1",
+            AgentProtocolConstants::PROTOCOL_AGENT_ID,
+            AgentProtocolConstants::PROTOCOL_SESSION_ID,
+        );
+        paused.status = TaskStatus::Running;
+        paused.awaiting_confirm = true;
+        paused.pending_confirms = Some(vec![RemotePendingConfirm::new(
+            "call-1",
+            "write_file",
+            None,
+        )]);
+        repository.save(&paused);
+
+        let store = AgentProtocolTaskStore::with_repository(
+            Arc::new(FixedAgentFactory::new(Arc::new(ResultAgent {
+                reply: reply_msg("hi"),
+            }))),
+            task_repository,
+        );
+        assert!(store.reclaim_interrupted(Vec::new()).is_empty());
+        let record = store
+            .task_repository()
+            .find("task-paused")
+            .expect("record kept");
+        assert_eq!(record.status, TaskStatus::Running);
+        assert!(record.awaiting_confirm);
+        assert_eq!(
+            record
+                .pending_confirms
+                .as_ref()
+                .map(|pending| pending.len()),
+            Some(1)
+        );
     }
 
     fn rt() -> tokio::runtime::Runtime {

@@ -25,16 +25,40 @@ use crate::filesystem::Filesystem;
 /// check before either wrote, so the later write resurrected the older sequence number.
 pub struct WorkspaceJournalStorage {
     fs: Arc<dyn Filesystem>,
+    /// The caller's runtime context, carried into every filesystem call.
+    ///
+    /// A shared/remote backend resolves its namespace from this context; constructing a fresh
+    /// `RuntimeContext::new()` per call put every journal in the anonymous `_default`
+    /// namespace, so a named user never saw its own history (#2918/#2091).
+    context: RuntimeContext,
     /// One asynchronous lock per value path, so the read-version → write-value → write-version
     /// sequence cannot interleave with another compare-and-set on that path.
-    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl WorkspaceJournalStorage {
     pub fn new(fs: Arc<dyn Filesystem>) -> Self {
+        Self::with_context(fs, RuntimeContext::new())
+    }
+
+    /// Creates storage whose filesystem calls carry `context`.
+    pub fn with_context(fs: Arc<dyn Filesystem>, context: RuntimeContext) -> Self {
         Self {
             fs,
-            locks: Mutex::new(HashMap::new()),
+            context,
+            locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The same storage bound to another call's context.
+    ///
+    /// The lock map is shared on purpose: two runs of one session in the same process must
+    /// serialize their compare-and-set on `head.json`, and they differ only by context.
+    fn rebind(&self, context: &RuntimeContext) -> Self {
+        Self {
+            fs: Arc::clone(&self.fs),
+            context: context.clone(),
+            locks: Arc::clone(&self.locks),
         }
     }
 
@@ -205,7 +229,7 @@ impl WorkspaceJournalStorage {
     /// leading `/` as well. Discovery works in the same relative namespace the journal writes
     /// in, so both are stripped before the value is used as a path again.
     pub(crate) async fn list_dirs(&self, prefix: &str) -> crate::Result<Vec<String>> {
-        let ctx = RuntimeContext::new();
+        let ctx = self.context.clone();
         let entries = match self.fs.ls(&ctx, prefix).await {
             Ok(entries) => entries,
             Err(_) => return Ok(Vec::new()),
@@ -229,7 +253,7 @@ impl WorkspaceJournalStorage {
 #[async_trait]
 impl AtomicJournalStorage for WorkspaceJournalStorage {
     async fn read(&self, path: &str) -> crate::Result<Option<StorageValue>> {
-        let ctx = RuntimeContext::new();
+        let ctx = self.context.clone();
         if !self.fs.exists(&ctx, path).await? {
             // A value is replaced without ever disappearing (`replace`), so a missing value
             // normally means "not written yet". A version marker without its value can only
@@ -263,7 +287,7 @@ impl AtomicJournalStorage for WorkspaceJournalStorage {
         expected_version: u64,
         bytes: &[u8],
     ) -> crate::Result<bool> {
-        let ctx = RuntimeContext::new();
+        let ctx = self.context.clone();
         // Serialize the whole check-then-write. The lease heartbeat and the run's flush
         // both compare-and-set `head.json`; let the version check and both writes run under
         // one lock so a stale renew cannot overwrite a newer sequence number. Immutable,
@@ -292,7 +316,7 @@ impl AtomicJournalStorage for WorkspaceJournalStorage {
     }
 
     async fn list_paths(&self, prefix: &str) -> crate::Result<Vec<String>> {
-        let ctx = RuntimeContext::new();
+        let ctx = self.context.clone();
         // A missing prefix is an empty result: the first acquisition creates it.
         let entries = match self.fs.ls(&ctx, prefix).await {
             Ok(entries) => entries,
@@ -310,7 +334,7 @@ impl AtomicJournalStorage for WorkspaceJournalStorage {
     }
 
     async fn remove(&self, path: &str) -> crate::Result<bool> {
-        let ctx = RuntimeContext::new();
+        let ctx = self.context.clone();
         let existed = self.fs.exists(&ctx, path).await?;
         if existed {
             let _ = self.fs.delete(&ctx, path).await;
@@ -350,13 +374,13 @@ impl WorkspaceThreadJournalStore {
     ///
     /// The fallback is deliberately not a migration: copying a live journal would fork it
     /// (two writers, two heads). A session written by an older build simply stays where it is.
-    async fn journal_prefix(&self, key: &ThreadKey) -> String {
+    async fn journal_prefix(&self, storage: &WorkspaceJournalStorage, key: &ThreadKey) -> String {
         let current = key.storage_path();
-        if self.has_journal(&current).await {
+        if self.has_journal(storage, &current).await {
             return current;
         }
         let legacy = key.legacy_storage_path();
-        if self.has_journal(&legacy).await {
+        if self.has_journal(storage, &legacy).await {
             tracing::debug!(
                 session = %key.session_id,
                 path = %legacy,
@@ -368,9 +392,9 @@ impl WorkspaceThreadJournalStore {
     }
 
     /// Whether a journal already exists at `prefix` (its head, or at least its header marker).
-    async fn has_journal(&self, prefix: &str) -> bool {
+    async fn has_journal(&self, storage: &WorkspaceJournalStorage, prefix: &str) -> bool {
         for marker in ["head.json", "session.json"] {
-            if let Ok(Some(_)) = self.storage.read(&format!("{prefix}/{marker}")).await {
+            if let Ok(Some(_)) = storage.read(&format!("{prefix}/{marker}")).await {
                 return true;
             }
         }
@@ -380,12 +404,13 @@ impl WorkspaceThreadJournalStore {
     /// Collects the session keys directly under `user_path` into `keys`.
     async fn collect_sessions(
         &self,
+        storage: &WorkspaceJournalStorage,
         user_path: &str,
         agent_id: &str,
         decoded_user: Option<&str>,
         keys: &mut Vec<ThreadKey>,
     ) -> crate::Result<()> {
-        for session_path in self.storage.list_dirs(user_path).await? {
+        for session_path in storage.list_dirs(user_path).await? {
             let Some(session_id) = decode_component(session_path.rsplit('/').next().unwrap_or(""))
             else {
                 continue;
@@ -409,12 +434,16 @@ impl ThreadJournalStore for WorkspaceThreadJournalStore {
     async fn open(
         &self,
         key: &ThreadKey,
-        _context: &RuntimeContext,
+        context: &RuntimeContext,
     ) -> crate::Result<Arc<dyn ThreadJournal>> {
-        let prefix = self.journal_prefix(key).await;
+        // The caller's context, not a fresh one: the journal writes through the same
+        // namespace the caller reads, which is what makes a shared/remote backend work
+        // (#2918).
+        let storage = self.storage.rebind(context);
+        let prefix = self.journal_prefix(&storage, key).await;
         Ok(Arc::new(
             agentscope_core::journal::AtomicThreadJournal::new(
-                Arc::clone(&self.storage) as Arc<dyn AtomicJournalStorage>,
+                Arc::new(storage) as Arc<dyn AtomicJournalStorage>,
                 prefix,
             ),
         ))
@@ -422,14 +451,15 @@ impl ThreadJournalStore for WorkspaceThreadJournalStore {
 
     async fn list(&self, context: &RuntimeContext) -> crate::Result<Vec<ThreadKey>> {
         let user_id = context.user_id();
+        let storage = self.storage.rebind(context);
         let mut keys = Vec::new();
         // Current layout: `.agentscope/sessions/<agent>/<user>/<session>`.
-        for agent_path in self.storage.list_dirs(SESSION_ROOT).await? {
+        for agent_path in storage.list_dirs(SESSION_ROOT).await? {
             let Some(agent_id) = decode_component(agent_path.rsplit('/').next().unwrap_or(""))
             else {
                 continue;
             };
-            for user_path in self.storage.list_dirs(&agent_path).await? {
+            for user_path in storage.list_dirs(&agent_path).await? {
                 let Some(decoded_user) =
                     decode_component(user_path.rsplit('/').next().unwrap_or(""))
                 else {
@@ -441,21 +471,23 @@ impl ThreadJournalStore for WorkspaceThreadJournalStore {
                 if decoded_user.as_deref() != user_id {
                     continue;
                 }
-                self.collect_sessions(&user_path, &agent_id, decoded_user.as_deref(), &mut keys)
-                    .await?;
+                self.collect_sessions(
+                    &storage,
+                    &user_path,
+                    &agent_id,
+                    decoded_user.as_deref(),
+                    &mut keys,
+                )
+                .await?;
             }
         }
         // Legacy layout: `agents/<agent>/sessions/<user>/<session>`, read-only fallback.
-        for agent_path in self.storage.list_dirs(LEGACY_SESSION_ROOT).await? {
+        for agent_path in storage.list_dirs(LEGACY_SESSION_ROOT).await? {
             let Some(agent_id) = decode_component(agent_path.rsplit('/').next().unwrap_or(""))
             else {
                 continue;
             };
-            for user_path in self
-                .storage
-                .list_dirs(&format!("{agent_path}/sessions"))
-                .await?
-            {
+            for user_path in storage.list_dirs(&format!("{agent_path}/sessions")).await? {
                 let Some(decoded_user) =
                     decode_component(user_path.rsplit('/').next().unwrap_or(""))
                 else {
@@ -465,8 +497,14 @@ impl ThreadJournalStore for WorkspaceThreadJournalStore {
                 if decoded_user.as_deref() != user_id {
                     continue;
                 }
-                self.collect_sessions(&user_path, &agent_id, decoded_user.as_deref(), &mut keys)
-                    .await?;
+                self.collect_sessions(
+                    &storage,
+                    &user_path,
+                    &agent_id,
+                    decoded_user.as_deref(),
+                    &mut keys,
+                )
+                .await?;
             }
         }
         keys.sort();
@@ -481,12 +519,23 @@ impl ThreadJournalStore for WorkspaceThreadJournalStore {
     /// locations hold nothing but the session's own subtree, so removing the prefix is the whole
     /// deletion.
     async fn delete(&self, key: &ThreadKey) -> crate::Result<()> {
-        let ctx = RuntimeContext::new();
+        self.delete_in(key, &RuntimeContext::new()).await
+    }
+}
+
+impl WorkspaceThreadJournalStore {
+    /// Deletes the journal of `key` using the caller's runtime context.
+    ///
+    /// Same contract as [`ThreadJournalStore::delete`], but the deletion addresses the
+    /// caller's namespace: a store that scopes by user cannot find the journal through an
+    /// anonymous context, so the delete reported success while the history stayed readable.
+    pub async fn delete_in(&self, key: &ThreadKey, context: &RuntimeContext) -> crate::Result<()> {
+        let storage = self.storage.rebind(context);
         for prefix in [key.storage_path(), key.legacy_storage_path()] {
-            if !self.storage.fs.exists(&ctx, &prefix).await? {
+            if !storage.fs.exists(&storage.context, &prefix).await? {
                 continue;
             }
-            self.storage.fs.delete(&ctx, &prefix).await?;
+            storage.fs.delete(&storage.context, &prefix).await?;
             tracing::debug!(session = %key.session_id, path = %prefix, "deleted a session journal");
         }
         Ok(())
@@ -529,6 +578,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    #[tokio::test]
+    async fn journal_io_uses_the_callers_runtime_context() {
+        // A shared backend resolves its namespace from the runtime context. Building a fresh
+        // `RuntimeContext::new()` per call put every journal in the anonymous namespace, so a
+        // named user never saw its own history (#2918/#2091).
+        let root = temp_dir("storage_ctx");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store: Arc<dyn crate::filesystem::BaseStore> =
+            Arc::new(crate::filesystem::InMemoryStore::new());
+        let spec = crate::filesystem::RemoteFilesystemSpec::new(Arc::clone(&store))
+            .isolation_scope(crate::agent::IsolationScope::User);
+        let fs = spec.build(&workspace, "agent-x");
+
+        let alice = WorkspaceJournalStorage::with_context(
+            Arc::clone(&fs),
+            RuntimeContext::new().with_user_id("alice"),
+        );
+        let bob = WorkspaceJournalStorage::with_context(
+            Arc::clone(&fs),
+            RuntimeContext::new().with_user_id("bob"),
+        );
+        let path = ".agentscope/sessions/s_agent/s_alice/s_s1/head.json";
+        assert!(alice.compare_and_set(path, 0, b"first").await.unwrap());
+
+        assert_eq!(
+            alice.read(path).await.unwrap().unwrap().bytes,
+            b"first".to_vec()
+        );
+        assert!(
+            bob.read(path).await.unwrap().is_none(),
+            "another user's namespace must not see the journal"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

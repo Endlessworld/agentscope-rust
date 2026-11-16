@@ -1,16 +1,39 @@
 //! Sandbox execution guard for preventing concurrent execution.
 use super::key::SandboxIsolationKey;
 use super::lease::SandboxLease;
+use agentscope_core::error::{Error, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Default upper bound for waiting on a key another task is executing under.
+///
+/// A guard wait is a *mutual-exclusion* wait, so it must be bounded: an unbounded wait
+/// inside a turn would hang the whole run instead of failing the acquisition.
+const DEFAULT_WAIT: Duration = Duration::from_secs(120);
+
+/// Per-key state: the gate that serialises holders plus the live holder count.
+struct KeyState {
+    /// Async gate; a holder owns the `OwnedMutexGuard` for the whole call window.
+    gate: Arc<tokio::sync::Mutex<()>>,
+    /// Live leases (admission counting, `is_held` / `active_count` diagnostics).
+    holders: usize,
+}
+
+/// Owned per-key gate hold; dropping it frees the key for the next waiter.
+///
+/// Lives inside [`SandboxLease`] so the mutual exclusion covers exactly the lease's
+/// lifetime, even when a caller forgets to `release`.
+#[allow(dead_code)] // holding the guard is the whole point; its value is never read
+pub(super) struct GateHold(pub(super) tokio::sync::OwnedMutexGuard<()>);
 
 /// Pluggable execution-guard contract, mirroring the Java `SandboxExecutionGuard`
 /// `@FunctionalInterface`.
 ///
-/// The concrete [`SandboxExecutionGuard`] below is the in-process default (re-entrant
-/// counting only). Distributed backends (JDBC / Redis / Mongo / COS / ...) implement this
-/// trait so `SandboxManager` can serialise sandbox acquisition across processes instead of
-/// being limited to the local process.
+/// The concrete [`SandboxExecutionGuard`] below is the in-process default: it serialises
+/// isolation keys **inside one process** with a per-key async gate. Distributed backends
+/// (JDBC / Redis / Mongo / COS / ...) implement this trait so `SandboxManager` can serialise
+/// sandbox acquisition across processes instead of being limited to the local process.
 ///
 /// ## Why `try_enter` / `release` are async
 ///
@@ -88,13 +111,15 @@ pub trait SandboxGuard: Send + Sync + std::fmt::Debug {
 
 #[async_trait::async_trait]
 impl SandboxGuard for SandboxExecutionGuard {
-    /// The in-process guard cannot fail: re-entrant counting is local state, so it always
-    /// yields `Ok(lease)`. Object-store guards that delegate here inherit that.
-    async fn try_enter(
-        &self,
-        key: SandboxIsolationKey,
-    ) -> agentscope_core::error::Result<SandboxLease> {
-        Ok(SandboxExecutionGuard::try_enter(self, key))
+    /// Serialises the isolation key in-process.
+    ///
+    /// The await is the point of the contract: two `SandboxManager::acquire` windows on one
+    /// key must not overlap (the second would resume/mutate/persist over the first), so the
+    /// second caller waits for the gate and keeps waiting until the first lease is dropped.
+    /// The wait is bounded by [`SandboxExecutionGuard::with_wait_timeout`] (120s by
+    /// default); a timeout is an `Err`, i.e. fail-closed abort of the acquisition.
+    async fn try_enter(&self, key: SandboxIsolationKey) -> Result<SandboxLease> {
+        SandboxExecutionGuard::enter_serialised(self, key).await
     }
 
     async fn release(&self, key: &SandboxIsolationKey) {
@@ -116,74 +141,136 @@ impl SandboxGuard for SandboxExecutionGuard {
 /// resume/create for isolation keys that are present. The lease is carried by the
 /// `SandboxAcquireResult` and closed by the caller after `SandboxManager::release`,
 /// ensuring the full call window is covered.
+///
+/// The async [`SandboxGuard`] path — the one `SandboxManager` uses — **serialises** a key:
+/// a second acquisition waits on the per-key gate until the first lease is dropped. The
+/// synchronous [`try_enter`](Self::try_enter) entry point keeps the historical admission
+/// counting only (re-entrant, never waits) because callers of it cannot `await`; it is the
+/// extension wrappers' entry point and does not provide mutual exclusion.
 pub struct SandboxExecutionGuard {
-    /// Active leases by isolation key.
-    leases: Arc<Mutex<HashMap<SandboxIsolationKey, usize>>>,
+    /// Per-key gate + live lease count.
+    keys: Arc<Mutex<HashMap<SandboxIsolationKey, KeyState>>>,
+
+    /// `false` for [`SandboxExecutionGuard::noop`], which admits without a lease.
+    enabled: bool,
+
+    /// Upper bound for the async gate wait.
+    wait: Duration,
 }
 
 impl SandboxExecutionGuard {
-    /// Creates a new execution guard.
+    /// Creates a new execution guard that serialises every isolation key.
     pub fn new() -> Self {
         Self {
-            leases: Arc::new(Mutex::new(HashMap::new())),
+            keys: Arc::new(Mutex::new(HashMap::new())),
+            enabled: true,
+            wait: DEFAULT_WAIT,
         }
     }
 
     /// Creates a no-op guard (no protection).
+    ///
+    /// Distinct from [`new`](Self::new) on purpose: an explicit no-op admits every caller
+    /// and hands back [`SandboxLease::noop`], so a host that wants no exclusion says so.
     pub fn noop() -> Self {
-        Self::new()
+        Self {
+            keys: Arc::new(Mutex::new(HashMap::new())),
+            enabled: false,
+            wait: DEFAULT_WAIT,
+        }
+    }
+
+    /// Overrides how long the async acquisition waits for a key another task holds.
+    pub fn with_wait_timeout(mut self, wait: Duration) -> Self {
+        self.wait = wait;
+        self
+    }
+
+    fn keys(&self) -> std::sync::MutexGuard<'_, HashMap<SandboxIsolationKey, KeyState>> {
+        self.keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Increments the live-lease count for `key` (creating the gate when absent).
+    fn admit(&self, key: &SandboxIsolationKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut keys = self.keys();
+        let entry = keys.entry(key.clone()).or_insert_with(|| KeyState {
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            holders: 0,
+        });
+        entry.holders += 1;
+        Arc::clone(&entry.gate)
+    }
+
+    /// Drops every idle key (no holder, no waiter) so the map cannot grow without bound.
+    ///
+    /// A waiter holds a clone of the gate, so `Arc::strong_count == 1` proves nobody is
+    /// queued on it — pruning then can never let a fresh gate race a woken waiter.
+    fn prune_idle(&self) {
+        let mut keys = self.keys();
+        keys.retain(|_, state| state.holders > 0 || Arc::strong_count(&state.gate) > 1);
+    }
+
+    /// Async acquisition: waits for the per-key gate, then hands the hold to the lease.
+    async fn enter_serialised(&self, key: SandboxIsolationKey) -> Result<SandboxLease> {
+        if !self.enabled {
+            return Ok(SandboxLease::noop());
+        }
+        self.prune_idle();
+        let gate = self.admit(&key);
+        let wait = self.wait;
+        let held = match tokio::time::timeout(wait, gate.lock_owned()).await {
+            Ok(held) => held,
+            Err(_) => {
+                // The admission was counted before the wait: take it back before failing,
+                // otherwise the key stays "held" with no holder.
+                self.release(&key);
+                return Err(Error::Other(format!(
+                    "sandbox execution guard timed out after {}s waiting for scope {key}",
+                    wait.as_secs()
+                )));
+            }
+        };
+        Ok(SandboxLease::with_gate(key, GateHold(held)))
     }
 
     /// Tries to acquire a lease for the given isolation key.
     ///
-    /// Returns a lease if the key is not already held, or if we allow re-entrant access.
+    /// Synchronous admission only: the caller cannot await, so it never blocks and the key
+    /// is not mutually exclusive against a concurrent task. [`SandboxGuard::try_enter`] is
+    /// the serialising entry point.
     pub fn try_enter(&self, key: SandboxIsolationKey) -> SandboxLease {
-        let mut leases = self.leases.lock().unwrap_or_else(|poisoned| {
-            // If the mutex is poisoned, we still want to return a lease
-            // to avoid deadlocking the entire system
-            poisoned.into_inner()
-        });
-
-        // For now, we allow re-entrant access (increment counter)
-        *leases.entry(key.clone()).or_insert(0) += 1;
-
+        if !self.enabled {
+            return SandboxLease::noop();
+        }
+        self.admit(&key);
         SandboxLease::new(key)
     }
 
     /// Releases a lease for the given isolation key.
     pub fn release(&self, key: &SandboxIsolationKey) {
-        let mut leases = self
-            .leases
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(count) = leases.get_mut(key) {
-            if *count > 1 {
-                *count -= 1;
-            } else {
-                leases.remove(key);
+        let mut keys = self.keys();
+        if let Some(state) = keys.get_mut(key) {
+            state.holders = state.holders.saturating_sub(1);
+            if state.holders == 0 && Arc::strong_count(&state.gate) == 1 {
+                keys.remove(key);
             }
         }
     }
 
     /// Returns true if the given key is currently held.
     pub fn is_held(&self, key: &SandboxIsolationKey) -> bool {
-        let leases = self
-            .leases
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        leases.contains_key(key)
+        let keys = self.keys();
+        keys.get(key)
+            .map(|state| state.holders > 0)
+            .unwrap_or(false)
     }
 
     /// Returns the number of active leases.
     pub fn active_count(&self) -> usize {
-        let leases = self
-            .leases
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        leases.len()
+        let keys = self.keys();
+        keys.values().filter(|state| state.holders > 0).count()
     }
 }
 
@@ -196,7 +283,9 @@ impl Default for SandboxExecutionGuard {
 impl Clone for SandboxExecutionGuard {
     fn clone(&self) -> Self {
         Self {
-            leases: Arc::clone(&self.leases),
+            keys: Arc::clone(&self.keys),
+            enabled: self.enabled,
+            wait: self.wait,
         }
     }
 }
@@ -404,5 +493,88 @@ mod tests {
 
         // Should be visible on guard2 (shared state)
         assert!(guard2.is_held(&key));
+    }
+
+    /// The async path is the one `SandboxManager` uses: a second acquisition on the same
+    /// key must wait until the first lease is dropped instead of resuming/mutating the same
+    /// sandbox concurrently (the write-after-write bug).
+    #[tokio::test]
+    async fn concurrent_entries_on_one_key_are_serialised() {
+        let guard = Arc::new(SandboxExecutionGuard::new());
+        let key = SandboxIsolationKey::new("session", "s1");
+
+        let first = SandboxGuard::try_enter(&*guard, key.clone())
+            .await
+            .expect("first lease");
+        let second = {
+            let guard = Arc::clone(&guard);
+            let key = key.clone();
+            tokio::spawn(async move { SandboxGuard::try_enter(&*guard, key).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "the second entry must wait for the first lease"
+        );
+
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("second entry after release")
+            .expect("join")
+            .expect("second lease");
+        assert!(!second.is_noop());
+        drop(second);
+    }
+
+    /// The wait is bounded: a holder that never releases fails the second acquisition
+    /// (fail-closed) instead of blocking the turn forever.
+    #[tokio::test]
+    async fn a_waiting_entry_times_out_and_does_not_keep_the_key_held() {
+        let guard = SandboxExecutionGuard::new().with_wait_timeout(Duration::from_millis(30));
+        let key = SandboxIsolationKey::new("session", "s2");
+
+        let first = SandboxGuard::try_enter(&guard, key.clone())
+            .await
+            .expect("first lease");
+        let error = SandboxGuard::try_enter(&guard, key.clone())
+            .await
+            .unwrap_err();
+        assert!(format!("{error}").contains("timed out"), "{error}");
+        assert_eq!(
+            guard.active_count(),
+            1,
+            "the failed wait must not leave an admission behind"
+        );
+
+        drop(first);
+        // `SandboxManager::release` always releases before the lease is dropped.
+        SandboxGuard::release(&guard, &key).await;
+        assert!(!guard.is_held(&key), "a failed wait must not leak the key");
+        // The key is free again once the holder is gone.
+        drop(
+            SandboxGuard::try_enter(&guard, key.clone())
+                .await
+                .expect("re-acquire"),
+        );
+    }
+
+    /// `noop()` is a real no-op now: it admits without exclusion and hands back a no-op
+    /// lease, so a host that wants no guard is explicit about it.
+    #[tokio::test]
+    async fn a_noop_guard_does_not_serialise() {
+        let guard = SandboxExecutionGuard::noop();
+        let key = SandboxIsolationKey::new("session", "s3");
+
+        let first = SandboxGuard::try_enter(&guard, key.clone())
+            .await
+            .expect("lease");
+        assert!(first.is_noop());
+        let second = SandboxGuard::try_enter(&guard, key.clone())
+            .await
+            .expect("lease");
+        assert!(second.is_noop());
+        assert!(!guard.is_held(&key));
+        assert_eq!(guard.active_count(), 0);
     }
 }

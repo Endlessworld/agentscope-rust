@@ -64,10 +64,11 @@ fn tool_result_msg(id: &str, name: &str, text: String) -> Msg {
 
 #[test]
 fn token_counter_estimates_text_messages() {
-    // "hello world" = 11 chars -> ceil(11 / 2.5) = 5 text tokens, plus role + overhead.
+    // "hello world" = 11 ASCII chars -> ceil(11 / 4) = 3 tokens, plus the `USER` role word
+    // (ceil(4 / 4) = 1) and the per-message overhead (5).
     let msg = Msg::user("hello world");
     let tokens = calculate_token(&[msg]);
-    assert_eq!(tokens, 12);
+    assert_eq!(tokens, 9);
 }
 
 #[test]
@@ -92,8 +93,8 @@ fn token_counter_counts_thinking_content() {
         ))])
         .build();
     let direct = calculate_token(&[msg]);
-    // 1000 chars / 2.5 = 400, plus role + message overhead
-    assert_eq!(direct, 400 + 5 + 4, "direct thinking counted, got {direct}");
+    // 1000 ASCII chars / 4 = 250, `ASSISTANT` role = ceil(9 / 4) = 3, plus message overhead 5.
+    assert_eq!(direct, 250 + 3 + 5, "direct thinking counted, got {direct}");
 
     // thinking nested inside a ToolResultBlock
     let msg = Msg::builder()
@@ -105,8 +106,8 @@ fn token_counter_counts_thinking_content() {
         ))])
         .build();
     let nested = calculate_token(&[msg]);
-    // 400 thinking + tool result overhead (8) + name/id + role + message overhead
-    assert!(nested > 400, "nested thinking counted, got {nested}");
+    // 250 thinking + tool result overhead (8) + name/id + role + message overhead
+    assert!(nested > 250, "nested thinking counted, got {nested}");
 }
 #[test]
 fn compaction_config_defaults_and_builder() {
@@ -179,7 +180,7 @@ fn truncate_args_clips_oversized_tool_arguments() {
     if let ContentBlock::ToolUse(tu) = &out[0].content[0] {
         let val = tu.input.get("content").and_then(|v| v.as_str()).unwrap();
         assert!(
-            val.len() < 100,
+            val.len() <= 100,
             "expected truncated arg, got len {}",
             val.len()
         );

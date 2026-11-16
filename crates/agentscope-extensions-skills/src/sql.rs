@@ -412,11 +412,14 @@ impl InMemoryConnection {
             .chars()
             .take_while(|c| !c.is_whitespace() && *c != '(')
             .collect::<String>();
+        // Strip both SQL identifier quoting styles: `parse_table` already does, and the MySQL
+        // repository now backtick-quotes `<database>.<table>` (#3248).
         start
             .rsplit('.')
             .next()
             .unwrap_or(&start)
             .trim_matches('"')
+            .trim_matches('`')
             .to_string()
     }
 

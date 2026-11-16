@@ -5,11 +5,14 @@
 //! into the budget. Registering the compiler here (rather than duplicating it inside the
 //! agent) keeps a single compiler and a single manifest.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::message::{Msg, MsgRole};
 use agentscope_core::middleware::{EventStream, ExtensionPoint, Middleware, ModelCallInput, Next};
+use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
+use futures::stream::BoxStream;
 use futures::StreamExt;
 
 use super::builder::{BudgetExceeded, ContextPipeline, PrepareOutcome};
@@ -81,6 +84,217 @@ struct OverflowCompacted {
     summary: String,
     /// Quantified outcome for the in-band compaction event.
     metrics: CompactionMetrics,
+}
+
+/// How many compaction passes one over-budget model call may chain.
+///
+/// One pass is not always enough: a pass preserves the configured tail, so a history whose
+/// tail is still oversized needs another pass over the shortened history. A pass that removes
+/// no planned message is never repeated, and three passes bound the work (keep tail → compact
+/// the shorter history → summary-only last resort).
+const MAX_OVERFLOW_COMPACTION_ROUNDS: usize = 3;
+
+/// The number of messages compaction is allowed to remove from a request.
+///
+/// The system message is fixed material: it survives every pass, so counting it would make a
+/// pass that folded the whole conversation into the summary look like no progress at all.
+fn planned_message_count(messages: &[Msg]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.role != MsgRole::System)
+        .count()
+}
+
+/// Whether a model failure is the provider rejecting the request as too long.
+///
+/// The local budget check only catches what it can predict: the provider tokenizer, the
+/// reserved output and gateway-side limits can disagree with the estimate, and
+/// `context_length_exceeded` is then the only warning the agent gets. Providers do not share
+/// one message, so both the structured classification (available when the failure came back as
+/// an HTTP error) and the rendered text are consulted.
+fn is_context_length_error(error: &crate::Error) -> bool {
+    if agentscope_extensions_model::ModelError::from_core(error).is_some_and(|classified| {
+        classified.kind == agentscope_extensions_model::ErrorKind::ContextLength
+    }) {
+        return true;
+    }
+    const MARKERS: [&str; 6] = [
+        "context_length",
+        "context length",
+        "maximum context",
+        "max context",
+        "too many tokens",
+        "prompt is too long",
+    ];
+    let rendered = error.to_string().to_ascii_lowercase();
+    MARKERS.iter().any(|marker| rendered.contains(marker))
+}
+
+/// The forced compaction a provider-side context-length rejection triggers.
+///
+/// It carries everything the local-budget fallback uses, because the retry happens where no
+/// agent state is reachable: inside the model call itself.
+struct ContextLengthRetry {
+    overflow: ContextOverflowCompaction,
+    state: Option<Arc<std::sync::Mutex<agentscope_core::state::AgentState>>>,
+    recorder: Option<Arc<agentscope_core::journal::InvocationRecorder>>,
+    delta_tx: Option<
+        futures::channel::mpsc::UnboundedSender<
+            agentscope_core::error::Result<agentscope_core::event::AgentEvent>,
+        >,
+    >,
+    agent_id: String,
+    session_id: String,
+    /// At most one forced compaction per model call: a second rejection is surfaced as-is
+    /// instead of compacting again.
+    retried: AtomicBool,
+}
+
+/// A stream that yields exactly the given failure once.
+fn failed_stream(error: crate::Error) -> BoxStream<'static, crate::Result<ChatResponse>> {
+    let failed: crate::Result<ChatResponse> = Err(error);
+    Box::pin(futures::stream::once(async move { failed }))
+}
+
+/// Runs one model attempt and, when the provider rejects it as over its context window,
+/// force-compacts the conversation once and dispatches the compacted request again.
+///
+/// The second attempt is forwarded verbatim: if it fails too, its error is the one the caller
+/// sees, because compaction has already done everything it can.
+async fn retry_after_context_length<'a>(
+    inner: &'a Arc<dyn Model>,
+    retry: &'a ContextLengthRetry,
+    messages: Vec<Msg>,
+    tools: Vec<ToolSchema>,
+    options: GenerateOptions,
+) -> BoxStream<'a, crate::Result<ChatResponse>> {
+    let mut attempt = inner.stream(messages.clone(), tools.clone(), options.clone());
+    let error = match attempt.next().await {
+        Some(Err(error)) if is_context_length_error(&error) => error,
+        // A failure after the first chunk is not retried: the consumer already rendered what
+        // came before it, and a replay would duplicate that prefix.
+        Some(first) => {
+            return Box::pin(futures::stream::once(async move { first }).chain(attempt));
+        }
+        None => return Box::pin(futures::stream::empty::<crate::Result<ChatResponse>>()),
+    };
+    drop(attempt);
+
+    if retry.retried.swap(true, Ordering::Relaxed) {
+        return failed_stream(error);
+    }
+    tracing::warn!(
+        agent = %retry.agent_id,
+        session = %retry.session_id,
+        %error,
+        "the provider rejected the request as over its context length; force-compacting and retrying once"
+    );
+    let Some(compacted) = compact_overflow(
+        retry.state.clone(),
+        &messages,
+        &retry.overflow,
+        &retry.agent_id,
+        &retry.session_id,
+        retry.recorder.as_ref(),
+        // summary_only: false, force: true — the provider's rejection is the trigger, so the
+        // throttles of the proactive path must not skip it.
+        false,
+        true,
+    )
+    .await
+    else {
+        return failed_stream(error);
+    };
+    // Announce it in-band like the local-budget fallback, so the shrink is visible.
+    if let Some(tx) = &retry.delta_tx {
+        let _ = tx.unbounded_send(Ok(compaction_event(
+            &retry.agent_id,
+            &compacted.summary,
+            Some(&compacted.metrics),
+        )));
+    }
+    Box::pin(inner.stream(compacted.messages, tools, options))
+}
+
+/// A model that turns a provider-side context-length rejection into one forced compaction and
+/// one retry.
+///
+/// `Next` is a `FnOnce`, so the middleware cannot call its continuation twice; wrapping the
+/// model is what reaches both the non-streaming `call` path and the streaming `stream_events`
+/// path, since both dispatch through `Model::stream`.
+struct ContextLengthRetryingModel {
+    inner: Arc<dyn Model>,
+    retry: Arc<ContextLengthRetry>,
+}
+
+impl Model for ContextLengthRetryingModel {
+    fn stream(
+        &self,
+        messages: Vec<Msg>,
+        tools: Vec<ToolSchema>,
+        options: GenerateOptions,
+    ) -> BoxStream<'_, crate::Result<ChatResponse>> {
+        Box::pin(
+            futures::stream::once(retry_after_context_length(
+                &self.inner,
+                &self.retry,
+                messages,
+                tools,
+                options,
+            ))
+            .flatten(),
+        )
+    }
+
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    fn tool_search_mode(&self) -> agentscope_core::model::ToolSearchMode {
+        self.inner.tool_search_mode()
+    }
+
+    fn supports_native_structured_output(&self) -> bool {
+        self.inner.supports_native_structured_output()
+    }
+
+    fn supports_native_structured_output_with_tools(&self) -> bool {
+        self.inner.supports_native_structured_output_with_tools()
+    }
+
+    fn supports_tool_choice_specific(&self) -> bool {
+        self.inner.supports_tool_choice_specific()
+    }
+
+    fn context_window_size(&self) -> usize {
+        self.inner.context_window_size()
+    }
+
+    fn max_output_tokens(&self) -> usize {
+        self.inner.max_output_tokens()
+    }
+
+    fn descriptor(&self) -> Option<&agentscope_core::model::ModelDescriptor> {
+        self.inner.descriptor()
+    }
+}
+
+/// Wraps `model` with the context-length retry, when a compactor is installed.
+fn with_context_length_retry(
+    model: Arc<dyn Model>,
+    retry: Option<&Arc<ContextLengthRetry>>,
+) -> Arc<dyn Model> {
+    match retry {
+        Some(retry) => Arc::new(ContextLengthRetryingModel {
+            inner: model,
+            retry: Arc::clone(retry),
+        }),
+        None => model,
+    }
 }
 
 /// Applies a [`ContextPipeline`] to every model call.
@@ -179,6 +393,20 @@ impl Middleware for ContextMiddleware {
                     let _ = tx.unbounded_send(Ok(event));
                 }
             };
+            // A provider can still reject a request the local budget accepted, so the model that
+            // travels downstream carries the forced-compaction retry. One handle is shared by
+            // both exits that dispatch the model, which is what keeps the retry single-shot.
+            let retry = overflow.as_ref().map(|overflow| {
+                Arc::new(ContextLengthRetry {
+                    overflow: overflow.clone(),
+                    state: state.clone(),
+                    recorder: recorder.clone(),
+                    delta_tx: delta_tx.clone(),
+                    agent_id: agent_id.clone(),
+                    session_id: session_id.clone(),
+                    retried: AtomicBool::new(false),
+                })
+            });
             let first = pipeline
                 .prepare_with_task_outcome(
                     Arc::clone(&model),
@@ -204,7 +432,7 @@ impl Middleware for ContextMiddleware {
                         prepared.messages,
                         prepared.tools,
                         prepared.options,
-                        model,
+                        with_context_length_retry(model, retry.as_ref()),
                     ));
                 }
                 Ok(PrepareOutcome::BudgetExceeded(info)) => info,
@@ -250,18 +478,30 @@ impl Middleware for ContextMiddleware {
             };
 
             let mut last_info = overflow_info;
-            for summary_only in [false, true] {
+            // Compact until the request fits, the strategy declines, or a pass stops shrinking
+            // the conversation. A single pass keeps the configured tail, so a history whose tail
+            // is still oversized needs another pass over the shortened history; repeating a pass
+            // that freed nothing cannot help, so it escalates to a summary-only history once.
+            let mut planned = messages.clone();
+            let mut summary_only = false;
+            for round in 0..MAX_OVERFLOW_COMPACTION_ROUNDS {
+                let before = planned_message_count(&planned);
                 let Some(compacted) = compact_overflow(
                     state.clone(),
-                    &messages,
+                    &planned,
                     &overflow,
                     &agent_id,
                     &session_id,
                     recorder.as_ref(),
                     summary_only,
+                    false,
                 )
                 .await
                 else {
+                    if summary_only {
+                        break;
+                    }
+                    summary_only = true;
                     continue;
                 };
 
@@ -276,16 +516,18 @@ impl Middleware for ContextMiddleware {
                     )));
                 }
 
+                let progressed = planned_message_count(&compacted.messages) < before;
                 let retry_request = ContextRequest {
                     call_id: uuid::Uuid::new_v4().to_string(),
                     ..request.clone()
                 };
                 let retry_call_id = retry_request.call_id.clone();
+                let retried = compacted.messages.clone();
                 match pipeline
                     .prepare_with_task_outcome(
                         Arc::clone(&model),
                         retry_request,
-                        compacted.messages,
+                        retried,
                         tools.clone(),
                         options.clone(),
                         task_state.as_ref(),
@@ -305,7 +547,7 @@ impl Middleware for ContextMiddleware {
                             prepared.messages,
                             prepared.tools,
                             prepared.options,
-                            model,
+                            with_context_length_retry(model, retry.as_ref()),
                         ));
                     }
                     Ok(PrepareOutcome::BudgetExceeded(info)) => {
@@ -313,6 +555,7 @@ impl Middleware for ContextMiddleware {
                             agent = %agent_id,
                             session = %session_id,
                             detail = %info,
+                            round,
                             summary_only,
                             "model input is still over budget after compaction"
                         );
@@ -331,6 +574,14 @@ impl Middleware for ContextMiddleware {
                             as EventStream;
                     }
                 }
+
+                if !progressed {
+                    if summary_only {
+                        break;
+                    }
+                    summary_only = true;
+                }
+                planned = compacted.messages;
             }
 
             tracing::warn!(
@@ -364,8 +615,10 @@ impl Middleware for ContextMiddleware {
 /// rewritten it, and the retry must not resurrect what they removed. When the call runs
 /// inside an agent the compacted history is also written back to the shared state, so the
 /// next iteration and the next turn start from it; an ad-hoc call without shared state is
-/// compacted locally for the retry only. Returns the messages to compile again, or `None`
-/// when no compaction could free context.
+/// compacted locally for the retry only. `force` bypasses the compaction throttles, for a
+/// provider that already rejected the request as too long. Returns the messages to compile
+/// again, or `None` when no compaction could free context.
+#[allow(clippy::too_many_arguments)]
 async fn compact_overflow(
     state: Option<Arc<std::sync::Mutex<agentscope_core::state::AgentState>>>,
     messages: &[Msg],
@@ -374,6 +627,7 @@ async fn compact_overflow(
     session_id: &str,
     recorder: Option<&Arc<agentscope_core::journal::InvocationRecorder>>,
     summary_only: bool,
+    force: bool,
 ) -> Option<OverflowCompacted> {
     let history: Vec<Msg> = messages
         .iter()
@@ -402,11 +656,33 @@ async fn compact_overflow(
         config.keep_messages = config.keep_messages.min(history.len().saturating_sub(1));
     }
 
-    match overflow
-        .compactor
-        .compact_if_needed_with_metrics(history, &config, agent_id, &effective_session, recorder)
-        .await
-    {
+    // A forced compaction skips the trigger: the provider already rejected the request, so a
+    // history below the local thresholds must not be left untouched.
+    let outcome = if force {
+        overflow
+            .compactor
+            .compact_forced_with_metrics_observed(
+                history,
+                &config,
+                agent_id,
+                &effective_session,
+                recorder,
+                None,
+            )
+            .await
+    } else {
+        overflow
+            .compactor
+            .compact_if_needed_with_metrics(
+                history,
+                &config,
+                agent_id,
+                &effective_session,
+                recorder,
+            )
+            .await
+    };
+    match outcome {
         Ok((Some(compacted), metrics)) => {
             tracing::info!(
                 agent = %agent_id,
@@ -415,7 +691,8 @@ async fn compact_overflow(
                 before_count = metrics.before_msg_count,
                 after_count = metrics.after_msg_count.unwrap_or(0),
                 summary_only,
-                "conversation compacted after a local budget miss"
+                force,
+                "conversation compacted to fit the request"
             );
             // The retained tail's usage was produced against the old prefix; the next
             // request must not anchor on it.
@@ -996,5 +1273,166 @@ mod tests {
             !last.contains("turn 0:"),
             "the compacted history must be what the next turn starts from: {last}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_request_is_compacted_until_it_fits() {
+        // One pass keeps the configured tail, and that tail alone can still be oversized. The
+        // middleware must compact again over the shortened history instead of sending the
+        // request that the local budget already refused.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let model: Arc<dyn Model> = Arc::new(StubModel {
+            window: 1_500,
+            seen: Arc::clone(&seen),
+        });
+
+        let state = Arc::new(Mutex::new(agentscope_core::state::AgentState::default()));
+        {
+            let mut guard = state.lock().unwrap();
+            for i in 0..10 {
+                guard
+                    .context_mut()
+                    .push(Msg::user(format!("turn {i}: {}", "x".repeat(2_000))));
+            }
+        }
+        let messages = state.lock().unwrap().context().to_vec();
+        let (delta_tx, mut delta_rx) = futures::channel::mpsc::unbounded();
+        let ctx = RuntimeContext {
+            state: Some(Arc::clone(&state)),
+            delta_tx: Some(delta_tx),
+            ..RuntimeContext::new()
+                .with_user_id("alice")
+                .with_session_id("s1")
+                .with_agent_id("agent")
+        };
+
+        let middleware = ContextMiddleware::new(pipeline(false)).with_overflow_compaction(
+            Arc::new(ConversationCompactor::new(None)),
+            CompactionConfig::builder().keep_messages(4).build(),
+        );
+        let events = run_with_ctx(middleware, model, messages, ctx).await;
+        assert!(events.iter().all(|event| event.is_ok()), "{events:?}");
+
+        // Every pass is announced, so the count tells how many were needed.
+        let mut compactions = 0;
+        while let Ok(Some(item)) = delta_rx.try_next() {
+            let event = item.expect("ok event");
+            if event.data().fields.get("kind").and_then(|v| v.as_str()) == Some("compaction") {
+                compactions += 1;
+            }
+        }
+        assert!(
+            compactions >= 2,
+            "the history needed more than one pass, saw {compactions}"
+        );
+
+        // The request that reached the provider is no longer the original history: the
+        // middleware compacted again over the shortened history instead of sending what the
+        // local budget already refused (#1740).
+        let requests = seen.lock().unwrap();
+        let last = requests
+            .last()
+            .expect("a request reached the provider")
+            .clone();
+        assert!(!last.contains("turn 0:"), "{last}");
+    }
+
+    /// A model that rejects the first request as over its context window and answers once the
+    /// conversation was compacted — the provider-side overflow the local budget missed.
+    struct ContextLengthRejectingModel {
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl Model for ContextLengthRejectingModel {
+        fn stream(
+            &self,
+            messages: Vec<Msg>,
+            _tools: Vec<ToolSchema>,
+            _options: GenerateOptions,
+        ) -> BoxStream<'_, crate::Result<ChatResponse>> {
+            let rendered: Vec<String> = messages.iter().map(|m| m.text_content()).collect();
+            let compacted = rendered
+                .iter()
+                .any(|text| text.contains("summary unavailable"));
+            self.requests.lock().unwrap().push(rendered);
+            if compacted {
+                let response = ChatResponse::builder()
+                    .content(vec![agentscope_core::message::ContentBlock::Text(
+                        agentscope_core::message::TextBlock::new("ack"),
+                    )])
+                    .build();
+                Box::pin(futures::stream::once(async move { Ok(response) }))
+            } else {
+                Box::pin(futures::stream::once(async move {
+                    let failure: crate::Result<ChatResponse> =
+                        Err(agentscope_core::error::Error::HttpStatus {
+                            status: 400,
+                            message: "context_length_exceeded: your prompt is too long".into(),
+                        });
+                    failure
+                }))
+            }
+        }
+
+        fn model_name(&self) -> &str {
+            "rejecting-stub"
+        }
+
+        fn context_window_size(&self) -> usize {
+            128_000
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_context_length_rejection_compacts_once_and_retries() {
+        // The provider rejects a request the local budget accepted: the only recovery is a
+        // forced compaction followed by one retry, on the model path itself.
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let model: Arc<dyn Model> = Arc::new(ContextLengthRejectingModel {
+            requests: Arc::clone(&requests),
+        });
+        let state = Arc::new(Mutex::new(agentscope_core::state::AgentState::default()));
+        {
+            let mut guard = state.lock().unwrap();
+            for i in 0..6 {
+                guard
+                    .context_mut()
+                    .push(Msg::user(format!("turn {i}: {}", "x".repeat(1_200))));
+            }
+        }
+        let messages = state.lock().unwrap().context().to_vec();
+        let (delta_tx, mut delta_rx) = futures::channel::mpsc::unbounded();
+        let ctx = RuntimeContext {
+            state: Some(Arc::clone(&state)),
+            delta_tx: Some(delta_tx),
+            ..RuntimeContext::new()
+                .with_user_id("alice")
+                .with_session_id("s1")
+                .with_agent_id("agent")
+        };
+
+        let middleware = ContextMiddleware::new(pipeline(false)).with_overflow_compaction(
+            Arc::new(ConversationCompactor::new(None)),
+            CompactionConfig::builder().keep_messages(1).build(),
+        );
+        let events = run_with_ctx(middleware, model, messages, ctx).await;
+        assert!(events.iter().all(|event| event.is_ok()), "{events:?}");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "the rejected request and one retry");
+        let retried = requests[1].join("\n");
+        assert!(retried.contains("summary unavailable"), "{retried}");
+        assert!(retried.contains("turn 5:"), "{retried}");
+        assert!(!retried.contains("turn 0:"), "{retried}");
+
+        // The forced compaction is announced in-band, like the local-budget fallback.
+        let mut compactions = 0;
+        while let Ok(Some(item)) = delta_rx.try_next() {
+            let event = item.expect("ok event");
+            if event.data().fields.get("kind").and_then(|v| v.as_str()) == Some("compaction") {
+                compactions += 1;
+            }
+        }
+        assert_eq!(compactions, 1, "one forced compaction, announced once");
     }
 }

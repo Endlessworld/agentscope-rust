@@ -965,7 +965,7 @@ mod tests {
         });
         let prepared = pipeline
             .prepare(
-                model(2000),
+                model(1200),
                 request(ContextPurpose::Reasoning),
                 vec![Msg::user("hi")],
                 Vec::new(),

@@ -37,7 +37,10 @@ use super::protocol_client::{
     AgentProtocolTransport, RemoteSubagentTransport, RemoteSubmitContext, RemoteTarget,
 };
 use super::record::TaskRecord;
-use super::repository::{TaskCompletionCallback, TaskRepository, SUPPRESS_COMPLETION_CALLBACK};
+use super::repository::{
+    CancelOutcome, TaskCompletionCallback, TaskRepository, CANCELLED_RESULT_PREFIX,
+    SUPPRESS_COMPLETION_CALLBACK,
+};
 use super::spec::TaskRunSpec;
 use super::status::TaskStatus;
 
@@ -481,6 +484,13 @@ impl TaskRepository for WorkspaceTaskRepository {
             };
 
             let terminal = match &outcome {
+                // A cancellation is terminal for the parent too: without a notification the
+                // parent agent keeps waiting for a result that will never arrive (and a
+                // cancelled child was only discoverable by polling `task_output`).
+                _ if bg2.is_cancellation_requested() => Some(Some(format!(
+                    "{CANCELLED_RESULT_PREFIX}the subagent task was cancelled before it \
+                         produced a result"
+                ))),
                 Ok(r) => {
                     update_record_status(
                         state.fs.as_ref(),
@@ -496,7 +506,8 @@ impl TaskRepository for WorkspaceTaskRepository {
                     Some(Some(r.clone()))
                 }
                 // A cancelled task is already terminal in the workspace; there is nothing to
-                // report back to the parent.
+                // report back to the parent. (A cancellation observed through the live handle
+                // is handled by the arm above.)
                 Err(e) if e.as_str() == CANCELLED_SENTINEL => None,
                 Err(e) => {
                     update_record_status(
@@ -587,13 +598,24 @@ impl TaskRepository for WorkspaceTaskRepository {
         result
     }
 
-    async fn cancel_task(&self, ctx: &RuntimeContext, session_id: &str, task_id: &str) -> bool {
+    async fn request_cancel(
+        &self,
+        ctx: &RuntimeContext,
+        session_id: &str,
+        task_id: &str,
+    ) -> CancelOutcome {
         let key = local_key(&self.state, ctx, session_id, task_id);
         let local = self.state.local_tasks.lock().unwrap().get(&key).cloned();
-        let found_local = local.is_some();
+        if let Some(task) = &local {
+            let status = task.get_task_status();
+            if status.is_terminal() {
+                return CancelOutcome::AlreadyTerminal(status);
+            }
+        }
 
         let path = self.tasks_path(session_id);
         let mut snapshot: Option<TaskRecord> = None;
+        let mut previous_status: Option<TaskStatus> = None;
 
         // Durable cancellation is written first so completion listeners always observe a
         // terminal record, never a still-running one. The write goes through an
@@ -613,7 +635,11 @@ impl TaskRepository for WorkspaceTaskRepository {
             };
             {
                 let rec = map.get_mut(task_id).expect("checked above");
+                previous_status = Some(rec.status);
                 rec.cancel_requested = true;
+                if rec.cancel_reason.is_none() {
+                    rec.cancel_reason = Some(CANCEL_REASON_PARENT.to_string());
+                }
                 if !rec.status.is_terminal() {
                     rec.status = TaskStatus::Cancelled;
                 }
@@ -631,11 +657,10 @@ impl TaskRepository for WorkspaceTaskRepository {
             }
         }
 
-        if let Some(local) = local {
-            local.cancel();
+        if let Some(task) = &local {
+            task.cancel();
         }
 
-        // Best-effort remote cancellation for agent-protocol tasks.
         if let Some(rec) = snapshot {
             if rec.is_agent_protocol_transport() {
                 if let Some(base_url) = rec.remote_base_url.clone() {
@@ -645,12 +670,34 @@ impl TaskRepository for WorkspaceTaskRepository {
                     };
                     if let Err(e) = self.transport.cancel(&target, task_id).await {
                         tracing::warn!("Remote cancel failed for task {task_id}: {e}");
+                        // The record is already marked cancelled locally, but the remote run
+                        // keeps going: reporting success here made the caller believe it had
+                        // stopped (and left the remote side billing).
+                        return CancelOutcome::Failed(e.to_string());
                     }
                 }
             }
-            return true;
+            if let Some(status) = previous_status.filter(|status| status.is_terminal()) {
+                return CancelOutcome::AlreadyTerminal(status);
+            }
+            return if self
+                .state
+                .local_tasks
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|task| task.is_execution_finished())
+            {
+                CancelOutcome::Terminated
+            } else {
+                CancelOutcome::Requested
+            };
         }
-        found_local
+        if local.is_some() {
+            CancelOutcome::Requested
+        } else {
+            CancelOutcome::NotFound
+        }
     }
 
     async fn find_pending_deliveries(
@@ -1296,8 +1343,11 @@ impl Drop for WorkspaceTaskRepository {
 // ---------------------------------------------------------------------
 
 /// Outcome marker for a task cancelled mid-flight: the workspace record is already terminal, so
-/// the caller must not write a terminal status or fire the completion callback.
+/// the caller must not write a terminal status.
 const CANCELLED_SENTINEL: &str = "__agentscope_cancelled__";
+
+/// Reason recorded for a cancellation the parent agent requested.
+const CANCEL_REASON_PARENT: &str = "cancel requested by the parent agent";
 
 /// Maximum optimistic-concurrency retries for a guarded task-record write.
 const RECORD_CAS_RETRIES: u32 = 5;

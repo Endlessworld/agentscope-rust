@@ -57,10 +57,21 @@ impl SandboxClient for DockerSandboxClient {
             session_id: session_id.clone(),
             container_id: None,
             container_name: None,
+            // The layout root is the authoritative workspace root: when a caller sets
+            // `LayoutSpec::with_root(...)` but no explicit client option, the container must
+            // use that root instead of the hard-coded default (#1729).
             workspace_root: options
                 .workspace_root
                 .clone()
-                .unwrap_or_else(|| DEFAULT_WORKSPACE_ROOT.to_string()),
+                .filter(|root| !root.trim().is_empty())
+                .unwrap_or_else(|| {
+                    let root = workspace_spec.root.to_string_lossy().replace('\\', "/");
+                    if root.trim().is_empty() {
+                        DEFAULT_WORKSPACE_ROOT.to_string()
+                    } else {
+                        root
+                    }
+                }),
             image: options
                 .docker_image
                 .clone()
@@ -267,6 +278,13 @@ impl DockerSandbox {
     /// Ensures the backing container is running (Java parity): a running container is reused,
     /// a stopped one is restarted, and a missing/unknown one is replaced by a new container
     /// that forces a full workspace re-initialization.
+    ///
+    /// The recorded `container_id` is only a hint: the CLI can time out after the daemon
+    /// already started a container, and a state write can be lost after `docker run`
+    /// succeeded. The container is then still there under the name derived from the
+    /// (persisted) sandbox session id, so an unusable id is reconciled **by name** before a
+    /// new container is created: reusing it beats failing every later `docker run` with
+    /// exit 125 because the name is taken.
     async fn ensure_container_running(&mut self) -> Result<()> {
         let container_id = self
             .docker()
@@ -289,18 +307,54 @@ impl DockerSandbox {
                 }
                 ContainerState::Unknown => {
                     warn!(
-                        "[sandbox-docker] Container {container_id} not found, creating a new one"
+                        "[sandbox-docker] Container {container_id} not found, reconciling by name"
                     );
                     self.docker_mut().workspace_root_ready = false;
                 }
             }
         }
+
+        let container_name = self.container_name();
+        match inspect_container_state(&container_name).await {
+            ContainerState::Running => {
+                debug!("[sandbox-docker] Adopting running container by name: {container_name}");
+                self.adopt_container(&container_name);
+                return Ok(());
+            }
+            ContainerState::Stopped => {
+                debug!("[sandbox-docker] Starting existing container by name: {container_name}");
+                run_docker_cli(CONTAINER_START_TIMEOUT_SECONDS, &["start", &container_name])
+                    .await?;
+                self.adopt_container(&container_name);
+                return Ok(());
+            }
+            ContainerState::Unknown => {}
+        }
         self.create_and_start_container().await
+    }
+
+    /// Deterministic container name for this session.
+    fn container_name(&self) -> String {
+        self.docker()
+            .container_name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| container_name_for(&self.docker().session_id))
+    }
+
+    /// Records a container found by name as the current one.
+    ///
+    /// Docker accepts a name wherever an id is accepted, so the name can stand in for the
+    /// id; `container_name` keeps the name visible to `shutdown`.
+    fn adopt_container(&mut self, container_name: &str) {
+        let state = self.docker_mut();
+        state.container_id = Some(container_name.to_string());
+        state.container_name = Some(container_name.to_string());
     }
 
     /// Runs a new detached container and records its id.
     async fn create_and_start_container(&mut self) -> Result<()> {
-        let container_name = format!("agentscope-sandbox-{}", self.docker().session_id);
+        let container_name = self.container_name();
         let args = build_docker_run_command(self.docker(), &container_name);
         debug!(
             "[sandbox-docker] Creating container: image={}, name={}",
@@ -308,12 +362,21 @@ impl DockerSandbox {
             container_name
         );
 
-        let mut command = docker_command();
-        command.args(&args);
-        let outcome =
-            run_command(command, CONTAINER_START_TIMEOUT_SECONDS, CLI_OUTPUT_BYTES).await?;
+        let mut outcome = self.run_container(&args).await?;
+        let mut stderr = outcome.stderr.trim().to_string();
+        if outcome.exit_code == Some(125) && is_name_conflict(&stderr) {
+            // A container left behind by a previous attempt holds the deterministic name.
+            // Remove it (it carries no state we trust) and retry once instead of failing
+            // every subsequent call with exit 125.
+            warn!(
+                "[sandbox-docker] Container name {container_name} is taken, removing it and retrying"
+            );
+            let _ = run_docker_cli(30, &["rm", "--force", &container_name]).await;
+            outcome = self.run_container(&args).await?;
+            stderr = outcome.stderr.trim().to_string();
+        }
+
         let stdout = String::from_utf8_lossy(&outcome.stdout).trim().to_string();
-        let stderr = outcome.stderr.trim();
         match outcome.exit_code {
             None => {
                 return Err(Error::Other(format!(
@@ -338,6 +401,36 @@ impl DockerSandbox {
         docker_state.container_id = Some(stdout.clone());
         docker_state.container_name = Some(container_name);
         debug!("[sandbox-docker] Container started: id={stdout}");
+        Ok(())
+    }
+
+    /// Runs `docker run` with the given argv once.
+    async fn run_container(&self, args: &[String]) -> Result<CliOutcome> {
+        let mut command = docker_command();
+        command.args(args);
+        run_command(command, CONTAINER_START_TIMEOUT_SECONDS, CLI_OUTPUT_BYTES).await
+    }
+
+    /// Re-applies the host workspace projection on **every** start.
+    ///
+    /// The projection roots are the host definitions (`AGENTS.md`, `skills/`, `knowledge/`,
+    /// ...). Replaying them unconditionally is what keeps a sandbox-side shell write from
+    /// surviving: only fresh workspaces used to be projected, so a restorable snapshot
+    /// carried the edited copy into the next session (#3388).
+    async fn replay_host_projection(&mut self) -> Result<()> {
+        let Some(spec) = self.docker().workspace_spec.clone() else {
+            return Ok(());
+        };
+        let Some(payload) = projection_payload(&spec)? else {
+            return Ok(());
+        };
+        debug!(
+            "[sandbox-docker] Replaying host projection: {} files, hash={}",
+            payload.file_count, payload.hash
+        );
+        let hash = payload.hash.clone();
+        self.hydrate_workspace(&payload.tar_bytes).await?;
+        self.docker_mut().workspace_projection_hash = Some(hash);
         Ok(())
     }
 
@@ -400,6 +493,9 @@ impl Sandbox for DockerSandbox {
         }
 
         self.docker_mut().workspace_root_ready = true;
+        // Host definitions are replayed after the spec on every start, so an edited sandbox
+        // copy never outlives the call that produced it.
+        self.replay_host_projection().await?;
         self.running.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -427,31 +523,47 @@ impl Sandbox for DockerSandbox {
     }
 
     async fn shutdown(&mut self) -> Result<()> {
-        let (container_id, owned) = {
+        let (container_id, container_name, owned) = {
             let state = self.docker();
             (
                 state.container_id.clone().filter(|id| !id.is_empty()),
+                state.container_name.clone().filter(|name| !name.is_empty()),
                 state.container_owned,
             )
         };
-        let Some(container_id) = container_id else {
+        if container_id.is_none() && container_name.is_none() {
             return Ok(());
-        };
+        }
+        let recorded = container_id.clone().or_else(|| container_name.clone());
         if !owned {
-            debug!("[sandbox-docker] Skipping shutdown: container is user-managed: {container_id}");
+            let label = recorded.clone().unwrap_or_default();
+            debug!("[sandbox-docker] Skipping shutdown: container is user-managed: {label}");
             return Ok(());
+        }
+        // Both handles are removed: the id is the container this instance recorded, the name
+        // is the deterministic one that a leaked/reconciled container answers to.
+        let mut targets: Vec<String> = Vec::new();
+        if let Some(id) = container_id {
+            targets.push(id);
+        }
+        if let Some(name) = container_name {
+            if !targets.iter().any(|target| target == &name) {
+                targets.push(name);
+            }
         }
         let stop_arg = format!("--time={CONTAINER_STOP_TIMEOUT_SECONDS}");
-        if let Err(e) = run_docker_cli(
-            CONTAINER_STOP_TIMEOUT_SECONDS * 2,
-            &["stop", &stop_arg, &container_id],
-        )
-        .await
-        {
-            warn!("[sandbox-docker] Failed to stop container {container_id}: {e}");
-        }
-        if let Err(e) = run_docker_cli(30, &["rm", "--force", &container_id]).await {
-            warn!("[sandbox-docker] Failed to remove container {container_id}: {e}");
+        for target in &targets {
+            if let Err(e) = run_docker_cli(
+                CONTAINER_STOP_TIMEOUT_SECONDS * 2,
+                &["stop", &stop_arg, target],
+            )
+            .await
+            {
+                warn!("[sandbox-docker] Failed to stop container {target}: {e}");
+            }
+            if let Err(e) = run_docker_cli(30, &["rm", "--force", target]).await {
+                warn!("[sandbox-docker] Failed to remove container {target}: {e}");
+            }
         }
         Ok(())
     }
@@ -574,6 +686,9 @@ fn build_docker_run_command(state: &DockerSandboxState, container_name: &str) ->
     let mut args: Vec<String> = vec![
         "run".into(),
         "-d".into(),
+        // `--rm` is what keeps a failed/interrupted run from leaving a container behind
+        // under the deterministic name (the next `docker run` would fail with exit 125).
+        "--rm".into(),
         "--name".into(),
         container_name.to_string(),
     ];
@@ -772,6 +887,39 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Deterministic container name for a sandbox session.
+fn container_name_for(session_id: &str) -> String {
+    format!("agentscope-sandbox-{session_id}")
+}
+
+/// Whether `docker run` failed because the deterministic name is already taken.
+///
+/// The daemon answers with exit 125 and wording that changed across Docker versions
+/// ("is already in use by container", "Conflict. The container name ..."), so both the
+/// exit code and the text are considered by the caller; this helper is the text half.
+fn is_name_conflict(stderr: &str) -> bool {
+    let text = stderr.to_ascii_lowercase();
+    text.contains("already in use")
+        || (text.contains("container name") && text.contains("conflict"))
+}
+
+/// Builds the host-projection archive for a workspace spec, if it declares one.
+fn projection_payload(spec: &WorkspaceSpec) -> Result<Option<super::helpers::ProjectionPayload>> {
+    let Some(projection) = &spec.workspace_projection else {
+        return Ok(None);
+    };
+    if projection.source_root.trim().is_empty() {
+        return Ok(None);
+    }
+    let layout = super::layout::LayoutSpec::default()
+        .with_root(spec.root.to_string_lossy().replace('\\', "/"))
+        .entry(
+            "workspace_projection",
+            super::layout::WorkspaceEntry::WorkspaceProjection(projection.clone()),
+        );
+    super::helpers::WorkspaceProjectionApplier::build(&layout)
+}
+
 /// Joins a container-absolute workspace root with a workspace-relative path.
 fn workspace_path(root: &str, relative: &str) -> String {
     let relative = relative.replace('\\', "/");
@@ -861,6 +1009,33 @@ mod tests {
         }
     }
 
+    /// The layout root is the authority when no client option overrides it (#1729): the
+    /// prompt and the container must agree on the workspace root.
+    #[tokio::test]
+    async fn client_takes_the_workspace_root_from_the_layout() {
+        let client = DockerSandboxClient::new();
+        let spec = WorkspaceSpec::new("/home/agent/ws");
+        let sandbox = client.create(&spec, None, None).await.unwrap();
+        match sandbox.state() {
+            SandboxState::Docker(state) => assert_eq!(state.workspace_root, "/home/agent/ws"),
+            other => panic!("expected Docker state, got {other:?}"),
+        }
+
+        // An explicit client option still wins.
+        let options = SandboxClientOptions {
+            workspace_root: Some("/opt/ws".to_string()),
+            ..Default::default()
+        };
+        let sandbox = client
+            .create(&WorkspaceSpec::new("/home/agent/ws"), None, Some(&options))
+            .await
+            .unwrap();
+        match sandbox.state() {
+            SandboxState::Docker(state) => assert_eq!(state.workspace_root, "/opt/ws"),
+            other => panic!("expected Docker state, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn client_resume_rejects_other_backends() {
         let client = DockerSandboxClient::new();
@@ -902,12 +1077,82 @@ mod tests {
     fn run_command_defaults_network_and_keepalive() {
         let args = build_docker_run_command(&sample_state(), "agentscope-sandbox-session-1");
         assert_eq!(
-            &args[..4],
-            ["run", "-d", "--name", "agentscope-sandbox-session-1"]
+            &args[..5],
+            [
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "agentscope-sandbox-session-1"
+            ]
         );
         assert!(args.contains(&"--network=none".to_string()));
         assert_eq!(args[args.len() - 4], DEFAULT_IMAGE);
         assert_eq!(&args[args.len() - 3..], ["sh", "-c", KEEP_ALIVE_COMMAND]);
+    }
+
+    #[test]
+    fn container_names_are_deterministic_per_session() {
+        assert_eq!(
+            container_name_for("s-1"),
+            "agentscope-sandbox-s-1",
+            "the name is what lets a new instance adopt a leaked container"
+        );
+        let state = sample_state();
+        let sandbox = DockerSandbox::new(SandboxState::Docker(state.clone()));
+        assert_eq!(
+            sandbox.container_name(),
+            container_name_for(&state.session_id)
+        );
+
+        let mut named = state.clone();
+        named.container_name = Some("explicit-name".to_string());
+        let sandbox = DockerSandbox::new(SandboxState::Docker(named));
+        assert_eq!(sandbox.container_name(), "explicit-name");
+    }
+
+    #[test]
+    fn name_conflict_is_recognised_across_docker_wordings() {
+        assert!(is_name_conflict(
+            "docker: Error response from daemon: Conflict. The container name \"/agentscope-sandbox-s-1\" is already in use by container \"abc\"."
+        ));
+        assert!(is_name_conflict(
+            "The container name \"/x\" is already in use by container\n"
+        ));
+        assert!(!is_name_conflict("no such image: ubuntu:22.04"));
+        assert!(!is_name_conflict(""));
+    }
+
+    #[test]
+    fn projection_payload_carries_the_host_definition_files() {
+        let root = std::env::temp_dir().join(format!(
+            "asr_docker_projection_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("skills/demo")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "# Host rules").unwrap();
+        std::fs::write(root.join("skills/demo/SKILL.md"), "# Skill").unwrap();
+
+        let spec = WorkspaceSpec {
+            workspace_projection: Some(crate::agent::sandbox::WorkspaceProjectionEntry {
+                ephemeral: false,
+                source_root: root.to_string_lossy().replace('\\', "/"),
+                include_roots: vec!["AGENTS.md".to_string(), "skills".to_string()],
+            }),
+            ..WorkspaceSpec::default()
+        };
+        let payload = projection_payload(&spec).unwrap().expect("projection");
+        assert_eq!(payload.file_count, 2, "AGENTS.md + skills/demo/SKILL.md");
+        let archive = String::from_utf8_lossy(&payload.tar_bytes).into_owned();
+        assert!(archive.contains("AGENTS.md"));
+        assert!(archive.contains("# Host rules"));
+
+        // No projection declared → nothing to replay.
+        assert!(projection_payload(&WorkspaceSpec::default())
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -850,9 +850,15 @@ fn append_separated_line(out: &mut Vec<u8>, text: &[u8]) {
 }
 
 fn decode_b64_field(parent: &Value, field: &str) -> Vec<u8> {
+    // #3966: envd wraps base64 at 76 columns, so whitespace is stripped before decoding.
     parent
         .get(field)
         .and_then(Value::as_str)
+        .map(|s| {
+            s.chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect::<String>()
+        })
         .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
         .unwrap_or_default()
 }
@@ -2179,6 +2185,24 @@ mod tests {
     fn envd_host_uses_port_and_domain() {
         assert_eq!(envd_host("sbx-1", "e2b.app"), "https://49983-sbx-1.e2b.app");
         assert_eq!(envd_host("sbx-1", ""), "https://49983-sbx-1.e2b.app");
+    }
+
+    /// #3966: envd wraps base64 fields at 76 columns, so the decoder must strip the line breaks.
+    #[test]
+    fn envd_base64_fields_tolerate_line_wrapping() {
+        use base64::Engine as _;
+        let raw = b"hello world";
+        let wrapped = base64::engine::general_purpose::STANDARD
+            .encode(raw)
+            .as_bytes()
+            .chunks(4)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let value = json!({ "stdout": format!("{wrapped}\n") });
+        assert_eq!(decode_b64_field(&value, "stdout"), raw.to_vec());
+        // A missing field stays an empty buffer.
+        assert!(decode_b64_field(&value, "stderr").is_empty());
     }
 
     #[test]

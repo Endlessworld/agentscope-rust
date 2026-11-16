@@ -32,7 +32,9 @@ pub use dashscope::{
     DashScopeTextEmbeddingBuilder,
 };
 pub use ollama::{OllamaTextEmbedding, OllamaTextEmbeddingBuilder};
-pub use openai::{OpenAiTextEmbedding, OpenAiTextEmbeddingBuilder};
+pub use openai::{
+    EmbedBatchOutcome, OpenAiTextEmbedding, OpenAiTextEmbeddingBuilder, MAX_BATCH_SIZE,
+};
 pub use utils::EmbeddingExecutionConfig;
 
 /// Default vector dimension used when none is configured (Java default: 1024).

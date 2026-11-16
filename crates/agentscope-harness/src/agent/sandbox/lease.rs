@@ -1,4 +1,5 @@
 //! Sandbox lease for execution isolation.
+use super::guard::GateHold;
 use super::key::SandboxIsolationKey;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,6 +32,14 @@ pub struct SandboxLease {
 
     /// Whether the guard release for this lease has already been performed.
     released: Arc<AtomicBool>,
+
+    /// In-process gate this lease holds, if any.
+    ///
+    /// Dropping the lease frees the gate, so the mutual exclusion can never outlive the
+    /// call window even when a caller forgets [`SandboxManager::release`].
+    ///
+    /// [`SandboxManager::release`]: super::SandboxManager::release
+    gate: Option<GateHold>,
 }
 
 impl SandboxLease {
@@ -40,6 +49,20 @@ impl SandboxLease {
             key,
             noop: false,
             released: Arc::new(AtomicBool::new(false)),
+            gate: None,
+        }
+    }
+
+    /// Creates a lease that holds the in-process gate for `key`.
+    ///
+    /// The gate is owned by the lease: it is freed when the lease is dropped, which is what
+    /// makes a second acquisition on the same key wait for the whole call window.
+    pub(super) fn with_gate(key: SandboxIsolationKey, gate: GateHold) -> Self {
+        Self {
+            key,
+            noop: false,
+            released: Arc::new(AtomicBool::new(false)),
+            gate: Some(gate),
         }
     }
 
@@ -49,6 +72,7 @@ impl SandboxLease {
             key: SandboxIsolationKey::new("noop", "noop"),
             noop: true,
             released: Arc::new(AtomicBool::new(false)),
+            gate: None,
         }
     }
 
@@ -83,6 +107,7 @@ impl std::fmt::Debug for SandboxLease {
             .field("key", &self.key)
             .field("noop", &self.noop)
             .field("released", &self.is_released())
+            .field("gate", &self.gate.is_some())
             .finish()
     }
 }

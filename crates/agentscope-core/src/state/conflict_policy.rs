@@ -7,12 +7,16 @@
 /// i.e. another writer advanced the slot first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ConflictPolicy {
-    /// Unconditional overwrite (default; preserves legacy last-writer-wins semantics).
-    #[default]
+    /// Unconditional overwrite (opt-in; the legacy last-writer-wins semantics).
+    ///
+    /// Defaulting to this meant a second writer silently clobbered the first turn's messages:
+    /// on the non-durable path `SessionTurnGate` only serialises in-process turns, so any other
+    /// writer (a second host, a restarted process, a background wakeup) was invisible.
     Overwrite,
-    /// Fail the save and surface a [`Error::ConcurrentSessionModification`].
+    /// Fail the save and surface a [`Error::ConcurrentSessionModification`] (default).
     ///
     /// [`Error::ConcurrentSessionModification`]: crate::error::Error::ConcurrentSessionModification
+    #[default]
     Fail,
     /// Reload the latest baseline, append this turn's newly added messages, and retry.
     ///
@@ -46,8 +50,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_overwrite() {
-        assert_eq!(ConflictPolicy::default(), ConflictPolicy::Overwrite);
+    fn default_is_fail() {
+        // Last-writer-wins is now opt-in: a conflict must be reported, not silently applied.
+        assert_eq!(ConflictPolicy::default(), ConflictPolicy::Fail);
     }
 
     #[test]

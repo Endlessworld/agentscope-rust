@@ -26,8 +26,13 @@ use crate::agent::context::auxiliary_text;
 /// the oldest turns are dropped from the rendering.
 const SUMMARY_INPUT_MAX_TOKENS: usize = 32_000;
 
-/// ~1 token per 2.5 characters (mixed English/Chinese heuristic).
-const CHARS_PER_TOKEN: f64 = 2.5;
+/// ASCII text (Latin prose, code, JSON punctuation) packs ~4 characters per token.
+const ASCII_CHARS_PER_TOKEN: f64 = 4.0;
+/// CJK and other non-ASCII text is roughly one token per character.
+///
+/// The previous flat `chars / 2.5` rate underestimated CJK by ~2.5x, which made a
+/// Chinese conversation look half its real size to the estimator-only paths.
+const NON_ASCII_CHARS_PER_TOKEN: f64 = 1.0;
 /// Structural overhead per message (role/name/formatting).
 const MESSAGE_OVERHEAD: usize = 5;
 /// Structural overhead per tool call.
@@ -44,7 +49,22 @@ fn estimate_text_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    (text.chars().count() as f64 / CHARS_PER_TOKEN).ceil() as usize
+    (weigh_text_tokens(text) as f64).ceil() as usize
+}
+
+/// Weighs text by character class: ASCII counts a quarter token per character, everything
+/// else a full token.
+fn weigh_text_tokens(text: &str) -> f64 {
+    let mut ascii = 0usize;
+    let mut non_ascii = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    ascii as f64 / ASCII_CHARS_PER_TOKEN + non_ascii as f64 / NON_ASCII_CHARS_PER_TOKEN
 }
 
 fn role_name(role: MsgRole) -> &'static str {
@@ -397,9 +417,9 @@ pub struct TruncateArgsConfig {
     pub trigger_tokens: usize,
     pub keep_messages: usize,
     pub keep_tokens: usize,
-    /// Max characters of any single tool argument value.
+    /// Max characters of any single tool argument value (the kept prefix plus the suffix).
     pub max_arg_length: usize,
-    /// Suffix appended after the first 20 characters of a truncated argument.
+    /// Suffix appended after the kept prefix of a truncated argument.
     pub truncation_text: String,
 }
 
@@ -694,6 +714,56 @@ impl ConversationCompactor {
         recorder: Option<&std::sync::Arc<agentscope_core::journal::InvocationRecorder>>,
         observed_tokens: Option<usize>,
     ) -> agentscope_core::error::Result<(Option<Vec<Msg>>, CompactionMetrics)> {
+        self.compact_with_metrics(
+            conversation,
+            config,
+            agent_id,
+            session_id,
+            recorder,
+            observed_tokens,
+            false,
+        )
+        .await
+    }
+
+    /// Runs a compaction that ignores the configured trigger.
+    ///
+    /// A caller-driven compaction (`compact_context`, a host shortcut such as `/compact`)
+    /// must not be dropped because the history is still under the token/message trigger:
+    /// the caller asked for it. What stays a real early return is a history with nothing
+    /// outside the preserved tail, which surfaces as `None`.
+    pub async fn compact_forced_with_metrics_observed(
+        &self,
+        conversation: Vec<Msg>,
+        config: &CompactionConfig,
+        agent_id: &str,
+        session_id: &str,
+        recorder: Option<&std::sync::Arc<agentscope_core::journal::InvocationRecorder>>,
+        observed_tokens: Option<usize>,
+    ) -> agentscope_core::error::Result<(Option<Vec<Msg>>, CompactionMetrics)> {
+        self.compact_with_metrics(
+            conversation,
+            config,
+            agent_id,
+            session_id,
+            recorder,
+            observed_tokens,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_with_metrics(
+        &self,
+        conversation: Vec<Msg>,
+        config: &CompactionConfig,
+        agent_id: &str,
+        session_id: &str,
+        recorder: Option<&std::sync::Arc<agentscope_core::journal::InvocationRecorder>>,
+        observed_tokens: Option<usize>,
+        force: bool,
+    ) -> agentscope_core::error::Result<(Option<Vec<Msg>>, CompactionMetrics)> {
         let started = std::time::Instant::now();
         let before_msg_count = conversation.len();
         // Prefer the provider-anchored count for the recorded "before" size; it is the
@@ -733,7 +803,7 @@ impl ConversationCompactor {
         }
 
         let outcome = self
-            .compact_candidate(conversation, config, observed_tokens)
+            .compact_candidate(conversation, config, observed_tokens, force)
             .await;
         let metrics = match &outcome {
             Ok(replacement) => match replacement {
@@ -779,6 +849,7 @@ impl ConversationCompactor {
         conversation: Vec<Msg>,
         config: &CompactionConfig,
         observed_tokens: Option<usize>,
+        force: bool,
     ) -> agentscope_core::error::Result<Option<Vec<Msg>>> {
         if conversation.is_empty() {
             return Ok(None);
@@ -790,7 +861,7 @@ impl ConversationCompactor {
         let observed = observed_tokens
             .filter(|tokens| *tokens > 0)
             .unwrap_or_else(|| calculate_token(&conversation));
-        if !should_compact(&conversation, observed, config) {
+        if !force && !should_compact(&conversation, observed, config) {
             return Ok(None);
         }
         let messages = prune_tool_results(
@@ -1031,10 +1102,10 @@ fn extract_tool_result_documents(
 /// only record of the turns dropped by the previous compaction, so trimming it would lose
 /// history cumulatively. Returns the body and whether anything was dropped.
 fn clamp_summary_input(prefix: &[Msg], formatted: String, reserve_chars: usize) -> (String, bool) {
-    let budget_chars = ((SUMMARY_INPUT_MAX_TOKENS as f64 * CHARS_PER_TOKEN) as usize)
-        .saturating_sub(reserve_chars);
-    let total_chars = formatted.chars().count();
-    if total_chars <= budget_chars {
+    // The template reserve is charged as if every character were a token: the templates are
+    // mostly ASCII, so this over-reserves instead of letting the request overshoot the cap.
+    let budget_tokens = SUMMARY_INPUT_MAX_TOKENS.saturating_sub(reserve_chars);
+    if estimate_text_tokens(&formatted) <= budget_tokens {
         return (formatted, false);
     }
     let head = prefix
@@ -1042,19 +1113,30 @@ fn clamp_summary_input(prefix: &[Msg], formatted: String, reserve_chars: usize) 
         .find(|msg| msg.name.as_deref() == Some(SUMMARY_MSG_NAME))
         .map(|msg| format!("[earlier summary] {}", render_message_for_summary(msg)))
         .unwrap_or_default();
-    let head_chars = head.chars().count();
-    let tail_budget = budget_chars.saturating_sub(head_chars + 40);
-    let tail: String = formatted
-        .chars()
-        .skip(total_chars.saturating_sub(tail_budget))
-        .collect();
-    let mut capped = String::with_capacity(head_chars + tail.len() + 64);
-    if !head.is_empty() {
-        capped.push_str(&head);
-        capped.push_str("\n\n[earlier turns omitted]\n");
+    let total_chars = formatted.chars().count();
+    let mut keep_chars = total_chars;
+    loop {
+        let mut capped = String::new();
+        if !head.is_empty() {
+            capped.push_str(&head);
+            capped.push_str("\n\n[earlier turns omitted]\n");
+        }
+        capped.extend(
+            formatted
+                .chars()
+                .skip(total_chars.saturating_sub(keep_chars)),
+        );
+        if estimate_text_tokens(&capped) <= budget_tokens || keep_chars == 0 {
+            return (capped, true);
+        }
+        // Shrink geometrically: the rendered body is dominated by the kept turns, so this
+        // converges in a handful of rounds even for a mostly non-ASCII history.
+        let next = keep_chars.saturating_mul(3) / 4;
+        if next == keep_chars {
+            return (capped, true);
+        }
+        keep_chars = next;
     }
-    capped.push_str(&tail);
-    (capped, true)
 }
 
 /// Builds a USER message carrying the compaction summary.
@@ -1187,10 +1269,17 @@ fn truncate_tool_use_args(msg: &Msg, cfg: &TruncateArgsConfig) -> Msg {
 fn truncate_tool_use_block(tu: &ToolUseBlock, cfg: &TruncateArgsConfig) -> ToolUseBlock {
     let mut any_modified = false;
     let mut new_input = tu.input.clone();
+    // `max_arg_length` is the length the truncated argument keeps (ellipsis included), not
+    // just the threshold: a fixed 20-character head made a 50k-argument tool result read as
+    // almost empty to the model that has to continue the work.
+    let keep = cfg
+        .max_arg_length
+        .saturating_sub(cfg.truncation_text.chars().count())
+        .max(1);
     for (k, v) in &tu.input {
         if let Some(s) = v.as_str() {
             if s.chars().count() > cfg.max_arg_length {
-                let head: String = s.chars().take(20).collect();
+                let head: String = s.chars().take(keep).collect();
                 new_input.insert(
                     k.clone(),
                     serde_json::Value::String(head + &cfg.truncation_text),
@@ -1453,7 +1542,7 @@ mod tests {
 
         // Locally large, but the provider says the real request is below the trigger.
         let conversation: Vec<Msg> = (0..6)
-            .map(|i| Msg::user(format!("turn {i}: {}", "x".repeat(5_000))))
+            .map(|i| Msg::user(format!("turn {i}: {}", "x".repeat(8_000))))
             .collect();
         assert!(calculate_token(&conversation) > 10_000);
         let replacement = compactor
@@ -1541,5 +1630,93 @@ mod tests {
             ),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn a_truncated_argument_keeps_max_arg_length_characters() {
+        let long = "x".repeat(10_000);
+        let cfg = TruncateArgsConfig::builder()
+            .trigger_messages(1)
+            .keep_messages(1)
+            .max_arg_length(50)
+            .truncation_text("...(truncated)")
+            .build();
+        let mut input = serde_json::Map::new();
+        input.insert("command".to_string(), serde_json::Value::String(long));
+        let messages = vec![
+            Msg::assistant_blocks(vec![ContentBlock::ToolUse(
+                ToolUseBlock::builder()
+                    .id("call-1")
+                    .name("execute")
+                    .input(input)
+                    .build(),
+            )]),
+            Msg::user("continue"),
+        ];
+
+        let truncated = truncate_args(&messages, Some(&cfg));
+        let ContentBlock::ToolUse(tool_use) = &truncated[0].content[0] else {
+            panic!("the tool call must survive truncation");
+        };
+        let kept = tool_use.input["command"].as_str().unwrap_or_default();
+        // The kept prefix plus the suffix is exactly the configured budget: a fixed
+        // 20-character head left the model with almost nothing to continue from.
+        assert_eq!(kept.chars().count(), 50);
+        assert!(kept.ends_with("...(truncated)"));
+    }
+
+    #[test]
+    fn cjk_text_costs_one_token_per_character() {
+        assert_eq!(estimate_text_tokens("abcd"), 1);
+        assert_eq!(estimate_text_tokens("你好世界"), 4);
+        // Mixed text is charged per class, not by a single flat average.
+        assert_eq!(estimate_text_tokens("ab你好"), 3);
+    }
+
+    #[tokio::test]
+    async fn a_forced_compaction_ignores_the_token_trigger() {
+        let compactor = ConversationCompactor::new(None);
+        // The history is far below the trigger; only the caller's request may run it.
+        let config = CompactionConfig::builder()
+            .trigger_messages(0)
+            .trigger_tokens(1_000_000)
+            .keep_messages(1)
+            .build();
+        let conversation: Vec<Msg> = (0..5).map(|i| Msg::user(format!("turn {i}"))).collect();
+
+        let skipped = compactor
+            .compact_if_needed_with_metrics_observed(
+                conversation.clone(),
+                &config,
+                "agent",
+                "session",
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            skipped.is_none(),
+            "the throttle still gates the automatic path"
+        );
+
+        let forced = compactor
+            .compact_forced_with_metrics_observed(
+                conversation,
+                &config,
+                "agent",
+                "session",
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            forced.is_some(),
+            "a requested compaction must not be throttled"
+        );
+        assert_eq!(forced.unwrap().len(), 2);
     }
 }

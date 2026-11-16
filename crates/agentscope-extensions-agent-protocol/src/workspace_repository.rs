@@ -140,6 +140,10 @@ impl ProtocolTaskRepository for WorkspaceProtocolTaskRepository {
     fn find(&self, task_id: &str) -> Option<TaskRecord> {
         futures::executor::block_on(self.find_async(task_id))
     }
+
+    fn active_records(&self) -> Vec<TaskRecord> {
+        futures::executor::block_on(self.list_async())
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +255,30 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec!["t-1".to_string(), "t-2".to_string()]);
+    }
+
+    #[test]
+    fn active_records_exposes_the_persisted_records_for_startup_recovery() {
+        // The trait-level enumeration is what lets a restarting process find the
+        // records whose run died with the previous one; it is synchronous because the
+        // store constructor is.
+        let dir = TempDir::new("active");
+        let repository = WorkspaceProtocolTaskRepository::new(dir.path());
+        ProtocolTaskRepository::save(&repository, &record("t-1", TaskStatus::Running));
+        ProtocolTaskRepository::save(&repository, &record("t-2", TaskStatus::Pending));
+        let mut found: Vec<(String, TaskStatus)> =
+            ProtocolTaskRepository::active_records(&repository)
+                .into_iter()
+                .map(|record| (record.task_id, record.status))
+                .collect();
+        found.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            found,
+            vec![
+                ("t-1".to_string(), TaskStatus::Running),
+                ("t-2".to_string(), TaskStatus::Pending),
+            ]
+        );
     }
 
     #[tokio::test]

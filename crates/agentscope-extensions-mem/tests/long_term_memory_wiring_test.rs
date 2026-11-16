@@ -41,6 +41,23 @@ impl RecordingTransport {
     fn requests(&self) -> Vec<(String, String)> {
         self.requests.lock().unwrap().clone()
     }
+
+    /// Waits for the fire-and-forget record to reach the transport: the middleware records
+    /// the finished turn off the event stream, so the caller may finish first.
+    async fn wait_for_memory_adds(&self) -> Vec<(String, String)> {
+        for _ in 0..200 {
+            let adds: Vec<_> = self
+                .requests()
+                .into_iter()
+                .filter(|(url, _)| url.ends_with(PLATFORM_MEMORIES_ENDPOINT))
+                .collect();
+            if !adds.is_empty() {
+                return adds;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Vec::new()
+    }
 }
 
 #[async_trait]
@@ -187,11 +204,8 @@ async fn the_middleware_retrieves_before_reasoning_and_records_after_the_turn() 
     assert!(searches[0].1.contains(USER_QUERY), "{}", searches[0].1);
 
     // ---- (3) the finished turn is recorded (user input + assistant reply) ----
-    let adds: Vec<_> = requests
-        .iter()
-        .filter(|(url, _)| url.ends_with(PLATFORM_MEMORIES_ENDPOINT))
-        .collect();
-    assert_eq!(adds.len(), 1, "requests: {requests:?}");
+    let adds = transport.wait_for_memory_adds().await;
+    assert_eq!(adds.len(), 1, "requests: {:?}", transport.requests());
     assert!(adds[0].1.contains(USER_QUERY), "{}", adds[0].1);
     assert!(adds[0].1.contains(REPLY_TEXT), "{}", adds[0].1);
 

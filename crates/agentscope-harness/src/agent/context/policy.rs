@@ -51,8 +51,10 @@ impl<'a> EstimateInput<'a> {
 
 /// The default character-based approximation used by the Java harness.
 ///
-/// Method string: `mixed-text-2.5chars-media-sized-v2`. Media blocks are charged by
-/// payload size (images) or a fixed budget (audio/video) instead of one flat rate.
+/// Method string: `mixed-text-weighted-media-sized-v3`. Text is weighed by character class
+/// (ASCII ~4 characters per token, CJK ~1 token per character) instead of a flat rate that
+/// underestimated CJK by ~2.5x. Media blocks are charged by payload size (images) or a fixed
+/// budget (audio/video) instead of one flat rate.
 pub struct ApproximateEstimator;
 
 impl TokenEstimator for ApproximateEstimator {
@@ -70,7 +72,7 @@ impl TokenEstimator for ApproximateEstimator {
         }
         Estimate {
             tokens: count,
-            method: "mixed-text-2.5chars-media-sized-v2".into(),
+            method: "mixed-text-weighted-media-sized-v3".into(),
             exact: false,
         }
     }
@@ -78,7 +80,19 @@ impl TokenEstimator for ApproximateEstimator {
 
 fn text(value: Option<&str>) -> i64 {
     match value {
-        Some(value) => (value.chars().count() as f64 / 2.5).ceil() as i64,
+        Some(value) => {
+            let mut ascii = 0i64;
+            let mut non_ascii = 0i64;
+            for ch in value.chars() {
+                if ch.is_ascii() {
+                    ascii += 1;
+                } else {
+                    non_ascii += 1;
+                }
+            }
+            // A quarter token per ASCII character, one token per CJK/other character.
+            ((ascii as f64 / 4.0) + non_ascii as f64).ceil() as i64
+        }
         None => 0,
     }
 }
@@ -405,10 +419,19 @@ mod tests {
     fn approximate_estimator_counts_text_by_characters() {
         let msg = Msg::user("abcd");
         let estimate = ApproximateEstimator.estimate(&EstimateInput::new(&[msg], &[]));
-        // 12 (per-message overhead) + ceil(4 / 2.5) = 14.
-        assert_eq!(estimate.tokens, 14);
-        assert_eq!(estimate.method, "mixed-text-2.5chars-media-sized-v2");
+        // 12 (per-message overhead) + ceil(4 / 4) = 13.
+        assert_eq!(estimate.tokens, 13);
+        assert_eq!(estimate.method, "mixed-text-weighted-media-sized-v3");
         assert!(!estimate.exact);
+    }
+
+    #[test]
+    fn approximate_estimator_charges_one_token_per_cjk_character() {
+        // Four Chinese characters are ~4 tokens, not ~2: a flat chars/2.5 rate made a
+        // Chinese conversation look half its real size.
+        let msg = Msg::user("你好世界");
+        let estimate = ApproximateEstimator.estimate(&EstimateInput::new(&[msg], &[]));
+        assert_eq!(estimate.tokens, 12 + 4);
     }
 
     #[test]

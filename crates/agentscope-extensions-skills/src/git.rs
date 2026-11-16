@@ -847,8 +847,10 @@ fn first_body_line(skill_md: &str) -> Option<String> {
 }
 
 /// Extracts the top-level scalar keys of the YAML frontmatter (the subset the skill identity
-/// needs: `name` / `description`). Mirrors the Java fallback parser: nested maps and top-level
-/// lists are skipped, `|` / `>` block scalars are folded, quoted scalars are unquoted.
+/// needs: `name` / `description`). Mirrors the Java fallback parser: `|` / `>` block scalars
+/// are folded, quoted scalars are unquoted, and a block sequence (`key:` + indented `- item`
+/// lines) is folded into one newline-joined value (#1438). A nested mapping keeps its key with
+/// an empty value instead of being dropped silently.
 fn frontmatter_scalars(markdown: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let Some(front) = split_frontmatter(markdown).0 else {
@@ -894,7 +896,33 @@ fn frontmatter_scalars(markdown: &str) -> BTreeMap<String, String> {
             continue;
         }
         if value.is_empty() {
-            // Nested mapping or an empty value: not a usable scalar.
+            // Minimal YAML subset: a block sequence (`key:` followed by indented `- item`
+            // lines) is folded into one newline-joined value (#1438).
+            let mut items: Vec<String> = Vec::new();
+            while i < lines.len() {
+                let next = lines[i];
+                let next_trimmed = next.trim();
+                if next_trimmed.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                if !(next.starts_with(' ') || next.starts_with('\t')) {
+                    break;
+                }
+                let Some(item) = next_trimmed.strip_prefix('-') else {
+                    // A nested mapping, not a sequence: keep the key and let the outer loop
+                    // skip the indented lines.
+                    break;
+                };
+                items.push(scalar_value(item));
+                i += 1;
+            }
+            if items.is_empty() {
+                // Unparseable nested structure: keep the key instead of dropping it silently.
+                out.insert(key.to_string(), String::new());
+            } else {
+                out.insert(key.to_string(), items.join("\n"));
+            }
             continue;
         }
         out.insert(key.to_string(), scalar_value(value));
@@ -999,9 +1027,18 @@ mod tests {
         );
         assert_eq!(fm.get("long").map(String::as_str), Some("line1\nline2"));
         assert_eq!(fm.get("folded").map(String::as_str), Some("one two"));
-        assert!(!fm.contains_key("nested"));
-        assert!(!fm.contains_key("child"));
-        assert!(!fm.contains_key("list"));
+        // A block sequence is folded into one newline-joined value (#1438).
+        assert_eq!(fm.get("list").map(String::as_str), Some("a"));
+        // A nested mapping keeps its key (no longer dropped silently) with no scalar value.
+        assert_eq!(fm.get("nested").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn frontmatter_scalars_reads_a_multi_item_sequence() {
+        let md = "---\nname: calc\ntags:\n  - math\n  - tools\n---\nbody\n";
+        let fm = frontmatter_scalars(md);
+        assert_eq!(fm.get("tags").map(String::as_str), Some("math\ntools"));
+        assert_eq!(fm.get("name").map(String::as_str), Some("calc"));
     }
 
     #[test]

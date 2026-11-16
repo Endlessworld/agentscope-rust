@@ -9,7 +9,7 @@ use super::guard::{SandboxExecutionGuard, SandboxGuard};
 use super::key::SandboxIsolationKey;
 use super::lease::SandboxLease;
 use super::state::{SandboxState, SandboxStateStore};
-use super::{Sandbox, SandboxClient, WorkspaceSpec};
+use super::{Sandbox, SandboxClient, SandboxSnapshotSpec, WorkspaceSpec};
 
 /// Result of acquiring a sandbox from `SandboxManager`.
 #[derive(Debug)]
@@ -22,6 +22,9 @@ pub struct SandboxAcquireResult {
 
     /// Guard lease (if configured).
     lease: SandboxLease,
+
+    /// Whether `release` keeps the backend alive (stop + persist, no shutdown).
+    reusable: bool,
 }
 
 impl SandboxAcquireResult {
@@ -31,6 +34,7 @@ impl SandboxAcquireResult {
             sandbox: Some(sandbox),
             self_managed: true,
             lease,
+            reusable: false,
         }
     }
 
@@ -40,6 +44,7 @@ impl SandboxAcquireResult {
             sandbox: Some(sandbox),
             self_managed: true,
             lease: SandboxLease::noop(),
+            reusable: false,
         }
     }
 
@@ -49,7 +54,21 @@ impl SandboxAcquireResult {
             sandbox: Some(sandbox),
             self_managed: false,
             lease: SandboxLease::noop(),
+            reusable: false,
         }
+    }
+
+    /// Marks the sandbox as reusable (or not): a reusable sandbox is only stopped on
+    /// `release` — its backend resource (container / K8s claim) survives so the next call
+    /// resumes instead of rebuilding.
+    pub fn with_reuse(mut self, reusable: bool) -> Self {
+        self.reusable = reusable;
+        self
+    }
+
+    /// Whether `release` keeps the backend resource alive.
+    pub fn is_reusable(&self) -> bool {
+        self.reusable
     }
 
     /// Returns the sandbox.
@@ -131,7 +150,10 @@ impl SandboxManager {
             client,
             state_store,
             agent_id: agent_id.into(),
-            execution_guard: Arc::new(SandboxExecutionGuard::noop()),
+            // The default manager serialises isolation keys in-process (the guard is no
+            // longer a no-op): two calls on one scope must not resume/mutate the same
+            // sandbox concurrently.
+            execution_guard: Arc::new(SandboxExecutionGuard::new()),
         }
     }
 
@@ -216,6 +238,7 @@ impl SandboxManager {
             // mutual exclusion).
             lease = self.execution_guard.try_enter(key.clone()).await?;
         }
+        let reusable = sandbox_context.reuse_on_release();
 
         // Try to load persisted state (Priority 3)
         if let Some(key) = &scope_key {
@@ -228,7 +251,8 @@ impl SandboxManager {
                     // TODO: Update workspace spec if needed
                     match self.client.resume(&state).await {
                         Ok(sandbox) => {
-                            return Ok(SandboxAcquireResult::self_managed(sandbox, lease));
+                            return Ok(SandboxAcquireResult::self_managed(sandbox, lease)
+                                .with_reuse(reusable));
                         }
                         Err(e) => {
                             warn!(
@@ -258,7 +282,18 @@ impl SandboxManager {
             .cloned()
             .unwrap_or_default();
 
-        let snapshot_spec = sandbox_context.snapshot_spec().cloned();
+        let snapshot_spec = sandbox_context.snapshot_spec().cloned().map(|spec| {
+            // Key the snapshot by the isolation scope rather than the freshly generated
+            // sandbox session id: a rebuilt container (or a lost state store) must find the
+            // archive of the *same* scope instead of starting from an empty workspace.
+            match &scope_key {
+                Some(key) => Arc::new(super::snapshot::KeyedSnapshotSpec::new(
+                    spec,
+                    key.to_snapshot_id(),
+                )) as Arc<dyn SandboxSnapshotSpec>,
+                None => spec,
+            }
+        });
         let client_options = sandbox_context.client_options().cloned();
 
         let sandbox = match self
@@ -279,7 +314,7 @@ impl SandboxManager {
             }
         };
 
-        Ok(SandboxAcquireResult::self_managed(sandbox, lease))
+        Ok(SandboxAcquireResult::self_managed(sandbox, lease).with_reuse(reusable))
     }
 
     /// Releases a sandbox (stop + shutdown if self-managed) and closes its guard lease.
@@ -302,10 +337,18 @@ impl SandboxManager {
                     "[sandbox] Releasing self-managed sandbox: {}",
                     sandbox.state().session_id()
                 );
-                // `close()` = stop (persist snapshot) + shutdown (destroy resources). A
-                // failed snapshot must not leave the backend alive, so `shutdown` is still
-                // attempted when `close()` fails: teardown is fail-closed.
-                if let Err(e) = sandbox.close().await {
+                if result.is_reusable() {
+                    // Reusable (session-level) sandbox: persist the snapshot but keep the
+                    // backend resource. Tearing it down here is what makes a Kubernetes
+                    // claim disappear every call (release -> delete claim -> resume 404 ->
+                    // full rebuild). Explicit close / expiry removes it.
+                    if let Err(e) = sandbox.stop().await {
+                        warn!("[sandbox] Failed to stop reusable sandbox: {}", e);
+                    }
+                } else if let Err(e) = sandbox.close().await {
+                    // `close()` = stop (persist snapshot) + shutdown (destroy resources). A
+                    // failed snapshot must not leave the backend alive, so `shutdown` is still
+                    // attempted when `close()` fails: teardown is fail-closed.
                     warn!("[sandbox] Failed to close sandbox: {}", e);
                     if let Err(e) = sandbox.shutdown().await {
                         warn!("[sandbox] Failed to shut down sandbox: {}", e);
@@ -956,6 +999,61 @@ mod tests {
             serde_json::from_str(json)
                 .map_err(|e| agentscope_core::error::Error::Other(e.to_string()))
         }
+    }
+
+    /// A reusable (session-level) sandbox is only stopped on release: `shutdown` is what
+    /// deletes the backend resource (Kubernetes claim / container), and deleting it every
+    /// call made the next call resume a claim that no longer exists (#2979).
+    #[tokio::test]
+    async fn release_keeps_a_reusable_sandbox_backend_alive() {
+        let counters = Arc::new(CloseCounters::default());
+        let manager = SandboxManager::new(
+            Arc::new(MockSandboxClient),
+            Arc::new(InMemorySandboxStateStore::new()),
+            "test-agent",
+        );
+        let result = SandboxAcquireResult::self_managed_no_guard(Box::new(ClosingSandbox {
+            state: closing_state(),
+            counters: Arc::clone(&counters),
+        }))
+        .with_reuse(true);
+
+        manager.release(result).await;
+
+        assert_eq!(
+            counters.stops.load(Ordering::SeqCst),
+            1,
+            "the reusable sandbox still persists its snapshot"
+        );
+        assert_eq!(
+            counters.shutdowns.load(Ordering::SeqCst),
+            0,
+            "release must not destroy a reusable sandbox's backend"
+        );
+    }
+
+    /// The reusable flag is opt-in and survives the acquire path.
+    #[tokio::test]
+    async fn a_reusable_context_marks_the_acquire_result() {
+        let manager = SandboxManager::new(
+            Arc::new(MockSandboxClient),
+            Arc::new(InMemorySandboxStateStore::new()),
+            "test-agent",
+        );
+        let plain = manager
+            .acquire(&agent_scoped_context(), None)
+            .await
+            .unwrap();
+        assert!(!plain.is_reusable());
+        manager.release(plain).await;
+
+        let reusable_context = SandboxContext::builder()
+            .isolation_scope(IsolationScope::Agent)
+            .reuse_on_release(true)
+            .build();
+        let reusable = manager.acquire(&reusable_context, None).await.unwrap();
+        assert!(reusable.is_reusable());
+        manager.release(reusable).await;
     }
 
     #[tokio::test]

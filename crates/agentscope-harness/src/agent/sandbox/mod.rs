@@ -42,9 +42,9 @@ pub use lease::SandboxLease;
 pub use manager::{SandboxAcquireResult, SandboxManager};
 pub use session_state_store::{AgentStateStoreSandboxStateStore, SANDBOX_STATE_KEY};
 pub use snapshot::{
-    LocalSandboxSnapshot, LocalSnapshotSpec, NoopSandboxSnapshot, NoopSnapshotSpec,
-    RemoteSandboxSnapshot, RemoteSnapshotClient, RemoteSnapshotSpec, SandboxSnapshot,
-    SandboxSnapshotSpec,
+    KeyedSnapshotSpec, LocalSandboxSnapshot, LocalSnapshotSpec, NoopSandboxSnapshot,
+    NoopSnapshotSpec, RemoteSandboxSnapshot, RemoteSnapshotClient, RemoteSnapshotSpec,
+    SandboxSnapshot, SandboxSnapshotSpec,
 };
 pub use state::{
     InMemorySandboxStateStore, LocalSandboxState, RemoteSandboxState, SandboxSnapshotRef,

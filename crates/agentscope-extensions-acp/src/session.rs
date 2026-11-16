@@ -2350,19 +2350,28 @@ impl AcpAgentSession {
         }
     }
 
-    /// Persists the live background task handles before the process exits.
+    /// Persists the live background task handles and stops their maintenance tasks before the
+    /// process exits.
     ///
     /// `close` cannot await, so the host calls this alongside it. Without it a task whose
     /// record write failed earlier becomes "not found" after the restart even though its result
-    /// was produced.
+    /// was produced, and the heartbeat keeps rewriting the store after the session is gone.
     pub(crate) async fn flush_background_tasks(&self) {
-        self.agent.task_repository().flush_live().await;
+        self.agent.task_repository().shutdown().await;
     }
 
     /// Cancels the active prompt and waits for its run to settle, so the next prompt cannot
     /// start while the previous execution still owns the journal.
     pub async fn cancel_and_wait(&self, timeout: std::time::Duration) -> bool {
         self.cancel();
+        // `cancel` only moves the generation (it is synchronous), so the child traversal has to
+        // happen here, where the caller already awaits: a cancelled parent must not leave the
+        // subagent tasks it spawned running with nobody to receive their results.
+        let session_id = self.session_id.to_string();
+        self.agent
+            .task_repository()
+            .cancel_session_tasks(&self.session_context(), &session_id)
+            .await;
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if !self.is_running() {
@@ -3529,6 +3538,23 @@ impl AcpAgentSession {
             }
 
             if cancelled {
+                // A cancelled parent must not leave its children behind: the subagent tasks it
+                // spawned keep running (and billing) with nobody left to receive their result,
+                // and the next prompt would find them still "running". Cancel them on the way
+                // out, before waiting for the turn itself to settle.
+                let session_id = self.session_id.to_string();
+                let cancelled_children = self
+                    .agent
+                    .task_repository()
+                    .cancel_session_tasks(&self.session_context(), &session_id)
+                    .await;
+                if cancelled_children > 0 {
+                    tracing::info!(
+                        session = %session_id,
+                        tasks = cancelled_children,
+                        "cancelled the session's subagent tasks along with the prompt"
+                    );
+                }
                 // The ACP cancel flag is the only client-facing cancellation: write it durably
                 // and let the invocation end itself. The tick observes the request at its next
                 // poll and settles the turn as `Cancelled` — a stop, not a rejection, and not a

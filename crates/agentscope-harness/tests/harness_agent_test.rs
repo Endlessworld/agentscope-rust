@@ -238,6 +238,69 @@ fn teams_mode_registers_team_tool() {
     assert!(agent.toolkit().tool_names().contains(&"team".to_string()));
 }
 
+#[tokio::test]
+async fn shutdown_stops_the_task_repository_writes() {
+    // #2147: `TaskRepository::shutdown` had no caller, so the heartbeat kept rewriting the task
+    // store every 30 s after the host believed the agent was closed.
+    #[derive(Default)]
+    struct SpyRepo(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl agentscope_harness::TaskRepository for SpyRepo {
+        async fn get_task(
+            &self,
+            _ctx: &RuntimeContext,
+            _session_id: &str,
+            _task_id: &str,
+        ) -> Option<Arc<agentscope_harness::BackgroundTask>> {
+            None
+        }
+        async fn put_task(
+            &self,
+            _ctx: &RuntimeContext,
+            _task_id: &str,
+            _sub_agent_id: &str,
+            _session_id: &str,
+            _spec: agentscope_harness::TaskRunSpec,
+        ) -> Arc<agentscope_harness::BackgroundTask> {
+            unimplemented!("the spy never runs a task")
+        }
+        async fn remove_task(&self, _ctx: &RuntimeContext, _session_id: &str, _task_id: &str) {}
+        fn clear(&self) {}
+        async fn list_tasks(
+            &self,
+            _ctx: &RuntimeContext,
+            _session_id: &str,
+            _filter: Option<agentscope_harness::TaskStatus>,
+        ) -> Vec<Arc<agentscope_harness::BackgroundTask>> {
+            Vec::new()
+        }
+        async fn cancel_task(
+            &self,
+            _ctx: &RuntimeContext,
+            _session_id: &str,
+            _task_id: &str,
+        ) -> bool {
+            false
+        }
+        async fn shutdown(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let repo = Arc::new(SpyRepo::default());
+    let agent = HarnessAgent::builder()
+        .name("dev")
+        .task_repository(repo.clone() as Arc<dyn agentscope_harness::TaskRepository>)
+        .build();
+    agent.shutdown().await;
+    assert_eq!(
+        repo.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "closing the agent must stop the repository's background writers"
+    );
+}
+
 #[test]
 fn task_repository_override_is_used() {
     let repo: Arc<dyn agentscope_harness::TaskRepository> =

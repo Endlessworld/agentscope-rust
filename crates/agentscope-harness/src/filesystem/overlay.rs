@@ -1,6 +1,6 @@
 //! Layered filesystem overlaying a writable "upper" store on a shared "lower" store,
 //! mirroring `OverlayFilesystem` (copy-on-write semantics).
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
@@ -107,14 +107,24 @@ impl Filesystem for OverlayFilesystem {
             .grep(ctx, pattern, path, glob)
             .await
             .unwrap_or_default();
-        let mut merged: BTreeMap<String, GrepMatch> = BTreeMap::new();
+        let mut merged: Vec<GrepMatch> = Vec::with_capacity(upper.len() + lower.len());
+        // Upper-first per *file*: a lower match survives only when the upper layer does not hold
+        // that file. Keying on "path:line" instead let a lower match on a line the edited upper
+        // file no longer has stay visible (#2448).
+        let mut shadowed: BTreeSet<String> = upper.iter().map(|m| m.path.clone()).collect();
+        merged.extend(upper);
         for m in lower {
-            merged.insert(format!("{}:{}", m.path, m.line), m);
+            if !shadowed.contains(&m.path) && self.upper.exists(ctx, &m.path).await.unwrap_or(false)
+            {
+                shadowed.insert(m.path.clone());
+            }
+            if shadowed.contains(&m.path) {
+                continue;
+            }
+            merged.push(m);
         }
-        for m in upper {
-            merged.insert(format!("{}:{}", m.path, m.line), m);
-        }
-        Ok(merged.into_values().collect())
+        merged.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+        Ok(merged)
     }
 
     async fn glob(&self, ctx: &RuntimeContext, pattern: &str, path: &str) -> Result<Vec<FileInfo>> {
@@ -162,5 +172,49 @@ impl Filesystem for OverlayFilesystem {
     async fn exists(&self, ctx: &RuntimeContext, path: &str) -> Result<bool> {
         Ok(self.upper.exists(ctx, path).await.unwrap_or(false)
             || self.lower.exists(ctx, path).await.unwrap_or(false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filesystem::LocalFilesystem;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fs_overlay_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn grep_hides_lower_matches_of_a_copied_up_file() {
+        let root = temp_dir("grep_shadow");
+        let upper = Arc::new(LocalFilesystem::sandboxed(root.join("upper")));
+        let lower = Arc::new(LocalFilesystem::sandboxed(root.join("lower")));
+        std::fs::create_dir_all(root.join("upper")).unwrap();
+        std::fs::create_dir_all(root.join("lower")).unwrap();
+        let ctx = RuntimeContext::default();
+
+        lower.write(&ctx, "/shared.md", "alpha").await.unwrap();
+        lower.write(&ctx, "/lower-only.md", "alpha").await.unwrap();
+        // The upper copy of `shared.md` no longer contains the pattern.
+        upper.write(&ctx, "/shared.md", "beta").await.unwrap();
+
+        let overlay = OverlayFilesystem::new(upper, lower);
+        let mut paths: Vec<String> = overlay
+            .grep(&ctx, "alpha", Some("/"), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.path)
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["/lower-only.md".to_string()],
+            "an edited upper file must shadow the lower file's stale matches"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

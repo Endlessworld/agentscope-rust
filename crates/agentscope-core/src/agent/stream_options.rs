@@ -133,6 +133,83 @@ impl StreamOptions {
     }
 }
 
+/// Rewrites incremental delta events into cumulative snapshots while
+/// [`StreamOptions::incremental`] is off.
+///
+/// With `incremental = true` (the default) every chunk is delivered as it arrives. A caller that
+/// sets it to `false` asks for whole-text events: each `TextBlockDelta` / `ThinkingBlockDelta`
+/// then carries the text accumulated so far for its reply, so a renderer that cannot append can
+/// simply replace its buffer. The block lifecycle (`Start` / `Delta` / `End`) is unchanged.
+#[derive(Debug, Default)]
+pub struct CumulativeDelta {
+    incremental: bool,
+    text: std::collections::HashMap<String, String>,
+    thinking: std::collections::HashMap<String, String>,
+}
+
+impl CumulativeDelta {
+    /// Creates an adapter for the given mode.
+    pub fn new(incremental: bool) -> Self {
+        Self {
+            incremental,
+            ..Default::default()
+        }
+    }
+
+    /// Returns `event`, rewritten in place when cumulative delivery is requested.
+    pub fn adapt(&mut self, event: AgentEvent) -> AgentEvent {
+        if self.incremental {
+            return event;
+        }
+        let kind = event.event_type();
+        // Deltas are emitted without a `reply_id` (only the block start/end carry it), so a
+        // missing id is not a reason to pass the event through untouched: deltas of one stream
+        // arrive in order and the matching block start resets the buffers.
+        let reply_id = event
+            .data()
+            .fields
+            .get("reply_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        match kind {
+            AgentEventType::TextBlockStart => {
+                self.text.clear();
+                event
+            }
+            AgentEventType::ThinkingBlockStart => {
+                self.thinking.clear();
+                event
+            }
+            AgentEventType::TextBlockDelta | AgentEventType::ThinkingBlockDelta => {
+                let Some(delta) = event.data().fields.get("delta").and_then(|v| v.as_str()) else {
+                    return event;
+                };
+                let buffer = if kind == AgentEventType::TextBlockDelta {
+                    &mut self.text
+                } else {
+                    &mut self.thinking
+                };
+                let cumulative = {
+                    let entry = buffer.entry(reply_id).or_default();
+                    entry.push_str(delta);
+                    entry.clone()
+                };
+                let source = event.source().map(str::to_string);
+                let metadata = event.metadata().clone();
+                let mut fields = event.data().fields.clone();
+                fields.insert("delta".to_string(), serde_json::Value::String(cumulative));
+                let rewritten = AgentEvent::with_fields(kind, fields).with_metadata_map(metadata);
+                match source {
+                    Some(source) => rewritten.with_source(source),
+                    None => rewritten,
+                }
+            }
+            _ => event,
+        }
+    }
+}
+
 /// Builder for [`StreamOptions`].
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptionsBuilder {
@@ -259,5 +336,52 @@ mod tests {
             .build();
         assert!(!opts.should_stream(&AgentEvent::new(AgentEventType::ToolResultTextDelta)));
         assert!(opts.should_stream(&AgentEvent::new(AgentEventType::ToolResultEnd)));
+    }
+
+    fn delta(kind: AgentEventType, text: &str) -> AgentEvent {
+        let mut fields = crate::message::JsonMap::new();
+        fields.insert("delta".to_string(), serde_json::json!(text));
+        AgentEvent::with_fields(kind, fields)
+    }
+
+    fn delta_text(event: &AgentEvent) -> String {
+        event
+            .data()
+            .fields
+            .get("delta")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn incremental_deltas_are_passed_through() {
+        let mut adapter = CumulativeDelta::new(true);
+        let first = adapter.adapt(delta(AgentEventType::TextBlockDelta, "ab"));
+        let second = adapter.adapt(delta(AgentEventType::TextBlockDelta, "cd"));
+        assert_eq!(delta_text(&first), "ab");
+        assert_eq!(delta_text(&second), "cd");
+    }
+
+    #[test]
+    fn cumulative_deltas_carry_the_text_so_far() {
+        // #1211: the visibility of `StreamOptions::incremental` at the event-assembly layer.
+        // Deltas carry no `reply_id`, so the adapter must accumulate them without one.
+        let mut adapter = CumulativeDelta::new(false);
+        let first = adapter.adapt(delta(AgentEventType::TextBlockDelta, "ab"));
+        let second = adapter.adapt(delta(AgentEventType::TextBlockDelta, "cd"));
+        assert_eq!(delta_text(&first), "ab");
+        assert_eq!(delta_text(&second), "abcd");
+        let thinking = adapter.adapt(delta(AgentEventType::ThinkingBlockDelta, "x"));
+        assert_eq!(delta_text(&thinking), "x", "text and thinking buffer apart");
+        // A new block starts the snapshot over.
+        let mut start_fields = crate::message::JsonMap::new();
+        start_fields.insert("reply_id".to_string(), serde_json::json!("r2"));
+        adapter.adapt(AgentEvent::with_fields(
+            AgentEventType::TextBlockStart,
+            start_fields,
+        ));
+        let next = adapter.adapt(delta(AgentEventType::TextBlockDelta, "ef"));
+        assert_eq!(delta_text(&next), "ef");
     }
 }

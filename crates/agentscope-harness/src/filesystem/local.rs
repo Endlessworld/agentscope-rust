@@ -262,7 +262,9 @@ impl LocalFilesystem {
                 if p.is_absolute() {
                     Ok(p.to_path_buf())
                 } else {
-                    Ok(self.root.join(p))
+                    // Normalizing drops `.` components, so `.` resolves to the root itself and
+                    // `ls(".")` reports `/x` instead of `/./x`.
+                    Ok(lexical_normalize(&self.root.join(p)))
                 }
             }
             LocalFsMode::Sandboxed => {
@@ -290,7 +292,7 @@ impl LocalFilesystem {
                         Err(Error::Tool(format!("Path outside root: {path}")))
                     }
                 } else {
-                    Ok(self.root.join(p))
+                    Ok(lexical_normalize(&self.root.join(p)))
                 }
             }
         }

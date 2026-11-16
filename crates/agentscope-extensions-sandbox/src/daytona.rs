@@ -44,6 +44,12 @@ pub struct DaytonaSandboxClientOptions {
     pub memory: Option<u32>,
     /// Disk in GiB.
     pub disk: Option<u32>,
+    /// Send the resource spec even when [`Self::snapshot_id`] is set.
+    ///
+    /// A snapshot already pins cpu/memory/disk, so Daytona rejects a create that specifies them
+    /// again. They are therefore omitted while a snapshot is configured; set this to `true` to
+    /// force an explicit override.
+    pub override_snapshot_resources: bool,
     /// Absolute workspace root inside the sandbox.
     pub workspace_root: String,
     /// TCP connect timeout in seconds.
@@ -67,6 +73,7 @@ impl Default for DaytonaSandboxClientOptions {
             cpu: Some(1),
             memory: Some(1),
             disk: Some(3),
+            override_snapshot_resources: false,
             workspace_root: DEFAULT_WORKSPACE_ROOT.to_string(),
             connect_timeout_seconds: 30,
             read_timeout_seconds: 120,
@@ -77,13 +84,18 @@ impl Default for DaytonaSandboxClientOptions {
 }
 
 /// Builds the `POST /sandbox` request body.
+///
+/// A configured snapshot already carries its own cpu/memory/disk, and Daytona rejects a create
+/// that repeats them, so the resource spec is only sent when no snapshot is used — or when the
+/// caller explicitly asks for an override via
+/// [`DaytonaSandboxClientOptions::override_snapshot_resources`] (#2421).
 pub fn build_create_sandbox_body(options: &DaytonaSandboxClientOptions) -> Value {
     let mut body = serde_json::Map::new();
-    match options
+    let snapshot = options
         .snapshot_id
         .as_ref()
-        .filter(|s| !s.trim().is_empty())
-    {
+        .filter(|s| !s.trim().is_empty());
+    match snapshot {
         Some(snapshot) => {
             body.insert("snapshot".to_string(), Value::String(snapshot.clone()));
         }
@@ -91,14 +103,16 @@ pub fn build_create_sandbox_body(options: &DaytonaSandboxClientOptions) -> Value
             body.insert("image".to_string(), Value::String(options.image.clone()));
         }
     }
-    if let Some(cpu) = options.cpu {
-        body.insert("cpu".to_string(), json!(cpu));
-    }
-    if let Some(memory) = options.memory {
-        body.insert("memory".to_string(), json!(memory));
-    }
-    if let Some(disk) = options.disk {
-        body.insert("disk".to_string(), json!(disk));
+    if snapshot.is_none() || options.override_snapshot_resources {
+        if let Some(cpu) = options.cpu {
+            body.insert("cpu".to_string(), json!(cpu));
+        }
+        if let Some(memory) = options.memory {
+            body.insert("memory".to_string(), json!(memory));
+        }
+        if let Some(disk) = options.disk {
+            body.insert("disk".to_string(), json!(disk));
+        }
     }
     Value::Object(body)
 }
@@ -447,6 +461,18 @@ mod tests {
         let body = build_create_sandbox_body(&options);
         assert_eq!(body["snapshot"], "snap-1");
         assert!(body.get("image").is_none());
+        // #2421: the snapshot already pins the resources, so repeating them is rejected.
+        assert!(body.get("cpu").is_none(), "body: {body}");
+        assert!(body.get("memory").is_none(), "body: {body}");
+        assert!(body.get("disk").is_none(), "body: {body}");
+
+        // An explicit override still reaches the server.
+        options.override_snapshot_resources = true;
+        let body = build_create_sandbox_body(&options);
+        assert_eq!(body["snapshot"], "snap-1");
+        assert_eq!(body["cpu"], 1);
+        assert_eq!(body["memory"], 1);
+        assert_eq!(body["disk"], 3);
     }
 
     #[test]

@@ -146,11 +146,29 @@ fn file_data_to_store_value(fd: &FileData) -> StoreValue {
         "encoding".to_string(),
         serde_json::Value::String(fd.encoding.clone()),
     );
+    // Recorded so `ls` can report a real mtime: an empty timestamp reads as "modified" to the
+    // memory consolidator's watermark, which re-fed every file to the model on each run (#2692).
+    result.insert(
+        "modifiedAt".to_string(),
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    );
     result
 }
 
+/// Timestamp stored with the item, if the store value carries one.
+fn store_modified_at(item: &StoreItem) -> String {
+    item.value
+        .get("modifiedAt")
+        .or_else(|| item.value.get("modified_at"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn normalize_path(path: &str) -> String {
-    if path.trim().is_empty() {
+    // `.` is how a caller names the root of the logical tree (`CompositeFilesystem` routes a
+    // root-equivalent path to its default backend as `.`).
+    if path.trim().is_empty() || path.trim() == "." {
         return "/".to_string();
     }
     let mut normalized = if path.starts_with('/') {
@@ -217,7 +235,13 @@ impl Filesystem for RemoteFilesystem {
                 continue;
             }
             if let Some(fd) = convert_item_to_file_data(&item) {
-                infos.push(FileInfo::file(item.key, fd.content.chars().count() as u64));
+                let modified_at = store_modified_at(&item);
+                infos.push(FileInfo {
+                    path: item.key,
+                    is_directory: false,
+                    size: fd.content.chars().count() as u64,
+                    modified_at,
+                });
             }
         }
         for subdir in subdirs {
@@ -629,5 +653,24 @@ mod tests {
             fs.read(&ctx_b, "/a.md", 0, 0).await.unwrap().content,
             "bob-data"
         );
+    }
+
+    #[tokio::test]
+    async fn ls_reports_the_stored_timestamp_and_accepts_a_dot_root() {
+        let fs = fs();
+        let ctx = RuntimeContext::new();
+        fs.write(&ctx, "/root/a.md", "a").await.unwrap();
+        let entries = fs.ls(&ctx, "/root").await.unwrap();
+        let file = entries.iter().find(|e| e.path == "/root/a.md").unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&file.modified_at).is_ok(),
+            "remote ls must report the stored mtime, got {:?}",
+            file.modified_at
+        );
+
+        // `.` names the same root as `/`: a composite routes its root to the backend as `.`.
+        let dotted = fs.ls(&ctx, ".").await.unwrap();
+        assert!(dotted.iter().any(|e| e.path == "/root/"));
+        assert_eq!(dotted.len(), fs.ls(&ctx, "/").await.unwrap().len());
     }
 }

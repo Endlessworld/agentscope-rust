@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use agentscope_core::agent::{CallableAgent, RuntimeContext};
+use agentscope_core::middleware::MiddlewareChain;
 use agentscope_core::model::{GenerateOptions, Model};
 use agentscope_core::state::AgentStateStore;
 use agentscope_core::tool::Toolkit;
@@ -63,12 +64,52 @@ pub fn allowlisted_inherited_toolkit(parent: &Toolkit, allow: &[String]) -> Tool
     if allow.is_empty() {
         return toolkit;
     }
+    let mut dropped = Vec::new();
     for name in toolkit.tool_names() {
         if !allow.iter().any(|a| a == &name) {
             toolkit.remove_tool(&name);
+            dropped.push(name);
         }
     }
+    // A declared allowlist that names a tool the parent does not have (or that drops almost
+    // everything) used to be silent: the child then ran without the tools and nothing said why.
+    if !dropped.is_empty() {
+        tracing::warn!(
+            dropped = ?dropped,
+            allow = ?allow,
+            "subagent declaration allowlist dropped inherited tools"
+        );
+    }
     toolkit
+}
+
+/// Reads the parent's *current* toolkit when a child is materialised.
+pub type ToolkitProvider = Arc<dyn Fn() -> Option<Toolkit> + Send + Sync>;
+
+/// Shared slot holding an optional [`ToolkitProvider`].
+///
+/// The subagent blueprint and the `agent_spawn` tool hold the same slot: the tool is what a host
+/// can reach, the blueprint is what the leaf factories read at spawn time.
+#[derive(Clone, Default)]
+pub struct ToolkitProviderSlot(Arc<RwLock<Option<ToolkitProvider>>>);
+
+impl ToolkitProviderSlot {
+    /// Installs the provider.
+    pub fn set(&self, provider: ToolkitProvider) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(provider);
+    }
+
+    /// The parent's current toolkit, when a provider is installed and still resolves.
+    pub fn current(&self) -> Option<Toolkit> {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|provider| provider())
+    }
 }
 
 /// `{name}[@{parentSessionId}][#{userId}]`, dropping blank segments; SHARED
@@ -263,6 +304,15 @@ pub struct SubagentBlueprint {
     /// Parent per-call generation defaults children inherit (Java `capturedGenOpts`).
     pub generate_options: Option<GenerateOptions>,
     pub toolkit: Toolkit,
+    /// Reads the parent's live toolkit at spawn time (see [`ToolkitProviderSlot`]).
+    pub toolkit_provider: ToolkitProviderSlot,
+    /// The middlewares the host registered on the parent builder, shared with every child.
+    ///
+    /// A child used to be built from scratch, so the parent's tool governance, HITL, audit and
+    /// budget middlewares never ran for a subagent. Only the caller-supplied chain is inherited:
+    /// the harness's own middlewares (compaction, memory, subagents, sandbox lifecycle, ...) are
+    /// rebuilt per child and must not be shared.
+    pub inherited_middleware: MiddlewareChain,
     pub cwd: Option<PathBuf>,
     pub main_workspace: PathBuf,
     pub max_iters: i32,
@@ -318,8 +368,19 @@ pub struct SubagentBlueprint {
 }
 
 impl SubagentBlueprint {
-    /// `general-purpose` (Java `buildGeneralPurposeFactory`): parent model and
-    /// the full parent toolkit, static leaf so it cannot spawn further.
+    /// The toolkit a child materialised now inherits.
+    ///
+    /// The parent's live toolkit when a provider is installed, otherwise the build-time
+    /// snapshot. Reading it at spawn time is what lets a child see tools registered after the
+    /// parent was built (a host bridges MCP servers into the live toolkit).
+    fn spawn_toolkit(&self) -> Toolkit {
+        self.toolkit_provider
+            .current()
+            .unwrap_or_else(|| self.toolkit.copy())
+    }
+
+    /// `general-purpose` (Java `buildGeneralPurposeFactory`): parent model and the full parent
+    /// toolkit, static leaf so it cannot spawn further.
     pub fn general_purpose_factory(self: &Arc<Self>) -> Arc<dyn SubagentFactory> {
         Arc::new(self.general_purpose_leaf())
     }
@@ -332,7 +393,7 @@ impl SubagentBlueprint {
             name: "general-purpose-subagent".into(),
             description: "General-purpose subagent for isolated task execution".into(),
             sys_prompt: build_subagent_sys_prompt(""),
-            toolkit: self.toolkit.copy(),
+            allow: None,
             workspace: self.main_workspace.clone(),
             max_iters: self.max_iters,
             model_override: None,
@@ -362,7 +423,7 @@ impl SubagentBlueprint {
             name: decl.name.clone(),
             description: decl.description.clone(),
             sys_prompt: build_subagent_sys_prompt(&resolve_declared_sys_prompt_base(decl)),
-            toolkit: allowlisted_inherited_toolkit(&self.toolkit, &decl.tools),
+            allow: Some(decl.tools.clone()),
             workspace: resolve_declared_workspace(decl, &self.main_workspace),
             max_iters: decl.steps.map(|s| s as i32).unwrap_or(self.max_iters),
             model_override: decl.model.clone(),
@@ -383,7 +444,11 @@ struct LeafFactory {
     name: String,
     description: String,
     sys_prompt: String,
-    toolkit: Toolkit,
+    /// Tool allowlist from the declaration (`None` = inherit everything).
+    ///
+    /// Held as the allowlist rather than a pre-filtered toolkit so the narrowing happens
+    /// against the parent's *current* tools at spawn time, not the build-time snapshot.
+    allow: Option<Vec<String>>,
     workspace: PathBuf,
     max_iters: i32,
     /// Model id from the declaration; `None` inherits the parent model.
@@ -404,6 +469,14 @@ impl LeafFactory {
     /// read the concrete `HarnessAgent` configuration (the trait returns
     /// `Arc<dyn CallableAgent>`, which has no downcast hook).
     fn build(&self, parent_rc: &RuntimeContext) -> HarnessAgent {
+        // Snapshot the parent's tools now, not when this factory was created: a host may have
+        // registered tools (MCP servers) after the parent was built, and a child built from the
+        // build-time copy silently did not see them.
+        let base_toolkit = self.blueprint.spawn_toolkit();
+        let toolkit = match &self.allow {
+            Some(allow) => allowlisted_inherited_toolkit(&base_toolkit, allow),
+            None => base_toolkit,
+        };
         let mut builder = HarnessAgent::builder()
             .name(self.name.clone())
             .description(self.description.clone())
@@ -414,7 +487,7 @@ impl LeafFactory {
                 self.blueprint.subagent_depth,
                 self.blueprint.max_subagent_depth,
             )
-            .toolkit(self.toolkit.copy())
+            .toolkit(toolkit)
             .workspace(self.workspace.clone())
             .sys_prompt(self.sys_prompt.clone())
             .max_iters(self.max_iters)
@@ -456,6 +529,13 @@ impl LeafFactory {
         }
         if let Some(store) = &self.blueprint.state_store {
             builder = builder.state_store(Arc::clone(store));
+        }
+        if !self.blueprint.inherited_middleware.is_empty() {
+            // The host's middlewares (tool governance, HITL, audit, budget) run for the child
+            // too. The chain is shared by `Arc`, so a counter or budget is observed across the
+            // whole tree; the harness's own middlewares are rebuilt per child and are not part
+            // of this chain.
+            builder = builder.middleware(self.blueprint.inherited_middleware.clone());
         }
         if let Some(decl) = &self.decl {
             builder = builder.session_id(derive_child_session_id(decl, parent_rc));
@@ -653,7 +733,7 @@ impl SubagentSessionRepair for HarnessSessionRepair {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentscope_core::message::{ContentBlock, Msg, TextBlock};
+    use agentscope_core::message::{ContentBlock, Msg, TextBlock, ToolResultBlock};
     use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 
     /// A model that always answers with a fixed text block.
@@ -679,6 +759,29 @@ mod tests {
         }
     }
 
+    /// A tool whose only job is to be countable in a toolkit.
+    struct NamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl agentscope_core::tool::Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        async fn call(
+            &self,
+            _args: agentscope_core::message::JsonMap,
+            _ctx: agentscope_core::tool::ToolExecutionContext,
+        ) -> agentscope_core::error::Result<ToolResultBlock> {
+            Ok(ToolResultBlock::text("ok"))
+        }
+    }
+
     /// Isolated scratch dir so a child build never touches the repository tree.
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -698,6 +801,8 @@ mod tests {
             skill_filter: SkillFilter::only(&[]),
             generate_options: None,
             toolkit: Toolkit::new(),
+            toolkit_provider: ToolkitProviderSlot::default(),
+            inherited_middleware: MiddlewareChain::default(),
             cwd: Some(dir.clone()),
             main_workspace: dir,
             max_iters: 5,
@@ -1106,6 +1211,26 @@ mod tests {
             .sys_prompt();
         assert!(prompt.contains("Inline Persona"), "{prompt}");
         assert!(prompt.contains("Subagent Context"), "{prompt}");
+    }
+
+    /// #3178: the child adapts the parent's *current* toolkit, not the build-time copy.
+    ///
+    /// A host that registers tools after building the agent (ACP writes MCP tools into the
+    /// toolkit then) used to leave every subagent without them.
+    #[test]
+    fn a_leaf_built_after_the_host_registers_a_tool_sees_it() {
+        let bp = blueprint(false);
+        let mut host = Toolkit::new();
+        host.register_tool(Arc::new(NamedTool("mcp_search")));
+        bp.toolkit_provider
+            .set(Arc::new(move || Some(host.clone())));
+
+        let child = bp.general_purpose_leaf().build(&RuntimeContext::new());
+        let names = child.toolkit().tool_names();
+        assert!(
+            names.contains(&"mcp_search".to_string()),
+            "the child must see the tool registered after build: {names:?}"
+        );
     }
 
     #[test]

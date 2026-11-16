@@ -23,6 +23,8 @@ pub struct TaskRecord {
     pub result: Option<String>,
     pub error_message: Option<String>,
     pub cancel_requested: bool,
+    /// Why the task was cancelled, when a reason was known (never a substitute for `status`).
+    pub cancel_reason: Option<String>,
     pub created_at: u64,
     pub last_checked_at: u64,
     pub last_updated_at: u64,
@@ -57,6 +59,7 @@ impl Default for TaskRecord {
             result: None,
             error_message: None,
             cancel_requested: false,
+            cancel_reason: None,
             created_at: now,
             last_checked_at: now,
             last_updated_at: now,

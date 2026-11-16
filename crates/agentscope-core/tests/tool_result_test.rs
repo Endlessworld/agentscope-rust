@@ -79,14 +79,35 @@ fn dangerous_path_flags_sensitive_files_and_dirs() {
 }
 
 #[test]
-fn dangerous_command_flags_disruptive_fragments() {
-    // DANGEROUS_COMMANDS 已置空（子串 contains 曾误判 `git add`/middleware/--format），
-    // 命令安全改由工具侧审批模式保障。空表对所有常规命令放行。
-    assert!(!is_dangerous_command("rm -rf /tmp/x"));
-    assert!(!is_dangerous_command("sudo rm -rf /"));
-    assert!(!is_dangerous_command("dd if=/dev/zero of=/dev/sda"));
+fn dangerous_command_flags_only_destructive_forms() {
+    // System-level / whole-workspace destruction is refused.
+    assert!(is_dangerous_command("rm -rf /"));
+    assert!(is_dangerous_command("sudo rm -fr ~"));
+    assert!(is_dangerous_command("rm -r -f .agentscope/workspace"));
+    assert!(is_dangerous_command("rm -rf ../other-user"));
+    assert!(is_dangerous_command("rm --recursive --force /tmp/x"));
+    assert!(is_dangerous_command("mkfs.ext4 /dev/sda1"));
+    assert!(is_dangerous_command("dd if=/dev/zero of=/dev/sda"));
+    assert!(is_dangerous_command("echo x > /dev/sda"));
+    assert!(is_dangerous_command("chmod -R 777 /"));
+    assert!(is_dangerous_command("shutdown -h now"));
+    assert!(is_dangerous_command("systemctl reboot"));
+    assert!(is_dangerous_command(":(){ :|:& };:"));
+    // The PowerShell spelling of the same workspace wipe is refused too.
+    assert!(is_dangerous_command(
+        "Remove-Item -Recurse -Force .agentscope/workspace"
+    ));
+    // Ordinary commands keep working: the substring matching that used to reject `git add`
+    // (`dd`) or `--format` is gone, and a recursive delete inside the workspace is not
+    // system-level destruction.
+    assert!(!is_dangerous_command("rm file.txt"));
+    assert!(!is_dangerous_command("rm -rf victim"));
+    assert!(!is_dangerous_command("Remove-Item -Recurse -Force victim"));
+    assert!(!is_dangerous_command("git add -A"));
+    assert!(!is_dangerous_command("cargo fmt --format pretty"));
+    assert!(!is_dangerous_command("echo hello > /dev/null"));
     assert!(!is_dangerous_command("ls -la"));
-    assert!(!is_dangerous_command("echo hello"));
+    assert!(!is_dangerous_command("grep middleware src/lib.rs"));
 }
 
 #[test]

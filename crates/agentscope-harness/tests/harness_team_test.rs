@@ -154,3 +154,40 @@ fn unknown_team_surfaces_not_found() {
     let err = c.create_task("nope", "x", "", vec![]).unwrap_err();
     assert!(matches!(err, TeamError::TeamNotFound(_)));
 }
+
+#[test]
+fn creating_a_team_twice_with_the_same_id_is_refused() {
+    let (c, _t) = team();
+    let task = c.create_task("t1", "keep me", "", vec![]).unwrap();
+
+    let err = c
+        .create_team(TeamCreateSpec {
+            id: "t1".into(),
+            name: "beta".into(),
+            members: vec![TeamMemberSpec::new("other", TeamRole::Lead)],
+        })
+        .unwrap_err();
+    assert!(matches!(err, TeamError::TeamExists(_)));
+
+    // The first team is untouched: its board was not replaced by the second spec.
+    let info = c.team_info("t1").unwrap();
+    assert_eq!(info.name, "alpha");
+    assert!(info.members.iter().any(|m| m.name == "dev"));
+    assert!(c.list_tasks("t1").unwrap().iter().any(|t| t.id == task.id));
+}
+
+#[tokio::test]
+async fn every_subscriber_of_a_member_receives_wakeups() {
+    let (c, t) = team();
+    let first = c.subscribe_wakeups(t, "dev");
+    let second = c.subscribe_wakeups(t, "dev");
+
+    c.send_message(t, "lead", "dev", "ping").unwrap();
+    for wakeups in [&first, &second] {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), wakeups.recv())
+            .await
+            .expect("wakeup within timeout")
+            .expect("the second subscriber must not be starved by the first");
+        assert_eq!(msg.content, "ping");
+    }
+}

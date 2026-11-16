@@ -407,11 +407,11 @@ impl OpenAiChatModel {
         crate::openai::compat::apply_vendor_rules(&model_name, &mut body);
         (body, streaming)
     }
-}
 
-#[async_trait::async_trait]
-impl Model for OpenAiChatModel {
-    fn stream(
+    /// Builds the provider stream for `messages` (`Model::stream` after the media
+    /// pre-flight). Kept as an inherent method so the async pre-flight can run
+    /// before the request body is serialized.
+    fn request_stream(
         &self,
         messages: Vec<Msg>,
         tools: Vec<ToolSchema>,
@@ -492,7 +492,7 @@ impl Model for OpenAiChatModel {
                             let final_resp = acc.into_final();
                             match final_resp {
                                 Some(resp) => {
-                                    return Some((Ok(resp), (chunks, StreamIncrementer::default())))
+                                    return Some((resp, (chunks, StreamIncrementer::default())))
                                 }
                                 None => return None,
                             }
@@ -503,6 +503,31 @@ impl Model for OpenAiChatModel {
         });
 
         Box::pin(stream)
+    }
+}
+
+#[async_trait::async_trait]
+impl Model for OpenAiChatModel {
+    fn stream(
+        &self,
+        messages: Vec<Msg>,
+        tools: Vec<ToolSchema>,
+        options: GenerateOptions,
+    ) -> BoxStream<'_, Result<agentscope_core::model::ChatResponse>> {
+        // Pre-flight the request's remote media. Providers fetch an image URL
+        // themselves and answer an unreachable one with a 400 for the whole call
+        // ("Failed to download multimodal content"), which loses the turn; probing
+        // first lets an unusable media block degrade to a text placeholder instead.
+        let preflight = futures::stream::once(async move {
+            let mut messages = messages;
+            agentscope_core::formatter::media_utils::degrade_unreachable_media(&mut messages).await;
+            (messages, tools, options)
+        });
+        preflight
+            .flat_map(move |(messages, tools, options)| {
+                self.request_stream(messages, tools, options)
+            })
+            .boxed()
     }
 
     fn model_name(&self) -> &str {
@@ -1592,8 +1617,12 @@ struct OpenAiStreamDelta {
 /// be replayed (MODEL-05).
 #[derive(Debug, Deserialize, Default)]
 struct OpenAiToolCallChunk {
+    /// Slot this fragment belongs to. Optional: a provider that streams a single
+    /// call (or a gateway that simply never sends `index`) omits it, and a
+    /// `#[serde(default)] u32` then dropped *every* fragment into slot 0, so two
+    /// calls' arguments were concatenated into `{...}{...}`.
     #[serde(default)]
-    index: u32,
+    index: Option<u32>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -1657,10 +1686,13 @@ fn usage_from_completion(usage: &CompletionUsage) -> ChatUsage {
     }
 }
 
-/// Builds a [`ToolUseBlock`] from a fully-assembled tool call. When the
-/// arguments are not a JSON object (invalid JSON, or a bare string) the raw
-/// text is kept in `content` so it still reaches the event stream instead of
-/// being silently dropped.
+/// Builds a [`ToolUseBlock`] from a fully-assembled tool call.
+///
+/// When the arguments never formed a JSON object (invalid JSON, a bare string, or
+/// two calls concatenated) the raw text is kept in `content` **and** the block is
+/// flagged with [`ToolUseBlock::METADATA_MALFORMED_ARGUMENTS`], so the acting phase
+/// refuses it instead of running the tool with `{}` and losing the error. An empty
+/// `{}` argument object is a valid no-argument call and is not flagged.
 ///
 /// `thought_signature` (OpenRouter / Gemini-via-OpenAI) is persisted under
 /// [`ToolUseBlock::METADATA_THOUGHT_SIGNATURE`] so later turns can replay it.
@@ -1672,8 +1704,12 @@ fn tool_use_block(
 ) -> ToolUseBlock {
     let input = parse_arguments(arguments);
     let mut tool_use = ToolUseBlock::new(id, name, input);
-    if tool_use.input.is_empty() && !arguments.is_empty() {
+    if !arguments.trim().is_empty() && !is_json_object(arguments) {
         tool_use.content = Some(arguments.to_string());
+        tool_use.metadata.insert(
+            ToolUseBlock::METADATA_MALFORMED_ARGUMENTS.to_string(),
+            serde_json::json!(true),
+        );
     }
     if let Some(signature) = thought_signature.filter(|signature| !signature.is_empty()) {
         tool_use.metadata.insert(
@@ -1718,11 +1754,49 @@ fn thinking_block(
 struct StreamIncrementer {
     id: String,
     tool_calls: BTreeMap<u32, ToolCallFragment>,
+    /// Slot of the fragment currently being streamed, so an `index`-less
+    /// continuation fragment lands on its own call instead of slot 0.
+    last_tool_index: Option<u32>,
     usage: Option<ChatUsage>,
     finish_reason: Option<String>,
 }
 
 impl StreamIncrementer {
+    /// Resolves the accumulation slot of one streamed fragment.
+    ///
+    /// With an explicit `index` the slot is the provider's. Without one, a
+    /// fragment that *opens* a call (it carries a name or an id) gets a fresh
+    /// slot, while a continuation (arguments only) extends the call already being
+    /// streamed — the same "merge into the owning call" contract the DashScope and
+    /// Anthropic accumulators implement.
+    fn tool_call_slot(&mut self, chunk: &OpenAiToolCallChunk) -> u32 {
+        if let Some(index) = chunk.index {
+            self.last_tool_index = Some(index);
+            return index;
+        }
+        let opens_a_call = chunk
+            .id
+            .as_deref()
+            .map(|id| !id.trim().is_empty())
+            .unwrap_or(false)
+            || chunk
+                .function
+                .as_ref()
+                .and_then(|function| function.name.as_deref())
+                .map(|name| !name.trim().is_empty())
+                .unwrap_or(false);
+        if opens_a_call {
+            let next = self
+                .tool_calls
+                .keys()
+                .next_back()
+                .map(|last| last + 1)
+                .unwrap_or(0);
+            self.last_tool_index = Some(next);
+            return next;
+        }
+        self.last_tool_index.unwrap_or(0)
+    }
     /// Consumes one chunk, returning a `ChatResponse` carrying only the
     /// incremental text/thinking content of this chunk (or `None` when the chunk
     /// carries no incremental content, e.g. an empty usage-only chunk).
@@ -1753,7 +1827,8 @@ impl StreamIncrementer {
             }
             if let Some(tool_calls) = &delta.tool_calls {
                 for tc in tool_calls {
-                    let frag = self.tool_calls.entry(tc.index).or_default();
+                    let slot = self.tool_call_slot(tc);
+                    let frag = self.tool_calls.entry(slot).or_default();
                     if let Some(id) = &tc.id {
                         frag.id = id.clone();
                     }
@@ -1796,26 +1871,38 @@ impl StreamIncrementer {
 
     /// Flushes the accumulated tool calls, usage and finish reason into a final
     /// [`ChatResponse`]. Returns `None` when nothing was accumulated.
-    fn into_final(self) -> Option<agentscope_core::model::ChatResponse> {
+    ///
+    /// A tool call whose name never arrived is an error rather than a nameless
+    /// [`ToolUseBlock`]: the acting phase would only report `Tool not found: `
+    /// much later, and the streaming `null` name is a provider bug worth naming
+    /// (#1237).
+    fn into_final(self) -> Option<Result<agentscope_core::model::ChatResponse>> {
         let mut blocks: Vec<ContentBlock> = Vec::new();
-        for frag in self.tool_calls.values() {
+        for fragment in self.tool_calls.values() {
+            if fragment.name.trim().is_empty() {
+                return Some(Err(agentscope_core::Error::Model(format!(
+                    "the model streamed a tool call without a name (id {:?}, arguments {:?}); \
+                     the call cannot be dispatched",
+                    fragment.id, fragment.arguments
+                ))));
+            }
             blocks.push(ContentBlock::ToolUse(tool_use_block(
-                frag.id.clone(),
-                frag.name.clone(),
-                &frag.arguments,
-                frag.thought_signature.clone(),
+                fragment.id.clone(),
+                fragment.name.clone(),
+                &fragment.arguments,
+                fragment.thought_signature.clone(),
             )));
         }
         if blocks.is_empty() && self.usage.is_none() {
             return None;
         }
-        Some(agentscope_core::model::ChatResponse::new(
+        Some(Ok(agentscope_core::model::ChatResponse::new(
             self.id,
             blocks,
             self.usage.unwrap_or_default(),
             None,
             self.finish_reason,
-        ))
+        )))
     }
 }
 
@@ -1834,6 +1921,14 @@ fn parse_arguments(args: &str) -> JsonMap {
         .ok()
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default()
+}
+
+/// Whether `args` parses as a JSON object (an empty `{}` included).
+fn is_json_object(args: &str) -> bool {
+    matches!(
+        serde_json::from_str::<serde_json::Value>(args),
+        Ok(serde_json::Value::Object(_))
+    )
 }
 
 /// A single non-streaming chat completion (`stream: false`).
@@ -2270,7 +2365,10 @@ mod tests {
             "id": "x", "choices": [],
             "usage": {"prompt_tokens": 0, "completion_tokens": 5, "total_tokens": 5}
         })));
-        let final_resp = inc.into_final().expect("final response");
+        let final_resp = inc
+            .into_final()
+            .expect("final response")
+            .expect("ok response");
         assert_eq!(final_resp.usage.input_tokens, 10);
         assert_eq!(final_resp.usage.output_tokens, 5);
     }
@@ -2592,7 +2690,7 @@ mod tests {
                     reasoning_details: None,
                     refusal: None,
                     tool_calls: Some(vec![OpenAiToolCallChunk {
-                        index: 0,
+                        index: Some(0),
                         id: Some("call_1".into()),
                         function: Some(OpenAiFunctionChunk {
                             name: Some("get_weather".into()),
@@ -2616,7 +2714,7 @@ mod tests {
                     reasoning_details: None,
                     refusal: None,
                     tool_calls: Some(vec![OpenAiToolCallChunk {
-                        index: 0,
+                        index: Some(0),
                         id: None,
                         function: Some(OpenAiFunctionChunk {
                             name: None,
@@ -2631,7 +2729,10 @@ mod tests {
         };
         assert!(inc.accumulate(&frag2).is_none());
 
-        let final_resp = inc.into_final().expect("tool call flushed");
+        let final_resp = inc
+            .into_final()
+            .expect("tool call flushed")
+            .expect("ok response");
         let tool = match &final_resp.content[0] {
             ContentBlock::ToolUse(t) => t,
             other => panic!("expected ToolUse, got {other:?}"),
@@ -2643,6 +2744,116 @@ mod tests {
             Some("Beijing")
         );
         assert_eq!(final_resp.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn index_less_streamed_tool_calls_are_accumulated_separately() {
+        // A provider that omits `index` used to drop every fragment into slot 0,
+        // so two calls' arguments were concatenated into `{...}{...}`, the parse
+        // failed, and the tools ran with `{}`.
+        let chunk = |value: serde_json::Value| -> OpenAiStreamChunk {
+            serde_json::from_value(value).expect("valid chunk")
+        };
+        let mut inc = StreamIncrementer::default();
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "r3",
+            "choices": [{"delta": {"tool_calls": [{
+                "id": "call_a",
+                "function": {"name": "first", "arguments": "{\"a\":"}
+            }]}}]
+        })));
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "r3",
+            "choices": [{"delta": {"tool_calls": [{
+                "function": {"arguments": "1}"}
+            }]}}]
+        })));
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "r3",
+            "choices": [{"delta": {"tool_calls": [{
+                "id": "call_b",
+                "function": {"name": "second", "arguments": "{\"b\":2}"}
+            }]}}]
+        })));
+
+        let final_resp = inc
+            .into_final()
+            .expect("tool calls flushed")
+            .expect("ok response");
+        let calls: Vec<(&str, &str)> = final_resp
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse(tool) => {
+                    Some((tool.name.as_str(), tool.content.as_deref().unwrap_or("")))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "each call keeps its own slot: {calls:?}");
+        let first = match &final_resp.content[0] {
+            ContentBlock::ToolUse(tool) => tool,
+            other => panic!("expected ToolUse, got {other:?}"),
+        };
+        assert_eq!(first.name, "first");
+        assert_eq!(first.input.get("a").and_then(|v| v.as_i64()), Some(1));
+        assert!(!first.has_malformed_arguments());
+        let second = match &final_resp.content[1] {
+            ContentBlock::ToolUse(tool) => tool,
+            other => panic!("expected ToolUse, got {other:?}"),
+        };
+        assert_eq!(second.name, "second");
+        assert_eq!(second.input.get("b").and_then(|v| v.as_i64()), Some(2));
+    }
+
+    #[test]
+    fn a_streamed_tool_call_without_a_name_fails_the_stream() {
+        // A provider that sends `name: null` (or a gateway that drops the field) used to
+        // produce a nameless block, so the acting phase reported `Tool not found: ` long
+        // after the model call (#1237). The failure now names the real cause.
+        let chunk = |value: serde_json::Value| -> OpenAiStreamChunk {
+            serde_json::from_value(value).expect("valid chunk")
+        };
+        let mut inc = StreamIncrementer::default();
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "r4",
+            "choices": [{"delta": {"tool_calls": [{
+                "id": "call_nameless",
+                "function": {"name": null, "arguments": "{\"a\":1}"}
+            }]}}]
+        })));
+
+        let error = inc
+            .into_final()
+            .expect("a flushed response")
+            .expect_err("a nameless call cannot be dispatched");
+        let text = error.to_string();
+        assert!(text.contains("without a name"), "{text}");
+        assert!(text.contains("call_nameless"), "{text}");
+    }
+
+    #[test]
+    fn unparseable_arguments_are_flagged_instead_of_running_with_empty_arguments() {
+        // `parse_arguments` silently returned an empty map, so the tool ran with
+        // `{}` and no error surfaced anywhere.
+        let block = tool_use_block(
+            "call_1".into(),
+            "get_weather".into(),
+            r#"{"city":"Bei"#,
+            None,
+        );
+        assert!(block.input.is_empty());
+        assert_eq!(block.content.as_deref(), Some(r#"{"city":"Bei"#));
+        assert!(
+            block.has_malformed_arguments(),
+            "must not execute with {{}}"
+        );
+
+        // A valid empty object is a legitimate no-argument call.
+        let no_args = tool_use_block("call_2".into(), "ping".into(), "{}", None);
+        assert!(no_args.input.is_empty());
+        assert!(!no_args.has_malformed_arguments());
+        assert!(no_args.content.is_none());
     }
 
     #[test]
@@ -2680,7 +2891,10 @@ mod tests {
             thinking.metadata.as_ref().unwrap()[ThinkingBlock::METADATA_REASONING_DETAILS],
             serde_json::json!([{"type": "reasoning.text", "text": "step"}])
         );
-        let final_resp = inc.into_final().expect("tool call flushed");
+        let final_resp = inc
+            .into_final()
+            .expect("tool call flushed")
+            .expect("ok response");
         let tool = match &final_resp.content[0] {
             ContentBlock::ToolUse(tool) => tool.clone(),
             other => panic!("expected ToolUse, got {other:?}"),

@@ -503,8 +503,82 @@ pub fn parse_exec_payload(text: &str) -> AgentRunExecResult {
     }
 }
 
+/// Unwraps the AgentRun `{"data": {...}}` response envelope.
+///
+/// The data plane wraps every payload in a `data` object, so deserializing the top level either
+/// fails outright or yields an empty structure (#1907). Responses without the envelope (control
+/// plane, MCP JSON-RPC) are returned unchanged.
+pub fn unwrap_data_envelope(value: Value) -> Value {
+    if let Value::Object(map) = &value {
+        if let Some(data) = map.get("data") {
+            if data.is_object() || data.is_array() {
+                return data.clone();
+            }
+        }
+    }
+    value
+}
+
+/// Reads the mount points the server reports for a sandbox response.
+///
+/// Returns `(mount_dir, writable)` pairs. An empty list means the server did not echo any mount,
+/// i.e. the configured mounts were not applied — the persistence path must key on that rather
+/// than on the local prefix check alone (#2538/#2382).
+pub fn confirmed_mount_dirs(value: &Value) -> Vec<(String, bool)> {
+    let value = unwrap_data_envelope(value.clone());
+    let mut dirs = Vec::new();
+    for (key, writable_by_default) in [("nasMountConfig", true), ("ossMountConfig", false)] {
+        let Some(points) = value
+            .get(key)
+            .and_then(|c| c.get("mountPoints"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for point in points {
+            let Some(dir) = point.get("mountDir").and_then(Value::as_str) else {
+                continue;
+            };
+            let dir = dir.trim();
+            if dir.is_empty() {
+                continue;
+            }
+            let read_only = point
+                .get("readOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(!writable_by_default);
+            dirs.push((dir.to_string(), !read_only));
+        }
+    }
+    dirs
+}
+
+/// Whether the server confirmed a persistent mount that covers the workspace root.
+pub fn workspace_on_confirmed_mount(workspace_root: &str, mounts: &[(String, bool)]) -> bool {
+    let root = workspace_root.trim();
+    !root.is_empty()
+        && mounts
+            .iter()
+            .any(|(dir, writable)| *writable && root.starts_with(dir.as_str()))
+}
+
+/// Decides whether the workspace is durable for this sandbox.
+///
+/// The server's own mount report wins when it has one: a create response that lists mounts means
+/// the mounts are live, and one that lists none means the workspace is sandbox-local despite the
+/// configuration. Without any report the configured prefix check is the only evidence available.
+pub fn workspace_mount_effective(value: &Value, options: &AgentRunSandboxClientOptions) -> bool {
+    let mounts = confirmed_mount_dirs(value);
+    if mounts.is_empty() {
+        options.workspace_on_nas()
+    } else {
+        workspace_on_confirmed_mount(&options.workspace_root, &mounts)
+    }
+}
+
 /// Extracts the sandbox status from a `GET /sandboxes/{id}` response.
 pub fn parse_sandbox_status(value: &Value) -> Option<String> {
+    let value = unwrap_data_envelope(value.clone());
     value
         .get("status")
         .and_then(Value::as_str)
@@ -522,6 +596,10 @@ pub struct AgentRunBackend {
     /// MCP streamable-HTTP session ids, keyed by remote sandbox id (filled by
     /// [`AgentRunBackend::ensure_mcp_session`]).
     mcp_sessions: Mutex<BTreeMap<String, String>>,
+    /// Workspace archives captured by [`AgentRunBackend::kill_sandbox`] when the mount was never
+    /// confirmed by the server (the sandbox is about to be deleted, so these bytes are the only
+    /// copy left). Reachable through [`AgentRunBackend::take_backup`].
+    backups: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 impl AgentRunBackend {
@@ -544,7 +622,14 @@ impl AgentRunBackend {
             retry,
             base_url,
             mcp_sessions: Mutex::new(BTreeMap::new()),
+            backups: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Takes the workspace archive captured when
+    /// [`AgentRunBackend::kill_sandbox`] could not confirm a durable mount.
+    pub async fn take_backup(&self, sandbox_id: &str) -> Option<Vec<u8>> {
+        self.backups.lock().await.remove(sandbox_id)
     }
 
     /// Returns the configured options.
@@ -770,6 +855,19 @@ impl AgentRunBackend {
     }
 
     fn handle_for(&self, sandbox_id: &str) -> RemoteSandboxHandle {
+        self.handle_for_with_mount(sandbox_id, self.options.workspace_on_nas())
+    }
+
+    /// Builds a handle whose persisted NAS flag reflects what the server actually reported.
+    ///
+    /// The flag decides whether [`AgentRunBackend::persist_workspace_bytes`] archives the
+    /// workspace or trusts the mount, so it must follow the server's answer rather than the local
+    /// prefix check alone (#2538/#2382).
+    fn handle_for_with_mount(
+        &self,
+        sandbox_id: &str,
+        mount_effective: bool,
+    ) -> RemoteSandboxHandle {
         let mut extra = BTreeMap::new();
         if let Some(template) = &self.options.template_name {
             extra.insert("template_name".to_string(), template.clone());
@@ -779,9 +877,31 @@ impl AgentRunBackend {
         }
         extra.insert(
             WORKSPACE_ON_NAS_EXTRA_KEY.to_string(),
-            self.options.workspace_on_nas().to_string(),
+            mount_effective.to_string(),
         );
         RemoteSandboxHandle::new(sandbox_id, extra)
+    }
+
+    /// Whether the server explicitly confirms a durable mount covering the workspace.
+    ///
+    /// Only a positive report counts here: a response that echoes no mount at all (or a mount
+    /// elsewhere) is "unconfirmed", so the caller keeps the bytes instead of trusting a mount that
+    /// may not exist. An unreadable answer is unconfirmed for the same reason.
+    async fn mount_confirmed(&self, sandbox_id: &str) -> bool {
+        let url = join_url(&self.base_url, &format!("/sandboxes/{sandbox_id}"));
+        match self.request_json(reqwest::Method::GET, url, None).await {
+            Ok(response) => workspace_on_confirmed_mount(
+                &self.options.workspace_root,
+                &confirmed_mount_dirs(&response),
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    "AgentRun sandbox {sandbox_id}: could not confirm the workspace mount ({e}); \
+                     treating it as unconfirmed"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -807,19 +927,95 @@ impl RemoteBackend for AgentRunBackend {
         self.mcp_sessions.lock().await.remove(&sandbox_id);
         let url = join_url(&self.base_url, "/sandboxes");
         let body = build_create_sandbox_body(&self.options, &sandbox_id)?;
-        self.request_json(reqwest::Method::POST, url, Some(body))
+        let response = self
+            .request_json(reqwest::Method::POST, url, Some(body))
             .await?;
         self.wait_until_ready(&sandbox_id).await?;
-        Ok(self.handle_for(&sandbox_id))
+        // Trust the server's own mount report over the local prefix check (#2538/#2382).
+        let mount_effective = workspace_mount_effective(&response, &self.options);
+        Ok(self.handle_for_with_mount(&sandbox_id, mount_effective))
+    }
+
+    /// Adopts the deterministic sandbox for `session_id` when it already exists.
+    ///
+    /// The first exec runs the MCP `initialize` handshake, which starts the sandbox through
+    /// "resolve or create"; without this probe that start issued a second `CreateSandbox` for an
+    /// id that already exists (#2070). A missing or terminal instance is left to
+    /// [`Self::create_sandbox`].
+    async fn reuse_sandbox(&self, session_id: &str) -> SandboxResult<Option<RemoteSandboxHandle>> {
+        let sandbox_id = derive_sandbox_id(session_id);
+        let url = join_url(&self.base_url, &format!("/sandboxes/{sandbox_id}"));
+        let response = match self.request_json(reqwest::Method::GET, url, None).await {
+            Ok(response) => response,
+            // Any client-side rejection means "no reusable instance": 404 is the documented one,
+            // and creating afterwards surfaces the real error (bad key, bad template) instead of
+            // failing the start on a probe.
+            Err(SandboxExtensionError::Http { status, .. }) if (400..500).contains(&status) => {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        };
+        let status = parse_sandbox_status(&response)
+            .unwrap_or_default()
+            .to_uppercase();
+        if ["FAILED", "TERMINATED", "DELETED", "STOPPED"]
+            .iter()
+            .any(|terminal| status.contains(terminal))
+        {
+            return Ok(None);
+        }
+        let mount_effective = workspace_mount_effective(&response, &self.options);
+        if !status.contains("READY") && !status.contains("RUNNING") {
+            // Still starting: resolve means "hand back a usable sandbox", so wait for it.
+            self.wait_until_ready(&sandbox_id).await?;
+        }
+        Ok(Some(
+            self.handle_for_with_mount(&sandbox_id, mount_effective),
+        ))
     }
 
     async fn connect_sandbox(&self, sandbox_id: &str) -> SandboxResult<RemoteSandboxHandle> {
         let url = join_url(&self.base_url, &format!("/sandboxes/{sandbox_id}"));
-        self.request_json(reqwest::Method::GET, url, None).await?;
-        Ok(self.handle_for(sandbox_id))
+        let response = self.request_json(reqwest::Method::GET, url, None).await?;
+        let mount_effective = workspace_mount_effective(&response, &self.options);
+        Ok(self.handle_for_with_mount(sandbox_id, mount_effective))
     }
 
     async fn kill_sandbox(&self, sandbox_id: &str) -> SandboxResult<()> {
+        // A configured mount that the server never confirmed does not actually keep the
+        // workspace, so the bytes have to be captured *before* the DELETE discards them
+        // (#2538/#2382). The confirmation comes from the live GET, since a handle may have been
+        // persisted by a process that saw a different answer.
+        if self.options.workspace_on_nas() && !self.mount_confirmed(sandbox_id).await {
+            let handle = self.handle_for(sandbox_id);
+            match persist_tar(self, &handle, &self.options.workspace_root).await {
+                Ok(bytes) if !bytes.is_empty() => {
+                    tracing::warn!(
+                        "AgentRun sandbox {sandbox_id}: mount was not confirmed by the server; \
+                         captured {} workspace bytes before deletion (no OSS uploader is \
+                         configured, use `take_backup` to persist them)",
+                        bytes.len()
+                    );
+                    self.backups
+                        .lock()
+                        .await
+                        .insert(sandbox_id.to_string(), bytes);
+                }
+                Ok(_) => tracing::warn!(
+                    "AgentRun sandbox {sandbox_id}: mount was not confirmed and the workspace \
+                     archive is empty; nothing to back up"
+                ),
+                // Keeping the sandbox is the only way to keep the workspace: the caller still
+                // holds its reference, so a retry can back it up properly.
+                Err(e) => {
+                    tracing::warn!(
+                        "AgentRun sandbox {sandbox_id}: workspace backup before deletion failed \
+                         ({e}); keeping the sandbox and its snapshot reference"
+                    );
+                    return Err(e);
+                }
+            }
+        }
         // The MCP session dies with the sandbox, so drop it before the DELETE.
         self.mcp_sessions.lock().await.remove(sandbox_id);
         let url = join_url(&self.base_url, &format!("/sandboxes/{sandbox_id}"));
@@ -1034,6 +1230,269 @@ mod tests {
             ..Default::default()
         });
         assert!(options.workspace_on_nas());
+    }
+
+    #[test]
+    fn data_envelope_is_unwrapped_before_parsing() {
+        // #1907: the data plane answers `{"data": {...}}`, so the top level is not the payload.
+        let wrapped = json!({"data": {"status": "READY"}});
+        assert_eq!(parse_sandbox_status(&wrapped).as_deref(), Some("READY"));
+        assert_eq!(unwrap_data_envelope(wrapped), json!({"status": "READY"}));
+        // Responses without an envelope stay as they are.
+        let plain = json!({"status": "READY"});
+        assert_eq!(parse_sandbox_status(&plain).as_deref(), Some("READY"));
+        // A non-object `data` member is not an envelope.
+        let odd = json!({"data": "text"});
+        assert_eq!(unwrap_data_envelope(odd.clone()), odd);
+    }
+
+    #[test]
+    fn server_reported_mounts_decide_the_workspace_durability() {
+        // #2538/#2382: the server's report wins over the local prefix check.
+        let options = AgentRunSandboxClientOptions {
+            workspace_root: "/home/nas/ws".to_string(),
+            nas_config: Some(AgentRunNasMountConfig {
+                mount_dir: Some("/home/nas".to_string()),
+                ..Default::default()
+            }),
+            ..base_options()
+        };
+        // No report at all: the configuration is the only evidence.
+        assert!(workspace_mount_effective(&json!({}), &options));
+        // An echoed mount confirms it.
+        let echoed =
+            json!({"data": {"nasMountConfig": {"mountPoints": [{"mountDir": "/home/nas"}]}}});
+        assert!(workspace_mount_effective(&echoed, &options));
+        assert_eq!(
+            confirmed_mount_dirs(&echoed),
+            vec![("/home/nas".to_string(), true)]
+        );
+        // A report naming only an unrelated read-only mount says the workspace is local.
+        let elsewhere = json!({"ossMountConfig": {"mountPoints": [{"mountDir": "/data/oss", "readOnly": true}]}});
+        assert!(!workspace_mount_effective(&elsewhere, &options));
+        assert_eq!(
+            confirmed_mount_dirs(&elsewhere),
+            vec![("/data/oss".to_string(), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_reads_the_data_envelope() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let session_id = "envelope-session";
+        let expected = derive_sandbox_id(session_id);
+        let create = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/sandboxes");
+                then.status(200)
+                    .json_body(json!({"data": {"sandboxId": "ack"}}));
+            })
+            .await;
+        let poll_path = format!("/sandboxes/{expected}");
+        let poll = server
+            .mock_async(|when, then| {
+                when.method(GET).path(poll_path.as_str());
+                then.status(200)
+                    .json_body(json!({"data": {"status": "READY"}}));
+            })
+            .await;
+        let backend = AgentRunBackend::new(AgentRunSandboxClientOptions {
+            data_plane_base_url: Some(server.base_url()),
+            // Fail fast instead of waiting the default 300s if the envelope is not unwrapped.
+            ready_timeout_seconds: 1,
+            max_retries: 1,
+            ..base_options()
+        })
+        .unwrap();
+        let handle = backend.create_sandbox(session_id).await.unwrap();
+        create.assert_hits_async(1).await;
+        poll.assert_hits_async(1).await;
+        assert_eq!(handle.id, expected);
+    }
+
+    #[tokio::test]
+    async fn reuse_reports_an_existing_sandbox_without_creating_one() {
+        // #2070: the MCP-triggered start must adopt the sandbox a previous create built.
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let session_id = "reuse-session";
+        let expected = derive_sandbox_id(session_id);
+        let probe_path = format!("/sandboxes/{expected}");
+        let live = server
+            .mock_async(|when, then| {
+                when.method(GET).path(probe_path.as_str());
+                then.status(200)
+                    .json_body(json!({"data": {"status": "READY"}}));
+            })
+            .await;
+        let create = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/sandboxes");
+                then.status(200).json_body(json!({"status": "READY"}));
+            })
+            .await;
+        let backend = AgentRunBackend::new(AgentRunSandboxClientOptions {
+            data_plane_base_url: Some(server.base_url()),
+            max_retries: 1,
+            ..base_options()
+        })
+        .unwrap();
+        let handle = backend
+            .reuse_sandbox(session_id)
+            .await
+            .unwrap()
+            .expect("the live sandbox is adopted");
+        assert_eq!(handle.id, expected);
+        live.assert_hits_async(1).await;
+        create.assert_hits_async(0).await;
+
+        // A missing sandbox falls through to a create.
+        let other = derive_sandbox_id("missing-session");
+        let missing_path = format!("/sandboxes/{other}");
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path(missing_path.as_str());
+                then.status(404);
+            })
+            .await;
+        assert!(backend
+            .reuse_sandbox("missing-session")
+            .await
+            .unwrap()
+            .is_none());
+
+        // A terminal sandbox must be recreated instead of adopted.
+        let dead = derive_sandbox_id("dead-session");
+        let dead_path = format!("/sandboxes/{dead}");
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path(dead_path.as_str());
+                then.status(200).json_body(json!({"status": "TERMINATED"}));
+            })
+            .await;
+        assert!(backend
+            .reuse_sandbox("dead-session")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn kill_backs_up_an_unconfirmed_workspace_before_deleting() {
+        // #2538/#2382: a configured mount the server never confirms is not durable, so the bytes
+        // are captured before the DELETE.
+        use base64::Engine as _;
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let archive = b"tarball".to_vec();
+        let exec_payload = json!({
+            "exitCode": 0,
+            "stdout": base64::engine::general_purpose::STANDARD.encode(&archive),
+        })
+        .to_string();
+        let live = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/sandboxes/sbx-nas");
+                then.status(200).json_body(json!({"status": "READY"}));
+            })
+            .await;
+        let init = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/mcp")
+                    .body_contains("\"method\":\"initialize\"");
+                then.status(200)
+                    .header("Mcp-Session-Id", "s1")
+                    .json_body(json!({
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {"protocolVersion": "2025-03-26"}
+                    }));
+            })
+            .await;
+        let call = server
+            .mock_async(move |when, then| {
+                when.method(POST)
+                    .path("/mcp")
+                    .body_contains("\"method\":\"tools/call\"");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"content": [{"type": "text", "text": exec_payload}], "isError": false}
+                }));
+            })
+            .await;
+        let delete = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/sandboxes/sbx-nas");
+                then.status(200);
+            })
+            .await;
+        let backend = AgentRunBackend::new(AgentRunSandboxClientOptions {
+            workspace_root: "/home/nas/ws".to_string(),
+            nas_config: Some(AgentRunNasMountConfig {
+                mount_dir: Some("/home/nas".to_string()),
+                ..Default::default()
+            }),
+            data_plane_base_url: Some(server.base_url()),
+            mcp_server_url: Some(server.base_url()),
+            max_retries: 1,
+            ..base_options()
+        })
+        .unwrap();
+
+        backend.kill_sandbox("sbx-nas").await.unwrap();
+        live.assert_hits_async(1).await;
+        init.assert_hits_async(1).await;
+        call.assert_hits_async(1).await;
+        delete.assert_hits_async(1).await;
+        assert_eq!(
+            backend.take_backup("sbx-nas").await.as_deref(),
+            Some(archive.as_slice()),
+            "the archive is kept for the caller instead of being deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_keeps_the_sandbox_when_the_backup_fails() {
+        // A failed backup must not be followed by a DELETE: the sandbox is the only copy left.
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let live = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/sandboxes/sbx-nas");
+                then.status(200).json_body(json!({"status": "READY"}));
+            })
+            .await;
+        let broken = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/mcp");
+                then.status(500).body("boom");
+            })
+            .await;
+        let delete = server
+            .mock_async(|when, then| {
+                when.method(DELETE).path("/sandboxes/sbx-nas");
+                then.status(200);
+            })
+            .await;
+        let backend = AgentRunBackend::new(AgentRunSandboxClientOptions {
+            workspace_root: "/home/nas/ws".to_string(),
+            nas_config: Some(AgentRunNasMountConfig {
+                mount_dir: Some("/home/nas".to_string()),
+                ..Default::default()
+            }),
+            data_plane_base_url: Some(server.base_url()),
+            mcp_server_url: Some(server.base_url()),
+            max_retries: 1,
+            ..base_options()
+        })
+        .unwrap();
+        assert!(backend.kill_sandbox("sbx-nas").await.is_err());
+        live.assert_hits_async(1).await;
+        broken.assert_hits_async(1).await;
+        delete.assert_hits_async(0).await;
     }
 
     #[tokio::test]

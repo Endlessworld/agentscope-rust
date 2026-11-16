@@ -311,16 +311,51 @@ fn write_if_changed(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
             return Ok(());
         }
     }
-    std::fs::write(target, bytes)?;
+    write_atomic(target, bytes)?;
     maybe_mark_executable(target, bytes);
     Ok(())
+}
+
+/// Writes through a sibling temp file plus rename, so a reader (another agent instance sharing
+/// the workspace, or `garbage_collect_orphans`) never sees a half-written resource file (#2772).
+///
+/// The rename is retried a few times because on Windows the destination can be briefly open
+/// elsewhere; a permanent failure removes the temp file and reports the last error.
+fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let file_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let tmp = target.with_file_name(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+
+    let mut last_err = None;
+    for attempt in 0..3u64 {
+        match std::fs::rename(&tmp, target) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(5 * (attempt + 1)));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("staging rename failed")))
 }
 
 fn remove_unexpected(staged_dir: &Path, expected: &[PathBuf]) {
     if let Ok(entries) = std::fs::read_dir(staged_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && !expected.iter().any(|e| e == &path) {
+            let dotted = path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+            // Dotted names are in-flight temp files of another writer, never published files.
+            if path.is_file() && !dotted && !expected.iter().any(|e| e == &path) {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -460,6 +495,30 @@ mod tests {
     fn decode_handles_base64_prefix() {
         assert_eq!(decode("base64:aGVsbG8="), b"hello");
         assert_eq!(decode("plain"), b"plain");
+    }
+
+    #[test]
+    fn write_atomic_commits_content_and_leaves_no_temp_file() {
+        let base = std::env::temp_dir().join(format!("asr_stager_atomic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("SKILL.md");
+        std::fs::write(&target, "old").unwrap();
+
+        write_atomic(&target, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        let leftovers: Vec<String> = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

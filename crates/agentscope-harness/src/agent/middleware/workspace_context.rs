@@ -218,6 +218,10 @@ impl Middleware for WorkspaceContextMiddleware {
         // file edit) cannot rewrite the system prompt and invalidate the prompt cache.
         // Without a session id there is nothing to scope the snapshot to, so we rebuild
         // every call rather than pinning a stale section for the process lifetime.
+        //
+        // The host definitions (`AGENTS.md`, `knowledge/`) are read host-first by
+        // `WorkspaceManager`, so what gets frozen is the host copy — a sandbox-side edit can
+        // neither be frozen nor leak into the next session (#3388).
         let session_key = ctx.session_id().map(str::to_string);
         let cached = session_key.as_ref().and_then(|key| {
             let guard = self
@@ -289,8 +293,13 @@ async fn build_workspace_section(
     let knowledge_content = wm.read_knowledge_md(rc).await.trim().to_string();
     let workspace = wm.workspace();
     let effective_workspace = effective_workspace(wm, rc, workspace);
+    // In sandbox mode the workspace the model works in is the sandbox root, not the host
+    // workspace: reporting the host directory here contradicts the `Sandbox root:` line
+    // emitted by `sandbox_paragraph` (#3192).
+    let session_workspace =
+        sandbox_cwd(wm.filesystem()).unwrap_or_else(|| effective_workspace.clone());
     let session_context =
-        build_session_context_section(&effective_workspace, rc, agent_name, environment_memory);
+        build_session_context_section(&session_workspace, rc, agent_name, environment_memory);
 
     let knowledge_block = build_knowledge_block(wm, rc, &knowledge_content, workspace).await;
     let additional_block = build_additional_context_block(wm, rc, additional_context_files).await;
@@ -522,11 +531,24 @@ unless explicitly instructed otherwise.\n",
     Some(sb)
 }
 
-fn sandbox_paragraph(effective: &Path, fs: &dyn Filesystem, artifact_enabled: bool) -> String {
-    let cwd = fs
-        .as_any()
+/// Workspace root reported by the sandbox backend, if the configured filesystem is a
+/// sandbox one.
+///
+/// `PinnedSandboxFilesystem` / `RoutedSandboxFilesystem` forward `as_any` to their inner
+/// sandbox backend, so this also resolves when the prompt sees a wrapper.
+fn sandbox_cwd(fs: Option<&dyn Filesystem>) -> Option<PathBuf> {
+    let fs = fs?;
+    if fs.kind() != FilesystemKind::Sandbox {
+        return None;
+    }
+    fs.as_any()
         .downcast_ref::<SandboxBackedFilesystem>()
-        .map(|sandbox| sandbox.cwd().to_string_lossy().to_string())
+        .map(|sandbox| sandbox.cwd().clone())
+}
+
+fn sandbox_paragraph(effective: &Path, fs: &dyn Filesystem, artifact_enabled: bool) -> String {
+    let cwd = sandbox_cwd(Some(fs))
+        .map(|cwd| cwd.to_string_lossy().to_string())
         .unwrap_or_else(|| effective.to_string_lossy().to_string());
     let mut sb = String::from("## Workspace\n");
     sb.push_str("Sandbox root: ");
@@ -992,6 +1014,27 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_root_is_reported_through_a_pinned_wrapper() {
+        let ws = std::env::temp_dir().join(format!("wctx-pinned-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let inner = Arc::new(SandboxBackedFilesystem::new(
+            Arc::new(LocalFilesystem::new(ws.clone())) as Arc<dyn Filesystem>,
+            ws.clone(),
+        )) as Arc<dyn crate::filesystem::SandboxFilesystem>;
+        let pinned = crate::filesystem::PinnedSandboxFilesystem::new(inner);
+
+        // The wrapper answers for the inner sandbox backend, so the prompt names the sandbox
+        // root instead of falling back to the host workspace (#3192).
+        let paragraph =
+            build_workspace_paragraph(&ws, &ws, Some(&pinned as &dyn Filesystem), false);
+        assert!(
+            paragraph.contains(&format!("Sandbox root: {}", ws.to_string_lossy())),
+            "{paragraph}"
+        );
+        std::fs::remove_dir_all(ws).ok();
+    }
+
+    #[test]
     fn sandbox_prompt_includes_artifact_notice_only_when_enabled() {
         let ws = std::env::temp_dir().join(format!("wctx-sandbox-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&ws).unwrap();
@@ -1006,6 +1049,37 @@ mod tests {
 
         let disabled = build_workspace_paragraph(&ws, &ws, Some(&fs), false);
         assert!(!disabled.contains("File Isolation Notice"), "{disabled}");
+        std::fs::remove_dir_all(ws).ok();
+    }
+
+    #[tokio::test]
+    async fn knowledge_listing_paths_resolve_against_the_filesystem_root() {
+        let ws = std::env::temp_dir().join(format!("wctx-knowledge-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(ws.join("knowledge/specs")).unwrap();
+        std::fs::write(ws.join("knowledge/KNOWLEDGE.md"), "# Knowledge").unwrap();
+        std::fs::write(ws.join("knowledge/specs/a.md"), "spec a").unwrap();
+        // The backend the builder installs by default: rooted at the workspace, which is also
+        // where `read_file` resolves workspace-relative paths (#2683).
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::with_mode(
+            ws.clone(),
+            LocalFsMode::Rooted,
+            10,
+        ));
+        let wm = WorkspaceManager::with_fs(ws.clone(), Some(Arc::clone(&fs)));
+        let rc = RuntimeContext::new();
+
+        let block = build_knowledge_block(&wm, &rc, "", &ws).await;
+        let listed: Vec<&str> = block
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .collect();
+        assert!(listed.len() >= 2, "{block}");
+        for path in listed {
+            // An injected path is exactly what the model passes to `read_file`, so it must
+            // resolve inside the root the listing came from.
+            let data = fs.read(&rc, path, 0, 100).await.expect(path);
+            assert!(!data.content.is_empty(), "{path} read back empty");
+        }
         std::fs::remove_dir_all(ws).ok();
     }
 

@@ -374,6 +374,9 @@ impl Middleware for StateCheckpointMiddleware {
 struct AsyncGate<S> {
     inner: S,
     post: Option<Pin<Box<dyn Future<Output = Option<Error>> + Send>>>,
+    /// The terminal item that stopped the inner stream, delivered only after the post phase
+    /// has run so a failing turn is still checkpointed (#2702).
+    pending: Option<Result<AgentEvent, Error>>,
     phase: Phase,
 }
 
@@ -393,8 +396,31 @@ impl<S> AsyncGate<S> {
         Self {
             inner,
             post: Some(post),
+            pending: None,
             phase: Phase::Pre(pre),
         }
+    }
+}
+
+impl<S> Drop for AsyncGate<S> {
+    fn drop(&mut self) {
+        // A consumer may drop the stream before it drains (a timeout, a closed subscriber). The
+        // post phase is the only writer of the turn's state, so run it once here rather than
+        // losing the checkpoint; `take` keeps the normal drain path from writing twice.
+        if !matches!(self.phase, Phase::Mid | Phase::Post(_)) {
+            return;
+        }
+        let Some(post) = self.post.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Some(error) = post.await {
+                    tracing::warn!(%error, "state checkpoint failed while closing a dropped stream");
+                }
+            });
+        }
+        // Without a runtime the process is shutting down and the store goes with it.
     }
 }
 
@@ -406,6 +432,13 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            // Done: deliver the terminal item the inner stream produced (if any) and finish.
+            if matches!(self.phase, Phase::Done) {
+                return match self.pending.take() {
+                    Some(item) => Poll::Ready(Some(item)),
+                    None => Poll::Ready(None),
+                };
+            }
             match std::mem::replace(&mut self.phase, Phase::Done) {
                 Phase::Pre(mut fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(()) => self.phase = Phase::Mid,
@@ -416,6 +449,18 @@ where
                 },
                 Phase::Mid => match Pin::new(&mut self.inner).poll_next(cx) {
                     Poll::Ready(Some(item)) => {
+                        if item.is_err() {
+                            // An error is usually the last thing a consumer polls: persist the
+                            // turn now instead of waiting for a drain that may never happen
+                            // (#2702 / #1997). The error itself is delivered after the post
+                            // phase, so the caller still observes it.
+                            self.pending = Some(item);
+                            match self.post.take() {
+                                Some(post) => self.phase = Phase::Post(post),
+                                None => self.phase = Phase::Done,
+                            }
+                            continue;
+                        }
                         self.phase = Phase::Mid;
                         return Poll::Ready(Some(item));
                     }
@@ -423,7 +468,7 @@ where
                         if let Some(post) = self.post.take() {
                             self.phase = Phase::Post(post);
                         } else {
-                            return Poll::Ready(None);
+                            self.phase = Phase::Done;
                         }
                     }
                     Poll::Pending => {
@@ -432,15 +477,111 @@ where
                     }
                 },
                 Phase::Post(mut fut) => match fut.as_mut().poll(cx) {
-                    Poll::Ready(None) => return Poll::Ready(None),
-                    Poll::Ready(Some(error)) => return Poll::Ready(Some(Err(error))),
+                    Poll::Ready(None) => self.phase = Phase::Done,
+                    Poll::Ready(Some(error)) => {
+                        // The run's own error outranks a persistence failure: surface it and
+                        // only report the checkpoint problem.
+                        if self.pending.is_none() {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        tracing::warn!(
+                            %error,
+                            "state checkpoint failed while closing an errored run"
+                        );
+                        self.phase = Phase::Done;
+                    }
                     Poll::Pending => {
                         self.phase = Phase::Post(fut);
                         return Poll::Pending;
                     }
                 },
-                Phase::Done => return Poll::Ready(None),
+                Phase::Done => {
+                    return match self.pending.take() {
+                        Some(item) => Poll::Ready(Some(item)),
+                        None => Poll::Ready(None),
+                    };
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use futures::StreamExt;
+
+    use super::*;
+
+    fn post_counter(
+        counter: Arc<AtomicUsize>,
+    ) -> Pin<Box<dyn Future<Output = Option<Error>> + Send>> {
+        Box::pin(async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            None
+        })
+    }
+
+    #[tokio::test]
+    async fn a_stream_error_still_runs_the_post_phase_once() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let inner = futures::stream::iter(vec![
+            Ok(AgentEvent::new(
+                agentscope_core::event::AgentEventType::AgentStart,
+            )),
+            Err(Error::Agent("run failed".into())),
+        ]);
+        let pre = Box::pin(async {}) as Pin<Box<dyn Future<Output = ()> + Send>>;
+        let mut gate = Box::pin(AsyncGate::new(
+            inner,
+            pre,
+            post_counter(Arc::clone(&counter)),
+        ));
+
+        let mut items = Vec::new();
+        while let Some(item) = gate.next().await {
+            items.push(item);
+        }
+
+        assert_eq!(items.len(), 2, "the event and the error are both delivered");
+        assert!(items[1].is_err(), "the run error is still surfaced");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the post phase must run exactly once after an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_still_runs_the_post_phase() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let inner = futures::stream::iter(vec![Ok(AgentEvent::new(
+            agentscope_core::event::AgentEventType::AgentStart,
+        ))]);
+        let pre = Box::pin(async {}) as Pin<Box<dyn Future<Output = ()> + Send>>;
+        let mut gate = Box::pin(AsyncGate::new(
+            inner,
+            pre,
+            post_counter(Arc::clone(&counter)),
+        ));
+
+        // Consume the only item, then abandon the stream before it drains.
+        assert!(gate.next().await.is_some());
+        drop(gate);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while counter.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a dropped stream must still persist the state"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the post phase runs once"
+        );
     }
 }

@@ -28,6 +28,9 @@ pub enum TeamError {
     },
     #[error("team `{0}` not found")]
     TeamNotFound(String),
+    /// A team with this id already exists (`create_team` used to overwrite it silently).
+    #[error("team `{0}` already exists")]
+    TeamExists(String),
     #[error("task `{0}` not found")]
     TaskNotFound(String),
     #[error("member `{0}` not found")]
@@ -294,7 +297,7 @@ struct TeamBoard {
     members: HashMap<String, TeamMemberInfo>,
     tasks: HashMap<String, TeamTask>,
     mailboxes: HashMap<String, Vec<TeamMessage>>,
-    wakeups: HashMap<String, tokio::sync::mpsc::UnboundedSender<TeamMessage>>,
+    wakeups: HashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<TeamMessage>>>,
 }
 
 /// Single-node [`TeamClient`] with per-task versioned CAS updates.
@@ -377,8 +380,11 @@ impl LocalTeamClient {
                 .entry(to.clone())
                 .or_default()
                 .push(msg.clone());
-            if let Some(tx) = board.wakeups.get(to) {
-                let _ = tx.send(msg);
+            // Every subscriber of the member gets the wakeup: the map used to key one sender per
+            // member name, so a second subscriber replaced the first and its `recv()` returned
+            // `None` immediately. A closed subscriber is dropped rather than kept forever.
+            if let Some(senders) = board.wakeups.get_mut(to) {
+                senders.retain(|tx| tx.send(msg.clone()).is_ok());
             }
         }
     }
@@ -415,14 +421,17 @@ impl TeamClient for LocalTeamClient {
             name: spec.name.clone(),
             members,
         };
+        // Two teams used to share one id: `insert` replaced the previous board, so every task and
+        // member of the first team silently disappeared. Refuse instead.
+        let mut boards = self.boards.lock().unwrap();
+        if boards.contains_key(&spec.id) {
+            return Err(TeamError::TeamExists(spec.id));
+        }
         self.names
             .lock()
             .unwrap()
             .insert(spec.id.clone(), spec.name);
-        self.boards
-            .lock()
-            .unwrap()
-            .insert(spec.id, Arc::new(Mutex::new(board)));
+        boards.insert(spec.id, Arc::new(Mutex::new(board)));
         Ok(info)
     }
 
@@ -612,7 +621,11 @@ impl TeamClient for LocalTeamClient {
     fn subscribe_wakeups(&self, team_id: &str, member: &str) -> TeamWakeups {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let _ = self.with_board(team_id, |board| {
-            board.wakeups.insert(member.to_string(), tx);
+            board
+                .wakeups
+                .entry(member.to_string())
+                .or_default()
+                .push(tx);
             Ok(())
         });
         TeamWakeups {

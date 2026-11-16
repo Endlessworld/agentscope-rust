@@ -22,6 +22,23 @@ pub const RETRIEVED_KNOWLEDGE_OPEN: &str =
 /// Closing tag of the injected knowledge block.
 pub const RETRIEVED_KNOWLEDGE_CLOSE: &str = "\n</retrieved_knowledge>";
 
+/// Metadata key that marks a message a middleware injected into the model request.
+///
+/// Middleware-injected `USER` messages (retrieved knowledge, long-term memory, …) are not the
+/// user's own input: [`extract_query_from_messages`] must skip them so an outer middleware's
+/// injection never becomes an inner middleware's retrieval query (#1403). Every injecting
+/// middleware must tag what it adds with this key and `true`; the memory middleware uses the
+/// same literal (the crates do not depend on each other).
+pub const INTERNAL_MESSAGE_METADATA_KEY: &str = "agentscope.internal_message";
+
+/// Whether `msg` was injected by a middleware rather than typed by the user.
+pub fn is_internal_message(msg: &Msg) -> bool {
+    msg.metadata()
+        .get(INTERNAL_MESSAGE_METADATA_KEY)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 /// Renders documents in the agentic-tool textual format.
 ///
 /// Mirrors Java `KnowledgeRetrievalTools.formatDocumentsForTool`: a header with the number
@@ -79,16 +96,19 @@ pub fn build_retrieved_knowledge_msg(documents: &[Document]) -> Msg {
         .name("user")
         .role(MsgRole::User)
         .content(blocks)
+        .metadata_entry(INTERNAL_MESSAGE_METADATA_KEY, serde_json::json!(true))
         .build()
 }
 
-/// Finds the query text from the last `USER` message in a history.
+/// Finds the query text from the last user-authored `USER` message in a history.
 ///
 /// Mirrors Java `GenericRAGHook.extractQueryFromMessages`: scans backwards and returns the
-/// first `USER` message's text content; empty string when none is present.
+/// first `USER` message's text content; empty string when none is present. Messages carrying
+/// [`INTERNAL_MESSAGE_METADATA_KEY`] were injected by another middleware and are skipped
+/// (#1403).
 pub fn extract_query_from_messages(messages: &[Msg]) -> String {
     for msg in messages.iter().rev() {
-        if msg.role() == MsgRole::User {
+        if msg.role() == MsgRole::User && !is_internal_message(msg) {
             return msg.text_content();
         }
     }
@@ -150,6 +170,24 @@ mod tests {
             Msg::assistant("tool-ish reply"),
         ];
         assert_eq!(extract_query_from_messages(&history), "second");
+    }
+
+    #[test]
+    fn query_extraction_skips_middleware_injected_user_messages() {
+        let injected = build_retrieved_knowledge_msg(&[doc("alpha", Some(0.5))]);
+        let history = vec![Msg::user("real question"), injected];
+        assert_eq!(extract_query_from_messages(&history), "real question");
+
+        // Only injected messages: there is no user query to retrieve for.
+        let history = vec![build_retrieved_knowledge_msg(&[doc("alpha", None)])];
+        assert_eq!(extract_query_from_messages(&history), "");
+    }
+
+    #[test]
+    fn the_injected_knowledge_message_is_marked_internal() {
+        let msg = build_retrieved_knowledge_msg(&[doc("alpha", None)]);
+        assert!(is_internal_message(&msg));
+        assert!(!is_internal_message(&Msg::user("typed by the user")));
     }
 
     #[test]

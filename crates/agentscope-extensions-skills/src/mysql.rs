@@ -158,9 +158,15 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
     }
 
     /// The fully-qualified table name (`<database>.<table>`), mirroring `getFullTableName`.
-    /// Identifiers are validated in the constructor, so plain concatenation is safe here.
+    ///
+    /// Identifiers are validated in the constructor, and they are still backtick-quoted here so
+    /// a reserved word (`order`, `select`, …) works as a database / table name (#3248).
     fn full_table_name(&self, table: &str) -> String {
-        format!("{}.{}", self.cfg.database_name, table)
+        format!(
+            "{}.{}",
+            quote_identifier(&self.cfg.database_name),
+            quote_identifier(table)
+        )
     }
 
     /// The skills table name.
@@ -193,7 +199,7 @@ impl<D: SqlDatabase> MysqlSkillRepository<D> {
         let sql = format!(
             "CREATE DATABASE IF NOT EXISTS {} DEFAULT CHARACTER SET utf8mb4 COLLATE \
              utf8mb4_unicode_ci",
-            self.cfg.database_name
+            quote_identifier(&self.cfg.database_name)
         );
         let mut conn = self.db.connection()?;
         conn.execute(&sql, &[])?;
@@ -673,6 +679,14 @@ impl<D: SqlDatabase> AgentSkillRepository for MysqlSkillRepository<D> {
     }
 }
 
+/// Backtick-quotes a MySQL identifier, doubling any embedded backtick.
+///
+/// Identifiers cannot be bound as statement parameters, so they are spliced into the SQL text;
+/// quoting keeps reserved words (`order`, `select`, …) usable as database / table names (#3248).
+fn quote_identifier(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -969,6 +983,29 @@ mod tests {
         assert_eq!(db.inner().rows("agentscope_skill_resources").len(), 1);
         // The body comes back from `skill_content`, so the caller still sees two resources.
         assert_eq!(r.get_skill("calc").unwrap().resources().len(), 2);
+    }
+
+    #[test]
+    fn reserved_word_identifiers_are_backtick_quoted() {
+        let db = Arc::new(InMemorySqlDatabase::new());
+        let cfg = MysqlSkillRepositoryConfig::default()
+            .database_name("order")
+            .skills_table_name("select")
+            .resources_table_name("group");
+        let repo = MysqlSkillRepository::with_config(db.clone(), cfg).unwrap();
+
+        assert_eq!(repo.full_table_name("select"), "`order`.`select`");
+        assert_eq!(repo.full_table_name("group"), "`order`.`group`");
+        // The DDL really ran against the quoted names.
+        assert!(db.schema_exists("order"));
+        assert!(db.table_exists("select"));
+        assert!(db.table_exists("group"));
+    }
+
+    #[test]
+    fn quote_identifier_doubles_embedded_backticks() {
+        assert_eq!(quote_identifier("plain"), "`plain`");
+        assert_eq!(quote_identifier("we`ird"), "`we``ird`");
     }
 
     /// SKILLS-08: Java `SkillUtil.createFrom` stores `parsed.getContent()` - the body after the
