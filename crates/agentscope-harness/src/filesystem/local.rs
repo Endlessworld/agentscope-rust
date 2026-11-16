@@ -341,7 +341,13 @@ impl Filesystem for LocalFilesystem {
     }
 
     async fn ls(&self, ctx: &RuntimeContext, path: &str) -> Result<Vec<FileInfo>> {
-        let dir = self.resolve(ctx, path)?;
+        // `/` (and an empty path) means the filesystem root, matching `glob`. `Rooted` mode
+        // would otherwise reject it as an absolute host path.
+        let dir = if path == "/" || path.is_empty() {
+            self.root.clone()
+        } else {
+            self.resolve(ctx, path)?
+        };
         if !dir.exists() {
             return Err(Error::Tool(format!("Path does not exist: {path}")));
         }
@@ -538,7 +544,12 @@ impl Filesystem for LocalFilesystem {
         path: Option<&str>,
         glob: Option<&str>,
     ) -> Result<Vec<GrepMatch>> {
-        let base = self.resolve(ctx, path.unwrap_or("."))?;
+        // `grep_files` defaults its `path` to `/`; in `Rooted` mode `resolve("/")` would reject
+        // it as an absolute host path. Mirror `glob`: `/` (and an empty path) is the root.
+        let base = match path {
+            Some("/") | Some("") | None => self.root.clone(),
+            Some(p) => self.resolve(ctx, p)?,
+        };
         if !base.exists() {
             return Ok(Vec::new());
         }

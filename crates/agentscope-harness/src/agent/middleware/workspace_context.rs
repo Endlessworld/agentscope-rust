@@ -123,6 +123,11 @@ pub struct WorkspaceContextMiddleware {
     disable_memory_hooks: bool,
     artifact_delivery_enabled: bool,
     use_legacy_xml_workspace_context: bool,
+    /// Directory the caller opened (the harness `cwd`), when it differs from the workspace.
+    ///
+    /// The default backend anchors tool paths there, so the prompt has to name it: otherwise
+    /// the model keeps addressing `AGENTS.md` / `src/` relative to the state directory.
+    project_root: Option<PathBuf>,
     /// Rendered workspace section frozen for the lifetime of one session.
     ///
     /// Re-reading AGENTS.md / MEMORY.md / knowledge on every model call changes the
@@ -174,6 +179,7 @@ impl WorkspaceContextMiddleware {
             disable_memory_hooks: false,
             artifact_delivery_enabled: false,
             use_legacy_xml_workspace_context: false,
+            project_root: None,
             frozen_section: Mutex::new(None),
         }
     }
@@ -201,6 +207,12 @@ impl WorkspaceContextMiddleware {
     /// legacy XML document instead of the markdown + `<loaded_context>` layout.
     pub fn set_use_legacy_xml_workspace_context(&mut self, enabled: bool) {
         self.use_legacy_xml_workspace_context = enabled;
+    }
+
+    /// Names the directory the caller opened when tool paths anchor there instead of the
+    /// workspace (`cwd != workspace` on the default filesystem).
+    pub fn set_project_root(&mut self, project_root: Option<PathBuf>) {
+        self.project_root = project_root;
     }
 }
 
@@ -247,6 +259,7 @@ impl Middleware for WorkspaceContextMiddleware {
                     self.disable_memory_hooks,
                     self.artifact_delivery_enabled,
                     self.use_legacy_xml_workspace_context,
+                    self.project_root.as_deref(),
                 )
                 .await;
                 if let Some(key) = session_key.clone() {
@@ -279,6 +292,7 @@ async fn build_workspace_section(
     disable_memory_hooks: bool,
     artifact_delivery_enabled: bool,
     use_legacy_xml_workspace_context: bool,
+    project_root: Option<&Path>,
 ) -> String {
     // Mirrors Java `includeMemoryContext()`: MEMORY.md is hidden only when both the
     // memory tools and the background hooks are off.
@@ -333,6 +347,7 @@ async fn build_workspace_section(
         &effective_workspace,
         wm.filesystem(),
         artifact_delivery_enabled,
+        project_root,
     );
     let loaded_context = build_loaded_context_section(
         &agents_content,
@@ -607,6 +622,7 @@ fn build_workspace_paragraph(
     effective: &Path,
     fs: Option<&dyn Filesystem>,
     artifact_delivery_enabled: bool,
+    project_root: Option<&Path>,
 ) -> String {
     let kind = fs.map(Filesystem::kind);
     let mut sb = match kind {
@@ -619,7 +635,21 @@ fn build_workspace_paragraph(
         Some(FilesystemKind::Composite) | Some(FilesystemKind::Remote) => {
             distributed_paragraph(workspace)
         }
-        _ => legacy_paragraph(workspace),
+        _ => {
+            // The default backend anchors tool paths at the project directory, while agent
+            // state (AGENTS.md, MEMORY.md, memory/, skills/, knowledge/) stays in the
+            // workspace. Name both, or the model reads project files relative to the state
+            // directory and writes agent state relative to the project.
+            let mut paragraph = legacy_paragraph(project_root.unwrap_or(workspace));
+            if project_root.is_some() {
+                paragraph.push_str(&format!(
+                    "Agent state (AGENTS.md, MEMORY.md, memory/, skills/, knowledge/) lives in: \
+{}\n",
+                    workspace.display()
+                ));
+            }
+            paragraph
+        }
     };
     sb.push_str(
         "AGENTS.md defines persona and local conventions — honor them when consistent \
@@ -947,7 +977,7 @@ mod tests {
     #[test]
     fn workspace_paragraph_mentions_directory() {
         let p = Path::new("/tmp/ws");
-        let out = build_workspace_paragraph(p, p, None, false);
+        let out = build_workspace_paragraph(p, p, None, false, None);
         assert!(out.starts_with("## Workspace\n"));
         assert!(out.contains("/tmp/ws"));
         assert!(out.contains("AGENTS.md"));
@@ -986,6 +1016,33 @@ mod tests {
     }
 
     #[test]
+    fn the_workspace_prompt_names_the_project_directory_and_the_state_directory() {
+        // With the default backend, tools anchor relative paths at `cwd` while agent state stays
+        // in the workspace; the prompt has to say both or the model edits the wrong tree.
+        let project = std::path::PathBuf::from("C:\\proj");
+        let workspace = project.join(".agentscope").join("workspace");
+        let paragraph =
+            build_workspace_paragraph(&workspace, &workspace, None, false, Some(&project));
+        assert!(
+            paragraph.contains("Your working directory is: C:\\proj"),
+            "{paragraph}"
+        );
+        assert!(
+            paragraph.contains("Agent state (AGENTS.md, MEMORY.md, memory/, skills/, knowledge/)"),
+            "{paragraph}"
+        );
+        assert!(
+            paragraph.contains("C:\\proj\\.agentscope\\workspace"),
+            "{paragraph}"
+        );
+
+        // Without a separate project root the paragraph keeps the workspace wording.
+        let legacy = build_workspace_paragraph(&workspace, &workspace, None, false, None);
+        assert!(legacy.contains("Your working directory is: C:\\proj\\.agentscope\\workspace"));
+        assert!(!legacy.contains("Agent state ("), "{legacy}");
+    }
+
+    #[test]
     fn java_style_temp_dir_keeps_a_trailing_separator() {
         assert!(java_style_temp_dir().ends_with(std::path::MAIN_SEPARATOR));
         assert!(!platform_description().trim().is_empty());
@@ -1002,7 +1059,7 @@ mod tests {
         let lower: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(ws.clone()));
         let fs: Arc<dyn Filesystem> = Arc::new(OverlayFilesystem::new(upper, lower));
 
-        let paragraph = build_workspace_paragraph(&ws, &ws, Some(fs.as_ref()), false);
+        let paragraph = build_workspace_paragraph(&ws, &ws, Some(fs.as_ref()), false, None);
         assert!(paragraph.contains("Additional roots:"), "{paragraph}");
         assert!(
             paragraph.contains(&extra.to_string_lossy().to_string()),
@@ -1026,7 +1083,7 @@ mod tests {
         // The wrapper answers for the inner sandbox backend, so the prompt names the sandbox
         // root instead of falling back to the host workspace (#3192).
         let paragraph =
-            build_workspace_paragraph(&ws, &ws, Some(&pinned as &dyn Filesystem), false);
+            build_workspace_paragraph(&ws, &ws, Some(&pinned as &dyn Filesystem), false, None);
         assert!(
             paragraph.contains(&format!("Sandbox root: {}", ws.to_string_lossy())),
             "{paragraph}"
@@ -1043,11 +1100,11 @@ mod tests {
             ws.clone(),
         );
 
-        let enabled = build_workspace_paragraph(&ws, &ws, Some(&fs), true);
+        let enabled = build_workspace_paragraph(&ws, &ws, Some(&fs), true, None);
         assert!(enabled.contains("File Isolation Notice"), "{enabled}");
         assert!(enabled.contains("deliver_artifact"), "{enabled}");
 
-        let disabled = build_workspace_paragraph(&ws, &ws, Some(&fs), false);
+        let disabled = build_workspace_paragraph(&ws, &ws, Some(&fs), false, None);
         assert!(!disabled.contains("File Isolation Notice"), "{disabled}");
         std::fs::remove_dir_all(ws).ok();
     }
@@ -1101,6 +1158,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .await;
         assert!(section.contains("AgentStateStore Context"));
@@ -1131,6 +1189,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .await;
         assert!(both_enabled.contains("## Memory Recall"));
@@ -1150,6 +1209,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .await;
         assert!(!tools_disabled.contains("## Memory Recall"));
@@ -1170,6 +1230,7 @@ mod tests {
             true,
             false,
             false,
+            None,
         )
         .await;
         assert!(hooks_disabled.contains("## Memory Recall"));
@@ -1188,6 +1249,7 @@ mod tests {
             true,
             false,
             false,
+            None,
         )
         .await;
         assert!(!both_disabled.contains("## Memory Recall"));
@@ -1219,6 +1281,7 @@ mod tests {
             false,
             false,
             true,
+            None,
         )
         .await;
         assert!(xml.starts_with("<workspace_context>"), "{xml}");

@@ -2235,10 +2235,19 @@ impl HarnessAgentBuilder {
         let agent_id = self.agent_id.clone().unwrap_or_else(|| name.clone());
         // Spec-built filesystems need the resolved workspace root, so they are assembled here
         // rather than by the caller (Java `Builder.filesystem(Local/RemoteFilesystemSpec)`).
-        // Java's default is a rooted backend. `LocalFilesystem::new` is `Unrestricted`, so an
-        // absolute path from the model (`C:\Users\...`, `/etc/passwd`) resolved against the
-        // host filesystem instead of the workspace (#2065).
-        let filesystem = self
+        //
+        // The default backend has two views over the same tree:
+        //
+        // - agent state (`filesystem`): relative paths anchor at the workspace
+        //   (`<cwd>/.agentscope/workspace`), because AGENTS.md / MEMORY.md / `memory/` /
+        //   `skills/` / sessions are addressed that way;
+        // - tools (`project_filesystem`): relative paths anchor at `cwd`, the directory the
+        //   caller opened (ACP reports it as `cwd`), so `list_files(".")` lists the project
+        //   and `read_file("src/main.rs")` reads the code being edited.
+        //
+        // Both are `Rooted` and accept absolute paths under either directory, so the model can
+        // still reach agent state by absolute path and cannot escape to the host (#2065).
+        let configured_filesystem = self
             .filesystem
             .clone()
             .or_else(|| {
@@ -2250,23 +2259,58 @@ impl HarnessAgentBuilder {
                 self.remote_filesystem_spec
                     .as_ref()
                     .map(|spec| spec.build(&resolved_workspace, &agent_id))
-            })
-            .unwrap_or_else(|| {
-                Arc::new(LocalFilesystem::with_mode(
+            });
+        let uses_default_filesystem = configured_filesystem.is_none();
+        let filesystem: Arc<dyn Filesystem> = configured_filesystem.unwrap_or_else(|| {
+            Arc::new(
+                LocalFilesystem::with_mode(
                     resolved_workspace.clone(),
                     LocalFsMode::Rooted,
                     DEFAULT_MAX_FILE_SIZE_MB,
-                ))
-            });
-        // Extra routes layer over whichever backend was resolved above; longest prefix wins.
-        let filesystem: Arc<dyn Filesystem> = if self.filesystem_routes.is_empty() {
-            filesystem
+                )
+                .with_additional_roots(vec![resolved_workspace.clone(), cwd.clone()]),
+            )
+        });
+        let project_filesystem: Arc<dyn Filesystem> = if uses_default_filesystem {
+            Arc::new(
+                LocalFilesystem::with_mode(
+                    cwd.clone(),
+                    LocalFsMode::Rooted,
+                    DEFAULT_MAX_FILE_SIZE_MB,
+                )
+                .with_additional_roots(vec![cwd.clone(), resolved_workspace.clone()]),
+            )
         } else {
-            Arc::new(CompositeFilesystem::new(
-                filesystem,
-                self.filesystem_routes.clone(),
-            ))
+            Arc::clone(&filesystem)
         };
+        // Extra routes layer over whichever backend was resolved above; longest prefix wins.
+        let (filesystem, project_filesystem): (Arc<dyn Filesystem>, Arc<dyn Filesystem>) =
+            if self.filesystem_routes.is_empty() {
+                (filesystem, project_filesystem)
+            } else {
+                (
+                    Arc::new(CompositeFilesystem::new(
+                        filesystem,
+                        self.filesystem_routes.clone(),
+                    )),
+                    Arc::new(CompositeFilesystem::new(
+                        project_filesystem,
+                        self.filesystem_routes.clone(),
+                    )),
+                )
+            };
+        // Tool-result spill files are agent state: pin them inside the workspace and hand the
+        // model the absolute path, because tools anchor relative paths at `cwd`. Otherwise the
+        // spill directory lands in the project root while the placeholder path resolves
+        // elsewhere, so `read_file` on it would miss.
+        let tool_result_eviction_config =
+            self.tool_result_eviction_config.clone().map(|mut cfg| {
+                if uses_default_filesystem {
+                    cfg.eviction_path =
+                        eviction_path_in_workspace(&resolved_workspace, &cfg.eviction_path);
+                }
+                cfg
+            });
         let description = self.description.clone();
         let environment = self
             .environment
@@ -2415,7 +2459,7 @@ impl HarnessAgentBuilder {
             // Compiler-driven eviction uses the same thresholds as the middleware: one
             // policy, two call sites (the compiler runs first).
             if !self.disable_tool_result_eviction {
-                if let Some(cfg) = self.tool_result_eviction_config.clone() {
+                if let Some(cfg) = tool_result_eviction_config.clone() {
                     pipeline = pipeline.with_eviction(crate::agent::context::ContextEviction {
                         fs: Arc::clone(&filesystem),
                         config: cfg,
@@ -2448,11 +2492,16 @@ impl HarnessAgentBuilder {
             ws_ctx.set_artifact_delivery_enabled(self.artifact_delivery_target.is_some());
             ws_ctx.set_use_legacy_xml_workspace_context(self.use_legacy_xml_workspace_context);
             ws_ctx.set_additional_context_files(self.additional_context_files.clone());
+            // The default backend anchors tool paths at `cwd`, so the model must be told where
+            // the project is; agent state (AGENTS.md, memory/, skills/) stays in the workspace.
+            if cwd != resolved_workspace {
+                ws_ctx.set_project_root(Some(cwd.clone()));
+            }
             middleware.add(Box::new(ws_ctx));
         }
         if !self.disable_at_path_expansion {
             middleware.add(Box::new(AtPathExpansionMiddleware::new(Arc::clone(
-                &filesystem,
+                &project_filesystem,
             ))));
         }
 
@@ -2551,7 +2600,7 @@ impl HarnessAgentBuilder {
 
         // ---- Tool-result eviction ----
         if !self.disable_tool_result_eviction {
-            if let Some(cfg) = self.tool_result_eviction_config.clone() {
+            if let Some(cfg) = tool_result_eviction_config.clone() {
                 middleware.add(Box::new(ToolResultEvictionMiddleware::new(
                     Arc::clone(&filesystem),
                     cfg,
@@ -2794,10 +2843,10 @@ impl HarnessAgentBuilder {
 
         // ---- Toolkit (filesystem / shell tools) ----
         if self.with_filesystem_tools {
-            FilesystemTool::register(&toolkit, Arc::clone(&filesystem));
+            FilesystemTool::register(&toolkit, Arc::clone(&project_filesystem));
         }
         if self.with_shell_tool && !self.disable_shell_tool {
-            if let Some(sandbox) = sandbox_filesystem(&filesystem, &cwd) {
+            if let Some(sandbox) = sandbox_filesystem(&project_filesystem, &cwd) {
                 toolkit.register_tool(Arc::new(ShellExecuteTool::with_output_compaction(
                     sandbox,
                     self.shell_output_compaction.clone(),
@@ -3394,6 +3443,20 @@ fn source_prefix(name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Pins a tool-result spill directory inside the agent workspace.
+///
+/// Relative spill paths (the default `large_tool_results`) would otherwise resolve against the
+/// tool filesystem, which anchors at the project `cwd`, and the spill files would land in the
+/// project root. The returned path is absolute so the placeholder the model sees stays readable
+/// through `read_file`.
+fn eviction_path_in_workspace(workspace: &std::path::Path, eviction_path: &str) -> String {
+    if std::path::Path::new(eviction_path).is_absolute() {
+        eviction_path.to_string()
+    } else {
+        workspace.join(eviction_path).to_string_lossy().to_string()
+    }
+}
+
 /// Returns a sandbox filesystem wrapper when the configured filesystem can be promoted to
 /// support shell execution. `LocalFilesystem` is wrapped in a `SandboxBackedFilesystem`.
 fn sandbox_filesystem(
@@ -3524,14 +3587,18 @@ mod tests {
         root
     }
 
-    /// The default filesystem is rooted at the workspace: an absolute host path must not
-    /// resolve, or `read_file("C:\\Users\\...")` reads the host (#2065).
+    /// The default filesystem is rooted at the workspace (agent state) plus the project `cwd`:
+    /// a path outside both must not resolve, or `read_file("C:\\Users\\...")` reads the host
+    /// (#2065).
     #[tokio::test]
     async fn default_filesystem_is_rooted_at_the_workspace() {
         let root = temp_root("rooted_default");
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("notes.md"), "workspace notes").unwrap();
+        // A file of the opened project (the ACP `cwd`) is reachable by absolute path.
+        let project_file = root.join("Cargo.toml");
+        std::fs::write(&project_file, "[package]").unwrap();
 
         let agent = HarnessAgent::builder()
             .cwd(root.clone())
@@ -3544,14 +3611,29 @@ mod tests {
             fs.read(&ctx, "notes.md", 0, 100).await.unwrap().content,
             "workspace notes"
         );
-        let host_file = root.join("outside.md");
+        assert_eq!(
+            fs.read(&ctx, &project_file.to_string_lossy(), 0, 100)
+                .await
+                .unwrap()
+                .content,
+            "[package]"
+        );
+        // Outside the project and the workspace: still refused.
+        let host_root =
+            std::env::temp_dir().join(format!("agentscope_harness_host_{}", std::process::id()));
+        std::fs::create_dir_all(&host_root).unwrap();
+        let host_file = host_root.join("outside.md");
         std::fs::write(&host_file, "host only").unwrap();
         let error = fs
             .read(&ctx, &host_file.to_string_lossy(), 0, 100)
             .await
             .unwrap_err()
             .to_string();
-        assert!(!error.is_empty());
+        assert!(
+            error.contains("outside root"),
+            "a host path outside every root must be refused: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&host_root);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3818,6 +3900,100 @@ mod tests {
             .expect("the route serves the file");
         assert_eq!(data.content, "routed content");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The default backend is assembled at the resolved workspace and accepts the project
+    /// directory as a second root, so absolute project paths keep working (#2065 follow-up).
+    #[tokio::test]
+    async fn the_default_filesystem_accepts_the_project_directory_beside_the_workspace() {
+        // ACP reports the opened project as `cwd` and keeps agent state under
+        // `<cwd>/.agentscope/workspace`. Rooting the default backend at the workspace alone made
+        // every absolute project path a `Path outside root` error, so `read_file` could not touch
+        // the code the user opened (#2065 follow-up).
+        let root = temp_root("fs_default_roots");
+        let project = root.join("project");
+        let workspace = project.join(".agentscope").join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(workspace.join("notes.md"), "agent state").unwrap();
+        std::fs::write(root.join("outside.txt"), "secret").unwrap();
+
+        let agent = HarnessAgent::builder()
+            .name("fs-root-agent")
+            .model(Arc::new(NoopModel))
+            .cwd(project.clone())
+            .workspace(workspace.clone())
+            .register_filesystem_tools(true)
+            .disable_web_tools()
+            .build();
+        let ctx = agentscope_core::agent::RuntimeContext::default();
+
+        // The project is addressable by its absolute path, exactly as an ACP client reports it.
+        let project_file = project.join("Cargo.toml").to_string_lossy().to_string();
+        let data = agent
+            .filesystem()
+            .read(&ctx, &project_file, 0, 100)
+            .await
+            .expect("the project directory is an accepted root");
+        assert!(data.content.contains("[package]"), "{}", data.content);
+
+        // Workspace-relative paths still resolve inside the workspace (agent state lives there).
+        let data = agent
+            .filesystem()
+            .read(&ctx, "notes.md", 0, 100)
+            .await
+            .expect("workspace-relative state reads");
+        assert_eq!(data.content, "agent state");
+
+        // Tools anchor relative paths at the project directory instead: `list_files(".")` must
+        // show the project, not the state directory.
+        let list = agent
+            .toolkit()
+            .get_tool("list_files")
+            .expect("list_files is registered");
+        let listed = list
+            .call(
+                serde_json::Map::from_iter([("path".to_string(), serde_json::json!("."))]),
+                agentscope_core::tool::ToolExecutionContext::default(),
+            )
+            .await
+            .expect("list_files succeeds")
+            .text_content();
+        assert!(listed.contains("Cargo.toml"), "{listed}");
+        assert!(
+            !listed.contains("notes.md"),
+            "the tool root must be the project: {listed}"
+        );
+
+        // Anything outside both roots stays rejected.
+        let outside = root.join("outside.txt").to_string_lossy().to_string();
+        let error = agent
+            .filesystem()
+            .read(&ctx, &outside, 0, 100)
+            .await
+            .expect_err("a path outside the project is refused");
+        assert!(
+            format!("{error}").contains("outside root"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Tool-result spill files must stay inside the agent workspace, even though tools anchor
+    /// relative paths at the project `cwd`.
+    #[test]
+    fn the_tool_result_spill_directory_stays_inside_the_workspace() {
+        let workspace = std::path::PathBuf::from("C:\\proj\\.agentscope\\workspace");
+        assert_eq!(
+            eviction_path_in_workspace(&workspace, "large_tool_results"),
+            "C:\\proj\\.agentscope\\workspace\\large_tool_results"
+        );
+        // An absolute override is kept: the caller already chose the location.
+        let absolute = std::path::PathBuf::from("C:\\spill");
+        assert_eq!(
+            eviction_path_in_workspace(&workspace, &absolute.to_string_lossy()),
+            absolute.to_string_lossy()
+        );
     }
 
     #[tokio::test]
