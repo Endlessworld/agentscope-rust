@@ -735,6 +735,7 @@ impl AcpCodingAgent {
         // would multiply that bound by N.
         let releases = sessions.into_iter().map(|session| async move {
             session.close();
+            session.flush_background_tasks().await;
             // Bounded: a wedged turn must not keep the process alive after the client left.
             let _ = session
                 .cancel_and_wait(std::time::Duration::from_secs(5))

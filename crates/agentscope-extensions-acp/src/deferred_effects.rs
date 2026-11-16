@@ -18,6 +18,12 @@ use agentscope_harness::agent::{AsyncToolRecord, AsyncToolRegistry};
 use async_trait::async_trait;
 use serde_json::json;
 
+/// A RUNNING offload older than this is a crashed node, not a slow tool: mark it terminal.
+///
+/// The inbox middleware's own sweep can only run while the agent is reasoning; a session that
+/// sat idle across a restart would otherwise keep the placeholder PENDING forever.
+const STALE_OFFLOAD_MINUTES: i64 = 10;
+
 /// Answers durable questions about offloaded tool calls from the harness registry.
 pub struct OffloadedToolEffects {
     registry: Arc<dyn AsyncToolRegistry>,
@@ -93,11 +99,27 @@ impl Executor for OffloadedToolEffects {
                 )),
             },
             // Still RUNNING (or a status this build does not know): the answer is not in yet and
-            // nothing here may claim one, so the effect stays unknown.
-            _ => ExecutionResult::unknown(format!(
-                "The background tool has not reported yet ({})",
-                record.status
-            )),
+            // nothing here may claim one, so the effect stays unknown. A record that has been
+            // RUNNING for far longer than the tool's offload ceiling belongs to a process that
+            // is gone; mark it so the next query settles the placeholder instead of parking the
+            // turn forever.
+            _ => {
+                if record.status == AsyncToolRecord::RUNNING {
+                    let age = chrono::Utc::now().signed_duration_since(record.created_at);
+                    if age.num_minutes() >= STALE_OFFLOAD_MINUTES {
+                        let _ = self.registry.mark_timeout(&record.id).await;
+                        return Ok(ExecutionResult::unknown(format!(
+                            "The background tool reported no result for {} minutes; it was \
+                             marked as timed out",
+                            age.num_minutes()
+                        )));
+                    }
+                }
+                ExecutionResult::unknown(format!(
+                    "The background tool has not reported yet ({})",
+                    record.status
+                ))
+            }
         })
     }
 }
@@ -204,6 +226,15 @@ mod tests {
             ExecutionState::Unknown
         );
         assert_eq!(query_state(Vec::new()), ExecutionState::Unknown);
+    }
+
+    #[test]
+    fn a_long_running_record_is_marked_timed_out_and_stays_unknown() {
+        // The offload's process is gone; the registry entry must not stay RUNNING forever. The
+        // query still cannot claim success, but the next one sees TIMEOUT and settles as Failed.
+        let mut stale = record("call-1", AsyncToolRecord::RUNNING);
+        stale.created_at = chrono::Utc::now() - chrono::Duration::minutes(11);
+        assert_eq!(query_state(vec![stale]), ExecutionState::Unknown);
     }
 
     #[test]

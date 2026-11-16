@@ -2350,6 +2350,15 @@ impl AcpAgentSession {
         }
     }
 
+    /// Persists the live background task handles before the process exits.
+    ///
+    /// `close` cannot await, so the host calls this alongside it. Without it a task whose
+    /// record write failed earlier becomes "not found" after the restart even though its result
+    /// was produced.
+    pub(crate) async fn flush_background_tasks(&self) {
+        self.agent.task_repository().flush_live().await;
+    }
+
     /// Cancels the active prompt and waits for its run to settle, so the next prompt cannot
     /// start while the previous execution still owns the journal.
     pub async fn cancel_and_wait(&self, timeout: std::time::Duration) -> bool {
@@ -2968,6 +2977,9 @@ impl AcpAgentSession {
         // Turn-level usage: reset at the start of each prompt turn, accumulate
         // from every model call, and report back as `PromptResponse.usage`.
         self.turn_usage = ChatUsage::default();
+        // A wakeup exists only to deliver background results; it must never monopolize the
+        // session while a real user prompt waits behind it.
+        let wakeup_turn = matches!(&input, TurnInput::Wakeup);
 
         // Bind the confirm handler to the current client connection so tool
         // calls that need approval push an ACP request_permission this turn.
@@ -3181,6 +3193,10 @@ impl AcpAgentSession {
         // provider) keeps renewing, so an unbounded wait turns `session/close` into exactly the
         // hang it is supposed to end. Nobody is left to observe a half-finished close there.
         const CLOSED_TURN_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+        // A wakeup turn has no prompt of its own waiting on it. Background results usually land
+        // within minutes; a wakeup that keeps polling for longer is blocking a real user prompt,
+        // so it is suspended and that prompt is allowed to run.
+        const WAKEUP_TURN_BUDGET: std::time::Duration = std::time::Duration::from_secs(15 * 60);
         // A run stopped by something other than this client's cancel is resumed in place.
         // Bounded so a permanently interrupted environment is reported instead of retried
         // forever; an interruption is not a failure and must not discard the user's prompt.
@@ -3195,6 +3211,7 @@ impl AcpAgentSession {
             // The tick loop is the only writer: this attempt starts it, renders what it
             // publishes, and hands the thread back when it leaves.
             let driver = TurnDriver::spawn(Arc::clone(&runtime.session), turn_id.clone());
+            let attempt_started = std::time::Instant::now();
             // Whether this attempt already streamed incremental text. Reset per attempt: a
             // resumed run may complete without emitting deltas (the answer already exists in
             // the restored state), and it must still reach the client. Keeping the flag from
@@ -3232,6 +3249,17 @@ impl AcpAgentSession {
                     _ = ticker.tick() => {
                         if cancel_epoch.load(Ordering::SeqCst) != my_epoch {
                             cancelled = true;
+                            break;
+                        }
+                        if wakeup_turn
+                            && settled_task.is_none()
+                            && attempt_started.elapsed() >= WAKEUP_TURN_BUDGET
+                        {
+                            stall = Some(format!(
+                                "the background wakeup turn ran for {}s without finishing; \
+                                 it was cancelled so a queued prompt can run",
+                                WAKEUP_TURN_BUDGET.as_secs()
+                            ));
                             break;
                         }
                         if settled_task.is_none() {

@@ -1,7 +1,9 @@
 //! Background task lifecycle tools, mirroring `TaskTool`: `task_output`,
 //! `task_cancel` and `task_list`. All operations are scoped to the parent session
 //! id carried in `ToolExecutionContext.runtime` under the `"sessionId"` key.
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::Result;
@@ -16,13 +18,77 @@ use crate::agent::subagent::task::{
 /// Shared core for the three task tools.
 pub struct TaskTool {
     repo: Arc<dyn TaskRepository>,
+    /// Consecutive `block=false` status checks per session/task.
+    ///
+    /// The model used to re-poll a Running task every ten seconds for half an hour, producing no
+    /// user-visible output while a real prompt waited behind the turn. The provider reminder
+    /// ("do not poll") was advisory; this makes the tool itself stop answering the same status.
+    polls: Mutex<HashMap<String, StatusPoll>>,
+}
+
+#[derive(Clone)]
+struct StatusPoll {
+    status: String,
+    count: u32,
+    at: Instant,
+}
+
+/// How many identical non-terminal status reads are answered before the tool refuses to poll.
+const MAX_RUNNING_STATUS_POLLS: u32 = 3;
+/// Polls older than this start the count again (a new turn may legitimately check once).
+const STATUS_POLL_WINDOW: Duration = Duration::from_secs(90);
+
+fn poll_key(session: &str, task_id: &str) -> String {
+    format!("{session}\u{0}{task_id}")
+}
+
+/// Records one non-terminal status read, returning whether it must be refused.
+fn note_status_poll(
+    polls: &Mutex<HashMap<String, StatusPoll>>,
+    session: &str,
+    task_id: &str,
+    status: &str,
+) -> bool {
+    let mut polls = polls
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    let entry = polls
+        .entry(poll_key(session, task_id))
+        .or_insert_with(|| StatusPoll {
+            status: status.to_string(),
+            count: 0,
+            at: now,
+        });
+    if entry.status != status || now.duration_since(entry.at) > STATUS_POLL_WINDOW {
+        entry.status = status.to_string();
+        entry.count = 0;
+    }
+    entry.at = now;
+    entry.count += 1;
+    entry.count > MAX_RUNNING_STATUS_POLLS
 }
 
 impl TaskTool {
     pub fn new(repo: Arc<dyn TaskRepository>) -> Arc<Self> {
-        Arc::new(Self { repo })
+        Arc::new(Self {
+            repo,
+            polls: Mutex::new(HashMap::new()),
+        })
     }
 
+    /// Returns true when this status check must be refused: the same task has already reported
+    /// the same non-terminal status [`MAX_RUNNING_STATUS_POLLS`] times inside the window.
+    fn note_status_poll(&self, session: &str, task_id: &str, status: &str) -> bool {
+        note_status_poll(&self.polls, session, task_id, status)
+    }
+
+    fn reset_status_poll(&self, session: &str, task_id: &str) {
+        self.polls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&poll_key(session, task_id));
+    }
     pub fn output_tool(self: &Arc<Self>) -> Arc<TaskOutputTool> {
         Arc::new(TaskOutputTool { tool: self.clone() })
     }
@@ -116,7 +182,9 @@ impl Tool for TaskOutputTool {
         true
     }
     fn description(&self) -> &str {
-        "Retrieve the output of a background subagent task by task_id. Prefer block=false to check status without waiting."
+        "Retrieve the output of a background subagent task by task_id. Use block=true (the \
+         default) to wait for it. block=false is for a single status check, not for polling a \
+         running task: wait for the completion <system-reminder> instead."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -138,7 +206,9 @@ impl Tool for TaskOutputTool {
         let rc = runtime_for(&session);
         let Some(bg) = self.tool.repo.get_task(&rc, &session, &task_id).await else {
             return Ok(ToolResultBlock::error(format!(
-                "Error: No background task found with ID: {task_id}. Use task_list() to see all known tasks."
+                "Error: No background task found with ID: {task_id}. If it was spawned in an \
+                 earlier process, its persisted record may have been lost; task_list() shows \
+                 what is still known."
             )));
         };
         bg.update_last_checked_at();
@@ -148,6 +218,18 @@ impl Tool for TaskOutputTool {
             .and_then(|v| v.as_u64())
             .map(|t| t.min(600_000))
             .unwrap_or(30_000);
+        if should_block {
+            self.tool.reset_status_poll(&session, &task_id);
+        } else if !bg.is_completed() {
+            let status = bg.get_status_string();
+            if self.tool.note_status_poll(&session, &task_id, &status) {
+                return Ok(ToolResultBlock::error(format!(
+                    "Error: task '{task_id}' is still {status}; repeated status polling is \
+                     disabled. Wait for the completion <system-reminder>, or call task_output \
+                     with block=true (timeout up to 600000 ms)."
+                )));
+            }
+        }
         if should_block && !bg.is_completed() {
             let st = bg.get_task_status();
             if st == TaskStatus::Pending || st == TaskStatus::Running {
@@ -158,6 +240,9 @@ impl Tool for TaskOutputTool {
                 let _ =
                     tokio::task::spawn_blocking(move || waiter.wait_for_completion(timeout)).await;
             }
+        }
+        if bg.is_completed() {
+            self.tool.reset_status_poll(&session, &task_id);
         }
         if bg.is_completed() && bg.get_task_status().is_terminal() {
             self.tool.repo.mark_delivered(&rc, &session, &task_id).await;
@@ -194,7 +279,8 @@ impl Tool for TaskCancelTool {
         let rc = runtime_for(&session);
         let Some(bg) = self.tool.repo.get_task(&rc, &session, &task_id).await else {
             return Ok(ToolResultBlock::error(format!(
-                "Error: No background task found with ID: {task_id}"
+                "Error: No background task found with ID: {task_id}. Its record may have been \
+                 lost after a restart; nothing is left to cancel."
             )));
         };
         let current = bg.get_task_status();
@@ -243,7 +329,9 @@ impl Tool for TaskListTool {
                 .map(|f| format!(" with status '{}'", f.as_str().to_lowercase()))
                 .unwrap_or_default();
             return Ok(ToolResultBlock::text(format!(
-                "No background tasks tracked{filter_desc}."
+                "No background tasks tracked{filter_desc}. A task spawned in an earlier process \
+                 may be missing if its record could not be persisted; agent_list shows subagents \
+                 that are currently live."
             )));
         }
         let mut sb = format!("{} tracked task(s):\n", tasks.len());
@@ -259,5 +347,30 @@ impl Tool for TaskListTool {
             sb.push_str(&format!("  created: {}\n", format_iso(t.created_at())));
         }
         Ok(ToolResultBlock::text(sb.trim().to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_running_polls_are_refused_after_the_limit() {
+        let polls = Mutex::new(HashMap::new());
+        assert!(!note_status_poll(&polls, "s", "t", "Running"));
+        assert!(!note_status_poll(&polls, "s", "t", "Running"));
+        assert!(!note_status_poll(&polls, "s", "t", "Running"));
+        assert!(
+            note_status_poll(&polls, "s", "t", "Running"),
+            "the fourth identical status read must be refused"
+        );
+        // A different task, a different status, or a reset starts a fresh budget.
+        assert!(!note_status_poll(&polls, "s", "other", "Running"));
+        assert!(!note_status_poll(&polls, "s", "t", "Pending"));
+        polls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        assert!(!note_status_poll(&polls, "s", "t", "Running"));
     }
 }

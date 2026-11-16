@@ -14,6 +14,7 @@
 //! repair back into that domain's own namespace — even after a restart.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,6 +57,21 @@ pub const HEARTBEAT_INTERVAL_SECONDS: u64 = 30;
 pub const ORPHAN_TIMEOUT_MINUTES: u64 = 10;
 /// How often (in minutes) the orphan sweeper scans all workspace task records.
 pub const SWEEP_INTERVAL_MINUTES: u64 = 5;
+
+/// How many times one task-map write is retried after a filesystem sharing violation.
+const TASK_WRITE_ATTEMPTS: u32 = 6;
+/// First backoff between task-map write attempts.
+const TASK_WRITE_BACKOFF: Duration = Duration::from_millis(20);
+/// Upper bound on the retry backoff.
+const TASK_WRITE_BACKOFF_MAX: Duration = Duration::from_millis(400);
+/// Sequence used to give every staging file its own name.
+static TASK_STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Serializes read-modify-write cycles on task maps within this process.
+///
+/// Concurrent `agent_spawn` calls in one batch all land here. A shared `.tmp` path made one
+/// writer delete another's staging file, so the survivor's rename failed with `os error 2` and
+/// the task record was silently lost.
+static TASK_STORE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Local task handle key: storage namespace + parent session + task id.
 ///
@@ -169,14 +185,27 @@ impl WorkspaceTaskRepository {
         tasks_path(&self.state.parent_agent_id, session_id)
     }
 
-    async fn persist_record(&self, ctx: &RuntimeContext, session_id: &str, record: &TaskRecord) {
+    async fn persist_record(
+        &self,
+        ctx: &RuntimeContext,
+        session_id: &str,
+        record: &TaskRecord,
+    ) -> bool {
         // Mirror Java `WorkspaceManager#writeTaskRecord`: register the caller's isolation domain
         // before writing, so a sweep in any later process can find and repair this record.
         register_task_scope(&self.state, ctx).await;
+        let _guard = TASK_STORE_LOCK.lock().await;
         let path = self.tasks_path(session_id);
-        let mut map = read_records(self.state.fs.as_ref(), ctx, &path).await;
+        let Some(mut map) = read_records_checked(self.state.fs.as_ref(), ctx, &path).await else {
+            tracing::warn!(
+                path = %path,
+                task = %record.task_id,
+                "task map is unreadable; refusing to overwrite it and lose the other records"
+            );
+            return false;
+        };
         map.insert(record.task_id.clone(), record.clone());
-        write_records(self.state.fs.as_ref(), ctx, &path, &map).await;
+        write_records(self.state.fs.as_ref(), ctx, &path, &map).await
     }
 
     /// Refreshes `last_updated_at` in the workspace for every live local task that is still
@@ -336,10 +365,24 @@ impl TaskRepository for WorkspaceTaskRepository {
                 record.remote_headers = Some(headers.clone());
             }
         }
-        self.persist_record(ctx, session_id, &record).await;
+        if !self.persist_record(ctx, session_id, &record).await {
+            // The task still runs and stays visible through this process's local overlay, but a
+            // restart will not know it. Keep the failure loud: silently claiming durability is
+            // what made A/E unrecoverable.
+            tracing::error!(
+                task = %task_id,
+                session = %session_id,
+                "background task record could not be persisted; it will not survive a restart"
+            );
+        }
 
         let local_key = local_key(&self.state, ctx, session_id, task_id);
         let bg = BackgroundTask::controlled(task_id, sub_agent_id);
+        // The persisted record carries the child session; the live handle must too, or
+        // `list_tasks` (and `agent_list`) cannot tell which live task is which subagent.
+        if let Some(child) = record.sub_session_id.clone() {
+            bg.set_sub_session_id(Some(child));
+        }
 
         // `cancel()` aborts the wrapper task. Dropping a `JoinHandle` *detaches* its task, so a
         // cancel that lands before the wrapper reaches the `Adopted` arm would leave the adopted
@@ -495,8 +538,12 @@ impl TaskRepository for WorkspaceTaskRepository {
         let key = local_key(&self.state, ctx, session_id, task_id);
         self.state.local_tasks.lock().unwrap().remove(&key);
         self.state.local_contexts.lock().unwrap().remove(&key);
+        let _guard = TASK_STORE_LOCK.lock().await;
         let path = self.tasks_path(session_id);
-        let mut map = read_records(self.state.fs.as_ref(), ctx, &path).await;
+        let Some(mut map) = read_records_checked(self.state.fs.as_ref(), ctx, &path).await else {
+            tracing::warn!(path = %path, task = %task_id, "task map is unreadable; not rewriting it");
+            return;
+        };
         map.remove(task_id);
         write_records(self.state.fs.as_ref(), ctx, &path, &map).await;
     }
@@ -553,8 +600,13 @@ impl TaskRepository for WorkspaceTaskRepository {
         // optimistic-concurrency loop: a plain read-modify-write here would race the poller's
         // `update_record_status` and could resurrect a stale `Running` record (both sides used
         // to stamp the same next version, so neither detected the conflict).
+        let _guard = TASK_STORE_LOCK.lock().await;
         for _ in 0..RECORD_CAS_RETRIES {
-            let mut map = read_records(self.state.fs.as_ref(), ctx, &path).await;
+            let Some(mut map) = read_records_checked(self.state.fs.as_ref(), ctx, &path).await
+            else {
+                tracing::warn!(path = %path, task = %task_id, "task map is unreadable; not cancelling durably");
+                break;
+            };
             let base_version = match map.get(task_id) {
                 Some(rec) => rec.version,
                 None => break,
@@ -569,7 +621,10 @@ impl TaskRepository for WorkspaceTaskRepository {
                 rec.version = base_version.wrapping_add(1);
                 snapshot = Some(rec.clone());
             }
-            let current = read_records(self.state.fs.as_ref(), ctx, &path).await;
+            let Some(current) = read_records_checked(self.state.fs.as_ref(), ctx, &path).await
+            else {
+                break;
+            };
             if current.get(task_id).map(|r| r.version) == Some(base_version) {
                 write_records(self.state.fs.as_ref(), ctx, &path, &map).await;
                 break;
@@ -648,7 +703,61 @@ impl TaskRepository for WorkspaceTaskRepository {
     }
 
     async fn shutdown(&self) {
+        WorkspaceTaskRepository::flush_live(self).await;
         self.abort_maintenance();
+    }
+
+    async fn flush_live(&self) {
+        let live: Vec<(String, RuntimeContext, Arc<BackgroundTask>)> = {
+            let tasks = self.state.local_tasks.lock().unwrap();
+            let contexts = self.state.local_contexts.lock().unwrap();
+            tasks
+                .iter()
+                .filter_map(|(key, task)| {
+                    let (sid, ctx) = contexts.get(key)?;
+                    Some((sid.clone(), ctx.clone(), Arc::clone(task)))
+                })
+                .collect()
+        };
+        if live.is_empty() {
+            return;
+        }
+        let _guard = TASK_STORE_LOCK.lock().await;
+        for (session_id, ctx, task) in live {
+            let path = self.tasks_path(&session_id);
+            let Some(mut map) = read_records_checked(self.state.fs.as_ref(), &ctx, &path).await
+            else {
+                continue;
+            };
+            let mut record = map.get(task.task_id()).cloned().unwrap_or_else(|| {
+                TaskRecord::new(
+                    task.task_id(),
+                    task.agent_id(),
+                    &self.state.parent_agent_id,
+                    &session_id,
+                )
+            });
+            let live_status = task.get_task_status();
+            if record.status.is_terminal() && !live_status.is_terminal() {
+                // The persisted record already reached a terminal state (cancel/failure); a
+                // live handle that has not observed it yet must not reopen it as Running.
+                continue;
+            }
+            record.status = live_status;
+            if let Some(result) = task.get_result() {
+                record.result = Some(result);
+            }
+            if let Some(error) = task.get_error() {
+                record.error_message = Some(error);
+            }
+            if let Some(child) = task.sub_session_id() {
+                record.sub_session_id = Some(child);
+            }
+            record.touch();
+            record.version = record.version.wrapping_add(1);
+            map.insert(record.task_id.clone(), record);
+            write_records(self.state.fs.as_ref(), &ctx, &path, &map).await;
+        }
     }
 }
 
@@ -927,46 +1036,139 @@ fn write_back_context(
     }
 }
 
+/// Number of times a task-map read is retried before it is reported as unreadable.
+const TASK_READ_ATTEMPTS: u32 = 3;
+
+/// Reads a task map, distinguishing "no file yet" from "could not read it".
+///
+/// A read failure must never be turned into an empty map by a writer: the heartbeat used to do
+/// exactly that and deleted every record of the session when one read raced a replace. A
+/// transient sharing/rename error is retried briefly before it is reported.
+async fn read_records_checked(
+    fs: &dyn Filesystem,
+    ctx: &RuntimeContext,
+    path: &str,
+) -> Option<BTreeMap<String, TaskRecord>> {
+    let mut last_error: Option<String> = None;
+    for attempt in 1..=TASK_READ_ATTEMPTS {
+        match fs.exists(ctx, path).await {
+            Ok(false) => return Some(BTreeMap::new()),
+            Ok(true) => {}
+            Err(error) => {
+                last_error = Some(error.to_string());
+                if attempt < TASK_READ_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(20 * attempt as u64)).await;
+                }
+                continue;
+            }
+        }
+        match fs.read(ctx, path, 0, 0).await {
+            Ok(data) => match serde_json::from_str(&data.content) {
+                Ok(map) => return Some(map),
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    break;
+                }
+            },
+            Err(error) => {
+                last_error = Some(error.to_string());
+                if attempt < TASK_READ_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(20 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    tracing::warn!(
+        path,
+        error = last_error.as_deref().unwrap_or("unknown"),
+        "could not read the task map"
+    );
+    None
+}
+
+/// Read-only view of a task map; an unreadable file is reported as empty.
 async fn read_records(
     fs: &dyn Filesystem,
     ctx: &RuntimeContext,
     path: &str,
 ) -> BTreeMap<String, TaskRecord> {
-    if !fs.exists(ctx, path).await.unwrap_or(false) {
-        return BTreeMap::new();
-    }
-    match fs.read(ctx, path, 0, 0).await {
-        Ok(data) => serde_json::from_str(&data.content).unwrap_or_default(),
-        Err(_) => BTreeMap::new(),
-    }
+    read_records_checked(fs, ctx, path)
+        .await
+        .unwrap_or_default()
 }
 
+/// Writes a task map through a unique staging file, retrying Windows sharing violations.
+///
+/// Returns whether the map reached its final path. Callers that treat persistence as a fact
+/// (task submission) must not pretend it succeeded when this is `false`.
 async fn write_records(
     fs: &dyn Filesystem,
     ctx: &RuntimeContext,
     path: &str,
     map: &BTreeMap<String, TaskRecord>,
-) {
-    if let Ok(json) = serde_json::to_string(map) {
-        // `Filesystem::write` refuses to overwrite an existing path, so writes go through a
-        // sidecar file that is then `rename`d over the target. `rename` is atomic within a
-        // volume, so a concurrent reader never observes a missing file (the old
-        // delete-then-write sequence opened exactly that window, and a racing writer could
-        // resurrect a map that had already dropped this record).
-        let tmp = format!("{path}.tmp");
-        if fs.exists(ctx, &tmp).await.unwrap_or(false) {
-            let _ = fs.delete(ctx, &tmp).await;
-        }
+) -> bool {
+    let Ok(json) = serde_json::to_string(map) else {
+        tracing::error!(path, "could not encode the task map");
+        return false;
+    };
+    let mut backoff = TASK_WRITE_BACKOFF;
+    for attempt in 1..=TASK_WRITE_ATTEMPTS {
+        // A per-write name is the fix for the observed loss: five parallel `agent_spawn` calls
+        // shared one `{path}.tmp`, deleted each other's staging file, and the surviving rename
+        // failed with "file not found". Every writer now has a private file to rename.
+        let sequence = TASK_STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let tmp = format!("{path}.{}.{sequence}.{stamp}.tmp", std::process::id());
         match fs.write(ctx, &tmp, &json).await {
-            Ok(()) => {
-                if let Err(e) = fs.move_path(ctx, &tmp, path).await {
-                    tracing::warn!("Failed to commit task records to {path}: {e}");
+            Ok(()) => match fs.move_path(ctx, &tmp, path).await {
+                Ok(()) => return true,
+                Err(error) => {
                     let _ = fs.delete(ctx, &tmp).await;
+                    if attempt < TASK_WRITE_ATTEMPTS {
+                        tracing::warn!(
+                            path,
+                            attempt,
+                            %error,
+                            "task-map rename failed; retrying with a fresh staging file"
+                        );
+                    } else {
+                        tracing::error!(
+                            path,
+                            attempt,
+                            %error,
+                            "task-map rename failed; records were NOT persisted"
+                        );
+                        return false;
+                    }
+                }
+            },
+            Err(error) => {
+                let _ = fs.delete(ctx, &tmp).await;
+                if attempt < TASK_WRITE_ATTEMPTS {
+                    tracing::warn!(
+                        path,
+                        attempt,
+                        %error,
+                        "task-map staging write failed; retrying"
+                    );
+                } else {
+                    tracing::error!(
+                        path,
+                        attempt,
+                        %error,
+                        "task-map staging write failed; records were NOT persisted"
+                    );
+                    return false;
                 }
             }
-            Err(e) => tracing::warn!("Failed to stage task records for {path}: {e}"),
         }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(TASK_WRITE_BACKOFF_MAX);
     }
+    false
 }
 
 /// Outcome of one guarded, optimistic-concurrency record mutation.
@@ -997,8 +1199,11 @@ async fn mutate_record<F>(
 where
     F: Fn(&mut TaskRecord) -> bool,
 {
+    let _guard = TASK_STORE_LOCK.lock().await;
     for _ in 0..RECORD_CAS_RETRIES {
-        let snapshot = read_records(fs, ctx, path).await;
+        let Some(snapshot) = read_records_checked(fs, ctx, path).await else {
+            return RecordMutation::Rejected;
+        };
         let base_version = match snapshot.get(task_id) {
             Some(rec) => rec.version,
             None => return RecordMutation::Missing,
@@ -1013,7 +1218,9 @@ where
         }
         // Re-read so the write carries any sibling update that landed in between; a changed
         // version for this record means someone else wrote it, so start over.
-        let mut latest = read_records(fs, ctx, path).await;
+        let Some(mut latest) = read_records_checked(fs, ctx, path).await else {
+            return RecordMutation::Rejected;
+        };
         match latest.get(task_id) {
             Some(rec) if rec.version == base_version => {}
             Some(_) => continue,
@@ -1023,8 +1230,10 @@ where
         mutate(rec);
         rec.touch();
         rec.version = base_version.wrapping_add(1);
-        write_records(fs, ctx, path, &latest).await;
-        return RecordMutation::Applied;
+        if write_records(fs, ctx, path, &latest).await {
+            return RecordMutation::Applied;
+        }
+        return RecordMutation::Rejected;
     }
     tracing::warn!("mutate_record: CAS retries exhausted for task {task_id}");
     RecordMutation::Rejected
@@ -1065,9 +1274,15 @@ async fn update_record_status(
     })
     .await;
     if matches!(outcome, RecordMutation::Missing) {
-        // Historical behaviour: materialise the map so a later write can create the record.
-        let map = read_records(fs, ctx, &path).await;
-        write_records(fs, ctx, &path, &map).await;
+        // Never materialise an empty map here. A record can be missing because the file was
+        // unreadable or replaced, and writing the empty snapshot back wiped every sibling task
+        // (the failure that made A/E disappear). The local overlay still serves the live task;
+        // a later successful `put_task`/heartbeat recreates the record.
+        tracing::warn!(
+            task = %task_id,
+            path = %path,
+            "task record is missing; keeping the persisted map untouched"
+        );
     }
 }
 impl Drop for WorkspaceTaskRepository {
@@ -2597,6 +2812,105 @@ mod tests {
         );
         // The entry itself is left in place (harmless, and a config rollback revives it).
         assert!(fs.exists(&registry_ctx(), &path).await.unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_task_submissions_keep_every_record() {
+        // Regression: five `agent_spawn` calls in one batch shared `{path}.tmp`; one writer
+        // deleted another's staging file, the survivor's rename failed with `os error 2`, and
+        // A/E vanished from the persisted map. Every task must survive the same burst now.
+        let (dir, fs) = temp_fs("concurrent-spawn");
+        let repo = Arc::new(WorkspaceTaskRepository::new(Arc::clone(&fs), "parent"));
+        let ctx = RuntimeContext::default().with_session_id("sess");
+
+        let mut spawned = Vec::new();
+        for index in 0..5 {
+            let repo = Arc::clone(&repo);
+            let ctx = ctx.clone();
+            spawned.push(tokio::spawn(async move {
+                repo.put_task(
+                    &ctx,
+                    &format!("task-{index}"),
+                    "general-purpose",
+                    "sess",
+                    TaskRunSpec::local(|| Ok("ok".to_string())),
+                )
+                .await;
+            }));
+        }
+        for task in spawned {
+            task.await.expect("task submission");
+        }
+
+        let path = tasks_path("parent", "sess");
+        let map = read_records(fs.as_ref(), &ctx, &path).await;
+        let mut ids: Vec<_> = map.keys().cloned().collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            (0..5).map(|i| format!("task-{i}")).collect::<Vec<_>>(),
+            "every concurrent submission must reach the persisted map"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_task_map_is_not_overwritten_by_a_new_task() {
+        // A corrupt/locked map must never be replaced with an empty (or single-record) one:
+        // the old heartbeat path did exactly that and erased every sibling task.
+        let (dir, fs) = temp_fs("unreadable-map");
+        let ctx = RuntimeContext::default().with_session_id("sess");
+        let path = tasks_path("parent", "sess");
+        fs.write(&ctx, &path, "not-json").await.unwrap();
+
+        let repo = WorkspaceTaskRepository::new(Arc::clone(&fs), "parent");
+        repo.put_task(
+            &ctx,
+            "task-new",
+            "general-purpose",
+            "sess",
+            TaskRunSpec::local(|| Ok("ok".to_string())),
+        )
+        .await;
+
+        let raw = fs.read(&ctx, &path, 0, 0).await.unwrap().content;
+        assert_eq!(raw, "not-json", "the unreadable map must stay untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn flush_live_recreates_a_record_lost_from_disk() {
+        let (dir, fs) = temp_fs("flush-live");
+        let repo = Arc::new(WorkspaceTaskRepository::new(Arc::clone(&fs), "parent"));
+        let ctx = RuntimeContext::default().with_session_id("sess");
+        let pending = tokio::spawn(async {
+            std::future::pending::<agentscope_core::error::Result<String>>().await
+        });
+        repo.put_task(
+            &ctx,
+            "task-live",
+            "general-purpose",
+            "sess",
+            TaskRunSpec::Adopted {
+                future: pending,
+                child_session: Some("sub-live".to_string()),
+            },
+        )
+        .await;
+
+        let path = tasks_path("parent", "sess");
+        let _ = std::fs::remove_file(
+            dir.join("agents")
+                .join("parent")
+                .join("tasks")
+                .join("sess.json"),
+        );
+        repo.flush_live().await;
+
+        let map = read_records(fs.as_ref(), &ctx, &path).await;
+        let record = map.get("task-live").expect("flushed record");
+        assert_eq!(record.sub_session_id.as_deref(), Some("sub-live"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

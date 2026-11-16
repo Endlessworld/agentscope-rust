@@ -138,7 +138,11 @@ impl WorkspaceAsyncToolRegistry {
             if !dir.is_directory {
                 continue;
             }
-            let candidate = format!("{}/{id}.json", dir.path);
+            // `ls` returns directory entries with a trailing slash on some backends. Concatenating
+            // `{dir.path}/{id}.json` then produced `...//id.json`; a remote key comparison misses
+            // that path, so terminal updates silently no-op and the record stays RUNNING forever.
+            let dir_path = dir.path.trim_end_matches('/');
+            let candidate = format!("{dir_path}/{id}.json");
             if self.fs.exists(&self.ctx, &candidate).await.unwrap_or(false) {
                 return Some(candidate);
             }
@@ -148,6 +152,11 @@ impl WorkspaceAsyncToolRegistry {
 
     async fn update_status(&self, id: &str, new_status: &str) -> Result<()> {
         let Some(path) = self.find_record_path(id).await else {
+            tracing::warn!(
+                id,
+                status = new_status,
+                "async tool record was not found; its terminal status was not persisted"
+            );
             return Ok(());
         };
         let Some(rec) = self.read_record(&path).await else {
@@ -269,5 +278,52 @@ impl AsyncToolRegistry for WorkspaceAsyncToolRegistry {
         }
         out.sort_by_key(|r| r.created_at);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filesystem::LocalFilesystem;
+
+    #[tokio::test]
+    async fn a_stale_record_is_marked_timeout() {
+        // Regression: `ls` returns directory paths with a trailing slash on this backend, and
+        // `format!("{dir}/{id}.json")` produced `...//id.json`. Terminal updates then missed the
+        // record and it stayed RUNNING forever.
+        let dir = std::env::temp_dir().join(format!("asr_async_tool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let session_dir = dir.join("async-tools").join("session-a");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("call-1.json"),
+            json!({
+                "id": "call-1",
+                "sessionId": "session-a",
+                "toolName": "execute",
+                "toolCallId": "call-1",
+                "status": AsyncToolRecord::RUNNING,
+                "createdAt": "2020-01-01T00:00:00+00:00",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+        let registry = WorkspaceAsyncToolRegistry::new(fs, "async-tools");
+        let stale = registry
+            .find_stale("session-a", ChronoDuration::minutes(10))
+            .await
+            .expect("stale scan");
+        assert_eq!(stale.len(), 1, "the old record must be found");
+        registry.mark_timeout("call-1").await.expect("mark timeout");
+
+        let records = registry
+            .list_session("session-a")
+            .await
+            .expect("list session");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, AsyncToolRecord::TIMEOUT);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

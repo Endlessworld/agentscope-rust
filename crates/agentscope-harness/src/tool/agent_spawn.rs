@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agentscope_core::agent::CallableAgent;
+use agentscope_core::agent::{CallableAgent, RuntimeContext};
 use agentscope_core::error::Result;
 use agentscope_core::event::{AgentEvent, AgentEventType};
 use agentscope_core::formatter::render_message_text;
@@ -897,20 +897,63 @@ impl Tool for AgentListTool {
         serde_json::json!({"type": "object", "properties": {}, "required": []})
     }
 
-    async fn call(&self, _args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
+    async fn call(&self, _args: JsonMap, ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
         let agents = self.spawn.live_agents();
-        if agents.is_empty() {
-            return Ok(ToolResultBlock::text("No subagents spawned yet."));
-        }
-        let mut sb = format!("{} spawned subagent(s):\n", agents.len());
-        for (key, agent_id, session_id, label) in agents {
-            sb.push_str(&format!(
-                "- agent_key: {key}  agent_id: {agent_id}  session_id: {session_id}"
-            ));
-            if let Some(l) = label {
-                sb.push_str(&format!("  label: {l}"));
+        let session = task_session_key_from_runtime(&ctx.runtime);
+        // The in-memory map only knows agents spawned by *this* process. A restart used to make
+        // this tool answer "No subagents spawned yet" even when the task records (and their
+        // results) were still on disk, which sent the model into a duplicate spawn.
+        let recorded = match self.spawn.task_repository() {
+            Some(repo) => {
+                let rc = RuntimeContext::default().with_session_id(&session);
+                repo.list_tasks(&rc, &session, None).await
             }
-            sb.push('\n');
+            None => Vec::new(),
+        };
+        let live_sessions: HashSet<String> = agents
+            .iter()
+            .map(|(_, _, session_id, _)| session_id.clone())
+            .collect();
+        let mut sb = String::new();
+        if !agents.is_empty() {
+            sb.push_str(&format!("{} spawned subagent(s):\n", agents.len()));
+            for (key, agent_id, session_id, label) in agents {
+                sb.push_str(&format!(
+                    "- agent_key: {key}  agent_id: {agent_id}  session_id: {session_id}"
+                ));
+                if let Some(l) = label {
+                    sb.push_str(&format!("  label: {l}"));
+                }
+                sb.push('\n');
+            }
+        }
+        let recovered: Vec<_> = recorded
+            .iter()
+            .filter(|task| {
+                task.sub_session_id()
+                    .is_some_and(|child| !live_sessions.contains(child.as_str()))
+            })
+            .collect();
+        if !recovered.is_empty() {
+            if !sb.is_empty() {
+                sb.push('\n');
+            }
+            sb.push_str("Recorded background tasks (recovered after a restart):\n");
+            for task in recovered {
+                let child = task.sub_session_id().unwrap_or_default();
+                let uuid = child.strip_prefix("sub-").unwrap_or(child.as_str());
+                sb.push_str(&format!(
+                    "- agent_key: agent:{}:{uuid}  agent_id: {}  session_id: {child}  \
+                     task_id: {}  status: {}\n",
+                    task.agent_id(),
+                    task.agent_id(),
+                    task.task_id(),
+                    task.get_status_string()
+                ));
+            }
+        }
+        if sb.is_empty() {
+            sb.push_str("No subagents spawned yet and no recorded background tasks.");
         }
         Ok(ToolResultBlock::text(sb.trim_end().to_string()))
     }
@@ -1562,6 +1605,58 @@ mod tests {
         assert!(
             crate::agent::middleware::subagents::take_subagent_exposed_events(&Some(sink))
                 .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn agent_list_reports_a_task_record_after_a_restart() {
+        // The live map is empty in a fresh process. `agent_list` used to answer "No subagents
+        // spawned yet" even though the task record (and its result) was on disk.
+        let dir = std::env::temp_dir().join(format!("asr_agent_list_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fs: Arc<dyn crate::filesystem::Filesystem> =
+            Arc::new(crate::filesystem::LocalFilesystem::sandboxed(&dir));
+        let ctx = RuntimeContext::default().with_session_id("sess");
+        let repo = Arc::new(crate::agent::subagent::task::WorkspaceTaskRepository::new(
+            fs,
+            "agentscope-coding-agent",
+        ));
+        let child = tokio::spawn(async { Ok("recorded result".to_string()) });
+        repo.put_task(
+            &ctx,
+            "task-1",
+            "general-purpose",
+            "sess",
+            TaskRunSpec::Adopted {
+                future: child,
+                child_session: Some("sub-11111111-2222-3333-4444-555555555555".to_string()),
+            },
+        )
+        .await;
+        let direct = repo.list_tasks(&ctx, "sess", None).await;
+        assert_eq!(direct.len(), 1, "the repository must still see the record");
+
+        let spawn = Arc::new(
+            AgentSpawnTool::new(Arc::new(DefaultAgentManager::new(&[])))
+                .with_task_repository(Arc::clone(&repo) as Arc<dyn TaskRepository>),
+        );
+        let tool = AgentListTool::new(spawn);
+        let mut tool_ctx = ToolExecutionContext::default();
+        tool_ctx
+            .runtime
+            .insert("sessionId".to_string(), serde_json::json!("sess"));
+        let result = tool
+            .call(JsonMap::new(), tool_ctx)
+            .await
+            .expect("agent_list");
+        let text = result.text_content();
+        assert!(text.contains("Recorded background tasks"), "{text}");
+        assert!(text.contains("task-1"), "{text}");
+        assert!(
+            text.contains("sub-11111111-2222-3333-4444-555555555555"),
+            "{text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

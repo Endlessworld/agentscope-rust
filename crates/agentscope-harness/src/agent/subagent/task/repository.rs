@@ -99,4 +99,11 @@ pub trait TaskRepository: Send + Sync {
 
     /// Releases background maintenance resources (heartbeat / orphan sweeper).
     async fn shutdown(&self) {}
+
+    /// Persists live in-memory task handles before the process goes away.
+    ///
+    /// A background task runs in this process even when its record write failed; flushing it at
+    /// shutdown is the last chance to keep its result discoverable after a restart. The default
+    /// is a no-op for repositories without a local overlay.
+    async fn flush_live(&self) {}
 }

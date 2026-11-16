@@ -814,6 +814,10 @@ impl HarnessAgent {
     /// `agentscope-extensions-acp` 的 `spawn_shutdown_handler`）在收到 Ctrl-C /
     /// SIGTERM 后调用本方法即可。返回 `true` 表示已经到达 `Terminated`。
     pub async fn shutdown(&self) -> bool {
+        // Keep the last resolvable copy of every live background task. A record write that
+        // failed while the process was healthy must not turn a finished result into "not found"
+        // after the next restart.
+        self.task_repository.flush_live().await;
         GracefulShutdownController::new(Arc::clone(&self.shutdown_manager))
             .shutdown()
             .await
