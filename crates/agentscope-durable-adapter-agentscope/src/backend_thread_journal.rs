@@ -128,10 +128,6 @@ impl BackendThreadJournal {
     }
 
     /// The committed native state, which a later commit must not discard.
-    async fn current_checkpoint(&self, lease: &Lease) -> CoreResult<Value> {
-        Ok(self.backend.frame(lease).await.map_err(convert)?.checkpoint)
-    }
-
     fn lease_for(&self, writer: &Writer) -> CoreResult<Lease> {
         let guard = self
             .lease
@@ -327,14 +323,11 @@ impl ThreadJournal for BackendThreadJournal {
             expected_position: expected_seq,
             entries,
         });
-        // The batch's native state becomes the thread's checkpoint. A batch without one carries
-        // the committed checkpoint forward: the backend refuses a commit that discards it, and
-        // re-committing the same value is deduplicated (no new position).
-        commit.checkpoint = match checkpoint::from_batch(events)? {
-            Some(snapshot) => snapshot,
-            None if state.checkpoint_metadata.is_some() => self.current_checkpoint(&lease).await?,
-            None => Value::Null,
-        };
+        // The batch's native state becomes the thread's checkpoint. A batch without one leaves
+        // the committed checkpoint where it is: sending it again made every journal fact
+        // re-encode and re-hash the whole conversation. `null` means "keep the current state"
+        // to the backend.
+        commit.checkpoint = checkpoint::from_batch(events)?.unwrap_or(Value::Null);
         self.backend.commit(&lease, commit).await.map_err(convert)?;
         self.head().await
     }
@@ -352,5 +345,44 @@ impl ThreadJournal for BackendThreadJournal {
                     .map_err(|error| journal_error(format!("Corrupt journal entry: {error}")))
             })
             .collect()
+    }
+
+    async fn visit(
+        &self,
+        after: u64,
+        through: u64,
+        visitor: &mut (dyn for<'a> FnMut(&'a JournalEvent) -> CoreResult<()> + Send),
+    ) -> CoreResult<()> {
+        if through < after {
+            return Err(journal_error("Invalid committed prefix"));
+        }
+        // A page is folded and dropped before the next one is read. The default `visit`
+        // collects the whole range through `scan`, which for a long session holds every
+        // checkpoint and tool payload at once; a projection only needs one page at a time.
+        const PAGE: usize = 128;
+        let mut cursor = after;
+        while cursor < through {
+            let limit = std::cmp::min(PAGE, (through - cursor) as usize);
+            let batch = self.read_after(cursor, limit).await?;
+            if batch.is_empty() {
+                return Err(journal_error("Missing committed prefix"));
+            }
+            let mut progressed = false;
+            for event in &batch {
+                if event.seq > through {
+                    break;
+                }
+                if event.seq != cursor + 1 {
+                    return Err(journal_error("Non-contiguous event sequence"));
+                }
+                cursor = event.seq;
+                progressed = true;
+                visitor(event)?;
+            }
+            if !progressed {
+                return Err(journal_error("Missing committed prefix"));
+            }
+        }
+        Ok(())
     }
 }

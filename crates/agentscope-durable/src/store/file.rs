@@ -1250,7 +1250,12 @@ fn acquire_lock(path: &Path) -> Result<ScopeLock> {
                     reclaim_stale(path, &observed);
                 }
                 if Instant::now() >= deadline {
-                    return Err(DurableError::unavailable("scope is locked"));
+                    let holder = lock_holder(path)
+                        .map(|holder| format!(" (held by {holder})"))
+                        .unwrap_or_default();
+                    return Err(DurableError::unavailable(format!(
+                        "scope is locked{holder}; another agent is using this workspace"
+                    )));
                 }
                 std::thread::sleep(LOCK_RETRY);
             }
@@ -1267,6 +1272,17 @@ fn acquire_lock(path: &Path) -> Result<ScopeLock> {
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+/// The holder named in a lock body (`<pid> <millis> <seq>`), for a diagnosis message.
+fn lock_holder(path: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let mut fields = body.split_whitespace();
+    let pid = fields.next()?;
+    Some(match fields.next() {
+        Some(since) => format!("pid {pid} since {since}"),
+        None => format!("pid {pid}"),
+    })
 }
 
 /// Takes a stale lock away from nobody.

@@ -126,6 +126,38 @@ fn resulted(seq: u64, call_id: &str, state: ToolResultState) -> JournalEvent {
     .expect("event")
 }
 
+/// A finished action: the observer saw the result of a dispatched call.
+fn action_ended(seq: u64, call_id: &str) -> JournalEvent {
+    let block = ToolResultBlock::builder()
+        .id(call_id)
+        .name("echo")
+        .output(ContentBlock::Text(TextBlock::new("ok")))
+        .state(ToolResultState::Success)
+        .build();
+    JournalEvent::from_payload(
+        format!("evt-{seq}"),
+        seq,
+        1_700_000_000_000 + seq as i64,
+        "action/end",
+        None,
+        None,
+        true,
+        &json!({
+            "toolCallId": call_id,
+            "observation": {
+                "action_id": format!("action-{call_id}"),
+                "tool_call_id": call_id,
+                "tool_name": "echo",
+                "status": "succeeded",
+                "started_at": 0,
+                "ended_at": 1,
+            },
+            "result": block,
+        }),
+    )
+    .expect("event")
+}
+
 /// A provider-side call: core never dispatches it, so it owns no attempt to record.
 fn server_requested(seq: u64, call_id: &str) -> JournalEvent {
     let mut call = ToolUseBlock::new(call_id, "google_search", Default::default());
@@ -570,5 +602,99 @@ async fn a_server_tool_result_is_not_recorded_as_a_local_fact() {
             .await
             .is_err(),
         "a provider-side call owns no durable record"
+    );
+}
+
+/// A result newer than the checkpoint must answer its call after a restart.
+///
+/// Regression: a turn that failed before it could commit its `tool/result` (the batch was
+/// rejected) left the checkpoint showing the call as unanswered while its `action/end` was
+/// already committed. Restoring only the checkpoint re-dispatched that call under the new
+/// turn's id, and the durable record rejected it with `NOT_FOUND: Execution does not exist`.
+#[tokio::test]
+async fn a_result_newer_than_the_checkpoint_is_not_dispatched_again() {
+    let (backend, journal, thread, lease) = journaled().await;
+    let writer = journal
+        .acquire("owner-a", Duration::from_secs(60))
+        .await
+        .expect("acquire");
+
+    let mut state = AgentState::builder()
+        .session_id("s1")
+        .user_id("alice")
+        .build();
+    state.context_mut().push(Msg::user("go"));
+    state.context_mut().push(assistant_with_call("c1"));
+
+    // The checkpoint predates the call, and the action finished without a checkpoint after it.
+    journal
+        .commit(
+            &writer,
+            "batch-1",
+            0,
+            &[
+                requested(1, "c1"),
+                checkpointed(2, &state),
+                dispatched(3, "c1"),
+                action_ended(4, "c1"),
+            ],
+        )
+        .await
+        .expect("journal batch");
+
+    // Turn A failed before it could answer the call, and the caller submits a new request.
+    backend
+        .record_failure(
+            &lease,
+            Failure::new(false, "the turn failed", RecoveryPolicy::defaults()),
+        )
+        .await
+        .expect("fail turn A");
+    backend
+        .submit(&thread, "req-2", json!({ "text": "again" }))
+        .await
+        .expect("submit turn B");
+    let lease_b = backend
+        .claim(&thread, "owner-b", Duration::from_secs(60))
+        .await
+        .expect("claim")
+        .expect("turn B is claimable");
+
+    let host = AgentScopeExecutionHost::open(
+        Arc::clone(&backend) as Arc<dyn SessionBackend>,
+        thread.clone(),
+        lease_b.clone(),
+        "run-2",
+    )
+    .await
+    .expect("host");
+
+    let mut restored = host.state().expect("checkpoint restored").clone();
+    assert!(
+        restored
+            .context()
+            .iter()
+            .flat_map(|message| message.tool_result_blocks())
+            .any(|result| result.id.as_deref() == Some("c1")),
+        "the committed action result must answer the pending call: {restored:?}"
+    );
+
+    // Acting must not register the call on the new turn: its durable execution belongs to turn
+    // A, and dispatching it as `turn-B:c1` would fail with `NOT_FOUND`.
+    host.before_boundary(
+        ExecutionBoundary::Acting,
+        &RuntimeContext::new(),
+        &mut restored,
+    )
+    .await
+    .expect("acting boundary");
+    assert!(
+        backend
+            .frame(&lease_b)
+            .await
+            .expect("frame")
+            .tools
+            .is_empty(),
+        "a settled call must not be dispatched again"
     );
 }

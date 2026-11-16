@@ -493,6 +493,10 @@ pub(crate) fn apply_projection_event(
     } = fold;
     super::JournalEventTypes::validate(event)?;
     let data = event.data()?;
+    // Dispatch/start and their terminal answers are the only facts that decide whether a call
+    // is still uncertain; keeping the rule in one function lets a caller advance just that set
+    // without replaying the state checkpoints a projection needs.
+    apply_uncertain_tool_event(uncertain, event.event_type.as_str(), &data);
     match event.event_type.as_str() {
         "state/checkpoint" | "migration/baseline" | "state/restored" => {
             // Only a present payload replaces the state folded so far: a checkpoint whose payload
@@ -517,45 +521,12 @@ pub(crate) fn apply_projection_event(
                 }
             }
         }
-        "tool/dispatch" => {
-            if let Some(id) = json_str(&data, "toolCallId") {
-                uncertain.insert(id);
-            }
-        }
-        "tool/result" => {
-            // A persisted tool result is the authoritative outcome, regardless of
-            // whether the action observer managed to write `action/end` (a denied or
-            // plan-rejected call never runs one). It must clear dispatch uncertainty;
-            // otherwise every later open demands reconciliation for a settled call.
-            if let Some(value) = data.get("message") {
-                if let Ok(message) = serde_json::from_value::<crate::message::Msg>(value.clone()) {
-                    for result in message.tool_result_blocks() {
-                        if let Some(id) = result.id.as_deref() {
-                            uncertain.remove(id);
-                        }
-                    }
-                }
-            }
-        }
-        // `action/start` is the first durable fact of a tool execution. Treating it as
-        // uncertain means a crash between "tool started" and "action/end" is recoverable
-        // even when the writer never got to record `tool/dispatch`.
-        "action/start" => {
-            if let Some(id) = json_str(&data, "toolCallId") {
-                uncertain.insert(id);
-            }
-        }
         "action/end" => {
-            // The attempt ended, so it is no longer *uncertain* — even when the tool
-            // failed before producing a result (`result: null`). Leaving it uncertain
-            // would make every later open of the session demand a reconciliation for a
-            // failure the run already recorded.
-            let id = json_str(&data, "toolCallId").unwrap_or_default();
-            uncertain.remove(&id);
             // An explicit null is a missing result, not a result to decode: earlier
             // writers recorded the field unconditionally, and trying to parse it fails
             // the whole projection (and with it every resume of that session).
             if let Some(value) = data.get("result").filter(|value| !value.is_null()) {
+                let id = json_str(&data, "toolCallId").unwrap_or_default();
                 // Early native action payloads omitted the polymorphic discriminator.
                 let mut value = value.clone();
                 if let Some(object) = value.as_object_mut() {
@@ -564,6 +535,20 @@ pub(crate) fn apply_projection_event(
                         .or_insert_with(|| serde_json::json!("tool_result"));
                 }
                 results.insert(id, serde_json::from_value(value)?);
+            }
+        }
+        "tool/result" => {
+            // The result message may be newer than the checkpoint (a batch that records only
+            // the result commits no state). Folding it into the same recovery map as
+            // `action/end` makes `restore()` answer the call even when the checkpoint does not.
+            if let Some(value) = data.get("message") {
+                if let Ok(message) = serde_json::from_value::<Msg>(value.clone()) {
+                    for result in message.tool_result_blocks() {
+                        if let Some(id) = result.id.clone() {
+                            results.insert(id, result.clone());
+                        }
+                    }
+                }
             }
         }
         "recovery/applied" => {
@@ -597,6 +582,132 @@ pub(crate) fn apply_projection_event(
     Ok(())
 }
 
+/// Applies the dispatch/outcome facts that decide whether a tool call is still uncertain.
+///
+/// Kept separate from [`apply_projection_event`] so a caller that only needs this set can fold
+/// new events without materializing state checkpoints or transcripts.
+fn apply_uncertain_tool_event(
+    uncertain: &mut BTreeSet<String>,
+    event_type: &str,
+    data: &serde_json::Value,
+) {
+    match event_type {
+        // `action/start` is the first durable fact of a tool execution. Treating it as
+        // uncertain means a crash between "tool started" and "action/end" is recoverable
+        // even when the writer never got to record `tool/dispatch`.
+        "tool/dispatch" | "action/start" => {
+            if let Some(id) = json_str(data, "toolCallId") {
+                uncertain.insert(id);
+            }
+        }
+        // A persisted tool result is the authoritative outcome, regardless of whether the
+        // action observer managed to write `action/end` (a denied or plan-rejected call never
+        // runs one). It must clear dispatch uncertainty; otherwise every later open demands
+        // reconciliation for a settled call.
+        "tool/result" => {
+            if let Some(value) = data.get("message") {
+                if let Ok(message) = serde_json::from_value::<crate::message::Msg>(value.clone()) {
+                    for result in message.tool_result_blocks() {
+                        if let Some(id) = result.id.as_deref() {
+                            uncertain.remove(id);
+                        }
+                    }
+                }
+            }
+        }
+        // The attempt ended, so it is no longer *uncertain* — even when the tool failed before
+        // producing a result (`result: null`). Leaving it uncertain would make every later open
+        // of the session demand a reconciliation for a failure the run already recorded.
+        "action/end" => {
+            if let Some(id) = json_str(data, "toolCallId") {
+                uncertain.remove(&id);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Appends one synthetic tool message per committed result the state does not carry yet.
+///
+/// The journal and the checkpoint are written by different batches: a result can be committed
+/// while the newest checkpoint predates it. Restoring only the checkpoint then leaves the call
+/// looking unanswered, and the next acting phase would execute the same effect again.
+pub fn realign_tool_results(
+    state: &mut crate::state::AgentState,
+    results: &BTreeMap<String, ToolResultBlock>,
+) {
+    let existing: HashSet<String> = state
+        .context()
+        .iter()
+        .flat_map(|message| message.tool_result_blocks())
+        .filter_map(|result| result.id.clone())
+        .collect();
+    for (id, result) in results {
+        if existing.contains(id) || result.is_suspended() {
+            continue;
+        }
+        let mut block = result.clone();
+        block.id = Some(id.clone());
+        state.context_mut().push(
+            crate::message::MsgBuilder::new()
+                .id(format!("recovered_{id}"))
+                .role(MsgRole::Tool)
+                .content(vec![ContentBlock::ToolResult(block)])
+                .build(),
+        );
+    }
+}
+
+/// Collects the committed tool outcomes in `events`, keyed by call id.
+///
+/// Both facts are authoritative: `action/end` carries the result the observer saw, and a
+/// `tool/result` message is the result the invocation folded back into its context. Either may
+/// be newer than the newest `state/checkpoint`, so a caller restoring that checkpoint must
+/// replay these before acting on pending calls.
+pub fn committed_tool_results(
+    events: &[JournalEvent],
+) -> crate::error::Result<BTreeMap<String, ToolResultBlock>> {
+    let mut results: BTreeMap<String, ToolResultBlock> = BTreeMap::new();
+    for event in events {
+        // Parse only the two outcome-bearing types: a `state/checkpoint` payload repeats the
+        // whole conversation and must not be materialized a second time here.
+        match event.event_type.as_str() {
+            "action/end" | "tool/result" => {}
+            _ => continue,
+        }
+        let data = event.data()?;
+        match event.event_type.as_str() {
+            "action/end" => {
+                let id = json_str(&data, "toolCallId").unwrap_or_default();
+                // An explicit null is a missing result, not a result to decode.
+                if let Some(value) = data.get("result").filter(|value| !value.is_null()) {
+                    // Early native action payloads omitted the polymorphic discriminator.
+                    let mut value = value.clone();
+                    if let Some(object) = value.as_object_mut() {
+                        object
+                            .entry("type")
+                            .or_insert_with(|| serde_json::json!("tool_result"));
+                    }
+                    results.insert(id, serde_json::from_value(value)?);
+                }
+            }
+            "tool/result" => {
+                if let Some(value) = data.get("message") {
+                    if let Ok(message) = serde_json::from_value::<Msg>(value.clone()) {
+                        for result in message.tool_result_blocks() {
+                            if let Some(id) = result.id.clone() {
+                                results.insert(id, result.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(results)
+}
+
 /// Finalizes a projection replay: realigns the recovered state with facts an older checkpoint
 /// may not contain.
 pub(crate) fn finish_projection(
@@ -617,28 +728,7 @@ pub(crate) fn finish_projection(
         if let Some(state_json) = &state {
             if !results.is_empty() || !extensions.is_empty() {
                 let mut restored = crate::state::AgentState::from_json_str(state_json)?;
-                let mut existing: HashSet<String> = HashSet::new();
-                for message in &restored.context {
-                    for result in message.tool_result_blocks() {
-                        if let Some(id) = &result.id {
-                            existing.insert(id.clone());
-                        }
-                    }
-                }
-                for (id, result) in &results {
-                    if existing.contains(id) || result.is_suspended() {
-                        continue;
-                    }
-                    let mut block = result.clone();
-                    block.id = Some(id.clone());
-                    restored.context.push(
-                        crate::message::MsgBuilder::new()
-                            .id(format!("recovered_{id}"))
-                            .role(MsgRole::Tool)
-                            .content(vec![ContentBlock::ToolResult(block)])
-                            .build(),
-                    );
-                }
+                realign_tool_results(&mut restored, &results);
                 for extension in &extensions {
                     super::JournalEventCodecRegistry::default_registry()
                         .apply_extension(&mut restored, extension)?;
@@ -681,6 +771,37 @@ impl JournalProjection {
             Some(json) => Ok(Some(crate::state::AgentState::from_json_str(json)?)),
             None => Ok(None),
         }
+    }
+
+    /// Folds the events committed since `as_of_seq` onto this projection.
+    ///
+    /// A caller that keeps a projection across ticks pays only for the facts committed since
+    /// the previous one instead of replaying a journal whose size is dominated by checkpoints.
+    pub async fn catch_up(&mut self, log: &dyn ThreadJournal) -> crate::error::Result<()> {
+        let head = log.head().await?;
+        if head.seq < self.as_of_seq {
+            // The journal was replaced or truncated underneath the projection: only a full
+            // read describes the new chain.
+            *self = Self::read(log).await?;
+            return Ok(());
+        }
+        if head.seq == self.as_of_seq {
+            return Ok(());
+        }
+        let mut fold = ProjectionFold {
+            state: self.state_json.clone(),
+            uncertain: self.uncertain_tool_calls.clone(),
+            runs: self.active_runs.clone(),
+            results: BTreeMap::new(),
+            verifications: self.verifications.clone(),
+            extensions: Vec::new(),
+        };
+        log.visit(self.as_of_seq, head.seq, &mut |event| {
+            apply_projection_event(&mut fold, event)
+        })
+        .await?;
+        *self = finish_projection(fold, head.seq)?;
+        Ok(())
     }
 }
 
@@ -1307,6 +1428,76 @@ mod tests {
             .filter(|m| m.id.starts_with("recovered_call-1"))
             .collect();
         assert_eq!(recovered.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_projection_catches_up_without_replaying_the_state() {
+        let (_storage, log, writer) = journal().await;
+        commit(
+            &*log,
+            &writer,
+            "b1",
+            &[
+                event(
+                    1,
+                    "tool/dispatch",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "toolCallId": "call-1" }),
+                ),
+                event(
+                    2,
+                    "action/start",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "toolCallId": "call-2" }),
+                ),
+            ],
+        )
+        .await;
+
+        let mut view = JournalProjection::read(&*log).await.unwrap();
+        assert_eq!(view.as_of_seq, 2);
+        assert_eq!(
+            view.uncertain_tool_calls
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["call-1".to_string(), "call-2".to_string()]
+        );
+
+        let result = ToolResultBlock::new("call-2", "tool", text_blocks("ok"));
+        let message = crate::message::MsgBuilder::new()
+            .role(MsgRole::Tool)
+            .content(vec![ContentBlock::ToolResult(result)])
+            .build();
+        commit(
+            &*log,
+            &writer,
+            "b2",
+            &[
+                event(
+                    3,
+                    "action/end",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "toolCallId": "call-1", "result": null }),
+                ),
+                event(
+                    4,
+                    "tool/result",
+                    Some("run-1"),
+                    Some("t1"),
+                    serde_json::json!({ "message": message }),
+                ),
+            ],
+        )
+        .await;
+
+        view.catch_up(&*log).await.unwrap();
+        assert_eq!(view.as_of_seq, 4);
+        assert!(view.uncertain_tool_calls.is_empty());
+        assert_eq!(view, JournalProjection::read(&*log).await.unwrap());
     }
 
     #[tokio::test]

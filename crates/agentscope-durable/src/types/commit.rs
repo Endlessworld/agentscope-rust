@@ -155,6 +155,11 @@ pub struct JournalAppend {
 pub struct Commit {
     pub commit_id: String,
     pub expected_revision: u64,
+    /// Native state at the end of this commit.
+    ///
+    /// `null` keeps the checkpoint a previous commit wrote: only a commit that carries native
+    /// state needs to send it, and re-sending an unchanged snapshot makes every journal fact
+    /// serialize and hash the whole conversation.
     #[serde(default)]
     pub checkpoint: Value,
     #[serde(default)]

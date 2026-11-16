@@ -59,6 +59,16 @@ fn renew_interval(lease: Duration) -> Duration {
 /// safety bound, not a hard event limit.
 const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 
+/// How many facts may still join a batch that is already over [`MAX_PENDING_BYTES`].
+///
+/// An oversized payload is admitted when nothing else is buffered (see [`admits_bytes`]), and
+/// the facts that follow it are usually just as large: `capture_state` buffers a huge
+/// `tool/result` message and then the required `state/checkpoint` that repeats the same
+/// conversation. Rejecting that append failed the whole turn with
+/// `Session pending buffer exhausted`, dropping every fact the batch held. Once the budget is
+/// exceeded, growth is bounded by allowing only this many more facts before a flush.
+const OVER_BUDGET_APPENDS: u32 = 2;
+
 /// Whether a `bytes`-sized payload may join the pending buffer.
 ///
 /// A payload that is larger than the whole budget on its own is still admitted when nothing
@@ -66,9 +76,16 @@ const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 /// is one large allocation rather than an unbounded queue. Rejecting it instead failed the
 /// whole turn with `Session pending buffer exhausted` — exactly the case a long conversation
 /// checkpoints into.
-fn admits_bytes(pending: usize, inflight: usize, bytes: usize) -> bool {
+///
+/// Once the batch is over budget, `over_budget` counts the extra facts already accepted; see
+/// [`OVER_BUDGET_APPENDS`]. Without that allowance the fact following an oversized payload
+/// could never be buffered.
+fn admits_bytes(pending: usize, inflight: usize, over_budget: u32, bytes: usize) -> bool {
     let buffered = pending.saturating_add(inflight);
-    buffered == 0 || buffered.saturating_add(bytes) <= MAX_PENDING_BYTES
+    if buffered == 0 || buffered.saturating_add(bytes) <= MAX_PENDING_BYTES {
+        return true;
+    }
+    buffered > MAX_PENDING_BYTES && over_budget < OVER_BUDGET_APPENDS
 }
 
 /// How many times a flush retries a transient persistence failure before giving up.
@@ -344,6 +361,8 @@ struct InflightBatch {
     /// megabytes). Callers that need to mutate it take a copy explicitly.
     events: Arc<Vec<JournalEvent>>,
     bytes: usize,
+    /// Over-budget facts already admitted into this batch (see [`OVER_BUDGET_APPENDS`]).
+    over_budget: u32,
 }
 
 /// Mutable recording state guarded by one mutex.
@@ -351,6 +370,8 @@ struct InflightBatch {
 struct RecorderState {
     pending: Vec<JournalEvent>,
     pending_bytes: usize,
+    /// Over-budget appends already accepted into `pending` (see [`OVER_BUDGET_APPENDS`]).
+    over_budget: u32,
     /// Events handed to an in-flight commit but not acknowledged yet.
     inflight: Option<InflightBatch>,
     durable_seq: u64,
@@ -645,6 +666,29 @@ impl InvocationRecorder {
         exporter: Option<Arc<JournalExporter>>,
     ) -> crate::error::Result<Self> {
         Self::open_with_lease(log, turn_id, run_id, exporter, LEASE).await
+    }
+
+    /// Opens a recorder with an explicit run id and a caller-supplied recovery baseline.
+    ///
+    /// The baseline is accepted only when its `seq`/`commit_id` still match the head acquired
+    /// under the writer lease; otherwise the recorder falls back to the full replay.
+    pub async fn open_with_run_and_baseline(
+        log: Arc<dyn ThreadJournal>,
+        turn_id: Option<&str>,
+        run_id: &str,
+        exporter: Option<Arc<JournalExporter>>,
+        baseline: RecorderBaseline,
+    ) -> crate::error::Result<Self> {
+        Self::open_with_lease_and_baseline(
+            log,
+            turn_id,
+            run_id,
+            exporter,
+            LEASE,
+            Some(baseline),
+            RecordingPolicy::default(),
+        )
+        .await
     }
 
     /// Opens a recorder using a caller-supplied recovery baseline.
@@ -1075,9 +1119,16 @@ impl InvocationRecorder {
             .as_ref()
             .map(|inflight| inflight.bytes)
             .unwrap_or(0);
-        if !admits_bytes(guard.pending_bytes, inflight_bytes, bytes) {
+        let buffered = guard.pending_bytes.saturating_add(inflight_bytes);
+        if !admits_bytes(
+            guard.pending_bytes,
+            inflight_bytes,
+            guard.over_budget,
+            bytes,
+        ) {
             return Err(journal_error("Session pending buffer exhausted"));
         }
+        let over_budget = buffered != 0 && buffered.saturating_add(bytes) > MAX_PENDING_BYTES;
         let inflight_events = guard
             .inflight
             .as_ref()
@@ -1108,6 +1159,9 @@ impl InvocationRecorder {
         }
         guard.pending.push(event);
         guard.pending_bytes += bytes;
+        if over_budget {
+            guard.over_budget += 1;
+        }
         Ok(seq)
     }
 
@@ -1161,6 +1215,7 @@ impl InvocationRecorder {
                 restored.extend(guard.pending.drain(..));
                 guard.pending = restored;
                 guard.pending_bytes += inflight.bytes;
+                guard.over_budget += inflight.over_budget;
             }
             if guard.pending.is_empty() {
                 return Ok(());
@@ -1169,11 +1224,13 @@ impl InvocationRecorder {
             let events: Vec<JournalEvent> = guard.pending.drain(..).collect();
             let bytes = guard.pending_bytes;
             guard.pending_bytes = 0;
+            let over_budget = std::mem::take(&mut guard.over_budget);
             let expected = guard.durable_seq;
             guard.inflight = Some(InflightBatch {
                 batch_id: batch_id.clone(),
                 events: Arc::new(events),
                 bytes,
+                over_budget,
             });
             (batch_id, expected)
         };
@@ -1266,18 +1323,19 @@ impl InvocationRecorder {
                     // the failure sticky, so no later write can pretend to have persisted.
                     {
                         let mut guard = self.lock();
-                        let mut restored = match guard.inflight.take() {
+                        let (mut restored, restored_over_budget) = match guard.inflight.take() {
                             Some(inflight) if inflight.batch_id == batch => {
-                                Arc::unwrap_or_clone(inflight.events)
+                                (Arc::unwrap_or_clone(inflight.events), inflight.over_budget)
                             }
                             // Defensive: the in-flight slot is ours (flush is serialized), so
                             // this only happens if the state was reset underneath us. Restore
                             // the batch we committed instead of dropping its events.
-                            _ => Arc::unwrap_or_clone(events),
+                            _ => (Arc::unwrap_or_clone(events), 0),
                         };
                         restored.extend(guard.pending.drain(..));
                         guard.pending = restored;
                         guard.pending_bytes += bytes;
+                        guard.over_budget += restored_over_budget;
                         if guard.failure.is_none() {
                             guard.failure = Some(message.clone());
                         }
@@ -2045,11 +2103,54 @@ mod tests {
     fn an_oversized_payload_is_admitted_when_nothing_else_is_buffered() {
         // A big checkpoint must not be rejected just because it exceeds the ceiling: the
         // journal spills it to a blob, so it is committed alone instead of failing the turn.
-        assert!(admits_bytes(0, 0, MAX_PENDING_BYTES + 1));
-        // Anything else still respects the budget.
-        assert!(admits_bytes(1, 0, MAX_PENDING_BYTES - 1));
-        assert!(!admits_bytes(1, 0, MAX_PENDING_BYTES));
-        assert!(!admits_bytes(0, 1, MAX_PENDING_BYTES));
+        assert!(admits_bytes(0, 0, 0, MAX_PENDING_BYTES + 1));
+        // Anything else still respects the budget while the batch is under it.
+        assert!(admits_bytes(1, 0, 0, MAX_PENDING_BYTES - 1));
+        assert!(!admits_bytes(1, 0, 0, MAX_PENDING_BYTES));
+        assert!(!admits_bytes(0, 1, 0, MAX_PENDING_BYTES));
+        // A batch that already holds an oversized payload may accept the fact that follows
+        // it (the checkpoint repeating the same conversation), but only so many times.
+        assert!(admits_bytes(MAX_PENDING_BYTES + 1, 0, 0, MAX_PENDING_BYTES));
+        assert!(admits_bytes(
+            MAX_PENDING_BYTES + 1,
+            0,
+            OVER_BUDGET_APPENDS - 1,
+            MAX_PENDING_BYTES
+        ));
+        assert!(!admits_bytes(
+            MAX_PENDING_BYTES + 1,
+            0,
+            OVER_BUDGET_APPENDS,
+            MAX_PENDING_BYTES
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_huge_tool_result_and_the_checkpoint_after_it_share_one_batch() {
+        // Regression: an uncapped shell result buffered an oversized `tool/result`, and the
+        // required `state/checkpoint` that followed it was rejected with "Session pending
+        // buffer exhausted" — the whole turn failed and every buffered fact was lost.
+        let (log, _storage) = journal().await;
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .unwrap();
+
+        let huge = format!("\"{}\"", "x".repeat(MAX_PENDING_BYTES));
+        assert!(huge.len() > MAX_PENDING_BYTES);
+        recorder
+            .append_serialized_required("tool/result", huge.clone(), true)
+            .expect("the oversized result is admitted alone");
+        recorder
+            .append_serialized_required("state/checkpoint", huge, true)
+            .expect("the checkpoint repeating the state must still be admitted");
+
+        recorder.flush().await.unwrap();
+        assert_eq!(recorder.metrics().durable_seq, 2);
+        assert_eq!(
+            event_types(&*log).await,
+            vec!["tool/result".to_string(), "state/checkpoint".to_string()]
+        );
+        recorder.close().await;
     }
 
     /// Storage that can be told to fail commit writes, to exercise sticky failures.

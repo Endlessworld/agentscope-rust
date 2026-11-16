@@ -601,12 +601,46 @@ const DURABLE_NAMESPACE: &str = "acp";
 const TICK_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
 /// How long a prompt waits for a tick in flight before it stops waiting for it.
 const DRIVER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a `running` turn may make no durable progress before the client is told.
+///
+/// Not a failure: a long command or a slow provider is legitimate, and the prompt keeps
+/// waiting. The notice exists because a hang with no output is indistinguishable from a lost
+/// request, and the user has to know that cancelling is an option.
+const RUNNING_STALL_NOTICE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Default hard cap for a `running` turn with no durable progress.
+///
+/// Above every per-tool ceiling the ACP agent configures (the shell and generic tool timeout is
+/// 30 minutes), so only a genuinely wedged run reaches it. `AGENTSCOPE_ACP_STALL_CANCEL_SECS`
+/// overrides it; `0`/`off` disables the cap.
+const RUNNING_STALL_CANCEL: std::time::Duration = std::time::Duration::from_secs(45 * 60);
 /// Message recorded for a tool call whose outcome was lost with the process that dispatched it.
 const ABANDONED_ON_RESUME_MESSAGE: &str = "This tool call was dispatched, but its outcome was \
      never recorded (the process ended or the run was interrupted). It was not retried; issue the \
      call again if it is still needed.";
 /// Why a resumed session settles the tool calls it found unsettled.
 const RECONCILE_REASON: &str = "resume: abandoned tool calls whose outcome was never recorded";
+
+/// The hard cap for a silent `running` turn, from `AGENTSCOPE_ACP_STALL_CANCEL_SECS`.
+fn running_stall_cancel_after() -> Option<std::time::Duration> {
+    let value = std::env::var("AGENTSCOPE_ACP_STALL_CANCEL_SECS").ok();
+    stall_cancel_after_value(value.as_deref())
+}
+
+/// Parses the stall-cap override; `None` means "wait forever" (the pre-existing behaviour).
+fn stall_cancel_after_value(value: Option<&str>) -> Option<std::time::Duration> {
+    let Some(value) = value else {
+        return Some(RUNNING_STALL_CANCEL);
+    };
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "off" | "0" | "false" | "no" | "disabled") {
+        return None;
+    }
+    match value.parse::<u64>() {
+        Ok(secs) if secs > 0 => Some(std::time::Duration::from_secs(secs)),
+        // An unreadable value is a typo, not an opt-out: keep the safe default.
+        _ => Some(RUNNING_STALL_CANCEL),
+    }
+}
 
 /// The durable runtime that drives this session's turns.
 ///
@@ -3181,6 +3215,13 @@ impl AcpAgentSession {
             let mut waiting_since: Option<std::time::Instant> = None;
             let mut first_poll_failure: Option<std::time::Instant> = None;
             let mut stall: Option<String> = None;
+            // Durable progress means a new turn revision: a streaming delta or a poll that
+            // returns the same revision is not progress. A run with none for long enough is
+            // either inside a legitimate long tool or wedged.
+            let stall_cancel_after = running_stall_cancel_after();
+            let mut last_revision = 0u64;
+            let mut quiet_since = std::time::Instant::now();
+            let mut stall_noticed = false;
             // A persistent ticker, not a fresh `sleep` per iteration: re-creating the timer every
             // loop restart meant a busy event stream could starve it indefinitely (a stalled
             // command was only noticed minutes later).
@@ -3198,6 +3239,11 @@ impl AcpAgentSession {
                                 Ok(current) => {
                                     first_poll_failure = None;
                                     let status = turn_status_name(current.status);
+                                    if current.revision != last_revision {
+                                        last_revision = current.revision;
+                                        quiet_since = std::time::Instant::now();
+                                        stall_noticed = false;
+                                    }
                                     if status != last_status {
                                         // Any status change is progress: restart the admission
                                         // clock so an earlier `queued` wait cannot accumulate.
@@ -3208,6 +3254,8 @@ impl AcpAgentSession {
                                             .then(std::time::Instant::now);
                                         waiting_since = (status == "waiting")
                                             .then(std::time::Instant::now);
+                                        quiet_since = std::time::Instant::now();
+                                        stall_noticed = false;
                                     }
                                     if current.status.terminal() {
                                         settled_task = Some(current);
@@ -3265,6 +3313,31 @@ impl AcpAgentSession {
                                                 .unwrap_or_else(|| "no reason recorded".to_string())
                                         ));
                                         break;
+                                    } else if current.status == TurnStatus::Running {
+                                        // A tick in flight holds the turn; no status change will
+                                        // be observed until it returns. Tell the client after a
+                                        // long silence, and apply the (configurable) hard cap so a
+                                        // genuinely wedged run cannot hold the prompt forever.
+                                        let quiet = quiet_since.elapsed();
+                                        if quiet >= RUNNING_STALL_NOTICE && !stall_noticed {
+                                            stall_noticed = true;
+                                            emit(self.advisory_notification(format!(
+                                                "The task has reported no progress for {}s. It \
+                                                 may be running a long command or waiting on a \
+                                                 provider; cancel it if this is unexpected.",
+                                                quiet.as_secs()
+                                            )));
+                                        }
+                                        if let Some(limit) = stall_cancel_after {
+                                            if quiet >= limit {
+                                                stall = Some(format!(
+                                                    "the task made no durable progress for {}s \
+                                                     (status `running`)",
+                                                    quiet.as_secs()
+                                                ));
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                                 Err(error) => {
@@ -3764,8 +3837,8 @@ fn fold_replay_cards(tasks: Vec<Arc<BackgroundTask>>) -> Vec<ReplayCard> {
 #[cfg(test)]
 mod tests {
     use super::{
-        prompt_idempotency_key, save_session_config, thought_level_params, turn_usage_to_response,
-        SelectedDescriptor,
+        prompt_idempotency_key, save_session_config, stall_cancel_after_value,
+        thought_level_params, turn_usage_to_response, SelectedDescriptor, RUNNING_STALL_CANCEL,
     };
     use agentscope_core::message::{ChatUsage, Msg};
     use agentscope_harness::agent::subagent::task::{BackgroundTask, TaskStatus};
@@ -3789,6 +3862,23 @@ mod tests {
         task.set_sub_session_id(child.map(str::to_string));
         task.set_last_checked_at(last_checked_at);
         task
+    }
+
+    #[test]
+    fn the_running_stall_cap_is_configurable_and_can_be_disabled() {
+        assert_eq!(stall_cancel_after_value(None), Some(RUNNING_STALL_CANCEL));
+        assert_eq!(
+            stall_cancel_after_value(Some("90")),
+            Some(std::time::Duration::from_secs(90))
+        );
+        // A typo must not silently turn the watchdog off.
+        assert_eq!(
+            stall_cancel_after_value(Some("nonsense")),
+            Some(RUNNING_STALL_CANCEL)
+        );
+        for off in ["off", "0", "false", "no", "disabled"] {
+            assert_eq!(stall_cancel_after_value(Some(off)), None, "{off}");
+        }
     }
 
     #[test]

@@ -566,13 +566,6 @@ fn write_checkpoint(
     command: &Commit,
     next: TurnStatus,
 ) -> Result<()> {
-    let digest = json::hash(&command.checkpoint)?;
-    if thread.checkpoint_metadata.is_some() && command.checkpoint.is_null() {
-        return Err(DurableError::invalid("Cannot discard native state"));
-    }
-    if command.checkpoint.is_null() {
-        return Ok(());
-    }
     let previous = match thread.checkpoint_position {
         0 => None,
         position => load_json::<CheckpointRecord>(
@@ -580,6 +573,16 @@ fn write_checkpoint(
             &checkpoint_history_part(&thread.definition.key.thread_id, position),
         )?,
     };
+    // A null checkpoint keeps the committed state: a journal batch that carries no native
+    // state must not re-send (and re-hash) the whole conversation. A terminal turn still
+    // records that the kept checkpoint is settled.
+    if command.checkpoint.is_null() {
+        if next.terminal() {
+            mark_checkpoint_settled(txn, thread, previous)?;
+        }
+        return Ok(());
+    }
+    let digest = json::hash(&command.checkpoint)?;
     let unchanged = thread
         .checkpoint_metadata
         .as_ref()
@@ -616,18 +619,31 @@ fn write_checkpoint(
         )?;
         thread.checkpoint_metadata = Some(metadata);
     } else if next.terminal() {
-        if let Some(mut record) = previous {
-            if !record.settled {
-                record.settled = true;
-                store_json(
-                    txn,
-                    &checkpoint_history_part(
-                        &thread.definition.key.thread_id,
-                        thread.checkpoint_position,
-                    ),
-                    &record,
-                )?;
-            }
+        mark_checkpoint_settled(txn, thread, previous)?;
+    }
+    Ok(())
+}
+
+/// Marks the checkpoint a terminal turn keeps as settled, without rewriting its payload.
+fn mark_checkpoint_settled(
+    txn: &mut dyn Txn,
+    thread: &ThreadData,
+    previous: Option<CheckpointRecord>,
+) -> Result<()> {
+    if thread.checkpoint_position == 0 {
+        return Ok(());
+    }
+    if let Some(mut record) = previous {
+        if !record.settled {
+            record.settled = true;
+            store_json(
+                txn,
+                &checkpoint_history_part(
+                    &thread.definition.key.thread_id,
+                    thread.checkpoint_position,
+                ),
+                &record,
+            )?;
         }
     }
     Ok(())

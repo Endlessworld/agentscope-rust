@@ -14,6 +14,7 @@
 //! poll: control lands at the next poll while the invocation yields, and a tool that blocks the
 //! runtime thread is only stopped once it returns.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -23,7 +24,9 @@ use agentscope_core::agent::{
     EXECUTION_POSITION_CONTEXT_KEY,
 };
 use agentscope_core::error::{Error, Result as CoreResult};
-use agentscope_core::journal::{InvocationRecorder, ThreadJournal, RECORDER_CONTEXT_KEY};
+use agentscope_core::journal::{
+    InvocationRecorder, JournalProjection, RecorderBaseline, ThreadJournal, RECORDER_CONTEXT_KEY,
+};
 use agentscope_core::message::{
     ContentBlock, GenerateReason, Msg, MsgRole, TextBlock, ToolResultBlock, ToolResultState,
     ToolUseBlock,
@@ -92,13 +95,93 @@ const UNKNOWN_OUTCOME: &str = "The turn cannot report success because a tool cal
 /// the same `Arc` back every time; a host that wants a fresh agent builds one per tick.
 pub struct AgentScopeHarnessAdapter {
     build: Arc<dyn Fn() -> Arc<HarnessAgent> + Send + Sync>,
+    /// The committed projection, advanced with the journal.
+    ///
+    /// The recovery guard runs at the start of every tick. Replaying the whole journal there
+    /// just to learn that nothing is stranded made every model decision read the session's
+    /// entire history; this view only folds the facts committed since the previous tick, and
+    /// doubles as the baseline the recorder opens on (so it does not replay the journal either).
+    projection: tokio::sync::Mutex<Option<(agentscope_durable::ThreadKey, JournalProjection)>>,
 }
 
 impl AgentScopeHarnessAdapter {
     pub fn new(build: impl Fn() -> Arc<HarnessAgent> + Send + Sync + 'static) -> Self {
         Self {
             build: Arc::new(build),
+            projection: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Settles the calls a failed attempt left without an outcome.
+    ///
+    /// The common case is "nothing stranded"; that answer comes from the incremental view.
+    /// A non-empty view falls back to the full recovery path, which restores the state and
+    /// reconciles in one commit (and is followed by a cache reset).
+    async fn settle_stranded(
+        &self,
+        journal: &Arc<BackendThreadJournal>,
+    ) -> CoreResult<BTreeSet<String>> {
+        let log: &dyn ThreadJournal = journal.as_ref();
+        let mut cache = self.projection.lock().await;
+        if cache
+            .as_ref()
+            .is_some_and(|(thread, _)| thread == journal.thread())
+        {
+            if let Some((_, view)) = cache.as_mut() {
+                view.catch_up(log).await?;
+            }
+        } else {
+            *cache = Some((
+                journal.thread().clone(),
+                JournalProjection::read(log).await?,
+            ));
+        }
+        if cache
+            .as_ref()
+            .is_some_and(|(_, view)| view.uncertain_tool_calls.is_empty())
+        {
+            return Ok(BTreeSet::new());
+        }
+        *cache = None;
+        agentscope_core::journal::recovery::settle_uncertain_tool_outcomes(
+            Arc::clone(journal) as Arc<dyn ThreadJournal>,
+            STRANDED_OUTCOME_MESSAGE,
+            STRANDED_RECONCILE_REASON,
+        )
+        .await
+    }
+
+    /// The committed projection as a recorder baseline, when it is exactly the journal head.
+    ///
+    /// Supplying it keeps `InvocationRecorder::open_with` from replaying the whole journal on
+    /// every tick; a head that moved in between makes the recorder reject it and fall back to
+    /// its own replay, so this is an optimization, never a correctness dependency.
+    async fn recorder_baseline(
+        &self,
+        journal: &Arc<BackendThreadJournal>,
+        resumed_turn: bool,
+    ) -> Option<RecorderBaseline> {
+        let log: &dyn ThreadJournal = journal.as_ref();
+        let mut cache = self.projection.lock().await;
+        let (thread, view) = cache.as_mut()?;
+        if thread != journal.thread() {
+            return None;
+        }
+        if view.catch_up(log).await.is_err() {
+            return None;
+        }
+        let head = log.head().await.ok()?;
+        if head.seq != view.as_of_seq || !view.uncertain_tool_calls.is_empty() {
+            return None;
+        }
+        Some(RecorderBaseline {
+            seq: view.as_of_seq,
+            commit_id: head.commit_id,
+            state_json: view.state_json.clone()?,
+            uncertain_tool_calls: BTreeSet::new(),
+            active_runs: view.active_runs.clone(),
+            resumed_turn,
+        })
     }
 }
 
@@ -125,13 +208,7 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
         // dispatched by this invocation yet, so such a call belonged to a run that already
         // ended: its outcome can never arrive, and recording it as interrupted (never as
         // success, never re-executed) is what lets the retry run at all.
-        let stranded = agentscope_core::journal::recovery::settle_uncertain_tool_outcomes(
-            Arc::clone(&journal) as Arc<dyn ThreadJournal>,
-            STRANDED_OUTCOME_MESSAGE,
-            STRANDED_RECONCILE_REASON,
-        )
-        .await
-        .map_err(|error| {
+        let stranded = self.settle_stranded(&journal).await.map_err(|error| {
             DurableError::invalid(format!(
                 "The tool calls the failed attempt left unanswered cannot be settled: {error}"
             ))
@@ -172,16 +249,30 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
                 .map_err(|_| DurableError::invalid("agent state lock poisoned"))? = state;
         }
 
-        let recorder = Arc::new(
-            InvocationRecorder::open_with(
-                Arc::clone(&journal) as Arc<dyn ThreadJournal>,
-                Some(&lease.turn_id),
-                &invocation_id(lease),
-                None,
-            )
-            .await
-            .map_err(convert)?,
-        );
+        let baseline = self.recorder_baseline(&journal, host.turn_started()).await;
+        let journal_log = Arc::clone(&journal) as Arc<dyn ThreadJournal>;
+        let opened = match baseline {
+            Some(baseline) => {
+                InvocationRecorder::open_with_run_and_baseline(
+                    journal_log,
+                    Some(&lease.turn_id),
+                    &invocation_id(lease),
+                    None,
+                    baseline,
+                )
+                .await
+            }
+            None => {
+                InvocationRecorder::open_with(
+                    journal_log,
+                    Some(&lease.turn_id),
+                    &invocation_id(lease),
+                    None,
+                )
+                .await
+            }
+        };
+        let recorder = Arc::new(opened.map_err(convert)?);
 
         let budget = Arc::new(TickBudget::new(Arc::clone(&host)));
         let mut extensions = Extensions::new();

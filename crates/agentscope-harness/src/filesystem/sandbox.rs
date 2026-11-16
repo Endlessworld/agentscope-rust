@@ -13,6 +13,14 @@ use tokio::io::AsyncReadExt;
 use super::CompositeFilesystem;
 use super::{ExecuteResponse, FileData, FileInfo, Filesystem, FilesystemKind, GrepMatch};
 
+/// Java parity: `LocalFilesystemWithShell` caps combined output at 100_000 bytes.
+///
+/// Without it one runaway command can emit an unbounded tool result, and a single result
+/// that large is enough to wedge the journal recorder's pending buffer for the rest of the
+/// turn: the following required `state/checkpoint` append is then rejected and the whole
+/// batch never commits.
+const MAX_OUTPUT_BYTES: usize = 100_000;
+
 /// A `Filesystem` that additionally supports shell command execution.
 #[async_trait]
 pub trait SandboxFilesystem: Filesystem {
@@ -217,20 +225,20 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         let mut stdout_stream = child.stdout.take();
         let mut stderr_stream = child.stderr.take();
 
-        // Spawn background tasks to drain stdout/stderr concurrently.
+        // Spawn background tasks to drain stdout/stderr concurrently, keeping at most
+        // `MAX_OUTPUT_BYTES` each while still reading to EOF so the child never blocks on a
+        // full pipe.
         let stdout_fut = async move {
-            let mut buf = Vec::new();
-            if let Some(ref mut stream) = stdout_stream {
-                let _ = stream.read_to_end(&mut buf).await;
+            match stdout_stream {
+                Some(stream) => read_capped(stream, MAX_OUTPUT_BYTES).await,
+                None => (Vec::new(), false),
             }
-            buf
         };
         let stderr_fut = async move {
-            let mut buf = Vec::new();
-            if let Some(ref mut stream) = stderr_stream {
-                let _ = stream.read_to_end(&mut buf).await;
+            match stderr_stream {
+                Some(stream) => read_capped(stream, MAX_OUTPUT_BYTES).await,
+                None => (Vec::new(), false),
             }
-            buf
         };
         let stdout_handle = tokio::spawn(stdout_fut);
         let stderr_handle = tokio::spawn(stderr_fut);
@@ -266,13 +274,13 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         };
 
         // Collect drained output.
-        let stdout_bytes = stdout_handle.await.unwrap_or_else(|e| {
+        let (stdout_bytes, stdout_truncated) = stdout_handle.await.unwrap_or_else(|e| {
             tracing::warn!("stdout task join error: {}", e);
-            Vec::new()
+            (Vec::new(), false)
         });
-        let stderr_bytes = stderr_handle.await.unwrap_or_else(|e| {
+        let (stderr_bytes, stderr_truncated) = stderr_handle.await.unwrap_or_else(|e| {
             tracing::warn!("stderr task join error: {}", e);
-            Vec::new()
+            (Vec::new(), false)
         });
 
         let mut output = String::from_utf8_lossy(&stdout_bytes).into_owned();
@@ -282,14 +290,64 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
             }
             output.push_str(&String::from_utf8_lossy(&stderr_bytes));
         }
+        let truncated = cap_output(&mut output, stdout_truncated || stderr_truncated);
 
         Ok(ExecuteResponse {
             output,
             exit_code: exit_status.code().unwrap_or(-1),
-            truncated: false,
+            truncated,
             timed_out: false,
         })
     }
+}
+
+/// Reads a stream to EOF, keeping at most `cap` bytes but draining the rest so the child
+/// process never blocks on a full pipe.
+async fn read_capped<R>(mut stream: R, cap: usize) -> (Vec<u8>, bool)
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut collected = Vec::new();
+    let mut truncated = false;
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let room = cap.saturating_sub(collected.len());
+                if room == 0 {
+                    // Anything read now is dropped: the output really is longer than the cap.
+                    truncated = true;
+                } else {
+                    collected.extend_from_slice(&buf[..read.min(room)]);
+                    truncated |= read > room;
+                }
+            }
+        }
+    }
+    (collected, truncated)
+}
+
+/// Caps the combined output the way `LocalFilesystemWithShell` does: cut on a char boundary
+/// and append the same marker, so the model knows the result is incomplete.
+///
+/// `already_truncated` marks a stream that was capped while draining; its cut may not be
+/// visible in the lossily decoded string, so the marker is still appended.
+fn cap_output(output: &mut String, already_truncated: bool) -> bool {
+    if output.len() <= MAX_OUTPUT_BYTES && !already_truncated {
+        return false;
+    }
+    if output.len() > MAX_OUTPUT_BYTES {
+        let mut end = MAX_OUTPUT_BYTES;
+        while end > 0 && !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.truncate(end);
+    }
+    output.push_str(&format!(
+        "\n\n... Output truncated at {MAX_OUTPUT_BYTES} bytes."
+    ));
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -639,5 +697,89 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&primary_dir);
         let _ = std::fs::remove_dir_all(&memory_dir);
+    }
+
+    #[tokio::test]
+    async fn execute_caps_runaway_output_at_the_java_parity_limit() {
+        // A single tool result this large used to exhaust the journal pending buffer and
+        // wedge the rest of the turn (the required checkpoint could not be appended).
+        #[cfg(windows)]
+        let command = "'x' * 200000";
+        #[cfg(not(windows))]
+        let command = "head -c 200000 /dev/zero | tr '\\0' x";
+
+        let dir = temp_dir("capped");
+        let fs = sandbox_fs(&dir);
+        let response = fs
+            .execute(&RuntimeContext::default(), command, 120)
+            .await
+            .expect("execute");
+
+        assert_eq!(response.exit_code, 0);
+        assert!(response.truncated, "oversized output must be flagged");
+        assert!(
+            response.output.starts_with(&"x".repeat(MAX_OUTPUT_BYTES)),
+            "the first {MAX_OUTPUT_BYTES} bytes are kept verbatim"
+        );
+        assert!(
+            response.output.ends_with(&format!(
+                "\n\n... Output truncated at {MAX_OUTPUT_BYTES} bytes."
+            )),
+            "the model must be told the result is incomplete"
+        );
+        // Only the retained prefix plus the marker: the rest was drained, not accumulated.
+        assert_eq!(
+            response.output.len(),
+            MAX_OUTPUT_BYTES
+                + format!("\n\n... Output truncated at {MAX_OUTPUT_BYTES} bytes.").len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn execute_keeps_small_output_untruncated() {
+        #[cfg(windows)]
+        let command = "'hello'";
+        #[cfg(not(windows))]
+        let command = "printf hello";
+
+        let dir = temp_dir("small");
+        let fs = sandbox_fs(&dir);
+        let response = fs
+            .execute(&RuntimeContext::default(), command, 120)
+            .await
+            .expect("execute");
+
+        assert_eq!(response.output.trim(), "hello");
+        assert!(!response.truncated);
+        assert!(!response.timed_out);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cap_output_cuts_on_a_char_boundary() {
+        // 60_000 two-byte chars exceed the byte budget without ever landing on an ASCII
+        // boundary at the cut point.
+        let mut output = "é".repeat(60_000);
+        assert!(cap_output(&mut output, false));
+
+        let marker = format!("\n\n... Output truncated at {MAX_OUTPUT_BYTES} bytes.");
+        let kept = &output[..output.len() - marker.len()];
+        assert!(kept.len() <= MAX_OUTPUT_BYTES);
+        assert!(kept.chars().all(|c| c == 'é'), "cut mid-char would panic");
+        assert!(output.ends_with(&marker));
+    }
+
+    #[test]
+    fn cap_output_marks_a_silently_capped_stream() {
+        // The stream was capped while draining, so even a short lossily decoded string must
+        // carry the marker.
+        let mut output = "short".to_string();
+        assert!(cap_output(&mut output, true));
+        assert!(output.ends_with(&format!(
+            "\n\n... Output truncated at {MAX_OUTPUT_BYTES} bytes."
+        )));
     }
 }

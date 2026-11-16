@@ -18,6 +18,12 @@
 //! result, uncertainty), message entries a transcript is rebuilt from, baseline/restore entries,
 //! and any event a client has not been told a replacement for.
 //!
+//! This is also a hard boundary for model prompt caching. The messages rebuilt from those
+//! entries are the exact prefix sent on every later model call; rewriting a `tool/result` into a
+//! summary — even one that fits the model's context — changes that prefix and invalidates the
+//! provider's cached tokens. Retention must only ever reclaim payloads that never reach a model
+//! request (superseded native state checkpoints, checkpoint history, consumed public events).
+//!
 //! A trim is not free: it walks three key ranges of the document. A scope that cannot shrink — a
 //! transcript longer than the event window, a baseline it must keep — would be walked again on
 //! every commit and give back almost nothing, which is a permanent fee on a session that simply

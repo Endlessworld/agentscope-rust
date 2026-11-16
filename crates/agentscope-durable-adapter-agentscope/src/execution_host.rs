@@ -23,7 +23,8 @@ use agentscope_core::agent::{
 };
 use agentscope_core::error::{Error, Result};
 use agentscope_core::journal::{
-    journal_error, InvocationRecorder, JournalEvent, JournalEventCodec, JournalEventCodecRegistry,
+    committed_tool_results, journal_error, realign_tool_results, InvocationRecorder, JournalEvent,
+    JournalEventCodec, JournalEventCodecRegistry,
 };
 use agentscope_core::message::{ContentBlock, Msg, MsgRole, TextBlock};
 use agentscope_core::state::AgentState;
@@ -77,9 +78,11 @@ impl AgentScopeExecutionHost {
         let turn_id = lease.turn_id.clone();
         let thread_state = backend.thread_state(&thread).await.map_err(convert)?;
         // The committed checkpoint is the only source of the previous invocation's state, and
-        // so of the iteration it died in: a restart is not a fresh iteration budget.
+        // so of the iteration it died in: a restart is not a fresh iteration budget. The
+        // journal tail after it is folded back in below, because a tool outcome can be
+        // committed without a checkpoint that carries it.
         let mut covered = 0u64;
-        let (state, mut position) = match &thread_state.checkpoint_metadata {
+        let (mut state, mut position) = match &thread_state.checkpoint_metadata {
             Some(metadata) => {
                 let committed = metadata.position.parse::<u64>().map_err(|error| {
                     journal_error(format!("Invalid checkpoint position: {error}"))
@@ -107,14 +110,23 @@ impl AgentScopeExecutionHost {
         // purpose — it is the fact that produced the state, and it is also how a turn that already
         // ran (and whose input is therefore committed) is told from one that never did.
         let from = covered.saturating_sub(1);
-        for event in read_events(
+        let events = read_events(
             backend.as_ref(),
             &thread,
             from,
             thread_state.journal_position,
         )
-        .await?
-        {
+        .await?;
+        // The checkpoint and the journal are different commits: a tool outcome can be newer
+        // than the state the checkpoint restored. Folding those results back in before the
+        // acting phase is what stops the resumed run from dispatching a call whose effect is
+        // already committed — that dispatch was rejected as `NOT_FOUND: Execution does not
+        // exist` because it carried the new turn's id.
+        if let Some(state) = state.as_mut() {
+            let results = committed_tool_results(&events)?;
+            realign_tool_results(state, &results);
+        }
+        for event in &events {
             if event.turn_id.as_deref() != Some(turn_id.as_str()) {
                 continue;
             }

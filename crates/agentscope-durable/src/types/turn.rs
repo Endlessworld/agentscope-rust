@@ -62,9 +62,12 @@ impl RecoveryPolicy {
 
     pub fn defaults() -> Self {
         Self {
-            max_retries: 3,
+            // A transient store/lock outage commonly lasts tens of seconds; three retries at
+            // 1/2/4s gave up in seven seconds and ended the turn. Six retries with a 60s cap
+            // cover roughly a minute before the failure becomes terminal.
+            max_retries: 6,
             initial_delay_millis: 1_000,
-            max_delay_millis: 30_000,
+            max_delay_millis: 60_000,
         }
     }
 
