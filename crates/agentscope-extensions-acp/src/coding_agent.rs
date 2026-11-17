@@ -257,9 +257,14 @@ pub struct AcpCodingAgent {
     /// Only this variant can gate tools on client capabilities at build time
     /// (and therefore have them inherited by subagents).
     session_factory: Option<Arc<dyn Fn(SessionBuild) -> HarnessAgent + Send + Sync>>,
-    models: Vec<ModelChoice>,
+    models: Arc<std::sync::RwLock<Vec<ModelChoice>>>,
     modes: Vec<ModeChoice>,
     sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>,
+    /// 宿主接管 `providers/*`：读写 `models.json`（内置 agent 用），而不是那份内存注册表。
+    ///
+    /// 开着时 `providers/set` 能新建条目、可以带模型表，并在写入后把新的模型列表
+    /// 推给每个活会话（`config_option_update`），没开的宿主行为不变。
+    manage_providers: bool,
     /// Builds a live model from a model id + session id (dynamic model
     /// switching). The session id lets callers derive per-session request
     /// headers (e.g. `x-opencode-session` for prompt-cache routing).
@@ -392,9 +397,10 @@ impl AcpCodingAgent {
             name: AGENT_NAME.to_string(),
             model_factory: Arc::new(model_factory),
             session_factory: None,
-            models,
+            models: Arc::new(std::sync::RwLock::new(models)),
             modes,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            manage_providers: false,
             model_builder: None,
             max_sessions: 1,
             client_support: ClientSupport::new(),
@@ -468,7 +474,40 @@ impl AcpCodingAgent {
     /// Cheap while the table is resident; when it is not, this parses it once (the behaviour
     /// `initialize` had before the value was cached).
     pub fn refresh_image_support(&self) -> bool {
-        self.image_support.refresh(&self.models)
+        self.image_support.refresh(&self.models_snapshot())
+    }
+
+    /// The model choices advertised to clients right now.
+    ///
+    /// A provider config change swaps the list, so this is the only way to read it:
+    /// taking a copy keeps the lock out of the per-session path.
+    pub fn models_snapshot(&self) -> Vec<ModelChoice> {
+        self.models
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Replaces the model choices and pushes them to every live session.
+    ///
+    /// Called after a `providers/*` mutation: new sessions get the new list from
+    /// `create_session`, live ones through `config_option_update` so the client's model
+    /// picker does not stay on a list that no longer exists. A session whose selected
+    /// model disappeared keeps running on its current model until the user picks another.
+    pub fn replace_models(&self, models: Vec<ModelChoice>) {
+        *self
+            .models
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = models.clone();
+        self.image_support.refresh(&models);
+        let mut registry = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for session in registry.values_mut() {
+            session.set_models(models.clone());
+            session.push_config_update();
+        }
     }
 
     pub fn builder() -> AcpCodingAgentBuilder {
@@ -574,7 +613,7 @@ impl AcpCodingAgent {
             session_id,
             cwd,
             agent,
-            self.models.clone(),
+            self.models_snapshot(),
             self.modes.clone(),
         );
         session.set_elicitation_slot(elicitation_slot);
@@ -1101,6 +1140,7 @@ impl AcpCodingAgent {
         let a_providers = agent.clone();
         let a_providers_set = agent.clone();
         let a_providers_disable = agent.clone();
+        let a_providers_ext = agent.clone();
         let result = Agent
             .v1()
             .on_receive_request(
@@ -1117,7 +1157,7 @@ impl AcpCodingAgent {
                         .client_support
                         .set_client_info(initialize.client_info.clone());
                     let mut caps = a_init.capabilities();
-                    if !a_init.providers.is_empty() {
+                    if a_init.manage_providers || !a_init.providers.is_empty() {
                         caps = caps.providers(
                             agent_client_protocol::v1::schema::ProvidersCapabilities::new(),
                         );
@@ -1158,10 +1198,21 @@ impl AcpCodingAgent {
                     let session_id = SessionId::new(format!("session-{}", uuid::Uuid::new_v4()));
                     let mut session = a_new.create_session(session_id.clone(), cwd, system_prompt);
                     session.set_additional_directories(req.additional_directories.clone());
-                    // Bridge any MCP servers the client declared before serving
-                    // the first prompt, so their tools are available immediately.
+                    // 建会话时就绑上连接：会话空闲（没跑 prompt）时也要能收到
+                    // `config_option_update`（供应商增删改后刷新模型下拉）。
+                    session.set_client(AcpClientHandle::new(cx.clone()));
+                    // Bridge the client's MCP servers on a spawned task: an ACP server's
+                    // `tools/list` is an `mcp/message` request whose reply can only be routed
+                    // by the dispatch loop that is running this handler. Awaiting it here
+                    // deadlocks that loop until `MCP_CONNECT_TIMEOUT` (60s per server), so
+                    // `session/new` stalls and the tools never reach the toolkit.
                     if !req.mcp_servers.is_empty() {
-                        session.apply_mcp_servers(&req.mcp_servers).await;
+                        let bridging = session.clone();
+                        let servers = req.mcp_servers.clone();
+                        cx.spawn(async move {
+                            bridging.apply_mcp_servers(&servers).await;
+                            Ok(())
+                        })?;
                     }
                     let config_options = session.config_options();
                     let modes = session.session_mode_state();
@@ -1466,9 +1517,18 @@ impl AcpCodingAgent {
                     };
                     let mut session = session;
                     session.set_additional_directories(req.additional_directories.clone());
-                    // Bridge MCP servers declared on load (idempotent per server).
+                    // 空闲会话也要能收到 `config_option_update`（同 `session/new`）。
+                    session.set_client(AcpClientHandle::new(cx.clone()));
+                    // Bridge MCP servers declared on load (idempotent per server). Spawned for
+                    // the same reason as `session/new`: awaiting an `mcp/message` reply in a
+                    // handler blocks the loop that has to route it.
                     if !req.mcp_servers.is_empty() {
-                        session.apply_mcp_servers(&req.mcp_servers).await;
+                        let bridging = session.clone();
+                        let servers = req.mcp_servers.clone();
+                        cx.spawn(async move {
+                            bridging.apply_mcp_servers(&servers).await;
+                            Ok(())
+                        })?;
                     }
                     let config_options = session.config_options();
                     let modes = session.session_mode_state();
@@ -1529,9 +1589,18 @@ impl AcpCodingAgent {
                     };
                     let mut session = session;
                     session.set_additional_directories(req.additional_directories.clone());
-                    // Bridge MCP servers declared on resume (idempotent per server).
+                    // 空闲会话也要能收到 `config_option_update`（同 `session/new`）。
+                    session.set_client(AcpClientHandle::new(cx.clone()));
+                    // Bridge MCP servers declared on resume (idempotent per server). Spawned
+                    // for the same reason as `session/new` (a handler must not await the
+                    // client's `mcp/message` reply).
                     if !req.mcp_servers.is_empty() {
-                        session.apply_mcp_servers(&req.mcp_servers).await;
+                        let bridging = session.clone();
+                        let servers = req.mcp_servers.clone();
+                        cx.spawn(async move {
+                            bridging.apply_mcp_servers(&servers).await;
+                            Ok(())
+                        })?;
                     }
                     let config_options = session.config_options();
                     let modes = session.session_mode_state();
@@ -1626,12 +1695,44 @@ impl AcpCodingAgent {
             )
             .on_receive_request(
                 async move |_req: ListProvidersRequest, responder, _cx| {
-                    responder.respond(ListProvidersResponse::new(a_providers.providers.list()))
+                    let providers = if a_providers.manage_providers {
+                        // 读 `models.json` + 解析模型目录（catalog 8MB）是同步 I/O：
+                        // 放在阻塞线程池，否则这条连接的 JSON-RPC 分发会被卡住，
+                        // 后面的 `initialize` / `session/new` 只能排队。
+                        tokio::task::spawn_blocking(crate::providers_admin::list)
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        a_providers.providers.list()
+                    };
+                    responder.respond(ListProvidersResponse::new(providers))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
                 async move |req: SetProviderRequest, responder, _cx| {
+                    if a_providers_set.manage_providers {
+                        let id = req.provider_id.to_string();
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            crate::providers_admin::set(req)
+                                .map(|()| crate::providers_admin::choices())
+                        })
+                        .await;
+                        return match outcome {
+                            Ok(Ok(models)) => {
+                                a_providers_set.replace_models(models);
+                                responder.respond(SetProviderResponse::new())
+                            }
+                            Ok(Err(error)) => responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data(format!("provider '{id}': {error}")),
+                            ),
+                            Err(error) => responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data(format!("provider '{id}': {error}")),
+                            ),
+                        };
+                    }
                     let ok = a_providers_set.providers.set(
                         &req.provider_id.to_string(),
                         req.api_type,
@@ -1651,18 +1752,99 @@ impl AcpCodingAgent {
             )
             .on_receive_request(
                 async move |req: DisableProviderRequest, responder, _cx| {
-                    let ok = a_providers_disable
-                        .providers
-                        .disable(&req.provider_id.to_string());
+                    let id = req.provider_id.to_string();
+                    if a_providers_disable.manage_providers {
+                        let target = id.clone();
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            crate::providers_admin::disable(&target)
+                                .map(|()| crate::providers_admin::choices())
+                        })
+                        .await;
+                        return match outcome {
+                            Ok(Ok(models)) => {
+                                a_providers_disable.replace_models(models);
+                                responder.respond(DisableProviderResponse::new())
+                            }
+                            Ok(Err(error)) => responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data(format!("provider '{id}': {error}")),
+                            ),
+                            Err(error) => responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data(format!("provider '{id}': {error}")),
+                            ),
+                        };
+                    }
+                    let ok = a_providers_disable.providers.disable(&id);
                     if ok {
                         responder.respond(DisableProviderResponse::new())
                     } else {
                         responder.respond_with_error(
-                            agent_client_protocol::Error::invalid_params().data(format!(
-                                "provider '{}' is unknown or required",
-                                req.provider_id
-                            )),
+                            agent_client_protocol::Error::invalid_params()
+                                .data(format!("provider '{id}' is unknown or required")),
                         )
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: crate::providers_admin::ProvidersExtRequest, responder, _cx| {
+                    if !a_providers_ext.manage_providers {
+                        return responder
+                            .respond_with_error(agent_client_protocol::Error::method_not_found());
+                    }
+                    let mut changed = false;
+                    let method = req.method_name().to_string();
+                    // 除网络探测外都是读盘/解析：同样丢给阻塞线程池。
+                    if method == crate::providers_admin::PROBE_METHOD {
+                        return responder.respond(crate::providers_admin::probe(req.params.clone()).await);
+                    }
+                    let params = req.params.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let value = match method.as_str() {
+                            crate::providers_admin::REMOVE_METHOD => {
+                                changed = true;
+                                params
+                                    .provider_id
+                                    .as_deref()
+                                    .ok_or_else(|| "providerId is required".to_string())
+                                    .and_then(crate::providers_admin::remove)
+                                    .map(|()| serde_json::json!({}))
+                            }
+                            crate::providers_admin::DEFAULT_METHOD => {
+                                changed = true;
+                                params
+                                    .provider_id
+                                    .as_deref()
+                                    .ok_or_else(|| "providerId is required".to_string())
+                                    .and_then(|id| {
+                                        crate::providers_admin::set_default(id, params.model.as_deref())
+                                    })
+                                    .map(|()| serde_json::json!({}))
+                            }
+                            crate::providers_admin::CATALOG_METHOD => Ok(serde_json::json!({
+                                "providers": crate::providers_admin::catalog(params.provider_id.as_deref())
+                            })),
+                            other => Err(format!("unhandled provider extension '{other}'")),
+                        }?;
+                        let models = changed.then(crate::providers_admin::choices);
+                        Ok::<_, String>((value, models))
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok((value, models))) => {
+                            if let Some(models) = models {
+                                a_providers_ext.replace_models(models);
+                            }
+                            responder.respond(value)
+                        }
+                        Ok(Err(error)) => responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data(error),
+                        ),
+                        Err(error) => responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data(error.to_string()),
+                        ),
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -1870,6 +2052,7 @@ pub struct AcpCodingAgentBuilder {
     max_sessions: Option<usize>,
     model_builder: Option<Arc<dyn Fn(&str, &str) -> Result<Arc<dyn Model>, String> + Send + Sync>>,
     auth_probe: Option<Arc<dyn Fn() -> AuthState + Send + Sync>>,
+    manage_providers: bool,
 }
 
 impl AcpCodingAgentBuilder {
@@ -1921,6 +2104,15 @@ impl AcpCodingAgentBuilder {
         self
     }
 
+    /// 让 `providers/*` 读写宿主的模型配置文件（内置 agent 用）。
+    ///
+    /// 开启后 `providers/set` 可以新建条目，模型表随 `_meta.models` 一起下发；
+    /// 写入成功会把新的模型列表推给每个活会话。
+    pub fn manage_providers(mut self, manage: bool) -> Self {
+        self.manage_providers = manage;
+        self
+    }
+
     /// 设置会话注册表上限（嵌入式优化，默认 1）。
     pub fn max_sessions(mut self, max: usize) -> Self {
         self.max_sessions = Some(max);
@@ -1963,6 +2155,7 @@ impl AcpCodingAgentBuilder {
         if let Some(probe) = self.auth_probe {
             agent = agent.with_auth_probe(move || probe());
         }
+        agent.manage_providers = self.manage_providers;
         Ok(agent)
     }
 }
@@ -2175,6 +2368,53 @@ mod tests {
 
     /// ACP-42: once the connection is gone nothing can consume a turn's output, so every
     /// session must be closed (which cancels its running turn) and dropped.
+    #[test]
+    fn a_session_whose_model_vanished_falls_back_to_the_new_first_model() {
+        use agent_client_protocol::v1::schema::{SessionConfigKind, SessionId};
+
+        let dir = std::env::temp_dir().join(format!("acp_set_models_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = super::HarnessAgent::builder()
+            .name("set-models")
+            .model(std::sync::Arc::new(StubModel))
+            .cwd(dir.clone())
+            .workspace(dir.join("ws"))
+            .build();
+        let choice = |id: &str| super::ModelChoice {
+            id: id.to_string(),
+            name: id.to_string(),
+            provider: None,
+            catalog_key: None,
+            base_url: None,
+        };
+        let mut session = super::AcpAgentSession::new(
+            SessionId::new("session-set-models"),
+            dir.clone(),
+            agent,
+            vec![choice("gone"), choice("kept")],
+            crate::config::default_modes(),
+        );
+        session.set_model("gone");
+
+        // The provider was removed or renamed: the new list no longer holds the selected model.
+        session.set_models(vec![choice("kept"), choice("fresh")]);
+
+        let current = session
+            .config_options()
+            .into_iter()
+            .find_map(|option| match option.kind {
+                SessionConfigKind::Select(select) => Some(select.current_value.to_string()),
+                _ => None,
+            })
+            .expect("the model option");
+        assert_eq!(
+            current, "kept",
+            "a currentValue outside the option list renders an empty model picker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn a_terminated_connection_releases_its_sessions() {
         use agent_client_protocol::v1::schema::SessionId;

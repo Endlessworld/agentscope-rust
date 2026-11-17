@@ -1521,6 +1521,26 @@ impl AcpAgentSession {
         self.models.iter().any(|choice| choice.id == model)
     }
 
+    /// Replaces the advertised model list (a provider config change).
+    ///
+    /// A session that lost its selected model (the provider was removed or renamed) falls back
+    /// to the first entry: `config_option_update` must never carry a `currentValue` that is not
+    /// one of the options, or the client renders an empty picker. The live agent keeps the model
+    /// instance it was built with until the next prompt resolves the new id.
+    pub fn set_models(&mut self, models: Vec<ModelChoice>) {
+        self.models = models;
+        let selected = self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .model
+            .clone();
+        if !self.models.is_empty() && !self.has_model(&selected) {
+            let fallback = self.models[0].id.clone();
+            self.set_model(fallback);
+        }
+    }
+
     /// Whether `level` is valid for the currently selected model.
     pub fn has_thought_level(&self, level: &str) -> bool {
         let model = self

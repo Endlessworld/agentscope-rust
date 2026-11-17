@@ -154,7 +154,8 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 | `session/status` | 会话存活探测：`open`（本进程持有）/ `saved`（仅磁盘有）/ `-32002` |
 | `session/archive` · `session/unarchive` | 归档（默认从 `session/list` 隐藏，`archived` 过滤可选 `only`/`include`） |
 | `auth/status` | 真实登录态：有真实凭据（含环境变量）为 `authenticated`，一处也没有为 `unauthenticated` |
-| `providers/list` · `providers/set` · `providers/disable` | 仅在配了多个 provider 时声明（ACP 不稳定特性） |
+| `providers/list` · `providers/set` · `providers/disable` | 模型供应商管理；`acp_harness_agent` 默认开启，模型表与展示信息走 `_meta`（见下节） |
+| `_agentscope/providers/remove` · `default` · `catalog` · `probe` | 删供应商 / 改默认 / models.dev 目录 / 探测端点（ACP 扩展） |
 | `_agentscope/session/respond` | 私有扩展：回答被挂起的结构化提问 |
 
 ### 按客户端能力门控
@@ -352,8 +353,79 @@ await acp
 - 本 crate 基于 `agent-client-protocol` 2.2；上游已到 3.6，两边都在 v1 协议线上，
   `initialize` / `session/*` 的线格式一致，握手兼容
 - 本 agent 在 `initialize` 中**原样回显**客户端声明的版本，不主动降级也不拒绝——请传 `1`
-- 不稳定特性（plan 操作、session notices、压缩进度、`end_turn` usage、MCP over ACP、`providers/*`）
+- 不稳定特性（plan 操作、session notices、压缩进度、`end_turn` usage、MCP over ACP、`providers/*`、`_agentscope/providers/*`）
   全部按**客户端声明的能力**门控：客户端没声明就不会收到，也不会报错
+
+## 模型供应商管理（`providers/*`）
+
+`acp_harness_agent` 把 `~/.agentscope/models.json` 当作**唯一事实来源**：设置页、`--setup` 向导与
+`providers/*` 都读写同一个文件。改完立即生效：新会话拿到新列表，活着的会话收到
+`config_option_update`（会话为空闲也能收到：`session/new` / `load` / `resume` 时就绑定了连接）。
+
+### 能力声明
+
+`initialize` 的 `agentCapabilities.providers` 出现即表示支持（空对象 `{}` 就够）。
+`acp_harness_agent` 默认开启（`AcpCodingAgent::builder().manage_providers(true)`）；
+以库方式自建 agent 时必须显式打开，否则这些方法回 `-32601`。
+
+| 方法 | 语义 |
+| --- | --- |
+| `providers/list` | 每个 provider 一条；密钥只给掩码，非密钥信息进 `_meta` |
+| `providers/set` | 新增/改写一个 provider；密钥从 `headers` 的 `Authorization: Bearer …` 或 `x-api-key` 取 |
+| `providers/disable` | 置 `disabled: true`，保留密钥与模型表，可再启用 |
+
+`_meta` 字段（全部可选，客户端画 UI 用）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `label` | 展示名（缺省等于 provider 键） |
+| `models` | 按端点协议分组的模型表 `{completions, messages, responses}` |
+| `apiKeyMasked` · `hasApiKey` | 掩码后的密钥 / 是否已配 |
+| `disabled` | 是否停用（与 `current` 为空同义） |
+| `readOnly` · `envVar` | 由环境变量提供：改环境变量才生效，删改会报错 |
+| `isDefault` · `defaultModel` | 是否默认 provider / 新会话用哪个模型 |
+
+`set` 的局部更新约定（标准面没有的字段都走 `_meta`）：
+
+- `baseUrl` 传空串 = **不改地址**，只做启用/停用这类局部更新；**新建**条目时必须给地址
+  （否则会落下一份连不通、也没法 `probe` 的配置）
+- 不带 `headers` = 不改密钥；`_meta.models` 缺省 = 不改模型表
+- 模型表的协议归属决定端点：`completions` → `POST {base_url}/chat/completions`，
+  `messages` → `POST {base_url}/messages`，`responses` → `POST {base_url}/responses`
+
+### 扩展方法（`_agentscope/providers/*`）
+
+标准面没有删除、默认项与“探测端点”，这几件事走 ACP 扩展（方法名以 `_` 开头，不支持的客户端不会误调）：
+
+| 方法 | 入参 | 返回 |
+| --- | --- | --- |
+| `_agentscope/providers/remove` | `{providerId}` | `{}`；环境变量提供的 provider 会报错 |
+| `_agentscope/providers/default` | `{providerId, model?}` | `{}`；`model` 缺省取该 provider 第一个模型 |
+| `_agentscope/providers/catalog` | `{providerId?}` | `{providers: [{id, name, baseUrl, protocol, env, modelCount, models?}]}`（models.dev，最后一项仅给了 `providerId` 才有） |
+| `_agentscope/providers/probe` | `{providerId?, baseUrl?, apiKey?, protocol?}` | `{ok, models?, protocol?, error?}`，实际打 `GET {baseUrl}/models` |
+
+四个方法共用一个入参形状（`camelCase`，用不到的字段省略）；错误一律 `-32602`，原囚放 `data`。
+
+### `models.json` 的字段
+
+provider 级可选字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `label` | 展示名 |
+| `disabled` | 停用：不进模型列表，也不参与默认模型解析 |
+| `env_var` | 该 provider 由环境变量提供（只读；启动时补齐到内存，**不写盘**） |
+
+行为约定：
+
+- 删除默认 provider 时自动回退到剩下的第一个；一个都没有就用内置默认
+- 活会话选中的模型被删/改名时，会话回落到新列表的第一个（否则客户端会收到一个不在
+  选项里的 `currentValue`，下拉显示为空）；已建好的模型实例在下个 prompt 前照旧可用
+- 环境变量提供的 provider 改不了、删不掉（`readOnly`）：从磁盘单独读会把它们当成新条目写进
+  `models.json`，从此不再从环境变量接管，所以每次改都从「文件 + 环境变量」的同一份视图出发
+- 多个 provider 下重复的裸模型 id 在模型下拉里会加上 `provider/` 前缀（避免歧义），
+  单 provider 或 id 不重复时保持原样
+- 文件损坏/解析失败时**不覆写**：告警后退到内置默认，改回文件即可恢复
 
 ## 工具、skills 与子智能体
 
