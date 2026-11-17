@@ -38,14 +38,20 @@
 //! deliberate trade against the low-consumption rule, not an oversight.
 //!
 //! Cross-process exclusion uses one lock file per scope; any number of hosts may share one root
-//! (see [`FileStore`]).
+//! (see [`FileStore`]). How that file is used depends on [`LockMode`]: on a local disk the lock is
+//! the *kernel's* — the file is created once, never written, and taken with an OS file lock, so a
+//! transaction costs two calls on an open handle and leaves the file system untouched (a process
+//! that dies holding it blocks nobody, because the kernel releases it with the handle). On a
+//! network share, where a client may emulate `flock`/`LockFileEx` and quietly stop excluding, the
+//! conservative mode keeps the create-if-absent lock: the file's existence is the lock, which a
+//! share always serialises, at the price of a create, a write and a delete per transaction.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -63,6 +69,14 @@ use crate::{DurableError, Result};
 // generous.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCK_RETRY: Duration = Duration::from_millis(10);
+
+// How often a contender retries the operating-system lock.
+//
+// The wait is a syscall against an already open handle, not a create, so it can afford to be far
+// tighter than the file mode's: a transaction that waits a millisecond longer than it must is the
+// only thing this costs, and the backoff keeps a long rewrite from being hammered with retries.
+const LOCK_OS_RETRY: Duration = Duration::from_millis(1);
+const LOCK_OS_RETRY_MAX: Duration = Duration::from_millis(20);
 
 // How long a lock whose owner cannot be identified by pid is left alone.
 //
@@ -129,6 +143,56 @@ const BLOB_KIND: &str = "json";
 /// blob it just wrote is younger than the grace.
 const BLOB_GC_GRACE: Duration = Duration::from_secs(10 * 60);
 
+/// This process's handle on one lock file, plus the gate that serialises its own writers.
+///
+/// The gate is what keeps two tasks of this process from fighting through the file system: one of
+/// them rewriting a multi-megabyte scope while the other created and deleted the lock file every
+/// ten milliseconds. A cross-process lock alone would not stop that — it cannot tell one of our
+/// threads from a stranger's process. With the gate every in-process waiter sleeps in memory and
+/// the file is only ever touched by the one writer holding it.
+struct ScopeGate {
+    gate: Mutex<()>,
+    /// The lock file of [`LockMode::Os`]; opened once and kept for the life of the store.
+    /// Nothing in [`LockMode::Conservative`] needs it, and that mode must not keep the file open:
+    /// its lock *is* the file's existence, which it creates and deletes per transaction.
+    file: Option<File>,
+}
+
+/// The scope lock of one transaction: the in-process gate plus the cross-process lock.
+struct HeldLock<'a> {
+    /// The OS lock, released before the gate so the next thread of this process is admitted last.
+    os: Option<&'a File>,
+    /// The create-if-absent lock of [`LockMode::Conservative`].
+    file: Option<ScopeLock>,
+    /// Held for the whole transaction and dropped last.
+    _gate: MutexGuard<'a, ()>,
+}
+
+impl HeldLock<'_> {
+    /// Whether this transaction still owns the lock it took.
+    fn verify(&self) -> Result<()> {
+        match &self.file {
+            Some(lock) => lock.verify(),
+            // An OS lock cannot be taken away from its holder: the kernel releases it when the
+            // handle closes, and this transaction is the only one that can close it while it runs.
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for HeldLock<'_> {
+    fn drop(&mut self) {
+        if let Some(file) = self.os.take() {
+            // Best effort, like every other unlock: a failed unlock only leaves the lock to the
+            // kernel when the store (and so the handle) goes away.
+            let _ = file.unlock();
+        }
+    }
+}
+
+/// The lock path of the readiness index, or of any other store-wide lock.
+const WORK_INDEX_LOCK: &str = "\u{1}work-index";
+
 /// How big a document must be for the legacy roll-out pass to be worth its walk.
 ///
 /// The pass serializes every value of the document once to find the ones still inline. Below this
@@ -144,6 +208,28 @@ const BLOB_CACHE_BYTES: usize = 4 << 20;
 /// How many scopes remember that their legacy payloads were already moved out of line.
 const ROLLED_OUT_SCOPES: usize = 64;
 
+/// How the writers of one scope exclude each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// An operating-system lock on a long-lived, empty lock file.
+    ///
+    /// The holder is named by the kernel instead of by the file's contents, so the file is created
+    /// once per scope and then never written, renamed or deleted: a transaction costs two calls on
+    /// an already open handle and leaves nothing behind on the file system. Because the kernel
+    /// releases the lock when the handle closes, a process that dies holding one blocks nobody —
+    /// so there is no stale body to judge and no tombstone to write.
+    ///
+    /// This is what a local disk wants. See [`LockMode::Conservative`] for a root on a share.
+    Os,
+    /// A lock file whose *existence* is the lock, named after the process holding it.
+    ///
+    /// A network share may emulate `flock`/`LockFileEx` in the client and quietly stop excluding,
+    /// while creating a name is the one operation a share always serialises; this mode keeps that
+    /// route. It costs a create, a write, a verify read and a delete per transaction, and a holder
+    /// that dies leaves a body behind that the next contender has to judge by pid and age.
+    Conservative,
+}
+
 /// Scope maps and the readiness index backed by plain files under one directory.
 ///
 /// Any number of hosts (processes) may open the same root at the same time: exclusion is per
@@ -151,6 +237,10 @@ const ROLLED_OUT_SCOPES: usize = 64;
 /// a complete previous or complete next document.
 pub struct FileStore {
     root: PathBuf,
+    /// How this store takes the cross-process lock; see [`LockMode`].
+    mode: LockMode,
+    /// One gate per lock path this process uses, so its own writers queue in memory.
+    locks: Mutex<HashMap<String, Arc<ScopeGate>>>,
     /// Scope documents this process last answered a [`RecordStore::read_parts`] from.
     ///
     /// Only that path uses it; see [`Picked`].
@@ -258,21 +348,33 @@ fn count_scope_write(bytes: usize) {
 }
 
 impl FileStore {
+    /// Opens a root for a local disk: writers exclude each other with an OS lock.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_lock_mode(root, LockMode::Os)
+    }
+
+    /// Opens a root on a network share, where the OS lock cannot be trusted.
+    pub fn open_conservative(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_lock_mode(root, LockMode::Conservative)
+    }
+
+    /// Opens a root with an explicit cross-process lock; see [`LockMode`].
+    pub fn open_with_lock_mode(root: impl AsRef<Path>, mode: LockMode) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         for dir in ["scopes", "work", "locks", "blobs"] {
             // Creating a directory two hosts need at the same moment answers "already exists",
             // which is success; a transient hold on the parent is retried like any other.
             retry_while_held(|| fs::create_dir_all(root.join(dir)))?;
         }
-        // One canonical root when the file system offers one: the in-process holder table is
-        // keyed by lock path, and two stores of this process opened on the same directory under
-        // different spellings (relative, absolute, a `..` in the middle) would otherwise disagree
-        // about what a lock path *is* — one store would take the other's live lock for an orphan.
-        // The fallback keeps a store usable where canonicalising is refused.
+        // One canonical root when the file system offers one: the lock table is keyed by lock
+        // path, and two stores of this process opened on the same directory under different
+        // spellings (relative, absolute, a `..` in the middle) would otherwise answer two gates
+        // for one lock file. The fallback keeps a store usable where canonicalising is refused.
         let root = fs::canonicalize(&root).unwrap_or(root);
         let store = Self {
             root,
+            mode,
+            locks: Mutex::new(HashMap::new()),
             picked: Mutex::new(HashMap::new()),
             blobs: Mutex::new(BlobCache::default()),
             rolled_out: Mutex::new(HashSet::new()),
@@ -281,6 +383,85 @@ impl FileStore {
         };
         store.adopt_flat_work_records()?;
         Ok(store)
+    }
+
+    /// This process's gate and handle for one lock path.
+    fn gate(&self, key: &str, path: &Path) -> Result<Arc<ScopeGate>> {
+        let mut locks = self
+            .locks
+            .lock()
+            .map_err(|_| DurableError::unavailable("lock table poisoned"))?;
+        if let Some(gate) = locks.get(key) {
+            return Ok(Arc::clone(gate));
+        }
+        let file = match self.mode {
+            LockMode::Os => Some(self.open_lock_file(path)?),
+            LockMode::Conservative => None,
+        };
+        let gate = Arc::new(ScopeGate {
+            gate: Mutex::new(()),
+            file,
+        });
+        locks.insert(key.to_string(), Arc::clone(&gate));
+        Ok(gate)
+    }
+
+    /// The long-lived lock file of [`LockMode::Os`].
+    ///
+    /// `create(true)` and not `create_new`: the file is the *name* of a lock, not the lock, so an
+    /// existing one is reused and an empty one left behind costs the next transaction nothing. It
+    /// is opened for writing because Windows refuses to lock a handle opened for append only, and
+    /// it is never truncated or written.
+    fn open_lock_file(&self, path: &Path) -> Result<File> {
+        let file = retry_while_held(|| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+        })?;
+        Ok(file)
+    }
+
+    /// Takes the scope lock: first the in-process gate, then whichever cross-process lock the mode
+    /// uses.
+    fn hold<'a>(&self, gate: &'a ScopeGate, path: &Path) -> Result<HeldLock<'a>> {
+        // Same-process writers queue here and never touch the file system while they wait.
+        let in_process = gate
+            .gate
+            .lock()
+            .map_err(|_| DurableError::unavailable("scope gate poisoned"))?;
+        let Some(file) = gate.file.as_ref() else {
+            let lock = acquire_lock(path)?;
+            return Ok(HeldLock {
+                os: None,
+                file: Some(lock),
+                _gate: in_process,
+            });
+        };
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        let mut backoff = LOCK_OS_RETRY;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(DurableError::unavailable(
+                            "scope is locked; another agent is using this workspace",
+                        ));
+                    }
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(LOCK_OS_RETRY_MAX);
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+        Ok(HeldLock {
+            os: Some(file),
+            file: None,
+            _gate: in_process,
+        })
     }
 
     fn scope_path(&self, scope: &str) -> PathBuf {
@@ -658,7 +839,7 @@ impl FileStore {
     fn commit(
         &self,
         scope: &str,
-        lock: &ScopeLock,
+        lock: &HeldLock<'_>,
         base: BTreeMap<String, Value>,
         staged: BTreeMap<String, Option<Value>>,
         scheduled: BTreeMap<String, Scheduled>,
@@ -690,7 +871,9 @@ impl FileStore {
         // lock (this function runs inside `transaction`), so there is one lock order and no cycle
         // is possible.
         if !scheduled.is_empty() {
-            let _index = acquire_lock(&self.work_lock_path())?;
+            let index_path = self.work_lock_path();
+            let index_gate = self.gate(WORK_INDEX_LOCK, &index_path)?;
+            let _index = self.hold(&index_gate, &index_path)?;
             for entry in scheduled.values() {
                 let path = self.work_path(&entry.queue, &entry.work_id);
                 if entry.ready_at < 0 {
@@ -741,7 +924,9 @@ impl RecordStore for FileStore {
         scope: &str,
         work: &mut dyn FnMut(&mut dyn Txn) -> Result<()>,
     ) -> Result<()> {
-        let lock = acquire_lock(&self.lock_path(scope))?;
+        let path = self.lock_path(scope);
+        let gate = self.gate(scope, &path)?;
+        let lock = self.hold(&gate, &path)?;
         let base = self.read_scope(scope)?;
         let mut staged = StagedTxn {
             store: self,
@@ -1870,7 +2055,118 @@ mod tests {
         assert!(store.ready("queue", i64::MAX, 10)?.is_empty());
         assert_eq!(file_count(&root.path().join("scopes")), 1);
         assert_eq!(file_count(&root.path().join("work")), 0);
-        assert_eq!(file_count(&root.path().join("locks")), 0);
+        // The OS mode leaves its lock file behind by design: it is the *name* of the lock, and
+        // keeping it is what makes the next transaction cost nothing. What must not stay behind is
+        // a temporary file or a body somebody has to judge — neither exists in this mode.
+        let locks = root.path().join("locks");
+        assert_eq!(file_count(&locks), 1, "one long-lived lock file");
+        let lock = fs::read_dir(&locks)?
+            .next()
+            .ok_or_else(|| DurableError::invalid("no lock file"))??;
+        assert_eq!(
+            fs::metadata(lock.path())?.len(),
+            0,
+            "the lock file is a name, never a body"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_os_lock_file_is_never_rewritten() -> Result<()> {
+        let root = TempRoot::new("os-lock");
+        let store = FileStore::open(root.path())?;
+        let locks = root.path().join("locks");
+        for round in 0..5 {
+            store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+                txn.put("n", Some(json!(round)))
+            })?;
+        }
+        // One file for the scope; the readiness index was never scheduled, so no second one.
+        assert_eq!(file_count(&locks), 1);
+        let lock = fs::read_dir(&locks)?
+            .next()
+            .ok_or_else(|| DurableError::invalid("no lock file"))??
+            .path();
+        let before = fs::metadata(&lock)?;
+        assert_eq!(before.len(), 0, "the lock file is never written to");
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("n", Some(json!(99)))
+        })?;
+        let after = fs::metadata(&lock)?;
+        assert_eq!(
+            before.modified().ok(),
+            after.modified().ok(),
+            "a transaction must not touch the lock file at all"
+        );
+        Ok(())
+    }
+
+    /// Two stores of this process on one root are two *hosts* as far as the lock is concerned:
+    /// their gates are separate and only the OS lock keeps them apart.
+    #[test]
+    fn two_stores_on_one_root_do_not_lose_each_others_updates() -> Result<()> {
+        let root = TempRoot::new("os-exclusive");
+        let first = Arc::new(FileStore::open(root.path())?);
+        let second = Arc::new(FileStore::open(root.path())?);
+        let bump = |store: &FileStore, hold: Option<Duration>| -> Result<()> {
+            store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+                let value = txn.get("v")?.and_then(|value| value.as_i64()).unwrap_or(0);
+                if let Some(hold) = hold {
+                    // Still holding the lock: a writer that does not exclude would read the same
+                    // zero and overwrite this increment.
+                    std::thread::sleep(hold);
+                }
+                txn.put("v", Some(json!(value + 1)))
+            })
+        };
+        bump(&first, None)?;
+        let (taken, taken_rx) = std::sync::mpsc::channel();
+        let holder = {
+            let first = Arc::clone(&first);
+            std::thread::spawn(move || {
+                let outcome =
+                    first.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+                        let value = txn.get("v")?.and_then(|value| value.as_i64()).unwrap_or(0);
+                        taken.send(()).ok();
+                        std::thread::sleep(Duration::from_millis(150));
+                        txn.put("v", Some(json!(value + 1)))
+                    });
+                outcome.map_err(|error| error.to_string())
+            })
+        };
+        taken_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first writer takes the lock");
+        let started = Instant::now();
+        bump(&second, None)?;
+        let waited = started.elapsed();
+        holder.join().expect("writer thread").expect("first write");
+        assert!(
+            waited >= Duration::from_millis(100),
+            "the second store must wait for the first: {waited:?}"
+        );
+        assert_eq!(
+            read_value(&first, "session", "v")?,
+            Some(json!(3)),
+            "both increments must survive"
+        );
+        Ok(())
+    }
+
+    /// The conservative mode keeps the create-if-absent lock, and deletes it again.
+    #[test]
+    fn the_conservative_mode_still_takes_and_drops_its_lock_file() -> Result<()> {
+        let root = TempRoot::new("conservative");
+        let store = FileStore::open_conservative(root.path())?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!(1)))
+        })?;
+        assert_eq!(
+            file_count(&root.path().join("locks")),
+            0,
+            "the file mode removes its lock again"
+        );
+        assert_eq!(read_value(&store, "session", "a")?, Some(json!(1)));
         Ok(())
     }
 

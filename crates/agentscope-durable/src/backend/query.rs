@@ -217,14 +217,22 @@ pub(super) fn ready(
         }
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    // The identity, not the work id, decides whether two entries are the same work: one thread is
+    // listed under its harness queue and under its versioned twin, and a record written before the
+    // work id carried the session kept the bare thread id. Deduplicating on the id alone would
+    // hand the same thread to two ticks.
     let mut seen = std::collections::BTreeSet::new();
     let mut selected = Vec::new();
-    for (_, work_id, payload) in candidates {
-        if !seen.insert(work_id.clone()) {
-            continue;
-        }
+    for (_, _, payload) in candidates {
         let Some(payload) = payload else { continue };
         let definition: ThreadSpec = serde_json::from_value(payload)?;
+        let identity = (
+            definition.key.session.storage_key(),
+            definition.key.thread_id.clone(),
+        );
+        if !seen.insert(identity) {
+            continue;
+        }
         selected.push(definition);
         if selected.len() == limit {
             break;

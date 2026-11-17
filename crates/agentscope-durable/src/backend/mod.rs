@@ -468,12 +468,17 @@ pub(super) fn schedule_thread(
     let ready = ready_at(thread, turn, now);
     let definition = &thread.definition;
     let payload = Some(serde_json::to_value(definition)?);
-    let thread_id = definition.key.thread_id.clone();
+    // The work id is the whole *thread* key, not its bare id: one queue is shared by every session
+    // of a harness, and a thread id (`main`) is unique within its session, not across them. With
+    // the bare id two sessions of the same harness wrote the same readiness record and the later
+    // write replaced the earlier one, so the replaced session was scheduled nowhere: `submit` kept
+    // succeeding, but no tick ever found that thread again.
+    let work_id = definition.key.storage_key();
     let all_queue = format!("thread:{}", definition.harness());
-    txn.schedule(&all_queue, &thread_id, ready, payload.clone())?;
+    txn.schedule(&all_queue, &work_id, ready, payload.clone())?;
     let selector = HarnessSelector::exact(definition)?;
     let versioned = format!("thread-version:{}", digest_of(&selector)?);
-    txn.schedule(&versioned, &thread_id, ready, payload)
+    txn.schedule(&versioned, &work_id, ready, payload)
 }
 
 pub(super) fn cursor_of(state: &SessionState, sequence: u64) -> String {

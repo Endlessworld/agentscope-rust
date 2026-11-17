@@ -143,6 +143,42 @@ async fn a_waiting_turn_is_only_ready_after_its_signal_arrives() {
     assert_eq!(ready[0].key.thread_id, "main");
 }
 
+/// Two sessions of one harness each keep their own readiness record.
+///
+/// The queue is per harness and the work id used to be the bare thread id, so two sessions that
+/// both call their thread `main` wrote the same record: the later write replaced the earlier and
+/// the replaced session was scheduled nowhere. `submit` kept succeeding on it, but no tick ever
+/// found the thread again — a silent stall, not an error.
+#[tokio::test]
+async fn sessions_of_one_harness_each_keep_their_readiness_record() {
+    let backend = TxnBackend::in_memory();
+    let selector = HarnessSelector::all("harness-a").expect("selector");
+    for session in ["s1", "s2"] {
+        let key = SessionKey::new("ns", session).expect("session key");
+        backend
+            .create(SessionSpec {
+                key: key.clone(),
+                primary_binding: binding(),
+                metadata: Value::Null,
+            })
+            .await
+            .expect("create session");
+        let thread = ThreadKey::new(key, "main").expect("thread key");
+        backend
+            .submit(&thread, "req-1", json!({ "text": "hi" }))
+            .await
+            .expect("submit");
+    }
+
+    let ready = backend.ready(&[selector], 10).await.expect("ready");
+    let mut sessions: Vec<&str> = ready
+        .iter()
+        .map(|spec| spec.key.session.session_id.as_str())
+        .collect();
+    sessions.sort_unstable();
+    assert_eq!(sessions, vec!["s1", "s2"]);
+}
+
 #[tokio::test]
 async fn an_identical_checkpoint_does_not_create_a_new_position() {
     let (backend, thread, _receipt, lease) = running().await;
