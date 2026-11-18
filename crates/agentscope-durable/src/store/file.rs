@@ -347,6 +347,42 @@ fn count_scope_write(bytes: usize) {
     SCOPE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
+/// Whether the file system under `root` implements `flock`.
+///
+/// `LockMode::Os` takes the lock from the kernel, which a FUSE mount (an Android `/sdcard`, an
+/// `sshfs` mount) may refuse with `ENOSYS`; a store opened there would fail every transaction
+/// with "Function not implemented". The probe costs one create, one lock attempt and one delete
+/// when the store opens, and it answers for the directory the store will write in.
+fn os_lock_supported(root: &Path) -> bool {
+    let path = root
+        .join("locks")
+        .join(format!(".flock-probe-{}", std::process::id()));
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => file,
+        // A lock directory that cannot even be opened is not this probe's answer to give:
+        // opening the root already reported it when it created the directories.
+        Err(_) => return true,
+    };
+    let supported = match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            true
+        }
+        // Another host holds it right now: this file system does implement locking.
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    };
+    drop(file);
+    let _ = retry_while_held(|| fs::remove_file(&path));
+    supported
+}
+
 impl FileStore {
     /// Opens a root for a local disk: writers exclude each other with an OS lock.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -371,6 +407,14 @@ impl FileStore {
         // spellings (relative, absolute, a `..` in the middle) would otherwise answer two gates
         // for one lock file. The fallback keeps a store usable where canonicalising is refused.
         let root = fs::canonicalize(&root).unwrap_or(root);
+        // A file system may answer `ENOSYS` to `flock` (an Android `/sdcard` FUSE mount, some
+        // network shares). An OS lock is then not takeable at all, and every transaction would
+        // fail with "Function not implemented"; the create-if-absent lock needs nothing the file
+        // system refuses, so the store falls back to it instead of being unusable there.
+        let mode = match mode {
+            LockMode::Os if !os_lock_supported(&root) => LockMode::Conservative,
+            mode => mode,
+        };
         let store = Self {
             root,
             mode,
