@@ -1300,6 +1300,7 @@ impl RecordStore for FileStore {
             bytes: RefCell::new(None),
             overlay: RefCell::new(None),
             parts: RefCell::new(BTreeMap::new()),
+            index: RefCell::new(None),
             staged: BTreeMap::new(),
             scheduled: BTreeMap::new(),
             now: crate::now_millis(),
@@ -1338,6 +1339,7 @@ impl RecordStore for FileStore {
             bytes: RefCell::new(None),
             overlay: RefCell::new(None),
             parts: RefCell::new(BTreeMap::new()),
+            index: RefCell::new(None),
             staged: BTreeMap::new(),
             scheduled: BTreeMap::new(),
             now: crate::now_millis(),
@@ -1482,6 +1484,9 @@ struct StagedTxn<'a> {
     overlay: RefCell<Option<Arc<Overlay>>>,
     /// Values asked for by [`Txn::get`], picked out of the document one record at a time.
     parts: RefCell<BTreeMap<String, Option<Value>>>,
+    /// The top-level byte ranges of the document, built on first read and reused for the rest of
+    /// the transaction.
+    index: RefCell<Option<Arc<DocumentIndex>>>,
     staged: BTreeMap<String, Option<Value>>,
     scheduled: BTreeMap<String, Scheduled>,
     now: i64,
@@ -1564,6 +1569,52 @@ impl StagedTxn<'_> {
         Ok(())
     }
 
+    /// The top-level index of the document bytes, built on first use.
+    ///
+    /// `None` when the scope has no document yet; the index is what turns the per-record walks a
+    /// transaction performs into one walk for all of them.
+    fn document_index(&self) -> Result<Option<Arc<DocumentIndex>>> {
+        if let Some(index) = self.index.borrow().as_ref() {
+            return Ok(Some(Arc::clone(index)));
+        }
+        self.ensure_bytes()?;
+        let index = {
+            let bytes = self.bytes.borrow();
+            match &*bytes {
+                Some(Some(document)) => Arc::new(index_document(document.as_slice())?),
+                _ => return Ok(None),
+            }
+        };
+        *self.index.borrow_mut() = Some(Arc::clone(&index));
+        Ok(Some(index))
+    }
+
+    /// One value from the document bytes: through the index when it is usable, by a scan when it
+    /// is not (a document whose ranges could not be placed).
+    ///
+    /// A read-only transaction scans: building the index costs one walk plus a `String` per
+    /// record, and a read-only transaction usually asks for one or two records, so the index only
+    /// pays in a transaction that reads several — which is what a write transaction does (state,
+    /// thread, turn, then a page of journal entries).
+    fn document_value(&self, part: &str) -> Result<Option<Value>> {
+        if !self.read_only {
+            if let Some(index) = self.document_index()? {
+                if index.complete {
+                    let bytes = self.bytes.borrow();
+                    return match &*bytes {
+                        Some(Some(document)) => index.value(document.as_slice(), part),
+                        _ => Ok(None),
+                    };
+                }
+            }
+        }
+        let bytes = self.bytes.borrow();
+        Ok(match &*bytes {
+            Some(Some(document)) => pick_parts(document.as_slice(), &[part])?.remove(part),
+            _ => None,
+        })
+    }
+
     /// The stored value of `part`, picked out of the document without building the rest of it.
     fn read(&self, part: &str) -> Result<Option<Value>> {
         if let Some(value) = self.staged.get(part) {
@@ -1581,11 +1632,7 @@ impl StagedTxn<'_> {
             } else if overlay.removes.contains(part) {
                 None
             } else {
-                let bytes = self.bytes.borrow();
-                match &*bytes {
-                    Some(Some(document)) => pick_parts(document.as_slice(), &[part])?.remove(part),
-                    _ => None,
-                }
+                self.document_value(part)?
             }
         };
         self.parts
@@ -1601,10 +1648,21 @@ impl StagedTxn<'_> {
     /// page is what made a page cost the conversation.
     fn document_keys(&self) -> Result<BTreeMap<String, Value>> {
         self.ensure_bytes()?;
-        let bytes = self.bytes.borrow();
-        let mut keys = match &*bytes {
-            Some(Some(document)) => key_map(document.as_slice())?,
-            _ => BTreeMap::new(),
+        let index = if self.read_only {
+            // A read-only transaction scans: see [`StagedTxn::document_value`].
+            None
+        } else {
+            self.document_index()?
+        };
+        let mut keys = match index {
+            Some(index) if index.complete => index.keys(),
+            _ => {
+                let bytes = self.bytes.borrow();
+                match &*bytes {
+                    Some(Some(document)) => key_map(document.as_slice())?,
+                    _ => BTreeMap::new(),
+                }
+            }
         };
         let overlay = self.overlay.borrow();
         let overlay = overlay.as_ref().expect("ensure_bytes parses the tail");
@@ -1813,6 +1871,88 @@ fn older_than(path: &Path, age: Duration) -> bool {
             .is_some_and(|elapsed| elapsed >= age),
         Err(_) => false,
     }
+}
+
+/// The top-level records of one serialized scope document, by byte range.
+///
+/// A transaction reads the same document several times — the state, the thread, the turn, then a
+/// page of journal entries — and every `pick_parts` call walks the whole document even though it
+/// materializes one record. This is built once per document bytes and answers each later read by
+/// slicing the record's own bytes, so the document is walked once per transaction instead of once
+/// per record.
+struct DocumentIndex {
+    /// Whether the ranges describe the document. A borrow that did not land inside the input
+    /// leaves them unusable, and the caller falls back to a scan.
+    complete: bool,
+    /// `part` → `(start, end)` of its value in the document bytes.
+    slots: BTreeMap<String, (usize, usize)>,
+}
+
+impl DocumentIndex {
+    /// The value of `part`, parsed from its own bytes; `None` when the document has no such part.
+    fn value(&self, bytes: &[u8], part: &str) -> Result<Option<Value>> {
+        match self.slots.get(part) {
+            Some((start, end)) => Ok(Some(serde_json::from_slice(&bytes[*start..*end])?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The keys the document holds, as `Null` values for `merge_keys` to walk.
+    fn keys(&self) -> BTreeMap<String, Value> {
+        self.slots
+            .keys()
+            .map(|key| (key.clone(), Value::Null))
+            .collect()
+    }
+}
+
+/// Indexes the top level of one serialized scope document.
+///
+/// Each value is borrowed as a `RawValue`, so the ranges point into the input itself and the walk
+/// builds one `String` per record and nothing else — no `Value`, no copy of the record.
+fn index_document(bytes: &[u8]) -> Result<DocumentIndex> {
+    use serde::de::{MapAccess, Visitor};
+    use serde::Deserializer;
+    use serde_json::value::RawValue;
+
+    struct Index {
+        base: usize,
+        slots: BTreeMap<String, (usize, usize)>,
+    }
+
+    impl<'de> Visitor<'de> for Index {
+        type Value = BTreeMap<String, (usize, usize)>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a stored scope document")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(
+            mut self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                let raw: &'de RawValue = map.next_value()?;
+                let text = raw.get();
+                let start = text.as_ptr() as usize - self.base;
+                self.slots.insert(key, (start, start + text.len()));
+            }
+            Ok(self.slots)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let slots = deserializer.deserialize_map(Index {
+        base: bytes.as_ptr() as usize,
+        slots: BTreeMap::new(),
+    })?;
+    deserializer.end()?;
+    // A zero-copy borrow always lands inside the input; the check keeps a future change to
+    // `RawValue` from turning a wrong offset into a wrong value.
+    let complete = slots
+        .values()
+        .all(|(start, end)| start <= end && *end <= bytes.len());
+    Ok(DocumentIndex { complete, slots })
 }
 
 /// The values of `wanted` in one serialized scope document, skipping everything else.
@@ -3218,6 +3358,52 @@ mod tests {
 
         // A scope that was never written answers `None`.
         assert_eq!(store.read_parts("other", &["a"])?, vec![None]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_document_index_places_exactly_what_a_scan_reads() -> Result<()> {
+        // Every shape the index has to place: a quoted quote, an escaped newline, a multi-byte
+        // character, an array holding an object, a string that contains the closing braces of its
+        // container, an empty object and a null.
+        let bytes = r#"{"a":{"t":"q\"n\nu✓"},"b":[1,{"c":"]}"}],"d":{},"e":null}"#.as_bytes();
+        let index = index_document(bytes)?;
+        assert!(index.complete, "every range lands inside the document");
+        assert_eq!(
+            index.keys().len(),
+            4,
+            "a, b, d and e are the top-level parts"
+        );
+        assert_eq!(index.value(bytes, "a")?, Some(json!({"t": "q\"n\nu✓"})));
+        assert_eq!(index.value(bytes, "b")?, Some(json!([1, {"c": "]}"}])));
+        assert_eq!(index.value(bytes, "d")?, Some(json!({})));
+        assert_eq!(index.value(bytes, "e")?, Some(Value::Null));
+        assert_eq!(index.value(bytes, "missing")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_transaction_reads_several_records_through_one_index() -> Result<()> {
+        let root = TempRoot::new("index-transaction");
+        let store = FileStore::open(root.path())?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!({"text": "one\"two"})))?;
+            txn.put("b", Some(json!([1, 2, 3])))?;
+            txn.put("c", Some(json!({"nested": {"deep": [{"x": "}"}]}})))
+        })?;
+        // The fold puts every record in the document; the reads below all come out of one index.
+        store.compact_scope("session")?;
+        let mut values = Vec::new();
+        store.read_transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            for part in ["a", "b", "c", "missing"] {
+                values.push(txn.get(part)?);
+            }
+            Ok(())
+        })?;
+        assert_eq!(values[0], Some(json!({"text": "one\"two"})));
+        assert_eq!(values[1], Some(json!([1, 2, 3])));
+        assert_eq!(values[2], Some(json!({"nested": {"deep": [{"x": "}"}]}})));
+        assert_eq!(values[3], None);
         Ok(())
     }
 
