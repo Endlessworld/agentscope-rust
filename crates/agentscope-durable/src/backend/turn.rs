@@ -552,16 +552,7 @@ pub(super) fn frame(store: &dyn RecordStore, lease: &Lease) -> Result<Frame> {
     let scope = lease.thread.session.storage_key();
     let thread_key = thread_part(&lease.thread.thread_id, "definition");
     let turn_key = turn_part(&lease.turn_id);
-    let checkpoint_key = checkpoint_part(&lease.thread.thread_id);
-    let mut values = store.read_parts(
-        &scope,
-        &[
-            thread_key.as_str(),
-            turn_key.as_str(),
-            checkpoint_key.as_str(),
-        ],
-    )?;
-    let checkpoint = values.pop().flatten().unwrap_or(Value::Null);
+    let mut values = store.read_parts(&scope, &[thread_key.as_str(), turn_key.as_str()])?;
     let turn_value = values
         .pop()
         .flatten()
@@ -577,6 +568,9 @@ pub(super) fn frame(store: &dyn RecordStore, lease: &Lease) -> Result<Frame> {
     }
     let now = crate::now_millis();
     assert_owned(&turn, lease, now)?;
+    // The checkpoint's state lives in its journal entry now, so it is read after the ownership
+    // check: a rejected frame must not pay for a multi-megabyte record.
+    let checkpoint = read_current_checkpoint(store, &scope, &thread)?;
     let tools: Vec<ToolExecution> = turn
         .tool_order
         .iter()

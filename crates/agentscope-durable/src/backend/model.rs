@@ -70,10 +70,6 @@ pub(crate) fn queue_part(thread_id: &str, index: u64) -> String {
     thread_data_part(thread_id, &format!("queue:{}", pos(index)))
 }
 
-pub(crate) fn checkpoint_part(thread_id: &str) -> String {
-    thread_data_part(thread_id, "checkpoint")
-}
-
 pub(crate) fn checkpoint_history_part(thread_id: &str, position: u64) -> String {
     thread_data_part(thread_id, &format!("checkpoint-history:{}", pos(position)))
 }
@@ -484,15 +480,25 @@ pub(crate) struct CommandRecord {
     pub digest: String,
 }
 
-/// A checkpoint record: metadata plus its (inline) content.
+/// A checkpoint record: metadata plus, for older roots, its inline content.
+///
+/// Newer roots do not inline the state: the `state/checkpoint` entry in the journal is the only
+/// copy, and `journal_seq` names the entry. Inlining it here as well stored the same state three
+/// times (the journal entry, this record and `checkpoint-history`), which is the largest
+/// duplication a session had after the request bodies stopped repeating the conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CheckpointRecord {
     pub metadata: CheckpointMetadata,
+    /// The state itself; `null` when [`Self::journal_seq`] names the entry that carries it.
+    #[serde(default)]
     pub checkpoint: Value,
     pub branch: String,
     pub journal_position: u64,
     pub resource_position: u64,
     pub settled: bool,
+    /// The `seq` of the `state/checkpoint` entry this record describes; `0` for an older root.
+    #[serde(default)]
+    pub journal_seq: u64,
 }
 
 #[cfg(test)]

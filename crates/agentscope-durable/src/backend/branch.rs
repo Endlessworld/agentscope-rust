@@ -208,16 +208,15 @@ pub(super) fn restore(store: &dyn RecordStore, restoration: Restoration) -> Resu
         };
         let record = CheckpointRecord {
             metadata: metadata.clone(),
+            // A restoration's state comes from the caller, not from a journal entry, so this is
+            // the one checkpoint that still inlines it.
             checkpoint: restoration.checkpoint.clone(),
             branch: thread.journal_branch.clone(),
             journal_position: thread.journal_position,
             resource_position: thread.resource_position,
             settled: true,
+            journal_seq: 0,
         };
-        txn.put(
-            &checkpoint_part(&target.key.thread_id),
-            Some(restoration.checkpoint.clone()),
-        )?;
         store_json(
             txn,
             &checkpoint_history_part(&target.key.thread_id, thread.checkpoint_position),

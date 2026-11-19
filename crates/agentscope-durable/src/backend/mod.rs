@@ -233,6 +233,81 @@ pub(super) fn require_turn(txn: &dyn Txn, turn_id: &str) -> Result<TurnData> {
     load_turn(txn, turn_id)?.ok_or_else(|| DurableError::not_found("Turn does not exist"))
 }
 
+/// The state a checkpoint record describes.
+///
+/// A newer record keeps only metadata and names the `state/checkpoint` entry that carries the
+/// state; an older one (and a restoration, whose state comes from the caller) still inlines it.
+pub(super) fn checkpoint_state(
+    txn: &dyn Txn,
+    thread_id: &str,
+    record: &CheckpointRecord,
+) -> Result<Value> {
+    if !record.checkpoint.is_null() || record.journal_seq == 0 {
+        return Ok(record.checkpoint.clone());
+    }
+    let entry = load_json::<Value>(
+        txn,
+        &journal_part(thread_id, &record.branch, record.journal_seq),
+    )?
+    .ok_or_else(|| DurableError::not_found("Checkpoint state entry does not exist"))?;
+    state_of_checkpoint_entry(entry)
+}
+
+/// [`checkpoint_state`] for a caller that reads through [`RecordStore`] instead of a [`Txn`].
+pub(super) fn read_checkpoint_state(
+    store: &dyn RecordStore,
+    scope: &str,
+    thread_id: &str,
+    record: &CheckpointRecord,
+) -> Result<Value> {
+    if !record.checkpoint.is_null() || record.journal_seq == 0 {
+        return Ok(record.checkpoint.clone());
+    }
+    let part = journal_part(thread_id, &record.branch, record.journal_seq);
+    let entry = store
+        .read_parts(scope, &[part.as_str()])?
+        .pop()
+        .flatten()
+        .ok_or_else(|| DurableError::not_found("Checkpoint state entry does not exist"))?;
+    state_of_checkpoint_entry(entry)
+}
+
+/// The state of a thread's newest checkpoint, read through [`RecordStore`].
+pub(super) fn read_current_checkpoint(
+    store: &dyn RecordStore,
+    scope: &str,
+    thread: &ThreadData,
+) -> Result<Value> {
+    let Some(metadata) = thread.checkpoint_metadata.as_ref() else {
+        return Ok(Value::Null);
+    };
+    let Ok(position) = metadata.position.parse::<u64>() else {
+        return Ok(Value::Null);
+    };
+    let part = checkpoint_history_part(&thread.definition.key.thread_id, position);
+    let Some(record) = store.read_parts(scope, &[part.as_str()])?.pop().flatten() else {
+        return Ok(Value::Null);
+    };
+    let record: CheckpointRecord = serde_json::from_value(record)?;
+    read_checkpoint_state(store, scope, &thread.definition.key.thread_id, &record)
+}
+
+/// The state inside a `state/checkpoint` journal entry (`{"stateJson": "<the whole state>"}`).
+fn state_of_checkpoint_entry(entry: Value) -> Result<Value> {
+    let payload = entry
+        .get("payloadJson")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DurableError::invalid("Checkpoint entry carries no payload"))?;
+    let data: Value = serde_json::from_str(payload)
+        .map_err(|error| DurableError::invalid(format!("Checkpoint payload: {error}")))?;
+    let state_json = data
+        .get("stateJson")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DurableError::invalid("Checkpoint entry carries no state"))?;
+    serde_json::from_str(state_json)
+        .map_err(|error| DurableError::invalid(format!("Checkpoint state: {error}")))
+}
+
 /// How many turn ids one read of a thread queue returns.
 ///
 /// The queue is read in pages so that a conversation is never cut off at a fixed size: a single

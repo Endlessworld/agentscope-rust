@@ -48,7 +48,7 @@ pub(super) fn commit(
         }
         let trim = scope_bytes
             .is_some_and(|bytes| compact::worth_compacting(bytes, state.compacted_bytes));
-        apply_journal(txn, &mut thread, &command)?;
+        let checkpoint_seq = apply_journal(txn, &mut thread, &command)?;
         if command.expected_revision != turn.revision {
             return Err(DurableError::conflict("Revision changed"));
         }
@@ -94,7 +94,7 @@ pub(super) fn commit(
         apply_consumed(txn, &mut state, &mut turn, lease, &command)?;
         let previous = turn.status;
         let next = derive_status(&turn, &command)?;
-        write_checkpoint(txn, &mut thread, &command, next)?;
+        write_checkpoint(txn, &mut thread, &command, next, checkpoint_seq)?;
         turn.revision += 1;
         turn.status = next;
         turn.waiting = command.waiting.clone();
@@ -210,15 +210,30 @@ fn reject_reserved(event_type: &str) -> Result<()> {
     Ok(())
 }
 
-fn apply_journal(txn: &mut dyn Txn, thread: &mut ThreadData, command: &Commit) -> Result<()> {
+/// Applies the batch's journal entries and reports the position of the last
+/// `state/checkpoint` entry it stored.
+///
+/// The position is what `write_checkpoint` needs: the entry is the only copy of the state, and a
+/// record that pointed at the entry's own `seq` field instead would be off by whatever the
+/// journal's numbering differs from the store's (they start at different positions), so the
+/// reference has to be the slot this function assigned.
+fn apply_journal(
+    txn: &mut dyn Txn,
+    thread: &mut ThreadData,
+    command: &Commit,
+) -> Result<Option<u64>> {
     let Some(journal) = &command.journal else {
-        return Ok(());
+        return Ok(None);
     };
     if journal.expected_position != thread.journal_position {
         return Err(DurableError::conflict("Journal position changed"));
     }
+    let mut checkpoint_seq = None;
     for entry in &journal.entries {
         thread.journal_position += 1;
+        if entry.get("type").and_then(Value::as_str) == Some("state/checkpoint") {
+            checkpoint_seq = Some(thread.journal_position);
+        }
         store_json(
             txn,
             &journal_part(
@@ -229,7 +244,7 @@ fn apply_journal(txn: &mut dyn Txn, thread: &mut ThreadData, command: &Commit) -
             entry,
         )?;
     }
-    Ok(())
+    Ok(checkpoint_seq)
 }
 
 fn apply_run(turn: &mut TurnData, change: &RunChange, lease: &Lease, now: i64) -> Result<()> {
@@ -565,6 +580,7 @@ fn write_checkpoint(
     thread: &mut ThreadData,
     command: &Commit,
     next: TurnStatus,
+    checkpoint_seq: Option<u64>,
 ) -> Result<()> {
     let previous = match thread.checkpoint_position {
         0 => None,
@@ -600,26 +616,55 @@ fn write_checkpoint(
             position: thread.checkpoint_position.to_string(),
             digest,
         };
+        // The journal entry is the only copy of the state. `journalSeq` names it, so the record
+        // stays metadata instead of repeating a multi-megabyte snapshot that already exists.
+        let journal_seq = checkpoint_seq.unwrap_or(0);
         let record = CheckpointRecord {
             metadata: metadata.clone(),
-            checkpoint: command.checkpoint.clone(),
+            checkpoint: if journal_seq == 0 {
+                command.checkpoint.clone()
+            } else {
+                Value::Null
+            },
             branch: thread.journal_branch.clone(),
             journal_position: thread.journal_position,
             resource_position: thread.resource_position,
             settled: next.terminal(),
+            journal_seq,
         };
-        txn.put(
-            &checkpoint_part(&thread.definition.key.thread_id),
-            Some(command.checkpoint.clone()),
-        )?;
         store_json(
             txn,
             &checkpoint_history_part(&thread.definition.key.thread_id, thread.checkpoint_position),
             &record,
         )?;
         thread.checkpoint_metadata = Some(metadata);
-    } else if next.terminal() {
-        mark_checkpoint_settled(txn, thread, previous)?;
+    } else if let Some(mut updated) = previous {
+        // The journal may still have appended an equivalent state (a reopened recorder captures
+        // before its first model call), so the record follows the newer copy: compaction keeps
+        // only the last `state/checkpoint` payload, and naming an older one would leave the
+        // record pointing at a reclaimed entry.
+        let mut changed = false;
+        if let Some(seq) = checkpoint_seq {
+            if updated.journal_seq != seq {
+                updated.journal_seq = seq;
+                updated.checkpoint = Value::Null;
+                changed = true;
+            }
+        }
+        if next.terminal() && !updated.settled {
+            updated.settled = true;
+            changed = true;
+        }
+        if changed {
+            store_json(
+                txn,
+                &checkpoint_history_part(
+                    &thread.definition.key.thread_id,
+                    thread.checkpoint_position,
+                ),
+                &updated,
+            )?;
+        }
     }
     Ok(())
 }

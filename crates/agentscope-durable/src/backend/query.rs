@@ -283,10 +283,11 @@ pub(super) fn checkpoint(
             &checkpoint_history_part(&thread.thread_id, position),
         )?
         .ok_or_else(|| DurableError::not_found("Checkpoint does not exist"))?;
+        let checkpoint = checkpoint_state(txn, &thread.thread_id, &record)?;
         Ok(CheckpointView {
             definition: data.definition,
             metadata: record.metadata,
-            checkpoint: record.checkpoint,
+            checkpoint,
             journal_position: record.journal_position,
             settled: record.settled,
         })

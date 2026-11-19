@@ -42,6 +42,19 @@ fn new_hex() -> String {
     Uuid::new_v4().to_string().replace('-', "")
 }
 
+/// A borrowing view of an [`AgentState`] that serializes without its `context`.
+///
+/// This is what a `state/checkpoint` writes: the conversation is journalled once, as
+/// `message/*` facts, and repeating it inside every checkpoint made the checkpoint the largest
+/// payload of a session. See [`AgentState::serialize_without_context`].
+pub struct SansContext<'a>(pub &'a AgentState);
+
+impl serde::Serialize for SansContext<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize_without_context(serializer)
+    }
+}
+
 impl Default for AgentState {
     fn default() -> Self {
         Self {
@@ -63,6 +76,33 @@ impl Default for AgentState {
 impl AgentState {
     pub fn builder() -> AgentStateBuilder {
         AgentStateBuilder::new()
+    }
+
+    /// Serializes this state without its `context`.
+    ///
+    /// A `state/checkpoint` repeats the conversation whenever it carries `context`, and the
+    /// conversation is already the largest part of the journal: every message lives once as a
+    /// `message/*` fact. A checkpoint therefore carries only what a replay cannot derive, and
+    /// recovery splices the messages back in (see `JournalProjection`). The wrapper keeps that
+    /// decision next to the fields it serializes, so a field added to `AgentState` shows up in
+    /// one place instead of silently going missing from every checkpoint.
+    pub fn serialize_without_context<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("AgentState", 10)?;
+        out.serialize_field("session_id", &self.session_id)?;
+        out.serialize_field("user_id", &self.user_id)?;
+        out.serialize_field("summary", &self.summary)?;
+        out.serialize_field("reply_id", &self.reply_id)?;
+        out.serialize_field("cur_iter", &self.cur_iter)?;
+        out.serialize_field("shutdown_interrupted", &self.shutdown_interrupted)?;
+        out.serialize_field("permission_context", &self.permission_context)?;
+        out.serialize_field("tool_context", &self.tool_context)?;
+        out.serialize_field("tasks_context", &self.tasks_context)?;
+        out.serialize_field("plan_mode_context", &self.plan_mode_context)?;
+        out.end()
     }
 
     pub fn session_id(&self) -> &str {
@@ -217,5 +257,36 @@ impl AgentStateBuilder {
             tasks_context: self.tasks_context.unwrap_or(def.tasks_context),
             plan_mode_context: self.plan_mode_context.unwrap_or(def.plan_mode_context),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The checkpoint serializer is the one place that decides what a checkpoint leaves out.
+    /// If a field is added to `AgentState` and not to it, every checkpoint silently loses that
+    /// field and recovery returns a state that differs from the live one. Comparing against the
+    /// full serialization makes that omission a test failure instead.
+    #[test]
+    fn the_checkpoint_form_keeps_every_field_but_the_context() {
+        let state = AgentState::builder()
+            .session_id("session-1")
+            .user_id("user-1")
+            .summary("a summary")
+            .context(vec![Msg::user("hello")])
+            .build();
+        let full = serde_json::to_value(&state).expect("full");
+        let without = serde_json::to_value(SansContext(&state)).expect("without");
+        let mut expected = full.as_object().expect("object").clone();
+        expected.remove("context");
+        assert_eq!(
+            without,
+            serde_json::Value::Object(expected),
+            "a checkpoint must carry every field except the conversation"
+        );
+        // The conversation is the one thing missing, and it is not empty in the full form.
+        assert!(full.get("context").is_some());
+        assert!(without.get("context").is_none());
     }
 }

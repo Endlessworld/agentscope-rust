@@ -882,7 +882,14 @@ mod tests {
         assert!(!call_id.is_empty());
         assert_eq!(prepared["purpose"], "REASONING");
         assert_eq!(prepared["model"], "stub");
-        assert_eq!(prepared["messages"][0]["role"], "User");
+        // The body is referenced, not repeated: the ids name messages the journal already holds
+        // as facts of their own, and the digest proves the call saw exactly those bytes.
+        assert!(prepared.get("messages").is_none(), "{prepared}");
+        assert_eq!(prepared["messageIds"].as_array().map(Vec::len), Some(1));
+        let digest = prepared["messagesDigest"].as_str().expect("digest");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{digest}");
+        assert!(prepared["toolsDigest"].as_str().is_some());
 
         let dispatch = facts
             .iter()

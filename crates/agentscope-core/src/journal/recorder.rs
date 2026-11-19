@@ -26,7 +26,7 @@ use super::{
 };
 use crate::agent::RuntimeContext;
 use crate::message::{ContentBlock, GenerateReason, Msg, MsgRole, ToolResultBlock};
-use crate::state::AgentState;
+use crate::state::{AgentState, SansContext};
 
 /// Runtime-context key carrying the active [`InvocationRecorder`].
 pub const RECORDER_CONTEXT_KEY: &str = "agentscope.journal.recorder";
@@ -69,6 +69,19 @@ const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 /// one. The interval balances the write cost against the replay cost (`S* ≈ sqrt(2·B·R)`, with
 /// the state around 2.9MB); the 20-turn diagnostic stays well below it.
 const CHECKPOINT_INTERVAL_BYTES: u64 = 15 << 20;
+
+/// Whether a turn boundary may write a prefix checkpoint (a P-frame: the state without
+/// `context`).
+///
+/// Off: the durable layer's `commit.checkpoint` is read back by `AgentScopeExecutionHost` as the
+/// only source of the previous invocation's state, and that path has no conversation to splice a
+/// prefix frame's messages into. Turning this on before moving that recovery path onto the
+/// journal projection would resume turns with an empty context.
+///
+/// The writer and the projection already support it (`contextFromEvents` + `stateDigest`, with
+/// `JournalProjection` rebuilding the transcript from the `message/*` facts), so this switch is
+/// the only missing piece.
+const CHECKPOINT_PREFIX_FRAMES: bool = false;
 
 /// Whether a `bytes`-sized fact may join the pending buffer.
 ///
@@ -328,35 +341,50 @@ fn escape_json_into(out: &mut Vec<u8>, bytes: &[u8]) {
 
 /// What a recorder persists for each model call.
 ///
-/// `request/prepared` carries the full `messages` + `tools` + `options` of every call. No read
-/// path consumes it — recovery uses `state/checkpoint`, `tool/dispatch` and `model/dispatch`;
-/// the projection drops it as a builtin event — so it is an audit fact, and it is by far the
-/// largest payload per call (megabytes). Hosts that do not need provider-level forensics can
-/// turn it off; the call itself is still discoverable through `model/dispatch`.
+/// A `request/prepared` fact records that a call was prepared, which messages it was shown and a
+/// digest of their bodies. The bodies themselves are **not** repeated: they are already facts of
+/// their own (`message/user`, `message/assistant`, …), and repeating them made this event the
+/// single largest payload of a session — 66% of a 20-turn store, four megabytes of a seven
+/// megabyte journal. No read path consumes the body; recovery uses `state/checkpoint` plus
+/// `model/dispatch`. A host that needs provider-level forensics can ask for the full body back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordingPolicy {
-    /// Journal the full request as `request/prepared` before dispatching it.
+    /// Journal a `request/prepared` fact before dispatching a request.
     pub record_model_requests: bool,
+    /// Inline the full `messages` + `tools` in that fact instead of `messageIds` + digests.
+    ///
+    /// Off by default: the bodies are already journalled once, per message.
+    pub record_model_request_bodies: bool,
 }
 
 impl Default for RecordingPolicy {
     fn default() -> Self {
         Self {
             record_model_requests: true,
+            record_model_request_bodies: false,
         }
     }
 }
 
 impl RecordingPolicy {
-    /// The policy a host gets when it says nothing: full Java-compatible recording.
+    /// The policy a host gets when it says nothing: a call is recorded, its bodies are referenced.
     pub fn journaling_requests() -> Self {
         Self::default()
     }
 
-    /// Records checkpoints and call boundaries, but not the full request payload.
+    /// Records checkpoints and call boundaries, but not the call facts at all.
     pub fn without_request_payloads() -> Self {
         Self {
             record_model_requests: false,
+            ..Self::default()
+        }
+    }
+
+    /// Records the full request body as well: the pre-2026 behaviour, for forensics hosts.
+    pub fn with_request_bodies() -> Self {
+        Self {
+            record_model_requests: true,
+            record_model_request_bodies: true,
         }
     }
 }
@@ -1634,16 +1662,25 @@ impl InvocationRecorder {
 
         // Decide what changed under the lock, then append with the lock released:
         // `append` takes the same (non-reentrant) mutex.
-        let (replaced, durable_seq, fresh, changed, checkpoint_due) = {
+        let (replaced, durable_seq, fresh, changed, checkpoint_due, full_checkpoint) = {
             let mut guard = self.lock();
             Self::check(&guard)?;
-            let checkpoint_due = guard.previous_state.is_none()
-                || guard.bytes_since_checkpoint >= CHECKPOINT_INTERVAL_BYTES
+            // Only an I-frame carries the conversation. Everything else is a prefix frame: the
+            // messages are already facts of their own (`message/*`), and recovery splices them
+            // back into the checkpointed state, so repeating them here would store the
+            // conversation once per checkpoint.
+            // A checkpoint is due on the interval, at a turn boundary, or right before a model
+            // call; only the interval frames (and the first one) are full. When prefix frames are
+            // disabled every due checkpoint is full, which is the durable layer's requirement.
+            let interval_due = guard.previous_state.is_none()
+                || guard.bytes_since_checkpoint >= CHECKPOINT_INTERVAL_BYTES;
+            let checkpoint_due = interval_due
                 // A turn boundary is the one point recovery starts from: the host reads the
                 // newest checkpoint, so deferring it would resume the turn from a stale
                 // conversation. Model calls inside a turn stay on the byte interval.
                 || reason.starts_with("run_")
                 || reason == "durable_boundary";
+            let full_checkpoint = !CHECKPOINT_PREFIX_FRAMES || interval_due;
             let unchanged = guard.previous_state == Some(state_fingerprint)
                 && state
                     .context
@@ -1702,7 +1739,14 @@ impl InvocationRecorder {
                 }
             }
             guard.previous_sections = current;
-            (replaced, durable_seq, fresh, changed, checkpoint_due)
+            (
+                replaced,
+                durable_seq,
+                fresh,
+                changed,
+                checkpoint_due,
+                full_checkpoint,
+            )
         };
         crate::diag::mark("checkpoint:plan");
 
@@ -1751,7 +1795,13 @@ impl InvocationRecorder {
         if checkpoint_due {
             self.append_serialized_required(
                 "state/checkpoint",
-                checkpoint_payload(state, reason, state_escaped_len)?,
+                checkpoint_payload(
+                    state,
+                    reason,
+                    state_escaped_len,
+                    full_checkpoint,
+                    state_fingerprint,
+                )?,
                 true,
             )?;
         } else {
@@ -1762,7 +1812,9 @@ impl InvocationRecorder {
             let mut guard = self.lock();
             guard.previous_state = Some(state_fingerprint);
             guard.previous_messages = messages;
-            if checkpoint_due {
+            // Only a full frame restarts the interval: a prefix frame does not carry the
+            // conversation, so the bytes it skipped still count towards the next I-frame.
+            if full_checkpoint {
                 guard.bytes_since_checkpoint = 0;
             }
         }
@@ -1776,11 +1828,17 @@ impl InvocationRecorder {
         state: &AgentState,
         reason: &str,
     ) -> crate::error::Result<()> {
-        // Publish whatever is already buffered first, so a large checkpoint is committed on
-        // its own (the journal spills it to a blob) instead of riding along with unrelated
-        // facts in one oversized batch.
-        self.flush().await?;
-        self.capture_state(state, reason)?;
+        // The checkpoint rides with whatever is already buffered whenever the batch admits it: the
+        // checkpoint of a small batch is small too, and splitting the two costs a second commit —
+        // and with it a second read and rewrite of every record the scope holds.
+        //
+        // Only a batch that cannot hold both is split: there the facts behind the checkpoint have
+        // to be published first so the checkpoint is not refused for their sake. `capture_state`
+        // validates before it appends anything, so a refused attempt leaves no trace to undo.
+        if self.capture_state(state, reason).is_err() {
+            self.flush().await?;
+            self.capture_state(state, reason)?;
+        }
         self.flush().await?;
         // Recovery always resumes from the newest checkpoint, so every earlier checkpoint of
         // this turn is unreadable-by-design: a full `AgentState` (megabytes) per iteration that
@@ -1816,10 +1874,11 @@ impl InvocationRecorder {
         if let Some(state) = state {
             self.checkpoint_now(state, "before_model").await?;
         }
-        // `request/prepared` is the only event carrying the full request payload, and no read
-        // path consumes it: recovery uses the checkpoint plus `model/dispatch`, and the
-        // projection drops it as a builtin. A host without provider-level forensics needs can
-        // turn it off; the call stays discoverable as dispatched below.
+        // `request/prepared` is the only event that used to carry the full request payload, and
+        // no read path consumes it: recovery uses the checkpoint plus `model/dispatch`, and the
+        // projection drops it as a builtin. The bodies are already facts of their own, so the
+        // default records the ids and a digest instead of the conversation a second time; a host
+        // without provider-level forensics needs can turn the fact off entirely.
         if self.policy.record_model_requests {
             // A borrowed projection: serializing the request straight from the input avoids
             // building a `serde_json::Value` tree of the whole conversation first.
@@ -1829,18 +1888,50 @@ impl InvocationRecorder {
                 model_call_id: &'a str,
                 purpose: &'a str,
                 model: &'a str,
-                messages: &'a [Msg],
-                tools: &'a [crate::model::ToolSchema],
+                /// Ids of the messages the call was shown, in order.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                message_ids: Option<Vec<&'a str>>,
+                /// SHA-256 over the message bodies those ids name.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                messages_digest: Option<String>,
+                /// SHA-256 over the tool schemas: they are static, so the digest proves which
+                /// tool set a call was given without repeating the schemas every time.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                tools_digest: Option<String>,
+                /// Present only when `record_model_request_bodies` inlines the request again.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                messages: Option<&'a [Msg]>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                tools: Option<&'a [crate::model::ToolSchema]>,
                 options: serde_json::Value,
             }
+            let body = self.policy.record_model_request_bodies;
+            let (message_ids, messages_digest, tools_digest) = if body {
+                (None, None, None)
+            } else {
+                (
+                    Some(
+                        input
+                            .messages
+                            .iter()
+                            .map(|message| message.id.as_str())
+                            .collect::<Vec<_>>(),
+                    ),
+                    Some(digest_json(&input.messages)?),
+                    Some(digest_json(&input.tools)?),
+                )
+            };
             self.append(
                 "request/prepared",
                 &PreparedRequest {
                     model_call_id: call_id,
                     purpose,
                     model: input.model.model_name(),
-                    messages: &input.messages,
-                    tools: &input.tools,
+                    message_ids,
+                    messages_digest,
+                    tools_digest,
+                    messages: body.then_some(&input.messages),
+                    tools: body.then_some(&input.tools),
                     options: options_payload(&input.options),
                 },
             )?;
@@ -2125,6 +2216,16 @@ fn message_json(state: &AgentState) -> crate::error::Result<Vec<MessageFingerpri
         .collect()
 }
 
+/// The hash a checkpoint records for its state.
+///
+/// A prefix checkpoint leaves the conversation out, so a replay rebuilds it from the `message/*`
+/// facts. Recording the hash of the whole state turns that rebuild into a checked claim: a
+/// projection that splices a different conversation back in fails instead of resuming from a
+/// state nobody ever held.
+pub(crate) fn state_digest(state: &AgentState) -> crate::error::Result<u64> {
+    Ok(state_fingerprint(state)?.0)
+}
+
 /// Serializes the state once into a hashing sink to fingerprint it without its JSON text,
 /// also reporting the escaped length the checkpoint payload will need.
 fn state_fingerprint(state: &AgentState) -> crate::error::Result<(u64, usize)> {
@@ -2185,21 +2286,65 @@ struct StateChanged<'a> {
 ///
 /// The state is streamed into the payload buffer, so a checkpoint of a multi-megabyte
 /// conversation never exists as a second `String` (let alone as a `serde_json::Value`).
+///
+/// `full` chooses the frame kind. An I-frame carries the whole state; a P-frame carries only
+/// what a replay cannot derive and leaves `context` to the `message/*` facts, flagged by
+/// `contextFromEvents` so the reader splices the conversation back in.
 fn checkpoint_payload(
     state: &AgentState,
     reason: &str,
     escaped_len: usize,
+    full: bool,
+    digest: u64,
 ) -> crate::error::Result<String> {
-    let mut out: Vec<u8> = Vec::with_capacity(escaped_len + reason.len() + 96);
-    out.extend_from_slice(b"{\"projectorVersion\":1,\"stateJson\":\"");
+    let mut out: Vec<u8> = Vec::with_capacity(escaped_len + reason.len() + 112);
+    if full {
+        out.extend_from_slice(b"{\"projectorVersion\":1,\"stateJson\":\"");
+    } else {
+        // `stateDigest` covers the whole state *including* the conversation the frame leaves
+        // out: a replay that splices a different one back in must fail, not resume.
+        out.extend_from_slice(b"{\"projectorVersion\":1,\"contextFromEvents\":true,");
+        out.extend_from_slice(
+            format!("\"stateDigest\":\"{digest:016x}\",\"stateJson\":\"").as_bytes(),
+        );
+    }
     {
         let mut sink = JsonStringSink { out: &mut out };
-        serde_json::to_writer(&mut sink, state).map_err(crate::error::Error::from)?;
+        if full {
+            serde_json::to_writer(&mut sink, state).map_err(crate::error::Error::from)?;
+        } else {
+            serde_json::to_writer(&mut sink, &SansContext(state))
+                .map_err(crate::error::Error::from)?;
+        }
     }
     out.extend_from_slice(b"\",\"reason\":\"");
     escape_json_into(&mut out, reason.as_bytes());
     out.extend_from_slice(b"\"}");
     String::from_utf8(out).map_err(|error| journal_error(format!("checkpoint payload: {error}")))
+}
+
+/// SHA-256 over a value's JSON encoding, streamed into the hasher.
+///
+/// Used by `request/prepared` to name the bytes a call was shown without repeating them: the
+/// conversation is serialized straight into the hash, so the digest costs no allocation of its
+/// own even when the request carries megabytes of history.
+fn digest_json<T: serde::Serialize>(value: &T) -> crate::error::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    struct Sink(Sha256);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut sink = Sink(Sha256::new());
+    serde_json::to_writer(&mut sink, value).map_err(crate::error::Error::from)?;
+    Ok(format!("{:x}", sink.0.finalize()))
 }
 
 /// Extracts tool calls from an event payload (`toolCalls` / `tool_calls`).
@@ -2809,6 +2954,114 @@ mod tests {
             .state_json
             .expect("the newest checkpoint restores");
         assert!(restored.contains("2-"), "{restored}");
+        recorder.close().await;
+    }
+
+    /// A prefix checkpoint omits the conversation and records a hash of the whole state instead.
+    /// Recovery rebuilds the transcript from the `message/*` facts and must arrive at exactly
+    /// the state the writer held — the digest rejects a rebuild that would resume from a state
+    /// nobody ever held.
+    #[tokio::test]
+    async fn a_prefix_checkpoint_rebuilds_the_conversation_from_the_facts() {
+        let (log, _storage) = journal().await;
+        let mut state = crate::state::AgentState::builder().session_id("s1").build();
+        let first = Msg::user("first question");
+        state.context_mut().push(first.clone());
+        state.set_summary("round-1");
+        let initial = serde_json::json!({
+            "stateJson": state.to_json().unwrap(),
+            "projectorVersion": 1,
+            "reason": "run_started",
+        })
+        .to_string();
+
+        let second = Msg::assistant("first answer");
+        state.context_mut().push(second.clone());
+        state.set_summary("round-2");
+        let digest = state_digest(&state).unwrap();
+        let prefix = checkpoint_payload(&state, "run_completed", 0, false, digest).unwrap();
+        assert!(
+            !prefix.contains("\"context\""),
+            "a prefix checkpoint must not repeat the conversation: {prefix}"
+        );
+
+        seed(
+            &*log,
+            "run-0",
+            vec![
+                raw(1, "state/checkpoint", Some("run-0"), Some("t0"), &initial),
+                raw(
+                    2,
+                    "message/assistant",
+                    Some("run-0"),
+                    Some("t0"),
+                    &serde_json::json!({ "message": &second }).to_string(),
+                ),
+                raw(3, "state/checkpoint", Some("run-0"), Some("t0"), &prefix),
+            ],
+        )
+        .await;
+
+        let projection = crate::journal::JournalProjection::read(&*log)
+            .await
+            .unwrap();
+        let restored = projection.restore().unwrap().expect("state");
+        assert_eq!(restored.summary(), "round-2");
+        let ids: Vec<&str> = restored
+            .context()
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(ids, vec![first.id.as_str(), second.id.as_str()]);
+    }
+
+    /// The next turn opens from a journal whose newest checkpoint is a prefix frame: the writer
+    /// never stored the conversation inside it, so the opener has to rebuild it from the facts
+    /// before it can resume.
+    #[tokio::test]
+    async fn a_second_turn_opens_from_a_prefix_checkpoint() {
+        let (log, _storage) = journal().await;
+        let mut state = crate::state::AgentState::builder().session_id("s1").build();
+        let first = Msg::user("first question");
+        state.context_mut().push(first.clone());
+        let initial = serde_json::json!({
+            "stateJson": state.to_json().unwrap(),
+            "projectorVersion": 1,
+            "reason": "run_started",
+        })
+        .to_string();
+        let second = Msg::assistant("first answer");
+        state.context_mut().push(second.clone());
+        let digest = state_digest(&state).unwrap();
+        let prefix = checkpoint_payload(&state, "run_completed", 0, false, digest).unwrap();
+
+        seed(
+            &*log,
+            "run-0",
+            vec![
+                raw(1, "state/checkpoint", Some("run-0"), Some("t0"), &initial),
+                raw(
+                    2,
+                    "message/assistant",
+                    Some("run-0"),
+                    Some("t0"),
+                    &serde_json::json!({ "message": &second }).to_string(),
+                ),
+                raw(3, "state/checkpoint", Some("run-0"), Some("t0"), &prefix),
+            ],
+        )
+        .await;
+
+        let recorder = InvocationRecorder::open(Arc::clone(&log), Some("t1"))
+            .await
+            .expect("a prefix checkpoint must be readable by the next turn");
+        let restored = recorder.restore_initial().unwrap().expect("state");
+        let ids: Vec<&str> = restored
+            .context()
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(ids, vec![first.id.as_str(), second.id.as_str()]);
         recorder.close().await;
     }
 

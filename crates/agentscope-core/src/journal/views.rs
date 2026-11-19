@@ -324,17 +324,19 @@ pub(crate) async fn replay_views(
     let mut turns = selection
         .turns
         .then(|| seed.as_ref().map(|s| s.turns.clone()).unwrap_or_default());
-    let mut projection = selection.projection.then(|| match &seed {
-        Some(snapshot) => ProjectionFold {
-            state: snapshot.projection.state_json.clone(),
-            uncertain: snapshot.projection.uncertain_tool_calls.clone(),
-            runs: snapshot.projection.active_runs.clone(),
-            results: BTreeMap::new(),
-            verifications: snapshot.projection.verifications.clone(),
-            extensions: Vec::new(),
-        },
-        None => ProjectionFold::default(),
-    });
+    let mut projection = if selection.projection {
+        Some(match &seed {
+            Some(snapshot) => seeded_fold(
+                snapshot.projection.state_json.clone(),
+                snapshot.projection.uncertain_tool_calls.clone(),
+                snapshot.projection.active_runs.clone(),
+                snapshot.projection.verifications.clone(),
+            )?,
+            None => ProjectionFold::default(),
+        })
+    } else {
+        None
+    };
     let mut pending = selection
         .pending
         .then(|| seed.as_ref().map(|s| s.pending.clone()).unwrap_or_default());
@@ -477,6 +479,71 @@ pub(crate) struct ProjectionFold {
     results: BTreeMap<String, ToolResultBlock>,
     verifications: Vec<TaskVerification>,
     extensions: Vec<JournalEvent>,
+    /// The conversation, rebuilt from the `message/*` facts in commit order.
+    ///
+    /// This is the single copy the journal keeps: a prefix checkpoint leaves `context` out and
+    /// recovery splices this list back into it, so a checkpoint never repeats a conversation.
+    messages: Vec<Msg>,
+    /// Ids already in [`Self::messages`], so a replayed or re-committed message is not doubled.
+    message_ids: HashSet<String>,
+    /// Whether the newest checkpoint deferred its `context` to the facts above.
+    context_from_events: bool,
+    /// The state hash such a checkpoint recorded, so the rebuilt state is verified, not assumed.
+    state_digest: Option<String>,
+}
+
+/// Appends a message unless its id is already in the transcript.
+fn push_message(messages: &mut Vec<Msg>, ids: &mut HashSet<String>, message: Msg) {
+    if ids.insert(message.id.clone()) {
+        messages.push(message);
+    }
+}
+
+/// The message a conversation event carries, if it carries one.
+fn message_of(event: &JournalEvent) -> Option<Msg> {
+    if !matches!(
+        event.event_type.as_str(),
+        "message/user" | "message/assistant" | "message/system" | "tool/result"
+    ) {
+        return None;
+    }
+    let data = event.data().ok()?;
+    serde_json::from_value(data.get("message")?.clone()).ok()
+}
+
+/// The conversation a checkpointed state carries; empty when it carries none.
+fn context_of_state(state_json: Option<&str>) -> crate::error::Result<Vec<Msg>> {
+    let Some(json) = state_json else {
+        return Ok(Vec::new());
+    };
+    let mut state = crate::state::AgentState::from_json_str(json)?;
+    Ok(std::mem::take(state.context_mut()))
+}
+
+/// Starts a fold from an already projected checkpoint.
+///
+/// The seed's state is whole (a projection always carries a complete `context`), so the
+/// transcript is re-derived from it and the fold continues as if it had replayed the prefix.
+fn seeded_fold(
+    state: Option<String>,
+    uncertain: BTreeSet<String>,
+    runs: BTreeSet<String>,
+    verifications: Vec<TaskVerification>,
+) -> crate::error::Result<ProjectionFold> {
+    let messages = context_of_state(state.as_deref())?;
+    let message_ids = messages.iter().map(|message| message.id.clone()).collect();
+    Ok(ProjectionFold {
+        state,
+        uncertain,
+        runs,
+        results: BTreeMap::new(),
+        verifications,
+        extensions: Vec::new(),
+        messages,
+        message_ids,
+        context_from_events: false,
+        state_digest: None,
+    })
 }
 
 pub(crate) fn apply_projection_event(
@@ -490,9 +557,18 @@ pub(crate) fn apply_projection_event(
         results,
         verifications,
         extensions,
+        messages,
+        message_ids,
+        context_from_events,
+        state_digest,
     } = fold;
     super::JournalEventTypes::validate(event)?;
     let data = event.data()?;
+    // The conversation lives once, in the `message/*` facts: folding it here is what lets a
+    // checkpoint leave `context` out.
+    if let Some(message) = message_of(event) {
+        push_message(messages, message_ids, message);
+    }
     // Dispatch/start and their terminal answers are the only facts that decide whether a call
     // is still uncertain; keeping the rule in one function lets a caller advance just that set
     // without replaying the state checkpoints a projection needs.
@@ -503,10 +579,45 @@ pub(crate) fn apply_projection_event(
             // a newer checkpoint superseded (or a malformed event) must not erase it.
             if let Some(json) = data.get("stateJson").and_then(|value| value.as_str()) {
                 *state = Some(json.to_string());
+                // A full frame carries the conversation; a prefix frame leaves it to the
+                // `message/*` facts folded above. The flag travels with the payload, so a
+                // history that mixes both kinds still recovers.
+                let from_events = data
+                    .get("contextFromEvents")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                *context_from_events = from_events;
+                *state_digest = data
+                    .get("stateDigest")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                if !from_events {
+                    *state_digest = None;
+                    if let Ok(restored) = crate::state::AgentState::from_json_str(json) {
+                        messages.clear();
+                        message_ids.clear();
+                        for message in restored.context() {
+                            push_message(messages, message_ids, message.clone());
+                        }
+                    }
+                }
             }
             results.clear();
             verifications.clear();
             extensions.clear();
+        }
+        // A replacement is the only fact that can drop messages: the conversation was
+        // compacted and this event carries the list that replaced it, in full.
+        "context/replaced" => {
+            messages.clear();
+            message_ids.clear();
+            if let Some(values) = data.get("messages").and_then(|value| value.as_array()) {
+                for value in values {
+                    if let Ok(message) = serde_json::from_value::<Msg>(value.clone()) {
+                        push_message(messages, message_ids, message);
+                    }
+                }
+            }
         }
         // A verification report is durable state, not optional telemetry: a payload that
         // cannot be decoded fails the projection instead of being skipped. A missing
@@ -726,17 +837,38 @@ pub(crate) fn finish_projection(
         results,
         verifications,
         extensions,
+        messages,
+        // The transcript is spent here: the projection carries a state whose `context` is whole.
+        message_ids: _,
+        context_from_events,
+        state_digest,
     } = fold;
     {
         // Realign a recovered state with facts whose effect may be lost in an older
-        // checkpoint: committed tool results, verification reports and extension events.
+        // checkpoint: committed tool results, verification reports and extension events. A
+        // prefix checkpoint also needs its conversation spliced back in: it deliberately left
+        // the messages out, because they are journalled once as `message/*` facts.
         if let Some(state_json) = &state {
-            if !results.is_empty() || !extensions.is_empty() {
+            if context_from_events || !results.is_empty() || !extensions.is_empty() {
                 let mut restored = crate::state::AgentState::from_json_str(state_json)?;
+                if context_from_events {
+                    *restored.context_mut() = messages;
+                }
                 realign_tool_results(&mut restored, &results);
                 for extension in &extensions {
                     super::JournalEventCodecRegistry::default_registry()
                         .apply_extension(&mut restored, extension)?;
+                }
+                if let Some(expected) = &state_digest {
+                    // The frame says which state it was written from; a rebuild that names a
+                    // different one is a bug (or a corrupted history), never a state to resume.
+                    let actual = super::recorder::state_digest(&restored)?;
+                    if actual != u64::from_str_radix(expected.trim(), 16).unwrap_or(actual) {
+                        return Err(journal_error(format!(
+                            "checkpoint state digest {expected} does not match the state rebuilt \
+                             from the journal"
+                        )));
+                    }
                 }
                 state = Some(restored.to_json()?);
             }
@@ -793,14 +925,12 @@ impl JournalProjection {
         if head.seq == self.as_of_seq {
             return Ok(());
         }
-        let mut fold = ProjectionFold {
-            state: self.state_json.clone(),
-            uncertain: self.uncertain_tool_calls.clone(),
-            runs: self.active_runs.clone(),
-            results: BTreeMap::new(),
-            verifications: self.verifications.clone(),
-            extensions: Vec::new(),
-        };
+        let mut fold = seeded_fold(
+            self.state_json.clone(),
+            self.uncertain_tool_calls.clone(),
+            self.active_runs.clone(),
+            self.verifications.clone(),
+        )?;
         log.visit(self.as_of_seq, head.seq, &mut |event| {
             apply_projection_event(&mut fold, event)
         })

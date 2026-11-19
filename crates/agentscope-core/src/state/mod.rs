@@ -12,6 +12,7 @@ pub mod store;
 pub mod verification;
 
 pub use agent_state::AgentState;
+pub use agent_state::SansContext;
 pub use conflict_policy::ConflictPolicy;
 pub use context::{
     PlanModeContextState, ReadCacheEntry, Task, TaskContextState, TaskScope, TaskState,
