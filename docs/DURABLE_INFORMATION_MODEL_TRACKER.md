@@ -6,12 +6,126 @@
 > 状态：✅ 已落地 / 🟡 部分 / ❌ 未落地 / ⏸ 暂缓 / 🧪 需先测量。
 > 数据来源：20 轮（8KB 用户 + 8KB 回复，`DIAG_TURNS=20`，`--features alloc-stats,durable-sqlite`；SQLite `durable.db` / FileStore `AGENTSCOPE_DURABLE_STORE=file`）；L30/L31 提交 `b143a3c` / `70302b2`。
 
+### 概述
+
+从信息论出发，durable 存储可以形式化为三个问题：**信息源**（会话真正产生了多少新信息）、**信道**（磁盘写入会遇到什么错误）、**失真**（哪些旧信息可以丢弃而不影响正确性）。当前实现的主要问题，是三者没有分开建模——把「状态」当成「信息」，于是每轮重写整份状态。
+
+## 一、形式化
+
+| 要素 | 定义 | 当前实现的问题 |
+|---|---|---|
+| 信息源 | 每轮真正新增的信息 = 新消息 + 工具结果 + 决策，熵率约为每轮几 KB | `state/checkpoint` 每轮写 2.88MB，`request/prepared` 再写一遍全量 messages |
+| 信道 | 不是 BSC，而是**擦除 + 截断 + 并发交错**信道（进程被杀、半行写入、双写者） | 用锁 + 原子写 + seq 处理了，但帧边界与 digest 分散在多层 |
+| 失真 | 允许丢「人读历史」，绝不允许丢「状态机语义」 | 两者用同一种表示（JSON 事件），无法按需区别对待 |
+
+## 二、五条设计原则
+
+**1）信息唯一性：每个信息单元只写一次**
+
+状态的每个 bit 都应能由事件序列确定性推导。因此：
+
+```
+request/prepared  →  不再携带 messages
+                     只携带 messages_digest + 新增消息的 hash 列表
+state/checkpoint  →  不再每轮整份 stateJson
+                     首轮 I 帧 + 后续 P 帧（state diff，父 hash 引用）
+message/appended  →  内容寻址：payload = hash，事件只存引用
+```
+
+同一份对话内容在 `request/prepared`、`message/appended`、`context/replaced`、`state/checkpoint` 里出现四次，这是最大的冗余源。内容寻址后只剩一份 blob。
+
+**2）分层编码：I 帧 / P 帧**
+
+借鉴视频编码：
+
+```
+I 帧（快照）：完整状态，每 S 字节或 K 个事件一次
+P 帧（事件）：只含增量，引用父 commit
+恢复     ：最近 I 帧 + 尾部 P 帧，代价 O(S + 尾部)
+```
+
+当前是「每轮一个 I 帧」，恢复成本低但写入成本高。正确做法是固定恢复代价预算，再反推 S。
+
+**3）快照间隔由 MDL 决定，而不是拍脑袋**
+
+设：快照字节 `B`、每轮新增事件字节 `R`、快照间隔 `S`（字节）。
+
+总成本 = 快照写入 `(R/S)·B` + 恢复读取 `≈ (S/2)`（平均恢复到最近快照的尾部长度）
+
+对 S 求导最小化，得经典 checkpoint 间隔：
+
+```
+S* ≈ sqrt(2 · B · R)        （Young 公式的离散版本）
+```
+
+以当前数据代入：`B ≈ 2.9MB`（整份 state）、`R ≈ 40KB/轮`，得 `S* ≈ 15MB ≈ 数百轮`。这说明**当前每轮一次 checkpoint 是严重过度**；改成每几十到上百轮一次全量、中间用 diff，写入成本可以降一个数量级。
+
+**4）原子帧 + 单调序号 = 擦除信道上的 ARQ**
+
+每次提交是一个自描述帧：
+
+```
+seq | commit_id | length | payload | digest(prev_seq, payload)
+```
+
+读端规则：从 head 反向验证 digest 链，遇到缺口/损坏停在最后一个完整帧。这等价于「检测 + 重传」在存储层的实现：**幂等重放**就是重传，`event-id` 就是去重窗口。当前系统已有这些要素，但应该把它们收敛为一个统一的帧格式，而不是分散在 `commits/`、`head.json`、`scope` 文档三处。
+
+**5）有损压缩的边界：只对「人读历史」做有损**
+
+| 数据 | 可否有损 | 理由 |
+|---|---|---|
+| 旧事件的业务 payload | 可折叠为 digest 或 `{"reclaimed":true}` | 客户端只读窗口内事件；恢复不依赖 |
+| 旧快照 | 可删除 | 有更新的快照 |
+| turn/tool 未结算状态 | **不可** | 丢失会导致重复执行副作用 |
+| admission / receipt / 幂等标记 | **不可** | 丢失会导致重复提交 |
+| 当前 state 的字段级语义 | **不可** | 状态机正确性 |
+
+当前 `EVENT_RETENTION=1024` 的裁剪、`reclaim_payloads` 的 payload 回收符合这一原则；但 `prune` 会把 `event-id` 一起删——一旦删了幂等标记，重放的旧提交就可能被再次接收，这是信息丢失导致的正确性风险（虽然窗口很远，但不符合「不可有损」这条）。
+
+## 三、具体存储模型
+
+```
+session/
+  meta.json                  formatVersion, session key, 创建时间（一次性）
+  head.json                  seq, commit_id, lease, epoch（CAS 原子换）
+
+  frames/<seq>.frame         seq | commit_id | len | payload | digest(prev)
+                             ← 唯一的写入路径：追加一个帧
+  blobs/<sha256>             内容寻址；同内容跨轮/跨会话只存一份
+  snapshots/<seq>.snap       I 帧：整份状态 + 覆盖到的 seq
+  snapshots/<seq>.snap.idx   稀疏索引：part → offset（只对快照建）
+  index/<prefix>.idx         二级索引（turn/tool/execution id → frame seq）
+```
+
+关键点：
+
+- **写入只追加帧**，永不重写整份文档 → 删掉 tail 压实、文档字节索引、trim 的一半；
+- **读按索引**：`get(part)` 走最新快照的 idx，再叠加其后帧的 delta；没有 idx 时才回退线性扫描；
+- **GC**：blob 引用计数 + 宽限期（`BLOB_GC_GRACE`），帧按 `EVENT_RETENTION` 与「最近快照之前的帧」回收；
+- **提交合并**：一次 tick 内多个小提交压成一个帧（组提交），把 16 次/轮降到 1–2 次/轮——这是把「信道容量」用在批量发送上。
+
+## 四、与当前实现对照
+
+| 原则 | 当前 | 需要改 |
+|---|---|---|
+| 唯一性 | `state/checkpoint` 每轮整份、`request/prepared` 全量 | ✅ 最大收益点 |
+| 分层编码 | 只有 I 帧 | 加 P 帧 + 自适应快照间隔 |
+| 内容寻址 | blob 按 hash 存，但事件仍内联大 payload | 事件统一引用 blob |
+| 原子帧 | 有 `commits/` + head CAS，但 scope 文档是另一套写路径 | 收敛为单一帧格式 |
+| 有损边界 | 基本正确，`prune` 删 event-id 有隐患 | 保留幂等标记 |
+
+## 五、可量化的指标（用来验证设计）
+
+1. **冗余率** = 磁盘字节 / 去重后唯一字节；当前同一消息重复 3–4 次，目标 < 1.5。
+2. **更新成本** = 每次提交写入字节 / 新增信息字节；当前 `2.9MB / 40KB ≈ 70`，目标 ≈ 1–2。
+3. **恢复成本** = 恢复读取字节 / 状态字节；目标 O(1)，由 `S*` 控制。
+4. **提交次数/轮**：16 → 1–2。
 ## 0. 结论（先回答）
 
 - **没有全部实现，也没有完全遵守五条原则。**
 - 五原则：**P1 🟡、P2 🟡、P3 🟡（固定 15MB，非自适应）、P4 🟡、P5 ✅（L31 后；marker 无界增长是代价）**。
 - 具体存储模型（`frames/`、`snapshots/`、`index/`）**❌ 未落地**：当前是 FileStore scope 文档 + append-only tail + 大 blob，SQLite 一行一条记录。
-- 指标：冗余率 **🧪 未测**；更新成本 **❌**（FileStore `sbytes≈1.3MB/轮` ≈32×；SQLite `djournal:facts≈4.14MB/轮` ≈100×，含读/压实）；恢复成本 **🧪 未测**（S=15MB）；提交次数 **❌** 16/轮（目标 1–2）。
+- 指标：冗余率 **🧪 未测**；更新成本 **❌**（FileStore `sbytes≈1.3MB/轮` ≈32×；SQLite `djournal:facts=388.6MB/20≈19.4MB/轮` ≈485×，含读/压实；注意 L30 的 82.8MB 是终态回退的**错误基线**）；恢复成本 **🧪 未测**（S=15MB）；提交次数 **❌** 16/轮（目标 1–2）。
 - 已落地：L30（checkpoint 间隔）、L31（prune 保留 `event-id`）、SQLite 后端 + ACP 接线、L24–L29 的存储/内存优化。
 - 最大收益点：**P1**（`request/prepared` 全量 messages、`message/appended` / `context/replaced` 内联；checkpoint 间隔已做）+ **提交合并**（16→1–2）。P2 的 state diff 需先证明不重复事件日志；P1 的 event 级内容寻址需先复测（X17 曾中性回退）。
 
@@ -133,21 +247,21 @@
 | 指标 | 定义 | 当前 | 目标 | 状态 |
 |---|---|---|---|---|
 | 冗余率 | 磁盘字节 / 去重后的唯一字节 | 未测；同一消息在 `request/prepared`/`message/appended`/`context/replaced`/`state/checkpoint` 出现 3–4 次；L30 已去掉 19/20 次 full checkpoint | <1.5 | 🧪 |
-| 更新成本 | 每次提交写入字节 / 新增信息字节 | FileStore `sbytes=1,299,520 B/轮`，按 40KB 新信息 ≈32×；SQLite `djournal:facts=82.8MB/20≈4.14MB/轮` ≈104×（含读/压实，非纯写） | 1–2 | ❌ |
+| 更新成本 | 每次提交写入字节 / 新增信息字节 | FileStore `sbytes=1,299,520 B/轮`，按 40KB 新信息 ≈32×；SQLite `djournal:facts=388.6MB/20≈19.4MB/轮` ≈485×（含读/压实，非纯写） | 1–2 | ❌ |
 | 恢复成本 | 恢复读取字节 / 状态字节 | 未测；S=15MB；20 轮 `jreads=3`、`parses=0` | O(1) | 🧪 |
 | 提交次数/轮 | 写事务数 / 轮 | 16（FileStore `txns=16`；SQLite 计数器未接线，实际同） | 1–2 | ❌ |
 
-### 4.2 20 轮基线（8KB + 8KB，L30 后）
+### 4.2 20 轮基线（8KB + 8KB，L30 + turn 边界修正后）
 
-| 指标 | SQLite | FileStore |
+| 指标 | SQLite（修正后） | FileStore（L30，待复测） |
 |---|---:|---:|
-| `djournal:facts` | **82.8MB** | **322.1MB** |
-| `djournal:read` | 47.0MB | 182.7MB |
-| `flush:done` | 41.0MB | 135.0MB |
-| `acp:settle` | 27.8MB | 34.9MB |
-| DB/磁盘 | **4.76MB** | **4.23MB** |
-| `peak_live` | 4.37MB | 6.58MB |
-| 耗时 | **2.69s** | **9.99s** |
+| `djournal:facts` | **388.6MB** | **322.1MB** |
+| `djournal:read` | 122.7MB | 182.7MB |
+| `flush:done` | 176.0MB | 135.0MB |
+| `acp:settle` | 84.3MB | 34.9MB |
+| DB/磁盘 | **11.4MB** | **4.23MB** |
+| `peak_live` | 3.93MB | 6.58MB |
+| 耗时 | **6.46s** | **9.99s** |
 | `jentries` | 357 | 357 |
 | `jreads` | 3 | 3 |
 | `parses` / `picks` | 0 / 0 | 0 / 8 |
@@ -165,15 +279,16 @@
 
 ### 已落地
 
-- L24 settle 复用 journal projection；L25 只读事务文档缓存；L26 幂等读回后置；L27 append-only tail；L28 文档字节索引；L29 压实策略；**L30 checkpoint 间隔**；**L31 prune 保留 `event-id`**。
+- L24 settle 复用 journal projection；L25 只读事务文档缓存；L26 幂等读回后置；L27 append-only tail；L28 文档字节索引；L29 压实策略；**L30 checkpoint 间隔 + turn 边界强制**（修正 deferred 期间 `previous_state` 抢先更新导致终态回退）；**L31 prune 保留 `event-id`**。
 - SQLite `RecordStore` + ACP `durable-sqlite`（`durable.db`，单机预览）。
-- 20 轮：SQLite 总分配 1180.8MB → 82.8MB（`djournal:facts`）等；详见 `MEMORY_GAP_TRACKER.md` §1.6。
+- 20 轮：SQLite 修正后 `djournal:facts` 388.6MB（L30 的 82.8MB 因终态回退不可用作基线）；详见 `MEMORY_GAP_TRACKER.md` §1.6。
 
 ### 已否定 / 中性（不要再直接做）
 
 - X15：`JournalAppend.entries → RawValue`（R3/B2a），实测 +1MB/轮，完全回退。
 - X16：全量文档索引（含只读事务），负收益；L28 限定写事务。
-- X17：SQLite 内容寻址 blob 层，实测 **+33MB**，已回退；event 级内容寻址须先复测。
+- X17：SQLite 内容寻址 blob 层，实测 **+33MB**，已回退；event 级内容寻址见 X19。
+- X19：`TxnBackend` 级 event 内容寻址（`content.rs`，16KB 阈值）已实现并通过全部单测/契约/适配器用例，但 20 轮净变差：`djournal:facts` 388.6→457.2MB、`acp:settle` 84.3→157.4MB、总分配 ≈870→1010MB，DB 不变 11.4MB——已完全回退。
 - X18：增量 `scope_bytes` 列，实测中性，已回退。
 - R7/B2b：去 `payloadJson` 字符串转义，仅 1–2MB/轮，不推进。
 - 「跳过全部 checkpoint」：110.6MB / peak 6.78MB，**不如间隔版** 82.8MB / 4.37MB；不要用 skip-all。
@@ -228,3 +343,4 @@ cargo fmt --all -- --check
 | 日期 | 变更 |
 |---|---|
 | 2026-11-20 | 初版：形式化（源/信道/失真）、五原则现状、具体模型对照、四项指标、路线图与验收；基于 L30/L31 与 SQLite 20 轮基线。 |
+| 2026-11-20 | P1 event 级内容寻址（`TxnBackend` 内部 `content.rs`，16KB 阈值）实现并全绿，但 20 轮净变差（`djournal:facts` +68.6MB、`acp:settle` +73.1MB、总分配 +140MB、DB 不变），按「无净收益即回退」完全回退（X19）；同时修正 L30 的 turn 边界终态回退（`recorder.rs` 的 `checkpoint_due`/`unchanged`），SQLite 修正基线 388.6MB/11.4MB/3.93MB/6.46s。 |

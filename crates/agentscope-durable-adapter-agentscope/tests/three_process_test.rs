@@ -242,6 +242,8 @@ struct Worker {
     recorder: Arc<InvocationRecorder>,
     lease: Lease,
     run: RunView,
+    /// The agent's final state, captured by `drive` so `settle` can checkpoint it.
+    state: tokio::sync::Mutex<Option<AgentState>>,
 }
 
 impl Worker {
@@ -278,6 +280,7 @@ impl Worker {
             recorder,
             lease,
             run,
+            state: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -306,6 +309,8 @@ impl Worker {
         let (mut stream, slot) =
             agent.run_stream_with_extensions(vec![Msg::user("go")], None, extensions);
         while let Some(_item) = stream.next().await {}
+        let state = agent.state_handle().lock().ok().map(|state| state.clone());
+        *self.state.lock().await = state;
         let result = slot.lock().expect("result slot").take();
         result.unwrap_or_else(|| Err(Error::Agent("the agent produced no result message".into())))
     }
@@ -313,6 +318,12 @@ impl Worker {
     /// Settles the turn with the crate's own ending logic: the effects this run really produced
     /// are applied first, then the reply becomes the turn's output.
     async fn settle(&self, reply: &Msg) {
+        if let Some(state) = self.state.lock().await.clone() {
+            self.recorder
+                .checkpoint_now(&state, "durable_boundary")
+                .await
+                .expect("checkpoint the final state");
+        }
         settle_turn(
             self.backend.as_ref(),
             &self.lease,

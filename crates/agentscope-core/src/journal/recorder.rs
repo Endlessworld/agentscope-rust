@@ -1637,12 +1637,22 @@ impl InvocationRecorder {
         let (replaced, durable_seq, fresh, changed, checkpoint_due) = {
             let mut guard = self.lock();
             Self::check(&guard)?;
+            let checkpoint_due = guard.previous_state.is_none()
+                || guard.bytes_since_checkpoint >= CHECKPOINT_INTERVAL_BYTES
+                // A turn boundary is the one point recovery starts from: the host reads the
+                // newest checkpoint, so deferring it would resume the turn from a stale
+                // conversation. Model calls inside a turn stay on the byte interval.
+                || reason.starts_with("run_")
+                || reason == "durable_boundary";
             let unchanged = guard.previous_state == Some(state_fingerprint)
                 && state
                     .context
                     .iter()
                     .all(|message| guard.recorded_messages.contains(&message.id));
-            if unchanged {
+            // An unchanged state still needs a checkpoint when one is due: a capture that
+            // updated `previous_state` while deferring the checkpoint left the durable one
+            // stale, so skipping here would keep the stale one forever.
+            if unchanged && !checkpoint_due {
                 crate::diag::mark("checkpoint:skipped");
                 return Ok(());
             }
@@ -1691,8 +1701,6 @@ impl InvocationRecorder {
                     }
                 }
             }
-            let checkpoint_due = guard.previous_state.is_none()
-                || guard.bytes_since_checkpoint >= CHECKPOINT_INTERVAL_BYTES;
             guard.previous_sections = current;
             (replaced, durable_seq, fresh, changed, checkpoint_due)
         };

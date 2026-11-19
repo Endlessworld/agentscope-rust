@@ -126,6 +126,10 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 
 > 探针「跳过全部 checkpoint」为 `djournal:facts` 110.6MB / `peak_live` 6.78MB；间隔版（首帧 + 15MB）反而更低（82.8MB / 4.37MB），因为不再反复写入随后被回收的 full checkpoint。间隔常量 `CHECKPOINT_INTERVAL_BYTES=15MB`，由 `RecorderState.bytes_since_checkpoint` 计数。
 
+> **L30 修正（重要）**：上表是在「turn 边界不强制 checkpoint」的版本上测的；该版本在 deferred 期间 `capture_state` 会先把 `previous_state` 换成新值但没写盘，轮到终态强制 capture 时被 `unchanged` 短路，导致持久化终态回退（`three_process_test` 抓到 `"go"` 而非终态）。修正（`recorder.rs` 的 `checkpoint_due` 在 `unchanged` 之前计算 + turn 边界强制写）后重新测得 SQLite 20 轮：`djournal:facts` **388.6MB**、`djournal:read` 122.7MB、`flush:done` 176.0MB、`acp:settle` 84.3MB、磁盘 **11.4MB**、`peak_live` 3.93MB、6.46s（FileStore 尚未复测，仍为 L30 旧值）。因此「82.8MB/4.76MB」是不可用的错误基线，后续以 388.6MB/11.4MB 为准。
+>
+> 内容寻址 event 级（X19）：已实现并全绿，20 轮 `djournal:facts` 388.6→**457.2MB**、`acp:settle` 84.3→**157.4MB**、总分配 ≈870→**1010MB**、磁盘不变 11.4MB，已完全回退。
+
 > L31：`prune` 保留 `event-id` digest 标记；20 轮 ACP `jentries=357 < EVENT_RETENTION=1024`，未触发裁剪，基线不变（每个已提交事件一个标记）。
 
 ---
@@ -166,7 +170,7 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 | L29 | **压实策略**：`MIN_GAIN_DIVISOR` 10→2（当前体积翻倍才 trim）+ `COMPACT_CEILING_BYTES=12MB` 绝对兜底 | `durable/src/backend/compact.rs` | SQLite 20 轮 `djournal:facts` 820.5→**473.9MB（−42.3%）**、DB 8.66→**10.79MB**、`peak_live` 3.84；FileStore `djournal:facts` 625.6→**557.7MB（−10.9%）**、磁盘 23.77→24.92MB、`peak_live` 10.85→10.37；8MB 兜底为 504.7MB/9.36MB（12MB 更优）；修复 >8MB 但增长 <10% 的 scope 永不 trim | durable 77 lib / 20 targets、sqlite 5、契约 11、acp lib 138、acp live 20 轮 / fmt 干净 |
 
 | L31 | **prune 保留 `event-id` 幂等标记**：`compact::prune` 只删 `event:*`，不再删 `event-id:*`；被剪事件的重放命中标记后是 no-op，不会以新 sequence 复活；新增回归用例（剪后标记仍在、重放不追加、同 id 异内容仍 conflict） | `durable/backend/compact.rs` / `mod.rs` / `query.rs` | 20 轮 ACP `jentries=357 < EVENT_RETENTION=1024`，未触发裁剪，内存/磁盘基线不变；每个已提交事件保留一个 digest 标记（正确性优先） | durable 78 lib + 20 targets / sqlite 5 / 契约 11 / acp lib 138 / fmt 干净 |
-| L30 | **Checkpoint 间隔**：`CHECKPOINT_INTERVAL_BYTES=15MB`；首次 capture 与每 15MB journal payload 写一次 full `state/checkpoint`，其余只写 message/tool/changed 事件；`RecorderState.bytes_since_checkpoint` 计 payload 字节，写后清零；新增 `checkpoint:deferred` | `core/journal/recorder.rs` | SQLite 20 轮 `djournal:facts` 473.9→**82.8MB（−82.5%）**、DB 10.79→**4.76MB**、`peak_live` 3.84→4.37、7.05→**2.69s**；FileStore `djournal:facts` 557.7→**322.1MB（−42.2%）**、磁盘 24.92→**4.23MB（−83%）**、`peak_live` 10.37→**6.58MB**、9.99s；探针 skip-all 110.6MB/6.78MB 已被间隔版超过 | core 574 / harness 734 / durable 77 lib + 20 targets / sqlite 5 / 契约 11 / acp lib 138 / acp live 20 轮 / fmt 干净 |
+| L30 | **Checkpoint 间隔 + turn 边界强制**：`CHECKPOINT_INTERVAL_BYTES=15MB`；首次 capture 与每 15MB journal payload 写一次 full `state/checkpoint`，其余只写 message/tool/changed 事件；`RecorderState.bytes_since_checkpoint` 计 payload 字节，写后清零；新增 `checkpoint:deferred`；**修正**：`checkpoint_due` 在 `unchanged` 短路之前计算，turn 收尾（`run_*`）与 `durable_boundary` 强制写 full checkpoint（否则 deferred 期间 `previous_state` 抢先更新但未落盘，终态回退） | `core/journal/recorder.rs` | SQLite 20 轮（修正后）`djournal:facts` **388.6MB**、`djournal:read` 122.7MB、`flush:done` 176.0MB、`acp:settle` 84.3MB、DB **11.4MB**、`peak_live` **3.93MB**、6.46s；L30 原始的 82.8MB/4.76MB/2.69s 是终态回退的错误基线；FileStore 尚未复测（保留 L30 的 322.1MB/4.23MB/6.58MB/9.99s） | core 574 / harness 734 / durable 80 lib + 20 targets / sqlite 5 / 契约 11 / acp lib 138 / adapter 全绿 / acp live 20 轮 / fmt 干净 |
 
 > L22 的三条前提（改动前已核实，**别改坏**）：`backend/commit.rs` 的 commit 不续租、不改 `thread.epoch`、不清 `turn.owner`（普通 Running 批次）；全仓库只有 `recorder::flush` 消费 `commit()` 返回值且只取 `head.seq`。
 
@@ -193,7 +197,7 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 - **剩余（2026-11-20）**：SQLite `djournal:facts` 仍占 **473.9MB/20 轮 ≈23.7MB/轮**（FileStore 557.7MB/20 轮 ≈27.9MB/轮）；主体是 `state/checkpoint` 全量 payload（见 R19）。磁盘格式（快照 + `formatVersion`）仍是未动选项。
 - **前置**：独立工作树，先写崩溃恢复测试。
 
-#### R19 —— checkpoint I/P 帧（已落地为 L30：间隔而非 diff）
+#### R19 —— checkpoint I/P 帧（已落地为 L30：间隔而非 diff；数据修正见 L30 行/§1.6）
 
 - **结果**：`CHECKPOINT_INTERVAL_BYTES=15MB`；首次 capture 与每 15MB 写一次 full `state/checkpoint`，其余只写事件。SQLite 20 轮 `djournal:facts` **473.9 → 82.8MB（−82.5%）**、DB **10.79 → 4.76MB**、`peak_live` 3.84 → 4.37MB；FileStore **557.7 → 322.1MB（−42.2%）**、磁盘 **24.92 → 4.23MB（−83%）**、`peak_live` 10.37 → 6.58MB。
 - **未做**：per-turn P-frame diff。事件本身就是 P 帧；full checkpoint 只在间隔写，diff 不再必要。
