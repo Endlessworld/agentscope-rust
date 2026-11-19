@@ -61,6 +61,15 @@ fn renew_interval(lease: Duration) -> Duration {
 /// turn with `Session pending buffer exhausted`, and the session could not continue.
 const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
+/// Journal payload bytes between two full `state/checkpoint` snapshots.
+///
+/// A checkpoint is a full `AgentState`; the facts after it are the deltas. Writing the full
+/// state every turn repeats the conversation for no recovery benefit — a replay already folds
+/// the facts — so only the first capture and every `CHECKPOINT_INTERVAL_BYTES` after it write
+/// one. The interval balances the write cost against the replay cost (`S* ≈ sqrt(2·B·R)`, with
+/// the state around 2.9MB); the 20-turn diagnostic stays well below it.
+const CHECKPOINT_INTERVAL_BYTES: u64 = 15 << 20;
+
 /// Whether a `bytes`-sized fact may join the pending buffer.
 ///
 /// The first fact of a batch is always admitted, however large: a checkpoint of a long
@@ -370,6 +379,8 @@ struct InflightBatch {
 struct RecorderState {
     pending: Vec<JournalEvent>,
     pending_bytes: usize,
+    /// Journal payload bytes accepted since the last full `state/checkpoint`.
+    bytes_since_checkpoint: u64,
     /// Events handed to an in-flight commit but not acknowledged yet.
     inflight: Option<InflightBatch>,
     durable_seq: u64,
@@ -1213,6 +1224,7 @@ impl InvocationRecorder {
         }
         guard.pending.push(event);
         guard.pending_bytes += bytes;
+        guard.bytes_since_checkpoint = guard.bytes_since_checkpoint.saturating_add(bytes as u64);
         Ok(seq)
     }
 
@@ -1622,7 +1634,7 @@ impl InvocationRecorder {
 
         // Decide what changed under the lock, then append with the lock released:
         // `append` takes the same (non-reentrant) mutex.
-        let (replaced, durable_seq, fresh, changed) = {
+        let (replaced, durable_seq, fresh, changed, checkpoint_due) = {
             let mut guard = self.lock();
             Self::check(&guard)?;
             let unchanged = guard.previous_state == Some(state_fingerprint)
@@ -1679,8 +1691,10 @@ impl InvocationRecorder {
                     }
                 }
             }
+            let checkpoint_due = guard.previous_state.is_none()
+                || guard.bytes_since_checkpoint >= CHECKPOINT_INTERVAL_BYTES;
             guard.previous_sections = current;
-            (replaced, durable_seq, fresh, changed)
+            (replaced, durable_seq, fresh, changed, checkpoint_due)
         };
         crate::diag::mark("checkpoint:plan");
 
@@ -1726,16 +1740,23 @@ impl InvocationRecorder {
         }
         crate::diag::mark("checkpoint:fresh");
         crate::diag::mark("checkpoint:payload");
-        self.append_serialized_required(
-            "state/checkpoint",
-            checkpoint_payload(state, reason, state_escaped_len)?,
-            true,
-        )?;
+        if checkpoint_due {
+            self.append_serialized_required(
+                "state/checkpoint",
+                checkpoint_payload(state, reason, state_escaped_len)?,
+                true,
+            )?;
+        } else {
+            crate::diag::mark("checkpoint:deferred");
+        }
         crate::diag::mark("checkpoint:appended");
         {
             let mut guard = self.lock();
             guard.previous_state = Some(state_fingerprint);
             guard.previous_messages = messages;
+            if checkpoint_due {
+                guard.bytes_since_checkpoint = 0;
+            }
         }
         crate::diag::mark("checkpoint:done");
         Ok(())
@@ -2758,6 +2779,9 @@ mod tests {
             for message in &messages {
                 builder = builder.add_message(message.clone());
             }
+            // The reclaim behavior is what this test covers: force the interval so every
+            // capture writes a full checkpoint, then assert the turn keeps the newest.
+            recorder.state.lock().unwrap().bytes_since_checkpoint = CHECKPOINT_INTERVAL_BYTES;
             recorder
                 .checkpoint_now(&builder.build(), "before_acting")
                 .await
