@@ -16,6 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentscope_durable::store::{RecordStore, Txn, WorkItem};
 use agentscope_durable::{DurableError, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 
@@ -40,6 +42,40 @@ CREATE TABLE IF NOT EXISTS agentscope_work (
 );
 CREATE INDEX IF NOT EXISTS agentscope_work_due ON agentscope_work (queue, ready_at);
 ";
+
+// ----------------------------------------------------------------------------
+// Write-traffic counters
+// ----------------------------------------------------------------------------
+//
+// Two relaxed atomic adds per write and nothing else: no disk, no lock, no allocation. They answer
+// "how many transactions and how many bytes does one turn cost" the same way the file store's
+// counters do, so a turn can be measured rather than inferred.
+
+static TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
+static BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// What this process wrote through [`SqliteStore`] since the last reset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteStats {
+    /// Committed write transactions.
+    pub transactions: u64,
+    /// Bytes of record text those transactions wrote.
+    pub bytes_written: u64,
+}
+
+/// The counters above, as of now.
+pub fn write_stats() -> WriteStats {
+    WriteStats {
+        transactions: TRANSACTIONS.load(Ordering::Relaxed),
+        bytes_written: BYTES_WRITTEN.load(Ordering::Relaxed),
+    }
+}
+
+/// Zeroes the counters; a measurement takes one before and one after the turn it costs.
+pub fn reset_write_stats() {
+    TRANSACTIONS.store(0, Ordering::Relaxed);
+    BYTES_WRITTEN.store(0, Ordering::Relaxed);
+}
 
 /// A [`RecordStore`] over one SQLite database.
 ///
@@ -124,6 +160,9 @@ impl SqliteStore {
             }
         }
         transaction.commit().map_err(unavailable)?;
+        if written {
+            TRANSACTIONS.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 }
@@ -257,6 +296,7 @@ impl Txn for SqliteTxn<'_> {
         match value {
             Some(value) => {
                 let text = encode(&value)?;
+                BYTES_WRITTEN.fetch_add(text.len() as u64, Ordering::Relaxed);
                 self.connection
                     .prepare_cached(
                         "INSERT INTO agentscope_part (scope_key, k, v) VALUES (?1, ?2, ?3) \
@@ -353,6 +393,9 @@ impl Txn for SqliteTxn<'_> {
             return Ok(());
         }
         let payload = payload.map(|value| encode(&value)).transpose()?;
+        if let Some(text) = &payload {
+            BYTES_WRITTEN.fetch_add(text.len() as u64, Ordering::Relaxed);
+        }
         self.connection
             .prepare_cached(
                 "INSERT INTO agentscope_work (queue, work_id, ready_at, payload) \

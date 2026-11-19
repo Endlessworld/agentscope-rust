@@ -111,11 +111,24 @@ fn footprint(label: &str, model: &EchoModel) {
         let (live, peak, blocks) = mem::live_heap().expect("alloc-stats on");
         let rs = agentscope_durable::traffic::read_stats();
         let ws = agentscope_durable::store::file::write_stats();
+        // One of the two stores is in use; summing keeps the line correct without the test having
+        // to know which backend the session picked.
+        #[cfg(feature = "durable-sqlite")]
+        let (txns, writes, sbytes) = {
+            let lite = agentscope_durable_sqlite::write_stats();
+            (
+                ws.transactions + lite.transactions,
+                ws.scope_writes,
+                ws.scope_bytes + lite.bytes_written,
+            )
+        };
+        #[cfg(not(feature = "durable-sqlite"))]
+        let (txns, writes, sbytes) = (ws.transactions, ws.scope_writes, ws.scope_bytes);
         let call_live = model.at_call_peak.load(Ordering::SeqCst);
         let call_kb = model.at_call_bytes.load(Ordering::SeqCst) / 1024;
         eprintln!(
             "{label:<28} msgs={msgs:<4} live={:7.2}MB peak_live={:7.2}MB | @call_live={:7.2}MB @call_kb={}KB | commit={:7.2}MB peak_commit={:7.2}MB | parses={} picks={} jreads={} jentries={} | txns={} writes={} sbytes={}",
-            mb(live), mb(peak), mb(call_live), call_kb, mb(u.commit), mb(u.peak_commit), rs.scope_parses, rs.scope_picks, rs.journal_reads, rs.journal_entries, ws.transactions, ws.scope_writes, ws.scope_bytes
+            mb(live), mb(peak), mb(call_live), call_kb, mb(u.commit), mb(u.peak_commit), rs.scope_parses, rs.scope_picks, rs.journal_reads, rs.journal_entries, txns, writes, sbytes
         );
     }
     #[cfg(not(feature = "alloc-stats"))]
@@ -180,6 +193,8 @@ async fn real_acp_session_live_heap_across_growing_turns() {
     for turn in 0..turns {
         agentscope_durable::traffic::reset_read_stats();
         agentscope_durable::store::file::reset_write_stats();
+        #[cfg(feature = "durable-sqlite")]
+        agentscope_durable_sqlite::reset_write_stats();
         let text = "u".repeat(user_bytes / 2) + &turn.to_string();
         let content = vec![ContentBlock::Text(
             agent_client_protocol::v1::schema::TextContent::new(text),
