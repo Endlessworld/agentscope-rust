@@ -56,11 +56,21 @@ pub(super) const EVENT_RETENTION: u64 = 1024;
 /// another trim to be worth its scans.
 ///
 /// The growth since the last trim is an upper bound on what a new trim can free: the payloads and
-/// checkpoint history it gave up are gone, and what came back is the events written since. Below a
-/// tenth the three key walks would cost what they cost the first time and free next to nothing, so
-/// the trim waits — the scope is then still bounded by "last result plus a tenth", the same order
-/// as the threshold itself.
-const MIN_GAIN_DIVISOR: u64 = 10;
+/// checkpoint history it gave up are gone, and what came back is the events written since. Below
+/// half the scope the three key walks would cost what they cost the first time and free next to
+/// nothing, and a full-document store would rewrite the same bytes for a few new ones; the trim
+/// waits until the scope has doubled. The absolute ceiling below still bounds a scope that grows
+/// too slowly to ever double.
+const MIN_GAIN_DIVISOR: u64 = 2;
+
+/// A scope this large is trimmed whatever its growth, so a scope that cannot shrink (or grows
+/// just under the fraction) cannot sit above this size forever.
+///
+/// The fractional rule alone leaves a document that the last trim could not shrink above the
+/// threshold permanently: the trim it skips is the only thing that would reclaim what it already
+/// dropped. Twelve mebibytes is large enough to amortise the walk over a real session and small
+/// enough that one document does not become a second database.
+const COMPACT_CEILING_BYTES: u64 = 12 << 20;
 
 /// Whether a scope of `bytes` is worth compacting, given the size the last trim left behind.
 ///
@@ -74,6 +84,9 @@ const MIN_GAIN_DIVISOR: u64 = 10;
 pub(super) fn worth_compacting(bytes: u64, after: u64) -> bool {
     if bytes <= COMPACT_THRESHOLD_BYTES {
         return false;
+    }
+    if bytes >= COMPACT_CEILING_BYTES {
+        return true;
     }
     after == 0 || bytes.saturating_sub(after) >= bytes / MIN_GAIN_DIVISOR
 }
@@ -272,12 +285,26 @@ mod tests {
         assert!(!worth_compacting(after + after / 20, after));
         assert!(!worth_compacting(after, after));
         // Shrunk since (another writer pruned, or an explicit `prune_events`): nothing to do
-        // until it grows back past a tenth again.
+        // until it grows back past twice the last result.
         assert!(!worth_compacting(after - 1, after));
-        // The rule is a tenth of the scope *now*, so it fires at ten ninths of the last result.
-        let grown = after + after / 9;
-        assert!(!worth_compacting(grown - 1, after));
+        // The rule is half of the scope *now*, so it fires at twice the last result.
+        let grown = after * 2;
+        assert!(!worth_compacting(grown - 2, after));
         assert!(worth_compacting(grown, after));
+    }
+
+    #[test]
+    fn a_scope_over_the_ceiling_is_compacted_whatever_it_grew() {
+        // The fractional rule alone would leave a scope that cannot shrink above the threshold
+        // forever; the ceiling is the escape hatch.
+        assert!(worth_compacting(
+            COMPACT_CEILING_BYTES,
+            COMPACT_CEILING_BYTES
+        ));
+        assert!(worth_compacting(
+            COMPACT_CEILING_BYTES + 1,
+            COMPACT_CEILING_BYTES
+        ));
     }
 
     #[test]
