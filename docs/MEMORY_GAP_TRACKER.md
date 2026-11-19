@@ -32,11 +32,16 @@
 | 整份 scope 解析/轮 | ~148 | **16** | = commit 次数（L1） |
 | 写字节 / 40 轮 | 42.87MB | 42.87MB | 未变，磁盘格式未改 |
 | `commit` / `peak_commit` | 31.21 / 39.54MB | 23.8–28 / 30–37MB | CRT retained pages，波动大 |
-| 累计分配/轮（**20 轮口径**） | ≈110MB | **≈84MB** | 基线修正（X14）：L22 时真实值 ≈152MB/轮（旧记 98MB 是漏计）；L24 后 108MB/轮；L25 后 1727.9MB/20 轮 ≈ 86MB/轮；**L26 后 1671.5MB/20 轮 ≈ 83.6MB/轮** |
+| 累计分配/轮（**20 轮口径**） | ≈110MB | **≈70MB** | 基线修正（X14）：L22 时真实值 ≈152MB/轮（旧记 98MB 是漏计）；L24 后 108MB/轮；L25 后 1727.9MB/20 轮 ≈ 86MB/轮；L26 后 1671.5MB/20 轮 ≈ 83.6MB/轮；**L27（B3-phase1）后 1394.0MB/20 轮 ≈ 69.7MB/轮** |
 
 健康信号：`drop(session)` 后 live → 0.07–0.09MB，无全局泄漏。
 
-### 1.3 分阶段归因（20 轮口径，L26 后，累计分配）
+### 1.3 分阶段归因（20 轮口径，L27 后，累计分配）
+
+> L27（B3-phase1）实测总计 **1394.0MB（69.7MB/轮）**，较 L26 基线 1671.5MB **−277.5MB（−13.9MB/轮，−16.6%）**，`peak_live` 11.21 → **10.71MB**。
+> 分项变化：`djournal:facts` 895.4 → **683.7MB（44.8 → 33.4/轮）**、`djournal:read` 336.6 → **264.7MB（16.8 → 12.9/轮）**、`flush:done` 202.9 → **191.8MB（10.1 → 9.4/轮）**、`acp:settle` 102.9 → 104.6MB（持平）。
+> 中间数据留档：只做 append（无 tail 缓存）时为 1949.2MB（97.5MB/轮，**净变差**）——原因是 log 非空后每个只读事务重新解析 tail（`djournal:read` 反弹到 25.5/轮）；加 `overlays` 解析缓存后才转为净收益，且写事务的 `require_state/thread/turn` 读也少了 tail 解析（`djournal:facts` 因此再降 7.5MB/轮）。
+> 下表是 L26 基线的分项与内容，用作对照。
 
 | `diag` 窗口 | 累计 | 每轮 | 内容 |
 |---|---:|---:|---|
@@ -79,7 +84,7 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 
 ---
 
-## 2. 已落地（L1–L22）
+## 2. 已落地（L1–L27）
 
 | # | 改动 | 位置 | 效果 | 验证 |
 |---|---|---|---|---|
@@ -109,6 +114,7 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 | L24 | **R1**：`settle_finished_turn_uncertainties_cached` — `SessionRuntime` 持跨轮 `JournalProjection` 缓存，每轮 `catch_up` 只 fold 新增事件；无悬挂直接返回，有悬挂才 `reconcile` 并清缓存 | `acp/src/session.rs`、`durable` 不改 | 20 轮总分配 **3043.8 → 2160.9MB（−44.1MB/轮，−29%）**；每轮全量折叠读消失；`peak_live` 8.96 → 9.90MB（缓存常驻，+0.94） | 新用例覆盖全量/命中/失效三条路径；acp 22 targets / 181 passed / 4 ignored / fmt 干净 |
 | L25 | **R2**：`RecordStore::read_transaction` + `store::txn_read` + `FileStore` 文档缓存（`stamp(len,mtime,created)` → `Arc<Vec<u8>>`，双 stamp 夹读）；**写事务绝不读缓存**，只读事务的 `put`/`schedule` 直接报错；`backend/query.rs` 8 个只读入口改 `with_session_read`（`prune_events` 保持写） | `durable/src/store.rs`、`store/file.rs`、`backend/{mod,query}.rs` | 20 轮总分配 **2160.9 → 1727.9MB（−21.7MB/轮，−20%）**；`djournal:read` 544.5 → 207.9MB；`peak_live` 9.90 → 11.21MB（缓存常驻 1.36MB） | 新用例：只读事务只读一次盘 / 写后失效 / 另一 host 写后失效 / 只读拒写；durable 108 passed（含 `three_process_test`）/ adapter 全绿 / acp 181 / harness 734 / fmt 干净 |
 | L26 | **R4**：幂等读回从提交前移到提交被拒后（新 `BackendThreadJournal::replay_head`，固有方法）；正常路径直接提交，只在 `state.journal_position` 不一致或 commit 报错时读回比对（同 id 同内容 → 返回 head；同 id 不同内容 → 报错） | `durable-adapter-agentscope/src/backend_thread_journal.rs` | 20 轮总分配 **1727.9 → 1671.5MB（−2.82MB/轮，−3.3%）**；`djournal:encode` 9.3MB/轮 → **0**；`jreads` 15 → **3**；`sbytes` 21,287,416 不变 | 反向验证：短路 `replay_head` 后 `a_stale_journal_position_is_rejected`（`idempotent replay` 断言）与 `tool_facts_test` replay 用例失败；adapter 66 / acp 181 / harness 734 / fmt 干净 |
+| L27 | **B3-phase1**：`FileStore` 写路径改 append-only——文档作基线，每次提交向 `scopes/<digest>.log` 追加一行 `LogDelta`（`{"puts":{part:value},"removes":[part]}`，payload 仍按 `BLOB_THRESHOLD` 外置），不再整份重写；读侧 `Overlay` 叠加（`read`/`keys`/`read_parts`/`scope_parts` 均「tail 优先、文档 `pick_parts` 兜底」）；log ≥ `LOG_COMPACT_BYTES`（256KB）时 `compact_scope` 折成整份文档；**首次提交即建文档**（否则读侧永远走 overlay-only）；新增 `overlays` 解析缓存（`log_stamp` 校验、`DOCUMENT_SCOPES=4`）；`scope_bytes` = 文档 + tail | `durable/src/store/file.rs` | 20 轮 **1671.5 → 1394.0MB（−13.9MB/轮，−16.6%）**；`djournal:facts` 895.4→**683.7MB**（44.8→33.4/轮）、`djournal:read` 336.6→**264.7MB**（16.8→12.9/轮）、`flush:done` 202.9→**191.8MB**、`acp:settle` 持平；`peak_live` 11.21→**10.71MB**。中间态留档：无 tail 缓存时 1949.2MB（97.5/轮，净变差） | 新增 4 用例（写后读 / 尾部半行容错 / 压实后一致 / 重开进程一致）；`compaction_test` 的字节曲线断言按新语义重写（`root_record` 走 store 读、trim 判定用 `compacted_bytes`、`positions.len()==1`）；`frame_read_traffic_test` 恢复（首次提交建文档）；durable 74 lib + 20 targets / adapter 14 targets / acp 21 targets 全绿 / fmt 干净 |
 
 > L22 的三条前提（改动前已核实，**别改坏**）：`backend/commit.rs` 的 commit 不续租、不改 `thread.epoch`、不清 `turn.owner`（普通 Running 批次）；全仓库只有 `recorder::flush` 消费 `commit()` 返回值且只取 `head.seq`。
 
@@ -129,9 +135,8 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 
 #### R8 —— B3：单文档全量重写 → append-only log + 周期快照
 
-- **设计**：`scopes/<digest>.snapshot.json` + `scopes/<digest>.log`；commit 只追加 `{generation, ops:[{part, bytes|null}], crc}` + fsync（O(staged)）；`keys` 用内存 `BTreeSet`；log > `max(4MB, snapshot/4)` 时重写快照 → rename → truncate；崩溃靠 `generation` 识别旧记录；`roll_out`/`collect_blobs` 挪到快照轮转。
-- **收益**：**60–70MB/轮（−60%~70%）**，唯一数量级方案。
-- **代价**：`base_raw`/`scope_parts`/`pick_from_cache`/`roll_out`/`collect_blobs`/`scope_bytes`/`read_parts` 全重写；崩溃一致性测试矩阵扩张（log 半写 / 快照替换中途 / 两代 log 共存）；`three_process_test` 跨进程 tail 语义。工程量为 L18+L19+L13 总和再加码。
+- **状态（2026-11-19）**：**phase1 已落地为 L27**。设计简化为「文档作基线 + `scopes/<digest>.log` 追加 delta + 读侧 overlay + 256KB 压实」；实测 **−13.9MB/轮（−16.6%）**，`peak_live` 11.21→10.71MB。原估（60–70MB/轮）**偏高**：写事务的成本主体是「读 + 扫描整份文档」（`require_state/thread/turn` → `pick_parts`），不是写回，换掉写回只省了一部分。
+- **剩余（phase2，待定）**：`djournal:facts` 仍占 **33.4MB/轮**（16 次写事务 × 每次扫描 1.36MB 文档/键）——要再降只能让读不再扫整份文档：内存键索引 + 快照（`.snapshot`/`.snap.meta`，`formatVersion=2`）+ `scopes/*.json` 迁移 + 崩溃恢复矩阵 7 项；预期上限 ≈30–40MB/轮，工程量大。
 - **前置**：独立工作树，先写崩溃恢复测试。
 
 ### 3.3 已量化并关闭（原 R9–R15，结论留档）
@@ -194,6 +199,7 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 
 | 日期 | 内容 |
 |---|---|
+| 2026-11-19 | **B3-phase1 落地（L27）**：`FileStore` 写路径改 append-only（文档 + `scopes/<digest>.log` 追加 `LogDelta`，读侧 `Overlay` 叠加，256KB 压实，首次提交建文档，tail 解析缓存）；`scope_bytes` = 文档 + tail。20 轮实测 **1671.5 → 1394.0MB（−13.9MB/轮，−16.6%）**，`djournal:facts` 44.8→**33.4/轮**、`djournal:read` 16.8→**12.9/轮**、`peak_live` 11.21→**10.71MB**。关键发现：只做 append 时为 1949.2MB（97.5/轮，**净变差**，`djournal:read` 反弹到 25.5/轮）——tail 解析必须缓存；加缓存后写事务也少解析 tail（`djournal:facts` 再降 7.5/轮）。磁盘格式未变（`sbytes` 不再是单轮 1.06MB 的整份重写，改为 delta + 周期压实）。验证：durable 74 lib + 20 targets / adapter 14 targets / acp 21 targets / fmt 干净 |
 | 2026-11-19 | **序列化字节一致性加固**：新增 `recorder.rs::the_structured_payloads_serialize_exactly_as_the_json_macro_did`，对 `context/replaced`、`message/<role>`、`tool/requested`、`input/applied`、`state/changed` 五个结构化 payload 与旧 `json!` 的 `Value::to_string()` 逐字节对拍（反向验证：调换 `ToolRequested` 字段声明顺序 → 用例立即失败）。同时发现并修复**构建态字节漂移**：`cargo test -p agentscope-core` 的依赖图未启用 `preserve_order`，`Value::Object` 退回 `BTreeMap`（字母序），而全量构建经 `rag`/`bson` 联启用了它（插入序）——同一份代码会因构建配置写出不同 journal 字节；已在 workspace `serde_json` 显式加 `preserve_order`（与已测 ACP 基线一致，`sbytes` 21,287,416 不变）。验证：core 574 passed / 3 ignored、harness 734、durable+adapter 20 targets 174、acp 21 targets 181 + 4 ignored、`cargo fmt` 干净 |
 | 2026-11-19 | **R4 落地（L26）**：幂等读回从提交前移到提交被拒后（`BackendThreadJournal::replay_head`，固有方法）；正常路径直接提交，只在 `state.journal_position` 不一致或 commit 报错时读回比对（同 id 同内容 → 返回 head，同 id 不同内容 → 报错）。20 轮实测 **1727.9 → 1671.5MB（−2.82MB/轮，−3.3%）**，`djournal:encode` 9.3MB/轮 → **0**、`jreads` 15→**3**；`djournal:facts`、`sbytes` 21,287,416、`peak_live` 11.21MB 均不变。反向验证：短路 `replay_head` → `a_stale_journal_position_is_rejected`（`idempotent replay` 断言）与 `tool_facts_test` replay 用例失败。验证：adapter 66 / acp 181 / harness 734 / `cargo check --workspace` EXIT=0 / fmt 干净 |
 | 2026-11-19 | **R3 实测后回退（X15）**：`JournalAppend.entries: Vec<Box<RawValue>>` + `Txn::put_raw` + `Staged` + `digest_head`/`hash_texts` 全链路实现并通过测试（adapter 66 / durable 108、`sbytes` 不变），但 20 轮实测 **1727.9 → 1748.7MB（+1MB/轮）**：省掉的 `Value` 树被 `to_string`+`from_string` 的整份文本复制抵消。全部反向编辑已回退，回退后 `totalMB=1727.9` 与 R2 逐项一致。R5/R6 同时量化关闭：R5 归 R8、R6 只是 `fs::metadata` |
