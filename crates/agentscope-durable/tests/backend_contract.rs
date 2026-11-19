@@ -11,8 +11,28 @@ fn binding() -> ThreadBinding {
     ThreadBinding::new("harness-a", "def-1", "state-1").expect("binding")
 }
 
+/// The store every contract test runs against.
+///
+/// `DURABLE_CONTRACT_STORE=sqlite` runs the same assertions against a SQLite database instead of
+/// the in-memory map, which is how a new `RecordStore` proves it keeps every invariant.
+fn contract_backend() -> TxnBackend {
+    match std::env::var("DURABLE_CONTRACT_STORE").as_deref() {
+        Ok("sqlite") => {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "agentscope-sqlite-contract-{}-{id}.db",
+                std::process::id()
+            ));
+            let store = agentscope_durable_sqlite::SqliteStore::open(path).expect("sqlite store");
+            TxnBackend::with_store(std::sync::Arc::new(store))
+        }
+        _ => TxnBackend::in_memory(),
+    }
+}
+
 async fn created() -> (TxnBackend, ThreadKey) {
-    let backend = TxnBackend::in_memory();
+    let backend = contract_backend();
     let key = SessionKey::new("ns", "s1").expect("session key");
     backend
         .create(SessionSpec {
@@ -151,7 +171,7 @@ async fn a_waiting_turn_is_only_ready_after_its_signal_arrives() {
 /// found the thread again — a silent stall, not an error.
 #[tokio::test]
 async fn sessions_of_one_harness_each_keep_their_readiness_record() {
-    let backend = TxnBackend::in_memory();
+    let backend = contract_backend();
     let selector = HarnessSelector::all("harness-a").expect("selector");
     for session in ["s1", "s2"] {
         let key = SessionKey::new("ns", session).expect("session key");

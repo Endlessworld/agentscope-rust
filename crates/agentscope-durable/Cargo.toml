@@ -22,6 +22,10 @@ sha2.workspace = true
 # dev-dependency stops every dependent crate from pulling the runtime in through this one.
 [dev-dependencies]
 tokio.workspace = true
+# The store-model probe writes a throwaway database; production code does not use it.
+rusqlite.workspace = true
+# The contract test can run every invariant against SQLite by setting DURABLE_CONTRACT_STORE=sqlite.
+agentscope-durable-sqlite = { path = "../agentscope-durable-sqlite" }
 
 # Liveness of the process that owns a scope lock file.
 [target.'cfg(unix)'.dependencies]

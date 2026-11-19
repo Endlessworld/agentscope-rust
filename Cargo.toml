@@ -10,6 +10,7 @@ members = [
     "crates/agentscope-durable-adapter-agentscope",
     "crates/agentscope-durable-worker",
     "crates/agentscope-durable-jdbc",
+    "crates/agentscope-durable-sqlite",
     "crates/agentscope-durable-objects",
     "crates/agentscope-durable-http",
     "crates/agentscope-durable-mcp",

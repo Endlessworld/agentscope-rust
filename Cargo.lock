@@ -120,8 +120,10 @@ dependencies = [
 name = "agentscope-durable"
 version = "0.2.0"
 dependencies = [
+ "agentscope-durable-sqlite",
  "async-trait",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -203,6 +205,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentscope-durable-sqlite"
+version = "0.2.0"
+dependencies = [
+ "agentscope-durable",
+ "rusqlite",
+ "serde_json",
+]
+
+[[package]]
 name = "agentscope-durable-worker"
 version = "0.2.0"
 dependencies = [
@@ -251,6 +262,7 @@ dependencies = [
  "agentscope-core",
  "agentscope-durable",
  "agentscope-durable-adapter-agentscope",
+ "agentscope-durable-sqlite",
  "agentscope-extensions-model",
  "agentscope-harness",
  "async-trait",
