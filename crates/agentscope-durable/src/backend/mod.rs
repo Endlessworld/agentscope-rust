@@ -1174,3 +1174,84 @@ mod queue_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    /// Pruning drops the event but keeps its id marker: a replay of the same commit must stay a
+    /// no-op instead of appending the pruned event again under a new sequence.
+    #[test]
+    fn a_pruned_event_keeps_its_id_marker_so_a_replay_cannot_resurrect_it() -> Result<()> {
+        let store = InMemoryStore::new();
+        let session = SessionKey::new("ns", "prune-event")?;
+        identity::create(
+            &store,
+            SessionSpec {
+                key: session.clone(),
+                primary_binding: ThreadBinding::new("harness-a", "def-1", "state-1")?,
+                metadata: Value::Null,
+            },
+        )?;
+        let key = ThreadKey::new(session.clone(), "main")?;
+        let scope = session.storage_key();
+        let sequence = crate::store::txn(&store, &scope, |txn: &mut dyn Txn| -> Result<u64> {
+            let mut state = require_state(txn)?;
+            let base = state.sequence;
+            append_event(
+                txn,
+                &mut state,
+                &key,
+                "turn-1",
+                None,
+                None,
+                "event-1",
+                "test",
+                Value::Null,
+            )?;
+            let sequence = state.sequence;
+            assert_eq!(sequence, base + 1);
+            let dropped = compact::prune(txn, &mut state, 0)?;
+            assert!(dropped > 0, "the prune dropped the event");
+            assert!(load_json::<PublicEvent>(txn, &event_part(sequence))?.is_none());
+            assert!(
+                load_json::<String>(txn, &event_id_part("event-1"))?.is_some(),
+                "the id marker outlives the pruned event"
+            );
+            // Replaying the same commit is a no-op: the marker still answers for the event.
+            append_event(
+                txn,
+                &mut state,
+                &key,
+                "turn-1",
+                None,
+                None,
+                "event-1",
+                "test",
+                Value::Null,
+            )?;
+            assert_eq!(
+                state.sequence, sequence,
+                "the pruned event is not appended again"
+            );
+            assert!(load_json::<PublicEvent>(txn, &event_part(sequence))?.is_none());
+            // A different identity under the same id is still rejected.
+            let conflict = append_event(
+                txn,
+                &mut state,
+                &key,
+                "turn-1",
+                None,
+                None,
+                "event-1",
+                "test",
+                Value::String("changed".to_string()),
+            );
+            assert!(conflict.is_err(), "the marker still guards the identity");
+            save_state(txn, &state)?;
+            Ok(state.sequence)
+        })?;
+        assert!(sequence > 0);
+        Ok(())
+    }
+}

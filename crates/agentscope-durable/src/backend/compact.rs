@@ -12,11 +12,13 @@
 //! * **Checkpoint history records.** They exist so a caller can read an older position; after a
 //!   compaction only the current position is kept, which is the only one recovery ever asks for.
 //! * **Consumed public events.** `prune_events` drops the oldest ones and advances
-//!   `retained_after`, the watermark `events()` already refuses a cursor below.
+//!   `retained_after`, the watermark `events()` already refuses a cursor below. The per-event
+//!   `event-id` digest marker stays: it is the replay's idempotency record.
 //!
 //! What is deliberately *never* dropped: journal entries that name a tool outcome (dispatch,
 //! result, uncertainty), message entries a transcript is rebuilt from, baseline/restore entries,
-//! and any event a client has not been told a replacement for.
+//! any event a client has not been told a replacement for, and the `event-id` digest marker of
+//! every committed event (the replay's idempotency record).
 //!
 //! This is also a hard boundary for model prompt caching. The messages rebuilt from those
 //! entries are the exact prefix sent on every later model call; rewriting a `tool/result` into a
@@ -229,10 +231,10 @@ fn drop_history(
 
 /// Drops every public event outside the newest `keep` and advances the watermark.
 ///
-/// The `event-id` marker of a dropped event goes with it. It exists to make a *replayed* commit
-/// idempotent, and a marker without its event can only do the opposite: the replay would append
-/// the dropped event again under a new sequence. Keeping the markers instead made the session
-/// document grow by one key per event forever, which is the growth pruning exists to stop.
+/// The `event-id` marker of a dropped event **stays**. It is the only record that a replayed
+/// commit was already applied: dropping it would let the replay append the pruned event again
+/// under a new sequence, resurrecting data the retention just removed. The marker is one small
+/// digest per committed event; keeping it is the price of replay idempotency.
 pub(super) fn prune(txn: &mut dyn Txn, state: &mut SessionState, keep: u64) -> Result<u64> {
     let floor = state.sequence.saturating_sub(keep);
     if floor <= state.retained_after {
@@ -250,9 +252,6 @@ pub(super) fn prune(txn: &mut dyn Txn, state: &mut SessionState, keep: u64) -> R
         if sequence > floor {
             // Sequence order is key order: nothing after this one is prunable either.
             return Ok(false);
-        }
-        if let Some(event) = load_json::<PublicEvent>(txn, part)? {
-            txn.put(&event_id_part(&event.event_id), None)?;
         }
         txn.put(part, None)?;
         dropped += 1;

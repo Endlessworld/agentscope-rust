@@ -336,7 +336,8 @@ pub(super) fn events(
 /// Drops the oldest public events, keeping the newest `keep_newest`.
 ///
 /// The watermark is what makes this safe to expose: a client that asks for a cursor below it is
-/// told to load a snapshot instead of being handed a silent gap.
+/// told to load a snapshot instead of being handed a silent gap. The `event-id` markers stay, so
+/// replaying a pruned commit is a no-op rather than re-appending the event.
 pub(super) fn prune_events(
     store: &dyn RecordStore,
     session: &SessionKey,
