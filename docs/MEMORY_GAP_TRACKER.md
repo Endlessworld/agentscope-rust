@@ -2,7 +2,7 @@
 
 > 跟踪 AgentScope durable 运行时在 ACP harness 下的堆分配与峰值内存（生产 RSS 曾从 <25MB 涨到约 184MB）。
 > 本文档是**单一事实来源**：测量口径、已落地项、剩余优化点、已否决项。
-> 最后更新：2026-11-20（`feature/sqlite`；L1–L29）。
+> 最后更新：2026-11-20（`feature/sqlite`；L1–L30）。
 
 ## 0. 阅读约定
 
@@ -109,9 +109,25 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 
 > 8MB 兜底：`djournal:facts` 504.7MB / 磁盘 9.36MB；12MB 兜底：473.9MB / 10.79MB；完全禁用压实：329MB / 18.15MB。FileStore 同策略：`djournal:facts` 625.6→**557.7MB（−10.9%）**、磁盘 23.77→**24.92MB（+4.8%）**、`peak_live` 10.85→**10.37MB**。策略同时修复 >8MB 但增长 <10% 的 scope 永不 trim 的老问题。
 
+**Checkpoint 间隔（L30，20 轮）**
+
+| 指标 | 逐轮 full checkpoint | 首帧 + 15MB 间隔 | 变化 |
+|---|---:|---:|---:|
+| SQLite `djournal:facts` | 473.9MB | **82.8MB** | −82.5% |
+| SQLite `djournal:read` | 122.7MB | **47.0MB** | −61.7% |
+| SQLite `flush:done` | 94.9MB | **41.0MB** | −56.8% |
+| SQLite `acp:settle` | 92.8MB | **27.8MB** | −70.0% |
+| SQLite 磁盘 | 10.79MB | **4.76MB** | −55.9% |
+| SQLite `peak_live` | 3.84MB | **4.37MB** | +0.53MB |
+| FileStore `djournal:facts` | 557.7MB | **322.1MB** | −42.2% |
+| FileStore 磁盘 | 24.92MB | **4.23MB** | −83.0% |
+| FileStore `peak_live` | 10.37MB | **6.58MB** | −36.5% |
+
+> 探针「跳过全部 checkpoint」为 `djournal:facts` 110.6MB / `peak_live` 6.78MB；间隔版（首帧 + 15MB）反而更低（82.8MB / 4.37MB），因为不再反复写入随后被回收的 full checkpoint。间隔常量 `CHECKPOINT_INTERVAL_BYTES=15MB`，由 `RecorderState.bytes_since_checkpoint` 计数。
+
 ---
 
-## 2. 已落地（L1–L29）
+## 2. 已落地（L1–L30）
 
 | # | 改动 | 位置 | 效果 | 验证 |
 |---|---|---|---|---|
@@ -146,6 +162,8 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 
 | L29 | **压实策略**：`MIN_GAIN_DIVISOR` 10→2（当前体积翻倍才 trim）+ `COMPACT_CEILING_BYTES=12MB` 绝对兜底 | `durable/src/backend/compact.rs` | SQLite 20 轮 `djournal:facts` 820.5→**473.9MB（−42.3%）**、DB 8.66→**10.79MB**、`peak_live` 3.84；FileStore `djournal:facts` 625.6→**557.7MB（−10.9%）**、磁盘 23.77→24.92MB、`peak_live` 10.85→10.37；8MB 兜底为 504.7MB/9.36MB（12MB 更优）；修复 >8MB 但增长 <10% 的 scope 永不 trim | durable 77 lib / 20 targets、sqlite 5、契约 11、acp lib 138、acp live 20 轮 / fmt 干净 |
 
+| L30 | **Checkpoint 间隔**：`CHECKPOINT_INTERVAL_BYTES=15MB`；首次 capture 与每 15MB journal payload 写一次 full `state/checkpoint`，其余只写 message/tool/changed 事件；`RecorderState.bytes_since_checkpoint` 计 payload 字节，写后清零；新增 `checkpoint:deferred` | `core/journal/recorder.rs` | SQLite 20 轮 `djournal:facts` 473.9→**82.8MB（−82.5%）**、DB 10.79→**4.76MB**、`peak_live` 3.84→4.37、7.05→**2.69s**；FileStore `djournal:facts` 557.7→**322.1MB（−42.2%）**、磁盘 24.92→**4.23MB（−83%）**、`peak_live` 10.37→**6.58MB**、9.99s；探针 skip-all 110.6MB/6.78MB 已被间隔版超过 | core 574 / harness 734 / durable 77 lib + 20 targets / sqlite 5 / 契约 11 / acp lib 138 / acp live 20 轮 / fmt 干净 |
+
 > L22 的三条前提（改动前已核实，**别改坏**）：`backend/commit.rs` 的 commit 不续租、不改 `thread.epoch`、不清 `turn.owner`（普通 Running 批次）；全仓库只有 `recorder::flush` 消费 `commit()` 返回值且只取 `head.seq`。
 
 ---
@@ -158,6 +176,8 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 
 ### 3.2 需批准（动 wire / 跨语言 / 大工程）
 
+> R19 已落地为 L30（checkpoint 间隔）；以下 R7/R8 仍需批准。
+
 #### R7 —— B2b：journal `payload` 去掉一层 `payloadJson` 字符串转义
 
 - **收益**：+2–3MB/轮。
@@ -169,11 +189,11 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 - **剩余（2026-11-20）**：SQLite `djournal:facts` 仍占 **473.9MB/20 轮 ≈23.7MB/轮**（FileStore 557.7MB/20 轮 ≈27.9MB/轮）；主体是 `state/checkpoint` 全量 payload（见 R19）。磁盘格式（快照 + `formatVersion`）仍是未动选项。
 - **前置**：独立工作树，先写崩溃恢复测试。
 
-#### R19 —— checkpoint I/P 帧（信息论方案）
+#### R19 —— checkpoint I/P 帧（已落地为 L30：间隔而非 diff）
 
-- **收益**：`djournal:facts` 剩余 473.9MB（SQLite）/ 557.7MB（FileStore）的主体是 `state/checkpoint` 全量 payload（每轮一份完整 state，约 254KB）；改成 I 帧（首个完整 state）+ P 帧（与上一帧的 diff），快照间隔由 `S* ≈ sqrt(2·B·R)` 推导（当前 B≈2.9MB、R≈40KB/轮 ⇒ S*≈15MB ≈ 数百轮），可把每轮 checkpoint 从全量降到增量。
-- **代价**：动 core `JournalEvent`/`state/checkpoint` 折叠 + `JournalProjection` 恢复路径 + Java wire（`stateJson` 语义）；需要先做字节预算与「P 帧丢失/乱序/重放」恢复矩阵。
-- **前置**：先补 `state/checkpoint` 的字节等价与恢复测试；不要动 `migration/baseline` / `state/restored` 的「唯一副本」语义。
+- **结果**：`CHECKPOINT_INTERVAL_BYTES=15MB`；首次 capture 与每 15MB 写一次 full `state/checkpoint`，其余只写事件。SQLite 20 轮 `djournal:facts` **473.9 → 82.8MB（−82.5%）**、DB **10.79 → 4.76MB**、`peak_live` 3.84 → 4.37MB；FileStore **557.7 → 322.1MB（−42.2%）**、磁盘 **24.92 → 4.23MB（−83%）**、`peak_live` 10.37 → 6.58MB。
+- **未做**：per-turn P-frame diff。事件本身就是 P 帧；full checkpoint 只在间隔写，diff 不再必要。
+- **剩余**：SQLite `djournal:facts` 82.8MB/20 轮（≈4.1MB/轮）+ `djournal:read` 47.0MB + `flush:done` 41.0MB；下一步是 16 次写事务合并（1–2 次/轮）与 `prune` 保留幂等标记，而不是 state diff。
 
 ### 3.3 已量化并关闭（原 R9–R15，结论留档）
 
@@ -239,6 +259,7 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 
 | 日期 | 内容 |
 |---|---|
+| 2026-11-20 | **Checkpoint 间隔（L30）**：`CHECKPOINT_INTERVAL_BYTES=15MB`；首次 capture 与每 15MB 写一次 full `state/checkpoint`，其余只写事件；`RecorderState.bytes_since_checkpoint` 计 payload 字节，写后清零；新增 `checkpoint:deferred`。20 轮 SQLite `djournal:facts` **473.9→82.8MB（−82.5%）**、DB **10.79→4.76MB**、`peak_live` 3.84→4.37、**7.05→2.69s**；FileStore **557.7→322.1MB（−42.2%）**、磁盘 **24.92→4.23MB（−83%）**、`peak_live` 10.37→6.58、9.99s。探针 skip-all 110.6MB/6.78MB，间隔版更优。验证：core 574 / harness 734 / durable 77 lib + 20 targets / sqlite 5 / 契约 11 / acp lib 138 / acp live 20 轮 / fmt 干净 |
 | 2026-11-20 | **SQLite 后端（feature/sqlite）**：新增 `agentscope-durable-sqlite`（一行一条记录、WAL、`BEGIN IMMEDIATE` 写 / `DEFERRED` 读、revision CAS、前缀有界 `keys`、`json_each` 批量读、只读拒写、`prepare_cached`）；ACP 可选 feature `durable-sqlite`（默认关闭；启用即默认 SQLite，`AGENTSCOPE_DURABLE_STORE=file` 回退；`durable.db`）；20 轮 **1180.8MB / 58.97MB/轮 / peak 3.84MB / 7.05s / 磁盘 8.27MB** vs FileStore **1350.3MB / 67.51 / 10.85 / 14.18 / 23.77**（总分配 −12.6%、峰值 −65%、耗时 −50%、磁盘 −65%）。`shared_across_hosts=false`。验证：durable 77 lib / 20 targets、sqlite 5、契约 11、acp lib 138、acp live 20 轮 / fmt 干净 |
 | 2026-11-20 | **压实策略（L29）**：`MIN_GAIN_DIVISOR` 10→2（当前体积翻倍才 trim）+ 12MB 绝对兜底；SQLite `djournal:facts` 820.5→473.9MB、DB 8.66→10.79MB；FileStore 625.6→557.7MB、磁盘 23.77→24.92MB；8MB 兜底 504.7MB/9.36MB，12MB 更优；修复 >8MB 但增长 <10% 的 scope 永不 trim。中性回退：SQLite blob 层（X17）、增量 `scope_bytes` 列（X18） |
 | 2026-11-19 | **B3-phase2 落地（L28）**：文档字节索引 `DocumentIndex`（`&RawValue` 零拷贝得 `part → (start,end)`，范围校验 + `complete` 兜底），写事务内一次构建、多次 `get`/`keys` 切片，**只读事务不建索引**（1–2 条记录时建索负收益）。20 轮实测 **1394.0 → 1350.3MB（−2.19MB/轮，−3.1%）**，`djournal:facts` 33.4→**31.3/轮**，`djournal:read`/`acp:settle` 持平；全量索引（含只读）为 1391.6MB、`djournal:read` 反弹 14.45/轮（X16）。新增 2 用例（索引逐值对拍 + 一次事务多记录）。验证：durable 76 lib / 20 targets / adapter 14 / acp 21 / fmt 干净 |
