@@ -123,13 +123,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Fixed message count: lets the same workload be compared across formats.
         for index in 0..seeded_override {
             state
-                .context
+                .context_mut()
                 .push(Msg::user(format!("probe-{index}-{}", "y".repeat(8 * 1024))));
             seeded += 1;
         }
     } else {
         while state.to_json()?.len() < target {
-            state.context.push(Msg::user(format!(
+            state.context_mut().push(Msg::user(format!(
                 "probe-{seeded}-{}",
                 "y".repeat(8 * 1024)
             )));
@@ -172,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A real turn appends to the context and then checkpoints through `capture_state`
             // (the same entry the checkpoint middleware uses).
             state
-                .context
+                .context_mut()
                 .push(Msg::user(format!("turn-{turn}-{}", "z".repeat(4 * 1024))));
             recorder.capture_state(&state, "probe")?;
             let phase_record = TOTAL.load(Ordering::Relaxed);
