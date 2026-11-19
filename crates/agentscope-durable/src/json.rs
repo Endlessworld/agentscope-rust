@@ -75,12 +75,15 @@ pub fn hash_legacy(value: &Value) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    hex_of(Sha256::digest(bytes))
+}
+
+fn hex_of(digest: impl AsRef<[u8]>) -> String {
     const HEX: [char; 16] = [
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
     ];
-    let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(64);
-    for byte in digest {
+    for byte in digest.as_ref() {
         hex.push(HEX[(byte >> 4) as usize]);
         hex.push(HEX[(byte & 0xf) as usize]);
     }

@@ -689,12 +689,8 @@ pub(super) fn journal(
             &thread.journal_branch,
             after,
         );
-        let mut entries = Vec::new();
-        for part in txn.keys(&prefix, Some(&cursor), limit)? {
-            if let Some(entry) = txn.get(&part)? {
-                entries.push(entry);
-            }
-        }
+        let parts = txn.keys(&prefix, Some(&cursor), limit)?;
+        let entries: Vec<Value> = txn.get_all(&parts)?.into_iter().flatten().collect();
         crate::traffic::count_journal_read(entries.len());
         Ok(entries)
     })

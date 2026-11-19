@@ -13,12 +13,31 @@ use serde_json::Value;
 
 use crate::Result;
 
+/// The identity of one document file: `(len, modified, created)`.
+///
+/// A document is replaced by an atomic rename of a freshly written temporary file, so all three
+/// change on every write; serving a stale read would take two writes that leave the same length
+/// and both timestamps.
+pub(crate) type DocumentStamp = (
+    u64,
+    Option<std::time::SystemTime>,
+    Option<std::time::SystemTime>,
+);
+
 /// A single session-scoped transaction. `now()` is the only time source.
 pub trait Txn {
     fn now(&self) -> i64;
     fn get(&self, part: &str) -> Result<Option<Value>>;
     fn put(&mut self, part: &str, value: Option<Value>) -> Result<()>;
     fn keys(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>>;
+    /// The values of `parts` at once, for a caller reading a page of records.
+    ///
+    /// The default reads them one by one; a store that keeps a scope as one document overrides
+    /// this so a whole page is picked in a single scan instead of one scan per record. Reading a
+    /// journal page whose length grows with the history is what makes that difference matter.
+    fn get_all(&self, parts: &[String]) -> Result<Vec<Option<Value>>> {
+        parts.iter().map(|part| self.get(part)).collect()
+    }
     /// `ready_at < 0` removes the entry.
     fn schedule(
         &mut self,
@@ -46,6 +65,30 @@ pub trait RecordStore: Send + Sync {
         scope: &str,
         work: &mut dyn FnMut(&mut dyn Txn) -> Result<()>,
     ) -> Result<()>;
+
+    /// Runs `work` in a transaction that must not write.
+    ///
+    /// Same atomicity and the same exclusion as [`RecordStore::transaction`]: the scope lock is
+    /// still taken, so a reader sees no half-written document and a writer cannot slip a commit
+    /// into the middle of a read. The difference is that a store which keeps a scope as one
+    /// document may answer from the bytes it read the previous time, validated against the file's
+    /// identity, instead of reading the file again — a journal fold reads the same document
+    /// several times per tick and its reads are all read-only.
+    ///
+    /// The closure must not call [`Txn::put`] or [`Txn::schedule`]. A document served from a
+    /// cache is not a safe base to rewrite: another host may have replaced it in between, and two
+    /// writes with the same length and timestamps would make the stale base invisible. The file
+    /// store rejects writes here rather than risk it.
+    ///
+    /// The default is [`RecordStore::transaction`]: a store whose records already live apart has
+    /// nothing to cache.
+    fn read_transaction(
+        &self,
+        scope: &str,
+        work: &mut dyn FnMut(&mut dyn Txn) -> Result<()>,
+    ) -> Result<()> {
+        self.transaction(scope, work)
+    }
 
     /// Entries that are due at or before `now`, ordered by readiness.
     fn ready(&self, queue: &str, now: i64, limit: usize) -> Result<Vec<WorkItem>>;
@@ -169,6 +212,25 @@ pub fn txn<T>(
     scope: &str,
     work: impl FnOnce(&mut dyn Txn) -> Result<T>,
 ) -> Result<T> {
+    run_once(work, |runner| store.transaction(scope, runner))
+}
+
+/// Runs `work` in a read-only transaction and returns its value.
+///
+/// See [`RecordStore::read_transaction`]: the closure must not write, and a store may answer from
+/// the document it read the previous time instead of reading the file again.
+pub fn txn_read<T>(
+    store: &dyn RecordStore,
+    scope: &str,
+    work: impl FnOnce(&mut dyn Txn) -> Result<T>,
+) -> Result<T> {
+    run_once(work, |runner| store.read_transaction(scope, runner))
+}
+
+fn run_once<T>(
+    work: impl FnOnce(&mut dyn Txn) -> Result<T>,
+    run: impl FnOnce(&mut dyn FnMut(&mut dyn Txn) -> Result<()>) -> Result<()>,
+) -> Result<T> {
     let mut slot: Option<T> = None;
     let mut pending = Some(work);
     let mut runner = |transaction: &mut dyn Txn| -> Result<()> {
@@ -178,18 +240,18 @@ pub fn txn<T>(
         slot = Some(work(transaction)?);
         Ok(())
     };
-    store.transaction(scope, &mut runner)?;
+    run(&mut runner)?;
     match slot {
         Some(value) => Ok(value),
         None => Err(crate::DurableError::unavailable("transaction did not run")),
     }
 }
 
-/// Read-only convenience over [`txn`] for call sites that need several parts at once.
+/// Read-only convenience over [`txn_read`] for call sites that need several parts at once.
 pub fn read<T>(
     store: &dyn RecordStore,
     scope: &str,
     work: impl FnOnce(&mut dyn Txn) -> Result<T>,
 ) -> Result<T> {
-    txn(store, scope, work)
+    txn_read(store, scope, work)
 }

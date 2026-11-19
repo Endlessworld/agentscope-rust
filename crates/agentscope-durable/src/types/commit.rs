@@ -144,6 +144,7 @@ pub struct Snapshot {
 #[serde(rename_all = "camelCase")]
 pub struct JournalAppend {
     pub expected_position: u64,
+    /// Entries exactly as the journal produced them.
     #[serde(default)]
     pub entries: Vec<Value>,
 }

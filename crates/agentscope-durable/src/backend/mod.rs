@@ -152,6 +152,18 @@ pub(super) fn with_session<T>(
     crate::store::txn(store, &session.storage_key(), work)
 }
 
+/// Runs `work` in a read-only transaction of one session scope.
+///
+/// Every read-side query is a pure read, so the store may answer from the document it read the
+/// previous time instead of reading the file again; see [`RecordStore::read_transaction`].
+pub(super) fn with_session_read<T>(
+    store: &dyn RecordStore,
+    session: &SessionKey,
+    work: impl FnOnce(&mut dyn Txn) -> Result<T>,
+) -> Result<T> {
+    crate::store::txn_read(store, &session.storage_key(), work)
+}
+
 pub(super) fn store_json<T: Serialize>(txn: &mut dyn Txn, part: &str, value: &T) -> Result<()> {
     txn.put(part, Some(serde_json::to_value(value)?))
 }

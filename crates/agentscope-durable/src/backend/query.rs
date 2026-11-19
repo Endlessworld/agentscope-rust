@@ -6,7 +6,7 @@ use super::*;
 use crate::backend::compact;
 
 pub(super) fn turn(store: &dyn RecordStore, thread: &ThreadKey, turn_id: &str) -> Result<TurnView> {
-    with_session(store, &thread.session, |txn| {
+    with_session_read(store, &thread.session, |txn| {
         let turn = require_turn(txn, turn_id)?;
         if turn.thread_id != thread.thread_id {
             return Err(DurableError::not_found(
@@ -19,7 +19,7 @@ pub(super) fn turn(store: &dyn RecordStore, thread: &ThreadKey, turn_id: &str) -
 
 /// Writer-side view of a thread: journal position, fence state and the active turn.
 pub(super) fn thread_state(store: &dyn RecordStore, thread: &ThreadKey) -> Result<ThreadStateView> {
-    with_session(store, &thread.session, |txn| {
+    with_session_read(store, &thread.session, |txn| {
         let data = require_thread(txn, thread)?;
         let current = current_turn(txn, &data)?;
         Ok(ThreadStateView {
@@ -44,7 +44,7 @@ pub(super) fn read_journal(
     limit: usize,
 ) -> Result<Vec<Value>> {
     let limit = clamp_limit(limit)?;
-    with_session(store, &thread.session, |txn| {
+    with_session_read(store, &thread.session, |txn| {
         let data = require_thread(txn, thread)?;
         if after > data.journal_position {
             return Ok(Vec::new());
@@ -56,12 +56,8 @@ pub(super) fn read_journal(
         // page of a long journal re-walked the whole prefix — quadratic reads on the one path a
         // tick takes before it can decide anything.
         let cursor = journal_part(&thread.thread_id, &data.journal_branch, after);
-        let mut entries = Vec::new();
-        for part in txn.keys(&prefix, Some(&cursor), limit)? {
-            if let Some(entry) = txn.get(&part)? {
-                entries.push(entry);
-            }
-        }
+        let parts = txn.keys(&prefix, Some(&cursor), limit)?;
+        let entries: Vec<Value> = txn.get_all(&parts)?.into_iter().flatten().collect();
         crate::traffic::count_journal_read(entries.len());
         Ok(entries)
     })
@@ -74,7 +70,7 @@ pub(super) fn turns(
     limit: usize,
 ) -> Result<TurnPage> {
     let limit = clamp_limit(limit)?;
-    with_session(store, &thread.session, |txn| {
+    with_session_read(store, &thread.session, |txn| {
         require_thread(txn, thread)?;
         let ids = queue_ids(txn, &thread.thread_id)?;
         let start = match cursor {
@@ -248,7 +244,7 @@ pub(super) fn checkpoints(
     limit: usize,
 ) -> Result<Vec<u64>> {
     let limit = clamp_limit(limit)?;
-    with_session(store, &thread.session, |txn| {
+    with_session_read(store, &thread.session, |txn| {
         require_thread(txn, thread)?;
         let prefix = checkpoint_history_prefix(&thread.thread_id);
         let mut positions = Vec::new();
@@ -280,7 +276,7 @@ pub(super) fn checkpoint(
     thread: &ThreadKey,
     position: u64,
 ) -> Result<CheckpointView> {
-    with_session(store, &thread.session, |txn| {
+    with_session_read(store, &thread.session, |txn| {
         let data = require_thread(txn, thread)?;
         let record = load_json::<CheckpointRecord>(
             txn,
@@ -304,7 +300,7 @@ pub(super) fn events(
     limit: usize,
 ) -> Result<EventPage> {
     let limit = clamp_limit(limit)?;
-    with_session(store, session, |txn| {
+    with_session_read(store, session, |txn| {
         let state = require_state(txn)?;
         let position = match cursor {
             // No cursor means "from the retained start": a session that pruned its oldest events
@@ -360,7 +356,7 @@ pub(super) fn prune_events(
 }
 
 pub(super) fn snapshot(store: &dyn RecordStore, session: &SessionKey) -> Result<Snapshot> {
-    with_session(store, session, |txn| {
+    with_session_read(store, session, |txn| {
         let state = require_state(txn)?;
         let mut turns = Vec::new();
         // Paged: a snapshot asks for every turn a session ever admitted, so the walk has no

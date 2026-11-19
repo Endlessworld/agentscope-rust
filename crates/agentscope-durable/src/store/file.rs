@@ -46,6 +46,7 @@
 //! conservative mode keeps the create-if-absent lock: the file's existence is the lock, which a
 //! share always serialises, at the price of a create, a write and a delete per transaction.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
@@ -55,11 +56,19 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{RecordStore, Txn, WorkItem};
 use crate::{DurableError, Result};
+
+/// One scope document as the exact JSON text of each record, not a parsed value tree.
+///
+/// A rewrite needs every record to keep, but none of them to be interpreted: keeping their bytes
+/// costs about the document's size, while a `Value` tree of the same document costs several times
+/// it and is what made a turn's peak grow with the journal behind it.
+type RawDocument = BTreeMap<String, Box<RawValue>>;
 
 // How long a contender waits for the scope lock before giving up.
 //
@@ -247,6 +256,14 @@ pub struct FileStore {
     picked: Mutex<HashMap<String, Picked>>,
     /// Out-of-line payloads this process read last; see [`BlobCache`].
     blobs: Mutex<BlobCache>,
+    /// Whole scope documents this process last served a read-only transaction from.
+    ///
+    /// [`Picked`] caches the values a `read_parts` asked for; this caches the bytes a
+    /// [`RecordStore::read_transaction`] parsed, because a journal fold reads the same 1.4MB
+    /// document several times per tick. An entry is valid only while the file's identity is
+    /// unchanged — a write is a rename of a fresh temporary file, so it always changes — and a
+    /// write transaction never reads through it.
+    documents: Mutex<HashMap<String, CachedDocument>>,
     /// Scopes whose legacy inline payloads this process already moved out of line.
     rolled_out: Mutex<HashSet<String>>,
     /// Whole-document scans this store answered a [`RecordStore::read_parts`] from.
@@ -257,6 +274,12 @@ pub struct FileStore {
     /// the counter. This is the same number without the neighbours.
     #[cfg(test)]
     scans: AtomicU64,
+    /// Document reads a transaction performed; only under `cfg(test)`.
+    ///
+    /// The counterpart of [`FileStore::scans`] for [`RecordStore::read_transaction`]: a test can
+    /// say "the second read-only transaction did not read the file" without watching the clock.
+    #[cfg(test)]
+    document_reads: AtomicU64,
 }
 
 /// The out-of-line payloads this process read last.
@@ -295,6 +318,19 @@ struct Picked {
 /// The entries are a few hundred bytes each and nothing depends on them: a miss only means the
 /// next poll scans the document, which is the behaviour without the cache.
 const PICKED_SCOPES: usize = 8;
+
+/// A whole document kept for the next read-only transaction on the same scope.
+struct CachedDocument {
+    stamp: crate::store::DocumentStamp,
+    bytes: Arc<Vec<u8>>,
+}
+
+/// How many scope documents the read-only cache holds before clearing.
+///
+/// A bound, not a policy: a session document is about a megabyte and a process works on one
+/// session at a time, so the entry that matters is one; the rest is room for a handful of
+/// scopes without ever becoming a second copy of a long session.
+const DOCUMENT_SCOPES: usize = 4;
 
 // ----------------------------------------------------------------------------
 // Write-traffic counters
@@ -421,9 +457,12 @@ impl FileStore {
             locks: Mutex::new(HashMap::new()),
             picked: Mutex::new(HashMap::new()),
             blobs: Mutex::new(BlobCache::default()),
+            documents: Mutex::new(HashMap::new()),
             rolled_out: Mutex::new(HashSet::new()),
             #[cfg(test)]
             scans: AtomicU64::new(0),
+            #[cfg(test)]
+            document_reads: AtomicU64::new(0),
         };
         store.adopt_flat_work_records()?;
         Ok(store)
@@ -655,11 +694,60 @@ impl FileStore {
         if blob_reference_of(&value).is_some() {
             return Ok(value);
         }
-        let bytes = serde_json::to_vec(&value)?;
-        if bytes.len() <= BLOB_THRESHOLD {
+        // The size is counted instead of materialized: serializing into a buffer only to write
+        // those same bytes into the blob file is one full payload of memory per large `put`.
+        let mut counter = CountingSink {
+            inner: std::io::sink(),
+            written: 0,
+        };
+        serde_json::to_writer(&mut counter, &value)?;
+        if counter.written <= BLOB_THRESHOLD {
             return Ok(value);
         }
-        self.store_blob(scope, &bytes)
+        self.store_blob_streamed(scope, &mut |out| serde_json::to_writer(out, &value))
+    }
+
+    /// Writes the blob `write` produces while hashing it, and answers the reference.
+    ///
+    /// The payload never has to exist as one buffer: [`FileStore::externalize`] sends a large
+    /// value here so its bytes reach the blob file straight from the serializer.
+    fn store_blob_streamed(
+        &self,
+        scope: &str,
+        write: &mut dyn FnMut(&mut dyn std::io::Write) -> serde_json::Result<()>,
+    ) -> Result<Value> {
+        let dir = self.blob_dir(scope);
+        retry_while_held(|| fs::create_dir_all(&dir))?;
+        let temp = dir.join(format!(".tmp-{}-{}", std::process::id(), next_sequence()));
+        let file = fs::File::create(&temp)?;
+        let mut sink = HashingSink::new(std::io::BufWriter::new(file));
+        let finished = match write(&mut sink) {
+            Ok(()) => sink.finish(),
+            Err(error) => Err(std::io::Error::other(error)),
+        };
+        let (blob, bytes) = match finished {
+            Ok(done) => done,
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return Err(error.into());
+            }
+        };
+        let path = self.blob_path(scope, &blob);
+        let present = match retry_while_held(|| fs::metadata(&path)) {
+            Ok(meta) => meta.len() == bytes as u64,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return Err(error.into());
+            }
+        };
+        if present {
+            let _ = fs::remove_file(&temp);
+        } else if let Err(error) = retry_while_held(|| fs::rename(&temp, &path)) {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        Ok(blob_reference(&blob, bytes))
     }
 
     fn cached_blob(&self, blob: &str) -> Option<Value> {
@@ -696,19 +784,20 @@ impl FileStore {
     /// below that a rewrite is cheap and the pass would cost more than the bytes it frees. The
     /// memo is per process and per scope: after the pass the document cannot go back to holding a
     /// large payload, so a second pass could not find one.
-    fn roll_out(&self, scope: &str, committed: &mut BTreeMap<String, Value>) -> Result<()> {
+    fn roll_out(&self, scope: &str, committed: &mut RawDocument) -> Result<()> {
         match self.rolled_out.lock() {
             Ok(rolled) if rolled.contains(scope) => return Ok(()),
             Ok(_) => {}
             Err(_) => return Ok(()),
         }
         for value in committed.values_mut() {
-            if blob_reference_of(value).is_some() {
+            let raw = value.get();
+            if blob_reference_of_raw(raw).is_some() {
                 continue;
             }
-            let bytes = serde_json::to_vec(value)?;
-            if bytes.len() > BLOB_THRESHOLD {
-                *value = self.store_blob(scope, &bytes)?;
+            if raw.len() > BLOB_THRESHOLD {
+                let reference = self.store_blob(scope, raw.as_bytes())?;
+                *value = raw_of(&reference)?;
             }
         }
         if let Ok(mut rolled) = self.rolled_out.lock() {
@@ -730,8 +819,11 @@ impl FileStore {
     /// only for a commit that removed parts — that is the only way a reference can disappear. A
     /// blob younger than [`BLOB_GC_GRACE`] is left alone; see that constant for the reader it
     /// protects.
-    fn collect_blobs(&self, scope: &str, committed: &BTreeMap<String, Value>) {
-        let referenced: HashSet<&str> = committed.values().filter_map(blob_reference_of).collect();
+    fn collect_blobs(&self, scope: &str, committed: &RawDocument) {
+        let referenced: HashSet<String> = committed
+            .values()
+            .filter_map(|value| blob_reference_of_raw(value.get()))
+            .collect();
         let entries = match retry_while_held(|| fs::read_dir(self.blob_dir(scope))) {
             Ok(entries) => entries,
             Err(_) => return,
@@ -758,6 +850,62 @@ impl FileStore {
     #[cfg(test)]
     fn scans(&self) -> u64 {
         self.scans.load(Ordering::Relaxed)
+    }
+
+    /// Counts one transaction read of a scope document; only under `cfg(test)`.
+    #[cfg(test)]
+    fn note_document_read(&self) {
+        self.document_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many transaction reads this store performed; only under `cfg(test)`.
+    #[cfg(test)]
+    fn document_reads(&self) -> u64 {
+        self.document_reads.load(Ordering::Relaxed)
+    }
+
+    /// `(len, modified, created)` of one scope document; `None` when it does not exist.
+    fn scope_stamp(&self, scope: &str) -> Option<crate::store::DocumentStamp> {
+        let meta = retry_while_held(|| fs::metadata(self.scope_path(scope))).ok()?;
+        Some((meta.len(), meta.modified().ok(), meta.created().ok()))
+    }
+
+    /// The document bytes of `scope`, when this process already read exactly these bytes.
+    fn cached_document(&self, scope: &str) -> Option<Arc<Vec<u8>>> {
+        let stamp = self.scope_stamp(scope)?;
+        let documents = self.documents.lock().ok()?;
+        let entry = documents.get(scope)?;
+        (entry.stamp == stamp).then(|| Arc::clone(&entry.bytes))
+    }
+
+    /// Keeps `bytes` as the document `stamp` describes and hands them back to the caller.
+    ///
+    /// Only a read bracketed by two identical stamps gets here: the file was not replaced while
+    /// it was being read, so the bytes and the stamp describe the same document.
+    fn keep_document(
+        &self,
+        scope: &str,
+        stamp: crate::store::DocumentStamp,
+        bytes: Vec<u8>,
+    ) -> Arc<Vec<u8>> {
+        let bytes = Arc::new(bytes);
+        if stamp.0 != bytes.len() as u64 {
+            return bytes;
+        }
+        let Ok(mut documents) = self.documents.lock() else {
+            return bytes;
+        };
+        if documents.len() >= DOCUMENT_SCOPES && !documents.contains_key(scope) {
+            documents.clear();
+        }
+        documents.insert(
+            scope.to_string(),
+            CachedDocument {
+                stamp,
+                bytes: Arc::clone(&bytes),
+            },
+        );
+        bytes
     }
 
     /// The last answer for `(scope, parts)`, if the document behind it is unchanged.
@@ -812,20 +960,6 @@ impl FileStore {
                 values: values.to_vec(),
             },
         );
-    }
-
-    fn read_scope(&self, scope: &str) -> Result<BTreeMap<String, Value>> {
-        // A share violation from the host that is replacing the document right now is transient;
-        // a missing document is not, and is answered at once.
-        match retry_while_held(|| fs::read(self.scope_path(scope))) {
-            Ok(bytes) => {
-                let scope = serde_json::from_slice(&bytes)?;
-                crate::traffic::count_scope_parse();
-                Ok(scope)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-            Err(error) => Err(error.into()),
-        }
     }
 
     /// Reads `parts` out of one scope document without building the rest of it.
@@ -884,7 +1018,7 @@ impl FileStore {
         &self,
         scope: &str,
         lock: &HeldLock<'_>,
-        base: BTreeMap<String, Value>,
+        base: RawDocument,
         staged: BTreeMap<String, Option<Value>>,
         scheduled: BTreeMap<String, Scheduled>,
     ) -> Result<()> {
@@ -899,7 +1033,8 @@ impl FileStore {
                 Some(value) => {
                     // A payload this large would be rewritten by every later commit of the session,
                     // so it is stored once and the document keeps a reference to it.
-                    committed.insert(part, self.externalize(scope, value)?);
+                    let stored = self.externalize(scope, value)?;
+                    committed.insert(part, raw_of(&stored)?);
                 }
                 None => {
                     committed.remove(&part);
@@ -949,9 +1084,8 @@ impl FileStore {
             // abandoned commit, not a lost update. One small read against a whole-document
             // rewrite, so the check is cheap enough to make unconditionally.
             lock.verify()?;
-            let bytes = serde_json::to_vec(&committed)?;
-            count_scope_write(bytes.len());
-            write_atomic(&self.scope_path(scope), &bytes)?;
+            let bytes = write_json(&self.scope_path(scope), &committed)?;
+            count_scope_write(bytes);
             if removed {
                 // Only now: until the document that stopped naming them is on disk, the old one
                 // still references these payloads.
@@ -971,25 +1105,59 @@ impl RecordStore for FileStore {
         let path = self.lock_path(scope);
         let gate = self.gate(scope, &path)?;
         let lock = self.hold(&gate, &path)?;
-        let base = self.read_scope(scope)?;
         let mut staged = StagedTxn {
             store: self,
             scope,
-            base: &base,
+            read_only: false,
+            bytes: RefCell::new(None),
+            parts: RefCell::new(BTreeMap::new()),
             staged: BTreeMap::new(),
             scheduled: BTreeMap::new(),
             now: crate::now_millis(),
         };
         let outcome = work(&mut staged);
-        let StagedTxn {
-            staged, scheduled, ..
-        } = staged;
         if let Err(error) = outcome {
             // Discard: nothing reached the disk.
             return Err(error);
         }
         TRANSACTIONS.fetch_add(1, Ordering::Relaxed);
-        self.commit(scope, &lock, base, staged, scheduled)
+        // A transaction that writes the scope needs the whole document to rewrite it; one that
+        // only wrote work records, or read a few records, never parses it.
+        let base = if staged.staged.is_empty() {
+            RawDocument::new()
+        } else {
+            staged.base_raw()?
+        };
+        let StagedTxn {
+            staged: staged_map,
+            scheduled,
+            ..
+        } = staged;
+        self.commit(scope, &lock, base, staged_map, scheduled)
+    }
+
+    fn read_transaction(
+        &self,
+        scope: &str,
+        work: &mut dyn FnMut(&mut dyn Txn) -> Result<()>,
+    ) -> Result<()> {
+        // The lock is still taken: a reader must not see a half-replaced document, and a writer
+        // must not slip a commit between two reads of one transaction. What the cache buys is the
+        // file read, not the exclusion.
+        let path = self.lock_path(scope);
+        let gate = self.gate(scope, &path)?;
+        let _lock = self.hold(&gate, &path)?;
+        let mut staged = StagedTxn {
+            store: self,
+            scope,
+            read_only: true,
+            bytes: RefCell::new(None),
+            parts: RefCell::new(BTreeMap::new()),
+            staged: BTreeMap::new(),
+            scheduled: BTreeMap::new(),
+            now: crate::now_millis(),
+        };
+        work(&mut staged)
     }
 
     fn scope_bytes(&self, scope: &str) -> Result<Option<u64>> {
@@ -1065,18 +1233,137 @@ struct Scheduled {
 struct StagedTxn<'a> {
     store: &'a FileStore,
     scope: &'a str,
-    base: &'a BTreeMap<String, Value>,
+    /// Whether the transaction may only read.
+    ///
+    /// A read-only transaction may answer from [`FileStore::cached_document`]; a writing one
+    /// always reads the file, because cached bytes are not a safe base to rewrite (another host
+    /// may have replaced the document since; two writes with the same length and timestamps
+    /// would make that invisible).
+    read_only: bool,
+    /// The document bytes, read once per transaction and shared by every pick, key walk and the
+    /// rewrite. An `Arc` so a read-only transaction keeps the same buffer as the cache instead of
+    /// copying a document-sized allocation per tick.
+    ///
+    /// `None` — not read; `Some(None)` — the scope has no document yet.
+    bytes: RefCell<Option<Option<Arc<Vec<u8>>>>>,
+    /// Values asked for by [`Txn::get`], picked out of the document one record at a time.
+    parts: RefCell<BTreeMap<String, Option<Value>>>,
     staged: BTreeMap<String, Option<Value>>,
     scheduled: BTreeMap<String, Scheduled>,
     now: i64,
 }
 
 impl StagedTxn<'_> {
-    fn read(&self, part: &str) -> Option<Value> {
-        match self.staged.get(part) {
-            Some(value) => value.clone(),
-            None => self.base.get(part).cloned(),
+    /// The document bytes, read once and reused for this transaction's picks, keys and rewrite.
+    ///
+    /// Bounded by the document's own size, not by the number of records in it: a journal page and
+    /// the picks it reads share one copy, where re-reading per record would multiply the file read
+    /// by the page. Holding it is cheap next to the value tree this store deliberately no longer
+    /// builds; it is taken out before the commit serializes, so no two document-sized buffers
+    /// overlap at the peak.
+    fn ensure_bytes(&self) -> Result<()> {
+        if self.bytes.borrow().is_some() {
+            return Ok(());
         }
+        if self.read_only {
+            if let Some(bytes) = self.store.cached_document(self.scope) {
+                *self.bytes.borrow_mut() = Some(Some(bytes));
+                return Ok(());
+            }
+        }
+        // A read-only transaction may keep what it read, but only when the file was not replaced
+        // while it was being read: two identities that agree bracket the read.
+        let before = if self.read_only {
+            self.store.scope_stamp(self.scope)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        self.store.note_document_read();
+        let loaded = match retry_while_held(|| fs::read(self.store.scope_path(self.scope))) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let loaded = match loaded {
+            None => Some(None),
+            Some(bytes) if !self.read_only => Some(Some(Arc::new(bytes))),
+            Some(bytes) => {
+                let after = self.store.scope_stamp(self.scope);
+                let stable = matches!(
+                    (&before, &after),
+                    (Some(before), Some(after)) if before == after
+                );
+                match (stable, after) {
+                    (true, Some(stamp)) => {
+                        Some(Some(self.store.keep_document(self.scope, stamp, bytes)))
+                    }
+                    // The file moved under the read: a complete document either way, but not one
+                    // a later stamp comparison would describe.
+                    _ => Some(Some(Arc::new(bytes))),
+                }
+            }
+        };
+        *self.bytes.borrow_mut() = loaded;
+        Ok(())
+    }
+
+    /// The stored value of `part`, picked out of the document without building the rest of it.
+    fn read(&self, part: &str) -> Result<Option<Value>> {
+        if let Some(value) = self.staged.get(part) {
+            return Ok(value.clone());
+        }
+        if let Some(cached) = self.parts.borrow().get(part) {
+            return Ok(cached.clone());
+        }
+        self.ensure_bytes()?;
+        let value = {
+            let bytes = self.bytes.borrow();
+            match &*bytes {
+                Some(Some(document)) => pick_parts(document.as_slice(), &[part])?.remove(part),
+                _ => None,
+            }
+        };
+        self.parts
+            .borrow_mut()
+            .insert(part.to_string(), value.clone());
+        Ok(value)
+    }
+
+    /// The keys of the document, as `Null` values, for `merge_keys` to walk.
+    ///
+    /// Only the keys are materialized; every value is skipped as input. Reading a long journal
+    /// walks its keys page after page, and building the whole value tree to learn the keys of one
+    /// page is what made a page cost the conversation.
+    fn document_keys(&self) -> Result<BTreeMap<String, Value>> {
+        self.ensure_bytes()?;
+        let bytes = self.bytes.borrow();
+        match &*bytes {
+            Some(Some(document)) => key_map(document.as_slice()),
+            _ => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// The whole document as raw JSON text per record, for `commit` to rewrite.
+    ///
+    /// `RawValue` keeps each record's exact bytes instead of parsing it into a `Value` tree, so a
+    /// rewrite holds about the document's size rather than several times it. The bytes are taken
+    /// out before the returned map is serialized, so the two buffers never overlap.
+    fn base_raw(&self) -> Result<RawDocument> {
+        self.ensure_bytes()?;
+        let base = {
+            let bytes = self.bytes.borrow();
+            match &*bytes {
+                Some(Some(document)) => {
+                    crate::traffic::count_scope_parse();
+                    serde_json::from_slice::<RawDocument>(document.as_slice())?
+                }
+                _ => RawDocument::new(),
+            }
+        };
+        // Free the document bytes now: `commit` only needs the raw records and its own buffer.
+        *self.bytes.borrow_mut() = None;
+        Ok(base)
     }
 }
 
@@ -1088,25 +1375,57 @@ impl Txn for StagedTxn<'_> {
     fn get(&self, part: &str) -> Result<Option<Value>> {
         // A payload stored out of line is read here and nowhere else, so a caller never sees a
         // reference and every digest it computes stays the digest of the payload.
-        match self.read(part) {
+        match self.read(part)? {
             Some(stored) => Ok(Some(self.store.resolve(self.scope, stored)?)),
             None => Ok(None),
         }
     }
 
     fn put(&mut self, part: &str, value: Option<Value>) -> Result<()> {
+        if self.read_only {
+            return Err(crate::DurableError::invalid(
+                "a read-only transaction cannot write",
+            ));
+        }
         self.staged.insert(part.to_string(), value);
         Ok(())
     }
 
     fn keys(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
+        let base = self.document_keys()?;
         Ok(crate::store::merge_keys(
-            self.base,
+            &base,
             &self.staged,
             prefix,
             after,
             limit,
         ))
+    }
+
+    fn get_all(&self, parts: &[String]) -> Result<Vec<Option<Value>>> {
+        // One scan of the document returns the whole page, where a `get` per record would scan
+        // it once per record and make a page cost the history it sits in.
+        self.ensure_bytes()?;
+        let wanted: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let mut picked = {
+            let bytes = self.bytes.borrow();
+            match &*bytes {
+                Some(Some(document)) => pick_parts(document.as_slice(), &wanted)?,
+                _ => BTreeMap::new(),
+            }
+        };
+        let mut values = Vec::with_capacity(parts.len());
+        for part in parts {
+            let stored = match self.staged.get(part) {
+                Some(staged) => staged.clone(),
+                None => picked.remove(part.as_str()),
+            };
+            values.push(match stored {
+                Some(stored) => Some(self.store.resolve(self.scope, stored)?),
+                None => None,
+            });
+        }
+        Ok(values)
     }
 
     fn schedule(
@@ -1116,6 +1435,11 @@ impl Txn for StagedTxn<'_> {
         ready_at: i64,
         payload: Option<Value>,
     ) -> Result<()> {
+        if self.read_only {
+            return Err(crate::DurableError::invalid(
+                "a read-only transaction cannot schedule work",
+            ));
+        }
         self.staged.insert(
             schedule_key(queue, work_id),
             Some(serde_json::json!({
@@ -1256,9 +1580,159 @@ fn pick_parts(bytes: &[u8], wanted: &[&str]) -> Result<BTreeMap<String, Value>> 
     Ok(picked)
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec(value)?;
-    write_atomic(path, &bytes)
+/// The raw JSON text of one value, for the raw document map.
+fn raw_of(value: &Value) -> Result<Box<RawValue>> {
+    let text = serde_json::to_string(value)?;
+    Ok(serde_json::from_str::<Box<RawValue>>(&text)?)
+}
+
+/// The digest a raw document record points at, if it is a blob reference.
+///
+/// Cheapest first: only a record whose bytes even mention the marker is parsed at all, so the scan
+/// a rewrite runs over every record stays a byte search rather than a parse.
+fn blob_reference_of_raw(raw: &str) -> Option<String> {
+    if !raw.contains(BLOB_MARKER) {
+        return None;
+    }
+    let value: Value = serde_json::from_str(raw).ok()?;
+    blob_reference_of(&value).map(str::to_string)
+}
+
+/// The keys of one serialized scope document, every value skipped as input.
+fn key_map(bytes: &[u8]) -> Result<BTreeMap<String, Value>> {
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
+    use serde::Deserializer;
+
+    struct Keys;
+
+    impl<'de> Visitor<'de> for Keys {
+        type Value = BTreeMap<String, Value>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a stored scope document")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut keys = BTreeMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                map.next_value::<IgnoredAny>()?;
+                keys.insert(key, Value::Null);
+            }
+            Ok(keys)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let keys = deserializer.deserialize_map(Keys)?;
+    deserializer.end()?;
+    Ok(keys)
+}
+
+/// Serializes `value` straight into the temporary file, then renames it into place.
+///
+/// A scope document is the largest buffer a commit handles: materializing it as `Vec<u8>` first
+/// would hold the whole document (megabytes once a checkpoint is inlined) next to the values it
+/// was built from. Returns the number of bytes written, for the traffic counters.
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<usize> {
+    let sequence = next_sequence();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temporary = path.with_file_name(format!(".{name}.{}-{sequence}.tmp", std::process::id()));
+    let outcome = retry_while_held(|| {
+        let sink = CountingSink {
+            inner: std::io::BufWriter::new(fs::File::create(&temporary)?),
+            written: 0,
+        };
+        let mut sink = sink;
+        serde_json::to_writer(&mut sink, value)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+        std::io::Write::flush(&mut sink)?;
+        Ok(sink.written)
+    });
+    let bytes = match outcome {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = retry_while_held(|| fs::remove_file(&temporary));
+            return Err(error.into());
+        }
+    };
+    BYTES_WRITTEN.fetch_add(bytes as u64, Ordering::Relaxed);
+    if let Err(error) = retry_while_held(|| fs::rename(&temporary, path)) {
+        let _ = retry_while_held(|| fs::remove_file(&temporary));
+        return Err(error.into());
+    }
+    Ok(bytes)
+}
+
+/// Hashes and counts the bytes handed to it while writing them on.
+struct HashingSink<W> {
+    inner: W,
+    hasher: Sha256,
+    written: usize,
+}
+
+impl<W> HashingSink<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            written: 0,
+        }
+    }
+
+    fn finish(self) -> std::io::Result<(String, usize)>
+    where
+        W: std::io::Write,
+    {
+        let Self {
+            mut inner,
+            hasher,
+            written,
+        } = self;
+        inner.flush()?;
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(64);
+        for byte in digest {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        Ok((hex, written))
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for HashingSink<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        self.written += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Counts the bytes handed to the writer so a streamed document can report its size.
+struct CountingSink<W> {
+    inner: W,
+    written: usize,
+}
+
+impl<W: std::io::Write> std::io::Write for CountingSink<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.written += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Temporary file plus rename, retried because another host may briefly hold the target.
@@ -2063,6 +2537,74 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_transaction_reads_the_document_once() -> Result<()> {
+        let root = TempRoot::new("read-only-cache");
+        let store = FileStore::open(root.path())?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!({"n": 1})))
+        })?;
+        let reads = store.document_reads();
+        for _ in 0..3 {
+            let value = crate::store::read(&store, "session", |txn: &mut dyn Txn| txn.get("a"))?;
+            assert_eq!(value, Some(json!({"n": 1})));
+        }
+        assert_eq!(
+            store.document_reads(),
+            reads + 1,
+            "three read-only transactions against an unchanged document read the file once"
+        );
+
+        // A write replaces the document, so the next read has to see the new bytes.
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!({"n": 2})))
+        })?;
+        assert_eq!(
+            read_value(&store, "session", "a")?,
+            Some(json!({"n": 2})),
+            "a write invalidates the cached document"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn another_hosts_write_invalidates_the_cached_document() -> Result<()> {
+        let root = TempRoot::new("read-only-cache-host");
+        let reader = FileStore::open(root.path())?;
+        let writer = FileStore::open(root.path())?;
+        writer.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!(1)))
+        })?;
+        assert_eq!(read_value(&reader, "session", "a")?, Some(json!(1)));
+        writer.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!(2)))
+        })?;
+        assert_eq!(
+            read_value(&reader, "session", "a")?,
+            Some(json!(2)),
+            "the reader must not serve the bytes it read before the other host wrote"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_read_only_transaction_rejects_writes() -> Result<()> {
+        let root = TempRoot::new("read-only-write");
+        let store = FileStore::open(root.path())?;
+        let error = store
+            .read_transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+                txn.put("a", Some(json!(1)))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("read-only"), "{error}");
+        let error = crate::store::read(&store, "session", |txn: &mut dyn Txn| {
+            txn.schedule("queue", "work", 0, None)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("read-only"), "{error}");
+        Ok(())
+    }
+
+    #[test]
     fn put_get_and_delete_round_trip() -> Result<()> {
         let root = TempRoot::new("round-trip");
         let store = FileStore::open(root.path())?;
@@ -2258,7 +2800,7 @@ mod tests {
         })?;
         // One transaction that deletes the first, replaces the second and appends a fourth: the
         // page must be the document with those three edits, in order.
-        let merged = crate::store::read(&store, "session", |txn: &mut dyn Txn| {
+        let merged = crate::store::txn(&store, "session", |txn: &mut dyn Txn| {
             txn.put("p:1", None)?;
             txn.put("p:2", Some(json!("replaced")))?;
             txn.put("p:4", Some(json!("p:4")))?;

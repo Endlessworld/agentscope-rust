@@ -542,38 +542,64 @@ pub(super) fn control_state(store: &dyn RecordStore, lease: &Lease) -> Result<Tu
 }
 
 pub(super) fn frame(store: &dyn RecordStore, lease: &Lease) -> Result<Frame> {
-    with_session(store, &lease.thread.session, |txn| {
-        let thread = require_thread(txn, &lease.thread)?;
-        let turn = require_turn(txn, &lease.turn_id)?;
-        let now = txn.now();
-        assert_owned(&turn, lease, now)?;
-        let checkpoint = txn
-            .get(&checkpoint_part(&lease.thread.thread_id))?
-            .unwrap_or(Value::Null);
-        let tools: Vec<ToolExecution> = turn
-            .tool_order
-            .iter()
-            .filter_map(|id| turn.tools.get(id))
-            .map(ToolData::view)
-            .collect();
-        let signals: Vec<Signal> = turn
-            .signals
-            .values()
-            .filter(|signal| {
-                !turn.consumed.contains(&signal.id) && !turn.withdrawn.contains(&signal.id)
-            })
-            .cloned()
-            .collect();
-        Ok(Frame {
-            definition: thread.definition.clone(),
-            turn: turn.view(&lease.thread),
-            input: turn.input.clone(),
-            checkpoint,
-            checkpoint_metadata: thread.checkpoint_metadata.clone(),
-            tools,
-            signals,
-            now,
+    // Reads only the three records a frame is built from. A whole-scope transaction parses the
+    // entire session document — every journal event of every past turn — into a value tree just
+    // to pull these out, and `frame` runs several times per tick: a long conversation paid tens
+    // of megabytes per read for facts it already held, the peak growing with the journal behind
+    // the turn. `read_parts` streams the document and materializes only the requested records
+    // (blob references resolved the same way a transaction does), so the peak stops tracking the
+    // history. The control poll already reads this way for the same reason.
+    let scope = lease.thread.session.storage_key();
+    let thread_key = thread_part(&lease.thread.thread_id, "definition");
+    let turn_key = turn_part(&lease.turn_id);
+    let checkpoint_key = checkpoint_part(&lease.thread.thread_id);
+    let mut values = store.read_parts(
+        &scope,
+        &[
+            thread_key.as_str(),
+            turn_key.as_str(),
+            checkpoint_key.as_str(),
+        ],
+    )?;
+    let checkpoint = values.pop().flatten().unwrap_or(Value::Null);
+    let turn_value = values
+        .pop()
+        .flatten()
+        .ok_or_else(|| DurableError::not_found("Turn does not exist"))?;
+    let thread_value = values
+        .pop()
+        .flatten()
+        .ok_or_else(|| DurableError::not_found("Thread does not exist"))?;
+    let thread: ThreadData = serde_json::from_value(thread_value)?;
+    let turn: TurnData = serde_json::from_value(turn_value)?;
+    if thread.definition.key != lease.thread {
+        return Err(DurableError::conflict("Thread key changed"));
+    }
+    let now = crate::now_millis();
+    assert_owned(&turn, lease, now)?;
+    let tools: Vec<ToolExecution> = turn
+        .tool_order
+        .iter()
+        .filter_map(|id| turn.tools.get(id))
+        .map(ToolData::view)
+        .collect();
+    let signals: Vec<Signal> = turn
+        .signals
+        .values()
+        .filter(|signal| {
+            !turn.consumed.contains(&signal.id) && !turn.withdrawn.contains(&signal.id)
         })
+        .cloned()
+        .collect();
+    Ok(Frame {
+        definition: thread.definition.clone(),
+        turn: turn.view(&lease.thread),
+        input: turn.input.clone(),
+        checkpoint,
+        checkpoint_metadata: thread.checkpoint_metadata.clone(),
+        tools,
+        signals,
+        now,
     })
 }
 
