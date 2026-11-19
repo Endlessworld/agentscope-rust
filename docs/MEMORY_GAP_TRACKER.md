@@ -2,7 +2,7 @@
 
 > 跟踪 AgentScope durable 运行时在 ACP harness 下的堆分配与峰值内存（生产 RSS 曾从 <25MB 涨到约 184MB）。
 > 本文档是**单一事实来源**：测量口径、已落地项、剩余优化点、已否决项。
-> 最后更新：2026-11-19（dev 工作树；L1–L22 已改未提交）。
+> 最后更新：2026-11-20（`feature/sqlite`；L1–L29）。
 
 ## 0. 阅读约定
 
@@ -82,9 +82,36 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 - 环境变量：`DIAG_TURNS`、`DIAG_USER_BYTES`、`DIAG_REPLY_BYTES`。
 - 临时 `eprintln!("DIAG …")` 探针在用完后**必须还原**（收尾前 `rg 'DIAG "'` 应为空）。
 
+### 1.6 SQLite 后端与压实策略（20 轮口径，2026-11-20）
+
+**SQLite vs FileStore（同负载 8KB + 8KB ×20，默认 SQLite）**
+
+| 指标 | FileStore | SqliteStore | 变化 |
+|---|---:|---:|---:|
+| 总分配 | 1350.3MB | **1180.8MB** | −12.6% |
+| 每轮 | 67.51MB | **58.97MB** | −8.54MB/轮 |
+| `peak_live` | 10.85MB | **3.84MB** | −65% |
+| 耗时 | 14.18s | **7.05s** | −50% |
+| 磁盘 | 23.77MB | **8.27MB** | −65% |
+
+> 磁盘后改为 `durable.db`（8,663,040B，同负载）；`shared_across_hosts=false`（WAL 不能放网络文件系统）。
+
+**压实策略（L29，SQLite 20 轮）**
+
+| 指标 | 10% 增长（旧） | 2× 增长 + 12MB 兜底 | 变化 |
+|---|---:|---:|---:|
+| `djournal:facts` | 820.5MB | **473.9MB** | −42.3% |
+| `djournal:read` | 122.7MB | 122.7MB | 持平 |
+| `flush:done` | 96.5MB | 94.9MB | −1.6MB |
+| `acp:settle` | 75.2MB | 92.8MB | +17.6MB |
+| `peak_live` | 3.84MB | 3.84MB | 持平 |
+| 磁盘 | 8.66MB | **10.79MB** | +25% |
+
+> 8MB 兜底：`djournal:facts` 504.7MB / 磁盘 9.36MB；12MB 兜底：473.9MB / 10.79MB；完全禁用压实：329MB / 18.15MB。FileStore 同策略：`djournal:facts` 625.6→**557.7MB（−10.9%）**、磁盘 23.77→**24.92MB（+4.8%）**、`peak_live` 10.85→**10.37MB**。策略同时修复 >8MB 但增长 <10% 的 scope 永不 trim 的老问题。
+
 ---
 
-## 2. 已落地（L1–L28）
+## 2. 已落地（L1–L29）
 
 | # | 改动 | 位置 | 效果 | 验证 |
 |---|---|---|---|---|
@@ -117,6 +144,8 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 | L27 | **B3-phase1**：`FileStore` 写路径改 append-only——文档作基线，每次提交向 `scopes/<digest>.log` 追加一行 `LogDelta`（`{"puts":{part:value},"removes":[part]}`，payload 仍按 `BLOB_THRESHOLD` 外置），不再整份重写；读侧 `Overlay` 叠加（`read`/`keys`/`read_parts`/`scope_parts` 均「tail 优先、文档 `pick_parts` 兜底」）；log ≥ `LOG_COMPACT_BYTES`（256KB）时 `compact_scope` 折成整份文档；**首次提交即建文档**（否则读侧永远走 overlay-only）；新增 `overlays` 解析缓存（`log_stamp` 校验、`DOCUMENT_SCOPES=4`）；`scope_bytes` = 文档 + tail | `durable/src/store/file.rs` | 20 轮 **1671.5 → 1394.0MB（−13.9MB/轮，−16.6%）**；`djournal:facts` 895.4→**683.7MB**（44.8→33.4/轮）、`djournal:read` 336.6→**264.7MB**（16.8→12.9/轮）、`flush:done` 202.9→**191.8MB**、`acp:settle` 持平；`peak_live` 11.21→**10.71MB**。中间态留档：无 tail 缓存时 1949.2MB（97.5/轮，净变差） | 新增 4 用例（写后读 / 尾部半行容错 / 压实后一致 / 重开进程一致）；`compaction_test` 的字节曲线断言按新语义重写（`root_record` 走 store 读、trim 判定用 `compacted_bytes`、`positions.len()==1`）；`frame_read_traffic_test` 恢复（首次提交建文档）；durable 74 lib + 20 targets / adapter 14 targets / acp 21 targets 全绿 / fmt 干净 |
 | L28 | **B3-phase2**：文档字节索引 `DocumentIndex`（`part → (start, end)`，用 `&RawValue` 零拷贝定位，`complete` 标志 + 范围校验兜底）+ 事务内复用（`StagedTxn.index`）；`document_value` / `document_keys` 在**写事务**走索引，**只读事务仍 `pick_parts` / `key_map`**（只读通常 1–2 条，建索引是负收益） | `durable/src/store/file.rs` | 20 轮 **1394.0 → 1350.3MB（−2.19MB/轮，−3.1%）**；`djournal:facts` 33.4 → **31.3/轮**；`djournal:read` 12.9、`acp:settle` 5.1 持平。全量索引（含只读）为 1391.6MB、`djournal:read` 反弹 14.45/轮——留档为 X16 | 新增 2 用例（`the_document_index_places_exactly_what_a_scan_reads`：转义/嵌套/unicode/空对象/null/缺失逐值对拍；`a_transaction_reads_several_records_through_one_index`）；durable 76 lib / 20 targets / adapter 14 / acp 21 / fmt 干净 |
 
+| L29 | **压实策略**：`MIN_GAIN_DIVISOR` 10→2（当前体积翻倍才 trim）+ `COMPACT_CEILING_BYTES=12MB` 绝对兜底 | `durable/src/backend/compact.rs` | SQLite 20 轮 `djournal:facts` 820.5→**473.9MB（−42.3%）**、DB 8.66→**10.79MB**、`peak_live` 3.84；FileStore `djournal:facts` 625.6→**557.7MB（−10.9%）**、磁盘 23.77→24.92MB、`peak_live` 10.85→10.37；8MB 兜底为 504.7MB/9.36MB（12MB 更优）；修复 >8MB 但增长 <10% 的 scope 永不 trim | durable 77 lib / 20 targets、sqlite 5、契约 11、acp lib 138、acp live 20 轮 / fmt 干净 |
+
 > L22 的三条前提（改动前已核实，**别改坏**）：`backend/commit.rs` 的 commit 不续租、不改 `thread.epoch`、不清 `turn.owner`（普通 Running 批次）；全仓库只有 `recorder::flush` 消费 `commit()` 返回值且只取 `head.seq`。
 
 ---
@@ -136,9 +165,15 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 
 #### R8 —— B3：单文档全量重写 → append-only log + 周期快照
 
-- **状态（2026-11-19）**：**phase1 已落地为 L27**（append-only tail）、**phase2 已落地为 L28**（文档字节索引，**未改磁盘格式**）。合计 20 轮 **1671.5 → 1350.3MB（−16.1MB/轮，−19.2%）**。原估（60–70MB/轮）**偏高**：写事务的成本主体是「读 + 扫描整份文档」，索引只消除其中的重复扫描。
-- **剩余（待定）**：`djournal:facts` 仍占 **31.3MB/轮**（16 次写事务）。要再降需先把这 31.3 拆到单项（R17：thread / turn / facts / checkpoint / turn-ending 各阶段标记），再决定是否值另一个工程；磁盘格式（快照 + `formatVersion`）仍是未动选项。
+- **状态（2026-11-20）**：**phase1 已落地为 L27**（append-only tail）、**phase2 已落地为 L28**（文档字节索引，**未改磁盘格式**）。合计 20 轮 **1671.5 → 1350.3MB（−16.1MB/轮，−19.2%）**。**L29 压实策略**把 `djournal:facts` 从 625.6 降到 **557.7MB**；**SQLite 后端（§1.6）**把总分配降到 **1180.8MB**、峰值 3.84MB。原估（60–70MB/轮）偏高。
+- **剩余（2026-11-20）**：SQLite `djournal:facts` 仍占 **473.9MB/20 轮 ≈23.7MB/轮**（FileStore 557.7MB/20 轮 ≈27.9MB/轮）；主体是 `state/checkpoint` 全量 payload（见 R19）。磁盘格式（快照 + `formatVersion`）仍是未动选项。
 - **前置**：独立工作树，先写崩溃恢复测试。
+
+#### R19 —— checkpoint I/P 帧（信息论方案）
+
+- **收益**：`djournal:facts` 剩余 473.9MB（SQLite）/ 557.7MB（FileStore）的主体是 `state/checkpoint` 全量 payload（每轮一份完整 state，约 254KB）；改成 I 帧（首个完整 state）+ P 帧（与上一帧的 diff），快照间隔由 `S* ≈ sqrt(2·B·R)` 推导（当前 B≈2.9MB、R≈40KB/轮 ⇒ S*≈15MB ≈ 数百轮），可把每轮 checkpoint 从全量降到增量。
+- **代价**：动 core `JournalEvent`/`state/checkpoint` 折叠 + `JournalProjection` 恢复路径 + Java wire（`stateJson` 语义）；需要先做字节预算与「P 帧丢失/乱序/重放」恢复矩阵。
+- **前置**：先补 `state/checkpoint` 的字节等价与恢复测试；不要动 `migration/baseline` / `state/restored` 的「唯一副本」语义。
 
 ### 3.3 已量化并关闭（原 R9–R15，结论留档）
 
@@ -180,6 +215,8 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 | X14 | 「20 轮累计分配 ≈98MB/轮」是**漏计** | settle 区间无标记时其 ≈51MB/轮 落入无标签被丢弃；加 `acp:settle` 并做 A/B 后真实值 ≈**152MB/轮**（3043.8MB/20 轮）。今后引用「每轮分配」必须说明是否包含 settle |
 | X15 | **R3（B2a：`entries: Vec<Box<RawValue>>` + `put_raw` + digest 分离）已实现并回退** | 20 轮实测 **1727.9 → 1748.7MB（+1MB/轮，两次测量一致）**：`apply_journal` 省 `Value` 树（`djournal:facts` −0.46MB/轮）被适配器 `to_string` + `RawValue::from_string` 的整份文本复制（`flush:batch` 11.7→42.1MB）吃光；`digest` 快路径收益 ≈0。`sbytes` 21,287,416 逐字节不变。结论：journal 的内存成本在「一次编码文本」本身，不在中间 `Value` 树；要再降只能动 wire 文本（R7）或批量异步化 |
 | X16 | **文档索引对只读事务是负收益** | 全量启用（含只读）20 轮 **1391.6MB（69.6/轮）**、`djournal:read` **14.45/轮**（较 L27 的 12.92 反弹）；限定 `!read_only` 后 **1350.3MB（67.5/轮）**、`djournal:read` 回到 12.92。原因：只读事务通常只读 1–2 条，建索引要一次全扫 + 每个 key 一个 `String`，比 `pick_parts` 单次扫描（只物化命中值）更贵。同时 `document_keys` 必须先判 `read_only` 再决定是否建索引，否则「建了却不用」 |
+| X17 | **SQLite 内容寻址 blob 层（大值外置 + `$blob` + 引用计数/GC）已实现并回退** | 20 轮总分配**变差约 +33MB**；回退后阶段表与回退前逐项一致（`djournal:facts` 820,524.6 vs 820,525.3KB，噪声内）。SQLite 的页缓存/行存储已经承担了大值读，外置只增加引用/GC 与一次间接寻址 |
+| X18 | **增量 `scope_bytes` 字节列（`put` 手工维护）中性，已回退** | 实测 `djournal:facts` 820.8MB（基线 820.5）、DB 8.67MB（基线 8.66）；`scope_bytes=None` 探针 `djournal:facts` 329MB 但 DB 18.2MB ⇒ 480MB 的大头是**压实**，不是 `SUM` 扫描。保留 `SUM` + 改压实策略（L29）才是正解 |
 
 ---
 
@@ -194,6 +231,7 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 7. 临时 A/B 短路（如 `if false && …`）必须还原，并在 tracker 里保留 A/B 数字与前后对照。
 8. 工作树里的历史改动（L1–L25）提交前单独 review：L22 依赖的三条前提（§2 备注）需在 diff 里仍然成立；L25 的前提是「写事务绝不读缓存、只读事务拒写」。
 9. 序列化/磁盘改动必须提交**字节等价对拍用例**（结构体 `to_string` vs 旧 `json!` 的 `Value::to_string()`）；`serde_json` 的 `preserve_order` 已显式固定在 workspace 依赖里 —— 缺了它，`cargo test -p <crate>` 单独构建时 `Value::Object` 退回 `BTreeMap`（字母序），journal payload 字节会随构建配置漂移，`sbytes` 基线随构建失效（2026-11-19 已实测）。
+10. SQLite 后端是**单机预览/beta**：`shared_across_hosts=false`（WAL 不能放网络文件系统）；尚无 `PRAGMA user_version`/迁移、CI 的 `DURABLE_CONTRACT_STORE=sqlite` 任务、崩溃/多进程/备份恢复用例；`synchronous=NORMAL` 断电可能丢最后若干已提交事务，需文档化并提供 `FULL` 选项。
 
 ---
 
@@ -201,6 +239,8 @@ cargo test -p agentscope-extensions-acp --features alloc-stats --test acp_live_m
 
 | 日期 | 内容 |
 |---|---|
+| 2026-11-20 | **SQLite 后端（feature/sqlite）**：新增 `agentscope-durable-sqlite`（一行一条记录、WAL、`BEGIN IMMEDIATE` 写 / `DEFERRED` 读、revision CAS、前缀有界 `keys`、`json_each` 批量读、只读拒写、`prepare_cached`）；ACP 可选 feature `durable-sqlite`（默认关闭；启用即默认 SQLite，`AGENTSCOPE_DURABLE_STORE=file` 回退；`durable.db`）；20 轮 **1180.8MB / 58.97MB/轮 / peak 3.84MB / 7.05s / 磁盘 8.27MB** vs FileStore **1350.3MB / 67.51 / 10.85 / 14.18 / 23.77**（总分配 −12.6%、峰值 −65%、耗时 −50%、磁盘 −65%）。`shared_across_hosts=false`。验证：durable 77 lib / 20 targets、sqlite 5、契约 11、acp lib 138、acp live 20 轮 / fmt 干净 |
+| 2026-11-20 | **压实策略（L29）**：`MIN_GAIN_DIVISOR` 10→2（当前体积翻倍才 trim）+ 12MB 绝对兜底；SQLite `djournal:facts` 820.5→473.9MB、DB 8.66→10.79MB；FileStore 625.6→557.7MB、磁盘 23.77→24.92MB；8MB 兜底 504.7MB/9.36MB，12MB 更优；修复 >8MB 但增长 <10% 的 scope 永不 trim。中性回退：SQLite blob 层（X17）、增量 `scope_bytes` 列（X18） |
 | 2026-11-19 | **B3-phase2 落地（L28）**：文档字节索引 `DocumentIndex`（`&RawValue` 零拷贝得 `part → (start,end)`，范围校验 + `complete` 兜底），写事务内一次构建、多次 `get`/`keys` 切片，**只读事务不建索引**（1–2 条记录时建索负收益）。20 轮实测 **1394.0 → 1350.3MB（−2.19MB/轮，−3.1%）**，`djournal:facts` 33.4→**31.3/轮**，`djournal:read`/`acp:settle` 持平；全量索引（含只读）为 1391.6MB、`djournal:read` 反弹 14.45/轮（X16）。新增 2 用例（索引逐值对拍 + 一次事务多记录）。验证：durable 76 lib / 20 targets / adapter 14 / acp 21 / fmt 干净 |
 | 2026-11-19 | **B3-phase1 落地（L27）**：`FileStore` 写路径改 append-only（文档 + `scopes/<digest>.log` 追加 `LogDelta`，读侧 `Overlay` 叠加，256KB 压实，首次提交建文档，tail 解析缓存）；`scope_bytes` = 文档 + tail。20 轮实测 **1671.5 → 1394.0MB（−13.9MB/轮，−16.6%）**，`djournal:facts` 44.8→**33.4/轮**、`djournal:read` 16.8→**12.9/轮**、`peak_live` 11.21→**10.71MB**。关键发现：只做 append 时为 1949.2MB（97.5/轮，**净变差**，`djournal:read` 反弹到 25.5/轮）——tail 解析必须缓存；加缓存后写事务也少解析 tail（`djournal:facts` 再降 7.5/轮）。磁盘格式未变（`sbytes` 不再是单轮 1.06MB 的整份重写，改为 delta + 周期压实）。验证：durable 74 lib + 20 targets / adapter 14 targets / acp 21 targets / fmt 干净 |
 | 2026-11-19 | **序列化字节一致性加固**：新增 `recorder.rs::the_structured_payloads_serialize_exactly_as_the_json_macro_did`，对 `context/replaced`、`message/<role>`、`tool/requested`、`input/applied`、`state/changed` 五个结构化 payload 与旧 `json!` 的 `Value::to_string()` 逐字节对拍（反向验证：调换 `ToolRequested` 字段声明顺序 → 用例立即失败）。同时发现并修复**构建态字节漂移**：`cargo test -p agentscope-core` 的依赖图未启用 `preserve_order`，`Value::Object` 退回 `BTreeMap`（字母序），而全量构建经 `rag`/`bson` 联启用了它（插入序）——同一份代码会因构建配置写出不同 journal 字节；已在 workspace `serde_json` 显式加 `preserve_order`（与已测 ACP 基线一致，`sbytes` 21,287,416 不变）。验证：core 574 passed / 3 ignored、harness 734、durable+adapter 20 targets 174、acp 21 targets 181 + 4 ignored、`cargo fmt` 干净 |
