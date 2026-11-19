@@ -3,6 +3,7 @@
 > 跟踪 AgentScope durable 运行时在 ACP harness 下的堆分配与峰值内存（生产 RSS 曾从 <25MB 涨到约 184MB）。
 > 本文档是**单一事实来源**：测量口径、已落地项、剩余优化点、已否决项。
 > 最后更新：2026-11-20（`feature/sqlite`；L1–L31）。
+> 关联：`docs/DURABLE_INFORMATION_MODEL_TRACKER.md`（durable 信息论方案跟踪）。
 
 ## 0. 阅读约定
 
