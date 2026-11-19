@@ -253,20 +253,25 @@ session/
 
 ### 4.2 20 轮基线（8KB + 8KB，L30 + turn 边界修正后）
 
-| 指标 | SQLite（修正后） | FileStore（L30，待复测） |
-|---|---:|---:|
-| `djournal:facts` | **388.6MB** | **322.1MB** |
-| `djournal:read` | 122.7MB | 182.7MB |
-| `flush:done` | 176.0MB | 135.0MB |
-| `acp:settle` | 84.3MB | 34.9MB |
-| DB/磁盘 | **11.4MB** | **4.23MB** |
-| `peak_live` | 3.93MB | 6.58MB |
-| 耗时 | **6.46s** | **9.99s** |
-| `jentries` | 357 | 357 |
-| `jreads` | 3 | 3 |
-| `parses` / `picks` | 0 / 0 | 0 / 8 |
-| `txns` / `writes` | 0 / 0（计数器未接线） | 16 / 1 |
-| `sbytes` | 0（不适用） | 1,299,520 B |
+| 指标 | SQLite（L30 基线） | SQLite（P1-1 + P1-3） | FileStore（L30，待复测） |
+|---|---:|---:|---:|
+| `djournal:facts` | **388.6MB** | **167.0MB** | **322.1MB** |
+| `djournal:read` | 122.7MB | 94.0MB | 182.7MB |
+| `flush:done` | 176.0MB | 218.9MB | 135.0MB |
+| `acp:settle` | 84.3MB | 57.9MB | 34.9MB |
+| `checkpoint:payload` | 24.1MB | 23.6MB | — |
+| DB/磁盘 | **11.4MB** | **4.12MB** | **4.23MB** |
+| `peak_live` | 3.93MB | 3.80MB | 6.58MB |
+| 耗时 | **6.46s** | **5.33s** | **9.99s** |
+| `jentries` | 357 | 39 | 357 |
+| `jreads` | 3 | 3 | 3 |
+| `parses` / `picks` | 0 / 0 | 0 / 0 | 0 / 8 |
+| `txns` / `writes` | 0 / 0（当时未接线） | 15 / 0 | 16 / 1 |
+| `sbytes` | 0（不适用） | 0 | 1,299,520 B |
+| 20 轮总分配 | ≈870MB | **640.9MB（32.0MB/轮）** | — |
+| stored（`payload_report`） | 7,106,083 B | **1,946,332 B** | — |
+
+P1-1 后 stored 2,950,471 B（`request/prepared` 4,709,502 → 58,171）；P1-3 后再降到 1,946,332 B，其中 `checkpoint-history` 从 2/500,671 B 降到约 1KB（`state/checkpoint` 40 条 = 20 全量 + 20 deferred = 272,553 B，`turn:<hash>` 20 × 18,941 B 是剩余最大项）。`flush:done` 上升 43MB 是 `frame` 每 tick 多读一次 `checkpoint-history` + journal 条目所致，总量仍是净降。
 
 ### 4.3 需要补的探针
 
@@ -280,6 +285,9 @@ session/
 ### 已落地
 
 - L24 settle 复用 journal projection；L25 只读事务文档缓存；L26 幂等读回后置；L27 append-only tail；L28 文档字节索引；L29 压实策略；**L30 checkpoint 间隔 + turn 边界强制**（修正 deferred 期间 `previous_state` 抢先更新导致终态回退）；**L31 prune 保留 `event-id`**。
+- **L32（P1-1）**：`request/prepared` 只存 `messageIds` + 摘要，不再内联整份 `messages`（`recorder.rs::prepare_request`）。存储 4,709,502 B → 58,171 B，读取端从未消费该字段，模型请求字节不变。
+- **L33（P1-3）**：`checkpoint-history` 记录只存 metadata + `journalSeq`，`state/checkpoint` 的 journal 条目成为唯一副本；`thread-data:*:checkpoint`（`checkpoint_part`）不再写。读取统一走 `checkpoint_state`（`query::checkpoint` / `turn::frame` / `restore` 内联兼容）。**坑**：`apply_journal` 必须返回它分配的**存储槽位**，不能用事件 JSON 里的 `seq` 字段——两者起点差一格，用 `seq` 会指向已回收的旧条目（`Checkpoint entry carries no state`）。`unchanged` 分支也要把 `journalSeq` 跟到新条目，否则重启后 recorder 重新 capture 会让记录指向被回收的副本。
+- **P 帧（前缀 checkpoint）已实现但默认关闭**：`CHECKPOINT_PREFIX_FRAMES = false`。写入端（`contextFromEvents` + `stateDigest`）与 `JournalProjection` 折叠端都已就绪，阻塞点是 `AgentScopeExecutionHost` 从 `commit.checkpoint` 读上一轮 state 时没有会话可拼接——开启前必须先把该恢复路径改成走 journal 投影。
 - SQLite `RecordStore` + ACP `durable-sqlite`（`durable.db`，单机预览）。
 - 20 轮：SQLite 修正后 `djournal:facts` 388.6MB（L30 的 82.8MB 因终态回退不可用作基线）；详见 `MEMORY_GAP_TRACKER.md` §1.6。
 
@@ -299,10 +307,10 @@ session/
 | 阶段 | 内容 | 状态 | 依赖/风险 | 验收 |
 |---|---|---|---|---|
 | 0 | 本文档 | ✅ | — | 本文 |
-| 1 | 指标探针：冗余率/更新/恢复/提交 | ⏳ 下一步 | DIAG 计数器；不改格式 | 20 轮可复现；四项基线 |
-| 2 | P1：`request/prepared` 去全量；`message`/`context` 去重/引用；event 级内容寻址 | ❌ | Java wire `PROTOCOL_VERSION`；prompt cache；X17 复测 | 同一消息一份；模型请求字节不变；冗余 <1.5 |
-| 3 | 提交合并 16→1–2 | ❌ | 事务边界/tick 组提交；ACP 语义 | `txns` 1–2/轮；`djournal:facts`/`flush:done` 降 |
-| 4 | P2：state P 帧/I 帧决策；父 hash；快照索引 | ❌ | 先证明不重复事件日志；格式/迁移 | 恢复 O(S)；无额外 state 写入 |
+| 1 | 指标探针：冗余率/更新/恢复/提交 | 🟡 基线已取（冗余率/提交次数有数；恢复成本待测） | DIAG 计数器；不改格式 | 20 轮可复现；四项基线 |
+| 2 | P1：`request/prepared` 去全量；`message`/`context` 去重/引用；event 级内容寻址 | 🟡 **P1-1/P1-3 已落地**（stored 7.11MB → 1.95MB）；event 级内容寻址已否证（X19）；`message`/`context` 去重未做 | Java wire `PROTOCOL_VERSION`；prompt cache；X17/X19 复测 | 同一消息一份；模型请求字节不变；冗余 <1.5 |
+| 3 | 提交合并 15→1–2 | ❌ | 事务边界/tick 组提交；ACP 语义 | `txns` 1–2/轮；`djournal:facts`/`flush:done` 降 |
+| 4 | P2：state P 帧/I 帧决策；父 hash；快照索引 | 🟡 前缀帧能力就绪、**默认关闭**；阻塞点：`ExecutionHost` 从 `commit.checkpoint` 读 state | 先把 host 恢复改成 journal 投影；格式/迁移 | 恢复 O(S)；无额外 state 写入 |
 | 5 | P4/具体模型：统一 frame + snapshots/index + GC | ❌ | formatVersion、跨语言、崩溃矩阵；独立立项 | 单一帧；崩溃停在最后完整帧；幂等 |
 | 6 | P3：自适应 S*（运行时 B/R） | 🟡 固定 15MB | B/R 统计；恢复探针 | 写入 + 恢复总成本在 S* 附近 |
 | 7 | 生产化：SQLite CI 契约、schema 版本/迁移、`synchronous`、备份/WAL、ACP load/resume/crash/并发 | ❌ | 独立清单 | 生产门槛 |
@@ -312,6 +320,7 @@ session/
 ## 7. 风险与待决策
 
 1. **P2：事件日志是否就是 P 帧？** 建议先测量；若事件已覆盖全部 delta，不做 state diff（避免多一层重复）。
+2. **P2 阻塞点（已验证）**：前缀帧（`contextFromEvents`）写入与折叠都可用，但 `AgentScopeExecutionHost` 的恢复路径把 `commit.checkpoint` 当作上一轮完整 state；前缀帧没有会话，必须先把 host 改成走 `JournalProjection` 再开启 `CHECKPOINT_PREFIX_FRAMES`（否则恢复后上下文为空）。
 2. **P1：`request/prepared` 去全量 messages** 需要新的 wire 版本与 Java 同步；先做 probe，确认收益。
 3. **P1：event 级内容寻址 vs X17 的存储级 blob**：先复测，不假定。
 4. **P4/具体模型：统一帧** 是否值得取代 FileStore scope/SQLite 行；大工程，先做崩溃/迁移设计。
@@ -344,3 +353,4 @@ cargo fmt --all -- --check
 |---|---|
 | 2026-11-20 | 初版：形式化（源/信道/失真）、五原则现状、具体模型对照、四项指标、路线图与验收；基于 L30/L31 与 SQLite 20 轮基线。 |
 | 2026-11-20 | P1 event 级内容寻址（`TxnBackend` 内部 `content.rs`，16KB 阈值）实现并全绿，但 20 轮净变差（`djournal:facts` +68.6MB、`acp:settle` +73.1MB、总分配 +140MB、DB 不变），按「无净收益即回退」完全回退（X19）；同时修正 L30 的 turn 边界终态回退（`recorder.rs` 的 `checkpoint_due`/`unchanged`），SQLite 修正基线 388.6MB/11.4MB/3.93MB/6.46s。 |
+| 2026-11-20 | **P1-1（L32）**：`request/prepared` 去全量 `messages`，改 `messageIds` + 摘要（stored −58%）；**P1-3（L33）**：`checkpoint-history` 只存 metadata + `journalSeq`，删掉 `checkpoint_part` 重复副本（stored 再 −34%，`checkpoint-history` 500KB → ~1KB）。20 轮 SQLite：总分配 ≈870 → **640.9MB**（−24.6%）、DB 11.4 → **4.12MB**（−64%）、stored 7.11 → **1.95MB**（−72.6%）、`peak_live` 3.80MB、5.33s。P 帧（前缀 checkpoint）实现完成但默认关闭（`CHECKPOINT_PREFIX_FRAMES = false`，阻塞于 host 恢复路径）。 |
