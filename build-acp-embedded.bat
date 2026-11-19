@@ -3,11 +3,12 @@ setlocal
 rem Build embedded-profile ACP binaries (size optimized): acp_harness_agent + acp_agent_cli
 rem Output: target\embedded\acp_harness_agent.exe and target\embedded\acp_agent_cli.exe
 rem Requires nightly toolchain (build-std) with rust-src installed.
-rem --features lite drops bundled SQLite; note MSVC always emits .pdb, exclude when packaging.
+rem --features lite,durable-sqlite keeps the embedded profile but stores durable state in SQLite;
+rem SQLite is bundled, so the binaries grow by the driver. AGENTSCOPE_DURABLE_STORE=file falls back.
 
 cd /d "%~dp0"
 
-cargo +nightly build --profile embedded --config .cargo/config.embedded.toml -p agentscope-extensions-acp --no-default-features --features lite --bins
+cargo +nightly build --profile embedded --config .cargo/config.embedded.toml -p agentscope-extensions-acp --no-default-features --features lite,durable-sqlite --bins
 set "EXITCODE=%ERRORLEVEL%"
 
 if not "%EXITCODE%"=="0" (

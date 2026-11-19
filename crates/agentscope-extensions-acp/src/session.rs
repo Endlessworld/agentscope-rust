@@ -1319,7 +1319,18 @@ impl AcpAgentSession {
     }
 
     fn durable_backend(&self) -> std::result::Result<Arc<dyn SessionBackend>, String> {
-        let store = FileStore::open(self.durable_root()?).map_err(|error| error.to_string())?;
+        let root = self.durable_root()?;
+        // A build that compiles the SQLite store in uses it by default, so an embedded
+        // deployment does not depend on an environment variable. `AGENTSCOPE_DURABLE_STORE=file`
+        // keeps a deployment on the file store without a rebuild.
+        #[cfg(feature = "durable-sqlite")]
+        if std::env::var("AGENTSCOPE_DURABLE_STORE").as_deref() != Ok("file") {
+            std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+            let store = agentscope_durable_sqlite::SqliteStore::open(root.join("durable.db"))
+                .map_err(|error| error.to_string())?;
+            return Ok(Arc::new(TxnBackend::with_store(Arc::new(store))));
+        }
+        let store = FileStore::open(root).map_err(|error| error.to_string())?;
         Ok(Arc::new(TxnBackend::with_store(Arc::new(store))))
     }
 

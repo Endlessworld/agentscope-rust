@@ -16,6 +16,10 @@ categories.workspace = true
 agentscope-core = { workspace = true }
 agentscope-durable = { workspace = true }
 agentscope-durable-adapter-agentscope = { workspace = true }
+# Optional: run the durable runtime on SQLite instead of the file store. Off by default so the
+# bundled SQLite driver is not part of every ACP build; when compiled in, SQLite is the default
+# backend (`AGENTSCOPE_DURABLE_STORE=file` keeps the file store).
+agentscope-durable-sqlite = { path = "../agentscope-durable-sqlite", optional = true }
 agentscope-extensions-model = { workspace = true }
 agentscope-harness = { version = "0.2.0", path = "../agentscope-harness", default-features = false }
 agent-client-protocol = { version = "5.0.0", features = [
@@ -80,6 +84,9 @@ path = "src/acp_harness_agent.rs"
 
 [features]
 default = ["rusqlite"]
+# Optional SQLite `RecordStore`. With it compiled in, `AGENTSCOPE_DURABLE_STORE=sqlite` makes a
+# session keep its durable state in one SQLite database instead of the file store.
+durable-sqlite = ["dep:agentscope-durable-sqlite"]
 rusqlite = ["agentscope-harness/rusqlite"]
 # Embedded minimal build: mirrors `agentscope-harness`'s `lite` feature,
 # dropping the bundled SQLite index.
