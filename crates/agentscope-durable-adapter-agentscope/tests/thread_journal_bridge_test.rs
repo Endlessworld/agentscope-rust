@@ -77,6 +77,31 @@ async fn a_journal_batch_and_its_turn_revision_commit_together() {
 }
 
 #[tokio::test]
+async fn the_head_a_commit_returns_is_the_one_a_reader_sees() {
+    let (_backend, journal, _thread, _receipt) = fixture().await;
+    let writer = journal
+        .acquire("owner-a", Duration::from_secs(30))
+        .await
+        .expect("acquire");
+    // The batch applies exactly its own entries and the commit never renews the lease, so the
+    // adapter answers from the state it already read instead of parsing the thread again: the
+    // answer still has to be the head a reader would find on disk.
+    let returned = journal
+        .commit(&writer, "batch-1", 0, &[event(1), event(2)])
+        .await
+        .expect("commit");
+    let stored = journal.head().await.expect("head");
+    assert_eq!(returned, stored);
+
+    let next = journal
+        .commit(&writer, "batch-2", returned.seq, &[event(3)])
+        .await
+        .expect("second commit");
+    assert_eq!(next, journal.head().await.expect("head"));
+    assert_eq!(next.seq, 3);
+}
+
+#[tokio::test]
 async fn a_stale_journal_position_is_rejected() {
     let (_backend, journal, _thread, _receipt) = fixture().await;
     let writer = journal
@@ -149,7 +174,7 @@ async fn a_replay_with_the_same_ids_but_changed_content_is_rejected() {
         .expect("commit");
 
     let mut changed = event(1);
-    changed.payload_json = json!({ "seq": 1, "changed": true }).to_string();
+    changed.payload_json = json!({ "seq": 1, "changed": true }).to_string().into();
     let replay = journal.commit(&writer, "batch-1", 0, &[changed]).await;
     assert!(
         replay.is_err(),
@@ -158,8 +183,8 @@ async fn a_replay_with_the_same_ids_but_changed_content_is_rejected() {
     let events = journal.read_after(0, 10).await.expect("read");
     assert_eq!(events.len(), 1);
     assert_eq!(
-        events[0].payload_json,
-        json!({ "seq": 1 }).to_string(),
+        events[0].payload_json.as_str(),
+        json!({ "seq": 1 }).to_string().as_str(),
         "the committed fact is untouched"
     );
 }

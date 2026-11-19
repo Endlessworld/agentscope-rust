@@ -142,6 +142,61 @@ impl BackendThreadJournal {
         }
         Ok(lease.clone())
     }
+
+    /// The head a batch already reached, when the journal holds that very batch.
+    ///
+    /// `Some` — the same ids and the same content are committed, so the batch is a replay whose
+    /// receipt was lost. `None` — the position is free, so the caller's failure was about
+    /// something else. An id match with different content is an error: swallowing it would hide
+    /// a rebuilt event or a batch re-based onto another position.
+    async fn replay_head(
+        &self,
+        expected_seq: u64,
+        events: &[JournalEvent],
+    ) -> CoreResult<Option<Head>> {
+        // A batch can be longer than one page (`read_journal` caps a page at 1000 entries), so the
+        // stored events are paged in rather than requested in one call.
+        const JOURNAL_PAGE: usize = 1000;
+        let mut existing = Vec::with_capacity(events.len().min(JOURNAL_PAGE));
+        let mut after = expected_seq;
+        while existing.len() < events.len() {
+            let wanted = (events.len() - existing.len()).min(JOURNAL_PAGE);
+            let page = self.read_after(after, wanted).await?;
+            let full_page = page.len() == wanted;
+            if let Some(last) = page.last() {
+                after = last.seq;
+            }
+            existing.extend(page);
+            if !full_page {
+                break;
+            }
+        }
+        if existing.is_empty() {
+            return Ok(None);
+        }
+        let same_ids = existing.len() == events.len()
+            && existing
+                .iter()
+                .zip(events)
+                .all(|(stored, incoming)| stored.event_id == incoming.event_id);
+        if !same_ids {
+            return Err(journal_error("Journal position was taken by another batch"));
+        }
+        // A replay is idempotent only when it is *the same batch*: an id match alone would
+        // silently swallow a fact whose content changed under the same id (a rebuilt event, a
+        // batch re-based onto another position), which is exactly the corruption this check
+        // exists to catch. The durable receipt compares digests for the same reason.
+        let same_content = existing
+            .iter()
+            .zip(events)
+            .all(|(stored, incoming)| stored == incoming);
+        if !same_content {
+            return Err(journal_error(
+                "Journal batch was replayed with different content",
+            ));
+        }
+        Ok(Some(self.head().await?))
+    }
 }
 
 fn convert(error: DurableError) -> agentscope_core::error::Error {
@@ -240,57 +295,25 @@ impl ThreadJournal for BackendThreadJournal {
                 })?,
             );
         }
+        agentscope_core::diag::mark("djournal:encode");
         // Idempotency is decided here, not by the durable receipt: a retry reads a new turn
         // revision, so the same batch would otherwise look like changed content.
         //
-        // A batch can be longer than one page (`read_journal` caps a page at 1000 entries), so the
-        // stored events are paged in rather than requested in one call.
-        const JOURNAL_PAGE: usize = 1000;
-        let mut existing = Vec::with_capacity(events.len().min(JOURNAL_PAGE));
-        let mut after = expected_seq;
-        while existing.len() < events.len() {
-            let wanted = (events.len() - existing.len()).min(JOURNAL_PAGE);
-            let page = self.read_after(after, wanted).await?;
-            let full_page = page.len() == wanted;
-            if let Some(last) = page.last() {
-                after = last.seq;
-            }
-            existing.extend(page);
-            if !full_page {
-                break;
-            }
-        }
-        if !existing.is_empty() {
-            let same_ids = existing.len() == events.len()
-                && existing
-                    .iter()
-                    .zip(events)
-                    .all(|(stored, incoming)| stored.event_id == incoming.event_id);
-            // A replay is idempotent only when it is *the same batch*: an id match alone would
-            // silently swallow a fact whose content changed under the same id (a rebuilt event,
-            // a batch re-based onto another position), which is exactly the corruption this
-            // check exists to catch. The durable receipt compares digests for the same reason.
-            let same_content = same_ids
-                && existing
-                    .iter()
-                    .zip(events)
-                    .all(|(stored, incoming)| stored == incoming);
-            if same_ids && !same_content {
-                return Err(journal_error(
-                    "Journal batch was replayed with different content",
-                ));
-            }
-            if same_content {
-                return self.head().await;
-            }
-            return Err(journal_error("Journal position was taken by another batch"));
-        }
+        // The check runs only after the commit is refused (`replay_head`). A batch at its
+        // expected position is accepted outright; reading the journal back to prove what the
+        // position already established cost a scan of the scope document in every commit.
+        agentscope_core::diag::mark("djournal:read");
         let state = self
             .backend
             .thread_state(&self.thread)
             .await
             .map_err(convert)?;
         if state.journal_position != expected_seq {
+            // A retry of a batch whose receipt was lost finds its own events already written;
+            // that batch is acknowledged by the head it produced. Anything else is a conflict.
+            if let Some(head) = self.replay_head(expected_seq, events).await? {
+                return Ok(head);
+            }
             return Err(journal_error("Journal position changed"));
         }
         let turn_id = state
@@ -328,8 +351,26 @@ impl ThreadJournal for BackendThreadJournal {
         // re-encode and re-hash the whole conversation. `null` means "keep the current state"
         // to the backend.
         commit.checkpoint = checkpoint::from_batch(events)?.unwrap_or(Value::Null);
-        self.backend.commit(&lease, commit).await.map_err(convert)?;
-        self.head().await
+        agentscope_core::diag::mark("djournal:facts");
+        if let Err(error) = self.backend.commit(&lease, commit).await {
+            // The position was taken between the read and the commit: the writer may have been
+            // this very batch, whose receipt was lost, or another batch entirely.
+            if let Some(head) = self.replay_head(expected_seq, events).await? {
+                return Ok(head);
+            }
+            return Err(convert(error));
+        }
+        agentscope_core::diag::mark("djournal:stored");
+        // The append is atomic and applies exactly this batch (`apply_journal` refuses a stale
+        // position and bumps it once per entry), so the new head is known here. Reading the
+        // thread document again would parse it a second time in every commit.
+        Ok(Head {
+            seq: expected_seq + events.len() as u64,
+            epoch: state.epoch,
+            owner: state.owner,
+            lease_until: state.lease_until,
+            commit_id: None,
+        })
     }
 
     async fn read_after(&self, after: u64, limit: usize) -> CoreResult<Vec<JournalEvent>> {

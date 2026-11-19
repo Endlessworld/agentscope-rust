@@ -214,7 +214,7 @@ async fn seed(backend: &TxnBackend, thread: &ThreadKey, lease: &Lease, facts: Ve
             execution_run_id: Some("run-1".to_string()),
             turn_id: Some(lease.turn_id.clone()),
             required: true,
-            payload_json: serde_json::to_string(data).expect("payload"),
+            payload_json: serde_json::to_string(data).expect("payload").into(),
         };
         entries.push(serde_json::to_value(event).expect("entry"));
     }
