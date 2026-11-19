@@ -17,7 +17,7 @@ use agent_client_protocol::v1::schema::{
 use agent_client_protocol::{v1::ConnectionTo, Client};
 use agentscope_core::agent::CallableAgent;
 use agentscope_core::event::{AgentEvent, ConfirmResult};
-use agentscope_core::journal::{ThreadJournal, TurnViews};
+use agentscope_core::journal::{JournalProjection, ThreadJournal};
 use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
 use agentscope_core::model::catalog::ModelDescriptor;
 use agentscope_core::model::{GenerateOptions, DEFAULT_CONTEXT_WINDOW};
@@ -653,6 +653,12 @@ struct SessionRuntime {
     session: Arc<DurableSession>,
     control: Arc<DurableRuntime>,
     journal: Arc<dyn ThreadJournal>,
+    /// 跨轮投影缓存：每轮的「是否还有悬挂 dispatch」检查只需 fold 新增事件。
+    ///
+    /// 以前每轮都 `JournalProjection::read` 全量折叠 journal（≈1.4MB scope + 全部事件，
+    /// 实测 25MB/轮分配）。缓存后正常轮只读自上次检查以来新增的几十条事件；
+    /// `reconcile_abandoned_tool_calls` 写入新事实后缓存失效（置 None）。
+    projection: tokio::sync::Mutex<Option<JournalProjection>>,
 }
 
 /// Settles the tool calls a dead run left uncertain, so the session can be opened again.
@@ -662,6 +668,7 @@ struct SessionRuntime {
 /// such an outcome can never arrive later: recording it as interrupted (never as success, never
 /// re-executed) is what lets the session continue.
 async fn reconcile_abandoned_tool_calls(journal: &Arc<dyn ThreadJournal>) {
+    agentscope_core::diag::mark("acp:reconcile");
     match agentscope_core::journal::recovery::settle_uncertain_tool_outcomes(
         Arc::clone(journal),
         ABANDONED_ON_RESUME_MESSAGE,
@@ -687,8 +694,13 @@ async fn reconcile_abandoned_tool_calls(journal: &Arc<dyn ThreadJournal>) {
 /// that hit this later in the same process would fail every following prompt with "Explicit
 /// reconciliation required", because the recorder refuses to open the journal. An unfinished
 /// turn is left alone: it owns its uncertainty, and resuming it must not find synthetic results.
+///
+/// Production runs [`settle_finished_turn_uncertainties_cached`]; this full-fold variant is kept
+/// as the reference implementation the cached check is tested against.
+#[cfg(test)]
 async fn settle_finished_turn_uncertainties(journal: &Arc<dyn ThreadJournal>) {
-    match TurnViews::read(&**journal).await {
+    agentscope_core::diag::mark("acp:settle");
+    match agentscope_core::journal::TurnViews::read(&**journal).await {
         Ok(turns) if turns.latest().map(|turn| !turn.ended()).unwrap_or(false) => return,
         Ok(_) => {}
         Err(error) => {
@@ -696,6 +708,71 @@ async fn settle_finished_turn_uncertainties(journal: &Arc<dyn ThreadJournal>) {
             return;
         }
     }
+    agentscope_core::diag::mark("acp:settle_read");
+    reconcile_abandoned_tool_calls(journal).await;
+}
+
+/// Settles unfinished-tool-call uncertainty using the runtime's cross-prompt projection cache.
+///
+/// Same outcome as [`settle_finished_turn_uncertainties`] — a finished turn's unanswered dispatch
+/// is recorded as interrupted, an unfinished turn's dispatch is left alone — but the check folds
+/// only the events committed since the previous prompt. The full fold cost one whole-journal
+/// replay per prompt (≈25MB of allocation at a 1.4MB scope, measured), which dominated every turn
+/// once the durable commit path had been trimmed.
+async fn settle_finished_turn_uncertainties_cached(runtime: &SessionRuntime) {
+    agentscope_core::diag::mark("acp:settle");
+    // An unfinished turn owns its uncertainty: resuming it must not find synthetic results.
+    match runtime.session.active().await {
+        Ok(None) => {}
+        Ok(Some(turn)) => {
+            tracing::trace!(turn = %turn.turn_id, "an unfinished turn keeps its dispatch uncertain");
+            return;
+        }
+        Err(error) => {
+            tracing::debug!(%error, "could not check for an unfinished turn");
+            return;
+        }
+    }
+    settle_uncertain_with_cache(&runtime.journal, &runtime.projection).await;
+}
+
+/// The cached-fold half of [`settle_finished_turn_uncertainties_cached`].
+///
+/// The caller owns the turn gate: it must only be reached when no turn of the thread is open,
+/// because reconciliation turns every uncertain dispatch into an `interrupted` result.
+async fn settle_uncertain_with_cache(
+    journal: &Arc<dyn ThreadJournal>,
+    cache: &tokio::sync::Mutex<Option<JournalProjection>>,
+) {
+    let mut guard = cache.lock().await;
+    let mut fresh = false;
+    if let Some(view) = guard.as_mut() {
+        match view.catch_up(&**journal).await {
+            Ok(()) => fresh = true,
+            Err(error) => tracing::debug!(%error, "could not catch up the cached projection"),
+        }
+    }
+    if !fresh {
+        match JournalProjection::read(&**journal).await {
+            Ok(view) => *guard = Some(view),
+            Err(error) => {
+                tracing::debug!(%error, "could not read the journal projection");
+                return;
+            }
+        }
+    }
+    let nothing_uncertain = guard
+        .as_ref()
+        .map(|view| view.uncertain_tool_calls.is_empty())
+        .unwrap_or(true);
+    drop(guard);
+    agentscope_core::diag::mark("acp:settle_read");
+    if nothing_uncertain {
+        return;
+    }
+    // Reconciliation writes facts (synthetic results, `recovery/applied`, a checkpoint), so the
+    // cached fold no longer describes the chain.
+    *cache.lock().await = None;
     reconcile_abandoned_tool_calls(journal).await;
 }
 
@@ -1095,7 +1172,7 @@ fn write_and_sync(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// retry inside this process keeps reusing the same key.
 fn prompt_idempotency_key(message: &Msg, accepted_at_ms: i64) -> String {
     let mut text = String::new();
-    for block in &message.content {
+    for block in message.content.iter() {
         if let agentscope_core::message::ContentBlock::Text(block) = block {
             if !text.is_empty() {
                 text.push('\n');
@@ -1343,6 +1420,7 @@ impl AcpAgentSession {
             session: Arc::new(DurableSession::new(runtime, thread)),
             control,
             journal,
+            projection: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -2603,7 +2681,7 @@ impl AcpAgentSession {
             // One message id per historical message: clients group chunks by it exactly as
             // they do for a live turn, so a replayed turn renders as one bubble.
             let message_id = MessageId::new(format!("history-{}", message.id));
-            for block in &message.content {
+            for block in message.content.iter() {
                 match (message.role, block) {
                     (MsgRole::User, CoreBlock::Text(text)) => {
                         notifications.push(SessionNotification::new(
@@ -2759,12 +2837,14 @@ impl AcpAgentSession {
     where
         F: Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync,
     {
+        agentscope_core::diag::mark("acp:prompt_enter");
         if let Some(stop) = self.run_prompt_shortcut(&content, &emit).await {
             return stop;
         }
         let stop = self
             .run_prompt_inner(TurnInput::Prompt(content), emit, None)
             .await;
+        agentscope_core::diag::mark("acp:prompt_done");
         self.report_turn_memory(stop);
         stop
     }
@@ -2958,6 +3038,7 @@ impl AcpAgentSession {
         // wait made such a cancel indistinguishable from "this turn started after the cancel"
         // and silently ignored it, so the prompt ran (and billed) anyway.
         crate::mem::note_activity();
+        agentscope_core::diag::mark("acp:run_enter");
         let cancel_epoch = Arc::clone(&self.cancel_epoch);
         let my_epoch = cancel_epoch.load(Ordering::SeqCst);
         let closed = Arc::clone(&self.closed);
@@ -3086,10 +3167,9 @@ impl AcpAgentSession {
         // runtime — so every later prompt in this process used to fail with "Explicit
         // reconciliation required". No run of this thread is in flight here (the prompt lock is
         // held and the turn below has not been admitted yet), which is what makes settling the
-        // leftover uncertainty safe.
-        if matches!(runtime.session.active().await, Ok(None)) {
-            settle_finished_turn_uncertainties(&runtime.journal).await;
-        }
+        // leftover uncertainty safe. The cached check makes this O(events since the last prompt).
+        settle_finished_turn_uncertainties_cached(&runtime).await;
+        agentscope_core::diag::mark("acp:after_settle");
         // A turn left unfinished by an earlier prompt still owns the thread: the runtime always
         // advances the oldest unfinished turn, so a new admission would sit behind it forever.
         // `Paused` is the one state that needs a nudge (it is deliberately not ready); a turn a
@@ -4284,6 +4364,87 @@ mod tests {
                 .uncertain_tool_calls,
             ["call-1".to_string()].into_iter().collect(),
             "an unfinished turn's dispatch must stay uncertain"
+        );
+
+        // The cached variant folds only the delta. A clean journal leaves its projection
+        // cached; a dispatch committed afterwards must still be settled by the next check.
+        let growing: Arc<dyn ThreadJournal> = Arc::new(AtomicThreadJournal::new(
+            Arc::new(MemoryJournalStorage::new()),
+            "acp/test",
+        ));
+        let writer = growing
+            .acquire("run-1", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let head = growing.head().await.unwrap();
+        growing
+            .commit(
+                &writer,
+                "batch-1",
+                head.seq,
+                &[
+                    event(
+                        1,
+                        "state/checkpoint",
+                        serde_json::json!({
+                            "stateJson": agentscope_core::state::AgentState::builder()
+                                .session_id("s1")
+                                .build()
+                                .to_json()
+                                .unwrap(),
+                        }),
+                    ),
+                    event(2, "run/start", serde_json::json!({})),
+                    event(
+                        3,
+                        "turn/cancelled",
+                        serde_json::json!({ "status": "cancelled" }),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        growing.release(&writer).await.unwrap();
+
+        let cache = tokio::sync::Mutex::new(None);
+        super::settle_uncertain_with_cache(&growing, &cache).await;
+        assert!(
+            cache.lock().await.is_some(),
+            "a clean journal caches its projection instead of reconciling"
+        );
+
+        let writer = growing
+            .acquire("run-2", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let head = growing.head().await.unwrap();
+        growing
+            .commit(
+                &writer,
+                "batch-2",
+                head.seq,
+                &[event(
+                    head.seq + 1,
+                    "tool/dispatch",
+                    serde_json::json!({ "toolCallId": "call-2" }),
+                )],
+            )
+            .await
+            .unwrap();
+        growing.release(&writer).await.unwrap();
+
+        super::settle_uncertain_with_cache(&growing, &cache).await;
+        assert!(
+            JournalProjection::read(&*growing)
+                .await
+                .unwrap()
+                .uncertain_tool_calls
+                .is_empty(),
+            "a dispatch appended after the cache was seeded must still be settled"
+        );
+        assert!(
+            cache.lock().await.is_none(),
+            "reconciliation invalidates the cached projection"
         );
     }
 

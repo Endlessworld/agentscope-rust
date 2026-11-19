@@ -283,6 +283,11 @@ pub fn live_heap() -> Option<(usize, usize, usize)> {
     None
 }
 
+/// Live heap bytes when the counting allocator is installed, else 0.
+pub fn live_bytes() -> usize {
+    live_heap().map(|(live, _, _)| live).unwrap_or(0)
+}
+
 /// Diagnostic allocator: wraps [`std::alloc::System`] and tracks live bytes.
 ///
 /// Installed by the two binaries instead of mimalloc under `--features alloc-stats`. It is a
@@ -302,11 +307,14 @@ pub mod counting {
         if live > PEAK.load(Relaxed) {
             PEAK.store(live, Relaxed);
         }
+        agentscope_core::diag::observe(live);
+        agentscope_core::diag::observe_alloc(bytes);
     }
 
     fn sub(bytes: usize) {
-        LIVE.fetch_sub(bytes, Relaxed);
+        let live = LIVE.fetch_sub(bytes, Relaxed) - bytes;
         BLOCKS.fetch_sub(1, Relaxed);
+        agentscope_core::diag::observe(live);
     }
 
     /// `(live bytes, peak live bytes, live blocks)`.
