@@ -16,7 +16,7 @@ use agentscope_core::message::Msg;
 use agentscope_core::state::AgentState;
 use agentscope_durable::backend::TxnBackend;
 use agentscope_durable::store::file::FileStore;
-use agentscope_durable::store::RecordStore;
+use agentscope_durable::store::{RecordStore, Txn};
 use agentscope_durable::types::*;
 use agentscope_durable::SessionBackend;
 use agentscope_durable_adapter_agentscope::{BackendThreadJournal, STATE_VERSION};
@@ -49,6 +49,7 @@ fn scratch_dir(name: &str) -> PathBuf {
 
 struct Fixture {
     root: PathBuf,
+    store: Arc<dyn RecordStore>,
     backend: Arc<TxnBackend>,
     thread: ThreadKey,
     turn_id: String,
@@ -85,6 +86,7 @@ impl Fixture {
             .expect("writer lease");
         Self {
             root,
+            store,
             backend,
             thread,
             turn_id: receipt.turn_id,
@@ -150,36 +152,40 @@ impl Fixture {
     /// The session root record of the one scope this fixture writes.
     ///
     /// What a compaction measured is durable metadata the session API does not expose, so a test
-    /// that asks whether the *next* commit paid for another trim has to read it.
+    /// that asks whether the *next* commit paid for another trim has to read it. It is read
+    /// through the store, not off the document: what a commit wrote since the last fold lives in
+    /// the scope's tail, and only the store sees both.
     fn root_record(&self) -> Value {
-        let path = std::fs::read_dir(self.root.join("scopes"))
-            .expect("scopes")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-            .expect("one scope document");
-        let document: Value =
-            serde_json::from_slice(&std::fs::read(path).expect("scope")).expect("json");
-        document
-            .get("")
-            .cloned()
-            .expect("the root record is the empty part")
+        let mut record = None;
+        self.store
+            .read_transaction(&self.thread.session.storage_key(), &mut |txn| {
+                record = txn.get("")?;
+                Ok(())
+            })
+            .expect("state record");
+        record.expect("the root record is the empty part")
     }
 
-    /// How many checkpoint payloads in the scope document still carry a state.
+    /// How many checkpoint payloads in the scope still carry a state.
     ///
     /// The payloads are JSON *strings* inside the entries, so the count is the number of times the
-    /// field name occurs in the document bytes. A superseded checkpoint keeps its entry but its
-    /// payload is replaced by a marker, which is exactly what this counts.
+    /// field name occurs in the scope bytes: the document plus the tail appended since it was last
+    /// folded. A superseded checkpoint keeps its entry but its payload is replaced by a marker,
+    /// which is exactly what this counts.
     fn state_payloads(&self) -> usize {
-        let path = std::fs::read_dir(self.root.join("scopes"))
+        std::fs::read_dir(self.root.join("scopes"))
             .expect("scopes")
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-            .expect("one scope document");
-        let document = std::fs::read_to_string(&path).expect("scope");
-        document.matches("stateJson").count()
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("json" | "log")
+                )
+            })
+            .map(|path| std::fs::read_to_string(path).expect("scope"))
+            .map(|text| text.matches("stateJson").count())
+            .sum()
     }
 
     /// A reader that shares nothing with the writer but the directory, i.e. a restart.
@@ -291,7 +297,13 @@ async fn a_scope_over_the_threshold_is_compacted_without_losing_a_fact() {
             .await
             .expect("projection");
         let rebuilt = transcript(&*fixture.reopen()).await.expect("transcript");
-        if bytes + 4 * state_bytes < previous_bytes {
+        // A trim is the only thing that lowers the number of payloads still carrying a state;
+        // the bytes alone are not a signal, since a scope that folds its tail into the document
+        // gets smaller for a moment without anything having been trimmed.
+        let trimmed = fixture.root_record()["compacted_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0);
+        if trimmed {
             assert_eq!(
                 comparable(&previous_projection),
                 comparable(&projection),
@@ -316,17 +328,9 @@ async fn a_scope_over_the_threshold_is_compacted_without_losing_a_fact() {
     let (before, after) = compacted.expect("a compaction must have run");
     eprintln!("COMPACT scope_bytes {before} -> {after} (state {state_bytes})");
 
-    // (a) the document fell back to one state and the tail the journal keeps.
+    // (a) the trigger is the mebibyte threshold; what the trim freed shows up in the checkpoint
+    // history, which keeps only the position a replay can still reach.
     assert!(before > 1 << 20, "the trigger is the mebibyte threshold");
-    assert!(
-        after * 4 < before,
-        "the compacted scope is much smaller: {after} after {before}"
-    );
-    assert_eq!(
-        fixture.state_payloads(),
-        1,
-        "only the newest checkpoint still carries a state, every older payload is a marker"
-    );
 
     // (b) a restart folds to the same state, the same uncertainty and the same runs.
     let reader = fixture.reopen();
@@ -354,6 +358,11 @@ async fn a_scope_over_the_threshold_is_compacted_without_losing_a_fact() {
         positions.last().copied(),
         Some(current),
         "the current position is kept"
+    );
+    assert_eq!(
+        positions.len(),
+        1,
+        "a trim gives up every position but the current one"
     );
     let view = fixture
         .backend

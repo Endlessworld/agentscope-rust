@@ -210,6 +210,13 @@ const WORK_INDEX_LOCK: &str = "\u{1}work-index";
 /// payload is stored out of line.
 const ROLL_OUT_BYTES: u64 = 1 << 20;
 
+/// How large a scope's append-only tail may grow before it is folded into the document.
+///
+/// Every commit since the last fold lands in the tail as one line, so a session that writes a few
+/// small deltas per tick rewrites the document once every few ticks instead of once per tick. The
+/// fold is the old whole-document write, so this bound sets how often it is paid.
+const LOG_COMPACT_BYTES: u64 = 256 * 1024;
+
 /// How many blobs this process keeps parsed, and how many bytes they may hold.
 const BLOB_CACHE_ENTRIES: usize = 16;
 const BLOB_CACHE_BYTES: usize = 4 << 20;
@@ -264,6 +271,8 @@ pub struct FileStore {
     /// unchanged — a write is a rename of a fresh temporary file, so it always changes — and a
     /// write transaction never reads through it.
     documents: Mutex<HashMap<String, CachedDocument>>,
+    /// Parsed tails this process last read, keyed by scope; each valid while its log is unchanged.
+    overlays: Mutex<HashMap<String, CachedOverlay>>,
     /// Scopes whose legacy inline payloads this process already moved out of line.
     rolled_out: Mutex<HashSet<String>>,
     /// Whole-document scans this store answered a [`RecordStore::read_parts`] from.
@@ -309,6 +318,8 @@ struct Picked {
         Option<std::time::SystemTime>,
         Option<std::time::SystemTime>,
     ),
+    /// The tail the answer was taken against, so an appended commit invalidates it.
+    log_stamp: Option<crate::store::DocumentStamp>,
     parts: Vec<String>,
     values: Vec<Option<Value>>,
 }
@@ -323,6 +334,17 @@ const PICKED_SCOPES: usize = 8;
 struct CachedDocument {
     stamp: crate::store::DocumentStamp,
     bytes: Arc<Vec<u8>>,
+}
+
+/// A parsed tail kept until the log behind it changes.
+///
+/// A journal fold and a control poll both read the same scope many times per tick, and the tail is
+/// the only part that changed since the last read. Parsing it per transaction would charge the
+/// conversation for a few kilobytes of deltas that mostly repeat; the log's identity changes on
+/// every append, so an entry is valid exactly while nothing was written.
+struct CachedOverlay {
+    log_stamp: Option<crate::store::DocumentStamp>,
+    overlay: Arc<Overlay>,
 }
 
 /// How many scope documents the read-only cache holds before clearing.
@@ -458,6 +480,7 @@ impl FileStore {
             picked: Mutex::new(HashMap::new()),
             blobs: Mutex::new(BlobCache::default()),
             documents: Mutex::new(HashMap::new()),
+            overlays: Mutex::new(HashMap::new()),
             rolled_out: Mutex::new(HashSet::new()),
             #[cfg(test)]
             scans: AtomicU64::new(0),
@@ -551,6 +574,11 @@ impl FileStore {
         self.root
             .join("scopes")
             .join(format!("{}.json", digest(scope)))
+    }
+
+    /// The commits appended since the document was last folded, one JSON line each.
+    fn log_path(&self, scope: &str) -> PathBuf {
+        self.scope_path(scope).with_extension("log")
     }
 
     fn work_path(&self, queue: &str, work_id: &str) -> PathBuf {
@@ -843,6 +871,97 @@ impl FileStore {
         }
     }
 
+    /// The bytes of the append-only tail, `None` when the scope never appended one.
+    fn log_bytes(&self, scope: &str) -> Result<Option<Vec<u8>>> {
+        match retry_while_held(|| fs::read(self.log_path(scope))) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// How many bytes the tail holds; zero when there is none.
+    fn log_size(&self, scope: &str) -> u64 {
+        match retry_while_held(|| fs::metadata(self.log_path(scope))) {
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        }
+    }
+
+    /// Appends one commit as a single line.
+    ///
+    /// One line is one write, so a process that dies mid-append leaves a tail no reader trusts and
+    /// [`FileStore::replay_log`] discards; a complete line is exactly one commit.
+    fn append_log(&self, scope: &str, delta: &LogDelta) -> Result<()> {
+        let path = self.log_path(scope);
+        let mut line = serde_json::to_vec(delta)?;
+        line.push(b'\n');
+        retry_while_held(|| {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            std::io::Write::write_all(&mut file, &line)
+        })?;
+        Ok(())
+    }
+
+    /// Applies every complete line of the tail to `document`.
+    ///
+    /// A tail that stops in the middle of a line is a commit that never finished, and is skipped; a
+    /// complete line that does not parse is a damaged store and stops the read. Applying a line
+    /// twice writes the same document — a put replaces and a remove deletes again — which is what
+    /// makes "write the document, then clear the tail" safe in that order.
+    fn replay_log(document: &mut RawDocument, log: &[u8]) -> Result<()> {
+        let mut rest = log;
+        while let Some(end) = rest.iter().position(|byte| *byte == b'\n') {
+            let line = &rest[..end];
+            rest = &rest[end + 1..];
+            if line.is_empty() {
+                continue;
+            }
+            let delta: LogDelta = serde_json::from_slice(line)
+                .map_err(|error| DurableError::invalid(format!("scope log is damaged: {error}")))?;
+            for (part, value) in delta.puts {
+                document.insert(part, raw_of(&value)?);
+            }
+            for part in delta.removes {
+                document.remove(&part);
+            }
+        }
+        Ok(())
+    }
+
+    /// The scope document with its tail applied.
+    fn merged_document(&self, scope: &str) -> Result<RawDocument> {
+        let mut document = match retry_while_held(|| fs::read(self.scope_path(scope))) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => RawDocument::new(),
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(log) = self.log_bytes(scope)? {
+            Self::replay_log(&mut document, &log)?;
+        }
+        Ok(document)
+    }
+
+    /// Folds the append-only tail into the document and clears it.
+    ///
+    /// The document is written first and the tail cleared second: a crash in between leaves a tail
+    /// that is already applied, which replays to the same document. The fold is also the only place
+    /// that moves legacy inline payloads out of line and collects unreferenced blobs, because it is
+    /// the only place that sees the whole document.
+    fn compact_scope(&self, scope: &str) -> Result<()> {
+        let mut document = self.merged_document(scope)?;
+        self.roll_out(scope, &mut document)?;
+        let bytes = write_json(&self.scope_path(scope), &document)?;
+        count_scope_write(bytes);
+        // An empty tail is a file, not a missing one: the next append reuses it.
+        retry_while_held(|| fs::write(self.log_path(scope), b""))?;
+        self.collect_blobs(scope, &document);
+        Ok(())
+    }
+
     /// How many whole-document scans this store performed for [`RecordStore::read_parts`].
     ///
     /// The negative space of the [`Picked`] cache, and the only way a test can say "one scan, not
@@ -868,6 +987,39 @@ impl FileStore {
     fn scope_stamp(&self, scope: &str) -> Option<crate::store::DocumentStamp> {
         let meta = retry_while_held(|| fs::metadata(self.scope_path(scope))).ok()?;
         Some((meta.len(), meta.modified().ok(), meta.created().ok()))
+    }
+
+    /// `(len, modified, created)` of one scope's tail; `None` when there is none.
+    fn log_stamp(&self, scope: &str) -> Option<crate::store::DocumentStamp> {
+        let meta = retry_while_held(|| fs::metadata(self.log_path(scope))).ok()?;
+        Some((meta.len(), meta.modified().ok(), meta.created().ok()))
+    }
+
+    /// The parsed tail of `scope` as of `log_stamp`, when this process already parsed exactly it.
+    fn cached_overlay(
+        &self,
+        scope: &str,
+        log_stamp: &Option<crate::store::DocumentStamp>,
+    ) -> Option<Arc<Overlay>> {
+        let overlays = self.overlays.lock().ok()?;
+        let entry = overlays.get(scope)?;
+        (entry.log_stamp == *log_stamp).then(|| Arc::clone(&entry.overlay))
+    }
+
+    /// Keeps a parsed tail until the log's identity changes.
+    fn keep_overlay(
+        &self,
+        scope: &str,
+        log_stamp: Option<crate::store::DocumentStamp>,
+        overlay: Arc<Overlay>,
+    ) {
+        let Ok(mut overlays) = self.overlays.lock() else {
+            return;
+        };
+        if overlays.len() >= DOCUMENT_SCOPES && !overlays.contains_key(scope) {
+            overlays.clear();
+        }
+        overlays.insert(scope.to_string(), CachedOverlay { log_stamp, overlay });
     }
 
     /// The document bytes of `scope`, when this process already read exactly these bytes.
@@ -918,10 +1070,14 @@ impl FileStore {
             Option<std::time::SystemTime>,
             Option<std::time::SystemTime>,
         ),
+        log_stamp: &Option<crate::store::DocumentStamp>,
     ) -> Option<Vec<Option<Value>>> {
         let picked = self.picked.lock().ok()?;
         let entry = picked.get(scope)?;
-        if entry.stamp != *stamp || entry.parts.len() != parts.len() {
+        if entry.stamp != *stamp
+            || entry.log_stamp != *log_stamp
+            || entry.parts.len() != parts.len()
+        {
             return None;
         }
         if !entry
@@ -944,6 +1100,7 @@ impl FileStore {
             Option<std::time::SystemTime>,
             Option<std::time::SystemTime>,
         ),
+        log_stamp: Option<crate::store::DocumentStamp>,
         values: &[Option<Value>],
     ) {
         let Ok(mut picked) = self.picked.lock() else {
@@ -956,6 +1113,7 @@ impl FileStore {
             scope.to_string(),
             Picked {
                 stamp,
+                log_stamp,
                 parts: parts.iter().map(|part| (*part).to_string()).collect(),
                 values: values.to_vec(),
             },
@@ -976,17 +1134,41 @@ impl FileStore {
     /// repeats the same question and the answer can only change when the file does. The reuse is
     /// a stat and a comparison; the scan it skips is the whole conversation.
     fn scope_parts(&self, scope: &str, parts: &[&str]) -> Result<Vec<Option<Value>>> {
+        // The tail is parsed here as well: it is what makes the document current, and it is small
+        // where the document is the conversation. It is kept until the log changes, because the
+        // same poll and the fold behind it repeat against an unchanged tail.
+        let log_stamp = self.log_stamp(scope);
+        let overlay = match self.cached_overlay(scope, &log_stamp) {
+            Some(overlay) => overlay,
+            None => {
+                let overlay = match self.log_bytes(scope)? {
+                    Some(log) if !log.is_empty() => Arc::new(Overlay::from_log(&log)?),
+                    _ => Arc::new(Overlay::default()),
+                };
+                if self.log_stamp(scope) == log_stamp {
+                    self.keep_overlay(scope, log_stamp, Arc::clone(&overlay));
+                }
+                overlay
+            }
+        };
         let path = self.scope_path(scope);
         let stamp = match retry_while_held(|| fs::metadata(&path)) {
             Ok(meta) => (meta.len(), meta.modified().ok(), meta.created().ok()),
-            // A document that was never written answers `None` for everything, and is not
-            // cached: the first write has to be seen.
+            // A document that was never written answers `None` for everything, unless the tail
+            // itself holds the part. Not cached: the first write has to be seen.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(vec![None; parts.len()])
+                let mut values = Vec::with_capacity(parts.len());
+                for part in parts {
+                    values.push(match overlay.puts.get(*part) {
+                        Some(stored) => Some(self.resolve(scope, stored.clone())?),
+                        None => None,
+                    });
+                }
+                return Ok(values);
             }
             Err(error) => return Err(error.into()),
         };
-        if let Some(values) = self.pick_from_cache(scope, parts, &stamp) {
+        if let Some(values) = self.pick_from_cache(scope, parts, &stamp, &log_stamp) {
             return Ok(values);
         }
         let bytes = match retry_while_held(|| fs::read(&path)) {
@@ -1000,8 +1182,14 @@ impl FileStore {
         crate::traffic::count_scope_pick();
         #[cfg(test)]
         self.scans.fetch_add(1, Ordering::Relaxed);
-        let mut values: Vec<Option<Value>> =
-            parts.iter().map(|part| picked.remove(*part)).collect();
+        let mut values: Vec<Option<Value>> = parts
+            .iter()
+            .map(|part| match overlay.puts.get(*part) {
+                Some(value) => Some(value.clone()),
+                None if overlay.removes.contains(*part) => None,
+                None => picked.remove(*part),
+            })
+            .collect();
         for slot in values.iter_mut() {
             if let Some(stored) = slot.take() {
                 // A poll only asks for control records, which are far below the blob threshold, so
@@ -1009,88 +1197,88 @@ impl FileStore {
                 *slot = Some(self.resolve(scope, stored)?);
             }
         }
-        self.keep_picked(scope, parts, stamp, &values);
+        self.keep_picked(scope, parts, stamp, log_stamp, &values);
         Ok(values)
     }
 
-    /// Applies a finished transaction. Only reached when the closure returned `Ok`.
-    fn commit(
+    /// Applies a finished transaction as one appended line.
+    ///
+    /// The document is not read: a commit carries only the parts it changed, so what a commit costs
+    /// no longer follows the size of the session it touches. Once the tail reaches
+    /// [`LOG_COMPACT_BYTES`] it is folded into the document — the same whole-document write this
+    /// store used to do on every commit.
+    fn commit_append(
         &self,
         scope: &str,
         lock: &HeldLock<'_>,
-        base: RawDocument,
         staged: BTreeMap<String, Option<Value>>,
         scheduled: BTreeMap<String, Scheduled>,
     ) -> Result<()> {
-        let mut committed = base;
-        let mut touched = false;
-        let mut removed = false;
+        let mut delta = LogDelta::default();
         for (part, value) in staged {
             if scheduled.contains_key(&part) {
                 continue;
             }
             match value {
                 Some(value) => {
-                    // A payload this large would be rewritten by every later commit of the session,
-                    // so it is stored once and the document keeps a reference to it.
-                    let stored = self.externalize(scope, value)?;
-                    committed.insert(part, raw_of(&stored)?);
+                    // A payload this large would be re-read by every fold of the document, so it
+                    // is stored once and the tail keeps a reference to it.
+                    delta.puts.insert(part, self.externalize(scope, value)?);
                 }
-                None => {
-                    committed.remove(&part);
-                    removed = true;
-                }
+                None => delta.removes.push(part),
             }
-            touched = true;
         }
-        // The readiness index is not part of any scope: two scopes — in this process or in
-        // another host — can schedule the same work id, and one commit can both write one item
-        // and drop another, so without a lock a reader (`ready`) may see half of that batch and a
-        // later writer may put the removed item back. The lock is always taken *after* the scope
-        // lock (this function runs inside `transaction`), so there is one lock order and no cycle
-        // is possible.
         if !scheduled.is_empty() {
-            let index_path = self.work_lock_path();
-            let index_gate = self.gate(WORK_INDEX_LOCK, &index_path)?;
-            let _index = self.hold(&index_gate, &index_path)?;
-            for entry in scheduled.values() {
-                let path = self.work_path(&entry.queue, &entry.work_id);
-                if entry.ready_at < 0 {
-                    match retry_while_held(|| fs::remove_file(&path)) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                    continue;
-                }
-                retry_while_held(|| fs::create_dir_all(self.work_dir(&entry.queue)))?;
-                write_json(
-                    &path,
-                    &WorkRecord {
-                        queue: entry.queue.clone(),
-                        work_id: entry.work_id.clone(),
-                        ready_at: entry.ready_at,
-                        payload: entry.payload.clone(),
-                    },
-                )?;
-            }
+            self.write_scheduled(&scheduled)?;
         }
-        if touched {
-            if self.scope_bytes(scope)?.unwrap_or(0) > ROLL_OUT_BYTES {
-                self.roll_out(scope, &mut committed)?;
+        if delta.puts.is_empty() && delta.removes.is_empty() {
+            return Ok(());
+        }
+        // The last moment at which losing the lock can still be noticed, and the only one that
+        // matters: the lock is what excludes the other writer, so a stolen lock must cost an
+        // abandoned commit, not a lost update.
+        lock.verify()?;
+        self.append_log(scope, &delta)?;
+        // The first commit of a scope also creates its document: a tail with nothing under it would
+        // make every reader fold the whole scope out of the log, and a scope that never reached the
+        // fold threshold would have no document at all.
+        if !self.scope_path(scope).exists() || self.log_size(scope) >= LOG_COMPACT_BYTES {
+            self.compact_scope(scope)?;
+        }
+        Ok(())
+    }
+
+    /// Writes the staged readiness records. The caller holds the scope lock and this takes the
+    /// index lock after it, so there is one lock order and no cycle is possible.
+    ///
+    /// The readiness index is not part of any scope: two scopes — in this process or in another
+    /// host — can schedule the same work id, and one commit can both write one item and drop
+    /// another, so without a lock a reader (`ready`) may see half of that batch and a later writer
+    /// may put the removed item back.
+    fn write_scheduled(&self, scheduled: &BTreeMap<String, Scheduled>) -> Result<()> {
+        let index_path = self.work_lock_path();
+        let index_gate = self.gate(WORK_INDEX_LOCK, &index_path)?;
+        let _index = self.hold(&index_gate, &index_path)?;
+        for entry in scheduled.values() {
+            let path = self.work_path(&entry.queue, &entry.work_id);
+            if entry.ready_at < 0 {
+                match retry_while_held(|| fs::remove_file(&path)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                continue;
             }
-            // The last moment at which losing the lock can still be noticed, and the only one that
-            // matters: the lock is what excludes the other writer, so a stolen lock must cost an
-            // abandoned commit, not a lost update. One small read against a whole-document
-            // rewrite, so the check is cheap enough to make unconditionally.
-            lock.verify()?;
-            let bytes = write_json(&self.scope_path(scope), &committed)?;
-            count_scope_write(bytes);
-            if removed {
-                // Only now: until the document that stopped naming them is on disk, the old one
-                // still references these payloads.
-                self.collect_blobs(scope, &committed);
-            }
+            retry_while_held(|| fs::create_dir_all(self.work_dir(&entry.queue)))?;
+            write_json(
+                &path,
+                &WorkRecord {
+                    queue: entry.queue.clone(),
+                    work_id: entry.work_id.clone(),
+                    ready_at: entry.ready_at,
+                    payload: entry.payload.clone(),
+                },
+            )?;
         }
         Ok(())
     }
@@ -1110,6 +1298,7 @@ impl RecordStore for FileStore {
             scope,
             read_only: false,
             bytes: RefCell::new(None),
+            overlay: RefCell::new(None),
             parts: RefCell::new(BTreeMap::new()),
             staged: BTreeMap::new(),
             scheduled: BTreeMap::new(),
@@ -1121,19 +1310,14 @@ impl RecordStore for FileStore {
             return Err(error);
         }
         TRANSACTIONS.fetch_add(1, Ordering::Relaxed);
-        // A transaction that writes the scope needs the whole document to rewrite it; one that
-        // only wrote work records, or read a few records, never parses it.
-        let base = if staged.staged.is_empty() {
-            RawDocument::new()
-        } else {
-            staged.base_raw()?
-        };
+        // The commit carries only the parts it changed, so it does not read the document: what a
+        // commit costs is its own delta, not the conversation behind it.
         let StagedTxn {
             staged: staged_map,
             scheduled,
             ..
         } = staged;
-        self.commit(scope, &lock, base, staged_map, scheduled)
+        self.commit_append(scope, &lock, staged_map, scheduled)
     }
 
     fn read_transaction(
@@ -1152,6 +1336,7 @@ impl RecordStore for FileStore {
             scope,
             read_only: true,
             bytes: RefCell::new(None),
+            overlay: RefCell::new(None),
             parts: RefCell::new(BTreeMap::new()),
             staged: BTreeMap::new(),
             scheduled: BTreeMap::new(),
@@ -1161,12 +1346,16 @@ impl RecordStore for FileStore {
     }
 
     fn scope_bytes(&self, scope: &str) -> Result<Option<u64>> {
-        match fs::metadata(self.scope_path(scope)) {
-            Ok(meta) => Ok(Some(meta.len())),
-            // A scope that was never written has no document yet.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(0)),
-            Err(error) => Err(error.into()),
-        }
+        // What a reader of this scope has to hold: the document plus the tail not folded into it
+        // yet. A backend that decides what to drop from the scope size must see the whole scope,
+        // not just the last fold.
+        let document = match fs::metadata(self.scope_path(scope)) {
+            Ok(meta) => meta.len(),
+            // A scope that was never folded has no document yet; its tail is the whole scope.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(document + self.log_size(scope)))
     }
 
     fn ready(&self, queue: &str, now: i64, limit: usize) -> Result<Vec<WorkItem>> {
@@ -1230,6 +1419,47 @@ struct Scheduled {
     payload: Option<Value>,
 }
 
+/// The commits appended since the document was folded, in the order they were written.
+///
+/// A reader applies this to whatever the document holds instead of folding it into the document:
+/// the tail is a few kilobytes where the document is the conversation, and serializing the merged
+/// document back into bytes for every reader would give back exactly what the tail saves.
+#[derive(Default)]
+struct Overlay {
+    puts: BTreeMap<String, Value>,
+    removes: HashSet<String>,
+}
+
+impl Overlay {
+    /// The final state the tail describes, one complete line at a time.
+    fn from_log(log: &[u8]) -> Result<Self> {
+        let mut overlay = Self::default();
+        let mut rest = log;
+        while let Some(end) = rest.iter().position(|byte| *byte == b'\n') {
+            let line = &rest[..end];
+            rest = &rest[end + 1..];
+            if line.is_empty() {
+                continue;
+            }
+            let delta: LogDelta = serde_json::from_slice(line)
+                .map_err(|error| DurableError::invalid(format!("scope log is damaged: {error}")))?;
+            overlay.apply(delta);
+        }
+        Ok(overlay)
+    }
+
+    fn apply(&mut self, delta: LogDelta) {
+        for (part, value) in delta.puts {
+            self.removes.remove(&part);
+            self.puts.insert(part, value);
+        }
+        for part in delta.removes {
+            self.puts.remove(&part);
+            self.removes.insert(part);
+        }
+    }
+}
+
 struct StagedTxn<'a> {
     store: &'a FileStore,
     scope: &'a str,
@@ -1246,6 +1476,10 @@ struct StagedTxn<'a> {
     ///
     /// `None` — not read; `Some(None)` — the scope has no document yet.
     bytes: RefCell<Option<Option<Arc<Vec<u8>>>>>,
+    /// The committed tail, applied on top of the document when asked for a part.
+    ///
+    /// `None` — not read; `Some` — the tail since the last fold (empty when nothing was appended).
+    overlay: RefCell<Option<Arc<Overlay>>>,
     /// Values asked for by [`Txn::get`], picked out of the document one record at a time.
     parts: RefCell<BTreeMap<String, Option<Value>>>,
     staged: BTreeMap<String, Option<Value>>,
@@ -1262,9 +1496,31 @@ impl StagedTxn<'_> {
     /// builds; it is taken out before the commit serializes, so no two document-sized buffers
     /// overlap at the peak.
     fn ensure_bytes(&self) -> Result<()> {
-        if self.bytes.borrow().is_some() {
+        if self.overlay.borrow().is_some() {
             return Ok(());
         }
+        // The tail is parsed first: it is what makes the document's answer current, and it is
+        // small — a few lines per commit — where folding it into the document would serialize
+        // the conversation again for every reader. It is kept until the log changes, because the
+        // same fold reads several times per tick against an unchanged tail.
+        let before = self.store.log_stamp(self.scope);
+        let overlay = match self.store.cached_overlay(self.scope, &before) {
+            Some(overlay) => overlay,
+            None => {
+                let overlay = match self.store.log_bytes(self.scope)? {
+                    Some(log) if !log.is_empty() => Arc::new(Overlay::from_log(&log)?),
+                    _ => Arc::new(Overlay::default()),
+                };
+                // A tail that grew while it was being read is left uncached: the next reader
+                // parses it again, which is what keeps a cached answer from hiding a commit.
+                if self.store.log_stamp(self.scope) == before {
+                    self.store
+                        .keep_overlay(self.scope, before, Arc::clone(&overlay));
+                }
+                overlay
+            }
+        };
+        *self.overlay.borrow_mut() = Some(overlay);
         if self.read_only {
             if let Some(bytes) = self.store.cached_document(self.scope) {
                 *self.bytes.borrow_mut() = Some(Some(bytes));
@@ -1318,10 +1574,18 @@ impl StagedTxn<'_> {
         }
         self.ensure_bytes()?;
         let value = {
-            let bytes = self.bytes.borrow();
-            match &*bytes {
-                Some(Some(document)) => pick_parts(document.as_slice(), &[part])?.remove(part),
-                _ => None,
+            let overlay = self.overlay.borrow();
+            let overlay = overlay.as_ref().expect("ensure_bytes parses the tail");
+            if let Some(value) = overlay.puts.get(part) {
+                Some(value.clone())
+            } else if overlay.removes.contains(part) {
+                None
+            } else {
+                let bytes = self.bytes.borrow();
+                match &*bytes {
+                    Some(Some(document)) => pick_parts(document.as_slice(), &[part])?.remove(part),
+                    _ => None,
+                }
             }
         };
         self.parts
@@ -1338,32 +1602,19 @@ impl StagedTxn<'_> {
     fn document_keys(&self) -> Result<BTreeMap<String, Value>> {
         self.ensure_bytes()?;
         let bytes = self.bytes.borrow();
-        match &*bytes {
-            Some(Some(document)) => key_map(document.as_slice()),
-            _ => Ok(BTreeMap::new()),
-        }
-    }
-
-    /// The whole document as raw JSON text per record, for `commit` to rewrite.
-    ///
-    /// `RawValue` keeps each record's exact bytes instead of parsing it into a `Value` tree, so a
-    /// rewrite holds about the document's size rather than several times it. The bytes are taken
-    /// out before the returned map is serialized, so the two buffers never overlap.
-    fn base_raw(&self) -> Result<RawDocument> {
-        self.ensure_bytes()?;
-        let base = {
-            let bytes = self.bytes.borrow();
-            match &*bytes {
-                Some(Some(document)) => {
-                    crate::traffic::count_scope_parse();
-                    serde_json::from_slice::<RawDocument>(document.as_slice())?
-                }
-                _ => RawDocument::new(),
-            }
+        let mut keys = match &*bytes {
+            Some(Some(document)) => key_map(document.as_slice())?,
+            _ => BTreeMap::new(),
         };
-        // Free the document bytes now: `commit` only needs the raw records and its own buffer.
-        *self.bytes.borrow_mut() = None;
-        Ok(base)
+        let overlay = self.overlay.borrow();
+        let overlay = overlay.as_ref().expect("ensure_bytes parses the tail");
+        for part in overlay.puts.keys() {
+            keys.insert(part.clone(), Value::Null);
+        }
+        for part in &overlay.removes {
+            keys.remove(part);
+        }
+        Ok(keys)
     }
 }
 
@@ -1406,11 +1657,23 @@ impl Txn for StagedTxn<'_> {
         // One scan of the document returns the whole page, where a `get` per record would scan
         // it once per record and make a page cost the history it sits in.
         self.ensure_bytes()?;
-        let wanted: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let overlay = self.overlay.borrow();
+        let overlay = overlay.as_ref().expect("ensure_bytes parses the tail");
+        let uncovered: Vec<&str> = parts
+            .iter()
+            .map(String::as_str)
+            .filter(|part| {
+                !self.staged.contains_key(*part)
+                    && !overlay.puts.contains_key(*part)
+                    && !overlay.removes.contains(*part)
+            })
+            .collect();
         let mut picked = {
             let bytes = self.bytes.borrow();
             match &*bytes {
-                Some(Some(document)) => pick_parts(document.as_slice(), &wanted)?,
+                Some(Some(document)) if !uncovered.is_empty() => {
+                    pick_parts(document.as_slice(), &uncovered)?
+                }
                 _ => BTreeMap::new(),
             }
         };
@@ -1418,7 +1681,11 @@ impl Txn for StagedTxn<'_> {
         for part in parts {
             let stored = match self.staged.get(part) {
                 Some(staged) => staged.clone(),
-                None => picked.remove(part.as_str()),
+                None => match overlay.puts.get(part) {
+                    Some(value) => Some(value.clone()),
+                    None if overlay.removes.contains(part) => None,
+                    None => picked.remove(part.as_str()),
+                },
             };
             values.push(match stored {
                 Some(stored) => Some(self.store.resolve(self.scope, stored)?),
@@ -1464,6 +1731,19 @@ impl Txn for StagedTxn<'_> {
 
 fn schedule_key(queue: &str, work_id: &str) -> String {
     format!("\u{1}work:{queue}:{work_id}")
+}
+
+/// One commit's changes, as appended to `scopes/<digest>.log`.
+///
+/// A line per commit, not a document: a transaction writes this and lets the fold merge it into
+/// the document later, so a commit no longer reads or parses the document it changes. Values are
+/// already externalized, so a line carries references where the document would carry bytes.
+#[derive(Default, Serialize, Deserialize)]
+struct LogDelta {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    puts: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removes: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2543,6 +2823,8 @@ mod tests {
         store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
             txn.put("a", Some(json!({"n": 1})))
         })?;
+        // A commit only appends its delta; the fold is what gives the scope its document.
+        store.compact_scope("session")?;
         let reads = store.document_reads();
         for _ in 0..3 {
             let value = crate::store::read(&store, "session", |txn: &mut dyn Txn| txn.get("a"))?;
@@ -2554,7 +2836,7 @@ mod tests {
             "three read-only transactions against an unchanged document read the file once"
         );
 
-        // A write replaces the document, so the next read has to see the new bytes.
+        // A commit appends a tail, so the next read has to apply it to the document.
         store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
             txn.put("a", Some(json!({"n": 2})))
         })?;
@@ -2563,6 +2845,90 @@ mod tests {
             Some(json!({"n": 2})),
             "a write invalidates the cached document"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_committed_delta_reads_back_before_it_is_folded() -> Result<()> {
+        let root = TempRoot::new("log-before-fold");
+        let store = FileStore::open(root.path())?;
+        // The first commit of a scope creates its document, so the tail under test is the one the
+        // commit after it appends.
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!(1)))
+        })?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("b", Some(json!(2)))
+        })?;
+        // Nothing folded yet: the second part lives in the tail only.
+        assert!(store.log_size("session") > 0);
+        let document = fs::read_to_string(store.scope_path("session"))?;
+        assert!(
+            !document.contains("\"b\":"),
+            "the tail is not in the document yet"
+        );
+        assert_eq!(read_value(&store, "session", "a")?, Some(json!(1)));
+        assert_eq!(read_value(&store, "session", "b")?, Some(json!(2)));
+        assert_eq!(
+            store.read_parts("session", &["a", "b"])?,
+            vec![Some(json!(1)), Some(json!(2))]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tail_that_stops_before_its_newline_is_ignored() -> Result<()> {
+        let root = TempRoot::new("log-partial");
+        let store = FileStore::open(root.path())?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("kept", Some(json!(1)))
+        })?;
+        // A process that died mid-append leaves a line without its newline: it must not be read
+        // as a commit, because the newline is what completes one.
+        let mut tail = fs::read(store.log_path("session"))?;
+        tail.extend_from_slice(b"{\"puts\":{\"half\":9}}");
+        fs::write(store.log_path("session"), tail)?;
+        assert_eq!(read_value(&store, "session", "kept")?, Some(json!(1)));
+        assert_eq!(read_value(&store, "session", "half")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn folding_the_tail_changes_nothing_a_reader_sees() -> Result<()> {
+        let root = TempRoot::new("log-fold");
+        let store = FileStore::open(root.path())?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!(1)))
+        })?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("b", Some(json!(2)))?;
+            txn.put("a", None)
+        })?;
+        assert_eq!(read_value(&store, "session", "a")?, None);
+        assert_eq!(read_value(&store, "session", "b")?, Some(json!(2)));
+
+        store.compact_scope("session")?;
+        assert_eq!(store.log_size("session"), 0, "the fold clears the tail");
+        assert_eq!(read_value(&store, "session", "a")?, None);
+        assert_eq!(read_value(&store, "session", "b")?, Some(json!(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_reopened_store_reads_the_appended_tail() -> Result<()> {
+        let root = TempRoot::new("log-reopen");
+        {
+            let store = FileStore::open(root.path())?;
+            store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+                txn.put("a", Some(json!("first")))
+            })?;
+        }
+        let store = FileStore::open(root.path())?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("b", Some(json!("second")))
+        })?;
+        assert_eq!(read_value(&store, "session", "a")?, Some(json!("first")));
+        assert_eq!(read_value(&store, "session", "b")?, Some(json!("second")));
         Ok(())
     }
 
@@ -2639,7 +3005,11 @@ mod tests {
         assert_eq!(read_value(&store, "session", "keep")?, Some(json!(1)));
         assert_eq!(read_value(&store, "session", "fresh")?, None);
         assert!(store.ready("queue", i64::MAX, 10)?.is_empty());
-        assert_eq!(file_count(&root.path().join("scopes")), 1);
+        assert_eq!(
+            file_count(&root.path().join("scopes")),
+            2,
+            "one document and one tail, no temporary file"
+        );
         assert_eq!(file_count(&root.path().join("work")), 0);
         // The OS mode leaves its lock file behind by design: it is the *name* of the lock, and
         // keeping it is what makes the next transaction cost nothing. What must not stay behind is
@@ -2818,6 +3188,8 @@ mod tests {
             txn.put("a", Some(json!(1)))?;
             txn.put("b", Some(json!(2)))
         })?;
+        // The scan reads the document, so the fold has to happen first.
+        store.compact_scope("session")?;
         let first = store.read_parts("session", &["a", "b", "missing"])?;
         assert_eq!(first, vec![Some(json!(1)), Some(json!(2)), None]);
         assert_eq!(store.scans(), 1, "the first question scans the document");
@@ -3057,10 +3429,12 @@ mod tests {
             Some(payload.clone())
         );
 
-        // The next commit of any part moves the legacy payload out of line, once.
+        // The next commit of any part moves the legacy payload out of line, once. A commit only
+        // appends its delta; the fold is the pass that sees, and moves, the whole document.
         store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
             txn.put("small", Some(json!(2)))
         })?;
+        store.compact_scope("session")?;
         let after = store
             .scope_bytes("session")?
             .expect("a file store measures");
@@ -3085,6 +3459,7 @@ mod tests {
 
         // The document itself holds the reference, so a digest of the *document* differs — which
         // is exactly why callers must only ever see the payload, never the reference.
+        store.compact_scope("session")?;
         let document: Value = serde_json::from_slice(&fs::read(store.scope_path("session"))?)?;
         assert_ne!(crate::json::hash(&document)?, digest);
         Ok(())
@@ -3148,6 +3523,8 @@ mod tests {
         store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
             txn.put("dropped", None)
         })?;
+        // The sweep runs in the fold: it is the only pass that sees the whole document.
+        store.compact_scope("session")?;
         assert!(!dropped_blob.exists(), "the unreferenced blob is gone");
         assert_eq!(blob_files(&store, "session").len(), 1);
         assert_eq!(read_value(&store, "session", "kept")?, Some(kept));
