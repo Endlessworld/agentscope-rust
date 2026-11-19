@@ -444,7 +444,7 @@ pub async fn degrade_unreachable_media(messages: &mut [crate::message::Msg]) -> 
 fn remote_media_urls(msg: &crate::message::Msg) -> Vec<String> {
     use crate::message::ContentBlock;
     let mut urls = Vec::new();
-    for block in &msg.content {
+    for block in msg.content.iter() {
         let source = match block {
             ContentBlock::Image(block) => Some(&block.source),
             ContentBlock::Audio(block) => Some(&block.source),
@@ -474,7 +474,7 @@ fn apply_media_degradation(
     use crate::message::{ContentBlock, TextBlock};
     let mut replaced = 0;
     for msg in messages.iter_mut() {
-        for block in msg.content.iter_mut() {
+        for block in msg.content_mut().iter_mut() {
             let placeholder = match block {
                 ContentBlock::Image(block) => {
                     media_placeholder("Image", &block.source, unavailable)

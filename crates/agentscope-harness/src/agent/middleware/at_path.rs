@@ -73,7 +73,8 @@ impl Middleware for AtPathExpansionMiddleware {
         let max_total = self.max_total_chars;
         let fut = async move {
             let mut input = input;
-            let mut messages = input.messages.clone();
+            // The input is owned here, so expand in place instead of copying the whole list.
+            let mut messages = std::mem::take(&mut input.messages);
             for msg in &mut messages {
                 expand_message(msg, &fs, max_total).await;
             }
@@ -142,7 +143,7 @@ async fn expand_message(msg: &mut Msg, fs: &Arc<dyn Filesystem>, max_total_chars
     }
 
     // Append as a new block: image and other non-text blocks must survive expansion.
-    msg.content
+    msg.content_mut()
         .push(ContentBlock::Text(TextBlock::new(preview)));
 }
 
@@ -301,7 +302,7 @@ mod tests {
         let mw = middleware(&dir);
         let mut msg = user_msg("look at @src/a.rs");
         // A pre-existing non-text block must survive expansion.
-        msg.content
+        msg.content_mut()
             .push(ContentBlock::Text(TextBlock::new("keep me")));
         expand_message(&mut msg, &mw.fs, DEFAULT_MAX_TOTAL_CHARS).await;
 

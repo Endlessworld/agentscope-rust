@@ -1439,7 +1439,7 @@ mod tests {
                 Some("run-0".into()),
                 Some("t1".into()),
                 true,
-                "{}",
+                "{}".to_string(),
             )
             .unwrap(),
             JournalEvent::new(
@@ -1450,7 +1450,7 @@ mod tests {
                 Some("run-0".into()),
                 Some("t1".into()),
                 true,
-                r#"{"toolCallId":"call-1"}"#,
+                r#"{"toolCallId":"call-1"}"#.to_string(),
             )
             .unwrap(),
             JournalEvent::new(
@@ -1461,7 +1461,7 @@ mod tests {
                 Some("run-0".into()),
                 Some("t1".into()),
                 true,
-                r#"{"status":"cancelled"}"#,
+                r#"{"status":"cancelled"}"#.to_string(),
             )
             .unwrap(),
         ];

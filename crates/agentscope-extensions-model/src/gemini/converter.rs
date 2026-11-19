@@ -343,7 +343,7 @@ pub fn to_gemini_contents(messages: &[Msg]) -> Vec<GeminiContent> {
         let mut parts: Vec<GeminiPart> = Vec::new();
         let mut tool_results: Vec<GeminiContent> = Vec::new();
 
-        for block in &msg.content {
+        for block in msg.content.iter() {
             match block {
                 ContentBlock::Text(t) => parts.push(GeminiPart::text(t.text.clone())),
                 ContentBlock::Hint(HintBlock { hint, .. }) => {
@@ -575,7 +575,7 @@ pub fn merge_to_content(messages: &[Msg], history_prompt: &str) -> GeminiContent
 
     for msg in messages {
         let name = msg.name.clone().unwrap_or_else(|| "Unknown".to_string());
-        for block in &msg.content {
+        for block in msg.content.iter() {
             match block {
                 ContentBlock::Text(t) => text.push(format!("{name}: {}", t.text)),
                 ContentBlock::Hint(HintBlock { hint, .. }) => {

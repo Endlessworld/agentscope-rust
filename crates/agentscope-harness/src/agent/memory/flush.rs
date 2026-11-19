@@ -249,7 +249,7 @@ fn render_content_blocks(msg: &Msg) -> Option<String> {
         return None;
     }
     let mut parts = Vec::new();
-    for block in &msg.content {
+    for block in msg.content.iter() {
         match block {
             ContentBlock::Text(t) if !t.text.trim().is_empty() => parts.push(t.text.clone()),
             ContentBlock::ToolUse(tu) => parts.push(render_tool_use(tu)),

@@ -450,7 +450,7 @@ fn redact_message_payload(msg: &Msg) -> Msg {
         return msg.clone();
     }
     let mut redacted = msg.clone();
-    redacted.content = redact_media_payloads(msg.content());
+    redacted.content = redact_media_payloads(msg.content()).into();
     redacted
 }
 

@@ -525,7 +525,7 @@ impl ServerMessageConvert {
     /// Mirrors Java `convertFromContentBlocks(Msg, boolean)`.
     pub fn convert_from_content_blocks(msg: &Msg, streaming_chunk: bool) -> Vec<Part> {
         let mut parts = Vec::new();
-        for block in &msg.content {
+        for block in msg.content.iter() {
             let Some(mut part) = content_block_to_part(block) else {
                 continue;
             };

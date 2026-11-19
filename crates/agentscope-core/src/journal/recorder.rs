@@ -228,6 +228,8 @@ fn fingerprint(bytes: &[u8]) -> u64 {
 struct HashingSink {
     hasher: std::collections::hash_map::DefaultHasher,
     len: usize,
+    /// Bytes the same input occupies once escaped as a JSON string body.
+    escaped_len: usize,
 }
 
 impl HashingSink {
@@ -244,6 +246,7 @@ impl std::io::Write for HashingSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         use std::hash::Hasher;
         self.len += buf.len();
+        self.escaped_len += escaped_len_of(buf);
         self.hasher.write(buf);
         Ok(buf.len())
     }
@@ -277,6 +280,22 @@ impl std::io::Write for JsonStringSink<'_> {
 ///
 /// UTF-8 continuation bytes pass through untouched: every byte this rewrites is ASCII, so a
 /// multi-byte sequence is never split.
+/// Byte length `bytes` occupies once escaped as a JSON string body.
+///
+/// The checkpoint payload escapes the whole state into one buffer. Measuring that length while
+/// the state is hashed lets the payload reserve its exact capacity, instead of growing by
+/// doubling and keeping the old and new buffers alive at once during the final realloc.
+fn escaped_len_of(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .map(|&byte| match byte {
+            b'"' | b'\\' | 0x08 | 0x09 | 0x0a | 0x0c | 0x0d => 2,
+            control if control < 0x20 => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
 fn escape_json_into(out: &mut Vec<u8>, bytes: &[u8]) {
     for &byte in bytes {
         match byte {
@@ -1139,9 +1158,10 @@ impl InvocationRecorder {
     fn append_serialized_required(
         &self,
         event_type: &str,
-        payload_json: String,
+        payload_json: impl Into<std::sync::Arc<String>>,
         required: bool,
     ) -> crate::error::Result<u64> {
+        let payload_json: std::sync::Arc<String> = payload_json.into();
         let mut guard = self.lock();
         Self::check(&guard)?;
         let bytes = payload_json.len();
@@ -1173,7 +1193,7 @@ impl InvocationRecorder {
         // canonical context may only receive it after a checkpoint captured a state that
         // lacks it.
         let completed = if event_type == "action/end" {
-            completed_action_result(&payload_json)
+            completed_action_result(payload_json.as_str())
         } else {
             None
         };
@@ -1233,6 +1253,7 @@ impl InvocationRecorder {
     /// happens to be pending at that moment.
     pub async fn flush(&self) -> crate::error::Result<()> {
         // Serializes commits on this recorder. `append` remains synchronous and lock-scoped.
+        crate::diag::mark("flush:enter");
         let _flush_guard = self.flush_lock.lock().await;
         let (batch, expected) = {
             let mut guard = self.lock();
@@ -1265,6 +1286,7 @@ impl InvocationRecorder {
 
         let mut attempt = 0usize;
         let mut rebases = 0usize;
+        crate::diag::mark("flush:batch");
         // The batch id and the expected prefix change when the batch is re-based onto a head
         // that moved under it, so both are loop-local rather than fixed for the whole flush.
         let (mut batch, mut expected) = (batch, expected);
@@ -1289,6 +1311,7 @@ impl InvocationRecorder {
             };
             match commit {
                 Ok(head) => {
+                    crate::diag::mark("flush:committed");
                     {
                         let mut guard = self.lock();
                         guard.durable_seq = head.seq;
@@ -1302,6 +1325,7 @@ impl InvocationRecorder {
                     // Keep the read path short: a cold start folds the tail after the snapshot
                     // instead of the whole chain.
                     self.publish_snapshot_if_due().await;
+                    crate::diag::mark("flush:done");
                     return Ok(());
                 }
                 Err(error) => {
@@ -1591,8 +1615,10 @@ impl InvocationRecorder {
 
     /// Snapshots the working state as durable facts plus a checkpoint.
     pub fn capture_state(&self, state: &AgentState, reason: &str) -> crate::error::Result<()> {
+        crate::diag::mark("checkpoint:capture");
         let messages = message_json(state)?;
-        let state_fingerprint = state_fingerprint(state)?;
+        let (state_fingerprint, state_escaped_len) = state_fingerprint(state)?;
+        crate::diag::mark("checkpoint:fingerprint");
 
         // Decide what changed under the lock, then append with the lock released:
         // `append` takes the same (non-reentrant) mutex.
@@ -1605,8 +1631,10 @@ impl InvocationRecorder {
                     .iter()
                     .all(|message| guard.recorded_messages.contains(&message.id));
             if unchanged {
+                crate::diag::mark("checkpoint:skipped");
                 return Ok(());
             }
+            crate::diag::mark("checkpoint:unchanged");
             let mut prefix = 0;
             while prefix < guard.previous_messages.len()
                 && prefix < messages.len()
@@ -1615,15 +1643,17 @@ impl InvocationRecorder {
                 prefix += 1;
             }
             let replaced = prefix < guard.previous_messages.len();
+            crate::diag::mark("checkpoint:prefix");
             let durable_seq = guard.durable_seq;
             let mut fresh = Vec::new();
-            for message in &state.context {
+            for message in state.context.iter() {
                 if guard.recorded_messages.insert(message.id.clone()) {
                     let applied = guard.input_messages.contains(&message.id);
                     fresh.push((message.clone(), applied));
                 }
             }
             let current = checkpoint_fields(state)?;
+            crate::diag::mark("checkpoint:fields");
             let mut changed: Vec<(&'static str, serde_json::Value)> = Vec::new();
             let before = &guard.previous_sections;
             for (event_type, now, previous) in [
@@ -1652,15 +1682,17 @@ impl InvocationRecorder {
             guard.previous_sections = current;
             (replaced, durable_seq, fresh, changed)
         };
+        crate::diag::mark("checkpoint:plan");
 
         if replaced {
+            crate::diag::mark("checkpoint:replaced");
             self.append(
                 "context/replaced",
-                &serde_json::json!({
-                    "reason": reason,
-                    "messages": state.context,
-                    "previousAsOfSeq": durable_seq,
-                }),
+                &ContextReplaced {
+                    reason,
+                    messages: state.context.as_slice(),
+                    previous_as_of_seq: durable_seq,
+                },
             )?;
         }
 
@@ -1668,38 +1700,44 @@ impl InvocationRecorder {
             if applied {
                 self.append(
                     "input/applied",
-                    &serde_json::json!({ "inputId": message.id }),
+                    &InputApplied {
+                        input_id: &message.id,
+                    },
                 )?;
             }
             self.append(
                 message_event_type(&message),
-                &serde_json::json!({ "message": &message }),
+                &MessageAppended { message: &message },
             )?;
             for call in message.tool_use_blocks() {
                 self.append(
                     "tool/requested",
-                    &serde_json::json!({
-                        "messageId": message.id,
-                        "toolCallId": call.id,
-                        "call": call,
-                    }),
+                    &ToolRequested {
+                        message_id: &message.id,
+                        tool_call_id: &call.id,
+                        call,
+                    },
                 )?;
             }
         }
 
         for (event_type, value) in changed {
-            self.append(event_type, &serde_json::json!({ "state": value }))?;
+            self.append(event_type, &StateChanged { state: &value })?;
         }
+        crate::diag::mark("checkpoint:fresh");
+        crate::diag::mark("checkpoint:payload");
         self.append_serialized_required(
             "state/checkpoint",
-            checkpoint_payload(state, reason)?,
+            checkpoint_payload(state, reason, state_escaped_len)?,
             true,
         )?;
+        crate::diag::mark("checkpoint:appended");
         {
             let mut guard = self.lock();
             guard.previous_state = Some(state_fingerprint);
             guard.previous_messages = messages;
         }
+        crate::diag::mark("checkpoint:done");
         Ok(())
     }
 
@@ -1782,6 +1820,7 @@ impl InvocationRecorder {
             "model/dispatch",
             &serde_json::json!({ "modelCallId": call_id, "attemptId": call_id }),
         )?;
+        crate::diag::mark("request:prepared");
         self.flush().await
     }
 
@@ -1800,6 +1839,7 @@ impl InvocationRecorder {
         status: &str,
         error: Option<&str>,
     ) -> crate::error::Result<()> {
+        crate::diag::mark("commit:finish");
         let result = self.finish_inner(state, status, error).await;
         self.close().await;
         result
@@ -1893,7 +1933,7 @@ impl InvocationRecorder {
         let mut snapshot = state.clone();
         for block in completed {
             let id = block.id.clone().unwrap_or_default();
-            snapshot.context.push(
+            snapshot.context_mut().push(
                 crate::message::MsgBuilder::new()
                     .id(format!("recovered_{id}"))
                     .role(MsgRole::Tool)
@@ -2033,7 +2073,7 @@ fn completed_action_result(payload_json: &str) -> Option<(String, ToolResultBloc
 fn pending_tool_use_ids(state: &AgentState) -> BTreeSet<String> {
     let mut used = BTreeSet::new();
     let mut answered = BTreeSet::new();
-    for message in &state.context {
+    for message in state.context.iter() {
         used.extend(message.tool_use_blocks().map(|call| call.id.clone()));
         answered.extend(
             message
@@ -2056,11 +2096,13 @@ fn message_json(state: &AgentState) -> crate::error::Result<Vec<MessageFingerpri
         .collect()
 }
 
-/// Serializes the state once into a hashing sink to fingerprint it without its JSON text.
-fn state_fingerprint(state: &AgentState) -> crate::error::Result<u64> {
+/// Serializes the state once into a hashing sink to fingerprint it without its JSON text,
+/// also reporting the escaped length the checkpoint payload will need.
+fn state_fingerprint(state: &AgentState) -> crate::error::Result<(u64, usize)> {
     let mut sink = HashingSink::default();
     serde_json::to_writer(&mut sink, state).map_err(crate::error::Error::from)?;
-    Ok(sink.finish().hash)
+    let escaped_len = sink.escaped_len;
+    Ok((sink.finish().hash, escaped_len))
 }
 
 /// The changed-worthy sections of a state, compared against the previous capture.
@@ -2072,12 +2114,54 @@ fn checkpoint_fields(state: &AgentState) -> crate::error::Result<CheckpointField
     })
 }
 
+/// Payload of `context/replaced`, serialized straight from borrowed fields.
+///
+/// Materializing the whole conversation as a `serde_json::Value` tree first would push the
+/// live heap to several times the conversation size; `append` serializes any `Serialize`
+/// directly, so borrow instead.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextReplaced<'a> {
+    reason: &'a str,
+    messages: &'a [Msg],
+    previous_as_of_seq: u64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageAppended<'a> {
+    message: &'a Msg,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolRequested<'a> {
+    message_id: &'a str,
+    tool_call_id: &'a str,
+    call: &'a crate::message::ToolUseBlock,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InputApplied<'a> {
+    input_id: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct StateChanged<'a> {
+    state: &'a serde_json::Value,
+}
+
 /// Builds the `state/checkpoint` payload with the state embedded as an escaped JSON string.
 ///
 /// The state is streamed into the payload buffer, so a checkpoint of a multi-megabyte
 /// conversation never exists as a second `String` (let alone as a `serde_json::Value`).
-fn checkpoint_payload(state: &AgentState, reason: &str) -> crate::error::Result<String> {
-    let mut out: Vec<u8> = Vec::new();
+fn checkpoint_payload(
+    state: &AgentState,
+    reason: &str,
+    escaped_len: usize,
+) -> crate::error::Result<String> {
+    let mut out: Vec<u8> = Vec::with_capacity(escaped_len + reason.len() + 96);
     out.extend_from_slice(b"{\"projectorVersion\":1,\"stateJson\":\"");
     {
         let mut sink = JsonStringSink { out: &mut out };
@@ -2140,6 +2224,79 @@ mod tests {
         // Only growth past the ceiling is refused.
         assert!(!admits_bytes(state, 0, state + 1));
         assert!(!admits_bytes(0, state * 2, 1));
+    }
+
+    /// The event payloads that used to be built with `json!` are written by structs now.
+    ///
+    /// Their text must stay byte-for-byte what the macro produced: a payload is stored in the
+    /// journal, read back by every projection and hashed into the commit, so a field order (or a
+    /// `serde_json` feature) that drifted would change the bytes of a session — and the `sbytes`
+    /// baseline — without any visible breakage.
+    #[test]
+    fn the_structured_payloads_serialize_exactly_as_the_json_macro_did() {
+        let message = Msg::builder()
+            .name("assistant")
+            .role(MsgRole::Assistant)
+            .block(ContentBlock::ToolUse(crate::message::ToolUseBlock::new(
+                "call-1",
+                "shell",
+                crate::message::JsonMap::new(),
+            )))
+            .build();
+        let call = message.tool_use_blocks().next().expect("the tool call");
+        let messages = vec![message.clone()];
+        let state = serde_json::json!({ "sessionId": "s1", "context": [] });
+        let reason = "compaction";
+        let durable_seq = 7;
+
+        assert_eq!(
+            serde_json::to_string(&ContextReplaced {
+                reason,
+                messages: messages.as_slice(),
+                previous_as_of_seq: durable_seq,
+            })
+            .expect("context/replaced"),
+            serde_json::json!({
+                "reason": reason,
+                "messages": &messages,
+                "previousAsOfSeq": durable_seq,
+            })
+            .to_string(),
+            "context/replaced must keep the bytes the macro wrote"
+        );
+        assert_eq!(
+            serde_json::to_string(&MessageAppended { message: &message }).expect("message event"),
+            serde_json::json!({ "message": &message }).to_string(),
+            "a message event must keep the bytes the macro wrote"
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolRequested {
+                message_id: &message.id,
+                tool_call_id: &call.id,
+                call,
+            })
+            .expect("tool/requested"),
+            serde_json::json!({
+                "messageId": &message.id,
+                "toolCallId": &call.id,
+                "call": call,
+            })
+            .to_string(),
+            "tool/requested must keep the bytes the macro wrote"
+        );
+        assert_eq!(
+            serde_json::to_string(&InputApplied {
+                input_id: &message.id,
+            })
+            .expect("input/applied"),
+            serde_json::json!({ "inputId": &message.id }).to_string(),
+            "input/applied must keep the bytes the macro wrote"
+        );
+        assert_eq!(
+            serde_json::to_string(&StateChanged { state: &state }).expect("state/changed"),
+            serde_json::json!({ "state": &state }).to_string(),
+            "state/changed must keep the bytes the macro wrote"
+        );
     }
 
     #[tokio::test]
@@ -2365,7 +2522,7 @@ mod tests {
             run.map(str::to_string),
             turn.map(str::to_string),
             true,
-            payload,
+            payload.to_string(),
         )
         .unwrap()
     }
@@ -2787,7 +2944,7 @@ mod tests {
         recorder.flush().await.unwrap();
 
         // Compaction drops the assistant message; the prefix shrinks.
-        state.context = vec![first];
+        state.context = vec![first].into();
         recorder.capture_state(&state, "compaction").unwrap();
         recorder.flush().await.unwrap();
 
@@ -3080,7 +3237,7 @@ mod tests {
                 Some("run-1".into()),
                 None,
                 true,
-                "{}",
+                "{}".to_string(),
             )
             .unwrap()],
         )
@@ -3195,7 +3352,7 @@ mod tests {
                     Some("run-1".into()),
                     None,
                     true,
-                    "{}",
+                    "{}".to_string(),
                 )
                 .unwrap()],
             )

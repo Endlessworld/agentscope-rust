@@ -103,12 +103,33 @@ impl AtomicThreadJournal {
 
     /// Hex-encoded SHA-256, used for commit/blob/seal/export names and checksums.
     pub fn hash(data: &[u8]) -> String {
-        let digest = Sha256::digest(data);
-        let mut out = String::with_capacity(digest.len() * 2);
-        for byte in digest {
-            out.push_str(&format!("{byte:02x}"));
+        hex_of(Sha256::digest(data).as_slice())
+    }
+
+    /// The checksum of one event batch, hashed while it is serialized.
+    ///
+    /// The checksum covers the escaped JSON text of every event, and a batch can carry a whole
+    /// conversation twice (`context/replaced` followed by the `state/checkpoint` repeating it).
+    /// Materializing that text in a `Vec` just to hash it kept a second copy of the batch alive
+    /// for the whole commit; the same bytes are streamed into the hasher instead.
+    fn hash_events(events: &[JournalEvent]) -> crate::error::Result<String> {
+        /// Feeds everything written to it into a SHA-256 digest.
+        struct Sha256Sink(Sha256);
+
+        impl std::io::Write for Sha256Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.update(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
-        out
+
+        let mut sink = Sha256Sink(Sha256::new());
+        serde_json::to_writer(&mut sink, events).map_err(crate::error::Error::from)?;
+        Ok(hex_of(sink.0.finalize().as_slice()))
     }
 
     fn now_ms() -> i64 {
@@ -197,11 +218,11 @@ impl AtomicThreadJournal {
                         }
                         let json = String::from_utf8(payload.bytes)
                             .map_err(|_| journal_error("Committed payload is not UTF-8"))?;
-                        hydrated.push(with_payload(event, json));
+                        hydrated.push(with_payload(event, json.into()));
                     }
                 }
             }
-            let checked = Self::hash(&serde_json::to_vec(&hydrated)?);
+            let checked = Self::hash_events(&hydrated)?;
             if checked != commit.hash {
                 if !reclaimed {
                     return Err(journal_error("Committed segment checksum mismatch"));
@@ -216,7 +237,7 @@ impl AtomicThreadJournal {
                 ..commit
             });
         }
-        let verified = Self::hash(&serde_json::to_vec(&commit.events)?);
+        let verified = Self::hash_events(&commit.events)?;
         if verified != commit.hash {
             return Err(journal_error("Committed segment checksum mismatch"));
         }
@@ -807,7 +828,15 @@ fn is_unreadable(error: &crate::error::Error) -> bool {
     )
 }
 
-fn with_payload(event: &JournalEvent, json: String) -> JournalEvent {
+fn hex_of(digest: &[u8]) -> String {
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn with_payload(event: &JournalEvent, json: std::sync::Arc<String>) -> JournalEvent {
     JournalEvent {
         schema_version: event.schema_version,
         event_id: event.event_id.clone(),
@@ -968,7 +997,8 @@ impl ThreadJournal for AtomicThreadJournal {
                 return Err(journal_error("Non-contiguous event batch"));
             }
         }
-        let hash = Self::hash(&serde_json::to_vec(events)?);
+        let hash = Self::hash_events(events)?;
+        crate::diag::mark("commit:hash");
         let commit_id = Self::hash(batch_id.as_bytes());
         let commit_path = self.path(&format!("commits/{commit_id}.json"));
         let head_path = self.path("head.json");
@@ -1016,12 +1046,13 @@ impl ThreadJournal for AtomicThreadJournal {
                         }
                     }
                     blobs.insert(event.event_id.clone(), blob);
-                    stored.push(with_payload(event, "{}".to_string()));
+                    stored.push(with_payload(event, "{}".to_string().into()));
                 } else {
                     stored.push(event.clone());
                 }
             }
 
+            crate::diag::mark("commit:blobs");
             let commit = Commit {
                 batch_id: batch_id.to_string(),
                 parent: head.commit_id.clone(),
@@ -1032,6 +1063,7 @@ impl ThreadJournal for AtomicThreadJournal {
                 payload_blobs: blobs,
             };
             let commit_bytes = serde_json::to_vec(&commit)?;
+            crate::diag::mark("commit:record");
             if !self
                 .storage
                 .compare_and_set(&commit_path, 0, &commit_bytes)
@@ -1059,7 +1091,10 @@ impl ThreadJournal for AtomicThreadJournal {
                 .compare_and_set(&head_path, expected, &next_bytes)
                 .await
             {
-                Ok(true) => return Ok(next),
+                Ok(true) => {
+                    crate::diag::mark("commit:head");
+                    return Ok(next);
+                }
                 Ok(false) => continue,
                 Err(error) => {
                     // The write may have landed before the failure surfaced; treat a matching
@@ -1409,7 +1444,7 @@ mod tests {
             Some("run-1".into()),
             Some("t1".into()),
             true,
-            "{}",
+            "{}".to_string(),
         )
         .unwrap()
     }
@@ -1576,12 +1611,40 @@ mod tests {
                 .bytes,
         )
         .unwrap();
-        assert_eq!(raw.events[0].payload_json, "{}");
+        assert_eq!(raw.events[0].payload_json.as_ref(), "{}");
         assert_eq!(raw.payload_blobs.len(), 1);
 
         // Reading hydrates the original payload and verifies the checksum.
         let read = log.scan(0, 1).await.unwrap();
-        assert_eq!(read[0].payload_json, payload);
+        assert_eq!(read[0].payload_json.as_ref(), payload.as_str());
+    }
+
+    #[test]
+    fn the_batch_checksum_is_the_hash_of_the_materialized_batch() {
+        // The stored checksum is verified against a re-serialized batch on read, so streaming
+        // the hash must produce exactly the bytes a materialized batch would (an existing
+        // journal is otherwise reported as corrupt). The payload carries a quote, a newline
+        // and a backslash so the escaping path is covered as well as the size.
+        let big = "y".repeat(MAX_INLINE_PAYLOAD_BYTES + 16);
+        let events = vec![
+            event(1, "run/start"),
+            JournalEvent::new(
+                "e2",
+                2,
+                0,
+                "state/checkpoint",
+                None,
+                None,
+                true,
+                serde_json::json!({ "blob": big, "note": "a\"b\nc\\d" }).to_string(),
+            )
+            .unwrap(),
+        ];
+        let materialized = AtomicThreadJournal::hash(&serde_json::to_vec(&events).unwrap());
+        assert_eq!(
+            AtomicThreadJournal::hash_events(&events).unwrap(),
+            materialized
+        );
     }
 
     #[tokio::test]

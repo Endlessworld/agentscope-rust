@@ -323,7 +323,7 @@ impl Middleware for InboxMiddleware {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                guard.context.extend(notifications.iter().cloned());
+                guard.context_mut().extend(notifications.iter().cloned());
             }
             input.messages.extend(notifications);
 
@@ -531,7 +531,7 @@ mod tests {
         // The same record was announced on an earlier step; the stable hint id is what makes
         // the deduplication possible (a random id re-announced it every step).
         let state = Arc::new(std::sync::Mutex::new(AgentState::builder().build()));
-        state.lock().unwrap().context.push(notification_for(
+        state.lock().unwrap().context_mut().push(notification_for(
             Some("system"),
             "stale hint",
             Some("stale:rec-1"),

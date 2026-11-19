@@ -474,7 +474,7 @@ mod tests {
             state.user_id = Some(user.to_string());
         }
         for message in messages {
-            state.context.push(message);
+            state.context_mut().push(message);
         }
         recorder.start(&[], &state).await.unwrap();
         recorder.finish(&state, "completed").await.unwrap();

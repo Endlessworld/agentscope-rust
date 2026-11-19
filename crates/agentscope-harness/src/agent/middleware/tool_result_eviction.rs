@@ -89,7 +89,7 @@ fn apply_to_state(ctx: &RuntimeContext, replacements: &HashMap<ToolResultFingerp
     let mut guard = state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for message in guard.context.iter_mut() {
+    for message in guard.context_mut().iter_mut() {
         let mut hits: Vec<(usize, String)> = Vec::new();
         for (index, block) in message.content.iter().enumerate() {
             let ContentBlock::ToolResult(tr) = block else {
@@ -105,7 +105,7 @@ fn apply_to_state(ctx: &RuntimeContext, replacements: &HashMap<ToolResultFingerp
         if hits.is_empty() {
             continue;
         }
-        let mut blocks = std::mem::take(&mut message.content);
+        let mut blocks = std::mem::take(message.content_mut());
         for (index, placeholder) in hits {
             let block = std::mem::replace(
                 &mut blocks[index],
@@ -115,7 +115,7 @@ fn apply_to_state(ctx: &RuntimeContext, replacements: &HashMap<ToolResultFingerp
                 blocks[index] = ContentBlock::ToolResult(with_placeholder(tr, placeholder));
             }
         }
-        message.content = blocks;
+        message.content = blocks.into();
     }
 }
 
@@ -161,7 +161,7 @@ async fn evict_message(
     // block would clone the whole conversation on every reasoning step.
     let mut placeholders: Vec<Option<String>> = Vec::with_capacity(msg.content.len());
     let mut changed = false;
-    for block in &msg.content {
+    for block in msg.content.iter() {
         let placeholder = match block {
             ContentBlock::ToolResult(tr) if !is_evicted(tr) => {
                 let fp = fingerprint(tr);
@@ -183,7 +183,7 @@ async fn evict_message(
     if !changed {
         return (msg, false);
     }
-    let blocks = std::mem::take(&mut msg.content);
+    let blocks = std::mem::take(msg.content_mut());
     msg.content = blocks
         .into_iter()
         .zip(placeholders)
@@ -193,7 +193,8 @@ async fn evict_message(
             }
             (block, _) => block,
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
     (msg, true)
 }
 
@@ -432,7 +433,7 @@ mod tests {
             .build();
         let small = Msg::tool("call_2", "execute", "tiny");
         let mut state = agentscope_core::state::AgentState::default();
-        state.context = vec![big, small];
+        state.context = vec![big, small].into();
         let state = Arc::new(std::sync::Mutex::new(state));
         let mut ctx = RuntimeContext::new();
         ctx.state = Some(Arc::clone(&state));
@@ -443,7 +444,7 @@ mod tests {
             &config,
             "agent",
             &ctx,
-            state.lock().unwrap().context.clone(),
+            state.lock().unwrap().context().to_vec(),
             &mut replacements,
         )
         .await;

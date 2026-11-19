@@ -98,7 +98,7 @@ pub async fn interrupted_model_output(
     // superseded by a retry.
     let mut open: Option<InterruptedOutput> = None;
     let mut visit = |event: &JournalEvent| -> crate::error::Result<()> {
-        let payload: serde_json::Value = match serde_json::from_str(&event.payload_json) {
+        let payload: serde_json::Value = match serde_json::from_str(event.payload_json.as_str()) {
             Ok(value) => value,
             // A payload that cannot be decoded is not evidence of an unfinished call.
             Err(_) => return Ok(()),
@@ -240,15 +240,30 @@ impl MergedChunk {
         }
         self.chunks += 1;
         for block in &chunk.content {
-            self.bytes += serde_json::to_string(block)
-                .map(|json| json.len())
-                .unwrap_or(0);
+            // Charge the coalescing budget by the text that actually has to be buffered. The
+            // previous `serde_json::to_string(block)` measured the same thing by serializing
+            // every streamed block, which is a full JSON copy per delta on a token stream.
             match block {
-                ContentBlock::Text(text) => self.text.push_str(&text.text),
-                ContentBlock::Thinking(thinking) => self.thinking.push_str(&thinking.thinking),
-                ContentBlock::ToolUse(call) => self.tool_calls.push(call.clone()),
-                ContentBlock::ToolResult(result) => self.tool_results.push(result.clone()),
-                other => self.other.push(other.clone()),
+                ContentBlock::Text(text) => {
+                    self.bytes += text.text.len();
+                    self.text.push_str(&text.text);
+                }
+                ContentBlock::Thinking(thinking) => {
+                    self.bytes += thinking.thinking.len();
+                    self.thinking.push_str(&thinking.thinking);
+                }
+                ContentBlock::ToolUse(call) => {
+                    self.bytes += 64;
+                    self.tool_calls.push(call.clone());
+                }
+                ContentBlock::ToolResult(result) => {
+                    self.bytes += 64;
+                    self.tool_results.push(result.clone());
+                }
+                other => {
+                    self.bytes += 64;
+                    self.other.push(other.clone());
+                }
             }
         }
     }

@@ -46,9 +46,9 @@ async fn seed_session(store: &InMemoryThreadJournalStore) {
     let recorder = InvocationRecorder::open(log, None).await.unwrap();
     let mut state = AgentState::builder().session_id("s1").user_id(USER).build();
     state
-        .context
+        .context_mut()
         .push(Msg::user("How do quantum computers work?"));
-    state.context.push(Msg::assistant(
+    state.context_mut().push(Msg::assistant(
         "Quantum computers use qubits and superposition.",
     ));
     recorder.start(&[], &state).await.unwrap();
@@ -124,7 +124,7 @@ async fn session_tools_do_not_leak_across_users() {
         .session_id("s1")
         .user_id("bob")
         .build();
-    state.context.push(Msg::user("qubits are fun"));
+    state.context_mut().push(Msg::user("qubits are fun"));
     recorder.start(&[], &state).await.unwrap();
     recorder.finish(&state, "completed").await.unwrap();
 

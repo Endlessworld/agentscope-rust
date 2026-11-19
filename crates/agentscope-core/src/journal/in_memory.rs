@@ -178,7 +178,7 @@ mod tests {
             Some("run-1".into()),
             Some("t1".into()),
             true,
-            "{}",
+            "{}".to_string(),
         )
         .unwrap();
         log.commit(&writer, "b1", 0, std::slice::from_ref(&event))

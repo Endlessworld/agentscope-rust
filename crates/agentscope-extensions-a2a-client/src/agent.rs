@@ -802,7 +802,7 @@ async fn drain_call(events: EventStream, outcome: CallOutcome) -> Result<Msg, A2
 fn history_of(state: &Arc<Mutex<AgentState>>) -> Vec<Msg> {
     state
         .lock()
-        .map(|state| state.context.clone())
+        .map(|state| state.context().to_vec())
         .unwrap_or_default()
 }
 
@@ -812,7 +812,7 @@ fn append_to_history(state: &Arc<Mutex<AgentState>>, messages: &[Msg]) {
         return;
     }
     if let Ok(mut state) = state.lock() {
-        state.context.extend(messages.iter().cloned());
+        state.context_mut().extend(messages.iter().cloned());
     }
 }
 

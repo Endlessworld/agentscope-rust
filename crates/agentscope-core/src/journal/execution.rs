@@ -230,7 +230,7 @@ impl SessionExecution {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let mut known = recorder.accepted_message_ids();
-        for message in &state.context {
+        for message in state.context.iter() {
             known.insert(message.id.clone());
         }
         let snapshot = inbox.snapshot().await?;
@@ -249,7 +249,7 @@ impl SessionExecution {
             }
             for message in &command.messages {
                 if known.insert(message.id.clone()) {
-                    state.context.push(message.clone());
+                    state.context_mut().push(message.clone());
                 }
             }
             accepted.push(command.id.clone());

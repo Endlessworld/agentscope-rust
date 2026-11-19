@@ -121,7 +121,7 @@ pub fn run_key(ctx: &RuntimeContext) -> String {
 /// The flattened text of one message: text blocks plus the text blocks of any tool result.
 fn message_text(message: &Msg) -> String {
     let mut parts: Vec<&str> = Vec::new();
-    for block in &message.content {
+    for block in message.content.iter() {
         match block {
             ContentBlock::Text(text) => parts.push(text.text.as_str()),
             ContentBlock::ToolResult(result) => {

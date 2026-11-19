@@ -149,7 +149,7 @@ fn document_messages(msg: &Msg) -> Result<Vec<DashScopeMessage>> {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for block in &msg.content {
+    for block in msg.content.iter() {
         let ContentBlock::Document(document) = block else {
             continue;
         };
@@ -663,7 +663,7 @@ fn to_dashscope_messages_flagged(
         std::collections::BTreeMap::new();
     for mut msg in messages {
         if msg.role == MsgRole::Assistant {
-            for block in &msg.content {
+            for block in msg.content.iter() {
                 if let ContentBlock::ToolUse(tool_use) = block {
                     if !tool_use.id.is_empty() && !tool_use.name.trim().is_empty() {
                         tool_names.insert(tool_use.id.clone(), tool_use.name.clone());
@@ -671,7 +671,7 @@ fn to_dashscope_messages_flagged(
                 }
             }
         } else if msg.role == MsgRole::Tool {
-            for block in msg.content.iter_mut() {
+            for block in msg.content_mut().iter_mut() {
                 if let ContentBlock::ToolResult(tr) = block {
                     if tr.name.as_deref().map(str::trim).unwrap_or("").is_empty() {
                         if let Some(name) = tr.id.as_ref().and_then(|id| tool_names.get(id)) {
@@ -710,7 +710,7 @@ fn reject_document_urls_on_multimodal_endpoint(messages: &[Msg]) -> Result<()> {
         if msg.role != MsgRole::User {
             continue;
         }
-        for block in &msg.content {
+        for block in msg.content.iter() {
             if let ContentBlock::Document(document) = block {
                 if matches!(document.source, Source::Url(_)) {
                     return Err(agentscope_core::Error::Other(
@@ -880,7 +880,7 @@ fn merge_history_text_and_parts(messages: &[Msg]) -> (String, Vec<DashScopeConte
 
     for msg in messages {
         let name = agent_name(msg);
-        for block in &msg.content {
+        for block in msg.content.iter() {
             match block {
                 ContentBlock::Text(t) => text.push_str(&format!("{name}: {}\n", t.text)),
                 ContentBlock::Hint(h) => {
@@ -1007,7 +1007,7 @@ pub fn merge_multimodal_conversation(
 
     for msg in messages {
         let name = agent_name(msg);
-        for block in &msg.content {
+        for block in msg.content.iter() {
             match block {
                 ContentBlock::Text(t) => text.push(format!("{name}: {}", t.text)),
                 ContentBlock::Hint(h) => {

@@ -233,7 +233,7 @@ mod tests {
                 Some("run-1".into()),
                 None,
                 true,
-                "{}",
+                "{}".to_string(),
             )
             .unwrap(),
             JournalEvent::new(
@@ -244,7 +244,7 @@ mod tests {
                 Some("run-1".into()),
                 None,
                 true,
-                "{}",
+                "{}".to_string(),
             )
             .unwrap(),
         ];
@@ -285,7 +285,7 @@ mod tests {
                     Some("run-1".into()),
                     None,
                     true,
-                    "{}",
+                    "{}".to_string(),
                 )
                 .unwrap()
             })
@@ -318,7 +318,7 @@ mod tests {
                     Some("run-1".into()),
                     None,
                     true,
-                    "{}",
+                    "{}".to_string(),
                 )
                 .unwrap()
             })
@@ -426,7 +426,7 @@ mod tests {
                         Some("run-1".into()),
                         None,
                         true,
-                        "{}",
+                        "{}".to_string(),
                     )
                     .unwrap()
                 })

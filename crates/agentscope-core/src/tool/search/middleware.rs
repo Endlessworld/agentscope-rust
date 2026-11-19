@@ -91,11 +91,8 @@ impl ToolSearchMiddleware {
 
         if !loaded.is_empty() {
             if let Some(state) = &ctx.state {
-                state
-                    .lock()
-                    .unwrap()
-                    .tool_context
-                    .add_discovered_tools(loaded.iter().cloned());
+                let mut guard = state.lock().unwrap();
+                Arc::make_mut(&mut guard.tool_context).add_discovered_tools(loaded.iter().cloned());
             }
         }
 
@@ -189,7 +186,7 @@ fn refresh_search_results(
     for message in messages {
         let mut content: Vec<ContentBlock> = Vec::with_capacity(message.content.len());
         let mut message_changed = false;
-        for block in &message.content {
+        for block in message.content.iter() {
             let mut next = block.clone();
             if let ContentBlock::ToolResult(result) = block {
                 if let Some(serde_json::Value::Array(matches)) = result.metadata.get(METADATA_TOOLS)
@@ -230,7 +227,7 @@ fn refresh_search_results(
         }
         if message_changed {
             let mut message = message.clone();
-            message.content = content;
+            message.content = content.into();
             refreshed.push(message);
             changed = true;
         } else {
@@ -382,9 +379,7 @@ mod tests {
         let toolkit = Toolkit::new();
         let middleware = ToolSearchMiddleware::new(&toolkit).unwrap();
         let mut state = AgentState::default();
-        state
-            .tool_context
-            .add_discovered_tools(["read_file".to_string()]);
+        Arc::make_mut(&mut state.tool_context).add_discovered_tools(["read_file".to_string()]);
         let ctx = RuntimeContext {
             state: Some(Arc::new(Mutex::new(state))),
             ..RuntimeContext::default()

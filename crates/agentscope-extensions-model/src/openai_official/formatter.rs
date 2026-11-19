@@ -164,7 +164,7 @@ impl ResponsesMultiAgentFormatter {
         include_prefix: bool,
     ) -> Result<(), agentscope_core::Error> {
         let agent_name = msg.name.as_deref();
-        for block in &msg.content {
+        for block in msg.content.iter() {
             match block {
                 ContentBlock::Text(text) => {
                     if include_prefix {

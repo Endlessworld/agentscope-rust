@@ -278,6 +278,7 @@ impl ContextPipeline {
         options: GenerateOptions,
         task_state: Option<&TaskContextState>,
     ) -> crate::Result<PrepareOutcome> {
+        agentscope_core::diag::mark("context:enter");
         let purpose = request.purpose;
         let task_revision = task_state.map(|state| state.revision()).unwrap_or(0);
         let mut transforms: Vec<String> = Vec::new();
@@ -286,6 +287,7 @@ impl ContextPipeline {
         let collected: CollectedMaterials = self.config.sources.collect(&request).await?;
         transforms.extend(collected.transforms.clone());
         let mut selected = collected.items;
+        agentscope_core::diag::mark("context:collect");
 
         // An auxiliary call sees no non-System material at all.
         if purpose != ContextPurpose::Reasoning {
@@ -306,7 +308,21 @@ impl ContextPipeline {
         // 3. Tool-result eviction. Java runs this inside the compiler as well: offloading an
         // oversized historical result changes the view that is measured and sent, so doing it
         // only in a sibling middleware pass would budget a request nobody ever sees.
-        let mut current = self.with_materials(messages.clone(), &selected);
+        // `with_materials` consumes and rebuilds the list, so handing it the owned list avoids
+        // a deep copy of the whole conversation on every compile. The original is only needed
+        // again if the budget-omission pass may rebuild the list.
+        let omission_candidates = if purpose == ContextPurpose::Reasoning {
+            self.config.selection.omission_order(&selected)
+        } else {
+            Vec::new()
+        };
+        let mut base = Some(messages);
+        let mut current = if omission_candidates.is_empty() {
+            self.with_materials(base.take().expect("base present"), &selected)
+        } else {
+            self.with_materials(base.as_ref().expect("base present").clone(), &selected)
+        };
+        agentscope_core::diag::mark("context:materials");
         if purpose == ContextPurpose::Reasoning {
             if let Some(eviction) = &self.config.eviction {
                 let fs_ctx = call_context(&request);
@@ -327,12 +343,14 @@ impl ContextPipeline {
                 current = rebuilt;
             }
         }
+        agentscope_core::diag::mark("context:evict");
         // 3.5 Task projection. Java projects inside the compiler before measuring, so the
         // budget counts the synthetic state message the provider will actually receive.
         if purpose == ContextPurpose::Reasoning && task_state.is_some() {
             current = self.project_task(current, task_state);
             transforms.push("task_state_projection".to_string());
         }
+        agentscope_core::diag::mark("context:project");
         let limit = self.input_limit(model.as_ref(), &options);
         let mut local_estimate = self
             .config
@@ -344,7 +362,7 @@ impl ContextPipeline {
         let mut observed_tokens = context_usage(&current, &tools, Some(model.model_name())).tokens;
 
         if purpose == ContextPurpose::Reasoning && observed_tokens > limit {
-            let order = self.config.selection.omission_order(&selected);
+            let order = omission_candidates;
             // Validate every candidate before touching the list: an eviction order that names
             // required/System material is a policy bug, not something to silently skip.
             {
@@ -373,8 +391,10 @@ impl ContextPipeline {
                 }
                 selected.retain(|candidate| candidate.source_id != id);
                 transforms.push(format!("omitted_for_budget:{id}"));
-                current =
-                    self.project_task(self.with_materials(messages.clone(), &selected), task_state);
+                current = self.project_task(
+                    self.with_materials(base.as_ref().expect("base present").clone(), &selected),
+                    task_state,
+                );
                 local_estimate = self
                     .config
                     .policy
@@ -397,6 +417,7 @@ impl ContextPipeline {
 
         // 4. Stable layout: one System message, conversation, state, references.
         let mut prepared = layout_messages(current);
+        agentscope_core::diag::mark("context:layout");
         if self.config.project_plan_state && purpose == ContextPurpose::Reasoning {
             prepared = remove_synthetic(prepared, &[MessageKind::PlanState]);
         }
@@ -590,7 +611,7 @@ impl ContextPipeline {
             let over = (estimate(&messages) - limit).max(1);
             let drop_chars = ((over as f64 * 2.5).ceil() as usize).max(64) + MARKER.chars().count();
             if drop_chars >= total_chars {
-                messages[message_index].content[block_index] =
+                messages[message_index].content_mut()[block_index] =
                     ContentBlock::Text(TextBlock::new(""));
                 continue;
             }
@@ -603,7 +624,7 @@ impl ContextPipeline {
             let chars: Vec<char> = text.text.chars().collect();
             let head: String = chars[..head_len].iter().collect();
             let tail: String = chars[total_chars - tail_len..].iter().collect();
-            messages[message_index].content[block_index] =
+            messages[message_index].content_mut()[block_index] =
                 ContentBlock::Text(TextBlock::new(format!("{head}{MARKER}{tail}")));
         }
         messages
@@ -806,7 +827,7 @@ impl ContextPipeline {
 pub fn validate_tool_pairs(messages: &[Msg]) -> std::result::Result<(), String> {
     let mut pending: HashSet<String> = HashSet::new();
     for message in messages {
-        for block in &message.content {
+        for block in message.content.iter() {
             match block {
                 ContentBlock::ToolUse(call) => {
                     if call.id.trim().is_empty() || !pending.insert(call.id.clone()) {

@@ -82,7 +82,7 @@ fn estimate_message_tokens(msg: &Msg) -> usize {
     if let Some(name) = &msg.name {
         tokens += estimate_text_tokens(name);
     }
-    for block in &msg.content {
+    for block in msg.content.iter() {
         tokens += estimate_content_block_tokens(block);
     }
     tokens
@@ -984,7 +984,7 @@ fn find_safe_cutoff_point(messages: &[Msg], cutoff: usize) -> usize {
     let mut tool_call_ids: Vec<String> = Vec::new();
     let mut idx = cutoff;
     while idx < messages.len() && messages[idx].role == MsgRole::Tool {
-        for block in &messages[idx].content {
+        for block in messages[idx].content.iter() {
             if let ContentBlock::ToolResult(tr) = block {
                 if let Some(id) = &tr.id {
                     tool_call_ids.push(id.clone());
@@ -999,7 +999,7 @@ fn find_safe_cutoff_point(messages: &[Msg], cutoff: usize) -> usize {
     for i in (0..cutoff).rev() {
         let msg = &messages[i];
         if msg.role == MsgRole::Assistant {
-            for block in &msg.content {
+            for block in msg.content.iter() {
                 if let ContentBlock::ToolUse(tu) = block {
                     if tool_call_ids.iter().any(|id| id == &tu.id) {
                         return i;
@@ -1034,7 +1034,7 @@ fn render_message_for_summary(msg: &Msg) -> String {
         _ => role_name(msg.role),
     };
     let mut parts: Vec<String> = Vec::new();
-    for block in &msg.content {
+    for block in msg.content.iter() {
         match block {
             ContentBlock::Text(t) if !t.text.trim().is_empty() => {
                 parts.push(t.text.trim().to_string());
@@ -1246,7 +1246,7 @@ fn determine_truncate_cutoff(messages: &[Msg], cfg: &TruncateArgsConfig) -> usiz
 fn truncate_tool_use_args(msg: &Msg, cfg: &TruncateArgsConfig) -> Msg {
     let mut any_modified = false;
     let mut new_blocks: Vec<ContentBlock> = Vec::with_capacity(msg.content.len());
-    for block in &msg.content {
+    for block in msg.content.iter() {
         match block {
             ContentBlock::ToolUse(tu) => {
                 let truncated = truncate_tool_use_block(tu, cfg);
@@ -1359,7 +1359,7 @@ pub fn prune_tool_results(messages: &[Msg], prune: Option<&PruneConfig>) -> Vec<
             .metadata(tr.metadata.clone())
             .state(tr.state)
             .build();
-        let mut new_blocks = msg.content.clone();
+        let mut new_blocks = (*msg.content).clone();
         new_blocks[block_idx] = ContentBlock::ToolResult(pruned);
         let mut m = Msg::builder()
             .id(msg.id.clone())

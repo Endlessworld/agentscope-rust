@@ -427,7 +427,7 @@ pub fn map_user_message(msg: &Msg, items: &mut Vec<Value>) -> Result<()> {
     }
 
     let mut parts = Vec::new();
-    for block in &msg.content {
+    for block in msg.content.iter() {
         match block {
             ContentBlock::Text(text) => parts.push(input_text(&text.text)),
             ContentBlock::Image(image) => {
@@ -546,7 +546,7 @@ pub fn map_assistant_message(msg: &Msg, items: &mut Vec<Value>) -> Result<()> {
         items.push(easy_message("assistant", Value::String(text)));
     }
 
-    for block in &msg.content {
+    for block in msg.content.iter() {
         match block {
             ContentBlock::ToolUse(tool) => map_tool_use_block(tool, items)?,
             ContentBlock::ToolResult(result) if result.is_server_tool() => {
@@ -585,7 +585,7 @@ pub fn map_tool_message(msg: &Msg, items: &mut Vec<Value>) -> Result<()> {
                 .to_string(),
         ));
     }
-    for block in &msg.content {
+    for block in msg.content.iter() {
         match block {
             ContentBlock::ToolResult(result) => map_tool_result_block(result, items)?,
             other => {
@@ -1061,7 +1061,7 @@ pub fn resolve_data_block_image_url(block: &DataBlock) -> Result<String> {
 
 fn collect_text(msg: &Msg) -> Option<String> {
     let mut parts = Vec::new();
-    for block in &msg.content {
+    for block in msg.content.iter() {
         if let ContentBlock::Text(text) = block {
             parts.push(text.text.clone());
         }

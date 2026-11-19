@@ -197,7 +197,7 @@ pub(crate) fn apply_transcript_event(
         "migration/baseline" => {
             if let Some(state) = event.data()?.get("stateJson").and_then(|v| v.as_str()) {
                 let restored = crate::state::AgentState::from_json_str(state)?;
-                for msg in restored.context {
+                for msg in restored.context.iter().cloned() {
                     if !messages.contains_key(&msg.id) {
                         ordered.push(msg.id.clone());
                         messages.insert(msg.id.clone(), msg);

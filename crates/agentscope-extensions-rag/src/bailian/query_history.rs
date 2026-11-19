@@ -82,7 +82,7 @@ impl QueryHistoryEntry {
 /// non-text blocks are ignored, and a null / empty content list yields an empty string.
 fn extract_text_content(msg: &Msg) -> String {
     let mut text = String::new();
-    for block in &msg.content {
+    for block in msg.content.iter() {
         if let ContentBlock::Text(text_block) = block {
             if !text.is_empty() {
                 text.push('\n');

@@ -424,7 +424,7 @@ mod tests {
             None,
             None,
             false,
-            "{}",
+            "{}".to_string(),
         )
         .unwrap();
         journal

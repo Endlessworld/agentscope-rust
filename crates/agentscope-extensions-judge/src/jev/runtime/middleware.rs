@@ -107,7 +107,7 @@ fn result_state_name(state: agentscope_core::message::ToolResultState) -> &'stat
 pub fn trace_message(message: &Msg) -> TraceMessage {
     let mut blocks = Vec::new();
     let mut text = String::new();
-    for block in &message.content {
+    for block in message.content.iter() {
         match block {
             ContentBlock::Text(block) => {
                 text.push_str(&block.text);

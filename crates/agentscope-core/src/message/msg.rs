@@ -75,7 +75,7 @@ pub struct Msg {
     /// Role of the message sender.
     pub role: MsgRole,
     /// Content blocks that make up the message content.
-    pub content: Vec<ContentBlock>,
+    pub content: std::sync::Arc<Vec<ContentBlock>>,
     /// Additional metadata. Never null; defaults to an empty map.
     pub metadata: JsonMap,
     /// Timestamp in `yyyy-MM-dd HH:mm:ss.SSS` format.
@@ -122,7 +122,7 @@ impl Msg {
             id: id.into(),
             name,
             role,
-            content,
+            content: content.into(),
             metadata,
             timestamp: timestamp.unwrap_or_else(current_timestamp),
             usage,
@@ -217,7 +217,12 @@ impl Msg {
 
     /// The immutable list of content blocks.
     pub fn content(&self) -> &[ContentBlock] {
-        &self.content
+        self.content.as_slice()
+    }
+
+    /// The content blocks, for in-place edits (copy-on-write when the message is shared).
+    pub fn content_mut(&mut self) -> &mut Vec<ContentBlock> {
+        std::sync::Arc::make_mut(&mut self.content)
     }
 
     /// The metadata associated with this message.
@@ -341,7 +346,7 @@ impl Msg {
     /// Returns a copy of this message with the given content blocks.
     pub fn with_content(&self, new_content: Vec<ContentBlock>) -> Self {
         let mut msg = self.clone();
-        msg.content = new_content;
+        msg.content = new_content.into();
         msg
     }
 
@@ -491,19 +496,19 @@ impl MsgBuilder {
 
     /// Sets content from a list of content blocks.
     pub fn content(mut self, content: Vec<ContentBlock>) -> Self {
-        self.content = content;
+        self.content = content.into();
         self
     }
 
     /// Sets content from a single content block.
     pub fn block(mut self, block: ContentBlock) -> Self {
-        self.content = vec![block];
+        self.content = vec![block].into();
         self
     }
 
     /// Sets text content from a string.
     pub fn text_content(mut self, text: impl Into<String>) -> Self {
-        self.content = vec![ContentBlock::Text(TextBlock::new(text))];
+        self.content = vec![ContentBlock::Text(TextBlock::new(text))].into();
         self
     }
 

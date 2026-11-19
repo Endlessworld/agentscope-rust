@@ -580,7 +580,7 @@ pub fn to_anthropic_messages(messages: &[Msg], fmt: &ChatFormatOptions) -> Vec<A
         let mut end = index;
         loop {
             let msg = &messages[end];
-            for block in &msg.content {
+            for block in msg.content.iter() {
                 if let ContentBlock::ToolResult(result) = block {
                     if !result.is_server_tool() {
                         tool_results.push(tool_result_block(result, fmt));
@@ -966,7 +966,7 @@ pub fn merge_conversation(
 
     for msg in messages {
         let name = msg.name.clone().unwrap_or_else(|| role_label(msg.role));
-        for block in &msg.content {
+        for block in msg.content.iter() {
             match block {
                 ContentBlock::Text(t) => text.push(format!("{name}: {}", t.text)),
                 ContentBlock::Hint(HintBlock { hint, .. }) => {

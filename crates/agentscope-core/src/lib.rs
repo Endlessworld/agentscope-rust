@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod credential;
+pub mod diag;
 pub mod error;
 pub mod event;
 pub mod formatter;

@@ -120,7 +120,7 @@ pub fn to_ollama_messages_with(
         let mut tool_results: Vec<&ContentBlock> = Vec::new();
         let mut images: Vec<String> = Vec::new();
 
-        for block in &msg.content {
+        for block in msg.content.iter() {
             match block {
                 ContentBlock::Text(_) => text_blocks.push(block),
                 ContentBlock::ToolUse(_) => tool_uses.push(block),
@@ -375,7 +375,7 @@ pub fn merge_conversation(messages: &[Msg], history_prompt: &str) -> OllamaMessa
     let mut images: Vec<String> = Vec::new();
     for msg in messages {
         let name = agent_name(msg);
-        for block in &msg.content {
+        for block in msg.content.iter() {
             match block {
                 ContentBlock::Text(t) => {
                     text.push_str(&format!("{name}: {}\n", t.text));

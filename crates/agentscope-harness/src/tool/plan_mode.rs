@@ -151,7 +151,7 @@ impl Tool for PlanWriteTool {
         let path = {
             let mut state = self.handle.state.lock().unwrap();
             let path = self.handle.manager.plan_file_path(&state);
-            state.plan_mode_context.current_plan_file = Some(path.clone());
+            Arc::make_mut(&mut state.plan_mode_context).current_plan_file = Some(path.clone());
             path
         };
         match self

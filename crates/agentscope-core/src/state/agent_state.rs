@@ -1,4 +1,5 @@
 //! Mutable per-agent runtime state, mirroring `io.agentscope.core.state.AgentState`.
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::interruption::InterruptControl;
@@ -20,7 +21,7 @@ pub struct AgentState {
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
-    pub context: Vec<Msg>,
+    pub context: Arc<Vec<Msg>>,
     #[serde(default)]
     pub reply_id: String,
     #[serde(default)]
@@ -28,13 +29,13 @@ pub struct AgentState {
     #[serde(default)]
     pub shutdown_interrupted: bool,
     #[serde(rename = "permission_context", default)]
-    pub permission_context: PermissionContextState,
+    pub permission_context: Arc<PermissionContextState>,
     #[serde(rename = "tool_context", default)]
-    pub tool_context: ToolContextState,
+    pub tool_context: Arc<ToolContextState>,
     #[serde(rename = "tasks_context", default)]
-    pub tasks_context: TaskContextState,
+    pub tasks_context: Arc<TaskContextState>,
     #[serde(rename = "plan_mode_context", default)]
-    pub plan_mode_context: PlanModeContextState,
+    pub plan_mode_context: Arc<PlanModeContextState>,
 }
 
 fn new_hex() -> String {
@@ -47,14 +48,14 @@ impl Default for AgentState {
             session_id: new_hex(),
             user_id: None,
             summary: String::new(),
-            context: Vec::new(),
+            context: Arc::new(Vec::new()),
             reply_id: new_hex(),
             cur_iter: 0,
             shutdown_interrupted: false,
-            permission_context: PermissionContextState::default(),
-            tool_context: ToolContextState::new(),
-            tasks_context: TaskContextState::new(),
-            plan_mode_context: PlanModeContextState::new(),
+            permission_context: Arc::new(PermissionContextState::default()),
+            tool_context: Arc::new(ToolContextState::new()),
+            tasks_context: Arc::new(TaskContextState::new()),
+            plan_mode_context: Arc::new(PlanModeContextState::new()),
         }
     }
 }
@@ -77,10 +78,10 @@ impl AgentState {
         self.summary = s.into();
     }
     pub fn context(&self) -> &[Msg] {
-        &self.context
+        self.context.as_slice()
     }
     pub fn context_mut(&mut self) -> &mut Vec<Msg> {
-        &mut self.context
+        Arc::make_mut(&mut self.context)
     }
     pub fn reply_id(&self) -> &str {
         &self.reply_id
@@ -104,7 +105,7 @@ impl AgentState {
         &self.permission_context
     }
     pub fn set_permission_context(&mut self, c: PermissionContextState) {
-        self.permission_context = c;
+        self.permission_context = Arc::new(c);
     }
     pub fn tool_context(&self) -> &ToolContextState {
         &self.tool_context
@@ -139,14 +140,14 @@ pub struct AgentStateBuilder {
     session_id: Option<String>,
     user_id: Option<String>,
     summary: Option<String>,
-    context: Option<Vec<Msg>>,
+    context: Option<Arc<Vec<Msg>>>,
     reply_id: Option<String>,
     cur_iter: i32,
     shutdown_interrupted: bool,
-    permission_context: Option<PermissionContextState>,
-    tool_context: Option<ToolContextState>,
-    tasks_context: Option<TaskContextState>,
-    plan_mode_context: Option<PlanModeContextState>,
+    permission_context: Option<Arc<PermissionContextState>>,
+    tool_context: Option<Arc<ToolContextState>>,
+    tasks_context: Option<Arc<TaskContextState>>,
+    plan_mode_context: Option<Arc<PlanModeContextState>>,
 }
 
 impl AgentStateBuilder {
@@ -166,11 +167,11 @@ impl AgentStateBuilder {
         self
     }
     pub fn context(mut self, c: Vec<Msg>) -> Self {
-        self.context = Some(c);
+        self.context = Some(Arc::new(c));
         self
     }
     pub fn add_message(mut self, m: Msg) -> Self {
-        self.context.get_or_insert_with(Vec::new).push(m);
+        Arc::make_mut(self.context.get_or_insert_with(|| Arc::new(Vec::new()))).push(m);
         self
     }
     pub fn reply_id(mut self, s: impl Into<String>) -> Self {
@@ -186,19 +187,19 @@ impl AgentStateBuilder {
         self
     }
     pub fn permission_context(mut self, c: PermissionContextState) -> Self {
-        self.permission_context = Some(c);
+        self.permission_context = Some(Arc::new(c));
         self
     }
     pub fn tool_context(mut self, c: ToolContextState) -> Self {
-        self.tool_context = Some(c);
+        self.tool_context = Some(Arc::new(c));
         self
     }
     pub fn tasks_context(mut self, c: TaskContextState) -> Self {
-        self.tasks_context = Some(c);
+        self.tasks_context = Some(Arc::new(c));
         self
     }
     pub fn plan_mode_context(mut self, c: PlanModeContextState) -> Self {
-        self.plan_mode_context = Some(c);
+        self.plan_mode_context = Some(Arc::new(c));
         self
     }
     pub fn build(self) -> AgentState {

@@ -1020,7 +1020,7 @@ fn user_message_content(msg: &Msg) -> ChatCompletionRequestUserMessageContent {
     // `OpenAIMessageConverter#convertUserMessage` switches to the content-part
     // array exactly when the message carries media (`hasMediaContent`).
     let mut multipart = false;
-    for block in &msg.content {
+    for block in msg.content.iter() {
         match block {
             ContentBlock::Text(text) if !text.text.is_empty() => {
                 parts.push(text_content_part(text.text.clone()));

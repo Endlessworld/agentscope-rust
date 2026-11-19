@@ -30,7 +30,7 @@ pub fn render_message_text(msg: &Msg, include_tool_results: bool) -> String {
     if include_tool_results {
         // A tool result carries its own output blocks. They are part of the turn and used to
         // be invisible to every text sink, so include them here rather than in each caller.
-        for block in &msg.content {
+        for block in msg.content.iter() {
             if let ContentBlock::ToolResult(result) = block {
                 documents.extend(result.output.iter().filter_map(|output| match output {
                     ContentBlock::Document(document) => Some(document),

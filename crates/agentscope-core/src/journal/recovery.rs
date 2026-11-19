@@ -178,7 +178,7 @@ async fn close_turn_locked(
             .role(MsgRole::Tool)
             .content(vec![ContentBlock::ToolResult(block)])
             .build();
-        state.context.push(message.clone());
+        state.context_mut().push(message.clone());
         push(
             "interaction/resolved",
             serde_json::json!({
@@ -223,7 +223,7 @@ async fn close_turn_locked(
             .role(MsgRole::Tool)
             .content(vec![ContentBlock::ToolResult(block)])
             .build();
-        state.context.push(message.clone());
+        state.context_mut().push(message.clone());
         push(
             "tool/result",
             serde_json::json!({ "message": message, "synthetic": true, "abandoned": true }),
@@ -231,7 +231,7 @@ async fn close_turn_locked(
         )?;
     }
 
-    for message in &mut state.context {
+    for message in state.context_mut().iter_mut() {
         let updated: Vec<ContentBlock> = message
             .content
             .iter()
@@ -244,7 +244,7 @@ async fn close_turn_locked(
                 other => other.clone(),
             })
             .collect();
-        message.content = updated;
+        message.content = updated.into();
     }
 
     push(
@@ -417,7 +417,7 @@ async fn reconcile_locked(
             .role(MsgRole::Tool)
             .content(vec![ContentBlock::ToolResult(outcome.clone())])
             .build();
-        state.context.push(message.clone());
+        state.context_mut().push(message.clone());
         push(
             "tool/result",
             serde_json::json!({ "message": message, "reconciled": true }),

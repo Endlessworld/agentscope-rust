@@ -70,14 +70,14 @@ impl PlanModeManager {
     /// Enters plan mode. Idempotent. Ensures a plan file path is recorded
     /// (default if none set). Returns the workspace-relative plan file path.
     pub fn enter(&self, state: &mut AgentState) -> String {
-        state.plan_mode_context.set_plan_active(true);
+        Arc::make_mut(&mut state.plan_mode_context).set_plan_active(true);
         let file = state
             .plan_mode_context
             .current_plan_file()
             .map(str::to_string);
         if file.as_deref().map(str::trim).unwrap_or("").is_empty() {
             let default = self.default_plan_file();
-            state.plan_mode_context.current_plan_file = Some(default.clone());
+            Arc::make_mut(&mut state.plan_mode_context).current_plan_file = Some(default.clone());
             return default;
         }
         file.unwrap()
@@ -85,7 +85,7 @@ impl PlanModeManager {
 
     /// Exits plan mode (back to BUILD). Idempotent. Keeps `currentPlanFile`.
     pub fn exit(&self, state: &mut AgentState) {
-        state.plan_mode_context.set_plan_active(false);
+        Arc::make_mut(&mut state.plan_mode_context).set_plan_active(false);
     }
 
     /// Workspace-relative path of the plan file currently associated with this agent.
@@ -108,7 +108,7 @@ impl PlanModeManager {
     ) -> Result<String> {
         let path = self.plan_file_path(state);
         self.filesystem.write(rc, &path, content).await?;
-        state.plan_mode_context.current_plan_file = Some(path.clone());
+        Arc::make_mut(&mut state.plan_mode_context).current_plan_file = Some(path.clone());
         Ok(path)
     }
 

@@ -62,7 +62,7 @@ impl TokenEstimator for ApproximateEstimator {
         let mut count = 0i64;
         for message in input.messages {
             count += 12 + text(message.name.as_deref());
-            for block in &message.content {
+            for block in message.content.iter() {
                 count += block_cost(block);
             }
         }
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn approximate_estimator_charges_media_a_flat_rate() {
         let mut msg = Msg::user("x");
-        msg.content
+        msg.content_mut()
             .push(ContentBlock::Text(TextBlock::new(String::new())));
         let base = ApproximateEstimator.estimate(&EstimateInput::new(&[msg.clone()], &[]));
         // An empty text block costs nothing extra beyond the message overhead.

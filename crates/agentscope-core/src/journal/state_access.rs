@@ -187,7 +187,7 @@ where
             }),
         )?;
     }
-    for message in &changed.context {
+    for message in changed.context.iter() {
         if previous_ids.contains(&message.id) {
             continue;
         }
@@ -339,7 +339,7 @@ mod tests {
     async fn replacing_context_records_the_reason() {
         let log = seeded().await;
         let snapshot = update(Arc::clone(&log), initial, "trim_history", |state| {
-            state.context.clear();
+            state.context_mut().clear();
             Ok(())
         })
         .await
@@ -400,7 +400,7 @@ mod tests {
         recorder.close().await;
 
         let err = update(Arc::clone(&log), initial, "trim", |state| {
-            state.context.clear();
+            state.context_mut().clear();
             Ok(())
         })
         .await

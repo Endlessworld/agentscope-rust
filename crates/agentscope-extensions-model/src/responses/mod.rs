@@ -465,7 +465,7 @@ fn source_url(source: &Source) -> String {
 /// dropped silently (MODEL-10).
 fn user_input_item(msg: &Msg) -> InputItem {
     let mut parts: Vec<InputContent> = Vec::new();
-    for block in &msg.content {
+    for block in msg.content.iter() {
         match block {
             ContentBlock::Text(text) if !text.text.is_empty() => {
                 parts.push(InputContent::InputText(InputTextContent {

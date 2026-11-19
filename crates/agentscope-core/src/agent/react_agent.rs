@@ -839,7 +839,7 @@ impl ReActAgent {
         // Seed the shared task bag from the persisted state, then restore it after the run
         // so any `todo_write` mutations survive.
         let seed = self.core.state.lock().unwrap().tasks_context.clone();
-        *self.core.tasks.lock().unwrap() = seed;
+        *self.core.tasks.lock().unwrap() = (*seed).clone();
         let key = call_gate_key(&self.core, &extensions);
         let gate = Arc::clone(&self.core.call_gate);
         let this = self.clone();
@@ -885,7 +885,7 @@ impl ReActAgent {
                 });
                 // Persist task-list mutations made by the `todo_write` tool back into state.
                 let tasks = this.core.tasks.lock().unwrap().clone();
-                this.core.state.lock().unwrap().tasks_context = tasks;
+                this.core.state.lock().unwrap().tasks_context = Arc::new(tasks);
 
                 // Close the turn before releasing the gate so the journal's terminal facts
                 // match what the caller observes.
@@ -1868,7 +1868,7 @@ impl ReActAgentBuilder {
             .unwrap_or_else(|| initial_state.permission_context().clone());
         initial_state.set_permission_context(permission_context.clone());
         let tasks: Arc<Mutex<TaskContextState>> =
-            Arc::new(Mutex::new(initial_state.tasks_context.clone()));
+            Arc::new(Mutex::new((*initial_state.tasks_context).clone()));
 
         let toolkit = self.toolkit.unwrap_or_default();
         let mut chain = self.middleware_chain.unwrap_or_default();
@@ -2152,7 +2152,7 @@ async fn finish_invocation(
     ctx: &crate::agent::RuntimeContext,
     host: Option<&Arc<dyn crate::agent::AgentExecutionHost>>,
     mut state: AgentState,
-    plan_mode_at_start: PlanModeContextState,
+    plan_mode_at_start: Arc<PlanModeContextState>,
     result: Result<Msg>,
 ) -> Result<Msg> {
     match (host, result) {
@@ -2187,7 +2187,7 @@ fn commit_loop_state(
     let mut shared = core.state.lock().unwrap();
     // Carry over plan-mode updates a plan-control tool made directly on the shared
     // state (the loop ran on a private clone; only rebind when it actually changed).
-    if shared.plan_mode_context != *plan_mode_at_start {
+    if *shared.plan_mode_context != *plan_mode_at_start {
         state.plan_mode_context = shared.plan_mode_context.clone();
     }
     // Same for the permission state: mode switches and "always allow" answers reach the
@@ -2543,12 +2543,13 @@ async fn reasoning_phase(
     // iteration publishes the state and builds its model request.
     host_boundary(ctx, state, crate::agent::ExecutionBoundary::Reasoning).await?;
     check_interrupted(core, Some(ctx))?;
+    crate::diag::mark("step:enter");
     state.set_cur_iter(iter);
     // `todo_write` mutates the shared task bag, which only lands in the caller's state at the
     // end of the call. Folding it in here keeps every published snapshot (per-iteration
     // checkpoint, context compilation, journal) on the live task state, as Java does by
     // mutating `AgentState` in place.
-    state.tasks_context = core.tasks.lock().unwrap().clone();
+    state.tasks_context = Arc::new(core.tasks.lock().unwrap().clone());
     // Publish the state accumulated so far (this turn's input plus the previous
     // iteration's assistant/tool messages) into the shared state before the
     // reasoning chain runs. Without this, `core.state` would stay frozen at the
@@ -2569,6 +2570,7 @@ async fn reasoning_phase(
         state.permission_context = shared.permission_context.clone();
         *shared = state.clone();
     }
+    crate::diag::mark("step:published");
     // The summarizing path is not a step: Java checks `maxIters` before `step(iter)`, so an
     // over-budget iteration never opens a step boundary nor folds in guidance.
     if iter >= core.max_iters {
@@ -2593,14 +2595,16 @@ async fn reasoning_phase(
     // replace — a history that is missing this step's guidance. Only `context` is handed
     // over; the rest of the shared state already carries the loop's snapshot.
     publish_context(core, state);
+    crate::diag::mark("step:publish_ctx");
 
     // Java prepends a fresh copy of the frozen `CallExecution.systemMsg` to every
     // reasoning request. The conversation state itself remains system-free.
-    let mut messages = Vec::new();
+    let mut messages =
+        Vec::with_capacity(state.context().len() + usize::from(system_msg.is_some()));
     if let Some(system_msg) = system_msg {
         messages.push(system_msg.clone());
     }
-    messages.extend(state.context().to_vec());
+    messages.extend_from_slice(state.context());
 
     let tool_request_config = ctx.extension::<crate::tool::ToolRequestConfig>(
         crate::tool::tool_request_config::TOOL_REQUEST_CONFIG_CONTEXT_KEY,
@@ -2609,6 +2613,7 @@ async fn reasoning_phase(
         tool_request_config.as_deref(),
         crate::agent::capability_surface_from_context(ctx).as_deref(),
     );
+    crate::diag::mark("step:request_built");
     // The model that serves *this* call (Java `getModel(scope.rc)`): a per-call selection may
     // name a different model than the build-time default, and everything below — the request's
     // model name, the journaled call and the usage tag — has to describe the model that
@@ -2634,6 +2639,7 @@ async fn reasoning_phase(
     // exponential backoff) when no explicit execution config was supplied.
     ModelUtils::ensure_default_execution_config(&mut options);
     let input = ReasoningInput::new(messages, tools, options);
+    crate::diag::mark("step:request_ready");
 
     // The context compiler runs inside the middleware chain and holds no agent state, so the
     // committed task snapshot travels with this call (Java resolves the live state from its
@@ -2646,7 +2652,9 @@ async fn reasoning_phase(
     // `ExecutionBoundary::Model`: the request is already built, so a hook that rewrites the
     // state here reaches the *next* iteration's request, exactly like Java's `MODEL` boundary.
     host_boundary(ctx, state, crate::agent::ExecutionBoundary::Model).await?;
-    let final_msg = match run_reasoning(core, &call_ctx, input, Arc::clone(&model)).await {
+    let reasoning = run_reasoning(core, &call_ctx, input, Arc::clone(&model)).await;
+    crate::diag::mark("step:reasoning_done");
+    let final_msg = match reasoning {
         Ok(msg) => msg,
         Err(e) => {
             // A budget-overflow compaction may have rewritten the shared history before the
@@ -2708,7 +2716,15 @@ async fn reasoning_phase(
 /// snapshot — accepted guidance, for instance. Only the conversation is handed over: task,
 /// plan-mode and permission state belong to the tools and are not overwritten here.
 fn publish_context(core: &Arc<AgentCore>, state: &AgentState) {
-    core.state.lock().unwrap().context = state.context().to_vec();
+    // Hand the context the next model call is built from to the shared state, but only when it
+    // differs. The loop published this very state just above, so the common step (no
+    // `steer`/`inject` guidance folded in since) already matches: comparing costs a walk, where
+    // copying costs the whole conversation. When a middleware or guidance did change it, the
+    // shared copy is replaced exactly as before.
+    let mut shared = core.state.lock().unwrap();
+    if shared.context() != state.context() {
+        shared.context = Arc::clone(&state.context);
+    }
 }
 
 /// Takes back a conversation rewrite a middleware made during the model call.
@@ -2722,7 +2738,7 @@ fn publish_context(core: &Arc<AgentCore>, state: &AgentState) {
 fn adopt_published_context(core: &Arc<AgentCore>, state: &mut AgentState) {
     let shared = core.state.lock().unwrap();
     if shared.context() != state.context() {
-        state.context = shared.context().to_vec();
+        state.context = Arc::clone(&shared.context);
         if !shared.summary().is_empty() {
             state.set_summary(shared.summary().to_string());
         }
@@ -2908,6 +2924,7 @@ async fn run_reasoning(
             let core = Arc::clone(&core);
             let delta_tx = delta_tx.clone();
             let fut = async move {
+                crate::diag::mark("reasoning:provider");
                 // Deltas only reach a consumer when the agent-level stream has a
                 // channel; without one nothing is visible, so retries stay allowed.
                 let msg = model_call_impl(&core, Some(&ctx), mc_input, delta_tx.is_some(), |ev| {
@@ -2941,12 +2958,14 @@ async fn run_reasoning(
             // SYSTEM entries into `inputMessages`. Normalise here so a third-party
             // `on_reasoning` middleware cannot leave two system messages behind.
             let messages = normalize_system_messages(r.messages);
+            crate::diag::mark("reasoning:normalized");
             let mc_input = ModelCallInput::new(messages, r.tools, r.options, model);
             chain.wrap_model_call(ctx.clone(), mc_input, model_core)
         })
     };
 
     let mut stream = chain.wrap_reasoning(ctx.clone(), input, reasoning_core);
+    crate::diag::mark("reasoning:entered");
     // A middleware can ask the agent to stop by emitting `RequestStop` (Java
     // `RequestStopEvent`). The stream is abandoned at that point instead of being drained, so
     // a middleware that stops *before* delegating prevents the model call entirely, and the
@@ -2961,6 +2980,7 @@ async fn run_reasoning(
         }
         events.push(item);
     }
+    crate::diag::mark("reasoning:stream_done");
     drop(stream);
     // A middleware can fail before the model core runs (for example the context
     // compiler rejecting an over-budget request). That failure only exists as a
@@ -9130,12 +9150,11 @@ mod tests {
             .build()
             .unwrap();
         // Activate plan mode on the persisted state the call will run against.
-        agent
-            .state_handle()
-            .lock()
-            .unwrap()
-            .plan_mode_context
-            .set_plan_active(true);
+        {
+            let state = agent.state_handle();
+            let mut guard = state.lock().unwrap();
+            Arc::make_mut(&mut guard.plan_mode_context).set_plan_active(true);
+        }
         let reply = agent.call(vec![Msg::user("compute")]).await.unwrap();
         assert_eq!(
             *counter.lock().unwrap(),
@@ -10277,7 +10296,7 @@ mod tests {
         let mut local_call = ToolUseBlock::new("c1", "add", JsonMap::new());
         local_call.id = "c1".to_string();
         let mut state = AgentState::default();
-        state.context.push(Msg::assistant_blocks(vec![
+        state.context_mut().push(Msg::assistant_blocks(vec![
             ContentBlock::ToolUse(server_call),
             ContentBlock::ToolUse(local_call),
         ]));
@@ -11650,12 +11669,11 @@ mod tests {
             .permission_context(ctx)
             .build()
             .unwrap();
-        agent
-            .state_handle()
-            .lock()
-            .unwrap()
-            .plan_mode_context
-            .set_plan_active(true);
+        {
+            let state = agent.state_handle();
+            let mut guard = state.lock().unwrap();
+            Arc::make_mut(&mut guard.plan_mode_context).set_plan_active(true);
+        }
 
         let reply = agent.call(vec![Msg::user("plan")]).await.unwrap();
         assert_eq!(reply.text_content(), "done");

@@ -25,7 +25,12 @@ pub struct JournalEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     pub required: bool,
-    pub payload_json: String,
+    /// The payload JSON, shared so cloning an event never copies it.
+    ///
+    /// `Arc<String>` rather than `Arc<str>`: a payload is always built as a `String` first
+    /// (a checkpoint is megabytes), and `Arc::new` shares that buffer instead of reallocating
+    /// and copying it into a new `Arc<str>`.
+    pub payload_json: std::sync::Arc<String>,
 }
 
 impl JournalEvent {
@@ -42,7 +47,7 @@ impl JournalEvent {
         execution_run_id: Option<String>,
         turn_id: Option<String>,
         required: bool,
-        payload_json: impl Into<String>,
+        payload_json: impl Into<std::sync::Arc<String>>,
     ) -> crate::error::Result<Self> {
         let event = Self {
             schema_version: Self::SCHEMA_VERSION,
@@ -92,18 +97,18 @@ impl JournalEvent {
         if self.event_type.is_empty() {
             return Err(journal_error("Session event requires a type"));
         }
-        serde_json::from_str::<serde_json::Value>(&self.payload_json)?;
+        serde_json::from_str::<serde_json::Value>(self.payload_json.as_str())?;
         Ok(())
     }
 
     /// Decodes the payload into a typed value.
     pub fn payload<T: for<'de> Deserialize<'de>>(&self) -> crate::error::Result<T> {
-        Ok(serde_json::from_str(&self.payload_json)?)
+        Ok(serde_json::from_str(self.payload_json.as_str())?)
     }
 
     /// Decodes the payload as a JSON object (`{}` when the payload is not an object).
     pub fn data(&self) -> crate::error::Result<serde_json::Value> {
-        Ok(serde_json::from_str(&self.payload_json)?)
+        Ok(serde_json::from_str(self.payload_json.as_str())?)
     }
 }
 
@@ -283,7 +288,17 @@ mod tests {
     use super::*;
 
     fn event(event_type: &str, required: bool) -> JournalEvent {
-        JournalEvent::new("e1", 1, 0, event_type, None, None, required, "{}").unwrap()
+        JournalEvent::new(
+            "e1",
+            1,
+            0,
+            event_type,
+            None,
+            None,
+            required,
+            "{}".to_string(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -308,7 +323,17 @@ mod tests {
         ev.seq = 0;
         assert!(ev.validate_envelope().is_err());
 
-        assert!(JournalEvent::new("e1", 1, 0, "run/start", None, None, true, "{oops").is_err());
+        assert!(JournalEvent::new(
+            "e1",
+            1,
+            0,
+            "run/start",
+            None,
+            None,
+            true,
+            "{oops".to_string()
+        )
+        .is_err());
     }
 
     #[test]
@@ -366,12 +391,22 @@ mod tests {
             None,
             None,
             true,
-            "{\"ok\":true}",
+            "{\"ok\":true}".to_string(),
         )
         .unwrap();
         registry.validate(&good).unwrap();
 
-        let bad = JournalEvent::new("e3", 1, 0, "extension/echo", None, None, true, "{}").unwrap();
+        let bad = JournalEvent::new(
+            "e3",
+            1,
+            0,
+            "extension/echo",
+            None,
+            None,
+            true,
+            "{}".to_string(),
+        )
+        .unwrap();
         assert!(registry.validate(&bad).is_err());
 
         let mut state = AgentState::builder().session_id("s").build();

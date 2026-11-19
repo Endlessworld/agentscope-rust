@@ -692,7 +692,7 @@ impl MessageConvert {
             if !msg.metadata.is_empty() {
                 nested_metadata.insert(msg.id.clone(), Value::Object(msg.metadata.clone()));
             }
-            for block in &msg.content {
+            for block in msg.content.iter() {
                 let Some(mut part) = content_block_to_part(block) else {
                     continue;
                 };

@@ -157,7 +157,7 @@ pub fn merge_agent_group(group: &[Msg], history_prompt: &str) -> Msg {
 
     for msg in group {
         let name = agent_name(msg);
-        for block in &msg.content {
+        for block in msg.content.iter() {
             match block {
                 ContentBlock::Text(t) => text.push_str(&format!("{name}: {}\n", t.text)),
                 ContentBlock::Hint(h) => {
