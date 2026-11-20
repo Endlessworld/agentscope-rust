@@ -4,6 +4,7 @@
 > **单一事实来源**：`docs/extensions/<MODULE>__GAP_TRACKER.md`。本文件与独立 tracker 冲突时**以独立 tracker 为准**，并在下次汇总时回填本文。
 > **开工顺序**：本文件 → 本模块 tracker → `docs/extensions/EXTENSIONS_MIGRATION_PLAN.md`（范围/波次/并行约束）→ `docs/MIGRATION_PLAN.md` + `docs/MIGRATION_GAP_TRACKER.md`（core/harness）。
 > **结论（2026-10-31 全量对齐复核后）**：历史 22 个模块的**存量**缺口清单仍全部关闭；但本轮**逐文件复核**（Java `main` @ `1524b3191` ↔ 本仓 HEAD，覆盖 30 个 crate：22 个 extensions 模块 + core + harness + acp + 6 个 protocol 子 crate）共 **543 行带唯一编号的清单条目**（`HARNESS-15` 去重退役，原 544）：**待办 254 / 设计决定（不迁移）5 / 已完成（本轮确认已对齐）265 / 无显式状态 19 / 待裁定 0**，其中 **P0 30 条**（§3.1）。逐行核对时 `待裁定` 实为 **43 行**（汇总表原把 `ACP-03`/`ACP-04` 并入「待办」）；其中 **41 项已于 2026-10-31 全部裁定**（§3.3），另 2 行按「已修 / 重复」关闭。⇒ 结论：**迁移未真正完成，P0 未清零前不达生产可用**。
+> **0.2.0 发布态（2026-11-21）**：workspace 已到 **40 个 crate + 1 个 `xtask`**（1 门面 + 1 过程宏 + 2 骨架 + 10 个 durable 运行时 + 26 个 extensions），MSRV 1.89。`agentscope-extensions-controlplane`（#14 / #22）已按 0.2.0 的 **D6** 决策从 workspace **删除**，下表该两行仅作历史追溯；`agentscope-extensions-acp` 已升级到 `agent-client-protocol` **5.0.0**（schema 1.15.1）并落地 durable / native 双驱动，现行状态见 [`docs/ACP_AGENT__GAP_TRACKER.md`](../ACP_AGENT__GAP_TRACKER.md)。下文 §1 的测试数与统计是 **2026-10-31 快照**，未随 0.2.0 重跑；新批次以各模块 tracker 为准。
 > **历史**：裁剪前的完整历史快照存档于 [`history/EXTENSIONS_MIGRATION_HISTORY.md`](./history/EXTENSIONS_MIGRATION_HISTORY.md)（只读，仅供追溯）。
 
 ## 0. 如何阅读本文件
@@ -33,7 +34,7 @@
 | 11 | B | POSTGRESQL | `agentscope-extensions-postgresql` | `已完成` | 127（含 `--features postgres-driver`；tracker 上次记 123 @10-30） | [POSTGRESQL](./POSTGRESQL__GAP_TRACKER.md) |
 | 12 | B | COS | `agentscope-extensions-cos` | `已完成` | 105（+3 `no_run` doc） | [COS](./COS__GAP_TRACKER.md) |
 | 13 | B | OSS | `agentscope-extensions-oss` | `已完成` | 64 默认 / 75（`--features s3`） | [OSS](./OSS__GAP_TRACKER.md) |
-| 14 | C | CONTROLPLANE（原 AISTIO） | `agentscope-extensions-controlplane` | `已完成` | 158（另 4 e2e） | [CONTROLPLANE](./CONTROLPLANE__GAP_TRACKER.md) |
+| 14 | C | CONTROLPLANE（原 AISTIO） | ~~`agentscope-extensions-controlplane`~~ | `已删除`（0.2.0 D6） | 158（删除前实测） | [CONTROLPLANE](./CONTROLPLANE__GAP_TRACKER.md)（历史） |
 | 15 | C | STUDIO | `agentscope-extensions-studio` | `已完成` | 92 | [STUDIO](./STUDIO__GAP_TRACKER.md) |
 | 16 | C | SKILLS | `agentscope-extensions-skills` | `已完成` | 108 / 116 / 123（pg）/ 118（mysql）/ 125（双开） | [SKILLS](./SKILLS__GAP_TRACKER.md) |
 | 17 | C | SCHEDULER | `agentscope-extensions-scheduler` | `已完成` | 100（另 3） | [SCHEDULER](./SCHEDULER__GAP_TRACKER.md) |
@@ -41,7 +42,7 @@
 | 19 | C | NACOS | `agentscope-extensions-nacos` | `已完成` | 92（`--features http-client`） | [NACOS](./NACOS__GAP_TRACKER.md) |
 | 20 | C | HIGRESS | `agentscope-extensions-higress` | `已完成` | 60 | [HIGRESS](./HIGRESS__GAP_TRACKER.md) |
 | 21 | — | JUDGE | `agentscope-extensions-judge` | `已完成` | 392（另 5 集成） | [JUDGE](./JUDGE__GAP_TRACKER.md) |
-| 22 | — | AISTIO | —（已并入 `agentscope-extensions-controlplane`） | `已完成`（并入 #14） | 见 #14 | [AISTIO](./AISTIO__GAP_TRACKER.md)（重定向） |
+| 22 | — | AISTIO | —（已并入 `agentscope-extensions-controlplane`，后者于 0.2.0 删除） | `已删除`（0.2.0 D6，随 #14） | — | [AISTIO](./AISTIO__GAP_TRACKER.md)（历史重定向） |
 
 - **波次**见 `EXTENSIONS_MIGRATION_PLAN.md` §2：A=协议/记忆/RAG/模型/沙箱/渠道，B=存储侧，C=非存储侧；JUDGE 为后续新增登记（裁定 B4），AISTIO 随 Java `a2cbea5c3` 改名为 CONTROLPLANE。
 - 另有独立 crate `agentscope-extensions-acp`（自 harness 抽出，与 protocol 拆分同批登记），**不属** extensions 20 模块计划；其 tracker 位于 `docs/ACP_AGENT__GAP_TRACKER.md`。
@@ -52,7 +53,7 @@
 |---|---|---|---|---|---|
 | CORE | [`CORE__GAP_TRACKER.md`](./CORE__GAP_TRACKER.md)（新建） | `agentscope-core` 22 个 Java 包（361 类 / 63k 行）↔ 103 个 `.rs` / 36.5k 行 | 26 | 1（CORE-01） | 0（2026-10-31 已裁定） |
 | HARNESS | [`HARNESS__GAP_TRACKER.md`](./HARNESS__GAP_TRACKER.md)（新建） | `agentscope-harness` 全包（295 类 / 53k 行）↔ 153 个 `.rs` / 49.8k 行 | 28 | 0（HARNESS-15 去重退役） | 0（2026-10-31 已裁定） |
-| ACP | [`docs/ACP_AGENT__GAP_TRACKER.md`](../ACP_AGENT__GAP_TRACKER.md)（沿用并补充） | **Java 无 ACP**（`rg -i acp` 对 Java 源码零命中）→ 改按协议规范/`ACP_AGENT_PLAN.md` 核对 | 20 | 1（ACP-01） | 0 |
+| ACP | [`docs/ACP_AGENT__GAP_TRACKER.md`](../ACP_AGENT__GAP_TRACKER.md)（沿用并补充） | **Java 无 ACP**（`rg -i acp` 对 Java 源码零命中）→ 改按协议规范/`ACP_AGENT_PLAN.md` 核对 | 20（2026-10-31 口径；5.0 升级与双驱动见 tracker 头部） | 1（ACP-01，历史口径） | 0 |
 
 - 两份新 tracker **取代**根 `GAP_TRACKER.md` 与 `docs/MIGRATION_GAP_TRACKER.md` 中 core/harness 相关段落的口径（旧文件保留作历史）。
 - 逐模块明细与证据（Java `文件#符号` ↔ Rust `文件:行`）在各模块 tracker 的 §3.5 / §4.3。

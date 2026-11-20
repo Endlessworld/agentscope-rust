@@ -1,16 +1,19 @@
 # AgentScope Rust
 
 AgentScope 的**原生异步 Rust 实现**。以 `agentscope-core`（智能体运行时与公共抽象）和
-`agentscope-harness`（可直接使用的装配层）为骨架，外加 27 个 `agentscope-extensions-*`
-适配 crate，覆盖模型 provider、协议接入、持久化、RAG、沙箱、平台通道与可观测性；
+`agentscope-harness`（可直接使用的装配层）为骨架，外加 26 个 `agentscope-extensions-*`
+适配 crate 与 10 个 `agentscope-durable-*` 可恢复运行时 crate，覆盖模型 provider、协议接入、
+持久化、RAG、沙箱、平台通道与可观测性；
 仓库同时提供开箱即用的 **ACP 编程智能体**（`acp_harness_agent` / `acp_agent_cli`）。
 
 - **基线**：对齐 Java 参考实现（`io.agentscope.core` / `io.agentscope.harness` 及其 extension 模块）
   的 API 语义、事件/状态 JSON 与工具治理行为
-- **技术栈**：Rust 2021（MSRV 1.85）· Tokio · serde · reqwest/rustls · async-openai / async-anthropic ·
+- **技术栈**：Rust 2021（MSRV 1.89）· Tokio · serde · reqwest/rustls · async-openai / async-anthropic ·
   rust-mcp-sdk · axum · rusqlite
-- **规模**：30 个 crate（1 个门面 `agentscope-rs` + 2 个骨架 + 27 个扩展），线性依赖，无循环
-- **进度**：`docs/MIGRATION_GAP_TRACKER.md`、`docs/extensions/EXTENSIONS_GAP_TRACKER.md`
+- **规模**：40 个 crate（1 个门面 `agentscope-rs` + 1 个过程宏 + 2 个骨架 + 10 个 durable 运行时 +
+  26 个 extensions），另加 1 个 `xtask` 构建工具；线性依赖，无循环
+- **进度**：`docs/MIGRATION_GAP_TRACKER.md`、`docs/extensions/EXTENSIONS_GAP_TRACKER.md`、
+  `docs/ACP_AGENT__GAP_TRACKER.md`、`docs/DURABLE_INFORMATION_MODEL_TRACKER.md`
   （各模块另有独立 tracker，为单一事实来源）
 
 ## 核心能力
@@ -19,7 +22,9 @@ AgentScope 的**原生异步 Rust 实现**。以 `agentscope-core`（智能体�
 
 - ReAct 循环、流式事件（32 种 `AgentEvent`）、结构化输出、串行门与优雅关闭
 - run 级控制（`AgentRun` / `RunControl`）、中断恢复与 pending tool 修复
-- 双轨会话：`SessionLogStore`（journal）+ 事件日志，可换后端（本地 / SQLite / BaseStore）
+- 双轨会话：`SessionLogStore`（journal）+ 事件日志，可换后端（本地 / SQLite / BaseStore）；
+  0.2.0 起事件与头部格式为 **v2**（0.1.x 会话不可读，见 `docs/MIGRATION_0.2.0.md`）
+- 可恢复执行：durable 运行时提供跨进程租约、崩溃原子结算、多宿主围栏（FileStore / SQLite / Postgres）
 
 **模型层**
 
@@ -45,6 +50,7 @@ AgentScope 的**原生异步 Rust 实现**。以 `agentscope-core`（智能体�
 - 协议：ACP、A2A（client / server）、Agent Protocol、AG-UI、OpenAI 兼容 Chat Completions
 - 存储：JDBC / MySQL / PostgreSQL / MongoDB / Redis / COS / OSS
 - 能力：RAG、长期记忆、skills 仓库、定时调度、影子训练、Studio 遥测、judge 决策 API
+- 可恢复运行时：durable thread/turn 记录、租约与围栏、内容寻址 blob（FileStore / SQLite / Postgres）
 
 ## Crate 地图
 
@@ -96,6 +102,31 @@ use agentscope_rs::{core::agent::ReActAgent, harness::HarnessAgent};
 | `agentscope-extensions-mysql` · `-postgresql` · `-mongodb` · `-redis` | 分布式存储：`AgentStateStore`、`BaseStore`、沙箱快照、执行锁 |
 | `agentscope-extensions-cos` · `-oss` | 对象存储：腾讯云 COS / S3 兼容（分片上传、预签名 URL） |
 
+### 可恢复运行时（durable）
+
+对齐 Java 的 `agentscope-durable`（`durable-runtime` / `durable-adapters` / `durable-worker`）与
+`agentscope-extensions-durable-*` 系列（`durable-adapters` 下仅迁了
+`durable-adapter-harness-agentscope`，agui / claude 适配未迁）；Rust 侧统一用
+`agentscope-durable-*` 前缀，并新增 `agentscope-durable-sqlite` 单机后端（Java 无）。核心抽象在
+`agentscope-durable`，其余是存储/传输适配：
+
+| crate | 职责 |
+| --- | --- |
+| `agentscope-durable` | 运行时核心：thread / turn / 执行记录、租约与围栏、settle 与 finalization、内容寻址 blob、FileStore（进程崩溃安全，不 `fsync`） |
+| `agentscope-durable-adapter-agentscope` | core/harness 适配：把 `HarnessAgent` 接成 durable 执行宿主（工具三态、checkpoint、事件 codec） |
+| `agentscope-durable-jdbc` | Postgres 记录存储：多宿主、围栏、锁与队列（生产推荐的共享后端） |
+| `agentscope-durable-sqlite` | SQLite 记录存储（单机）：schema v2、WAL、revision CAS、空间回收 |
+| `agentscope-durable-objects` | 内容寻址对象存储，大对象外置 |
+| `agentscope-durable-mcp` | MCP 工具的执行传输适配 |
+| `agentscope-durable-sandbox` | 沙箱进程执行端口 |
+| `agentscope-durable-http` | HTTP 执行传输适配（骨架，对齐 Java） |
+| `agentscope-durable-rocketmq` | RocketMQ 事件通道适配（对齐 Java） |
+| `agentscope-durable-worker` | Brain/Hands worker 与驱动（骨架） |
+
+> 成熟度不齐：`durable` / `adapter` / `jdbc` / `sqlite` / `objects` / `mcp` / `sandbox` 已有完整实现与测试；
+> `http` / `rocketmq` 只做协议/传输映射（客户端由宿主注入），`worker` 提供 Brain/Hands 骨架。
+> ACP 的 `durable` 变体只依赖前两项。
+
 ### 能力扩展
 
 | crate | 职责 |
@@ -119,33 +150,39 @@ agentscope-rust/
 ├── Cargo.toml                     # workspace：版本 / 依赖 / profile 统一在此
 ├── crates/
 │   ├── agentscope-core/           # 运行时与公共抽象（不依赖任何其它 workspace crate）
+│   ├── agentscope-macros/         # 过程宏
 │   ├── agentscope-harness/        # 装配层（依赖 core + extensions-model）
-│   └── agentscope-extensions-*/   # 27 个适配 crate
+│   ├── agentscope-durable*/       # 10 个可恢复运行时 crate
+│   └── agentscope-extensions-*/   # 26 个适配 crate
 ├── docs/                          # 迁移方案、进度 tracker、环境变量、设计记录
 │   └── extensions/                # 每个模块的迁移 tracker
+├── xtask/                         # 构建/打包任务（cargo xtask acp …）
 └── LICENSE · README.md
 ```
 
 - **`agentscope-core`**：只允许依赖第三方 crate。公共抽象若被多个模块需要，下沉到这里。
+- **`agentscope-durable*`**：只在需要可恢复执行时引入；`agentscope-durable` 不依赖任何
+  `extensions-*`，适配层（`-adapter-agentscope` / `-jdbc` / `-sqlite` …）按需组合。
 - **`agentscope-extensions-*`**：一般依赖 `core`（多数还需要 `harness` 的 `BaseStore` /
   `Sandbox` / `SkillRepository` 等 trait），少数依赖其它扩展（如 `mysql` → `jdbc`、`nacos` → `a2a-*`）。
   确需新增跨模块引用时，先在 `docs/extensions/EXTENSIONS_GAP_TRACKER.md` 记「跨模块需求」并获裁定。
-- **`agentscope-harness`**：装配层，不反向依赖任何 `extensions-*`（`extensions-model` 除外）。
+- **`agentscope-harness`**：装配层，不反向依赖任何 `extensions-*`（`extensions-model` 除外）或 durable crate。
 - **禁止循环引用**：依赖图必须保持 DAG；出现循环时把公共抽象下沉到 core。
 
 ## 快速开始
 
 ### 从 crates.io 引入
 
-workspace 已具备发布元数据，首发版本为 `0.1.0`：
+workspace 已具备发布元数据，当前版本为 `0.2.0`：
 
 ```toml
 [dependencies]
-agentscope-core = "0.1.0"
-agentscope-harness = "0.1.0"
+agentscope-core = "0.2.0"
+agentscope-harness = "0.2.0"
 ```
 
-> 预发布版本不会被 `cargo add` 默认选中，需显式写出（或用 `--precise`）。
+> `0.2.0` 是**硬切换**版本：会话格式升到 v2、`session` → `journal` / `thread` 全量重命名、
+> 删除 `AgentSession` / `SessionAnswer` / `controlplane`。升级前先读 [`docs/MIGRATION_0.2.0.md`](docs/MIGRATION_0.2.0.md)。
 
 ### 从源码构建
 
@@ -155,7 +192,7 @@ cargo test   --workspace                 # 单元 + 集成测试（默认全离�
 cargo clippy --workspace --all-targets    # 静态检查
 ```
 
-- **Rust** ≥ 1.85（见根 `Cargo.toml` 的 `rust-version`）
+- **Rust** ≥ 1.89（见根 `Cargo.toml` 的 `rust-version`）
 - **可选工具**：`docker` CLI（Docker 沙箱后端与相关集成测试）、`pwsh`（Windows 下的沙箱 shell）
 - 外部依赖全部来自 crates.io；workspace 内部通过 `path` 互相引用（发布时由 `version` 生效）
 
@@ -214,7 +251,10 @@ cargo run -p agentscope-extensions-acp --bin acp_agent_cli
 ```
 
 不想自己编译的话，[Releases](https://github.com/Endlessworld/agentscope-rust/releases) 提供
-多平台预编译包（embedded profile + `lite` features，单个压缩包约 4～6 MB、解压后约 12 MB）：
+多平台预编译包（`embedded` profile + `lite` features，单个压缩包约 4～6 MB、解压后约 12 MB）。
+`lite` 会同时关掉 `durable`，因此**预编译包只带原生驱动**：会话历史落在
+`<cwd>/.agentscope/acp-sessions/`，没有跨进程续跑与崩溃原子性；需要这些保证请用
+`cargo xtask acp build durable|sqlite` 自建：
 
 | 平台 | 压缩包 | 二进制 |
 | --- | --- | --- |
@@ -237,6 +277,8 @@ cargo run -p agentscope-extensions-acp --bin acp_agent_cli
 | `CODING_PROVIDER` | 覆盖 `default_provider` |
 | `CODING_MODEL_ID` | 覆盖 `default_model` |
 | `OPENAI_API_KEY` / `OPENAI_BASE_URL` | 覆盖 provider 的凭据与网关 |
+| `AGENTSCOPE_TURN_DRIVER` | `native` 切到原生驱动（默认 `durable`；仅编译了 `durable` 时有效） |
+| `AGENTSCOPE_DURABLE_STORE` | 编译 `durable-sqlite` 时默认 `sqlite`；设 `file` 回退 FileStore |
 | `RUST_LOG` | tracing 过滤器（默认 `info,acp_harness_agent=debug,agentscope_harness=debug`） |
 | `AGENTSCOPE_SESSION_RETENTION` | 会话 journal 保留窗口（二进制默认 `12h`） |
 
@@ -252,18 +294,21 @@ REPL slash 命令：`/model <id>` 切换模型、`/models` 列出模型、`/quit
 ## 构建、测试与体积
 
 ```bash
-# 嵌入式最小集：去掉 rusqlite（省掉 bundled SQLite C 引擎），索引降级为目录扫描
+# 嵌入式最小集：去掉 rusqlite（省掉 bundled SQLite C 引擎），索引降级为目录扫描；
+# 同时会关掉默认的 durable feature，ACP 只剩原生驱动
 cargo build --profile embedded -p agentscope-harness -p agentscope-extensions-acp \
     --no-default-features --features lite --bins
 
 # ACP 二进制：三个变体（native / durable / sqlite），产物在 target/acp/<profile>/<variant>/
 cargo xtask acp build all --profile release      # stable，三变体
 cargo xtask acp build sqlite --profile embedded  # 体积优先，需要 nightly
+cargo xtask acp upx sqlite --profile embedded    # UPX 打包 + 完整性校验（UPX_EXE 可覆盖）
 ```
 
 - 根目录的 `build-acp-*.bat` / `pack-acp-upx.bat` 只是 `cargo xtask ...` 的 Windows 薄封装
 
-- 默认 feature `rusqlite`：启用工作区 SQLite 索引；`lite` 关闭它
+- 默认 feature `rusqlite` + `durable`：前者启用工作区 SQLite 索引，后者提供默认的 durable turn 驱动；
+  `lite` 关闭 rusqlite，`--no-default-features` 才会连 durable 一起关掉
 - `embedded` profile：`opt-level="z"` + fat LTO + `strip`（详见 `docs/EMBEDDED_SIZE.md`）
 
 > 若编译报 `os error 112`（磁盘空间不足），先清 `target/debug/incremental` 与 `target/debug/deps/*.pdb` 再重试。
@@ -275,17 +320,27 @@ cargo xtask acp build sqlite --profile embedded  # 体积优先，需要 nightly
 | `docs/MIGRATION_PLAN.md` | 迁移方案：可行性、依赖映射、技术难点、测试策略 |
 | `docs/MIGRATION_GAP_TRACKER.md` | core / harness 迁移进度与缺口清单 |
 | `docs/MIGRATION_0.2.0.md` | 0.2.0 迁移须知：会话格式 v2 硬切、重命名/删除的 API、升级与回退 |
-| `docs/extensions/EXTENSIONS_MIGRATION_PLAN.md` | 27 个扩展 crate 的迁移编排与回执约定 |
+| `docs/extensions/EXTENSIONS_MIGRATION_PLAN.md` | 26 个扩展 crate 的迁移编排与回执约定 |
 | `docs/extensions/*__GAP_TRACKER.md` | 各扩展模块的进度 tracker（单一事实来源） |
+| `docs/DURABLE_MIGRATION_PLAN.md` · `docs/DURABLE_API_DESIGN.md` | durable 运行时的 D1–D7 决策、里程碑与 API |
+| `docs/DURABLE_MIGRATION_REVIEW.md` · `docs/DURABLE_INFORMATION_MODEL_TRACKER.md` | durable 发布后审查、数据形状与内存/写放大台账 |
+| `docs/DURABLE_JDBC.md` · `docs/DURABLE_SQLITE.md` | Postgres / SQLite 后端：表结构、pragma、迁移与限制 |
+| `docs/ACP_TURN_DRIVER_DESIGN.md` | ACP 的 `TurnDriver` 双驱动设计与落地状态 |
+| `docs/JAVA_BUG_PARITY.md` | Java 未关闭 Bug 的 Rust 侧比对与修复台账 |
 | `docs/ENVIRONMENT.md` | 全部环境变量参考 |
 | `docs/ACP_AGENT_PLAN.md` · `docs/ACP_AGENT__GAP_TRACKER.md` | ACP 编程智能体的设计与进度 |
-| `crates/agentscope-extensions-acp/README.md` | ACP 运行说明（skills / 环境变量） |
+| `crates/agentscope-extensions-acp/README.md` | ACP 运行说明（驱动模式 / skills / 环境变量） |
 | `.agents/context/` | 跨会话项目上下文（画像、状态、ADR、经验教训） |
 
 ## 已知限制
 
 - **迁移仍在收尾**：以各模块 tracker 为准。`core.hook` 因 Java 侧已废弃而**不迁移**；
-  部分扩展仍有 P2 长尾（如 AISTIO 的 gRPC 传输、e2b 的 snapshot prune）。
+  `agentscope-extensions-controlplane`（原 AISTIO）已于 0.2.0 **删除**（D6），控制面能力由部署方自备；
+  部分扩展仍有 P2 长尾（如 e2b 的 snapshot prune）。
+- **durable 成熟度不齐**：`durable` / `adapter` / `jdbc` / `sqlite` / `objects` / `mcp` / `sandbox` 可用；
+  `http` / `rocketmq` 只做协议/传输映射（客户端由宿主注入），`worker` 是 Brain/Hands 骨架。
+  FileStore 不 `fsync`（掉电不安全），SQLite 是单机后端
+  （WAL 不能放网络文件系统），多宿主请用 Postgres。
 - **真实后端需要外部服务**：MySQL / PostgreSQL / MongoDB / Redis / 对象存储的集成测试需
   自备服务或 Docker，默认跳过；单元测试全部离线（传输均经 trait 注入替身）。
 - **Docker 沙箱**走 `docker` CLI，本机无 daemon 时相关测试自动跳过。

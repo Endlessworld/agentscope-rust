@@ -1,5 +1,10 @@
 # CONTROLPLANE 模块迁移 — 跨会话进度跟踪文件（Gap Tracker）
 
+> **2026-11-21（0.2.0）：本 crate 已删除。** 按 `docs/MIGRATION_0.2.0.md` 的 **D6** 决策，
+> `crates/agentscope-extensions-controlplane` 与 `agentscope-rs` 的 `controlplane` feature
+> 已从 workspace 移除（提交 `ea4b1cc`），控制面能力由部署方自备。本文件仅保留为**历史记录**，
+> 不再代表当前可构建的代码；汇总口径见 [`EXTENSIONS_GAP_TRACKER.md`](./EXTENSIONS_GAP_TRACKER.md) §1。
+
 > **用途**：本文件是 **CONTROLPLANE** 模块迁移的**单一事实来源**。开工前必须先读本文件 + `docs/extensions/EXTENSIONS_GAP_TRACKER.md` + `docs/MIGRATION_PLAN.md`；完成后必须更新对应条目的 `执行状态` 与 `交接信息`。切勿臆断代码现状——以本文件 + `git status` + `cargo build` 实际验证为准。
 > **Java 源码**：`E:\local-github\agentscope-java\agentscope-extensions\agentscope-extensions-controlplane\`（主包 `io.agentscope.extensions.controlplane`，子包 `adapter` / `model` / `store` / `transport`）。**命名历史**：该模块原名 `agentscope-extensions-aistio`，Java 于 commit `a2cbea5c3`（2026-10-08）整体重命名（54 文件全为 rename）；旧版源码可用 `git show a2cbea5c3~1:agentscope-extensions/agentscope-extensions-aistio/...` 取出。
 > **Rust 目标**：`crates/agentscope-extensions-controlplane/`（波次 C）；crate 名、类型前缀（`ControlPlane*`）、env（`CONTROL_PLANE_*`）、journal 目录与 sink 名均已于 **2026-10-22** 对齐。

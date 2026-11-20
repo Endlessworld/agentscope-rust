@@ -4,7 +4,7 @@
 任何实现了 ACP 的编辑器 / 客户端都能把它当作编码助手用——读改文件、执行 shell、加载 skills、
 派发子智能体、自动压缩上下文。附带的 REPL 客户端可以在没有 IDE 的情况下直接验证。
 
-> 状态：`0.1.0`。协议实现基于 [`agent-client-protocol`](https://crates.io/crates/agent-client-protocol) 5.0（schema 1.15）。
+> 状态：`0.2.0`。协议实现基于 [`agent-client-protocol`](https://crates.io/crates/agent-client-protocol) 5.0.0（schema 1.15.1，v1 协议线）。
 
 ## 两个可执行文件
 
@@ -21,23 +21,41 @@
 - **三种审批模式**：`plan`（只读）/ `accept_edits`（默认，改文件免问、shell 需确认）/ `yolo`（全自动）
 - **权限记忆**：用户选择「总是允许 / 总是拒绝」后写入工作区，跨会话生效
 - **运行时切换**：`model` 与 `thought_level` 作为 ACP config option 暴露，客户端可随时切换
-- **会话持久化**：`session/new|load|resume|list|delete|close`，历史以 journal 为准，重启后恢复
+- **会话持久化**：`session/new|load|resume|list|delete|close`，历史以 journal 为准，重启后恢复；默认走 durable 驱动（跨进程可续跑），也可切到轻量的原生驱动（见「运行模式」）
 - **上下文压缩**：超过阈值自动压缩，并在客户端支持时推送进度通知；也可主动触发——模型调用 `compact_context` 工具（由用户提示词驱动），或直接发送 `/compact`（宿主立即压缩，不占模型回合）
-- **MCP**：支持客户端以 `stdio` / `http` / `sse` 声明的 MCP server，也支持 MCP over ACP
+- **长任务不霸占回合**：`execute` 超过 240 秒自动转后台（执行上限 1800 秒），模型先拿到占位结果继续推理，真实输出在后续 wakeup 回合注入
+- **MCP**：支持客户端以 `stdio` / `http` / `sse` 声明的 MCP server，也支持 MCP over ACP（SDK 5.0 的 request-scoped 语义）
 - **Skills**：用户级与项目级 skill 目录，按需通过 `load_skill_through_path` 读取
 - **子智能体**：内置 `general-purpose`，另可从 `<workspace>/subagents/*.md` 声明
+
+## 运行模式
+
+同一个协议面由两套 turn 驱动实现，客户端无感，差别只在**持久化保证**：
+
+| 驱动 | 何时编译 | 会话历史 | 跨进程续跑 | 崩溃原子 | 多宿主 |
+| --- | --- | --- | --- | --- | --- |
+| `durable`（默认） | feature `durable`（默认开启） | `<workspace>/.agentscope/durable/` 下的 journal；编译 `durable-sqlite` 时为 `durable.db` | ✅ | ✅ | ✅（依赖共享存储语义；SQLite WAL 不能放网络文件系统） |
+| `native` | 任意构建 | `<cwd>/.agentscope/acp-sessions/<session_id>/`（逐条消息 JSON 行 + `turns.json`） | ❌ | ❌（未写完的最后一条会被丢弃） | ❌ |
+
+- **运行时切换**：`AGENTSCOPE_TURN_DRIVER=native` 选原生驱动；未设置、拼错或空值一律保持 durable——两种历史存放位置不可互换，不能靠“猜”切过去。构建里没有 `durable` feature 时只有一个驱动，该变量被忽略。
+- **SQLite 后端**：编译 `durable-sqlite` 后默认用 `<workspace>/.agentscope/durable/durable.db`；`AGENTSCOPE_DURABLE_STORE=file` 保留 FileStore，无需重新构建。
+- **掉电语义**：FileStore 是“进程崩溃安全、掉电不安全”（不 `fsync`）；重要部署请在文件系统层做快照。
 
 ## 安装
 
 ```bash
-cargo install agentscope-extensions-acp --version 0.1.0
+cargo install agentscope-extensions-acp --version 0.2.0
 
 # 或从源码（仓库根目录）
 cargo install --path crates/agentscope-extensions-acp
 ```
 
-要求 Rust 1.85+。默认 feature 带 `rusqlite`（bundled SQLite，用于工作区索引）；
-不想编 C 引擎可用 `--no-default-features --features lite`（索引降级为目录扫描）。
+要求 Rust 1.89+。默认 feature 是 `rusqlite` + `durable`：前者是 bundled SQLite（工作区索引），
+后者是默认的 durable turn 驱动。按需裁剪：
+
+- `--no-default-features --features lite`：不编 C 引擎，索引降级为目录扫描；同时**不编译 durable**，只剩原生驱动（发布包即此组合）。
+- `--features durable-sqlite`：在 durable 之上启用 SQLite 会话后端（默认即 `durable.db`）。
+- `--features alloc-stats`：诊断构建，`[mem]` 行报告真实堆占用。
 
 ## 快速开始
 
@@ -350,11 +368,16 @@ await acp
 ### 版本对齐
 
 - `protocolVersion` 是**整数**，当前稳定值 `1`（v2 仍是需显式启用的草稿）
-- 本 crate 基于 `agent-client-protocol` 2.2；上游已到 3.6，两边都在 v1 协议线上，
-  `initialize` / `session/*` 的线格式一致，握手兼容
+- 本 crate 基于 `agent-client-protocol` **5.0.0**（schema **1.15.1**）；SDK 的大版本升级已完成，
+  `initialize` / `session/*` 的线格式与 v1 客户端兼容
+- 5.0 的 v1 方法面相对 2.2 **新增** `auth/status`、`session/set_title`、`session/status`、
+  `session/archive|unarchive`、`proxy/*`；**删除** `document/*`、`nes/*`、`mcp/connect|disconnect`。
+  本项目只实现 agent 侧方法，`proxy/*` 不实现；MCP over ACP 改为 request-scoped（`mcp/message`
+  带 `serverId` + `requestId`，不再有建连/断连）
 - 本 agent 在 `initialize` 中**原样回显**客户端声明的版本，不主动降级也不拒绝——请传 `1`
-- 不稳定特性（plan 操作、session notices、压缩进度、`end_turn` usage、MCP over ACP、`providers/*`、`_agentscope/providers/*`）
-  全部按**客户端声明的能力**门控：客户端没声明就不会收到，也不会报错
+- 不稳定特性（plan 操作、`end_turn` usage、MCP over ACP、`providers/*`、`_agentscope/providers/*`、
+  `subagent_update`）全部按**客户端声明的能力**门控：客户端没声明就不会收到，也不会报错；
+  session notices 与压缩进度在 schema 1.11 起已转正，不再需要单独的 feature 名
 
 ## 模型供应商管理（`providers/*`）
 
@@ -459,10 +482,14 @@ provider 级可选字段：
 | `CODING_MODEL_ID` | 同上的 `default_model` | 临时覆盖模型 |
 | `OPENAI_API_KEY` | provider 里的 `api_key` | 覆盖密钥（启动时会打 warn，避免与配置冲突后难查 401） |
 | `OPENAI_BASE_URL` | provider 里的 `base_url` | 覆盖网关 |
+| `AGENTSCOPE_MODELS_JSON` | `~/.agentscope/models.json` | 覆盖模型配置文件路径（测试与多配置并存） |
 | `LANG` | `zh` | 系统提示语言 |
 | `AGENTSCOPE_LOG_DIR` | `<cwd>/.agentscope/log` | 日志目录（写 `acp-agent.log`） |
 | `RUST_LOG` | `info,acp_harness_agent=debug,agentscope_harness=debug` | tracing 过滤器 |
-| `AGENTSCOPE_ACP_COMPACTION_WINDOW` | 跟随所选模型 | 强制压缩窗口（tokens），覆盖模型自己的上下文窗口；不设时按模型窗口的 90% 触发（如 1M 窗口 → `888192`），仅模型窗口未知时回落 `256000`（触发点 `218419`） |
+| `AGENTSCOPE_TURN_DRIVER` | `durable` | `native` 切到原生驱动；其它值一律保持 durable（仅编译了 `durable` 时有意义） |
+| `AGENTSCOPE_DURABLE_STORE` | 编译 `durable-sqlite` 时 `sqlite` | 设为 `file` 时改用 FileStore（未编译 `durable-sqlite` 时只有 FileStore） |
+| `AGENTSCOPE_ACP_STALL_CANCEL_SECS` | `2700`（45 分钟） | durable 驱动下，`running` turn 无任何 durable 进展时的硬上限；`0`/`off` 关闭。高于所有单工具上限（shell 30 分钟），只用于真卡死的 run |
+| `AGENTSCOPE_ACP_COMPACTION_WINDOW` | 跟随所选模型（未知时 `256000`） | 显式覆盖压缩窗口（tokens）。不设时按模型自己的上下文窗口推导触发点（1M 窗口约 `888192`）；设置后可用于封顶或提高触发点 |
 | `AGENTSCOPE_SESSION_RETENTION` | 二进制 `12h`（库默认 30 天） | 会话 journal 保留期；`off` 关闭清理；支持 `m`/`h`/`d` |
 | `AGENTSCOPE_ACP_WORKER_THREADS` | `min(ncpu, 8)` | tokio worker 数 |
 | `AGENTSCOPE_ACP_MEM_TRIM_IDLE` | `3` 秒 | 空闲多久后归还工作集；`0` 关闭 |
@@ -501,11 +528,16 @@ provider、模型目录、扩展等其余变量见仓库根 [`docs/ENVIRONMENT.m
 
 ## 已知限制
 
-- 预发布：协议表面会随 `agent-client-protocol` 的不稳定特性调整
+- 0.x 预发布：协议表面会随 `agent-client-protocol` 的不稳定特性调整
+- 预编译包（`embedded` profile + `lite`）**只带原生驱动**：没有 durable 的跨进程续跑与崩溃原子性；
+  需要这些保证时用 `cargo xtask acp build durable|sqlite` 自建
 - `acp_agent_cli` 默认只按 `acp_harness_agent.exe` 找同级二进制，非 Windows 需设 `ACP_AGENT_EXE`
 - 仅支持 stdio 传输（不提供 TCP / HTTP 上的 ACP）
 - 音频输入未实现（`prompt_capabilities.audio = false`）
 - 全自动模式（`yolo`）不做任何确认，请在可信工作区使用
+- durable 的 FileStore 不做 `fsync`（进程崩溃安全、掉电不安全）；SQLite 后端是单机预览，
+  WAL 不能放网络文件系统，多宿主请用 Postgres 记录存储（`agentscope-durable-jdbc`）
+- 后台化的长工具是**进程内** spawn：ACP 进程退出，后台命令与其结果一起消失
 
 ## 作为库使用
 
@@ -516,24 +548,40 @@ use agentscope_extensions_acp::AcpCodingAgent;
 
 let agent = AcpCodingAgent::builder()
     .model_factory(build_agent)   // fn(cwd, session_id) -> 装配好的 HarnessAgent
+    .manage_providers(true)       // 开启 providers/* 管理（二进制默认开启）
     .build();
 agent.run_stdio().await?;         // 在当前 stdio 上服务 ACP 客户端
 ```
 
-完整的装配示例（模型解析、skills、compaction、子智能体）见 [`src/acp_harness_agent.rs`](src/acp_harness_agent.rs)。
+需要接收客户端 `systemPrompt`（append 模式）时必须改用 `session_factory`——`model_factory`
+的签名拿不到这段文本，此时能力不声明且请求会被拒绝。完整的装配示例（模型解析、skills、
+compaction、子智能体）见 [`src/acp_harness_agent.rs`](src/acp_harness_agent.rs)。
 
 ## 开发
 
 ```bash
 cargo test -p agentscope-extensions-acp                    # 单元测试（全离线）
-cargo build -p agentscope-extensions-acp --bins            # 两个可执行文件
-cargo build -p agentscope-extensions-acp --no-default-features --features lite --bins
-cargo build -p agentscope-extensions-acp --features alloc-stats  # 诊断：[mem] 行报告真实堆占用
+cargo build -p agentscope-extensions-acp --bins            # 两个可执行文件（默认 durable + FileStore）
+
+# 三个发布变体，产物在 target/acp/<profile>/<variant>/
+cargo xtask acp build native  --profile release            # 原生驱动，无 durable
+cargo xtask acp build durable --profile release            # durable + FileStore
+cargo xtask acp build sqlite  --profile release            # durable + SQLite
+cargo xtask acp build all     --profile embedded           # 体积优先，需 nightly + rust-src
+cargo xtask acp upx sqlite    --profile embedded           # UPX 打包 + 完整性校验
 ```
 
-模块划分：`coding_agent`（ACP 请求分发与能力声明）、`session`（会话状态机与事件流）、
-`config`（modes / config options）、`elicitation`（结构化提问）、`mcp_over_acp`、`mem`（线程与内存诊断）、
-`provider`（`providers/*` 支持）。
+变体只差 feature 组合：`native` = `rusqlite`/`lite`，`durable` = `+durable`，
+`sqlite` = `+durable-sqlite`（隐含 `durable`，两个驱动都编进去，由 `AGENTSCOPE_TURN_DRIVER` 选）。
+两个二进制必须同目录（`acp_agent_cli` 从自身目录 spawn `acp_harness_agent`）。
+
+诊断构建：`cargo build -p agentscope-extensions-acp --features alloc-stats` 让 `[mem]` 行报告真实堆占用。
+
+模块划分：`coding_agent`（ACP 请求分发与能力声明）、`session`（协议状态 + durable 驱动）、
+`turn_driver`（驱动接缝）、`native_driver` + `session_history`（无 durable 的驱动与轻量历史）、
+`config`（modes / config options）、`elicitation`（结构化提问）、`mcp_over_acp`、`deferred_effects`、
+`event_queue`、`provider` + `providers_admin`（`providers/*` 支持）、`mem`（线程与内存诊断）、
+`retention`、`recording`。
 
 ## 许可证
 

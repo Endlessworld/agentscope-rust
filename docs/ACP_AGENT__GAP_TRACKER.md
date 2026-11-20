@@ -17,8 +17,17 @@
 | acp.session | AcpAgentSession：单会话状态 + prompt 驱动 ReActAgent | 已完成 | `run_prompt` 流式 + 取消（AtomicBool） |
 | acp.config | 会话配置（model/mode）、SessionConfigOption 构造 | 已完成 | select 构造 + 3 单测 |
 | acp.event | AgentEvent → SessionUpdate 转换 | 已完成 | 文本/思考 delta + 工具调用，4 单测 |
-| 依赖 | `agent-client-protocol` 依赖已声明 | 待升级 | `crates/agentscope-extensions-acp/Cargo.toml:19` 仍 pin crates.io **v2.2.0** + 6 个 unstable feature，传递 `agent-client-protocol-schema` **1.9.1**；上游已到 **5.0.0 / schema 1.15.1**，升级任务与新增能力见 **§6** |
-| sdk.ability | SDK 能力盘点（2.2.0 一轮 + 5.0.0 一轮） | 已完成（2.2.0） / 待办（5.0.0） | 2.2.0 轮：§2.7.2 所有「待办（不包含暂缓）」项已接线（Notices、Compaction、Plan 操作、Providers、MCP-over-ACP、`PromptResponse.usage`、分页/元数据、CLI 会话恢复）。5.0.0 轮：新增 6 项 v1 能力 + MCP 破坏性改造 + 7 项升级阻断，见 **§6**（`ACP-U01..U08` / `ACP-33..ACP-45`） |
+| 依赖 | `agent-client-protocol` 依赖已声明 | 已完成（5.0.0） | `crates/agentscope-extensions-acp/Cargo.toml` 现为 `agent-client-protocol = 5.0.0`（`stdio` / `process` + 逐项 unstable，schema **1.15.1**）；§6 的升级复核保留为历史证据 |
+| sdk.ability | SDK 能力盘点（2.2.0 一轮 + 5.0.0 一轮） | 已完成（2.2.0）；5.0.0 升级已落地 | 2.2.0 轮：§2.7.2 所有「待办（不包含暂缓）」项已接线（Notices、Compaction、Plan 操作、Providers、MCP-over-ACP、`PromptResponse.usage`、分页/元数据、CLI 会话恢复）。5.0.0 轮：§6 的升级阻断项随 5.0.0 依赖落地；新增能力（`ACP-33..ACP-45`）的逐项状态见 §6.4 与原条目 |
+
+> **0.2.0 发布态（2026-11-21）**：依赖已是 `agent-client-protocol = 5.0.0`（schema 1.15.1）。运行侧在 0.2.0 前落地了四件事，本节是现行口径，§2–§6 保留为历史轮次证据：
+>
+> - **TurnDriver 双驱动**：`DurableDriver`（默认；跨进程 / 崩溃原子 / 多宿主）与 `NativeDriver`（不依赖 `agentscope-durable`，历史在 `<cwd>/.agentscope/acp-sessions/`），`AGENTSCOPE_TURN_DRIVER=native` 运行期切换；`durable` feature 默认开启，`--no-default-features` 时只剩原生驱动。
+> - **构建变体**：`cargo xtask acp build native|durable|sqlite|all [--profile release|embedded]`，产物在 `target/acp/<profile>/<variant>/`。
+> - **长任务**：`execute` 超过 240s 转后台（执行上限 1800s），真实输出经 wakeup 回合注入。
+> - **供应商托管**：`providers/*` 与 `_agentscope/providers/*` 由 `providers_admin.rs` 统一读写 `models.json`（`manage_providers(true)`）。
+>
+> 现行 ACP 能力表、驱动保证与限制见 `crates/agentscope-extensions-acp/README.md`。
 
 > 2026-10-31 全量对齐复核：本 crate 已独立为 `crates/agentscope-extensions-acp`（17 个 `src/*.rs`），且 **Java 侧无 ACP 模块**（`rg -il 'acp' …/agentscope-java -g '*.java'` exit 1）。本轮以「ACP 规范 + SDK 2.2.0 能力面」为基线逐个文件核对，结论见 **§3.5**（7 项缺口/待裁定，其中 1 项 P0）与 **§4.3**（7 项 Rust 原生设计决定 + 8 项已知差异）。
 
@@ -263,6 +272,9 @@ Form 模式用受限 JSON Schema（扁平 `object`）描述请求内容，`Elici
 > **编号**：本节新增三组前缀——`ACP-U**`（升级阻断项，必做，非新特性）、`ACP-33+`（新能力缺口，接续 §3.5 的 `ACP-32` 单调递增）、`ACP-D08+`（设计决定，接续 §4.3.1 的 `ACP-D07`）。历史编号一律不复用。
 
 ### 6.1 版本与工程面事实（升级前必须知道）
+
+> 下表是 **2026-11-02 升级前的复核快照**（当时 workspace 仍是 2.2.0 / MSRV 1.85）。升级已在 0.2.0 完成，
+> 现行版本、MSRV 与 feature 组合见本文开头的「0.2.0 发布态」与 `crates/agentscope-extensions-acp/README.md`。
 
 | # | 项 | 现状（2.2.0 / schema 1.9.1） | 新基线（5.0.0 / schema 1.15.1） | 对本项目的影响 |
 |---|---|---|---|---|

@@ -45,10 +45,15 @@
 | `AGENTSCOPE_LOG_DIR` | `<cwd>/.agentscope/log` | 日志目录，写 `acp-agent.log` |
 | `RUST_LOG` | `info,acp_harness_agent=debug,agentscope_harness=debug` | tracing 过滤器（如 `RUST_LOG=trace`） |
 | `AGENTSCOPE_ACP_WORKER_THREADS` | `min(ncpu, 8)` | tokio worker 线程数（每线程一份栈与分配器缓存） |
+| `AGENTSCOPE_ACP_MEM_TRIM_IDLE` | `3` | 空闲多少秒后归还工作集；`0` 关闭 |
 | `AGENTSCOPE_ACP_MEM_REPORT` | 关 | 每个 turn 额外记录序列化后的 `AgentState` 体积 |
 | `AGENTSCOPE_ACP_MEM_COLLECT` | 开 | 每个 turn 后向分配器归还内存；`=0` 关闭（unix 有效，Windows 为 no-op） |
 | `AGENTSCOPE_ACP_RECORD_MODEL_REQUESTS` | 关 | 把每次模型请求体（`request/prepared`）写进会话 journal，排查用；单次可达数 MB |
-| `AGENTSCOPE_ACP_COMPACTION_WINDOW` | `256000` | 对话压缩使用的窗口属性（tokens），**与所选模型的窗口无关**；触发点为 `trigger_for_window(该值)`，默认 `218419` |
+| `AGENTSCOPE_TURN_DRIVER` | `durable` | ACP turn 驱动：`native` 切到原生驱动；其它值（含未设置/拼错）一律保持 durable（仅编译了 `durable` feature 时有意义） |
+| `AGENTSCOPE_DURABLE_STORE` | 编译 `durable-sqlite` 时 `sqlite` | 设为 `file` 时改用 FileStore；未编译 `durable-sqlite` 时只有 FileStore |
+| `AGENTSCOPE_ACP_STALL_CANCEL_SECS` | `2700`（45 分钟） | durable 驱动下，`running` turn 无 durable 进展时的硬上限；`0`/`off`/`false`/`no` 关闭。高于所有单工具上限，只用于真卡死的 run |
+| `AGENTSCOPE_ACP_COMPACTION_WINDOW` | 跟随所选模型（未知时 `256000`） | 显式覆盖压缩窗口（tokens）。不设时按模型自己的上下文窗口推导触发点（1M 窗口约 `888192`）；设置后用于封顶或提高触发点 |
+| `AGENTSCOPE_MODELS_JSON` | `~/.agentscope/models.json` | 覆盖模型配置文件路径（测试与多配置并存） |
 | `AGENTSCOPE_SESSION_RETENTION` | ACP 二进制 `12h`；库默认 30 天 | 会话 journal 保留窗口；`off/0/false/no` 关闭清理；裸数字按天，支持 `m`/`h`/`d` 后缀 |
 | `AGENTSCOPE_JOURNAL_RETENTION_DAYS` | `min(会话保留天数, 30)` | 空闲会话目录（journal）按天淘汰 |
 
