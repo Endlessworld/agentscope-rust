@@ -157,3 +157,32 @@ async fn the_next_prompt_drains_the_queue_in_order() {
         "the queued turn's updates must carry its id in _meta.turnId"
     );
 }
+
+#[tokio::test]
+async fn stop_cancels_the_whole_queue_without_running_it() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let session = build_session("stop", Arc::clone(&seen));
+
+    let (first, _) = session.queue(prompt("one"), "q-1").await.expect("queue");
+    let (second, _) = session.queue(prompt("two"), "q-2").await.expect("queue");
+    assert_eq!(session.queued().await.expect("list").len(), 2);
+
+    assert_eq!(
+        session.cancel_queued().await.expect("clear the queue"),
+        2,
+        "stop clears every waiting turn"
+    );
+    assert!(session.queued().await.expect("list").is_empty());
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "stop must not run what it cancels"
+    );
+
+    // The client re-submits the parked text with a fresh idempotency key: the cancelled turns
+    // must not make that collide.
+    let (again, position) = session.queue(prompt("one"), "q-3").await.expect("requeue");
+    assert_ne!(again, first);
+    assert_ne!(again, second);
+    assert_eq!(position, 1);
+    assert_eq!(session.queued().await.expect("list").len(), 1);
+}

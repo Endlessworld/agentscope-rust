@@ -3273,6 +3273,48 @@ impl AcpAgentSession {
         Ok(true)
     }
 
+    /// Cancels every turn that has not started yet and answers how many were dropped.
+    ///
+    /// Stop is "stop everything": a queue that survives the user's Stop would run behind their
+    /// back on the next prompt. The text is not lost — the client keeps the parked inputs and
+    /// re-submits them (`_acp_extends/session/queue`) before its next prompt.
+    ///
+    /// The running turn is left to [`Self::cancel`]: pausing or interrupting it mid-flight is
+    /// that path's business, and a turn that already started must not be silently re-queued.
+    #[cfg(feature = "durable")]
+    pub async fn cancel_queued(&self) -> std::result::Result<usize, String> {
+        let runtime = self.durable_store()?.open_runtime().await?;
+        let mut cancelled = 0usize;
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = runtime
+                .session
+                .turns(cursor.as_deref(), 1000)
+                .await
+                .map_err(|error| error.to_string())?;
+            for turn in &page.items {
+                if turn.status != TurnStatus::Queued {
+                    continue;
+                }
+                // Deterministic per turn, so a retried Stop reaches the same cancellation.
+                let request_id = format!("stop-{}", turn.turn_id);
+                match runtime.session.cancel(&turn.turn_id, &request_id).await {
+                    Ok(()) => cancelled += 1,
+                    Err(error) => tracing::warn!(
+                        turn = %turn.turn_id,
+                        %error,
+                        "stop: could not cancel a queued turn"
+                    ),
+                }
+            }
+            match page.cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(cancelled)
+    }
+
     /// Pauses the running turn where it is; the turn stays resumable.
     ///
     /// The flag is raised *before* the suspend lands: the drive loop checks it the moment the
@@ -3400,6 +3442,12 @@ impl AcpAgentSession {
         _request_id: &str,
     ) -> std::result::Result<bool, String> {
         Err("this build has no durable driver, so nothing is queued".to_string())
+    }
+
+    /// Nothing can wait in a build without the durable driver, so Stop has no queue to clear.
+    #[cfg(not(feature = "durable"))]
+    pub async fn cancel_queued(&self) -> std::result::Result<usize, String> {
+        Ok(0)
     }
 
     /// Pauses the running turn; a native turn runs to its end inside this process.
@@ -4974,6 +5022,15 @@ impl AcpAgentSession {
     /// call contributed usage (so an empty turn does not report a bogus 0).
     pub fn turn_usage_response(&self) -> Option<agent_client_protocol::v1::schema::Usage> {
         turn_usage_to_response(&self.turn.usage)
+    }
+
+    /// Whether the running prompt ended because the client asked to pause it.
+    ///
+    /// The prompt still has to answer with a `stopReason`, and ACP has no `paused` reason: the
+    /// turn did not finish, so it answers `cancelled`. This flag is what lets the response carry
+    /// `_meta.paused` so a client can tell a pause from a real cancellation.
+    pub fn pause_pending(&self) -> bool {
+        self.turn.pause_requested.load(Ordering::SeqCst)
     }
 
     /// Builds the ACP `UsageUpdate` notification: `used` is the tokens in

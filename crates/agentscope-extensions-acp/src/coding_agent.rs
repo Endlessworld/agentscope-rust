@@ -1279,9 +1279,23 @@ impl AcpCodingAgent {
                         // Turn-level token usage must be read before the session
                         // is moved back into the registry.
                         let usage = session.turn_usage_response();
+                        let paused = session.pause_pending();
                         registrar.register_session(session);
                         match outcome {
-                            Ok(stop) => responder.respond(PromptResponse::new(stop).usage(usage)),
+                            Ok(stop) => {
+                                let mut response = PromptResponse::new(stop).usage(usage);
+                                // A turn that finished before the pause request reached it answers
+                                // `end_turn`: the request is moot, not a pause to resume.
+                                if paused && stop == StopReason::Cancelled {
+                                    // ACP has no `paused` stop reason: the turn did not finish,
+                                    // so it answers `cancelled`. The marker is what separates a
+                                    // pause from a real cancellation for the client.
+                                    let mut meta = agent_client_protocol::v1::schema::Meta::new();
+                                    meta.insert("paused".to_string(), serde_json::json!(true));
+                                    response = response.meta(meta);
+                                }
+                                responder.respond(response)
+                            }
                             Err(panic) => {
                                 let detail = panic
                                     .downcast_ref::<&str>()
@@ -1308,6 +1322,13 @@ impl AcpCodingAgent {
                 async move |notif: CancelNotification, _cx| {
                     if let Some(session) = a_cancel.get_session(&notif.session_id) {
                         session.cancel();
+                        // Stop also empties the queue: a turn the user aborted must not run behind
+                        // their back on the next prompt. The client keeps the parked text and
+                        // re-submits it before its next prompt, so nothing is lost. Awaited, so an
+                        // immediate re-submit cannot race the cancellation still in flight.
+                        if let Err(error) = session.cancel_queued().await {
+                            tracing::warn!(%error, "stop: could not clear the queued turns");
+                        }
                     } else if let Some(parent) = a_cancel.subagent_parent(&notif.session_id) {
                         // A child session is not a registered session: the client cancels it by
                         // naming the child, and the parent owns the agent that must be stopped.
