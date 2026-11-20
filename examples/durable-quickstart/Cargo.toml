@@ -1,0 +1,13 @@
+[package]
+name = "durable-quickstart"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+agentscope-durable = { workspace = true }
+agentscope-durable-sqlite = { path = "../../crates/agentscope-durable-sqlite" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

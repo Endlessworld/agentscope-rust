@@ -31,6 +31,10 @@
 //! | `nacos` | [`nacos`] | `agentscope-extensions-nacos` |
 //! | `higress` | [`higress`] | `agentscope-extensions-higress` |
 //! | `judge` | [`judge`] | `agentscope-extensions-judge` |
+//! | `durable` | [`durable`] | `agentscope-durable` |
+//! | `durable-sqlite` | [`durable_sqlite`] | `agentscope-durable-sqlite` |
+//! | `durable-adapter-agentscope` | [`durable_adapter_agentscope`] | `agentscope-durable-adapter-agentscope` |
+//! | `durable-worker` | [`durable_worker`] | `agentscope-durable-worker` |
 //! | `jdbc` | [`jdbc`] | `agentscope-extensions-jdbc` |
 //! | `mysql` | [`mysql`] | `agentscope-extensions-mysql` |
 //! | `postgresql` | [`postgresql`] | `agentscope-extensions-postgresql` |
@@ -91,6 +95,15 @@ pub use agentscope_extensions_channel as channel;
 pub use agentscope_extensions_higress as higress;
 #[cfg(feature = "judge")]
 pub use agentscope_extensions_judge as judge;
+
+#[cfg(feature = "durable")]
+pub use agentscope_durable as durable;
+#[cfg(feature = "durable-adapter-agentscope")]
+pub use agentscope_durable_adapter_agentscope as durable_adapter_agentscope;
+#[cfg(feature = "durable-sqlite")]
+pub use agentscope_durable_sqlite as durable_sqlite;
+#[cfg(feature = "durable-worker")]
+pub use agentscope_durable_worker as durable_worker;
 #[cfg(feature = "mem")]
 pub use agentscope_extensions_mem as mem;
 #[cfg(feature = "nacos")]

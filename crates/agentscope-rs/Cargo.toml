@@ -42,6 +42,10 @@ agentscope-extensions-training = { workspace = true, optional = true }
 agentscope-extensions-nacos = { workspace = true, optional = true }
 agentscope-extensions-higress = { workspace = true, optional = true }
 agentscope-extensions-judge = { workspace = true, optional = true }
+agentscope-durable = { workspace = true, optional = true }
+agentscope-durable-sqlite = { path = "../agentscope-durable-sqlite", optional = true }
+agentscope-durable-adapter-agentscope = { workspace = true, optional = true }
+agentscope-durable-worker = { path = "../agentscope-durable-worker", optional = true }
 
 [features]
 # Light default: the agent runtime and the harness, nothing that needs a database or an HTTP
@@ -76,6 +80,13 @@ nacos = ["harness", "dep:agentscope-extensions-nacos"]
 higress = ["harness", "dep:agentscope-extensions-higress"]
 judge = ["harness", "dep:agentscope-extensions-judge"]
 
+# Durable execution. `durable` is the semantic core; the other three are the store, the
+# AgentScope harness adapter and the resident worker that drive it.
+durable = ["harness", "dep:agentscope-durable"]
+durable-sqlite = ["durable", "dep:agentscope-durable-sqlite"]
+durable-adapter-agentscope = ["durable", "dep:agentscope-durable-adapter-agentscope"]
+durable-worker = ["durable", "dep:agentscope-durable-worker"]
+
 # Storage backends.
 jdbc = ["harness", "dep:agentscope-extensions-jdbc"]
 mysql = ["harness", "dep:agentscope-extensions-mysql"]
@@ -106,6 +117,10 @@ full = [
     "nacos",
     "higress",
     "judge",
+    "durable",
+    "durable-sqlite",
+    "durable-adapter-agentscope",
+    "durable-worker",
     "jdbc",
     "mysql",
     "postgresql",

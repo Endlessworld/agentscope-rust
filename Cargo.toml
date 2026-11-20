@@ -16,6 +16,8 @@ members = [
     "crates/agentscope-durable-mcp",
     "crates/agentscope-durable-rocketmq",
     "crates/agentscope-durable-sandbox",
+    # A runnable quickstart for the durable runtime.
+    "examples/durable-quickstart",
     # agentscope-extensions/* 迁移 crate（每个 crate 由 docs/extensions/<MODULE>__GAP_TRACKER.md 跟踪）
     "crates/agentscope-extensions-model",
     "crates/agentscope-extensions-protocol",

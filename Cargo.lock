@@ -122,6 +122,7 @@ version = "0.2.0"
 dependencies = [
  "agentscope-durable-sqlite",
  "async-trait",
+ "futures",
  "libc",
  "rusqlite",
  "serde",
@@ -152,9 +153,12 @@ version = "0.2.0"
 dependencies = [
  "agentscope-durable",
  "async-trait",
+ "axum",
+ "futures",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -189,6 +193,8 @@ name = "agentscope-durable-rocketmq"
 version = "0.2.0"
 dependencies = [
  "agentscope-durable",
+ "agentscope-durable-worker",
+ "async-trait",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -200,6 +206,7 @@ version = "0.2.0"
 dependencies = [
  "agentscope-durable",
  "async-trait",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -211,6 +218,7 @@ dependencies = [
  "agentscope-durable",
  "rusqlite",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -221,6 +229,7 @@ dependencies = [
  "async-trait",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -746,6 +755,10 @@ name = "agentscope-rs"
 version = "0.2.0"
 dependencies = [
  "agentscope-core",
+ "agentscope-durable",
+ "agentscope-durable-adapter-agentscope",
+ "agentscope-durable-sqlite",
+ "agentscope-durable-worker",
  "agentscope-extensions-a2a-client",
  "agentscope-extensions-a2a-server",
  "agentscope-extensions-acp",
@@ -2103,6 +2116,17 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "durable-quickstart"
+version = "0.2.0"
+dependencies = [
+ "agentscope-durable",
+ "agentscope-durable-sqlite",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "dyn-clone"
