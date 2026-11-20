@@ -8,13 +8,14 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentscope_durable::executor::{Executor, ExecutorCapabilities};
 use agentscope_durable::{DurableError, ExecutionRequest, ExecutionResult, ExecutionState, Result};
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
+use crate::bindings::{BindingRecord, BindingState, BindingStore};
 use crate::output::capture;
 use crate::sandbox::{ExecSpec, Handle, Poll, Sandbox, SandboxError, SandboxErrorKind};
 
@@ -46,6 +47,8 @@ struct Live {
 pub struct SandboxExecutor {
     sandbox: Arc<dyn Sandbox>,
     live: Mutex<HashMap<String, Live>>,
+    /// Where execution identities survive this process; absent keeps the old in-process behavior.
+    bindings: Option<Arc<dyn BindingStore>>,
 }
 
 impl SandboxExecutor {
@@ -57,7 +60,14 @@ impl SandboxExecutor {
         Self {
             sandbox,
             live: Mutex::new(HashMap::new()),
+            bindings: None,
         }
+    }
+
+    /// Records every execution's identity so a restarted process can adopt the handle.
+    pub fn with_bindings(mut self, bindings: Arc<dyn BindingStore>) -> Self {
+        self.bindings = Some(bindings);
+        self
     }
 
     /// How many executions this process still has a handle for. Terminal observations are
@@ -77,9 +87,17 @@ impl SandboxExecutor {
     }
 
     /// Reads the execution's current fact without starting anything.
+    ///
+    /// A handle this process does not hold may still be live: the store is the second place a
+    /// restarted host looks, and adopting the record is what makes the execution resumable.
     async fn observe(&self, execution_id: &str) -> Result<ExecutionResult> {
-        let Some(live) = self.entry(execution_id) else {
-            return Ok(ExecutionResult::unknown(NO_HANDLE));
+        let live = match self.entry(execution_id) {
+            Some(live) => live,
+            None => match self.attach(execution_id).await? {
+                Adopted::Live(live) => live,
+                Adopted::Released => return Ok(released_result()),
+                Adopted::Absent => return Ok(ExecutionResult::unknown(NO_HANDLE)),
+            },
         };
         let poll = match self.sandbox.poll(&live.handle).await {
             Ok(poll) => poll,
@@ -87,6 +105,7 @@ impl SandboxExecutor {
             // would either duplicate or drop work.
             Err(error) if error.kind() == SandboxErrorKind::NotFound => {
                 self.forget(execution_id);
+                self.mark_gone(execution_id)?;
                 return Ok(ExecutionResult::unknown(format!(
                     "the sandbox no longer knows this execution: {error}"
                 )));
@@ -107,6 +126,7 @@ impl SandboxExecutor {
                 truncated,
             } => {
                 self.forget(execution_id);
+                self.mark_gone(execution_id)?;
                 Ok(exited_result(
                     &live.handle,
                     code,
@@ -128,6 +148,7 @@ impl SandboxExecutor {
         let kill_error = self.sandbox.kill(&live.handle).await.err();
         let last = self.sandbox.poll(&live.handle).await.ok();
         self.forget(execution_id);
+        self.mark_gone(execution_id)?;
 
         let mut payload = base(OUTCOME_TIMED_OUT);
         if let Some(timeout_ms) = live.spec.timeout_ms {
@@ -190,6 +211,11 @@ impl Executor for SandboxExecutor {
         if self.entry(&request.execution_id).is_some() {
             return self.observe(&request.execution_id).await;
         }
+        match self.attach(&request.execution_id).await? {
+            Adopted::Live(_) => return self.observe(&request.execution_id).await,
+            Adopted::Released => return Ok(released_result()),
+            Adopted::Absent => {}
+        }
         let spec = ExecSpec::from_arguments(&request.call.arguments).map_err(durable)?;
         let handle = match self.sandbox.spawn(spec.clone()).await {
             Ok(handle) => handle,
@@ -205,6 +231,12 @@ impl Executor for SandboxExecutor {
         let deadline = spec
             .timeout_ms
             .map(|ms| Instant::now() + Duration::from_millis(ms));
+        // The handle is recorded before anything observes it: a crash between the spawn and the
+        // first poll still leaves a restart something to adopt.
+        if let Err(error) = self.record_attached(request, &handle, &spec, deadline) {
+            let _ = self.sandbox.kill(&handle).await;
+            return Err(error);
+        }
         if let Ok(mut live) = self.live.lock() {
             live.insert(
                 request.execution_id.clone(),
@@ -223,8 +255,13 @@ impl Executor for SandboxExecutor {
     }
 
     async fn cancel(&self, request: &ExecutionRequest) -> Result<ExecutionResult> {
-        let Some(live) = self.entry(&request.execution_id) else {
-            return Ok(ExecutionResult::unknown(NO_HANDLE));
+        let live = match self.entry(&request.execution_id) {
+            Some(live) => live,
+            None => match self.attach(&request.execution_id).await? {
+                Adopted::Live(live) => live,
+                Adopted::Released => return Ok(released_result()),
+                Adopted::Absent => return Ok(ExecutionResult::unknown(NO_HANDLE)),
+            },
         };
         // A command that finished before the request landed is a fact worth keeping: report what
         // really happened instead of overwriting it with a cancellation.
@@ -236,6 +273,7 @@ impl Executor for SandboxExecutor {
         }) = self.sandbox.poll(&live.handle).await
         {
             self.forget(&request.execution_id);
+            self.mark_gone(&request.execution_id)?;
             return Ok(exited_result(
                 &live.handle,
                 code,
@@ -248,6 +286,7 @@ impl Executor for SandboxExecutor {
         match self.sandbox.kill(&live.handle).await {
             Ok(()) => {
                 self.forget(&request.execution_id);
+                self.mark_gone(&request.execution_id)?;
                 Ok(ExecutionResult {
                     state: ExecutionState::Cancelled,
                     handle: Some(live.handle.id.clone()),
@@ -261,6 +300,147 @@ impl Executor for SandboxExecutor {
             ))),
         }
     }
+}
+
+/// What the store said about an execution this process does not hold.
+enum Adopted {
+    Live(Live),
+    /// Stopping was already requested, or the execution is over: the answer is `CANCELLED`.
+    Released,
+    /// Nothing is recorded.
+    Absent,
+}
+
+impl SandboxExecutor {
+    async fn attach(&self, execution_id: &str) -> Result<Adopted> {
+        let Some(store) = &self.bindings else {
+            return Ok(Adopted::Absent);
+        };
+        let Some(record) = store.get(execution_id)? else {
+            return Ok(Adopted::Absent);
+        };
+        match record.state {
+            BindingState::Attached => {
+                let live = live_from(&record);
+                if let Ok(mut live_map) = self.live.lock() {
+                    live_map.insert(execution_id.to_string(), live.clone());
+                }
+                Ok(Adopted::Live(live))
+            }
+            // The previous host died between the barrier and the kill: retry the kill, then
+            // close the record so the next sweep does not see it again.
+            BindingState::Releasing => {
+                let _ = self.sandbox.kill(&record.handle).await;
+                self.mark(&record, BindingState::Gone)?;
+                Ok(Adopted::Released)
+            }
+            BindingState::Gone => Ok(Adopted::Released),
+        }
+    }
+
+    fn mark(&self, record: &BindingRecord, state: BindingState) -> Result<()> {
+        let Some(store) = &self.bindings else {
+            return Ok(());
+        };
+        let mut next = record.clone();
+        next.state = state;
+        next.updated_at = now_millis();
+        store.put(&next)
+    }
+
+    fn mark_gone(&self, execution_id: &str) -> Result<()> {
+        let Some(store) = &self.bindings else {
+            return Ok(());
+        };
+        let Some(record) = store.get(execution_id)? else {
+            return Ok(());
+        };
+        self.mark(&record, BindingState::Gone)
+    }
+
+    fn record_attached(
+        &self,
+        request: &ExecutionRequest,
+        handle: &Handle,
+        spec: &ExecSpec,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let Some(store) = &self.bindings else {
+            return Ok(());
+        };
+        let deadline_ms = deadline.map(|deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            now_millis() + remaining.as_millis() as u64
+        });
+        store.put(&BindingRecord {
+            execution_id: request.execution_id.clone(),
+            thread: request.thread.clone(),
+            handle: handle.clone(),
+            spec: spec.clone(),
+            deadline_ms,
+            state: BindingState::Attached,
+            updated_at: now_millis(),
+        })
+    }
+
+    /// Sweeps the store: `Releasing` records are closed, expired `Attached` ones are stopped.
+    pub async fn keepalive(&self, limit: usize) -> Result<usize> {
+        let Some(store) = &self.bindings else {
+            return Ok(0);
+        };
+        let now = now_millis();
+        let mut handled = 0;
+        for record in store.live(limit)? {
+            match record.state {
+                BindingState::Releasing => {
+                    let _ = self.sandbox.kill(&record.handle).await;
+                    self.mark(&record, BindingState::Gone)?;
+                    handled += 1;
+                }
+                BindingState::Attached => {
+                    if !record.deadline_ms.is_some_and(|deadline| deadline <= now) {
+                        continue;
+                    }
+                    if let Ok(Poll::Running { .. }) = self.sandbox.poll(&record.handle).await {
+                        let _ = self.sandbox.kill(&record.handle).await;
+                    }
+                    self.forget(&record.execution_id);
+                    self.mark(&record, BindingState::Gone)?;
+                    handled += 1;
+                }
+                BindingState::Gone => {}
+            }
+        }
+        Ok(handled)
+    }
+}
+
+fn live_from(record: &BindingRecord) -> Live {
+    let deadline = record.deadline_ms.map(|deadline_ms| {
+        let remaining = deadline_ms.saturating_sub(now_millis());
+        Instant::now() + Duration::from_millis(remaining)
+    });
+    Live {
+        handle: record.handle.clone(),
+        spec: record.spec.clone(),
+        deadline,
+    }
+}
+
+fn released_result() -> ExecutionResult {
+    ExecutionResult {
+        state: ExecutionState::Cancelled,
+        handle: None,
+        result: Value::Object(base(OUTCOME_CANCELLED)),
+        error: Some("the execution was released".to_string()),
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn is_expired(deadline: Option<Instant>) -> bool {

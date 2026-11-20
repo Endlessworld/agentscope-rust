@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Bytes kept per stream when the call does not ask for a different bound.
@@ -15,7 +16,8 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// reorders arguments, normalises a working directory or injects an environment variable. Whatever
 /// the model asked for is what the sandbox is asked to run, because the effect that gets recorded
 /// must be the effect that was intended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecSpec {
     pub command: String,
     pub args: Vec<String>,
@@ -142,7 +144,8 @@ fn number(
 
 /// The sandbox's name for one execution. Opaque to the runtime: it is carried in the durable
 /// result verbatim so a later query can be answered by whoever holds the sandbox.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Handle {
     pub id: String,
 }

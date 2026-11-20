@@ -36,11 +36,15 @@
 //! [`FakeSandbox`] is a scripted sandbox for tests: no process, no clock, no I/O. It is production
 //! code so a downstream crate can assert its own executor wiring without a container.
 
+mod bindings;
 mod executor;
 mod fake;
 mod output;
 mod sandbox;
 
+pub use bindings::{
+    BindingRecord, BindingState, BindingStore, FileBindings, MemoryBindings, SandboxBindings,
+};
 pub use executor::{
     SandboxExecutor, OUTCOME_CANCELLED, OUTCOME_FAILED, OUTCOME_RUNNING, OUTCOME_SUCCEEDED,
     OUTCOME_TIMED_OUT,
