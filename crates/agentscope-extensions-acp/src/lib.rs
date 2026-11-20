@@ -25,6 +25,7 @@ pub mod retention;
 pub mod session;
 pub mod setup;
 pub mod support;
+pub mod turn_driver;
 
 pub use coding_agent::{
     compaction_trigger_for, compaction_window_tokens, release_catalog_if_unused, AcpCodingAgent,

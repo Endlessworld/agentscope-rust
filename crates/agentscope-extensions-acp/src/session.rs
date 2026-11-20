@@ -8,6 +8,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use crate::turn_driver::{
+    DriverError, DriverInput, EventSink, Guarantees, ReplayItem, ResumeOutcome,
+    TurnDriver as TurnDriverSeam, TurnOutcome, TurnView,
+};
 use agent_client_protocol::v1::schema::{
     ContentBlock, CreateElicitationRequest, CreateElicitationResponse, MessageId, PermissionOption,
     PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
@@ -799,6 +803,78 @@ pub(crate) fn turn_status_name(status: TurnStatus) -> &'static str {
     }
 }
 
+/// The durable runtime that backs this session's turns.
+///
+/// The slot used to live on [`AcpAgentSession`]. Owning it here is the first step of the seam in
+/// [`crate::turn_driver`]: the protocol layer will reach turns through the trait, and this type
+/// will own the store handle, the thread and the tick loop instead of the session.
+///
+/// Nothing routes through the trait yet: `run`/`cancel`/`view`/`replay`/`resume` answer
+/// `Unavailable` and the session keeps calling its own methods, so the migration changes no
+/// behaviour. What it does pin is the ownership: the session no longer holds a runtime field.
+pub(crate) struct DurableDriver {
+    runtime: tokio::sync::Mutex<Option<Arc<SessionRuntime>>>,
+}
+
+impl DurableDriver {
+    fn new() -> Self {
+        Self {
+            runtime: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// The slot [`AcpAgentSession::open_runtime`] fills and every reader locks.
+    fn runtime(&self) -> &tokio::sync::Mutex<Option<Arc<SessionRuntime>>> {
+        &self.runtime
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnDriverSeam for DurableDriver {
+    async fn run(
+        &self,
+        _input: DriverInput,
+        _sink: EventSink,
+    ) -> std::result::Result<TurnOutcome, DriverError> {
+        Err(DriverError::Unavailable(
+            "the turn is still driven by AcpAgentSession; the seam takes over in the next step"
+                .to_string(),
+        ))
+    }
+
+    async fn cancel(&self, _turn_id: &str) -> std::result::Result<(), DriverError> {
+        Err(DriverError::Unavailable(
+            "cancel is still routed through AcpAgentSession".to_string(),
+        ))
+    }
+
+    async fn view(&self) -> std::result::Result<TurnView, DriverError> {
+        Err(DriverError::Unavailable(
+            "status is still read through AcpAgentSession".to_string(),
+        ))
+    }
+
+    async fn replay(&self) -> std::result::Result<Vec<ReplayItem>, DriverError> {
+        Err(DriverError::Unavailable(
+            "session/load still reads the journal through AcpAgentSession".to_string(),
+        ))
+    }
+
+    async fn resume(&self) -> std::result::Result<ResumeOutcome, DriverError> {
+        Err(DriverError::Unavailable(
+            "session/resume still runs through AcpAgentSession".to_string(),
+        ))
+    }
+
+    fn guarantees(&self) -> Guarantees {
+        Guarantees {
+            cross_process: true,
+            crash_atomic: true,
+            multi_host: true,
+        }
+    }
+}
+
 /// Advances one turn until it settles or yields.
 ///
 /// One `tick` is one model decision plus the tools it dispatched, so a turn needs as many ticks
@@ -946,7 +1022,7 @@ pub struct AcpAgentSession {
     /// prompts; opening per prompt would rebuild the store handle and re-read the thread state.
     /// The turns themselves live in the store, so a restart rebuilds this from what a tick
     /// committed.
-    runtime: Arc<tokio::sync::Mutex<Option<Arc<SessionRuntime>>>>,
+    driver: Arc<DurableDriver>,
     /// Manages MCP client connections for this session (stdio servers declared
     /// by the ACP client via `mcp_servers`). Shared across clones so tools keep
     /// working after `register_session` write-back.
@@ -1253,7 +1329,7 @@ impl AcpAgentSession {
             elicitation_slot: Arc::new(Mutex::new(None)),
             permission_store,
             mcp_manager: Arc::new(agentscope_harness::agent::McpClientManager::new()),
-            runtime: Arc::new(tokio::sync::Mutex::new(None)),
+            driver: Arc::new(DurableDriver::new()),
             bridged_servers: Arc::new(Mutex::new(Vec::new())),
             pending_acp_servers: Arc::new(Mutex::new(Vec::new())),
             support: ClientSupport::new(),
@@ -1350,7 +1426,7 @@ impl AcpAgentSession {
     /// fsync hiccup). Those failures are not the user's fault and must not end a turn on the
     /// first attempt.
     async fn open_runtime(&self) -> std::result::Result<Arc<SessionRuntime>, String> {
-        let cached = self.runtime.lock().await.as_ref().map(Arc::clone);
+        let cached = self.driver.runtime().lock().await.as_ref().map(Arc::clone);
         if let Some(runtime) = cached {
             return Ok(runtime);
         }
@@ -1375,7 +1451,7 @@ impl AcpAgentSession {
                 Err(error) => return Err(error.to_string()),
             }
         };
-        *self.runtime.lock().await = Some(Arc::clone(&opened));
+        *self.driver.runtime().lock().await = Some(Arc::clone(&opened));
         Ok(opened)
     }
 
@@ -1720,7 +1796,7 @@ impl AcpAgentSession {
         answers: std::collections::BTreeMap<String, String>,
     ) -> std::result::Result<(), String> {
         let runtime = {
-            let slot = self.runtime.lock().await;
+            let slot = self.driver.runtime().lock().await;
             match slot.as_ref() {
                 Some(runtime) => Arc::clone(runtime),
                 None => return Err("the session runtime is not open".to_string()),
@@ -2454,7 +2530,7 @@ impl AcpAgentSession {
         self.cancel_subagents();
         // Release the dispatcher unless a prompt currently holds the handle; dropping the
         // last clone stops it after that prompt unwinds.
-        if let Ok(mut runtime) = self.runtime.try_lock() {
+        if let Ok(mut runtime) = self.driver.runtime().try_lock() {
             runtime.take();
         }
     }
@@ -2648,7 +2724,8 @@ impl AcpAgentSession {
         // The transcript comes from the durable journal this session writes. The harness journal
         // store is no longer the writer, so reading it would replay an empty conversation.
         let cached = self
-            .runtime
+            .driver
+            .runtime()
             .lock()
             .await
             .as_ref()
