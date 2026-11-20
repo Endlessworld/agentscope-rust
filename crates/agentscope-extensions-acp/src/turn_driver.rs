@@ -84,6 +84,20 @@ pub enum TurnStatusView {
 }
 
 impl TurnStatusView {
+    /// A stable name for a store that has to remember the status across restarts.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
     /// Terminal turns never advance again; a waiting or interrupted one may be resumed.
     pub fn terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
