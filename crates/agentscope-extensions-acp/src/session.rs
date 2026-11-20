@@ -3643,7 +3643,7 @@ impl AcpAgentSession {
         Some(stop)
     }
 
-    /// Builds the `session/update` replay a client needs after `session/load`.
+    /// Streams the `session/update` replay a client needs after `session/load`.
     ///
     /// ACP v1 `loadSession` requires the agent to replay the whole conversation: the client
     /// has no state for that session and renders whatever `session/update`s arrive before the
@@ -3661,9 +3661,10 @@ impl AcpAgentSession {
     ///
     /// An unreadable journal is not an error for `load`: the session may have been created by
     /// this very request for a cwd that has no history yet, so the replay is simply empty.
-    pub async fn replay_notifications(
-        &self,
-    ) -> Vec<agent_client_protocol::v1::schema::SessionNotification> {
+    pub async fn replay_notifications<F>(&self, mut emit: F)
+    where
+        F: FnMut(agent_client_protocol::v1::schema::SessionNotification) + Send,
+    {
         use agent_client_protocol::v1::schema::{
             ContentChunk, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
         };
@@ -3688,18 +3689,13 @@ impl AcpAgentSession {
                         %error,
                         "cannot open the durable journal; session/load will replay nothing"
                     );
-                    return Vec::new();
+                    return;
                 }
             },
         };
-        if let Err(error) = agentscope_core::journal::JournalProjection::read(&*journal).await {
-            tracing::warn!(
-                session = %self.session_id,
-                %error,
-                "cannot inspect the session; session/load will replay nothing"
-            );
-            return Vec::new();
-        }
+        // The transcript read is also the readability check: it walks the committed prefix and
+        // fails on a damaged journal, so a separate projection pass would fold the same events a
+        // second time and double the memory a resume peaks at.
         let transcript = match agentscope_core::journal::transcript(&*journal).await {
             Ok(transcript) => transcript,
             Err(error) => {
@@ -3708,61 +3704,57 @@ impl AcpAgentSession {
                     %error,
                     "cannot read the transcript; session/load will replay nothing"
                 );
-                return Vec::new();
+                return;
             }
         };
 
-        let mut notifications = Vec::new();
+        // Each notification is handed over as it is built: a loaded session has no reason to
+        // hold the whole replay twice (once as the transcript, once as a vector of chunks).
         for message in transcript.messages {
             // One message id per historical message: clients group chunks by it exactly as
             // they do for a live turn, so a replayed turn renders as one bubble.
             let message_id = MessageId::new(format!("history-{}", message.id));
             for block in message.content.iter() {
-                match (message.role, block) {
+                let update = match (message.role, block) {
                     (MsgRole::User, CoreBlock::Text(text)) => {
-                        notifications.push(SessionNotification::new(
-                            self.session_id.clone(),
-                            SessionUpdate::UserMessageChunk(
-                                ContentChunk::new(ContentBlock::Text(TextContent::new(
-                                    text.text.clone(),
-                                )))
-                                .message_id(message_id.clone()),
-                            ),
+                        Some(SessionUpdate::UserMessageChunk(
+                            ContentChunk::new(ContentBlock::Text(TextContent::new(
+                                text.text.clone(),
+                            )))
+                            .message_id(message_id.clone()),
                         ))
                     }
                     (MsgRole::Assistant, CoreBlock::Text(text)) => {
-                        notifications.push(SessionNotification::new(
-                            self.session_id.clone(),
-                            SessionUpdate::AgentMessageChunk(
-                                ContentChunk::new(ContentBlock::Text(TextContent::new(
-                                    text.text.clone(),
-                                )))
-                                .message_id(message_id.clone()),
-                            ),
+                        Some(SessionUpdate::AgentMessageChunk(
+                            ContentChunk::new(ContentBlock::Text(TextContent::new(
+                                text.text.clone(),
+                            )))
+                            .message_id(message_id.clone()),
                         ))
                     }
                     (MsgRole::Assistant, CoreBlock::ToolUse(tool)) => {
-                        notifications.push(SessionNotification::new(
-                            self.session_id.clone(),
-                            SessionUpdate::ToolCall(
-                                ToolCall::new(tool.id.clone(), event::human_title(&tool.name))
-                                    .name(tool.name.clone())
-                                    .kind(event::tool_kind_for(&tool.name))
-                                    // A committed tool call already ran (or its turn ended):
-                                    // replaying it as pending would leave a spinner forever.
-                                    .status(ToolCallStatus::Completed)
-                                    .raw_input(serde_json::Value::Object(tool.input.clone())),
-                            ),
+                        Some(SessionUpdate::ToolCall(
+                            ToolCall::new(tool.id.clone(), event::human_title(&tool.name))
+                                .name(tool.name.clone())
+                                .kind(event::tool_kind_for(&tool.name))
+                                // A committed tool call already ran (or its turn ended):
+                                // replaying it as pending would leave a spinner forever.
+                                .status(ToolCallStatus::Completed)
+                                .raw_input(serde_json::Value::Object(tool.input.clone())),
                         ))
                     }
                     // Thinking and tool results are not replayed: the transcript view owns the
                     // message order, and the tool call above already carries its arguments.
-                    _ => {}
+                    _ => None,
+                };
+                if let Some(update) = update {
+                    emit(SessionNotification::new(self.session_id.clone(), update));
                 }
             }
         }
-        notifications.extend(self.replay_subagent_cards().await);
-        notifications
+        for card in self.replay_subagent_cards().await {
+            emit(card);
+        }
     }
 
     /// Replays the subagent cards of a loaded session.

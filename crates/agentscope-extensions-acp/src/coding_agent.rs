@@ -1536,9 +1536,11 @@ impl AcpCodingAgent {
                     // before answering: the client has no state for this session, so it renders
                     // exactly the `session/update`s that arrive. Without this the IDE showed an
                     // empty transcript while the agent still answered with the full context.
-                    for notification in session.replay_notifications().await {
-                        let _ = cx.send_notification(notification);
-                    }
+                    session
+                        .replay_notifications(|notification| {
+                            let _ = cx.send_notification(notification);
+                        })
+                        .await;
                     let response = LoadSessionResponse::new()
                         .modes(modes)
                         .config_options(config_options);

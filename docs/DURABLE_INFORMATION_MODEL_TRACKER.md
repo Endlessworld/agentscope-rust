@@ -14,6 +14,7 @@
 - **提交合并已归因并否证**（X20）：15 次提交各自对应恢复语义边界（dispatch、usage、输入+checkpoint、迭代、turn 收尾、finalization），合并到 1–2 次会破坏恢复语义；真正的成本在**单次事务**（≈0.66MB/事务，读整份文档 + 序列化 delta）。
 - **下一步：B3-phase2（已获批准）** —— 内存键索引 + 快照，降低单次事务的文档读取成本。
 - **L37（长会话写放大修复）**：scope 常驻超过 12MB 时，ceiling 分支过去让**每次提交**都 trim；SQLite 上每次 trim 后 `VACUUM` 重写整个数据库文件，恢复这样一个长会话后写入饱和到 90–180MB/s（读取少：VACUUM 的读命中页缓存，写要落盘）。现在 ceiling 之上也要有 256KB 净增长才 trim，且 SQLite 只在 freelist ≥ 2MB 且 ≥ 文件 1/4 时才 VACUUM。
+- **L38（恢复路径内存峰值）**：`session/load` 的 replay 曾同时持有三份对话：`finish_transcript` 把 fold 的 `HashMap` clone 成 `Vec`（fold + 结果）、`replay_notifications` 先整折一次 `JournalProjection`（结果丢弃）再整折一次 transcript、通知 `Vec` 又 clone 每条文本。修复：消费式 `finish_transcript`、删掉多余的 projection 校验、通知改为流式 `emit`（签名变回调）。
 - 已落地：L24–L35（含 L30 checkpoint 间隔、L31 prune 保留 `event-id`、L32/L33 P1 去重、L34 settle 轻量 fold、L35 SQLite 空间回收）、SQLite 后端 + ACP 接线。
 
 ## 1. 形式化（信息源 / 信道 / 失真）
@@ -234,6 +235,7 @@ session/
 - **第 1 项归因（`7be409e`）**：15 次写事务 = 11 次 recorder 提交 + 4 个站点（`turn.rs:42` admit、`turn.rs:402`/`499`、`tools.rs:13`；首轮另有 `identity.rs:12`）。11 次提交的 shape（每轮）：`model/chunk`×2、`model/end`×2、`request/prepared+model/dispatch`×2、`state/checkpoint+turn/output+step/end+turn/completed+run/end`×1、`message/user+state/checkpoint`×1、`step/start`×1、`durable/finalization_started+message/assistant`×1、`durable/finalization_completed`×1。结论：这些是恢复语义边界，**不可合并**；成本在单次事务（≈0.66MB/事务）。
 - **L36（B3-phase2 第 1 步，`3928e12`）**：`FileStore` 持久化键索引——`compact_scope` 把每条记录的字节偏移写成 `scopes/<digest>.idx`（`ScopeIndex { stamp, parts }`），写事务 `get` 只 range-read 该记录；索引带文档 stamp，`read_document_range` 打开文件后**再次校验** stamp 与边界，缺失/过期/越界/解析失败一律回退整份文档（不引入新失败模式）；只读事务仍走文档缓存（X16 结论）。20 轮 FileStore：`djournal:facts` 408.0 → **300.9MB（−26.2%）**、`flush:done` −21.4MB、`peak_live` 9.47 → **8.22MB**；`djournal:read` 与 `sbytes` 不变。
 - **L37（长会话写放大修复）**：`compact::worth_compacting` 的 ceiling 分支原来无条件 `true`，于是「活数据本身就超过 12MB」的 scope **每次提交**都走三趟 key walk；trim 后 `RecordStore::reclaim_space` 在 SQLite 上是 `VACUUM`，重写整个 `durable.db`（含无关会话）。恢复这样一个长会话后，每一次提交都变成一次全库重写——现场：PID 12372 写入 90–180MB/s、读取很少。修法：①ceiling 之上也要求自上次测量以来净增长 ≥ `COMPACT_CEILING_GROWTH_BYTES`（256KB）才 trim（新增长正是 trim 能回收的东西，所以 scope 仍有界）；②SQLite 只在 freelist ≥ 2MB 且 ≥ 文件 1/4 时才 `VACUUM`（更小的释放由页复用处理）。20 轮基线不变（2.5MB scope 未达阈值），单测 `a_scope_over_the_ceiling_needs_a_real_slice_of_new_bytes`、`a_trim_that_freed_little_does_not_rebuild_the_file` 锁定。
+- **L38（恢复路径内存峰值）**：`session/load` 的 replay 曾同时持有三份对话：①`views::finish_transcript` 用 `fold.messages.get(&id).cloned()`，fold（`HashMap`）与结果的 `Vec` 同时存在；②`replay_notifications` 先 `JournalProjection::read` 整折一遍（结果只用作可读性检查）、再 `transcript` 整折一遍；③通知 `Vec<SessionNotification>` 又 clone 每条文本，与 transcript 同时存在。现场：恢复后进程 25MB → 50MB。修法：①消费式 `finish_transcript`（`remove` 逐条移出，只有一份）；②删掉多余的 projection 校验（transcript 读本身就能发现损坏）；③`replay_notifications` 改为流式 `emit` 回调，调用点直接 `send_notification`。验证：core 577、harness 734、ACP 147 passed；20 轮 `djournal:facts` 170,998.1KB 逐位不变。
 - SQLite `RecordStore` + ACP `durable-sqlite`（`durable.db`，单机预览）。
 
 ### 已否定 / 中性（不要再直接做）
@@ -314,4 +316,5 @@ cargo fmt --all -- --check
 | 2026-11-20 | **文档重构**：合并重复的「五项原则」「四项指标」两套章节为一套（删除概述副本），纳入 L34/L35、X20、`scope_parts` 零收益、第 1/2 项结论与当前 20 轮基线；`store_model_min_probe.rs` 转正为 `store_model_min_test.rs`（断言 DB/unique 与 legacy/new，作为 B3-phase2 的设计依据）；B3-phase2 已获批准。 |
 | 2026-11-20 | **B3-phase2 第 1 步（L36，`3928e12`）**：`FileStore` 持久化键索引 + range read，20 轮 FileStore `djournal:facts` 408.0 → 300.9MB（−26.2%）、`peak_live` 9.47 → 8.22MB。第 2 步增量 tail 解析净变差（`facts` 330.6）已完全回退（X21）；`formatVersion` root 头（`d608f22`）与损坏行恢复测试补齐；收尾 20 轮与第 1 步基线一致（301.0MB、`sbytes` 逐字节相同）。 |
 | 2026-11-20 | **L37（长会话写放大修复）**：ceiling 分支不再无条件 trim（要求 256KB 净增长），SQLite `VACUUM` 增加 freelist 阈值（≥2MB 且 ≥1/4 文件）；修复「scope 常驻 >12MB 的长会话每次提交全库重写」的 90–180MB/s 写入。 |
+| 2026-11-20 | **L38（恢复路径内存峰值）**：`finish_transcript` 消费式构建、删掉 `replay_notifications` 里多余的 projection fold、通知改流式；修复 `session/load` 后 25MB → 50MB 的内存翻倍。 |
 | 2026-11-20 | **第 5–7 项探针证伪**：`djournal:stored` 的这三类载荷由 recorder 层写入，`apply_journal` 置空探针后 `sbytes`/`djournal:stored` 逐字节不变；去重需改 wire（`PROTOCOL_VERSION`）或 store 层还原（X19 同源），收益仅 −555KB 磁盘/内存 0 → 优先级降到暂不做。 |

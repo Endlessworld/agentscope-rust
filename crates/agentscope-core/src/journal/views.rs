@@ -224,14 +224,20 @@ pub(crate) fn apply_transcript_event(
     Ok(())
 }
 
-pub(crate) fn finish_transcript(fold: TranscriptFold, as_of_seq: u64) -> Transcript {
+pub(crate) fn finish_transcript(mut fold: TranscriptFold, as_of_seq: u64) -> Transcript {
+    // Take each message out of the fold instead of cloning it. The ordered ids are unique (a
+    // message is only appended when the fold does not already hold it), so a removal returns the
+    // same message a lookup would; a replay of a long session no longer holds the whole
+    // conversation twice at once, which a resume measured as a doubled working set.
+    let mut messages = Vec::with_capacity(fold.ordered.len());
+    for id in fold.ordered {
+        if let Some(message) = fold.messages.remove(&id) {
+            messages.push(message);
+        }
+    }
     Transcript {
         as_of_seq,
-        messages: fold
-            .ordered
-            .into_iter()
-            .filter_map(|id| fold.messages.get(&id).cloned())
-            .collect(),
+        messages,
     }
 }
 
@@ -1253,6 +1259,64 @@ mod tests {
     /// Renders a text-only block list for transcript/result fixtures.
     fn text_blocks(text: &str) -> Vec<ContentBlock> {
         vec![ContentBlock::Text(TextBlock::new(text))]
+    }
+
+    /// A consumed fold must yield a replaced message once, in first-seen order.
+    ///
+    /// `turn/output` carries the message id the fold already holds, with the text the turn
+    /// actually ended with. Taking messages out by id (instead of cloning them) is only correct
+    /// while the ordered ids are unique - this pins that: two events, two messages, one entry
+    /// for the replaced id, and it carries the newer text.
+    #[test]
+    fn finish_transcript_yields_a_replaced_message_once() {
+        let mut fold = TranscriptFold::default();
+        let user = Msg::user("first");
+        let assistant = Msg::assistant("second");
+        apply_transcript_event(
+            &mut fold,
+            &event(
+                1,
+                "message/user",
+                None,
+                None,
+                serde_json::json!({ "message": serde_json::to_value(&user).unwrap() }),
+            ),
+        )
+        .expect("a user message folds");
+        apply_transcript_event(
+            &mut fold,
+            &event(
+                2,
+                "message/assistant",
+                None,
+                None,
+                serde_json::json!({ "message": serde_json::to_value(&assistant).unwrap() }),
+            ),
+        )
+        .expect("an assistant message folds");
+        let mut rewritten = assistant.clone();
+        *rewritten.content_mut() = text_blocks("second, rewritten");
+        apply_transcript_event(
+            &mut fold,
+            &event(
+                3,
+                "turn/output",
+                None,
+                None,
+                serde_json::json!({ "message": serde_json::to_value(&rewritten).unwrap() }),
+            ),
+        )
+        .expect("a turn output replaces the assistant message");
+
+        let transcript = finish_transcript(fold, 3);
+        assert_eq!(transcript.messages.len(), 2, "the replaced id appears once");
+        assert_eq!(transcript.messages[0].id(), user.id());
+        assert_eq!(transcript.messages[1].id(), assistant.id());
+        let text = match &transcript.messages[1].content()[0] {
+            ContentBlock::Text(text) => text.text.clone(),
+            other => panic!("expected a text block, got {other:?}"),
+        };
+        assert_eq!(text, "second, rewritten", "the newer text wins");
     }
 
     fn event(
