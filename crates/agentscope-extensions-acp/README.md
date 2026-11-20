@@ -173,8 +173,8 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 | `session/archive` · `session/unarchive` | 归档（默认从 `session/list` 隐藏，`archived` 过滤可选 `only`/`include`） |
 | `auth/status` | 真实登录态：有真实凭据（含环境变量）为 `authenticated`，一处也没有为 `unauthenticated` |
 | `providers/list` · `providers/set` · `providers/disable` | 模型供应商管理；`acp_harness_agent` 默认开启，模型表与展示信息走 `_meta`（见下节） |
-| `_agentscope/providers/remove` · `default` · `catalog` · `probe` | 删供应商 / 改默认 / models.dev 目录 / 探测端点（ACP 扩展） |
-| `_agentscope/session/respond` | 私有扩展：回答被挂起的结构化提问 |
+| `_acp_extends/providers/remove` · `default` · `catalog` · `probe` | 删供应商 / 改默认 / models.dev 目录 / 探测端点（ACP 扩展） |
+| `_acp_extends/session/respond` | 私有扩展：回答被挂起的结构化提问 |
 
 ### 按客户端能力门控
 
@@ -375,9 +375,9 @@ await acp
   本项目只实现 agent 侧方法，`proxy/*` 不实现；MCP over ACP 改为 request-scoped（`mcp/message`
   带 `serverId` + `requestId`，不再有建连/断连）
 - 本 agent 在 `initialize` 中**原样回显**客户端声明的版本，不主动降级也不拒绝——请传 `1`
-- 不稳定特性（plan 操作、`end_turn` usage、MCP over ACP、`providers/*`、`_agentscope/providers/*`、
-  `subagent_update`）全部按**客户端声明的能力**门控：客户端没声明就不会收到，也不会报错；
-  session notices 与压缩进度在 schema 1.11 起已转正，不再需要单独的 feature 名
+- 不稳定特性（plan 操作、`end_turn` usage、MCP over ACP、`providers/*`、`_acp_extends/providers/*`、
+  `subagent_update`）全部按**客户端声明的能力**门控：客户端没声明就不会收到，也不会报错。
+  session notices 与压缩进度在 schema 1.11 起已转正，不再需要单独的 feature 门控。
 
 ## 模型供应商管理（`providers/*`）
 
@@ -416,16 +416,16 @@ await acp
 - 模型表的协议归属决定端点：`completions` → `POST {base_url}/chat/completions`，
   `messages` → `POST {base_url}/messages`，`responses` → `POST {base_url}/responses`
 
-### 扩展方法（`_agentscope/providers/*`）
+### 扩展方法（`_acp_extends/providers/*`）
 
 标准面没有删除、默认项与“探测端点”，这几件事走 ACP 扩展（方法名以 `_` 开头，不支持的客户端不会误调）：
 
 | 方法 | 入参 | 返回 |
 | --- | --- | --- |
-| `_agentscope/providers/remove` | `{providerId}` | `{}`；环境变量提供的 provider 会报错 |
-| `_agentscope/providers/default` | `{providerId, model?}` | `{}`；`model` 缺省取该 provider 第一个模型 |
-| `_agentscope/providers/catalog` | `{providerId?}` | `{providers: [{id, name, baseUrl, protocol, env, modelCount, models?}]}`（models.dev，最后一项仅给了 `providerId` 才有） |
-| `_agentscope/providers/probe` | `{providerId?, baseUrl?, apiKey?, protocol?}` | `{ok, models?, protocol?, error?}`，实际打 `GET {baseUrl}/models` |
+| `_acp_extends/providers/remove` | `{providerId}` | `{}`；环境变量提供的 provider 会报错 |
+| `_acp_extends/providers/default` | `{providerId, model?}` | `{}`；`model` 缺省取该 provider 第一个模型 |
+| `_acp_extends/providers/catalog` | `{providerId?}` | `{providers: [{id, name, baseUrl, protocol, env, modelCount, models?}]}`（models.dev，最后一项仅给了 `providerId` 才有） |
+| `_acp_extends/providers/probe` | `{providerId?, baseUrl?, apiKey?, protocol?}` | `{ok, models?, protocol?, error?}`，实际打 `GET {baseUrl}/models` |
 
 四个方法共用一个入参形状（`camelCase`，用不到的字段省略）；错误一律 `-32602`，原囚放 `data`。
 

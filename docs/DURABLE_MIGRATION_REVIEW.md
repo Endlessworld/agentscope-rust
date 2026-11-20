@@ -251,7 +251,7 @@
 2. `300s WAITING_STALL_TIMEOUT` 对合法长等待会误报 stall，但 turn 仍可恢复。
 3. pid 复用 → 最多 60s 等待后 `unavailable`（不误抢，方向正确）。
 4. `history()` 仍只投影 turn 输出，无消息转录；ACP 走 journal 转录，无回退。
-5. `_agentscope/respond` 的 wait key 仍依赖「interaction id == wait key」，没有通用 interaction 记录。
+5. `_acp_extends/respond` 的 wait key 仍依赖「interaction id == wait key」，没有通用 interaction 记录。
 6. ACP 路径不经过 `HarnessAdapter::settle` 默认实现（adapter 自己 settle）。
 7. 每个 session 一次 `TxnBackend::open`（file store 每次加锁打开），LRU 淘汰时随 runtime 释放，未做全局缓存。
 8. 内存峰值 ≈3–5× scope 字节（1 MiB 阈值下可控）；`InMemoryStore::transaction` 持锁跑闭包，嵌套 `with_session` 会死锁（当前无嵌套调用点）。

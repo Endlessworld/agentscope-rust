@@ -1137,6 +1137,7 @@ impl AcpCodingAgent {
         let a_archive = agent.clone();
         let a_unarchive = agent.clone();
         let a_respond = agent.clone();
+        let a_steer = agent.clone();
         let a_providers = agent.clone();
         let a_providers_set = agent.clone();
         let a_providers_disable = agent.clone();
@@ -1388,6 +1389,12 @@ impl AcpCodingAgent {
             .on_receive_request(
                 async move |req: crate::ext::ExtRespondRequest, responder, _cx| {
                     handle_ext_respond(a_respond.clone(), req, responder).await
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: crate::ext::ExtSteerRequest, responder, _cx| {
+                    handle_ext_steer(a_steer.clone(), req, responder).await
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -1932,7 +1939,7 @@ fn spawn_wakeup_loop(
     })
 }
 
-/// Handles `_agentscope/session/respond`: converts the wire answers and hands them to the
+/// Handles `_acp_extends/session/respond`: converts the wire answers and hands them to the
 /// session runtime, which continues the suspended turn.
 async fn handle_ext_respond(
     agent: Arc<AcpCodingAgent>,
@@ -1961,6 +1968,35 @@ async fn handle_ext_respond(
         Err(error) => responder.respond_with_error(
             agent_client_protocol::Error::internal_error().data(error.to_string()),
         ),
+    }
+}
+
+/// Handles `_acp_extends/session/steer`: folds one message into the turn the session is
+/// executing and answers which turn it reached.
+async fn handle_ext_steer(
+    agent: Arc<AcpCodingAgent>,
+    req: crate::ext::ExtSteerRequest,
+    responder: agent_client_protocol::v1::Responder<crate::ext::ExtSteerResult>,
+) -> Result<(), agent_client_protocol::Error> {
+    let params = req.params;
+    if let Err(error) = params.validate() {
+        return responder
+            .respond_with_error(agent_client_protocol::Error::invalid_params().data(error));
+    }
+    let session_id = SessionId::new(params.session_id.clone());
+    let session = match agent.get_session(&session_id) {
+        Some(session) => session,
+        None => {
+            return responder.respond_with_error(
+                agent_client_protocol::v1::schema::Error::session_not_found(session_id).into(),
+            );
+        }
+    };
+    match session.steer(params.text, &params.client_request_id).await {
+        Ok(turn_id) => responder.respond(crate::ext::ExtSteerResult { turn_id }),
+        Err(error) => {
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(error))
+        }
     }
 }
 

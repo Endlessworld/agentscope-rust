@@ -321,7 +321,7 @@ ACP 侧接线已验证可编译、ACP lib 114 条全绿，但集成用例 `sessi
 3. `drive_turn`：一个 prompt 一个 driver（`TurnDriver`），每轮 `session.tick()` 后读 `session.turn(turn_id)`，终态或 `Paused`/`Pausing`/`Waiting` 即交还；`TICK_PAUSE = 20ms`；`finish()` 有 5s 宽限期（tick 卡在阻塞工具里时只告警，不 abort——abort 会让 turn 停在 `Running` 直到租约过期）。
 4. 事件：sink 把 `serde_json::Value` 反序列化回 `AgentEvent` 推进有界队列（`event_queue`，溢出计数，`AgentResult` 必留），渲染路径与原来完全一致（`map_delta_event`/`map_result_event`/`ToolEventMapper`/usage/compaction）。
 5. 取消：ACP 的 `cancel_epoch` 仍是客户端唯一入口；命中后走 `control.cancel(..., control_id("cancel"))` 写 durable 意图，再等 turn 转终态（活会话 10s，关闭中的会话 500ms）后 `driver.finish()`，返回 `StopReason::Cancelled`。
-6. `respond` / `_agentscope/respond`：先把 `SessionAnswer` 折成文本，再 `session.respond(turn_id, interaction_id, text)`；`close`/`replay_notifications` 一律从 durable journal 读（harness journal 已不是写者，读它会重放空会话）。
+6. `respond` / `_acp_extends/respond`：先把 `SessionAnswer` 折成文本，再 `session.respond(turn_id, interaction_id, text)`；`close`/`replay_notifications` 一律从 durable journal 读（harness journal 已不是写者，读它会重放空会话）。
 7. `turn_status_name` 把 durable 状态映射回客户端认识的六个名字（`Paused`/`Pausing` → `interrupted`）；`interrupted` 保留 `MAX_INTERRUPTED_RESUMES = 2` 的自动续跑，`cancelled` 直接 `StopReason::Cancelled`，`failed` 用 turn 上落盘的错误文本（去重 `Agent error: ` 前缀）。
 
 **adapter 侧同步修的两处语义**
@@ -339,7 +339,7 @@ ACP 侧接线已验证可编译、ACP lib 114 条全绿，但集成用例 `sessi
 
 **仍是近似/未做**
 
-- `_agentscope/respond` 的 wait key 仍依赖「interaction id == wait key」（§2.8 前提），没有通用 interaction 记录。
+- `_acp_extends/respond` 的 wait key 仍依赖「interaction id == wait key」（§2.8 前提），没有通用 interaction 记录。
 - ACP 路径不经过 `HarnessAdapter::settle` 的默认实现：adapter 自己 settle。
 - `history()` 仍无消息转录；durable 侧 `acting_iteration` 续跑入口仍缺（§2.5）。
 - 每个 session 一次 `TxnBackend::open`（file store 每次加锁打开），LRU 淘汰时随 runtime 释放，未做全局缓存。

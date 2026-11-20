@@ -5,7 +5,7 @@
 //! - 标准面 `providers/list|set|disable`（ACP `unstable_llm_providers`）：
 //!   `list` 把 `~/.agentscope/models.json` 里的每个 provider 一条 `ProviderInfo` 送出去，
 //!   `set` 新增/改写一条，`disable` 只打停用标记（密钥保留，可再启用）。
-//! - 扩展面 `_agentscope/providers/*`：标准面装不下的三件事——
+//! - 扩展面 `_acp_extends/providers/*`：标准面装不下的三件事——
 //!   `remove`（删除条目）、`default`（改默认 provider/model）、`catalog`（models.dev
 //!   预设，选厂商即预填 base_url + 协议 + 模型表）、`probe`（用保存的密钥去
 //!   `GET {base_url}/models`，既是“测试连接”也是“拉取模型列表”。
@@ -30,13 +30,13 @@ use crate::config::ModelChoice;
 use crate::model_config::{mask_secret, ModelConfig, ModelsSpec, ProviderUpsert};
 
 /// 删除一个 provider 条目。
-pub const REMOVE_METHOD: &str = "_agentscope/providers/remove";
+pub const REMOVE_METHOD: &str = "_acp_extends/providers/remove";
 /// 改默认 provider / 模型。
-pub const DEFAULT_METHOD: &str = "_agentscope/providers/default";
+pub const DEFAULT_METHOD: &str = "_acp_extends/providers/default";
 /// models.dev 预设列表（可带 `providerId` 取单个预设的模型表）。
-pub const CATALOG_METHOD: &str = "_agentscope/providers/catalog";
+pub const CATALOG_METHOD: &str = "_acp_extends/providers/catalog";
 /// 用保存的凭据访问 `GET {base_url}/models`，充当“测试连接”与“拉取模型”。
-pub const PROBE_METHOD: &str = "_agentscope/providers/probe";
+pub const PROBE_METHOD: &str = "_acp_extends/providers/probe";
 
 /// 扩展方法的入参（四个方法共用一个形状，未用到的字段省略）。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -59,7 +59,7 @@ pub struct ExtParams {
     pub protocol: Option<String>,
 }
 
-/// 一条 `_agentscope/providers/*` 请求。
+/// 一条 `_acp_extends/providers/*` 请求。
 #[derive(Debug, Clone)]
 pub struct ProvidersExtRequest {
     method: Arc<str>,
@@ -263,7 +263,7 @@ pub fn disable(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `_agentscope/providers/remove`：删除。
+/// `_acp_extends/providers/remove`：删除。
 pub fn remove(id: &str) -> Result<(), String> {
     let mut config = load();
     config.remove_provider(id)?;
@@ -271,7 +271,7 @@ pub fn remove(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `_agentscope/providers/default`：改默认 provider / 模型（新会话用它）。
+/// `_acp_extends/providers/default`：改默认 provider / 模型（新会话用它）。
 pub fn set_default(provider: &str, model: Option<&str>) -> Result<(), String> {
     let mut config = load();
     config.set_default(provider, model)?;
@@ -279,7 +279,7 @@ pub fn set_default(provider: &str, model: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// `_agentscope/providers/catalog`：models.dev 预设。
+/// `_acp_extends/providers/catalog`：models.dev 预设。
 ///
 /// 不带 `provider_id` 时只给摘要（id / baseUrl / 协议 / 模型数），带去时才带上模型表，
 /// 免得一次请求把整张目录（十几 MB 解析结果的模型名）全塞进 JSON-RPC。
@@ -321,7 +321,7 @@ fn protocol_key(protocol: ApiProtocol) -> &'static str {
     }
 }
 
-/// `_agentscope/providers/probe`：用已存（或本次传入）的端点与密钥拉模型列表。
+/// `_acp_extends/providers/probe`：用已存（或本次传入）的端点与密钥拉模型列表。
 ///
 /// 成功：`{ok: true, models: [id...], protocol}`；失败：`{ok: false, error}`。
 /// 一个 200 但不带 `data` 数组的响应（某些网关只认 `/chat/completions`）也算成功，

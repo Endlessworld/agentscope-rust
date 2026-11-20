@@ -129,7 +129,7 @@ Durable = execution lifecycle              → 「系统能接着干这件事」
 | `ToolResultBlock::suspended(reason, id, name)` 存在 | `core/message/block.rs:665` |
 | `GenerateReason::ToolSuspended` → turn `suspended` | `message/msg.rs`、`recorder.rs` |
 | pending interaction 由 journal 的 `interaction/requested|resolved` 持久化，**纯日志重放可得** | `core/session/views.rs::pending_interactions` |
-| 外部应答入口 `_agentscope/session/respond`（ACP 私有扩展方法） | `acp/src/ext.rs::RESPOND_METHOD` |
+| 外部应答入口 `_acp_extends/session/respond`（ACP 私有扩展方法） | `acp/src/ext.rs::RESPOND_METHOD` |
 | `respond_all` 通过 inbox command `"respond"` 提交，**进程重启后同样可用** | `session.rs:665` |
 | 限制：`respond` 需要 session 已注册到内存（`get_session`），未 load 时返回 `session_not_found` | `coding_agent.rs::handle_ext_respond` |
 
@@ -434,7 +434,7 @@ trait Executor { start/query/cancel; capabilities }
 | D7 | `SessionTurnGate` 仅进程内 | `gateway/session_turn_gate.rs:141` | 多进程并发无保护 |
 | D8 | 结果只能作为 hint 文本进入 reasoning，不是结构化 tool_result | `middleware/inbox.rs` | 模型可能误判 |
 | D9 | suspend/respond 已具备但 ACP 侧几乎没有使用场景接线 | `acp/src/ext.rs` | 跨天等待没有可用入口 |
-| D10 | 进程退出后 `_agentscope/session/respond` 需先 load 会话 | `coding_agent.rs::handle_ext_respond` | 外部回调前必须先重建会话 |
+| D10 | 进程退出后 `_acp_extends/session/respond` 需先 load 会话 | `coding_agent.rs::handle_ext_respond` | 外部回调前必须先重建会话 |
 
 ---
 
@@ -542,7 +542,7 @@ cargo fmt --all -- --check
 |---|---|
 | `crates/agentscope-extensions-acp/src/coding_agent.rs` | ACP 方法实现、会话注册表、wakeup 循环、offload 阈值 |
 | `crates/agentscope-extensions-acp/src/session.rs` | 单会话：turn 驱动、runtime 句柄、suspend/respond 接线 |
-| `crates/agentscope-extensions-acp/src/ext.rs` | `_agentscope/session/respond` 扩展方法 |
+| `crates/agentscope-extensions-acp/src/ext.rs` | `_acp_extends/session/respond` 扩展方法 |
 | `crates/agentscope-extensions-acp/src/mem.rs` | 内存治理与观测（HeapCompact / trim / usage） |
 | `crates/agentscope-harness/src/agent/middleware/async_tool.rs` | 工具 offload + 占位结果 + inbox/wakeup 投递 |
 | `crates/agentscope-harness/src/agent/bus/async_tool.rs` | 异步工具记录（落盘，但丢 result） |

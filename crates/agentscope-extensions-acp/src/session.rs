@@ -618,6 +618,13 @@ const TICK_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
 /// How long a prompt waits for a tick in flight before it stops waiting for it.
 #[cfg(feature = "durable")]
 const DRIVER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a steer waits for the prompt it targets to be claimed by a writer.
+///
+/// A prompt that was just accepted is `Queued` for a few milliseconds (`epoch == 0`), and
+/// durable answers `CONFLICT` for it. Telling the client "not running" in that window would
+/// turn the most common case (type while the first token streams) into an error.
+#[cfg(feature = "durable")]
+const STEER_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 /// How long a `running` turn may make no durable progress before the client is told.
 ///
 /// Not a failure: a long command or a slow provider is legitimate, and the prompt keeps
@@ -997,6 +1004,20 @@ pub(crate) fn render_event(
     }
 }
 
+/// The parts of a prompt that outlive admission.
+///
+/// A turn is driven the same way whether this prompt admitted it or the queue extension did;
+/// only these values differ.
+#[cfg(feature = "durable")]
+struct DrivePlan {
+    cancel_epoch: Arc<std::sync::atomic::AtomicU64>,
+    admitted_epoch: u64,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    cancellation: Option<agent_client_protocol::RequestCancellation>,
+    wakeup: bool,
+    caps: PromptCaps,
+}
+
 #[cfg(feature = "durable")]
 pub(crate) struct DurableDriver {
     agent: Arc<HarnessAgent>,
@@ -1076,6 +1097,27 @@ impl DurableDriver {
             self.durable_thread()?,
         )))
     }
+    /// Installs the bounded queue this turn renders from and hands it back.
+    ///
+    /// The sink runs inside the agent and cannot block, so a stalled client would grow an
+    /// unbounded channel without limit. Overflow is dropped and counted (`AGENT_RESULT` is
+    /// always kept), and the end of the turn reports it.
+    fn attach_events(&self, runtime: &Arc<SessionRuntime>) -> Arc<crate::event_queue::EventQueue> {
+        let events = crate::event_queue::EventQueue::new(crate::event_queue::EVENT_QUEUE_CAPACITY);
+        let events_sink = crate::event_queue::EventQueueSender::new(Arc::clone(&events));
+        runtime
+            .session
+            .set_event_sink(Arc::new(move |value: &serde_json::Value| {
+                // The sink runs inside the agent and cannot block, so the value it publishes is
+                // the serialized event this client renders. A closed queue only means the
+                // prompt already returned; the run itself is unaffected.
+                if let Ok(event) = serde_json::from_value::<AgentEvent>(value.clone()) {
+                    events_sink.push(event);
+                }
+            }));
+        events
+    }
+
     /// Runs one turn: admits it, ticks it, settles it and renders what the sink publishes.
     ///
     /// Inherent rather than trait so the rest of this file can call it without a `dyn`
@@ -1093,8 +1135,6 @@ impl DurableDriver {
         let cancellation = input.cancellation;
         let caps = input.caps;
         let mut turn_usage = ChatUsage::default();
-        // Read once: the model does not change inside a turn.
-        let context_window = self.context_window();
         let runtime = match self.open_runtime().await {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -1109,21 +1149,6 @@ impl DurableDriver {
                 });
             }
         };
-        // Bounded backlog: the sink runs inside the agent and cannot block, so a stalled
-        // client would grow an unbounded channel without limit. Overflow is dropped and
-        // counted (`AGENT_RESULT` is always kept), and the end of the turn reports it.
-        let events = crate::event_queue::EventQueue::new(crate::event_queue::EVENT_QUEUE_CAPACITY);
-        let events_sink = crate::event_queue::EventQueueSender::new(Arc::clone(&events));
-        runtime
-            .session
-            .set_event_sink(Arc::new(move |value: &serde_json::Value| {
-                // The sink runs inside the agent and cannot block, so the value it publishes is
-                // the serialized event this client renders. A closed queue only means the
-                // prompt already returned; the run itself is unaffected.
-                if let Ok(event) = serde_json::from_value::<AgentEvent>(value.clone()) {
-                    events_sink.push(event);
-                }
-            }));
         // A turn that already ended can still hold a dispatch without a result: a cancelled or
         // stopped acting phase, or a run that failed after dispatch. The recorder refuses to
         // open such a journal, and `open_runtime` reconciles only once, when it builds the
@@ -1220,6 +1245,42 @@ impl DurableDriver {
             }
         };
 
+        // The turn exists now; from here on it is only a turn to drive. Keeping admission
+        // and driving apart lets a queued turn be driven without a prompt of its own.
+        let plan = DrivePlan {
+            cancel_epoch,
+            admitted_epoch: my_epoch,
+            closed,
+            cancellation,
+            wakeup: wakeup_turn,
+            caps,
+        };
+        self.drive_turn(runtime, turn_id, plan, sink).await
+    }
+
+    /// Drives one admitted turn: ticks it, settles it, and renders what the sink publishes.
+    ///
+    /// Split from [`Self::run_turn`] so a turn admitted earlier can be driven without a new
+    /// prompt (a queued turn, or one resumed after a pause).
+    async fn drive_turn(
+        &self,
+        runtime: Arc<SessionRuntime>,
+        turn_id: String,
+        plan: DrivePlan,
+        sink: EventSink,
+    ) -> std::result::Result<TurnOutcome, DriverError> {
+        let DrivePlan {
+            cancel_epoch,
+            admitted_epoch: my_epoch,
+            closed,
+            cancellation,
+            wakeup: wakeup_turn,
+            caps,
+        } = plan;
+        let mut turn_usage = ChatUsage::default();
+        // Read once: the model does not change inside a turn.
+        let context_window = self.context_window();
+        let events = self.attach_events(&runtime);
         // One stable message id per turn: every text/thinking chunk and tool call
         // emitted this turn shares it, so ACP clients group them into one
         // assistant message and render tool calls / thoughts correctly.
@@ -2896,6 +2957,59 @@ impl AcpAgentSession {
         Ok(())
     }
 
+    /// Folds one message into the turn this session is executing and answers which turn it was.
+    ///
+    /// Durable accepts a steer only for the active turn a writer has already claimed: the
+    /// admission window right after a prompt is accepted (`Queued`, `epoch == 0`) answers
+    /// `CONFLICT`, so that window is retried before the client is told the turn is not running.
+    /// A retried steer with the same `request_id` reaches the same signal, never the model twice.
+    #[cfg(feature = "durable")]
+    pub async fn steer(
+        &self,
+        text: String,
+        request_id: &str,
+    ) -> std::result::Result<String, String> {
+        let durable = self.durable_store()?.clone();
+        let runtime = {
+            let slot = durable.runtime().lock().await;
+            match slot.as_ref() {
+                Some(runtime) => Arc::clone(runtime),
+                None => return Err(crate::ext::NO_ACTIVE_TURN.to_string()),
+            }
+        };
+        let deadline = std::time::Instant::now() + STEER_SETTLE_GRACE;
+        loop {
+            let turn = runtime
+                .session
+                .active()
+                .await
+                .map_err(|error| error.to_string())?;
+            let Some(turn) = turn else {
+                return Err(crate::ext::NO_ACTIVE_TURN.to_string());
+            };
+            match runtime
+                .control
+                .steer(
+                    runtime.session.thread(),
+                    &turn.turn_id,
+                    request_id,
+                    text.clone(),
+                )
+                .await
+            {
+                Ok(_) => return Ok(turn.turn_id),
+                // Admitted but not claimed yet: wait for the writer, not for the user to retype.
+                Err(error)
+                    if error.code() == agentscope_durable::ErrorCode::Conflict
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
     /// Answers an outstanding interaction and continues the turn without a new user prompt.
     ///
     /// A build without the durable driver can never have a suspended turn: the native driver
@@ -2906,6 +3020,19 @@ impl AcpAgentSession {
         _answers: std::collections::BTreeMap<String, String>,
     ) -> std::result::Result<(), String> {
         Err("this build has no durable driver, so no turn is waiting for an answer".to_string())
+    }
+
+    /// Folds one message into the turn this session is executing.
+    ///
+    /// A build without the durable driver runs a turn to its end inside this process and keeps
+    /// no interruption point, so there is nothing a steer could be folded into.
+    #[cfg(not(feature = "durable"))]
+    pub async fn steer(
+        &self,
+        _text: String,
+        _request_id: &str,
+    ) -> std::result::Result<String, String> {
+        Err("this build has no durable driver, so there is no turn to steer".to_string())
     }
 
     /// Current thought level.
