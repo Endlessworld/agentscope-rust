@@ -19,6 +19,8 @@
 //! * [`mapping`] -- durable `ExecutionRequest` -> `tools/call`, and `tools/call` ->
 //!   [`ExecutionResult`](agentscope_durable::ExecutionResult).
 //! * [`executor`] -- [`McpExecutor`], the `Executor` implementation.
+//! * [`pool`] -- [`McpConnectionPool`], a bounded registry that lets two executors share one
+//!   live transport; it never opens a connection itself.
 //! * [`testing`] -- [`FakeTransport`] for downstream tests.
 //!
 //! # The mapping, and its tradeoffs
@@ -75,6 +77,7 @@ pub mod error;
 pub mod executor;
 pub mod jsonrpc;
 pub mod mapping;
+pub mod pool;
 pub mod session;
 pub mod testing;
 pub mod transport;
@@ -90,6 +93,7 @@ pub use mapping::{
     tools_call_params, tools_call_request, tools_call_result_to_execution, CallToolResult,
     TaskPointer, TaskStatus, ToolsCallParams, METHOD_TOOLS_CALL,
 };
+pub use pool::McpConnectionPool;
 pub use session::{
     initialize_request, initialize_request_with, initialized_notification, server_info,
     tools_list_page_request, tools_list_request, ClientCapabilities, EmptyCapability,

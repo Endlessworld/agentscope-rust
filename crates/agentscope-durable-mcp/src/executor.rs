@@ -19,6 +19,7 @@ use crate::error::TransportError;
 use crate::jsonrpc::{RequestId, Response};
 use crate::mapping::{error_to_execution_result, tool_not_advertised_result};
 use crate::mapping::{tools_call_for_execution, tools_call_result_to_execution};
+use crate::pool::McpConnectionPool;
 use crate::transport::McpTransport;
 
 /// Sends durable tool calls through an [`McpTransport`].
@@ -35,6 +36,20 @@ impl McpExecutor {
     /// Binds a transport to the peer's declared tool catalog.
     pub fn new(transport: Arc<dyn McpTransport>, catalog: ToolCatalog) -> Self {
         Self { transport, catalog }
+    }
+
+    /// Builds an executor whose transport is the connection `pool` holds for `server_key`.
+    ///
+    /// The transport is taken now, so the executor keeps working even if the pool later sweeps
+    /// the entry; build another executor to adopt a new connection.
+    pub fn with_pool(
+        pool: Arc<McpConnectionPool>,
+        server_key: impl Into<String>,
+        catalog: ToolCatalog,
+    ) -> Result<Self> {
+        let server_key = server_key.into();
+        let transport = pool.get(&server_key).map_err(|error| error.to_durable())?;
+        Ok(Self::new(transport, catalog))
     }
 
     /// The catalog this executor validates against.

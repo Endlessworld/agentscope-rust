@@ -27,9 +27,13 @@
 pub mod layout;
 mod local;
 mod memory;
+#[cfg(feature = "s3")]
+pub mod s3;
+pub mod transport;
 
 pub use local::LocalObjectStore;
 pub use memory::MemoryObjectStore;
+pub use transport::ObjectTransport;
 
 /// The result of an object-store operation.
 pub type Result<T> = std::result::Result<T, ObjectError>;

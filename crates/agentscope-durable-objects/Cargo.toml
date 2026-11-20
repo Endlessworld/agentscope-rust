@@ -16,3 +16,8 @@ categories.workspace = true
 # `sha2` is already a workspace dependency and is what names the objects.
 [dependencies]
 sha2.workspace = true
+
+[features]
+default = []
+# `S3ObjectStore`: the `ObjectStore` adapter over an injected `ObjectTransport`. No cloud SDK.
+s3 = []

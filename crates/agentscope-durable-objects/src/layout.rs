@@ -75,3 +75,11 @@ pub fn scope_path(root: &Path, scope: &str) -> PathBuf {
 pub fn blob_path(root: &Path, scope: &str, digest: &str) -> PathBuf {
     scope_path(root, scope).join(blob_file(digest))
 }
+
+/// `blobs/<sha256(scope)>/<digest>.json`: the key a remote bucket stores the object under.
+///
+/// This is [`blob_path`] without a root, so a transport can lift it into whatever namespace its
+/// bucket uses (`s3://bucket/prefix/<key>`).
+pub fn object_key(scope: &str, digest: &str) -> String {
+    format!("{BLOB_DIR}/{}/{}", scope_dir(scope), blob_file(digest))
+}
