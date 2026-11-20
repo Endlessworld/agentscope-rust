@@ -1138,6 +1138,9 @@ impl AcpCodingAgent {
         let a_unarchive = agent.clone();
         let a_respond = agent.clone();
         let a_steer = agent.clone();
+        let a_queue = agent.clone();
+        let a_queue_list = agent.clone();
+        let a_queue_remove = agent.clone();
         let a_providers = agent.clone();
         let a_providers_set = agent.clone();
         let a_providers_disable = agent.clone();
@@ -1395,6 +1398,24 @@ impl AcpCodingAgent {
             .on_receive_request(
                 async move |req: crate::ext::ExtSteerRequest, responder, _cx| {
                     handle_ext_steer(a_steer.clone(), req, responder).await
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: crate::ext::ExtQueueRequest, responder, _cx| {
+                    handle_ext_queue(a_queue.clone(), req, responder).await
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: crate::ext::ExtQueueListRequest, responder, _cx| {
+                    handle_ext_queue_list(a_queue_list.clone(), req, responder).await
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: crate::ext::ExtQueueRemoveRequest, responder, _cx| {
+                    handle_ext_queue_remove(a_queue_remove.clone(), req, responder).await
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -1994,6 +2015,93 @@ async fn handle_ext_steer(
     };
     match session.steer(params.text, &params.client_request_id).await {
         Ok(turn_id) => responder.respond(crate::ext::ExtSteerResult { turn_id }),
+        Err(error) => {
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(error))
+        }
+    }
+}
+
+/// Handles `_acp_extends/session/queue`: admits the message as its own turn and answers before
+/// it runs.
+async fn handle_ext_queue(
+    agent: Arc<AcpCodingAgent>,
+    req: crate::ext::ExtQueueRequest,
+    responder: agent_client_protocol::v1::Responder<crate::ext::ExtQueueResult>,
+) -> Result<(), agent_client_protocol::Error> {
+    let params = req.params;
+    if let Err(error) = params.validate() {
+        return responder
+            .respond_with_error(agent_client_protocol::Error::invalid_params().data(error));
+    }
+    let session_id = SessionId::new(params.session_id.clone());
+    let session = match agent.get_session(&session_id) {
+        Some(session) => session,
+        None => {
+            return responder.respond_with_error(
+                agent_client_protocol::v1::schema::Error::session_not_found(session_id).into(),
+            );
+        }
+    };
+    match session
+        .queue(params.content, &params.client_request_id)
+        .await
+    {
+        Ok((turn_id, position)) => {
+            responder.respond(crate::ext::ExtQueueResult { turn_id, position })
+        }
+        Err(error) => {
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(error))
+        }
+    }
+}
+
+/// Handles `_acp_extends/session/queue/list`: the session's unfinished turns, in run order.
+async fn handle_ext_queue_list(
+    agent: Arc<AcpCodingAgent>,
+    req: crate::ext::ExtQueueListRequest,
+    responder: agent_client_protocol::v1::Responder<crate::ext::ExtQueueListResult>,
+) -> Result<(), agent_client_protocol::Error> {
+    let session_id = SessionId::new(req.params.session_id.clone());
+    let session = match agent.get_session(&session_id) {
+        Some(session) => session,
+        None => {
+            return responder.respond_with_error(
+                agent_client_protocol::v1::schema::Error::session_not_found(session_id).into(),
+            );
+        }
+    };
+    match session.queued().await {
+        Ok(items) => responder.respond(crate::ext::ExtQueueListResult { items }),
+        Err(error) => {
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(error))
+        }
+    }
+}
+
+/// Handles `_acp_extends/session/queue/remove`: withdraws a queued turn before it runs.
+async fn handle_ext_queue_remove(
+    agent: Arc<AcpCodingAgent>,
+    req: crate::ext::ExtQueueRemoveRequest,
+    responder: agent_client_protocol::v1::Responder<crate::ext::ExtQueueRemoveResult>,
+) -> Result<(), agent_client_protocol::Error> {
+    let params = req.params;
+    let session_id = SessionId::new(params.session_id.clone());
+    let session = match agent.get_session(&session_id) {
+        Some(session) => session,
+        None => {
+            return responder.respond_with_error(
+                agent_client_protocol::v1::schema::Error::session_not_found(session_id).into(),
+            );
+        }
+    };
+    match session
+        .remove_queued(&params.turn_id, &params.client_request_id)
+        .await
+    {
+        Ok(removed) => responder.respond(crate::ext::ExtQueueRemoveResult {
+            turn_id: params.turn_id,
+            removed,
+        }),
         Err(error) => {
             responder.respond_with_error(agent_client_protocol::Error::internal_error().data(error))
         }

@@ -27,9 +27,9 @@
 | 方法 | params | result | 作用 |
 |---|---|---|---|
 | `_acp_extends/session/steer` | `{sessionId, text, clientRequestId}` | `{turnId}` | 把一条消息折进当前活跃 Turn，下一推理边界生效 |
-| `_acp_extends/session/queue` | `{sessionId, input, clientRequestId}` | `{turnId, position}` | 立即 durable 受理为排队 Turn |
-| `_acp_extends/session/queue/cancel` | `{sessionId, turnId, clientRequestId}` | `{}` | 取消指定的排队 Turn（与 durable 同步） |
-| `_acp_extends/session/queue/list` | `{sessionId}` | `{items: [{turnId, clientRequestId, text, position}]}` | 重连后恢复「排队中」气泡 |
+| `_acp_extends/session/queue` | `{sessionId, content, clientRequestId}` | `{turnId, position}` | 立即 durable 受理为排队 Turn；`content` 与 `session/prompt` 同形 |
+| `_acp_extends/session/queue/remove` | `{sessionId, turnId, clientRequestId}` | `{turnId, removed}` | 取消指定的排队 Turn（与 durable 同步）；已开始/已结束返回 `removed: false` |
+| `_acp_extends/session/queue/list` | `{sessionId}` | `{items: [{turnId, position, status}]}` | 重连后对账；不回显输入文本（客户端自己持有） |
 | `_acp_extends/session/pause` | `{sessionId, turnId?}` | `{turnId, status}` | 暂停当前 Turn（`Pausing`→`Paused`，位置与工具保留） |
 | `_acp_extends/session/resume` | `{sessionId, turnId}` | `{turnId, status}` | 从 `Paused` 继续（用户显式触发） |
 | `_acp_extends/session/respond` | `{sessionId, answers}` | `{}` | 既有：回答被挂起的交互（本次仅改名） |
@@ -47,17 +47,30 @@
 | pause | `DurableRuntime::suspend(turn, requestId)` | adapter 在边界返回 `HostPaused` → `Paused` |
 | resume | `DurableRuntime::resume(turn, requestId)` | Turn 回 `Queued`，需驱动循环重新 tick |
 
-驱动结构：`run_prompt_inner` 里的「准入 + 驱动 + 渲染」需要抽成 `drive_one_turn(turn_id)`，之后由外层循环按「自己的 Turn → 队列 Turn」顺序调用（P2）。`Paused` 的自动恢复（现有 `interrupted` 分支）必须让位于用户显式暂停（`pause_requested` 标记）。
+驱动结构（P2 已落地）：`DurableDriver::run_turn` 只做「准备 runtime → 结算遗留 uncertainty → 唤醒暂停的队首 → `submit` 拿 `turn_id`」，随后调用 `DurableDriver::drive_turn(runtime, turn_id, DrivePlan, sink)` 完成「tick + 结算 + 渲染」。
+
+排空（P3 已落地）：`AcpAgentSession::run_prompt_inner` 在提交自己的 prompt **之前**和 `driver.run` 返回**之后**各调用一次 `DurableDriver::drain_queued`，因此：
+- 上个进程留下的 `Queued` Turn 先跑（FIFO 不被新 prompt 插队）；
+- prompt 执行期间客户端 queue 的消息，在同一个请求里接着跑；
+- 取消代数（`cancel_epoch`）变化即停止排空，未开始的 Turn 保持 `Queued`（D4）；
+- 队首是 `Paused` 时整条队列停下（不越过用户的暂停）。
+
+代价：`session/prompt` 的响应会延迟到队列排空；客户端需按 `_meta.turnId` 归属流式内容，而不是按「哪个 prompt 请求还开着」。
+
+`Paused` 的自动恢复（现有 `interrupted` 分支）必须让位于用户显式暂停（`pause_requested` 标记，P4）。
 
 ## 3. 分期任务
 
 - [x] **P0 改名** `_agentscope/*` → `_acp_extends/*`（代码、README、跟踪文档）。
 - [x] **P1 Steer**：`_acp_extends/session/steer` + `AcpAgentSession::steer` + 处理函数 + 参数校验单测。
   - 活跃 Turn 的 `epoch == 0` 窗口（admit→claim）短暂重试（500ms / 50ms 步长），之后返回 `turn_not_running`，由客户端降级为 `queue`。
-- [ ] **P2 抽取 `drive_one_turn`**：行为不变的机械搬移；`message_id` 下沉到单 Turn 作用域。
-  - 验证：ACP lib 145+ 全绿 + 20 轮 ACP 诊断逐项比对。
-- [ ] **P3 Queue**：`queue` / `queue/cancel` / `queue/list` + `TurnState.queued` 台账 + 排空循环 + `_meta.turnId`。
-  - 入口规则：拿到 `prompt_lock` 后若队首是 `Queued`，先驱动它（覆盖「上个进程死在两个 Turn 之间」）。
+- [x] **P2 拆分准入与驱动**：`run_turn` = 准备 + `submit`；`drive_turn(runtime, turn_id, DrivePlan, sink)` = tick/结算/渲染。行为零变化（`attach_events` 唯一变化的位置：从 `submit` 前挪到 `drive_turn` 内，两者之间没有 tick）。
+  - 验证：ACP lib 152 全绿；`cargo check --all-targets` 干净；未做 20 轮诊断（`drive_turn` 与 `run_turn` 调用序列逐行一致）。
+- [x] **P3 Queue**：`queue` / `queue/remove` / `queue/list` + 排空循环 + `_meta.turnId`。
+  - 去掉了原计划的 `TurnState.queued` 台账：排空按 durable 的队首（最老非终态 Turn）驱动，台账反而是第二份真相。
+  - 幂等：`clientRequestId` 前加 `queue-` 作 durable `request_id`；重试时消息 id 是新生成的，digest 必然不同 → `CONFLICT` 时回读 `admission(request_id)` 返回首次受理的 Turn。
+  - `_meta.turnId` 在 `drive_turn` 的 sink 包装层统一注入，所有 `SessionNotification` 都带。
+  - 验证：新增 `tests/acp_queue_test.rs`（2 条：durable 可见 + 幂等 + 移除；下一条 prompt 先跑队列、`_meta.turnId` 归属）；ACP 全量 21 个 target 全绿。
 - [ ] **P4 Pause/Resume**：`pause` 置 `pause_requested`，prompt 循环遇到 `Paused` 不再自动 resume，以 `Cancelled + _meta.paused` 返回；`resume` 用 `drive_one_turn` 在后台驱动并流式输出。
 - [ ] **P5 客户端**（`acp-agent-ui`，独立仓库）：Enter → steer、Tab → queue、排队气泡 + 移除、暂停/继续按钮、按 `turnId` 归属流式内容。
 
@@ -90,6 +103,8 @@
 |---|---|---|
 | 2026-11-20 | P0 完成：`_agentscope/*` → `_acp_extends/*`（`ext.rs`、`providers_admin.rs`、`coding_agent.rs`、ACP README、5 份 docs 共 32 处） | `rg _agentscope` 仅剩本文件的改名说明 |
 | 2026-11-20 | P1 完成：`_acp_extends/session/steer`（`ExtSteerRequest`/`ExtSteerParams`/`ExtSteerResult` + `JsonRpcResponse` 实现）、`AcpAgentSession::steer`（活跃 Turn 解析、admit→claim 窗口 500ms 重试、`request_id` 幂等）、`handle_ext_steer` + 注册 | `cargo test -p agentscope-extensions-acp --lib`：**152 passed / 0 failed**（新增 4 条）；`cargo fmt --all -- --check` 干净 |
+| 2026-11-21 | P2 完成：`run_turn` 在 `submit` 后调用新的 `drive_turn`（`DrivePlan` 承载 `cancel_epoch`/`admitted_epoch`/`closed`/`cancellation`/`wakeup`/`caps`），`attach_events` 下沉 | ACP lib 152、全量 target 21 个全绿、fmt 干净 |
+| 2026-11-21 | P3 完成：`ext.rs` 三种 queue 方法（`wire_response!` / `impl_ext_request!` 宏消除重复）、`AcpAgentSession::{queue,queued,remove_queued}`、`DurableDriver::drain_queued` + 两处调用、`_meta.turnId`、`tests/acp_queue_test.rs` | lib **158 passed**；`--test acp_queue_test` 2 passed；全量 21 target 全绿；fmt 干净 |
 
 ### 待办提醒
 

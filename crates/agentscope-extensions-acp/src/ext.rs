@@ -14,6 +14,37 @@ use std::sync::Arc;
 use agent_client_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, UntypedMessage};
 use serde::{Deserialize, Serialize};
 
+/// Implements [`JsonRpcResponse`] for a result type through serde.
+///
+/// The SDK implements the trait for `serde_json::Value` only, so a typed result has to say how
+/// it crosses the wire. Every result here is a plain serializable struct, which is the same
+/// shape the derive macro would generate.
+macro_rules! wire_response {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl JsonRpcResponse for $ty {
+                fn into_json(
+                    self,
+                    _method: &str,
+                ) -> Result<serde_json::Value, agent_client_protocol::Error> {
+                    serde_json::to_value(self).map_err(|error| {
+                        agent_client_protocol::Error::internal_error().data(error.to_string())
+                    })
+                }
+
+                fn from_json(
+                    _method: &str,
+                    value: serde_json::Value,
+                ) -> Result<Self, agent_client_protocol::Error> {
+                    serde_json::from_value(value).map_err(|error| {
+                        agent_client_protocol::Error::invalid_params().data(error.to_string())
+                    })
+                }
+            }
+        )+
+    };
+}
+
 /// Answers one or more pending interactions of a session and continues its turn.
 ///
 /// Params: `{ "sessionId": "...", "answers": { "<requestId>": { ... } } }` where each answer
@@ -84,6 +115,45 @@ impl ExtRespondParams {
         }
         Ok(converted)
     }
+}
+
+/// Declares a request type whose response is a plain serializable struct.
+macro_rules! impl_ext_request {
+    ($request:ty, $params:ty, $method:path, $response:ty) => {
+        impl JsonRpcMessage for $request {
+            fn matches_method(method: &str) -> bool {
+                method == $method
+            }
+
+            fn method(&self) -> &str {
+                &self.method
+            }
+
+            fn to_untyped_message(&self) -> Result<UntypedMessage, agent_client_protocol::Error> {
+                UntypedMessage::new(self.method(), &self.params)
+            }
+
+            fn parse_message(
+                method: &str,
+                params: &serde_json::Value,
+            ) -> Result<Self, agent_client_protocol::Error> {
+                if method != $method {
+                    return Err(agent_client_protocol::Error::method_not_found());
+                }
+                let params: $params = serde_json::from_value(params.clone()).map_err(|error| {
+                    agent_client_protocol::Error::invalid_params().data(error.to_string())
+                })?;
+                Ok(Self {
+                    method: Arc::from(method),
+                    params,
+                })
+            }
+        }
+
+        impl JsonRpcRequest for $request {
+            type Response = $response;
+        }
+    };
 }
 
 /// An incoming `_acp_extends/session/respond` request.
@@ -170,20 +240,7 @@ pub struct ExtSteerResult {
     pub turn_id: String,
 }
 
-impl JsonRpcResponse for ExtSteerResult {
-    fn into_json(self, _method: &str) -> Result<serde_json::Value, agent_client_protocol::Error> {
-        serde_json::to_value(self)
-            .map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))
-    }
-
-    fn from_json(
-        _method: &str,
-        value: serde_json::Value,
-    ) -> Result<Self, agent_client_protocol::Error> {
-        serde_json::from_value(value)
-            .map_err(|error| agent_client_protocol::Error::invalid_params().data(error.to_string()))
-    }
-}
+wire_response!(ExtSteerResult);
 
 /// An incoming `_acp_extends/session/steer` request.
 #[derive(Debug, Clone)]
@@ -225,6 +282,178 @@ impl JsonRpcMessage for ExtSteerRequest {
 impl JsonRpcRequest for ExtSteerRequest {
     type Response = ExtSteerResult;
 }
+
+/// Queues a message as its own turn and answers before it runs.
+///
+/// Params: `{ "sessionId": "...", "content": [ ... ], "clientRequestId": "..." }`. The answer
+/// names the admitted turn and its place among the session's unfinished turns, so a client can
+/// render the bubble as "queued #2" without waiting for the turn to run.
+pub const QUEUE_METHOD: &str = "_acp_extends/session/queue";
+
+/// Lists the session's unfinished turns in the order the runtime will run them.
+///
+/// Params: `{ "sessionId": "..." }`; the answer is `{ "items": [ { "turnId", "position",
+/// "status" } ] }`. The turn's input is not echoed: the client queued it and still holds it,
+/// and the durable store keeps the input for the run, not for listing.
+pub const QUEUE_LIST_METHOD: &str = "_acp_extends/session/queue/list";
+
+/// Removes a queued turn before it runs.
+///
+/// Params: `{ "sessionId": "...", "turnId": "...", "clientRequestId": "..." }`. A turn that
+/// already started is not removed — stopping the running turn is `session/cancel`.
+pub const QUEUE_REMOVE_METHOD: &str = "_acp_extends/session/queue/remove";
+
+/// Parameters of [`QUEUE_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtQueueParams {
+    /// Session the queued turn belongs to.
+    pub session_id: String,
+    /// The message, in the same block form `session/prompt` accepts.
+    pub content: Vec<agent_client_protocol::v1::schema::ContentBlock>,
+    /// Idempotency key: a retried queue reaches the same turn, never a second one.
+    pub client_request_id: String,
+}
+
+impl ExtQueueParams {
+    /// Rejects an unusable message before it reaches the durable layer.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.content.is_empty() {
+            return Err("a queued message needs content".to_string());
+        }
+        if self.client_request_id.trim().is_empty() {
+            return Err("a queued message needs a clientRequestId".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Response of [`QUEUE_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtQueueResult {
+    /// The turn the message was admitted as.
+    pub turn_id: String,
+    /// Its place among the session's unfinished turns; `1` is the next to run.
+    pub position: u32,
+}
+
+/// An incoming `_acp_extends/session/queue` request.
+#[derive(Debug, Clone)]
+pub struct ExtQueueRequest {
+    method: Arc<str>,
+    pub params: ExtQueueParams,
+}
+
+impl JsonRpcMessage for ExtQueueRequest {
+    fn matches_method(method: &str) -> bool {
+        method == QUEUE_METHOD
+    }
+
+    fn method(&self) -> &str {
+        &self.method
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, agent_client_protocol::Error> {
+        UntypedMessage::new(self.method(), &self.params)
+    }
+
+    fn parse_message(
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<Self, agent_client_protocol::Error> {
+        if method != QUEUE_METHOD {
+            return Err(agent_client_protocol::Error::method_not_found());
+        }
+        let params: ExtQueueParams = serde_json::from_value(params.clone()).map_err(|error| {
+            agent_client_protocol::Error::invalid_params().data(error.to_string())
+        })?;
+        Ok(Self {
+            method: Arc::from(method),
+            params,
+        })
+    }
+}
+
+impl JsonRpcRequest for ExtQueueRequest {
+    type Response = ExtQueueResult;
+}
+
+/// Parameters of [`QUEUE_LIST_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtQueueListParams {
+    /// Session whose queue is listed.
+    pub session_id: String,
+}
+
+/// One unfinished turn as [`QUEUE_LIST_METHOD`] reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtQueueItem {
+    pub turn_id: String,
+    /// Its place in the queue; `1` is the next to run.
+    pub position: u32,
+    /// The durable status: `queued`, `running`, `waiting`, `pausing`, `paused`, `cancelling`.
+    pub status: String,
+}
+
+/// Response of [`QUEUE_LIST_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtQueueListResult {
+    pub items: Vec<ExtQueueItem>,
+}
+
+/// An incoming `_acp_extends/session/queue/list` request.
+#[derive(Debug, Clone)]
+pub struct ExtQueueListRequest {
+    method: Arc<str>,
+    pub params: ExtQueueListParams,
+}
+
+/// Parameters of [`QUEUE_REMOVE_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtQueueRemoveParams {
+    /// Session the queued turn belongs to.
+    pub session_id: String,
+    /// The turn to remove.
+    pub turn_id: String,
+    /// Idempotency key: a retried removal reaches the same command.
+    pub client_request_id: String,
+}
+
+/// Response of [`QUEUE_REMOVE_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtQueueRemoveResult {
+    pub turn_id: String,
+    /// `false` when the turn had already started or settled, so nothing was removed.
+    pub removed: bool,
+}
+
+/// An incoming `_acp_extends/session/queue/remove` request.
+#[derive(Debug, Clone)]
+pub struct ExtQueueRemoveRequest {
+    method: Arc<str>,
+    pub params: ExtQueueRemoveParams,
+}
+
+impl_ext_request!(
+    ExtQueueListRequest,
+    ExtQueueListParams,
+    QUEUE_LIST_METHOD,
+    ExtQueueListResult
+);
+impl_ext_request!(
+    ExtQueueRemoveRequest,
+    ExtQueueRemoveParams,
+    QUEUE_REMOVE_METHOD,
+    ExtQueueRemoveResult
+);
+
+wire_response!(ExtQueueResult, ExtQueueListResult, ExtQueueRemoveResult);
 
 #[cfg(test)]
 mod tests {
@@ -326,5 +555,88 @@ mod tests {
     fn another_method_is_not_parsed() {
         let params = json!({ "sessionId": "s", "answers": {} });
         assert!(ExtRespondRequest::parse_message("session/prompt", &params).is_err());
+    }
+
+    #[test]
+    fn the_queue_methods_use_our_namespace() {
+        assert!(QUEUE_METHOD.starts_with("_acp_extends/"));
+        assert!(QUEUE_LIST_METHOD.starts_with("_acp_extends/"));
+        assert!(QUEUE_REMOVE_METHOD.starts_with("_acp_extends/"));
+        assert!(ExtQueueRequest::matches_method(QUEUE_METHOD));
+        assert!(ExtQueueListRequest::matches_method(QUEUE_LIST_METHOD));
+        assert!(ExtQueueRemoveRequest::matches_method(QUEUE_REMOVE_METHOD));
+        assert!(!ExtQueueRequest::matches_method("session/prompt"));
+    }
+
+    #[test]
+    fn queue_params_round_trip_through_the_wire_format() {
+        let params = json!({
+            "sessionId": "session-1",
+            "content": [{ "type": "text", "text": "run the tests" }],
+            "clientRequestId": "queue-1"
+        });
+        let request = ExtQueueRequest::parse_message(QUEUE_METHOD, &params).unwrap();
+        assert_eq!(request.params.session_id, "session-1");
+        assert_eq!(request.params.client_request_id, "queue-1");
+        assert_eq!(request.params.content.len(), 1);
+        request.params.validate().unwrap();
+    }
+
+    #[test]
+    fn an_unusable_queued_message_is_rejected_before_the_store_sees_it() {
+        let content: Vec<agent_client_protocol::v1::schema::ContentBlock> =
+            serde_json::from_value(json!([{ "type": "text", "text": "run the tests" }]))
+                .expect("one text block");
+        let empty = ExtQueueParams {
+            session_id: "session-1".into(),
+            content: Vec::new(),
+            client_request_id: "queue-1".into(),
+        };
+        assert!(empty.validate().is_err());
+        let unnamed = ExtQueueParams {
+            session_id: "session-1".into(),
+            content,
+            client_request_id: "  ".into(),
+        };
+        assert!(unnamed.validate().is_err());
+    }
+
+    #[test]
+    fn a_queue_answer_names_the_turn_and_its_place() {
+        let value = ExtQueueResult {
+            turn_id: "turn_1".into(),
+            position: 2,
+        }
+        .into_json(QUEUE_METHOD)
+        .unwrap();
+        assert_eq!(value, json!({ "turnId": "turn_1", "position": 2 }));
+    }
+
+    #[test]
+    fn a_queue_list_answer_carries_the_items() {
+        let value = ExtQueueListResult {
+            items: vec![ExtQueueItem {
+                turn_id: "turn_1".into(),
+                position: 1,
+                status: "queued".into(),
+            }],
+        }
+        .into_json(QUEUE_LIST_METHOD)
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({ "items": [{ "turnId": "turn_1", "position": 1, "status": "queued" }] })
+        );
+    }
+
+    #[test]
+    fn a_queue_removal_answer_says_what_happened() {
+        let value = ExtQueueRemoveResult {
+            turn_id: "turn_1".into(),
+            removed: false,
+        }
+        .into_json(QUEUE_REMOVE_METHOD)
+        .unwrap();
+        assert_eq!(value, json!({ "turnId": "turn_1", "removed": false }));
     }
 }

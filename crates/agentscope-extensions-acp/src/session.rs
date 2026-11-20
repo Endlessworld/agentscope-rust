@@ -835,6 +835,83 @@ pub(crate) fn turn_status_name(status: TurnStatus) -> &'static str {
     }
 }
 
+/// The status of an unfinished turn as the queue extension reports it.
+///
+/// [`turn_status_name`] answers what the *prompt* path needs, where a paused turn is an
+/// interruption to continue. A queue entry is different: the client renders "paused" as a
+/// deliberate state of its own, so the durable names are kept apart.
+#[cfg(feature = "durable")]
+pub(crate) fn queued_status_name(status: TurnStatus) -> &'static str {
+    match status {
+        TurnStatus::Queued => "queued",
+        TurnStatus::Running => "running",
+        TurnStatus::Waiting => "waiting",
+        TurnStatus::Pausing => "pausing",
+        TurnStatus::Paused => "paused",
+        TurnStatus::Cancelling => "cancelling",
+        TurnStatus::Succeeded => "completed",
+        TurnStatus::Failed => "failed",
+        TurnStatus::Cancelled => "cancelled",
+    }
+}
+
+/// The oldest unfinished turn of the thread, if any.
+///
+/// The runtime always advances the oldest unfinished turn, so this is the only turn a tick can
+/// make progress on; queue listings walk the same order.
+#[cfg(feature = "durable")]
+async fn unfinished_head(
+    runtime: &Arc<SessionRuntime>,
+) -> std::result::Result<Option<agentscope_durable::TurnView>, DriverError> {
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = runtime
+            .session
+            .turns(cursor.as_deref(), 1000)
+            .await
+            .map_err(|error| DriverError::Unavailable(error.to_string()))?;
+        if let Some(turn) = page.items.iter().find(|turn| !turn.status.terminal()) {
+            return Ok(Some(turn.clone()));
+        }
+        match page.cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(None),
+        }
+    }
+}
+
+/// The place of `turn_id` among the thread's unfinished turns; `1` is the next to run.
+#[cfg(feature = "durable")]
+async fn unfinished_position(
+    runtime: &Arc<SessionRuntime>,
+    turn_id: &str,
+) -> std::result::Result<u32, String> {
+    let mut cursor: Option<String> = None;
+    let mut position = 0u32;
+    loop {
+        let page = runtime
+            .session
+            .turns(cursor.as_deref(), 1000)
+            .await
+            .map_err(|error| error.to_string())?;
+        for turn in &page.items {
+            if turn.status.terminal() {
+                continue;
+            }
+            position += 1;
+            if turn.turn_id == turn_id {
+                return Ok(position);
+            }
+        }
+        match page.cursor {
+            Some(next) => cursor = Some(next),
+            // The turn was admitted by this call, so a missing one means the page boundary
+            // changed under the read; the end of the queue is the closest true answer.
+            None => return Ok(position.max(1)),
+        }
+    }
+}
+
 /// The durable runtime that backs this session's turns.
 ///
 /// The slot used to live on [`AcpAgentSession`]. Owning it here is the first step of the seam in
@@ -1009,6 +1086,7 @@ pub(crate) fn render_event(
 /// A turn is driven the same way whether this prompt admitted it or the queue extension did;
 /// only these values differ.
 #[cfg(feature = "durable")]
+#[derive(Clone)]
 struct DrivePlan {
     cancel_epoch: Arc<std::sync::atomic::AtomicU64>,
     admitted_epoch: u64,
@@ -1134,7 +1212,9 @@ impl DurableDriver {
         let closed = Arc::clone(&input.closed);
         let cancellation = input.cancellation;
         let caps = input.caps;
-        let mut turn_usage = ChatUsage::default();
+        // Only the pre-admission failures below report it: a turn that reaches `drive_turn`
+        // accumulates its own usage there.
+        let turn_usage = ChatUsage::default();
         let runtime = match self.open_runtime().await {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -1277,6 +1357,23 @@ impl DurableDriver {
             wakeup: wakeup_turn,
             caps,
         } = plan;
+        // Every update this turn publishes is tagged with the turn it belongs to. A client
+        // renders a prompt and the turns queued behind it as one stream, so an update without
+        // its turn would land in whichever assistant message happened to be open.
+        let sink: EventSink =
+            {
+                let inner = sink;
+                let turn_id = turn_id.clone();
+                Arc::new(
+                move |mut notification: agent_client_protocol::v1::schema::SessionNotification| {
+                    notification
+                        .meta
+                        .get_or_insert_with(serde_json::Map::new)
+                        .insert("turnId".to_string(), serde_json::Value::String(turn_id.clone()));
+                    inner(notification);
+                },
+            )
+            };
         let mut turn_usage = ChatUsage::default();
         // Read once: the model does not change inside a turn.
         let context_window = self.context_window();
@@ -1837,6 +1934,44 @@ impl DurableDriver {
                     });
                 }
             }
+        }
+    }
+
+    /// Drives the session's unfinished turns until the queue is empty.
+    ///
+    /// A prompt is the only thing that ticks this session, so turns a client queued while the
+    /// previous prompt ran would otherwise sit in `queued` until someone asked again. The drain
+    /// starts turns, it does not skip them: a paused head means the client paused the session
+    /// and nothing behind it may run, and a cancel generation moved since admission means the
+    /// client stopped — everything still queued keeps its place for the next prompt.
+    async fn drain_queued(
+        &self,
+        plan: DrivePlan,
+        sink: EventSink,
+    ) -> std::result::Result<(), DriverError> {
+        loop {
+            if plan.cancel_epoch.load(Ordering::SeqCst) != plan.admitted_epoch
+                || plan.closed.load(Ordering::SeqCst)
+            {
+                return Ok(());
+            }
+            let runtime = self
+                .open_runtime()
+                .await
+                .map_err(DriverError::Unavailable)?;
+            let Some(head) = unfinished_head(&runtime).await? else {
+                return Ok(());
+            };
+            // A paused head is the client's own stop: running what is behind it would reorder
+            // the conversation the client deliberately held.
+            if head.status == TurnStatus::Paused {
+                return Ok(());
+            }
+            // The outcome is per turn (a failed queued message must not swallow the rest) and
+            // has already reached the client through the sink.
+            let _ = self
+                .drive_turn(runtime, head.turn_id, plan.clone(), Arc::clone(&sink))
+                .await?;
         }
     }
 
@@ -3010,6 +3145,100 @@ impl AcpAgentSession {
         }
     }
 
+    /// Admits one message as its own turn and answers before it runs.
+    ///
+    /// The turn is durable the moment this returns: a crash before the next prompt leaves it
+    /// `queued`, and that prompt drains it. A message queued while another turn runs never
+    /// touches that turn — the runtime only ever advances the oldest unfinished one.
+    #[cfg(feature = "durable")]
+    pub async fn queue(
+        &self,
+        content: Vec<ContentBlock>,
+        request_id: &str,
+    ) -> std::result::Result<(String, u32), String> {
+        let message = Self::convert_prompt_blocks(content, self.selected_descriptor().as_deref())?;
+        let runtime = self.durable_store()?.open_runtime().await?;
+        // The recorder refuses to open a journal that still holds a dispatch without a result;
+        // admitting a turn below writes one.
+        settle_finished_turn_uncertainties_cached(&runtime).await;
+        let input = serde_json::to_value(&message).map_err(|error| error.to_string())?;
+        let request_id = format!("queue-{request_id}");
+        let receipt = match runtime.session.submit(&request_id, input).await {
+            Ok(receipt) => receipt,
+            // A retry rebuilds the message, and every message carries a fresh id, so the second
+            // attempt's admission digest differs from the first. The admission record is the
+            // authority on what this request id already admitted: answer with that turn instead
+            // of failing a retry the client cannot influence.
+            Err(error) if error.code() == agentscope_durable::ErrorCode::Conflict => {
+                match runtime.session.admission(&request_id).await {
+                    Ok(Some(receipt)) => receipt,
+                    _ => return Err(error.to_string()),
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let position = unfinished_position(&runtime, &receipt.turn_id).await?;
+        Ok((receipt.turn_id, position))
+    }
+
+    /// The session's unfinished turns, in the order the runtime will run them.
+    #[cfg(feature = "durable")]
+    pub async fn queued(&self) -> std::result::Result<Vec<crate::ext::ExtQueueItem>, String> {
+        let runtime = self.durable_store()?.open_runtime().await?;
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = runtime
+                .session
+                .turns(cursor.as_deref(), 1000)
+                .await
+                .map_err(|error| error.to_string())?;
+            for turn in &page.items {
+                if turn.status.terminal() {
+                    continue;
+                }
+                items.push(crate::ext::ExtQueueItem {
+                    turn_id: turn.turn_id.clone(),
+                    position: items.len() as u32 + 1,
+                    status: queued_status_name(turn.status).to_string(),
+                });
+            }
+            match page.cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(items)
+    }
+
+    /// Removes a turn from the queue, before it runs.
+    ///
+    /// Answers `false` when the turn had already started (or settled): stopping the running turn
+    /// is `session/cancel`, so a client removing an obsolete bubble cannot accidentally stop the
+    /// answer it just started.
+    #[cfg(feature = "durable")]
+    pub async fn remove_queued(
+        &self,
+        turn_id: &str,
+        request_id: &str,
+    ) -> std::result::Result<bool, String> {
+        let runtime = self.durable_store()?.open_runtime().await?;
+        let turn = runtime
+            .session
+            .turn(turn_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if turn.status != TurnStatus::Queued {
+            return Ok(false);
+        }
+        runtime
+            .session
+            .cancel(turn_id, &format!("queue-remove-{request_id}"))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
     /// Answers an outstanding interaction and continues the turn without a new user prompt.
     ///
     /// A build without the durable driver can never have a suspended turn: the native driver
@@ -3033,6 +3262,35 @@ impl AcpAgentSession {
         _request_id: &str,
     ) -> std::result::Result<String, String> {
         Err("this build has no durable driver, so there is no turn to steer".to_string())
+    }
+
+    /// Queues a message as its own turn.
+    ///
+    /// A build without the durable driver runs a turn to its end inside this process, so a
+    /// message cannot wait in a store that survives the request that admitted it.
+    #[cfg(not(feature = "durable"))]
+    pub async fn queue(
+        &self,
+        _content: Vec<ContentBlock>,
+        _request_id: &str,
+    ) -> std::result::Result<(String, u32), String> {
+        Err("this build has no durable driver, so a message cannot be queued".to_string())
+    }
+
+    /// The session's unfinished turns; nothing can outlive a native turn, so the queue is empty.
+    #[cfg(not(feature = "durable"))]
+    pub async fn queued(&self) -> std::result::Result<Vec<crate::ext::ExtQueueItem>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Removes a turn from the queue.
+    #[cfg(not(feature = "durable"))]
+    pub async fn remove_queued(
+        &self,
+        _turn_id: &str,
+        _request_id: &str,
+    ) -> std::result::Result<bool, String> {
+        Err("this build has no durable driver, so nothing is queued".to_string())
     }
 
     /// Current thought level.
@@ -4489,7 +4747,27 @@ impl AcpAgentSession {
             last_input_tokens: Arc::clone(&self.last_input_tokens),
         };
         let sink: EventSink = Arc::new(move |notification| emit(notification));
-        match self
+        // A prompt is also the drain for what was queued behind it: nothing else ticks this
+        // session, so a turn admitted while the previous prompt ran would sit in `queued` until
+        // someone asked again. Leftovers (a process that died between queueing and running) go
+        // first, so the queue keeps its order. A failure to drive them is a transport problem
+        // and must not swallow the prompt itself.
+        #[cfg(feature = "durable")]
+        let drain = DrivePlan {
+            cancel_epoch: Arc::clone(&cancel_epoch),
+            admitted_epoch: my_epoch,
+            closed: Arc::clone(&closed),
+            cancellation: None,
+            wakeup: false,
+            caps: caps.clone(),
+        };
+        #[cfg(feature = "durable")]
+        if let Some(durable) = &self.durable {
+            if let Err(error) = durable.drain_queued(drain.clone(), Arc::clone(&sink)).await {
+                tracing::warn!(session = %self.session_id, %error, "could not drain the queue");
+            }
+        }
+        let stop = match self
             .driver
             .run(
                 DriverInput {
@@ -4519,7 +4797,16 @@ impl AcpAgentSession {
                 ));
                 StopReason::Refusal
             }
+        };
+        // Whatever the client queued while this prompt ran goes next, in the same request: the
+        // client stays busy, and a prompt is the only place that ticks.
+        #[cfg(feature = "durable")]
+        if let Some(durable) = &self.durable {
+            if let Err(error) = durable.drain_queued(drain, Arc::clone(&sink)).await {
+                tracing::warn!(session = %self.session_id, %error, "could not drain the queue");
+            }
         }
+        stop
     }
 
     /// The provider-reported input tokens of the most recent model call.
