@@ -11,12 +11,25 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = ["client"]
+client = []
+server = ["client", "dep:axum", "dep:futures", "dep:tokio"]
+
 [dependencies]
 agentscope-durable = { version = "0.2.0", path = "../agentscope-durable" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# Only a host that mounts the service opts into these; the default build stays transport-free.
+axum = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
 # No HTTP client here: the transport is injected, so this crate owns only the wire shapes.
 [dev-dependencies]
+axum.workspace = true
+futures.workspace = true
 tokio.workspace = true
+tower = { version = "0.5", features = ["util"] }

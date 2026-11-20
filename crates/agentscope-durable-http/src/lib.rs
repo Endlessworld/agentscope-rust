@@ -4,46 +4,37 @@
 //! 不依赖 `agentscope-extensions-*`，不持有业务规则。传输由调用方注入（本 crate 不选 HTTP 客户端），
 //! 这里只拥有线上形状与状态映射。
 //!
-//! The surface is the five calls a durable host needs, each one a pure request shape plus a
-//! response decoder:
+//! Two halves share one wire definition in [`wire`]:
 //!
-//! | call | request | response |
-//! | --- | --- | --- |
-//! | `claim` | `POST {prefix}/sessions/{ns}/{session}/threads/{thread}/claim` | `Lease` or `null` |
-//! | `commit` | `POST …/threads/{thread}/turns/{turn}/commits` | [`CommitReceipt`] |
-//! | `frame` | `GET …/threads/{thread}/turns/{turn}/frame` | [`Frame`] |
-//! | `events` | `GET {prefix}/sessions/{ns}/{session}/events?after=&limit=` | [`EventPage`] |
-//! | `receipt` | `GET …/turns/{turn}/commits/{commit}/receipt` | `CommitReceipt` or `null` |
+//! - **client** (default feature): [`HttpBackend`] for the five calls a durable host needs, and
+//!   [`HttpSessionBackend`], which implements the whole [`SessionBackend`] over the transport.
+//! - **server** (`server` feature): [`server::DurableService`] mounts an axum router on any
+//!   `SessionBackend`, plus [`sse`] for committed event streaming with `Last-Event-ID`.
 //!
-//! Fenced calls carry `X-Durable-Owner` and `X-Durable-Epoch`; every call carries
-//! `X-Durable-Version`. Page sizes follow the backend contract exactly: `1..=1000`, rejected —
-//! never clamped — outside it. `409` is a conflict that still answers the committed receipt, so
-//! [`HttpError::receipt`] keeps it.
+//! Neither half retries and neither invents a code: a failure carries the server's
+//! [`DurableError`], and a `409` keeps the receipt the backend already applied.
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
-use agentscope_durable::{
-    Commit, CommitReceipt, DurableError, ErrorCode, EventPage, Frame, Lease, Result, SessionKey,
-    ThreadKey,
-};
-use async_trait::async_trait;
+use agentscope_durable::{CommitReceipt, DurableError, ErrorCode};
 use serde::de::DeserializeOwned;
 
-/// Wire protocol version every request announces.
-pub const PROTOCOL_VERSION: &str = agentscope_durable::PROTOCOL_VERSION;
+mod client;
+mod wire;
 
-/// Route prefix of the backend surface; the paths below hang off it.
-pub const DEFAULT_PREFIX: &str = "/v1";
+pub use client::{
+    claim_request, commit_request, events_request, events_request_with, frame_request,
+    receipt_request, HttpBackend, HttpSessionBackend,
+};
+pub use wire::*;
 
-/// The page-size contract of the backend, mirrored so the client refuses the same input.
-pub const MAX_PAGE_LIMIT: usize = 1000;
+pub use agentscope_durable::{DeltaFilter, EventStreamOptions};
 
-const HEADER_VERSION: &str = "X-Durable-Version";
-const HEADER_CONTENT_TYPE: &str = "Content-Type";
-const HEADER_OWNER: &str = "X-Durable-Owner";
-const HEADER_EPOCH: &str = "X-Durable-Epoch";
+#[cfg(feature = "server")]
+pub mod server;
+#[cfg(feature = "server")]
+pub mod sse;
 
 /// A decoded failure: the backend error plus the receipt a `409` carried, if any.
 ///
@@ -142,6 +133,20 @@ impl HttpRequest {
             .find(|(header, _)| header.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
     }
+
+    /// The path a transport has to address, query included.
+    pub fn path_and_query(&self) -> String {
+        if self.query.is_empty() {
+            return self.path.clone();
+        }
+        let query = self
+            .query
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("{}?{query}", self.path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,184 +184,15 @@ impl fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-#[async_trait]
+#[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     async fn send(&self, request: HttpRequest)
         -> std::result::Result<HttpResponse, TransportError>;
 }
 
-// ---------------------------------------------------------------- request shapes
-
-/// Claims the writer lease of a thread. `200` answers the lease, or `null` when no turn is ready.
-pub fn claim_request(
-    prefix: &str,
-    thread: &ThreadKey,
-    owner: &str,
-    ttl: Duration,
-) -> Result<HttpRequest> {
-    if owner.trim().is_empty() {
-        return Err(DurableError::invalid("Lease owner must not be blank"));
-    }
-    let mut headers = version_headers();
-    headers.push((
-        HEADER_CONTENT_TYPE.to_string(),
-        "application/json".to_string(),
-    ));
-    Ok(HttpRequest {
-        method: Method::Post,
-        path: format!("{}/claim", thread_scope(prefix, thread)),
-        query: Vec::new(),
-        headers,
-        body: serde_json::to_vec(&serde_json::json!({
-            "owner": owner,
-            "ttlMillis": ttl.as_millis() as u64,
-        }))?,
-    })
-}
-
-/// Commits one fenced transition. `200` answers the [`CommitReceipt`]; `409` answers the receipt
-/// that already holds the commit.
-pub fn commit_request(prefix: &str, lease: &Lease, commit: &Commit) -> Result<HttpRequest> {
-    let mut headers = version_headers();
-    headers.push((
-        HEADER_CONTENT_TYPE.to_string(),
-        "application/json".to_string(),
-    ));
-    headers.extend(lease_headers(lease));
-    Ok(HttpRequest {
-        method: Method::Post,
-        path: format!(
-            "{}/commits",
-            turn_scope(prefix, &lease.thread, &lease.turn_id)
-        ),
-        query: Vec::new(),
-        headers,
-        body: serde_json::to_vec(commit)?,
-    })
-}
-
-/// Reads everything a running invocation needs about its turn, under the same fence.
-pub fn frame_request(prefix: &str, lease: &Lease) -> Result<HttpRequest> {
-    let mut headers = version_headers();
-    headers.extend(lease_headers(lease));
-    Ok(HttpRequest {
-        method: Method::Get,
-        path: format!(
-            "{}/frame",
-            turn_scope(prefix, &lease.thread, &lease.turn_id)
-        ),
-        query: Vec::new(),
-        headers,
-        body: Vec::new(),
-    })
-}
-
-/// Reads one page of a session's public events after a cursor.
-pub fn events_request(
-    prefix: &str,
-    session: &SessionKey,
-    after: Option<&str>,
-    limit: usize,
-) -> Result<HttpRequest> {
-    page_limit(limit)?;
-    let mut query = Vec::with_capacity(2);
-    if let Some(after) = after {
-        query.push(("after".to_string(), encode_segment(after)));
-    }
-    query.push(("limit".to_string(), limit.to_string()));
-    Ok(HttpRequest {
-        method: Method::Get,
-        path: format!("{}/events", session_scope(prefix, session)),
-        query,
-        headers: version_headers(),
-        body: Vec::new(),
-    })
-}
-
-/// Reads the receipt of one commit; `200` answers it or `null` when the commit never landed.
-pub fn receipt_request(
-    prefix: &str,
-    thread: &ThreadKey,
-    turn_id: &str,
-    commit_id: &str,
-) -> Result<HttpRequest> {
-    Ok(HttpRequest {
-        method: Method::Get,
-        path: format!(
-            "{}/commits/{}/receipt",
-            turn_scope(prefix, thread, turn_id),
-            encode_segment(commit_id)
-        ),
-        query: Vec::new(),
-        headers: version_headers(),
-        body: Vec::new(),
-    })
-}
-
-/// One page-size rule for every paged call, identical to `backend::clamp_limit`.
-fn page_limit(limit: usize) -> Result<()> {
-    if limit == 0 || limit > MAX_PAGE_LIMIT {
-        return Err(DurableError::invalid("Page limit must be 1..=1000"));
-    }
-    Ok(())
-}
-
-fn session_scope(prefix: &str, session: &SessionKey) -> String {
-    format!(
-        "{}/sessions/{}/{}",
-        prefix.trim_end_matches('/'),
-        encode_segment(&session.namespace),
-        encode_segment(&session.session_id)
-    )
-}
-
-fn thread_scope(prefix: &str, thread: &ThreadKey) -> String {
-    format!(
-        "{}/threads/{}",
-        session_scope(prefix, &thread.session),
-        encode_segment(&thread.thread_id)
-    )
-}
-
-fn turn_scope(prefix: &str, thread: &ThreadKey, turn_id: &str) -> String {
-    format!(
-        "{}/turns/{}",
-        thread_scope(prefix, thread),
-        encode_segment(turn_id)
-    )
-}
-
-fn version_headers() -> Vec<(String, String)> {
-    vec![(HEADER_VERSION.to_string(), PROTOCOL_VERSION.to_string())]
-}
-
-fn lease_headers(lease: &Lease) -> Vec<(String, String)> {
-    vec![
-        (HEADER_OWNER.to_string(), lease.owner.clone()),
-        (HEADER_EPOCH.to_string(), lease.epoch.to_string()),
-    ]
-}
-
-/// Percent-encodes one path segment or query value, keeping only RFC 3986 unreserved bytes.
-///
-/// Identities are arbitrary text (a session id may contain `/` or spaces); interpolating them
-/// raw would silently address a different route.
-fn encode_segment(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(*byte as char)
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
 // ---------------------------------------------------------------- responses
 
-fn decode<T: DeserializeOwned>(response: HttpResponse) -> HttpResult<T> {
+pub(crate) fn decode<T: DeserializeOwned>(response: HttpResponse) -> HttpResult<T> {
     if response.status != 200 {
         return Err(failure(&response));
     }
@@ -368,25 +204,33 @@ fn decode<T: DeserializeOwned>(response: HttpResponse) -> HttpResult<T> {
 }
 
 /// The same, for calls whose `200` body may be `null` or empty ("nothing yet").
-fn decode_optional<T: DeserializeOwned>(response: HttpResponse) -> HttpResult<Option<T>> {
+pub(crate) fn decode_optional<T: DeserializeOwned>(
+    response: HttpResponse,
+) -> HttpResult<Option<T>> {
     if response.status == 200 && response.body.iter().all(u8::is_ascii_whitespace) {
         return Ok(None);
     }
     decode(response)
 }
 
-fn failure(response: &HttpResponse) -> HttpError {
-    let code = match response.status {
-        400 => ErrorCode::Invalid,
-        404 => ErrorCode::NotFound,
-        409 => ErrorCode::Conflict,
-        412 => ErrorCode::Fenced,
-        // Only `200` carries a body on this surface.
-        200..=299 => ErrorCode::Invalid,
-        _ => ErrorCode::Unavailable,
-    };
+/// For calls that only confirm the write; their `200` carries `null`.
+pub(crate) fn decode_unit(response: HttpResponse) -> HttpResult<()> {
+    if response.status != 200 {
+        return Err(failure(&response));
+    }
+    Ok(())
+}
+
+/// Reads the failure body the server wrote: its `code` wins over the status, because `409` covers
+/// both a conflict and a stale fence.
+pub(crate) fn failure(response: &HttpResponse) -> HttpError {
     let parsed = serde_json::from_slice::<serde_json::Value>(&response.body).ok();
     let object = parsed.as_ref().filter(|value| value.is_object());
+    let code = object
+        .and_then(|object| object.get("code"))
+        .and_then(|code| code.as_str())
+        .and_then(parse_code)
+        .unwrap_or_else(|| code_for_status(response.status));
     let message = match object {
         Some(object) => object
             .get("message")
@@ -417,81 +261,17 @@ fn plain_text_message(body: &[u8]) -> Option<String> {
     (!text.is_empty() && text.chars().count() <= 512).then(|| text.to_owned())
 }
 
-// ---------------------------------------------------------------- backend
-
-/// The five-call client: it builds, sends and decodes, and holds no state of its own.
-pub struct HttpBackend {
-    transport: Arc<dyn Transport>,
-    prefix: String,
-}
-
-impl HttpBackend {
-    pub fn new(transport: Arc<dyn Transport>) -> Self {
-        Self::with_prefix(transport, DEFAULT_PREFIX)
-    }
-
-    pub fn with_prefix(transport: Arc<dyn Transport>, prefix: impl Into<String>) -> Self {
-        Self {
-            transport,
-            prefix: prefix.into(),
-        }
-    }
-
-    async fn send(&self, request: HttpRequest) -> HttpResult<HttpResponse> {
-        self.transport.send(request).await.map_err(|error| {
-            HttpError::from(DurableError::unavailable(format!(
-                "durable HTTP outcome is unconfirmed: {error}"
-            )))
-        })
-    }
-
-    pub async fn claim(
-        &self,
-        thread: &ThreadKey,
-        owner: &str,
-        ttl: Duration,
-    ) -> HttpResult<Option<Lease>> {
-        let request = claim_request(&self.prefix, thread, owner, ttl)?;
-        decode_optional(self.send(request).await?)
-    }
-
-    pub async fn commit(&self, lease: &Lease, commit: &Commit) -> HttpResult<CommitReceipt> {
-        let request = commit_request(&self.prefix, lease, commit)?;
-        decode(self.send(request).await?)
-    }
-
-    pub async fn frame(&self, lease: &Lease) -> HttpResult<Frame> {
-        let request = frame_request(&self.prefix, lease)?;
-        decode(self.send(request).await?)
-    }
-
-    pub async fn events(
-        &self,
-        session: &SessionKey,
-        after: Option<&str>,
-        limit: usize,
-    ) -> HttpResult<EventPage> {
-        let request = events_request(&self.prefix, session, after, limit)?;
-        decode(self.send(request).await?)
-    }
-
-    pub async fn receipt(
-        &self,
-        thread: &ThreadKey,
-        turn_id: &str,
-        commit_id: &str,
-    ) -> HttpResult<Option<CommitReceipt>> {
-        let request = receipt_request(&self.prefix, thread, turn_id, commit_id)?;
-        decode_optional(self.send(request).await?)
-    }
-}
+/// Keeps the `Arc` import used by the doc example and by callers naming the transport handle.
+#[allow(dead_code)]
+fn _transport_handle(_: Arc<dyn Transport>) {}
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::time::Duration;
 
-    use agentscope_durable::TurnStatus;
+    use agentscope_durable::{Commit, Lease, SessionKey, ThreadKey, TurnStatus};
 
     use super::*;
 
@@ -515,7 +295,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
+    #[async_trait::async_trait]
     impl Transport for FakeTransport {
         async fn send(
             &self,
