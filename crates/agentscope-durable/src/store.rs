@@ -90,6 +90,15 @@ pub trait RecordStore: Send + Sync {
         self.transaction(scope, work)
     }
 
+    /// Reclaims space a compaction freed.
+    ///
+    /// A store whose pages are reused in place has nothing to do; one with a freelist (SQLite)
+    /// can hand the freed pages back to the filesystem. Called outside a transaction, and only
+    /// after a trim.
+    fn reclaim_space(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Entries that are due at or before `now`, ordered by readiness.
     fn ready(&self, queue: &str, now: i64, limit: usize) -> Result<Vec<WorkItem>>;
 

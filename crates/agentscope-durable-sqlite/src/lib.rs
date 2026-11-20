@@ -99,6 +99,16 @@ impl SqliteStore {
     }
 
     fn from_connection(connection: Connection) -> Result<Self> {
+        // `incremental_vacuum` only frees pages when the database was created with
+        // `auto_vacuum=INCREMENTAL`, and the pragma is a no-op once the file has any page (even
+        // the header `journal_mode` writes), so it goes first of all; the schema comes after.
+        // An existing root keeps its `NONE` mode: changing it needs a `VACUUM`, which is not
+        // worth doing on every open.
+        if auto_vacuum_none(&connection) && no_schema(&connection) {
+            // A pragma value cannot be a bound parameter, so `pragma_update` silently fails
+            // here; the setting is issued as a literal statement instead.
+            let _ = connection.execute_batch("PRAGMA auto_vacuum = INCREMENTAL");
+        }
         // WAL lets a reader see the last committed state without waiting for a writer; an
         // in-memory database ignores the request and stays in its own journal mode.
         let _ = connection.pragma_update(None, "journal_mode", "WAL");
@@ -165,6 +175,41 @@ impl SqliteStore {
         }
         Ok(())
     }
+}
+
+impl SqliteStore {
+    fn reclaim_freelist(&self) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| DurableError::unavailable("the sqlite connection lock was poisoned"))?;
+        // Outside a transaction (the commit has returned). A trim is rare — the size has to
+        // double, or pass the ceiling — so rebuilding the file is the simple answer: it returns
+        // every free page to the filesystem, where `incremental_vacuum` leaves most of the work
+        // to a later checkpoint in WAL mode and freed almost nothing here.
+        connection.execute_batch("VACUUM").map_err(unavailable)?;
+        Ok(())
+    }
+}
+
+/// Whether the database was created without automatic vacuuming.
+fn auto_vacuum_none(connection: &Connection) -> bool {
+    connection
+        .query_row("PRAGMA auto_vacuum", [], |row| row.get::<_, i64>(0))
+        .map(|mode| mode == 0)
+        .unwrap_or(false)
+}
+
+/// Whether the store schema has not been created yet.
+fn no_schema(connection: &Connection) -> bool {
+    connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'agentscope_part'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count == 0)
+        .unwrap_or(false)
 }
 
 impl RecordStore for SqliteStore {
@@ -253,6 +298,10 @@ impl RecordStore for SqliteStore {
         // WAL is not safe on a network filesystem, so the database file must stay on the host
         // that opened it. Cross-host leases and shared roots are therefore not advertised.
         false
+    }
+
+    fn reclaim_space(&self) -> Result<()> {
+        self.reclaim_freelist()
     }
 }
 
@@ -525,6 +574,46 @@ mod tests {
             "agentscope-sqlite-{name}-{}-{id}.db",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn reclaim_space_frees_the_pages_a_trim_released() {
+        let path = temp_path("reclaim");
+        let store = SqliteStore::open(&path).expect("store");
+        let auto_vacuum: i64 = {
+            let connection = store.connection.lock().expect("lock");
+            connection
+                .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+                .expect("auto_vacuum")
+        };
+        assert_eq!(auto_vacuum, 2, "a new root uses incremental auto-vacuum");
+        let payload = "x".repeat(4096);
+        let write = |value: Option<Value>| {
+            store
+                .transaction("ns/reclaim", &mut |txn: &mut dyn Txn| {
+                    for index in 0..400 {
+                        txn.put(&format!("row:{index:04}"), value.clone())?;
+                    }
+                    Ok(())
+                })
+                .expect("write");
+        };
+        let freelist = || -> i64 {
+            let connection = store.connection.lock().expect("lock");
+            connection
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .expect("freelist_count")
+        };
+        write(Some(Value::String(payload)));
+        assert_eq!(freelist(), 0, "an insert leaves no free pages");
+        write(None);
+        assert!(
+            freelist() > 0,
+            "deleting rows puts their pages on the freelist"
+        );
+        store.reclaim_space().expect("reclaim");
+        assert_eq!(freelist(), 0, "the reclaim empties the freelist");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

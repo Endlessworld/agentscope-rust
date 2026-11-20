@@ -18,7 +18,8 @@ pub(super) fn commit(
     // decides what may be dropped. A store that cannot measure (in memory, remote KV) never
     // triggers this and keeps every fact.
     let scope_bytes = store.scope_bytes(&lease.thread.session.storage_key())?;
-    with_session(store, &lease.thread.session, |txn| {
+    let mut compacted = false;
+    let receipt = with_session(store, &lease.thread.session, |txn| {
         let mut state = require_state(txn)?;
         let mut thread = require_thread(txn, &lease.thread)?;
         let mut turn = require_turn(txn, &lease.turn_id)?;
@@ -161,6 +162,7 @@ pub(super) fn commit(
         // The scope is one document that this commit is rewriting anyway, so trimming it here
         // costs no extra write: the bytes it drops are bytes this write would otherwise carry.
         if trim {
+            compacted = true;
             // Whatever the trim frees (nothing, when the scope cannot shrink), the resulting size
             // is measured by the next commit: `compact_pending` says the recorded size is stale.
             state.compact_pending = true;
@@ -185,7 +187,13 @@ pub(super) fn commit(
         save_thread(txn, &thread)?;
         save_state(txn, &state)?;
         Ok(receipt)
-    })
+    })?;
+    if compacted {
+        // The trim freed pages; a store with a freelist hands them back outside the transaction.
+        // A store whose pages are reused in place does nothing.
+        store.reclaim_space()?;
+    }
+    Ok(receipt)
 }
 
 fn status_event(status: TurnStatus) -> &'static str {
