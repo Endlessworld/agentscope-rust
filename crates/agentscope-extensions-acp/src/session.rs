@@ -1048,6 +1048,46 @@ impl Drop for TickLoop {
 }
 
 /// A single ACP session backed by a [`HarnessAgent`].
+/// The state a turn owns, separate from the protocol state.
+///
+/// These are the fields `run_prompt_inner` needs beyond the store: the cancellation generation a
+/// turn was admitted under, the lock that serializes prompts, the closed flag it checks while
+/// waiting for that lock, the "a prompt is running" flag, and the usage the turn reports back.
+/// Grouping them is the first half of design doc P1.5: once the body moves into `DurableDriver`,
+/// it takes this one value instead of five session fields.
+#[derive(Clone)]
+pub(crate) struct TurnState {
+    /// A single session-wide flag leaked across turns: a cancel that arrived while the next
+    /// prompt was already waiting behind `prompt_lock` either stopped the wrong turn or was
+    /// silently cleared by that turn's start. Each prompt captures the generation it started
+    /// under, and `cancel` advances it — so only the turn running at cancel time stops.
+    cancel_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes prompts for this session. ACP forbids overlapping prompt turns, but clients
+    /// do send a follow-up before the previous response arrives (or a host retries one); two
+    /// concurrent runs on the same session used to be rejected as `turn_unfinished`.
+    prompt_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Whether this session was closed. A prompt that finishes after `session/close` must not
+    /// put the session back into the registry.
+    closed: Arc<AtomicBool>,
+    /// Whether a prompt is currently being executed (guards LRU eviction).
+    running: Arc<AtomicBool>,
+    /// Token usage accumulated during the turn that is running (reset per turn),
+    /// reported back as `PromptResponse.usage`.
+    usage: ChatUsage,
+}
+
+impl Default for TurnState {
+    fn default() -> Self {
+        Self {
+            cancel_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            closed: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
+            usage: ChatUsage::default(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AcpAgentSession {
     session_id: SessionId,
@@ -1085,20 +1125,10 @@ pub struct AcpAgentSession {
     applied_model: String,
     /// Cancellation generation for the prompt turn.
     ///
-    /// A single session-wide flag leaked across turns: a cancel that arrived while the next
-    /// prompt was already waiting behind `prompt_lock` either stopped the wrong turn or was
-    /// silently cleared by that turn's start. Each prompt captures the generation it started
-    /// under, and `cancel` advances it — so only the turn running at cancel time stops.
-    cancel_epoch: Arc<std::sync::atomic::AtomicU64>,
-    /// Serializes prompts for this session. ACP forbids overlapping prompt turns, but clients
-    /// do send a follow-up before the previous response arrives (or a host retries one); two
-    /// concurrent runs on the same session used to be rejected as `turn_unfinished`.
-    prompt_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Whether this session was closed. A prompt that finishes after `session/close` must not
-    /// put the session back into the registry.
-    closed: Arc<AtomicBool>,
-    /// Whether a prompt is currently being executed (guards LRU eviction).
-    running: Arc<AtomicBool>,
+    /// The state a turn owns: the cancellation generation, the lock that serializes prompts,
+    /// the closed/running flags and the usage of the turn in flight. Grouped so the execution
+    /// body can move behind `TurnDriver` as one value (design doc P1.5).
+    turn: TurnState,
     usage: ChatUsage,
     /// The provider-reported input tokens of the most recent model call. This is the
     /// real size of the live context (system prompt + tools + history), reported back
@@ -1140,9 +1170,7 @@ pub struct AcpAgentSession {
     /// `session/update` variants are only legal when the matching capability was
     /// advertised, so every optional update is gated on this.
     support: ClientSupport,
-    /// Token usage accumulated during the turn that is running (reset per turn),
-    /// reported back as `PromptResponse.usage`.
-    turn_usage: ChatUsage,
+
     /// Workspace roots beyond `cwd`, reported in `session/list`.
     additional_directories: Vec<PathBuf>,
     /// Sidecar file used to restore `{model, mode, thought_level}` after a restart.
@@ -1422,10 +1450,6 @@ impl AcpAgentSession {
             modes,
             model_builder: None,
             applied_model: actual_model,
-            cancel_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            closed: Arc::new(AtomicBool::new(false)),
-            running: Arc::new(AtomicBool::new(false)),
             usage: ChatUsage::default(),
             last_input_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             client: Arc::new(Mutex::new(None)),
@@ -1433,10 +1457,11 @@ impl AcpAgentSession {
             permission_store,
             mcp_manager: Arc::new(agentscope_harness::agent::McpClientManager::new()),
             driver,
+            turn: TurnState::default(),
             bridged_servers: Arc::new(Mutex::new(Vec::new())),
             pending_acp_servers: Arc::new(Mutex::new(Vec::new())),
             support: ClientSupport::new(),
-            turn_usage: ChatUsage::default(),
+
             additional_directories: Vec::new(),
             config_path,
             title: None,
@@ -2544,12 +2569,12 @@ impl AcpAgentSession {
     pub fn cancel(&self) {
         // Cancels exactly the turn that owns the session now: a prompt that starts later reads
         // the new generation and keeps running.
-        self.cancel_epoch.fetch_add(1, Ordering::SeqCst);
+        self.turn.cancel_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Closes the session: cancels the active prompt and prevents it from being re-registered.
     pub fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        self.turn.closed.store(true, Ordering::SeqCst);
         self.cancel();
         // Subagents outlive the prompt that spawned them: closing the session must not leave
         // them running with nobody to render them (or to answer their permission requests).
@@ -2597,12 +2622,12 @@ impl AcpAgentSession {
 
     /// Whether the session was closed by the client.
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.turn.closed.load(Ordering::SeqCst)
     }
 
     /// Whether a prompt is running right now.
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.turn.running.load(Ordering::SeqCst)
     }
 
     /// Runs a prompt against the core agent and streams updates, honouring the
@@ -2649,7 +2674,7 @@ impl AcpAgentSession {
         }
         // Serialize with a running turn: rewriting the history under an in-flight request
         // would make the model answer from a prefix the client already dropped.
-        let _guard = Arc::clone(&self.prompt_lock).lock_owned().await;
+        let _guard = Arc::clone(&self.turn.prompt_lock).lock_owned().await;
         let report = match self.agent.compact_now().await {
             Ok(None) => {
                 "Nothing to compact: context compaction is unavailable in this session or the \
@@ -3153,9 +3178,9 @@ impl AcpAgentSession {
         // and silently ignored it, so the prompt ran (and billed) anyway.
         crate::mem::note_activity();
         agentscope_core::diag::mark("acp:run_enter");
-        let cancel_epoch = Arc::clone(&self.cancel_epoch);
+        let cancel_epoch = Arc::clone(&self.turn.cancel_epoch);
         let my_epoch = cancel_epoch.load(Ordering::SeqCst);
-        let closed = Arc::clone(&self.closed);
+        let closed = Arc::clone(&self.turn.closed);
         // One prompt turn per session. A client may send a follow-up before the previous
         // response arrives (a retry, a Stop followed by a new message); without this lock the
         // second run raced the first and was rejected as `turn_unfinished`, losing the input.
@@ -3163,7 +3188,7 @@ impl AcpAgentSession {
         // The wait is cancellable and bounded: a stuck previous turn must not make every later
         // prompt hang forever behind an un-cancellable lock.
         let _prompt_guard = tokio::select! {
-            guard = Arc::clone(&self.prompt_lock).lock_owned() => guard,
+            guard = Arc::clone(&self.turn.prompt_lock).lock_owned() => guard,
             _ = async {
                 if let Some(c) = &cancellation {
                     c.cancelled().await;
@@ -3196,11 +3221,11 @@ impl AcpAgentSession {
             // Closed while this prompt waited for the previous turn to finish.
             return StopReason::Cancelled;
         }
-        self.running.store(true, Ordering::SeqCst);
-        let _running = RunningPrompt(Arc::clone(&self.running));
+        self.turn.running.store(true, Ordering::SeqCst);
+        let _running = RunningPrompt(Arc::clone(&self.turn.running));
         // Turn-level usage: reset at the start of each prompt turn, accumulate
         // from every model call, and report back as `PromptResponse.usage`.
-        self.turn_usage = ChatUsage::default();
+        self.turn.usage = ChatUsage::default();
         // A wakeup exists only to deliver background results; it must never monopolize the
         // session while a real user prompt waits behind it.
         let wakeup_turn = matches!(&input, TurnInput::Wakeup);
@@ -4010,15 +4035,15 @@ impl AcpAgentSession {
     /// Accumulates usage for the currently running turn (reported back as
     /// `PromptResponse.usage`).
     fn accumulate_turn_usage(&mut self, usage: &ChatUsage) {
-        self.turn_usage.input_tokens += usage.input_tokens;
-        self.turn_usage.output_tokens += usage.output_tokens;
-        self.turn_usage.cached_tokens += usage.cached_tokens;
+        self.turn.usage.input_tokens += usage.input_tokens;
+        self.turn.usage.output_tokens += usage.output_tokens;
+        self.turn.usage.cached_tokens += usage.cached_tokens;
     }
 
     /// Builds the ACP `Usage` for the running turn, or `None` when no model
     /// call contributed usage (so an empty turn does not report a bogus 0).
     pub fn turn_usage_response(&self) -> Option<agent_client_protocol::v1::schema::Usage> {
-        turn_usage_to_response(&self.turn_usage)
+        turn_usage_to_response(&self.turn.usage)
     }
 
     /// Builds the ACP `UsageUpdate` notification: `used` is the tokens in
