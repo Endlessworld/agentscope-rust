@@ -193,7 +193,16 @@ mod tests {
     /// A broker whose calls always fail, to prove the consumer does not advance on errors.
     struct FailingBroker;
 
+    #[async_trait::async_trait]
     impl Broker for FailingBroker {
+        fn topic(&self) -> &str {
+            "failing"
+        }
+
+        fn tag(&self) -> &str {
+            "failing"
+        }
+
         async fn publish(&self, _message: Message) -> Result<(), crate::BrokerError> {
             Err(crate::BrokerError::unavailable("offline"))
         }

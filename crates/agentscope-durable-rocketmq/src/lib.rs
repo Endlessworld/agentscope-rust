@@ -24,18 +24,32 @@
 mod broker;
 mod consumer;
 mod cursor;
+mod dyn_broker;
 mod envelope;
 mod error;
+mod hands;
+mod hands_route;
 mod message;
+mod remote_executor;
+mod reply_inbox;
 mod route;
+mod wakeups;
+mod worker;
 
 pub use broker::{Broker, InMemoryBroker};
 pub use consumer::{Batch, Consumer};
 pub use cursor::Cursor;
+pub use dyn_broker::DynBroker;
 pub use envelope::Envelope;
 pub use error::{BrokerError, ConsumeError, CursorError, EnvelopeError};
+pub use hands::{HandsEnvelope, HandsKind};
+pub use hands_route::{reply_topic, request_topic, wakeup_topic};
 pub use message::Message;
+pub use remote_executor::RemoteExecutor;
+pub use reply_inbox::ReplyInbox;
 pub use route::{route, topic_for_namespace, Route, TAG_PREFIX, TOPIC_PREFIX};
+pub use wakeups::RocketMqWakeups;
+pub use worker::RocketMqWorker;
 
 /// Test-only single-poll executor.
 ///

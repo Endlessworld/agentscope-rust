@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use agentscope_durable::SessionKey;
+use async_trait::async_trait;
 
 use crate::cursor::Cursor;
 use crate::error::BrokerError;
@@ -28,15 +29,21 @@ use crate::route::{route, Route};
 ///   advance the cursor by the number of messages it fetched.
 ///
 /// Native `async fn` keeps the port free of `async-trait`; it is therefore not `dyn`-compatible.
-/// A host that needs dynamic dispatch wraps a concrete broker in its own enum.
+/// A host that needs dynamic dispatch wraps a concrete broker in [`DynBroker`](crate::DynBroker).
 ///
 /// TODO: retries/backoff and transactional publish are intentionally absent. RocketMQ 5
 /// transaction messages need a half-message check against a live broker's transaction service,
 /// which cannot be verified here, and a retry inside the port would hide the retryable
 /// [`BrokerError::Unavailable`] from the caller that owns the backoff policy. The write-side
 /// exactly-once story stays with the durable journal (idempotent `eventId`), not with the MQ.
-#[allow(async_fn_in_trait)]
+#[async_trait]
 pub trait Broker: Send + Sync {
+    /// Topic this partition serves; a message for another topic is rejected by the broker.
+    fn topic(&self) -> &str;
+
+    /// Tag this partition serves; it is the subscription filter of the partition.
+    fn tag(&self) -> &str;
+
     /// Publish one message.
     async fn publish(&self, message: Message) -> Result<(), BrokerError>;
 
@@ -117,7 +124,16 @@ impl InMemoryBroker {
     }
 }
 
+#[async_trait]
 impl Broker for InMemoryBroker {
+    fn topic(&self) -> &str {
+        &self.inner.topic
+    }
+
+    fn tag(&self) -> &str {
+        &self.inner.tag
+    }
+
     async fn publish(&self, message: Message) -> Result<(), BrokerError> {
         if message.topic != self.inner.topic {
             return Err(BrokerError::invalid(format!(

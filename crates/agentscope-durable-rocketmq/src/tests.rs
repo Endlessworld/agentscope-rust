@@ -306,7 +306,16 @@ impl ScriptedBroker {
     }
 }
 
+#[async_trait::async_trait]
 impl Broker for ScriptedBroker {
+    fn topic(&self) -> &str {
+        "scripted"
+    }
+
+    fn tag(&self) -> &str {
+        "scripted"
+    }
+
     async fn publish(&self, _message: Message) -> Result<(), BrokerError> {
         Err(BrokerError::invalid("the scripted broker is read-only"))
     }

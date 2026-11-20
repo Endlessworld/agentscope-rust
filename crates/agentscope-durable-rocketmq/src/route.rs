@@ -64,7 +64,7 @@ fn tag_for_session(session: &SessionKey) -> String {
 
 /// Lowercase ASCII slug: letters/digits survive, `-`/`_` survive, everything else becomes a
 /// single `-`, runs are collapsed and the result is bounded.
-fn slugify(namespace: &str) -> String {
+pub(crate) fn slugify(namespace: &str) -> String {
     let mut slug = String::with_capacity(namespace.len().min(SLUG_MAX));
     for character in namespace.chars() {
         let mapped = if character.is_ascii_alphanumeric() {
@@ -90,7 +90,7 @@ fn slugify(namespace: &str) -> String {
     }
 }
 
-fn digest_hex(value: &str) -> String {
+pub(crate) fn digest_hex(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
