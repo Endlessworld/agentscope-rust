@@ -217,6 +217,13 @@ const ROLL_OUT_BYTES: u64 = 1 << 20;
 /// fold is the old whole-document write, so this bound sets how often it is paid.
 const LOG_COMPACT_BYTES: u64 = 256 * 1024;
 
+/// The on-disk layout version this build reads and writes.
+///
+/// A root names its version in `format.json`. The check is one file read at open: a root written
+/// by a newer layout is refused before any transaction touches it, instead of being misread.
+/// This build writes no file: version 1 is the layout every existing root already has.
+const STORE_FORMAT_VERSION: u64 = 1;
+
 /// How many blobs this process keeps parsed, and how many bytes they may hold.
 const BLOB_CACHE_ENTRIES: usize = 16;
 const BLOB_CACHE_BYTES: usize = 4 << 20;
@@ -495,8 +502,32 @@ impl FileStore {
             #[cfg(test)]
             range_reads: AtomicU64::new(0),
         };
+        store.check_format()?;
         store.adopt_flat_work_records()?;
         Ok(store)
+    }
+
+    /// Refuses a root this build cannot read, before a transaction touches it.
+    ///
+    /// A root with no `format.json` is this build's own layout: the file is written only by a
+    /// layout that has something to declare, so an existing root keeps opening.
+    fn check_format(&self) -> Result<()> {
+        let path = self.root.join("format.json");
+        let bytes = match retry_while_held(|| fs::read(&path)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let format: StoreFormat = serde_json::from_slice(&bytes).map_err(|error| {
+            DurableError::invalid(format!("store format is unreadable: {error}"))
+        })?;
+        if format.version != STORE_FORMAT_VERSION {
+            return Err(DurableError::invalid(format!(
+                "store format {} is not readable by this build (it reads {STORE_FORMAT_VERSION})",
+                format.version
+            )));
+        }
+        Ok(())
     }
 
     /// This process's gate and handle for one lock path.
@@ -2090,6 +2121,12 @@ fn index_document(bytes: &[u8]) -> Result<DocumentIndex> {
 /// in hand, so it writes down where each record lands and a later transaction reads only those
 /// bytes. It is derived data: `stamp` names the document it describes, and a missing, damaged or
 /// stale index only means the read falls back to the document.
+/// The on-disk layout version of a store root, as `format.json` names it.
+#[derive(Serialize, Deserialize)]
+struct StoreFormat {
+    version: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct ScopeIndex {
     stamp: ScopeStamp,
@@ -3579,6 +3616,26 @@ mod tests {
         assert_eq!(index.value(bytes, "d")?, Some(json!({})));
         assert_eq!(index.value(bytes, "e")?, Some(Value::Null));
         assert_eq!(index.value(bytes, "missing")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_root_of_another_format_is_refused() -> Result<()> {
+        let root = TempRoot::new("format");
+        FileStore::open(root.path())?;
+        assert!(
+            !root.path().join("format.json").exists(),
+            "version 1 declares nothing"
+        );
+        fs::write(root.path().join("format.json"), br#"{"version":99}"#)?;
+        let error = match FileStore::open(root.path()) {
+            Ok(_) => panic!("a root of another format must not open"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("store format 99"),
+            "the refusal names the version: {error}"
+        );
         Ok(())
     }
 
