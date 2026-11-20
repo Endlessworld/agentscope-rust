@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::turn_driver::{
-    DriverError, DriverInput, EventSink, Guarantees, ReplayItem, ResumeOutcome,
-    TurnDriver as TurnDriverSeam, TurnOutcome, TurnView,
+    DriverError, DriverInput, EventSink, Guarantees, ReplayItem, ResumeOutcome, TurnDriver,
+    TurnOutcome, TurnView,
 };
 use agent_client_protocol::v1::schema::{
     ContentBlock, CreateElicitationRequest, CreateElicitationResponse, MessageId, PermissionOption,
@@ -931,7 +931,7 @@ impl DurableDriver {
 }
 
 #[async_trait::async_trait]
-impl TurnDriverSeam for DurableDriver {
+impl TurnDriver for DurableDriver {
     async fn run(
         &self,
         _input: DriverInput,
@@ -1008,12 +1008,12 @@ async fn drive_turn(session: Arc<DurableSession>, turn_id: String, stop: Arc<Ato
 }
 
 /// The tick loop of one prompt attempt.
-struct TurnDriver {
+struct TickLoop {
     stop: Arc<AtomicBool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl TurnDriver {
+impl TickLoop {
     fn spawn(session: Arc<DurableSession>, turn_id: String) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn(drive_turn(session, turn_id, Arc::clone(&stop)));
@@ -1038,7 +1038,7 @@ impl TurnDriver {
     }
 }
 
-impl Drop for TurnDriver {
+impl Drop for TickLoop {
     fn drop(&mut self) {
         // Only reached on a path that returned without `finish`: the loop is asked to stop, and
         // the handle is dropped (the task detaches and ends after its current tick).
@@ -3433,7 +3433,7 @@ impl AcpAgentSession {
             let mut cancelled = false;
             // The tick loop is the only writer: this attempt starts it, renders what it
             // publishes, and hands the thread back when it leaves.
-            let driver = TurnDriver::spawn(Arc::clone(&runtime.session), turn_id.clone());
+            let driver = TickLoop::spawn(Arc::clone(&runtime.session), turn_id.clone());
             let attempt_started = std::time::Instant::now();
             // Whether this attempt already streamed incremental text. Reset per attempt: a
             // resumed run may complete without emitting deltas (the answer already exists in
