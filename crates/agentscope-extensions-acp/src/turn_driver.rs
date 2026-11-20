@@ -15,15 +15,21 @@
 use std::fmt;
 use std::sync::Arc;
 
-use agentscope_core::event::AgentEvent;
 use agentscope_core::message::{ChatUsage, Msg};
 use async_trait::async_trait;
 
 /// Where a driver publishes the events of a turn.
 ///
+/// The payload is the ACP notification already rendered, not a core `AgentEvent`: what a turn
+/// reports (a tool call's state, the text of a failure, the stop reason) is read off the frame
+/// the driver produces, so rendering is the driver's job. Making the session render core events
+/// instead would mean rewriting every `super::event::*` call in the prompt loop, which is a
+/// rewrite rather than the move this seam is meant to be.
+///
 /// The driver calls it synchronously; the session's queue bounds the backlog, so a slow client
 /// never grows it without limit.
-pub type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+pub type EventSink =
+    Arc<dyn Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync>;
 
 /// One prompt, as the protocol layer sees it.
 #[derive(Clone, Debug)]

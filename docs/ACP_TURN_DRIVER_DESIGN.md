@@ -197,6 +197,10 @@ fn render_event(ctx: &mut RenderCtx<'_>, event: &AgentEvent, out: &mut dyn FnMut
 
 > `session/status` 返回的是**会话级**状态（`SessionStatus::Open` / `Saved`，`coding_agent.rs:838`），不读 turn 记录；`TurnDriver::view` 的消费者是 `run` 自己（取消后确认终态、内层循环判断），不是协议层。设计初稿把二者混为一谈，此处更正：`view` 没有协议级入口，它的接管只能随 `run` 一起做。
 
+### 4.1.1 `EventSink` 装的是什么
+
+`EventSink` 发的是**已渲染的 ACP 通知**（`SessionNotification`），不是 core `AgentEvent`。一轮要报的东西——tool call 的状态迁移、失败的文案、stop reason——是从驱动产出的 frame 上读出来的，所以渲染是驱动的职责；若改成「驱动发 core 事件、协议层渲染」，等于把 `run_prompt_inner` 里全部 `super::event::*` 调用重写一遍，那是重写而不是本接缝要做的搬移，也与「功能不降级」冲突。协议层仍然不需要知道事件来历：它只把通知交给 `event_queue`。
+
 ### 4.2 物理保证（不是功能）
 
 | 保证 | DurableDriver | NativeDriver |
