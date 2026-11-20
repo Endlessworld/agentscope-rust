@@ -1,0 +1,9 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# Deliberately dependency-free: a task runner must never change the dependency
+# graph of the crates it builds.
+[dependencies]

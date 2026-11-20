@@ -256,10 +256,12 @@ REPL slash 命令：`/model <id>` 切换模型、`/models` 列出模型、`/quit
 cargo build --profile embedded -p agentscope-harness -p agentscope-extensions-acp \
     --no-default-features --features lite --bins
 
-# Windows 便捷脚本（release / embedded 两个 ACP 二进制）
-build-acp-release.bat
-build-acp-embedded.bat
+# ACP 二进制：三个变体（native / durable / sqlite），产物在 target/acp/<profile>/<variant>/
+cargo xtask acp build all --profile release      # stable，三变体
+cargo xtask acp build sqlite --profile embedded  # 体积优先，需要 nightly
 ```
+
+- 根目录的 `build-acp-*.bat` / `pack-acp-upx.bat` 只是 `cargo xtask ...` 的 Windows 薄封装
 
 - 默认 feature `rusqlite`：启用工作区 SQLite 索引；`lite` 关闭它
 - `embedded` profile：`opt-level="z"` + fat LTO + `strip`（详见 `docs/EMBEDDED_SIZE.md`）

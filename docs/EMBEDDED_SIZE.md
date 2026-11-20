@@ -5,14 +5,34 @@ ACP 二进制（`acp_harness_agent` / `acp_agent_cli`）的体积优化手册：
 
 ## 构建方式
 
+所有本机构建入口都收敛到 workspace 任务运行器 `xtask`（`cargo xtask`，实现见
+`xtask/src/main.rs`，需要 Rust 不需要外部工具）。根目录的 `.bat` 只是 Windows 上的薄封装：
+
 ```bat
-build-acp-embedded.bat
-rem 等价于：
-cargo +nightly build --profile embedded --config .cargo/config.embedded.toml ^
-  -p agentscope-extensions-acp --no-default-features --features lite --bins
+cargo xtask acp build all --profile release     rem native + durable + sqlite（stable）
+cargo xtask acp build sqlite --profile embedded rem 体积优先，等价于原 build-acp-embedded.bat
 ```
 
-需要 nightly（`build-std`）且已装 `rust-src`；产物在 `target/embedded/`（`.pdb` 不要打包）。
+变体 = `agentscope-extensions-acp` 的 feature 组合：
+
+| 变体 | feature（release / embedded） | 运行时 |
+|---|---|---|
+| `native` | `rusqlite` / `lite` | 仅 native driver，不含 durable |
+| `durable` | `rusqlite,durable` / `lite,durable` | durable driver + 文件存储（同 `default`） |
+| `sqlite` | `rusqlite,durable-sqlite` / `lite,durable-sqlite` | durable driver + SQLite 存储，两种 driver 都在 |
+| `all` | 以上三者 | |
+
+`durable-sqlite` 隐含 `durable`，所以 `sqlite` 变体同时含两种 driver，运行时用
+`AGENTSCOPE_TURN_DRIVER` 切换（默认 durable）。产物按变体分目录，两个二进制必须放在一起
+（`acp_agent_cli` 会从自身目录 spawn `acp_harness_agent`）：
+
+```
+target/acp/<profile>/<variant>/acp_harness_agent[.exe]
+target/acp/<profile>/<variant>/acp_agent_cli[.exe]
+```
+
+cargo 自己的原始产物仍在 `target/<profile>/`。embedded profile 需要 nightly（`build-std`）
+且已装 `rust-src`；`.pdb` 不要打包。
 
 交叉 / 指定平台（发布矩阵走的就是这条，产物在 `target/<triple>/embedded/`）：
 
@@ -94,16 +114,17 @@ unwind table），不要尝试；`panic_immediate_abort` 已从新 nightly 的 s
 
 ## UPX 加壳（可选，手动执行，默认不启用）
 
-`pack-acp-upx.bat` 把 `target/embedded/*.exe` 加壳后**另存**到 `target/embedded/upx/`，
+`cargo xtask acp upx sqlite --profile embedded`（`pack-acp-upx.bat` 是其薄封装）把
+`target/acp/embedded/sqlite/*.exe` 加壳后**另存**到 `target/acp/embedded/sqlite/upx/`，
 原始产物不动：
 
 ```bat
 set UPX_EXE=C:\tools\upx\upx.exe   rem 或者把 upx 加进 PATH
-pack-acp-upx.bat
+cargo xtask acp upx sqlite --profile embedded
 ```
 
-脚本只做 `upx --best --lzma` + `upx -t` 完整性校验 + 打印前后字节数；不联网、不覆盖原始文件、
-不并入 `build-acp-embedded.bat`（漏装 UPX 时直接报错退出，不影响正常构建）。
+只做 `upx --best --lzma` + `upx -t` 完整性校验 + 打印前后字节数；不联网、不覆盖原始文件、
+不并入构建命令（漏装 UPX 时直接报错退出，不影响正常构建）。
 
 实测（UPX 5.3.0 win64，与上表同一份产物）：
 

@@ -12,3 +12,10 @@ incremental = false
 # profile / toolchain 区分 rustflags，写在此处会连累 stable 下的 cargo build/test。
 # 它们存放在 .cargo/config.embedded.toml，需显式指定：
 #   cargo +nightly build --profile embedded --config .cargo/config.embedded.toml
+
+[alias]
+# `cargo xtask ...` runs the workspace task runner (xtask/src/main.rs):
+#   cargo xtask acp build all --profile release
+#   cargo xtask acp build sqlite --profile embedded
+#   cargo xtask acp upx sqlite --profile embedded
+xtask = "run --quiet --package xtask --"

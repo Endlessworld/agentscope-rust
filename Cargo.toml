@@ -43,6 +43,7 @@ members = [
     "crates/agentscope-extensions-nacos",
     "crates/agentscope-extensions-higress",
     "crates/agentscope-extensions-judge",
+    "xtask",
 ]
 
 [workspace.package]
