@@ -75,6 +75,12 @@ const STREAM_CONTROL_POLL_MAX: std::time::Duration = std::time::Duration::from_s
 /// un-terminated, so the tick stops waiting and settles the cancellation itself.
 const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a pause waits for the model call in flight to stop producing chunks before it cuts
+/// the stream. A live stream is left alone: the message the client is already rendering has to
+/// reach the checkpoint, or the resumed turn would produce it a second time. A provider that
+/// stalls after the request has nothing left to preserve, so the tick stops waiting for it.
+const PAUSE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The synthetic result recorded for a tool call a previous run dispatched but never answered.
 const STRANDED_OUTCOME_MESSAGE: &str = "This tool call was dispatched by an earlier attempt of \
      this turn, but that attempt ended before its result was recorded. It was not retried; its \
@@ -364,6 +370,7 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
         let mut poll_at = tokio::time::Instant::now() + poll_delay;
         let mut observed: Option<TurnControl> = None;
         let mut cancel_deadline: Option<tokio::time::Instant> = None;
+        let mut last_item_at = tokio::time::Instant::now();
         loop {
             let item = tokio::select! {
                 item = stream.next() => item,
@@ -399,14 +406,23 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
                         continue;
                     }
                     if control.status == TurnStatus::Pausing {
-                        yielded = true;
-                        break;
+                        if last_item_at.elapsed() >= PAUSE_GRACE {
+                            yielded = true;
+                            break;
+                        }
+                        // A pause yields at the next boundary, never through a live model response:
+                        // cutting the stream here would drop the assistant message the user is
+                        // already watching — it never reaches the checkpoint, so the resumed run
+                        // would produce it a second time. Only a stream that stopped producing
+                        // chunks is cut loose.
+                        continue;
                     }
                     continue;
                 }
             };
             let Some(item) = item else { break };
             // Anything the stream produces means it is alive: ask again at the fast interval.
+            last_item_at = tokio::time::Instant::now();
             poll_delay = STREAM_CONTROL_POLL_MIN;
             poll_at = tokio::time::Instant::now() + poll_delay;
             match item {

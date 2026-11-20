@@ -364,7 +364,12 @@ impl AgentExecutionHost for AgentScopeExecutionHost {
         context: &RuntimeContext,
         state: &mut AgentState,
     ) -> Result<()> {
-        self.check_control().await?;
+        // A pause that lands once the reply is ready has nothing left to yield: suspending
+        // there would make the resumed turn re-enter a step it had already finished. Let the
+        // finalization settle the turn instead.
+        if boundary != ExecutionBoundary::Finalization {
+            self.check_control().await?;
+        }
         match boundary {
             // Input applied here enters the next model request.
             ExecutionBoundary::Reasoning => self.apply_inputs(state).await?,
@@ -399,7 +404,6 @@ impl AgentExecutionHost for AgentScopeExecutionHost {
         if self.completed.load(Ordering::SeqCst) {
             return continuation.await;
         }
-        self.check_control().await?;
         let recorder = InvocationRecorder::from_context(context)
             .ok_or_else(|| journal_error("Durable finalization requires a native recorder"))?;
         let before = current_state(context)?;
@@ -427,6 +431,10 @@ impl AgentExecutionHost for AgentScopeExecutionHost {
                 });
             }
         }
+        // A pause that lands once the reply is ready is observed *after* the reply is committed: a
+        // resumed finalization replays the committed reply instead of asking the model again, so
+        // a pause near the end of an answer never rewrites what the user already read.
+        self.check_control().await?;
         continuation.await?;
         recorder.append(FINALIZATION_COMPLETED, &json!({ "id": frame_id }))?;
         // The continuation may have replaced the state (finish middleware runs after the reply
