@@ -837,19 +837,70 @@ impl DurableDriver {
         self.runtime.lock().await.as_ref().map(Arc::clone)
     }
 
+    /// The runtime context that identifies this ACP session in the journal.
+    ///
+    /// The user id is left unset on purpose: `HarnessAgent::session_key` falls back to the
+    /// agent's pinned state, so a host that configured a tenant keeps it.
+    fn session_context(&self) -> agentscope_core::agent::RuntimeContext {
+        agentscope_core::agent::RuntimeContext::new().with_session_id(self.session_id.to_string())
+    }
+
+    /// The store root of this session's durable state.
+    ///
+    /// The root is the harness *workspace*, not the ACP `cwd`: `session/load` rebuilds the
+    /// session from the cwd the client sends, and the conversation must still be found there
+    /// (the harness journal lives in the workspace for the same reason).
+    fn durable_root(&self) -> std::result::Result<PathBuf, String> {
+        self.agent
+            .workspace_manager()
+            .map(|manager| manager.workspace().join(".agentscope").join("durable"))
+            .ok_or_else(|| "the agent has no workspace to keep durable state in".to_string())
+    }
+
+    /// The thread this ACP session drives: one session, one thread.
+    fn durable_thread(&self) -> std::result::Result<ThreadKey, String> {
+        let session = SessionKey::new(DURABLE_NAMESPACE, self.session_id.to_string())
+            .map_err(|error| error.to_string())?;
+        ThreadKey::new(session, "main").map_err(|error| error.to_string())
+    }
+
+    fn durable_backend(&self) -> std::result::Result<Arc<dyn SessionBackend>, String> {
+        let root = self.durable_root()?;
+        // A build that compiles the SQLite store in uses it by default, so an embedded
+        // deployment does not depend on an environment variable. `AGENTSCOPE_DURABLE_STORE=file`
+        // keeps a deployment on the file store without a rebuild.
+        #[cfg(feature = "durable-sqlite")]
+        if std::env::var("AGENTSCOPE_DURABLE_STORE").as_deref() != Ok("file") {
+            std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+            let store = agentscope_durable_sqlite::SqliteStore::open(root.join("durable.db"))
+                .map_err(|error| error.to_string())?;
+            return Ok(Arc::new(TxnBackend::with_store(Arc::new(store))));
+        }
+        let store = FileStore::open(root).map_err(|error| error.to_string())?;
+        Ok(Arc::new(TxnBackend::with_store(Arc::new(store))))
+    }
+
+    /// The durable journal of this session, for a reader that must not open a runtime (the
+    /// `session/load` replay). Reading a thread that was never written is an error, which the
+    /// caller turns into an empty replay.
+    fn durable_journal(&self) -> std::result::Result<Arc<dyn ThreadJournal>, String> {
+        Ok(Arc::new(BackendThreadJournal::new(
+            self.durable_backend()?,
+            self.durable_thread()?,
+        )))
+    }
+
     /// Opens (or reuses) the durable runtime of this session.
     ///
     /// Opening touches durable storage, which can fail transiently (a competing writer, an
     /// fsync hiccup). Those failures are not the user's fault and must not end a turn on the
     /// first attempt.
-    async fn open_runtime(
-        &self,
-        backend: Arc<dyn SessionBackend>,
-        thread: ThreadKey,
-    ) -> std::result::Result<Arc<SessionRuntime>, String> {
+    async fn open_runtime(&self) -> std::result::Result<Arc<SessionRuntime>, String> {
         if let Some(runtime) = self.cached().await {
             return Ok(runtime);
         }
+        let backend = self.durable_backend()?;
+        let thread = self.durable_thread()?;
         let mut attempts = 0usize;
         let opened = loop {
             attempts += 1;
@@ -1496,70 +1547,34 @@ impl AcpAgentSession {
     }
 
     /// The runtime context that identifies this ACP session in the journal.
-    ///
-    /// The user id is left unset on purpose: `HarnessAgent::session_key` falls back to the
-    /// agent's pinned state, so a host that configured a tenant keeps it.
     fn session_context(&self) -> agentscope_core::agent::RuntimeContext {
-        agentscope_core::agent::RuntimeContext::new().with_session_id(self.session_id.to_string())
+        self.driver.session_context()
     }
 
     /// The store root of this session's durable state.
-    ///
-    /// The root is the harness *workspace*, not the ACP `cwd`: `session/load` rebuilds the
-    /// session from the cwd the client sends, and the conversation must still be found there
-    /// (the harness journal lives in the workspace for the same reason).
     fn durable_root(&self) -> std::result::Result<PathBuf, String> {
-        self.agent
-            .workspace_manager()
-            .map(|manager| manager.workspace().join(".agentscope").join("durable"))
-            .ok_or_else(|| "the agent has no workspace to keep durable state in".to_string())
+        self.driver.durable_root()
     }
 
     /// The thread this ACP session drives: one session, one thread.
     fn durable_thread(&self) -> std::result::Result<ThreadKey, String> {
-        let session = SessionKey::new(DURABLE_NAMESPACE, self.session_id.to_string())
-            .map_err(|error| error.to_string())?;
-        ThreadKey::new(session, "main").map_err(|error| error.to_string())
+        self.driver.durable_thread()
     }
 
     fn durable_backend(&self) -> std::result::Result<Arc<dyn SessionBackend>, String> {
-        let root = self.durable_root()?;
-        // A build that compiles the SQLite store in uses it by default, so an embedded
-        // deployment does not depend on an environment variable. `AGENTSCOPE_DURABLE_STORE=file`
-        // keeps a deployment on the file store without a rebuild.
-        #[cfg(feature = "durable-sqlite")]
-        if std::env::var("AGENTSCOPE_DURABLE_STORE").as_deref() != Ok("file") {
-            std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-            let store = agentscope_durable_sqlite::SqliteStore::open(root.join("durable.db"))
-                .map_err(|error| error.to_string())?;
-            return Ok(Arc::new(TxnBackend::with_store(Arc::new(store))));
-        }
-        let store = FileStore::open(root).map_err(|error| error.to_string())?;
-        Ok(Arc::new(TxnBackend::with_store(Arc::new(store))))
+        self.driver.durable_backend()
     }
 
     /// The durable journal of this session, for a reader that must not open a runtime (the
     /// `session/load` replay). Reading a thread that was never written is an error, which the
     /// caller turns into an empty replay.
     pub(crate) fn durable_journal(&self) -> std::result::Result<Arc<dyn ThreadJournal>, String> {
-        Ok(Arc::new(BackendThreadJournal::new(
-            self.durable_backend()?,
-            self.durable_thread()?,
-        )))
+        self.driver.durable_journal()
     }
 
     /// Opens (or reuses) the durable runtime of this session.
-    ///
-    /// Opening touches durable storage, which can fail transiently (a competing writer, an
-    /// fsync hiccup). Those failures are not the user's fault and must not end a turn on the
-    /// first attempt.
     async fn open_runtime(&self) -> std::result::Result<Arc<SessionRuntime>, String> {
-        if let Some(runtime) = self.driver.cached().await {
-            return Ok(runtime);
-        }
-        let backend = self.durable_backend()?;
-        let thread = self.durable_thread()?;
-        self.driver.open_runtime(backend, thread).await
+        self.driver.open_runtime().await
     }
 
     /// The working directory.
