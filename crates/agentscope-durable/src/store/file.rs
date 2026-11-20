@@ -49,7 +49,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -289,6 +289,12 @@ pub struct FileStore {
     /// say "the second read-only transaction did not read the file" without watching the clock.
     #[cfg(test)]
     document_reads: AtomicU64,
+    /// Records a transaction read through a [`ScopeIndex`] instead of the whole document.
+    ///
+    /// Only under `cfg(test)`, and the negative space of [`FileStore::document_reads`]: a test can
+    /// say "the record was read and the document was not".
+    #[cfg(test)]
+    range_reads: AtomicU64,
 }
 
 /// The out-of-line payloads this process read last.
@@ -486,6 +492,8 @@ impl FileStore {
             scans: AtomicU64::new(0),
             #[cfg(test)]
             document_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            range_reads: AtomicU64::new(0),
         };
         store.adopt_flat_work_records()?;
         Ok(store)
@@ -956,10 +964,43 @@ impl FileStore {
         self.roll_out(scope, &mut document)?;
         let bytes = write_json(&self.scope_path(scope), &document)?;
         count_scope_write(bytes);
+        self.write_scope_index(scope, &document);
         // An empty tail is a file, not a missing one: the next append reuses it.
         retry_while_held(|| fs::write(self.log_path(scope), b""))?;
         self.collect_blobs(scope, &document);
         Ok(())
+    }
+
+    /// The byte ranges of `scope`'s document, beside it; see [`ScopeIndex`].
+    fn index_path(&self, scope: &str) -> PathBuf {
+        self.scope_path(scope).with_extension("idx")
+    }
+
+    /// Records the ranges of the document [`FileStore::compact_scope`] just wrote.
+    ///
+    /// The fold is the one place that has the whole document in hand, so it is where an index
+    /// costs nothing extra. Failing to write it is not a failure of the fold: the index is derived
+    /// data, and a scope without one is read exactly as it was before it existed.
+    fn write_scope_index(&self, scope: &str, document: &RawDocument) {
+        let Some(stamp) = self.scope_stamp(scope) else {
+            return;
+        };
+        let Some(stamp) = scope_index_stamp(&stamp) else {
+            return;
+        };
+        let Ok(parts) = document_slots(document) else {
+            return;
+        };
+        let _ = write_json(&self.index_path(scope), &ScopeIndex { stamp, parts });
+    }
+
+    /// The index beside `scope`'s document, when one is there and parses.
+    ///
+    /// Whether it describes the document on disk is decided against the handle a read opens, so
+    /// this answers the file and not its freshness.
+    fn load_scope_index(&self, scope: &str) -> Option<ScopeIndex> {
+        let bytes = retry_while_held(|| fs::read(self.index_path(scope))).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// How many whole-document scans this store performed for [`RecordStore::read_parts`].
@@ -981,6 +1022,18 @@ impl FileStore {
     #[cfg(test)]
     fn document_reads(&self) -> u64 {
         self.document_reads.load(Ordering::Relaxed)
+    }
+
+    /// Counts one read of a document range; only under `cfg(test)`.
+    #[cfg(test)]
+    fn note_range_read(&self) {
+        self.range_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many document ranges this store read; only under `cfg(test)`.
+    #[cfg(test)]
+    fn range_reads(&self) -> u64 {
+        self.range_reads.load(Ordering::Relaxed)
     }
 
     /// `(len, modified, created)` of one scope document; `None` when it does not exist.
@@ -1301,6 +1354,7 @@ impl RecordStore for FileStore {
             overlay: RefCell::new(None),
             parts: RefCell::new(BTreeMap::new()),
             index: RefCell::new(None),
+            persisted: RefCell::new(None),
             staged: BTreeMap::new(),
             scheduled: BTreeMap::new(),
             now: crate::now_millis(),
@@ -1340,6 +1394,7 @@ impl RecordStore for FileStore {
             overlay: RefCell::new(None),
             parts: RefCell::new(BTreeMap::new()),
             index: RefCell::new(None),
+            persisted: RefCell::new(None),
             staged: BTreeMap::new(),
             scheduled: BTreeMap::new(),
             now: crate::now_millis(),
@@ -1467,10 +1522,10 @@ struct StagedTxn<'a> {
     scope: &'a str,
     /// Whether the transaction may only read.
     ///
-    /// A read-only transaction may answer from [`FileStore::cached_document`]; a writing one
-    /// always reads the file, because cached bytes are not a safe base to rewrite (another host
-    /// may have replaced the document since; two writes with the same length and timestamps
-    /// would make that invisible).
+    /// A read-only transaction may answer from [`FileStore::cached_document`]; a writing one reads
+    /// the file itself — the whole document, or one record's bytes through [`ScopeIndex`] — because
+    /// cached bytes are not a safe base to rewrite (another host may have replaced the document
+    /// since; two writes with the same length and timestamps would make that invisible).
     read_only: bool,
     /// The document bytes, read once per transaction and shared by every pick, key walk and the
     /// rewrite. An `Arc` so a read-only transaction keeps the same buffer as the cache instead of
@@ -1487,6 +1542,11 @@ struct StagedTxn<'a> {
     /// The top-level byte ranges of the document, built on first read and reused for the rest of
     /// the transaction.
     index: RefCell<Option<Arc<DocumentIndex>>>,
+    /// The index written beside the document, loaded on first use and only for a transaction that
+    /// reads records out of the document.
+    ///
+    /// `None` — not tried; `Some(None)` — the scope has no index this transaction can use.
+    persisted: RefCell<Option<Option<ScopeIndex>>>,
     staged: BTreeMap<String, Option<Value>>,
     scheduled: BTreeMap<String, Scheduled>,
     now: i64,
@@ -1501,31 +1561,10 @@ impl StagedTxn<'_> {
     /// builds; it is taken out before the commit serializes, so no two document-sized buffers
     /// overlap at the peak.
     fn ensure_bytes(&self) -> Result<()> {
-        if self.overlay.borrow().is_some() {
+        self.ensure_overlay()?;
+        if self.bytes.borrow().is_some() {
             return Ok(());
         }
-        // The tail is parsed first: it is what makes the document's answer current, and it is
-        // small — a few lines per commit — where folding it into the document would serialize
-        // the conversation again for every reader. It is kept until the log changes, because the
-        // same fold reads several times per tick against an unchanged tail.
-        let before = self.store.log_stamp(self.scope);
-        let overlay = match self.store.cached_overlay(self.scope, &before) {
-            Some(overlay) => overlay,
-            None => {
-                let overlay = match self.store.log_bytes(self.scope)? {
-                    Some(log) if !log.is_empty() => Arc::new(Overlay::from_log(&log)?),
-                    _ => Arc::new(Overlay::default()),
-                };
-                // A tail that grew while it was being read is left uncached: the next reader
-                // parses it again, which is what keeps a cached answer from hiding a commit.
-                if self.store.log_stamp(self.scope) == before {
-                    self.store
-                        .keep_overlay(self.scope, before, Arc::clone(&overlay));
-                }
-                overlay
-            }
-        };
-        *self.overlay.borrow_mut() = Some(overlay);
         if self.read_only {
             if let Some(bytes) = self.store.cached_document(self.scope) {
                 *self.bytes.borrow_mut() = Some(Some(bytes));
@@ -1566,6 +1605,39 @@ impl StagedTxn<'_> {
             }
         };
         *self.bytes.borrow_mut() = loaded;
+        Ok(())
+    }
+
+    /// The tail since the last fold, parsed once per transaction.
+    ///
+    /// Separate from [`StagedTxn::ensure_bytes`] because a read of one record needs the tail — it
+    /// is what makes the document current — but not the document.
+    fn ensure_overlay(&self) -> Result<()> {
+        if self.overlay.borrow().is_some() {
+            return Ok(());
+        }
+        // The tail is parsed first: it is what makes the document's answer current, and it is
+        // small — a few lines per commit — where folding it into the document would serialize
+        // the conversation again for every reader. It is kept until the log changes, because the
+        // same fold reads several times per tick against an unchanged tail.
+        let before = self.store.log_stamp(self.scope);
+        let overlay = match self.store.cached_overlay(self.scope, &before) {
+            Some(overlay) => overlay,
+            None => {
+                let overlay = match self.store.log_bytes(self.scope)? {
+                    Some(log) if !log.is_empty() => Arc::new(Overlay::from_log(&log)?),
+                    _ => Arc::new(Overlay::default()),
+                };
+                // A tail that grew while it was being read is left uncached: the next reader
+                // parses it again, which is what keeps a cached answer from hiding a commit.
+                if self.store.log_stamp(self.scope) == before {
+                    self.store
+                        .keep_overlay(self.scope, before, Arc::clone(&overlay));
+                }
+                overlay
+            }
+        };
+        *self.overlay.borrow_mut() = Some(overlay);
         Ok(())
     }
 
@@ -1615,7 +1687,13 @@ impl StagedTxn<'_> {
         })
     }
 
-    /// The stored value of `part`, picked out of the document without building the rest of it.
+    /// The stored value of `part`, without building the rest of the document.
+    ///
+    /// The tail is consulted first: a part a commit appended is answered without touching the
+    /// document at all. Then the index beside the document, when a write transaction has one: a
+    /// write reads the state, the thread and the turn and rewrites nothing but its own delta, so
+    /// reading the whole document for them is what a commit used to cost. The document itself is
+    /// read only when neither can answer.
     fn read(&self, part: &str) -> Result<Option<Value>> {
         if let Some(value) = self.staged.get(part) {
             return Ok(value.clone());
@@ -1623,22 +1701,72 @@ impl StagedTxn<'_> {
         if let Some(cached) = self.parts.borrow().get(part) {
             return Ok(cached.clone());
         }
-        self.ensure_bytes()?;
+        self.ensure_overlay()?;
         let value = {
             let overlay = self.overlay.borrow();
-            let overlay = overlay.as_ref().expect("ensure_bytes parses the tail");
+            let overlay = overlay.as_ref().expect("ensure_overlay parses the tail");
             if let Some(value) = overlay.puts.get(part) {
                 Some(value.clone())
             } else if overlay.removes.contains(part) {
                 None
             } else {
-                self.document_value(part)?
+                match self.indexed_value(part)? {
+                    Some(value) => value,
+                    None => {
+                        self.ensure_bytes()?;
+                        self.document_value(part)?
+                    }
+                }
             }
         };
         self.parts
             .borrow_mut()
             .insert(part.to_string(), value.clone());
         Ok(value)
+    }
+
+    /// The index beside the document, when this transaction can read records out of it.
+    ///
+    /// A read-only transaction does not: it serves the same document again from
+    /// [`FileStore::cached_document`] on the next tick, which a per-record range read would neither
+    /// replace nor fill, and the fold that follows it reads every record anyway.
+    fn persisted_index(&self) -> Option<ScopeIndex> {
+        if self.read_only || self.bytes.borrow().is_some() {
+            return None;
+        }
+        if let Some(entry) = self.persisted.borrow().as_ref() {
+            return entry.clone();
+        }
+        let loaded = self.store.load_scope_index(self.scope);
+        *self.persisted.borrow_mut() = Some(loaded.clone());
+        loaded
+    }
+
+    /// The value of `part` out of the document's own bytes, when the index describes the document
+    /// on disk.
+    ///
+    /// `None` means the index cannot answer — none, stale, a range that does not read — and the
+    /// caller reads the document instead; that is the behaviour of a scope the fold never touched.
+    /// `Some(None)` is the value of a part the document does not hold.
+    fn indexed_value(&self, part: &str) -> Result<Option<Option<Value>>> {
+        let Some(index) = self.persisted_index() else {
+            return Ok(None);
+        };
+        let Some((start, end)) = index.parts.get(part).copied() else {
+            return Ok(Some(None));
+        };
+        #[cfg(test)]
+        self.store.note_range_read();
+        let path = self.store.scope_path(self.scope);
+        let text = match read_document_range(&path, &index.stamp, start, end) {
+            Some(text) => text,
+            None => return Ok(None),
+        };
+        match serde_json::from_slice(&text) {
+            Ok(value) => Ok(Some(Some(value))),
+            // A range the index placed wrongly is a miss, not an error.
+            Err(_) => Ok(None),
+        }
     }
 
     /// The keys of the document, as `Null` values, for `merge_keys` to walk.
@@ -1953,6 +2081,78 @@ fn index_document(bytes: &[u8]) -> Result<DocumentIndex> {
         .values()
         .all(|(start, end)| start <= end && *end <= bytes.len());
     Ok(DocumentIndex { complete, slots })
+}
+
+/// The byte ranges of one scope document, kept beside it as `scopes/<digest>.idx`.
+///
+/// A transaction reads a handful of records — the state, the thread, the turn — and used to read
+/// the whole document to get them. The fold is the one place that already has the whole document
+/// in hand, so it writes down where each record lands and a later transaction reads only those
+/// bytes. It is derived data: `stamp` names the document it describes, and a missing, damaged or
+/// stale index only means the read falls back to the document.
+#[derive(Clone, Serialize, Deserialize)]
+struct ScopeIndex {
+    stamp: ScopeStamp,
+    parts: BTreeMap<String, (u64, u64)>,
+}
+
+/// [`crate::store::DocumentStamp`] in the form an index file carries.
+///
+/// A file time is written as nanoseconds since the epoch, which serde cannot derive for a
+/// `SystemTime`; a time the epoch cannot express leaves the index unwritten rather than compared
+/// against a rounded value.
+type ScopeStamp = (u64, Option<u128>, Option<u128>);
+
+/// A document stamp in the form [`ScopeIndex`] stores, or `None` when it cannot be expressed.
+fn scope_index_stamp(stamp: &crate::store::DocumentStamp) -> Option<ScopeStamp> {
+    fn nanos(time: Option<std::time::SystemTime>) -> Option<Option<u128>> {
+        match time {
+            Some(time) => Some(Some(
+                time.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos(),
+            )),
+            None => Some(None),
+        }
+    }
+    Some((stamp.0, nanos(stamp.1)?, nanos(stamp.2)?))
+}
+
+/// `part` → `(start, end)` of its value in the bytes [`write_json`] writes for `document`.
+///
+/// The same walk `serde_json` makes over a map — the entries in key order, `"key":value` joined
+/// by commas — counted instead of materialized, so indexing a fold costs one `String` per record
+/// and not a second copy of the document it just streamed to disk.
+fn document_slots(document: &RawDocument) -> Result<BTreeMap<String, (u64, u64)>> {
+    let mut slots = BTreeMap::new();
+    let mut position = 1u64; // the opening `{`
+    for (part, raw) in document {
+        if !slots.is_empty() {
+            position += 1; // the `,` between two entries
+        }
+        let key = serde_json::to_string(part)?;
+        position += key.len() as u64 + 1; // `"key":`
+        let start = position;
+        position += raw.get().len() as u64;
+        slots.insert(part.clone(), (start, position));
+    }
+    Ok(slots)
+}
+
+/// `[start, end)` of the document at `path`, provided the file is still the one `stamp` describes.
+///
+/// The stamp is taken from the open handle and not from the path, so the bytes come from the very
+/// file that was compared: a document replaced between the check and the read would otherwise
+/// answer with another document's bytes.
+fn read_document_range(path: &Path, stamp: &ScopeStamp, start: u64, end: u64) -> Option<Vec<u8>> {
+    let mut file = retry_while_held(|| File::open(path)).ok()?;
+    let meta = file.metadata().ok()?;
+    let current = scope_index_stamp(&(meta.len(), meta.modified().ok(), meta.created().ok()))?;
+    if current != *stamp || end < start || end > meta.len() {
+        return None;
+    }
+    let mut bytes = vec![0u8; (end - start) as usize];
+    file.seek(SeekFrom::Start(start)).ok()?;
+    file.read_exact(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 /// The values of `wanted` in one serialized scope document, skipping everything else.
@@ -3147,8 +3347,8 @@ mod tests {
         assert!(store.ready("queue", i64::MAX, 10)?.is_empty());
         assert_eq!(
             file_count(&root.path().join("scopes")),
-            2,
-            "one document and one tail, no temporary file"
+            3,
+            "one document, its index and one tail, no temporary file"
         );
         assert_eq!(file_count(&root.path().join("work")), 0);
         // The OS mode leaves its lock file behind by design: it is the *name* of the lock, and
@@ -3404,6 +3604,105 @@ mod tests {
         assert_eq!(values[1], Some(json!([1, 2, 3])));
         assert_eq!(values[2], Some(json!({"nested": {"deep": [{"x": "}"}]}})));
         assert_eq!(values[3], None);
+        Ok(())
+    }
+
+    #[test]
+    fn an_indexed_get_reads_only_the_part() -> Result<()> {
+        let root = TempRoot::new("indexed-get");
+        let store = FileStore::open(root.path())?;
+        // Below the blob threshold, so the document really carries them.
+        let big = "x".repeat(8 * 1024);
+        // One part whose name holds a control character, which the document escapes: the index
+        // counts the key's own bytes and must count the escaped ones.
+        let odd = "k\u{1}odd";
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!({"text": big.clone()})))?;
+            txn.put("b", Some(json!({"text": big.clone()})))?;
+            txn.put(odd, Some(json!(3)))
+        })?;
+        store.compact_scope("session")?;
+
+        // The index has to place the records exactly where the document bytes do: a range off by
+        // one byte parses as something else, or not at all.
+        let document = fs::read(store.scope_path("session"))?;
+        let placed = index_document(&document)?;
+        assert!(placed.complete, "every range lands inside the document");
+        let expected: BTreeMap<String, (u64, u64)> = placed
+            .slots
+            .iter()
+            .map(|(part, (start, end))| (part.clone(), (*start as u64, *end as u64)))
+            .collect();
+        let written = fs::read(store.index_path("session"))?;
+        let index: ScopeIndex = serde_json::from_slice(&written)?;
+        assert_eq!(index.parts, expected, "the index places what a scan reads");
+        let stamp = store
+            .scope_stamp("session")
+            .expect("the fold writes a document");
+        assert_eq!(
+            scope_index_stamp(&stamp),
+            Some(index.stamp),
+            "the index describes the document that landed"
+        );
+
+        // A write transaction is what reads records without rewriting the document.
+        let documents = store.document_reads();
+        let ranges = store.range_reads();
+        let value = crate::store::txn(&store, "session", |txn: &mut dyn Txn| txn.get("a"))?;
+        assert_eq!(value, Some(json!({"text": big})));
+        assert_eq!(
+            store.document_reads(),
+            documents,
+            "the document is not read"
+        );
+        assert_eq!(store.range_reads(), ranges + 1, "its record is");
+
+        // A part the document does not hold is a miss the index answers too.
+        let asked = crate::store::txn(&store, "session", |txn: &mut dyn Txn| {
+            Ok((txn.get(odd)?, txn.get("c")?))
+        })?;
+        assert_eq!(asked, (Some(json!(3)), None));
+        assert_eq!(store.document_reads(), documents, "still no document read");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_index_falls_back_to_the_document() -> Result<()> {
+        let root = TempRoot::new("stale-index");
+        let store = FileStore::open(root.path())?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!(1)))
+        })?;
+        store.compact_scope("session")?;
+
+        // A document replaced without its index — by another host, or by a build that wrote none —
+        // leaves ranges describing bytes that are gone. The new value has the length of the old
+        // one, so only the file's identity can tell the two documents apart.
+        let mut document: RawDocument =
+            serde_json::from_slice(&fs::read(store.scope_path("session"))?)?;
+        document.insert("a".to_string(), raw_of(&json!(7))?);
+        write_json(&store.scope_path("session"), &document)?;
+        let written = fs::read(store.index_path("session"))?;
+        let index: ScopeIndex = serde_json::from_slice(&written)?;
+        let stamp = store.scope_stamp("session").expect("the document exists");
+        assert_ne!(
+            scope_index_stamp(&stamp),
+            Some(index.stamp),
+            "the rewrite leaves the index describing bytes that are gone"
+        );
+
+        let documents = store.document_reads();
+        let value = crate::store::txn(&store, "session", |txn: &mut dyn Txn| txn.get("a"))?;
+        assert_eq!(
+            value,
+            Some(json!(7)),
+            "a stale index must not answer with another document's bytes"
+        );
+        assert_eq!(
+            store.document_reads(),
+            documents + 1,
+            "the read falls back to the document"
+        );
         Ok(())
     }
 
