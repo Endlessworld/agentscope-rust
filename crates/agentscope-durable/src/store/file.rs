@@ -3271,6 +3271,32 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_line_fails_the_read_instead_of_hiding_a_commit() -> Result<()> {
+        let root = TempRoot::new("damaged-line");
+        let store = FileStore::open(root.path())?;
+        store.transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+            txn.put("a", Some(json!(1)))
+        })?;
+        // A complete line that is not a delta is damage, not a commit in progress: skipping it
+        // would answer with a state that never existed.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(store.log_path("session"))?;
+        std::io::Write::write_all(&mut file, b"not a delta\n")?;
+        let error = store
+            .read_transaction("session", &mut |txn: &mut dyn Txn| -> Result<()> {
+                txn.get("a")?;
+                Ok(())
+            })
+            .expect_err("a damaged tail must not read as a shorter history");
+        assert!(
+            error.to_string().contains("damaged"),
+            "the error names the damage: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn folding_the_tail_changes_nothing_a_reader_sees() -> Result<()> {
         let root = TempRoot::new("log-fold");
         let store = FileStore::open(root.path())?;

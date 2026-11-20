@@ -231,6 +231,7 @@ session/
 - **L35**：SQLite 新库 `auto_vacuum=INCREMENTAL`（pragma 必须早于 WAL header，且值不能绑定参数 → 只能 `execute_batch` 字面量）、trim 后 `VACUUM`（`incremental_vacuum` 在 WAL 下实测一页不回收）；DB 4.12 → **2.52MB**（−39%），机制单测 `reclaim_space_frees_the_pages_a_trim_released` 覆盖（`22c12e5`）。
 - **P 帧（前缀 checkpoint）**：写入端（`contextFromEvents` + `stateDigest`）与折叠端就绪，默认关闭；阻塞点见 P2。
 - **第 1 项归因（`7be409e`）**：15 次写事务 = 11 次 recorder 提交 + 4 个站点（`turn.rs:42` admit、`turn.rs:402`/`499`、`tools.rs:13`；首轮另有 `identity.rs:12`）。11 次提交的 shape（每轮）：`model/chunk`×2、`model/end`×2、`request/prepared+model/dispatch`×2、`state/checkpoint+turn/output+step/end+turn/completed+run/end`×1、`message/user+state/checkpoint`×1、`step/start`×1、`durable/finalization_started+message/assistant`×1、`durable/finalization_completed`×1。结论：这些是恢复语义边界，**不可合并**；成本在单次事务（≈0.66MB/事务）。
+- **L36（B3-phase2 第 1 步，`3928e12`）**：`FileStore` 持久化键索引——`compact_scope` 把每条记录的字节偏移写成 `scopes/<digest>.idx`（`ScopeIndex { stamp, parts }`），写事务 `get` 只 range-read 该记录；索引带文档 stamp，`read_document_range` 打开文件后**再次校验** stamp 与边界，缺失/过期/越界/解析失败一律回退整份文档（不引入新失败模式）；只读事务仍走文档缓存（X16 结论）。20 轮 FileStore：`djournal:facts` 408.0 → **300.9MB（−26.2%）**、`flush:done` −21.4MB、`peak_live` 9.47 → **8.22MB**；`djournal:read` 与 `sbytes` 不变。
 - SQLite `RecordStore` + ACP `durable-sqlite`（`durable.db`，单机预览）。
 
 ### 已否定 / 中性（不要再直接做）
@@ -246,6 +247,7 @@ session/
 - 完全禁用压实：磁盘膨胀。
 - **`scope_parts` 接只读文档缓存**：`djournal:read` 96,252.1KB **逐位不变**——`pick_from_cache`（按 part 集合的答案缓存）已覆盖全部重复读，`fs::read` 未被触达；回退。
 - **第 2 项（frame 单事务）**：无净收益，回退（见 §4.2）。
+- **X21（B3-phase2 第 2 步）**：增量 tail 解析（`CachedOverlay.parsed_len` + 前缀哈希，只解析新增行）。单测全绿，但 20 轮 FileStore 净变差：`djournal:facts` 300.9 → **330.6MB（+9.9%）**、`acp:settle` 36.3 → **44.6**、`djournal:read` 214.3 → 219.1。原因：tail 本身只有几 KB，全量解析本来就便宜，增量多付「读整份 log + 哈希 + clone 整个 Overlay」；完全回退。
 
 ## 6. 路线图与验收
 
@@ -307,3 +309,4 @@ cargo fmt --all -- --check
 | 2026-11-20 | **`scope_parts` 文档缓存实测零收益，回退**（`djournal:read` 逐位不变）。 |
 | 2026-11-20 | **第 1 项归因**：15 次写事务 = 11 次 recorder 提交 + 4 个站点；X20（`model/chunk` 合并实验）被 `a_stalled_stream_is_journaled_within_the_flush_window` 否决并回退；结论：合并空间受恢复语义限制，成本在单次事务（`7be409e`）。 |
 | 2026-11-20 | **文档重构**：合并重复的「五项原则」「四项指标」两套章节为一套（删除概述副本），纳入 L34/L35、X20、`scope_parts` 零收益、第 1/2 项结论与当前 20 轮基线；`store_model_min_probe.rs` 转正为 `store_model_min_test.rs`（断言 DB/unique 与 legacy/new，作为 B3-phase2 的设计依据）；B3-phase2 已获批准。 |
+| 2026-11-20 | **B3-phase2 第 1 步（L36，`3928e12`）**：`FileStore` 持久化键索引 + range read，20 轮 FileStore `djournal:facts` 408.0 → 300.9MB（−26.2%）、`peak_live` 9.47 → 8.22MB。第 2 步增量 tail 解析净变差（`facts` 330.6）已完全回退（X21）；`formatVersion` root 头（`d608f22`）与损坏行恢复测试补齐；收尾 20 轮与第 1 步基线一致（301.0MB、`sbytes` 逐字节相同）。 |
