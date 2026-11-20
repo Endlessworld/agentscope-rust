@@ -940,6 +940,70 @@ impl JournalProjection {
     }
 }
 
+/// Tracks only which tool calls a journal prefix left unanswered.
+///
+/// `settle` asks the journal one question — is any dispatched call still unanswered? — and a full
+/// [`JournalProjection`] answers it by also decoding every checkpoint payload and rebuilding the
+/// transcript, which is several megabytes per prompt. This type folds the same events but keeps
+/// only the uncertainty set, so catching up costs the delta and nothing else.
+#[derive(Debug, Default, Clone)]
+pub struct UncertaintyTracker {
+    /// Sequence the set describes.
+    pub as_of_seq: u64,
+    /// Calls with a dispatch (or start) and no terminal answer.
+    pub uncertain_tool_calls: BTreeSet<String>,
+}
+
+impl UncertaintyTracker {
+    /// Reads the uncertainty of a whole journal.
+    pub async fn read(log: &dyn ThreadJournal) -> crate::error::Result<Self> {
+        let head = log.head().await?;
+        let mut tracker = Self::default();
+        if head.seq > 0 {
+            log.visit(0, head.seq, &mut |event| {
+                apply_uncertain_tool_event(
+                    &mut tracker.uncertain_tool_calls,
+                    event.event_type.as_str(),
+                    &event.data()?,
+                );
+                Ok(())
+            })
+            .await?;
+        }
+        tracker.as_of_seq = head.seq;
+        Ok(tracker)
+    }
+
+    /// Folds the events committed since [`Self::as_of_seq`].
+    pub async fn catch_up(&mut self, log: &dyn ThreadJournal) -> crate::error::Result<()> {
+        let head = log.head().await?;
+        let from = self.as_of_seq;
+        if head.seq < from {
+            // The journal was replaced or truncated underneath the tracker.
+            *self = Self::read(log).await?;
+            return Ok(());
+        }
+        if head.seq == from {
+            return Ok(());
+        }
+        let mut uncertain = std::mem::take(&mut self.uncertain_tool_calls);
+        let outcome = log
+            .visit(from, head.seq, &mut |event| {
+                apply_uncertain_tool_event(
+                    &mut uncertain,
+                    event.event_type.as_str(),
+                    &event.data()?,
+                );
+                Ok(())
+            })
+            .await;
+        self.uncertain_tool_calls = uncertain;
+        outcome?;
+        self.as_of_seq = head.seq;
+        Ok(())
+    }
+}
+
 /// Outstanding typed requests at a committed prefix; callers cannot invent tool outcomes.
 ///
 /// Resolves a tool continuation against committed pending requests.

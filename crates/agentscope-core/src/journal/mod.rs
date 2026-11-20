@@ -53,7 +53,7 @@ pub use storage::{AtomicJournalStorage, StorageValue};
 pub use views::{
     admission_views, apply_pending_event, committed_tool_results, pending_interactions,
     realign_tool_results, recovery_views, transcript, transcript_entries, transcript_jsonl,
-    JournalProjection, Transcript, TranscriptEntry, Turn, TurnViews,
+    JournalProjection, Transcript, TranscriptEntry, Turn, TurnViews, UncertaintyTracker,
 };
 
 /// Error message prefix used by session persistence failures.

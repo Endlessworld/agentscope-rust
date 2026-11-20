@@ -17,7 +17,7 @@ use agent_client_protocol::v1::schema::{
 use agent_client_protocol::{v1::ConnectionTo, Client};
 use agentscope_core::agent::CallableAgent;
 use agentscope_core::event::{AgentEvent, ConfirmResult};
-use agentscope_core::journal::{JournalProjection, ThreadJournal};
+use agentscope_core::journal::{ThreadJournal, UncertaintyTracker};
 use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
 use agentscope_core::model::catalog::ModelDescriptor;
 use agentscope_core::model::{GenerateOptions, DEFAULT_CONTEXT_WINDOW};
@@ -658,7 +658,7 @@ struct SessionRuntime {
     /// 以前每轮都 `JournalProjection::read` 全量折叠 journal（≈1.4MB scope + 全部事件，
     /// 实测 25MB/轮分配）。缓存后正常轮只读自上次检查以来新增的几十条事件；
     /// `reconcile_abandoned_tool_calls` 写入新事实后缓存失效（置 None）。
-    projection: tokio::sync::Mutex<Option<JournalProjection>>,
+    projection: tokio::sync::Mutex<Option<UncertaintyTracker>>,
 }
 
 /// Settles the tool calls a dead run left uncertain, so the session can be opened again.
@@ -742,7 +742,7 @@ async fn settle_finished_turn_uncertainties_cached(runtime: &SessionRuntime) {
 /// because reconciliation turns every uncertain dispatch into an `interrupted` result.
 async fn settle_uncertain_with_cache(
     journal: &Arc<dyn ThreadJournal>,
-    cache: &tokio::sync::Mutex<Option<JournalProjection>>,
+    cache: &tokio::sync::Mutex<Option<UncertaintyTracker>>,
 ) {
     let mut guard = cache.lock().await;
     let mut fresh = false;
@@ -753,7 +753,7 @@ async fn settle_uncertain_with_cache(
         }
     }
     if !fresh {
-        match JournalProjection::read(&**journal).await {
+        match UncertaintyTracker::read(&**journal).await {
             Ok(view) => *guard = Some(view),
             Err(error) => {
                 tracing::debug!(%error, "could not read the journal projection");
@@ -4205,8 +4205,8 @@ mod tests {
     #[tokio::test]
     async fn an_uncertain_tool_call_is_settled_before_the_session_opens() {
         use agentscope_core::journal::{
-            AtomicThreadJournal, InvocationRecorder, JournalEvent, JournalProjection,
-            MemoryJournalStorage, ThreadJournal,
+            AtomicThreadJournal, InvocationRecorder, JournalEvent, MemoryJournalStorage,
+            ThreadJournal, UncertaintyTracker,
         };
         use std::sync::Arc;
         use std::time::Duration;
@@ -4269,7 +4269,7 @@ mod tests {
 
         super::reconcile_abandoned_tool_calls(&log).await;
 
-        let projection = JournalProjection::read(&*log).await.unwrap();
+        let projection = UncertaintyTracker::read(&*log).await.unwrap();
         assert!(
             projection.uncertain_tool_calls.is_empty(),
             "the abandoned call is settled: {:?}",
@@ -4294,8 +4294,8 @@ mod tests {
     #[tokio::test]
     async fn a_finished_turns_stranded_dispatch_is_settled_before_the_next_prompt() {
         use agentscope_core::journal::{
-            AtomicThreadJournal, JournalEvent, JournalProjection, MemoryJournalStorage,
-            ThreadJournal,
+            AtomicThreadJournal, JournalEvent, MemoryJournalStorage, ThreadJournal,
+            UncertaintyTracker,
         };
         use std::sync::Arc;
         use std::time::Duration;
@@ -4356,7 +4356,7 @@ mod tests {
         let finished = seed(true).await;
         super::settle_finished_turn_uncertainties(&finished).await;
         assert!(
-            JournalProjection::read(&*finished)
+            UncertaintyTracker::read(&*finished)
                 .await
                 .unwrap()
                 .uncertain_tool_calls
@@ -4369,7 +4369,7 @@ mod tests {
         let open = seed(false).await;
         super::settle_finished_turn_uncertainties(&open).await;
         assert_eq!(
-            JournalProjection::read(&*open)
+            UncertaintyTracker::read(&*open)
                 .await
                 .unwrap()
                 .uncertain_tool_calls,
@@ -4446,7 +4446,7 @@ mod tests {
 
         super::settle_uncertain_with_cache(&growing, &cache).await;
         assert!(
-            JournalProjection::read(&*growing)
+            UncertaintyTracker::read(&*growing)
                 .await
                 .unwrap()
                 .uncertain_tool_calls
