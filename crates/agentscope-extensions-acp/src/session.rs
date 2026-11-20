@@ -1094,6 +1094,7 @@ struct DrivePlan {
     cancellation: Option<agent_client_protocol::RequestCancellation>,
     wakeup: bool,
     caps: PromptCaps,
+    pause_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(feature = "durable")]
@@ -1212,6 +1213,7 @@ impl DurableDriver {
         let closed = Arc::clone(&input.closed);
         let cancellation = input.cancellation;
         let caps = input.caps;
+        let pause_requested = Arc::clone(&input.pause_requested);
         // Only the pre-admission failures below report it: a turn that reaches `drive_turn`
         // accumulates its own usage there.
         let turn_usage = ChatUsage::default();
@@ -1334,6 +1336,7 @@ impl DurableDriver {
             cancellation,
             wakeup: wakeup_turn,
             caps,
+            pause_requested,
         };
         self.drive_turn(runtime, turn_id, plan, sink).await
     }
@@ -1356,6 +1359,7 @@ impl DurableDriver {
             cancellation,
             wakeup: wakeup_turn,
             caps,
+            pause_requested,
         } = plan;
         // Every update this turn publishes is tagged with the turn it belongs to. A client
         // renders a prompt and the turns queued behind it as one stream, so an update without
@@ -1520,6 +1524,12 @@ impl DurableDriver {
                                     }
                                     if current.status.terminal() {
                                         settled_task = Some(current);
+                                    } else if current.status == TurnStatus::Paused {
+                                        // Nothing advances a paused turn by itself: waiting
+                                        // here would hold the prompt open forever. Report it,
+                                        // and let the caller decide — continue it, or answer a
+                                        // pause the client asked for.
+                                        settled_task = Some(current);
                                     } else if current.status == TurnStatus::Queued
                                         && std::time::Instant::now() >= admission_deadline
                                     {
@@ -1574,9 +1584,15 @@ impl DurableDriver {
                                                 .unwrap_or_else(|| "no reason recorded".to_string())
                                         ));
                                         break;
-                                    } else if current.status == TurnStatus::Running {
+                                    } else if matches!(
+                                        current.status,
+                                        TurnStatus::Running | TurnStatus::Pausing
+                                    ) {
                                         // A tick in flight holds the turn; no status change will
-                                        // be observed until it returns. Tell the client after a
+                                        // be observed until it returns. A pausing turn is still
+                                        // held by its running invocation, so the same silence
+                                        // watchdog applies: a hung provider must not make the
+                                        // pause unobservable forever. Tell the client after a
                                         // long silence, and apply the (configurable) hard cap so a
                                         // genuinely wedged run cannot hold the prompt forever.
                                         let quiet = quiet_since.elapsed();
@@ -1816,6 +1832,20 @@ impl DurableDriver {
                 // instead of throwing the user's prompt away. Hosts interrupt runs for
                 // transient reasons (shutdown sweeps, a raced cancel, a recovered process) and
                 // none of those are the user's problem.
+                // The client asked to pause: its suspend is landing (or has landed), so
+                // continuing here would undo it. Answer the prompt; the turn stays resumable
+                // until the client asks for it.
+                "interrupted" if pause_requested.load(Ordering::SeqCst) => {
+                    driver.finish().await;
+                    sink(self.advisory_notification(
+                        caps.supports_notices,
+                        "The task is paused. Resume it to continue.",
+                    ));
+                    return Ok(TurnOutcome {
+                        stop_reason: StopReason::Cancelled,
+                        usage: Some(turn_usage),
+                    });
+                }
                 "interrupted" if resumes < MAX_INTERRUPTED_RESUMES => {
                     resumes += 1;
                     sink(super::event::message_chunk(
@@ -2243,6 +2273,9 @@ pub(crate) struct TurnState {
     closed: Arc<AtomicBool>,
     /// Whether a prompt is currently being executed (guards LRU eviction).
     running: Arc<AtomicBool>,
+    /// Whether the client asked the running turn to pause. A paused turn is left paused instead
+    /// of being continued by the interrupted-run resume: the user's stop outranks it.
+    pause_requested: Arc<AtomicBool>,
     /// Token usage accumulated during the turn that is running (reset per turn),
     /// reported back as `PromptResponse.usage`.
     usage: ChatUsage,
@@ -2255,6 +2288,7 @@ impl Default for TurnState {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             closed: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
+            pause_requested: Arc::new(AtomicBool::new(false)),
             usage: ChatUsage::default(),
         }
     }
@@ -3239,6 +3273,81 @@ impl AcpAgentSession {
         Ok(true)
     }
 
+    /// Pauses the running turn where it is; the turn stays resumable.
+    ///
+    /// The flag is raised *before* the suspend lands: the drive loop checks it the moment the
+    /// turn reports `interrupted`, and a flag raised afterwards would let it continue first.
+    #[cfg(feature = "durable")]
+    pub async fn pause(&self, request_id: &str) -> std::result::Result<(String, String), String> {
+        let runtime = self.durable_store()?.open_runtime().await?;
+        let turn = runtime
+            .session
+            .active()
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| crate::ext::NO_ACTIVE_TURN.to_string())?;
+        if turn.status.terminal() {
+            return Err(crate::ext::NO_ACTIVE_TURN.to_string());
+        }
+        self.turn
+            .pause_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let view = runtime
+            .session
+            .suspend(&turn.turn_id, request_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((turn.turn_id, queued_status_name(view.status).to_string()))
+    }
+
+    /// Continues a paused turn, streaming its updates through `emit`.
+    ///
+    /// This runs a turn, so it takes the same lock a prompt does: the thread has one writer, and
+    /// two drivers would race for the lease. The request stays open until the turn settles, which
+    /// is what lets the client see the rest of the answer instead of a fire-and-forget resume.
+    #[cfg(feature = "durable")]
+    pub async fn resume_turn<F>(
+        &self,
+        turn_id: &str,
+        request_id: &str,
+        emit: F,
+    ) -> std::result::Result<StopReason, String>
+    where
+        F: Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync + 'static,
+    {
+        let _guard = Arc::clone(&self.turn.prompt_lock).lock_owned().await;
+        let durable = self.durable_store()?.clone();
+        let runtime = durable.open_runtime().await?;
+        runtime
+            .session
+            .resume(turn_id, request_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.turn
+            .pause_requested
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let plan = DrivePlan {
+            cancel_epoch: Arc::clone(&self.turn.cancel_epoch),
+            admitted_epoch: self.turn.cancel_epoch.load(Ordering::SeqCst),
+            closed: Arc::clone(&self.turn.closed),
+            cancellation: None,
+            wakeup: false,
+            caps: PromptCaps {
+                supports_notices: self.support.supports_notices(),
+                supports_plan_operations: self.support.supports_plan_operations(),
+                supports_compaction: self.support.supports_compaction(),
+                last_input_tokens: Arc::clone(&self.last_input_tokens),
+            },
+            pause_requested: Arc::clone(&self.turn.pause_requested),
+        };
+        let sink: EventSink = Arc::new(move |notification| emit(notification));
+        durable
+            .drive_turn(runtime, turn_id.to_string(), plan, sink)
+            .await
+            .map(|outcome| outcome.stop_reason)
+            .map_err(|error| error.to_string())
+    }
+
     /// Answers an outstanding interaction and continues the turn without a new user prompt.
     ///
     /// A build without the durable driver can never have a suspended turn: the native driver
@@ -3291,6 +3400,26 @@ impl AcpAgentSession {
         _request_id: &str,
     ) -> std::result::Result<bool, String> {
         Err("this build has no durable driver, so nothing is queued".to_string())
+    }
+
+    /// Pauses the running turn; a native turn runs to its end inside this process.
+    #[cfg(not(feature = "durable"))]
+    pub async fn pause(&self, _request_id: &str) -> std::result::Result<(String, String), String> {
+        Err("this build has no durable driver, so there is no turn to pause".to_string())
+    }
+
+    /// Continues a paused turn.
+    #[cfg(not(feature = "durable"))]
+    pub async fn resume_turn<F>(
+        &self,
+        _turn_id: &str,
+        _request_id: &str,
+        _emit: F,
+    ) -> std::result::Result<StopReason, String>
+    where
+        F: Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync + 'static,
+    {
+        Err("this build has no durable driver, so there is no paused turn to resume".to_string())
     }
 
     /// Current thought level.
@@ -4690,6 +4819,12 @@ impl AcpAgentSession {
         // Turn-level usage: reset at the start of each prompt turn, accumulate
         // from every model call, and report back as `PromptResponse.usage`.
         self.turn.usage = ChatUsage::default();
+        // A pause belongs to the turn that was running when the client asked for it. The next
+        // prompt is a new turn and must not inherit the flag: it would refuse to continue an
+        // unrelated interruption.
+        self.turn
+            .pause_requested
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         // A wakeup exists only to deliver background results; it must never monopolize the
         // session while a real user prompt waits behind it.
         let wakeup_turn = matches!(&input, TurnInput::Wakeup);
@@ -4760,6 +4895,7 @@ impl AcpAgentSession {
             cancellation: None,
             wakeup: false,
             caps: caps.clone(),
+            pause_requested: Arc::clone(&self.turn.pause_requested),
         };
         #[cfg(feature = "durable")]
         if let Some(durable) = &self.durable {
@@ -4778,6 +4914,7 @@ impl AcpAgentSession {
                     closed,
                     cancellation,
                     caps,
+                    pause_requested: Arc::clone(&self.turn.pause_requested),
                 },
                 Arc::clone(&sink),
             )

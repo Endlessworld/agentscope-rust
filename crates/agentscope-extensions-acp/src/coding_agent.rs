@@ -1141,6 +1141,8 @@ impl AcpCodingAgent {
         let a_queue = agent.clone();
         let a_queue_list = agent.clone();
         let a_queue_remove = agent.clone();
+        let a_pause = agent.clone();
+        let a_resume_turn = agent.clone();
         let a_providers = agent.clone();
         let a_providers_set = agent.clone();
         let a_providers_disable = agent.clone();
@@ -1416,6 +1418,18 @@ impl AcpCodingAgent {
             .on_receive_request(
                 async move |req: crate::ext::ExtQueueRemoveRequest, responder, _cx| {
                     handle_ext_queue_remove(a_queue_remove.clone(), req, responder).await
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: crate::ext::ExtPauseRequest, responder, _cx| {
+                    handle_ext_pause(a_pause.clone(), req, responder).await
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: crate::ext::ExtResumeRequest, responder, cx| {
+                    handle_ext_resume(a_resume_turn.clone(), req, responder, cx).await
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -2106,6 +2120,76 @@ async fn handle_ext_queue_remove(
             responder.respond_with_error(agent_client_protocol::Error::internal_error().data(error))
         }
     }
+}
+
+/// Handles `_acp_extends/session/pause`: suspends the running turn where it is.
+async fn handle_ext_pause(
+    agent: Arc<AcpCodingAgent>,
+    req: crate::ext::ExtPauseRequest,
+    responder: agent_client_protocol::v1::Responder<crate::ext::ExtPauseResult>,
+) -> Result<(), agent_client_protocol::Error> {
+    let params = req.params;
+    let session_id = SessionId::new(params.session_id.clone());
+    let session = match agent.get_session(&session_id) {
+        Some(session) => session,
+        None => {
+            return responder.respond_with_error(
+                agent_client_protocol::v1::schema::Error::session_not_found(session_id).into(),
+            );
+        }
+    };
+    match session.pause(&params.client_request_id).await {
+        Ok((turn_id, status)) => responder.respond(crate::ext::ExtPauseResult { turn_id, status }),
+        Err(error) => {
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(error))
+        }
+    }
+}
+
+/// Handles `_acp_extends/session/resume`: continues a paused turn and streams it to the client.
+///
+/// Runs on a spawned task like a prompt: a long-running handler would block the dispatch loop, so
+/// a `session/cancel` (or another request) could never be read while the turn runs.
+async fn handle_ext_resume(
+    agent: Arc<AcpCodingAgent>,
+    req: crate::ext::ExtResumeRequest,
+    responder: agent_client_protocol::v1::Responder<crate::ext::ExtResumeResult>,
+    cx: agent_client_protocol::v1::ConnectionTo<agent_client_protocol::Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let params = req.params;
+    let session_id = SessionId::new(params.session_id.clone());
+    let session = match agent.get_session(&session_id) {
+        Some(session) => session,
+        None => {
+            return responder.respond_with_error(
+                agent_client_protocol::v1::schema::Error::session_not_found(session_id).into(),
+            );
+        }
+    };
+    let emit_cx = cx.clone();
+    cx.spawn(async move {
+        let turn_id = params.turn_id.clone();
+        let outcome = session
+            .resume_turn(&turn_id, &params.client_request_id, move |notification| {
+                let _ = emit_cx.send_notification(notification);
+            })
+            .await;
+        match outcome {
+            Ok(stop) => {
+                let stop_reason = serde_json::to_value(&stop)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                responder.respond(crate::ext::ExtResumeResult {
+                    turn_id,
+                    stop_reason,
+                })
+            }
+            Err(error) => responder
+                .respond_with_error(agent_client_protocol::Error::internal_error().data(error)),
+        }
+    })?;
+    Ok(())
 }
 
 /// Whether `session_id` names a subagent's session (`sub-<uuid>`, as minted by `agent_spawn`)

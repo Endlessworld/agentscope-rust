@@ -455,6 +455,90 @@ impl_ext_request!(
 
 wire_response!(ExtQueueResult, ExtQueueListResult, ExtQueueRemoveResult);
 
+/// Pauses the running turn where it is.
+///
+/// Params: `{ "sessionId": "...", "clientRequestId": "..." }`. The answer names the turn and its
+/// status (`pausing` until the run reaches a boundary, then `paused`). A paused turn keeps its
+/// position and its tool results; it is continued by [`RESUME_METHOD`], never automatically.
+pub const PAUSE_METHOD: &str = "_acp_extends/session/pause";
+
+/// Continues a paused turn.
+///
+/// Params: `{ "sessionId": "...", "turnId": "...", "clientRequestId": "..." }`. The request stays
+/// open until the turn settles, streaming its updates like a prompt, and answers with the stop
+/// reason — a fire-and-forget resume would leave the client unable to tell "still running" from
+/// "already over".
+pub const RESUME_METHOD: &str = "_acp_extends/session/resume";
+
+/// Parameters of [`PAUSE_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtPauseParams {
+    /// Session whose running turn is paused.
+    pub session_id: String,
+    /// Idempotency key for the suspend command.
+    pub client_request_id: String,
+}
+
+/// Response of [`PAUSE_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtPauseResult {
+    pub turn_id: String,
+    /// `pausing` while the run winds down, `paused` once it stopped.
+    pub status: String,
+}
+
+/// An incoming `_acp_extends/session/pause` request.
+#[derive(Debug, Clone)]
+pub struct ExtPauseRequest {
+    method: Arc<str>,
+    pub params: ExtPauseParams,
+}
+
+/// Parameters of [`RESUME_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtResumeParams {
+    /// Session the paused turn belongs to.
+    pub session_id: String,
+    /// The turn to continue.
+    pub turn_id: String,
+    /// Idempotency key for the resume command.
+    pub client_request_id: String,
+}
+
+/// Response of [`RESUME_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtResumeResult {
+    pub turn_id: String,
+    /// The ACP stop reason of the turn, once it settled.
+    pub stop_reason: String,
+}
+
+/// An incoming `_acp_extends/session/resume` request.
+#[derive(Debug, Clone)]
+pub struct ExtResumeRequest {
+    method: Arc<str>,
+    pub params: ExtResumeParams,
+}
+
+impl_ext_request!(
+    ExtPauseRequest,
+    ExtPauseParams,
+    PAUSE_METHOD,
+    ExtPauseResult
+);
+impl_ext_request!(
+    ExtResumeRequest,
+    ExtResumeParams,
+    RESUME_METHOD,
+    ExtResumeResult
+);
+
+wire_response!(ExtPauseResult, ExtResumeResult);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,6 +710,50 @@ mod tests {
         assert_eq!(
             value,
             json!({ "items": [{ "turnId": "turn_1", "position": 1, "status": "queued" }] })
+        );
+    }
+
+    #[test]
+    fn the_pause_and_resume_methods_use_our_namespace() {
+        assert!(PAUSE_METHOD.starts_with("_acp_extends/"));
+        assert!(RESUME_METHOD.starts_with("_acp_extends/"));
+        assert!(ExtPauseRequest::matches_method(PAUSE_METHOD));
+        assert!(ExtResumeRequest::matches_method(RESUME_METHOD));
+        assert!(!ExtResumeRequest::matches_method("session/resume"));
+    }
+
+    #[test]
+    fn pause_and_resume_round_trip_through_the_wire_format() {
+        let pause = ExtPauseRequest::parse_message(
+            PAUSE_METHOD,
+            &json!({ "sessionId": "session-1", "clientRequestId": "pause-1" }),
+        )
+        .unwrap();
+        assert_eq!(pause.params.session_id, "session-1");
+
+        let resume = ExtResumeRequest::parse_message(
+            RESUME_METHOD,
+            &json!({
+                "sessionId": "session-1",
+                "turnId": "turn_1",
+                "clientRequestId": "resume-1"
+            }),
+        )
+        .unwrap();
+        assert_eq!(resume.params.turn_id, "turn_1");
+    }
+
+    #[test]
+    fn a_resume_answer_reports_the_stop_reason() {
+        let value = ExtResumeResult {
+            turn_id: "turn_1".into(),
+            stop_reason: "end_turn".into(),
+        }
+        .into_json(RESUME_METHOD)
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({ "turnId": "turn_1", "stopReason": "end_turn" })
         );
     }
 

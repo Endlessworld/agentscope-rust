@@ -478,6 +478,7 @@ mod tests {
                     admitted_epoch: 0,
                     closed: Arc::new(AtomicBool::new(false)),
                     cancellation: None,
+                    pause_requested: Arc::new(AtomicBool::new(false)),
                     caps: crate::turn_driver::PromptCaps {
                         supports_notices: false,
                         supports_plan_operations: false,
@@ -507,6 +508,7 @@ mod tests {
                     admitted_epoch: 0,
                     closed: Arc::new(AtomicBool::new(false)),
                     cancellation: None,
+                    pause_requested: Arc::new(AtomicBool::new(false)),
                     caps: crate::turn_driver::PromptCaps {
                         supports_notices: false,
                         supports_plan_operations: false,

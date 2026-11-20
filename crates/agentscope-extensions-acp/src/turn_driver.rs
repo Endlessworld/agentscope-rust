@@ -59,6 +59,9 @@ pub struct DriverInput {
     pub closed: Arc<std::sync::atomic::AtomicBool>,
     pub cancellation: Option<agent_client_protocol::RequestCancellation>,
     pub caps: PromptCaps,
+    /// Whether the client asked to pause. A turn that reports `interrupted` while this is set is
+    /// left paused instead of being continued: the user's stop outranks the automatic resume.
+    pub pause_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What a finished turn reports back to the protocol layer.

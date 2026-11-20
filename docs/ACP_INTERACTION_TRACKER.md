@@ -30,8 +30,8 @@
 | `_acp_extends/session/queue` | `{sessionId, content, clientRequestId}` | `{turnId, position}` | 立即 durable 受理为排队 Turn；`content` 与 `session/prompt` 同形 |
 | `_acp_extends/session/queue/remove` | `{sessionId, turnId, clientRequestId}` | `{turnId, removed}` | 取消指定的排队 Turn（与 durable 同步）；已开始/已结束返回 `removed: false` |
 | `_acp_extends/session/queue/list` | `{sessionId}` | `{items: [{turnId, position, status}]}` | 重连后对账；不回显输入文本（客户端自己持有） |
-| `_acp_extends/session/pause` | `{sessionId, turnId?}` | `{turnId, status}` | 暂停当前 Turn（`Pausing`→`Paused`，位置与工具保留） |
-| `_acp_extends/session/resume` | `{sessionId, turnId}` | `{turnId, status}` | 从 `Paused` 继续（用户显式触发） |
+| `_acp_extends/session/pause` | `{sessionId, clientRequestId}` | `{turnId, status}` | 暂停当前 Turn（`Pausing`→`Paused`，位置与工具保留） |
+| `_acp_extends/session/resume` | `{sessionId, turnId, clientRequestId}` | `{turnId, stopReason}` | 从 `Paused` 继续（用户显式触发）；请求保持到该 Turn 结束并流式输出 |
 | `_acp_extends/session/respond` | `{sessionId, answers}` | `{}` | 既有：回答被挂起的交互（本次仅改名） |
 | `_acp_extends/providers/{remove,default,catalog,probe}` | 不变 | 不变 | 既有：供应商管理（本次仅改名） |
 
@@ -71,7 +71,10 @@
   - 幂等：`clientRequestId` 前加 `queue-` 作 durable `request_id`；重试时消息 id 是新生成的，digest 必然不同 → `CONFLICT` 时回读 `admission(request_id)` 返回首次受理的 Turn。
   - `_meta.turnId` 在 `drive_turn` 的 sink 包装层统一注入，所有 `SessionNotification` 都带。
   - 验证：新增 `tests/acp_queue_test.rs`（2 条：durable 可见 + 幂等 + 移除；下一条 prompt 先跑队列、`_meta.turnId` 归属）；ACP 全量 21 个 target 全绿。
-- [ ] **P4 Pause/Resume**：`pause` 置 `pause_requested`，prompt 循环遇到 `Paused` 不再自动 resume，以 `Cancelled + _meta.paused` 返回；`resume` 用 `drive_one_turn` 在后台驱动并流式输出。
+- [x] **P4 Pause/Resume**：`pause` 先置 `TurnState.pause_requested` 再 `suspend`；驱动循环把 `Paused` 当作「本 prompt 的结算点」，命中 `interrupted` 且 `pause_requested` 时**不再自动 resume**，以 `Cancelled` 回答原 prompt；`resume` 在请求内（spawn 任务 + 同一 `prompt_lock`）`resume` 后驱动该 Turn，流式输出并返回 `stopReason`。
+  - 顺带修掉一个既有缺口：轮询循环原先只把**终态**当结算点，`Paused` 会让 `session/prompt` 永远挂着；现在 `Paused` 也会离开循环，`interrupted` 分支因此第一次真正可达。
+  - `Pausing`（暂停请求已发出、执行体尚未到边界）并入 `Running` 的静默看门狗，避免挂死的 provider 让暂停永远观察不到。
+  - 验证：`tests/acp_pause_test.rs` 2 条（排队 Turn 暂停后不跑、resume 只跑一次且带 `_meta.turnId`；运行中的 Turn 被暂停后 prompt 以 `Cancelled` 返回且 Turn 停在 `paused`）；ACP 全量 22 个 target 全绿。
 - [ ] **P5 客户端**（`acp-agent-ui`，独立仓库）：Enter → steer、Tab → queue、排队气泡 + 移除、暂停/继续按钮、按 `turnId` 归属流式内容。
 
 ## 4. 客户端契约（acp-agent-ui）
@@ -105,6 +108,7 @@
 | 2026-11-20 | P1 完成：`_acp_extends/session/steer`（`ExtSteerRequest`/`ExtSteerParams`/`ExtSteerResult` + `JsonRpcResponse` 实现）、`AcpAgentSession::steer`（活跃 Turn 解析、admit→claim 窗口 500ms 重试、`request_id` 幂等）、`handle_ext_steer` + 注册 | `cargo test -p agentscope-extensions-acp --lib`：**152 passed / 0 failed**（新增 4 条）；`cargo fmt --all -- --check` 干净 |
 | 2026-11-21 | P2 完成：`run_turn` 在 `submit` 后调用新的 `drive_turn`（`DrivePlan` 承载 `cancel_epoch`/`admitted_epoch`/`closed`/`cancellation`/`wakeup`/`caps`），`attach_events` 下沉 | ACP lib 152、全量 target 21 个全绿、fmt 干净 |
 | 2026-11-21 | P3 完成：`ext.rs` 三种 queue 方法（`wire_response!` / `impl_ext_request!` 宏消除重复）、`AcpAgentSession::{queue,queued,remove_queued}`、`DurableDriver::drain_queued` + 两处调用、`_meta.turnId`、`tests/acp_queue_test.rs` | lib **158 passed**；`--test acp_queue_test` 2 passed；全量 21 target 全绿；fmt 干净 |
+| 2026-11-21 | P4 完成：`pause`/`resume` 两种扩展、`TurnState.pause_requested`、`DrivePlan.pause_requested`、驱动循环把 `Paused` 当结算点、`resume_turn`（同一 `prompt_lock` 内驱动）、`tests/acp_pause_test.rs` | `--test acp_pause_test` 2 passed；全量 22 target 全绿；fmt 干净 |
 
 ### 待办提醒
 
