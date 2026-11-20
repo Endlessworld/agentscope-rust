@@ -14,7 +14,9 @@ use agentscope_core::error::Result;
 use agentscope_core::journal::{journal_error, JournalEvent};
 use agentscope_core::message::{Msg, MsgRole, ToolResultBlock, ToolResultState, ToolUseBlock};
 use agentscope_core::state::AgentState;
-use agentscope_durable::{ExecutionResult, ExecutionState, ToolCall, ToolResultRecord};
+use agentscope_durable::{
+    ExecutionResult, ExecutionState, ToolCall, ToolCatalog, ToolResultRecord,
+};
 use serde_json::Value;
 
 /// Native journal events carry no executor: a local tool is run by the core toolkit.
@@ -34,7 +36,11 @@ pub(crate) fn execution_id(turn_id: &str, call_id: &str) -> String {
 }
 
 /// Derives the tool facts of one batch. `turn_id` is the turn the batch is committed into.
-pub(crate) fn from_batch(turn_id: &str, events: &[JournalEvent]) -> Result<ToolFacts> {
+pub(crate) fn from_batch(
+    turn_id: &str,
+    events: &[JournalEvent],
+    catalog: Option<&dyn ToolCatalog>,
+) -> Result<ToolFacts> {
     let mut facts = ToolFacts::default();
     let mut seen: HashSet<String> = HashSet::new();
     // Calls a provider executed: they never got an intent, so they must never get a result
@@ -51,7 +57,7 @@ pub(crate) fn from_batch(turn_id: &str, events: &[JournalEvent]) -> Result<ToolF
                     server_calls.insert(call.id.clone());
                     continue;
                 }
-                let intent = tool_call(&call)?;
+                let intent = tool_call(&call, catalog)?;
                 if seen.insert(intent.call_id.clone()) {
                     facts.intents.push(intent);
                 }
@@ -94,15 +100,31 @@ pub(crate) fn from_batch(turn_id: &str, events: &[JournalEvent]) -> Result<ToolF
 }
 
 /// The durable intent of a native tool call.
-pub(crate) fn tool_call(call: &ToolUseBlock) -> Result<ToolCall> {
+///
+/// A catalog hit names the executor that owns the tool and the digest of its definition; a miss
+/// keeps the historical `"local"` executor, which is what every host without a catalog used.
+pub(crate) fn tool_call(
+    call: &ToolUseBlock,
+    catalog: Option<&dyn ToolCatalog>,
+) -> Result<ToolCall> {
     let arguments = serde_json::to_value(&call.input)
         .map_err(|error| journal_error(format!("Cannot encode tool arguments: {error}")))?;
+    let Some(binding) = catalog.and_then(|catalog| catalog.binding(&call.name)) else {
+        return ToolCall::new(
+            call.id.clone(),
+            LOCAL_EXECUTOR,
+            call.name.clone(),
+            arguments,
+        )
+        .map_err(|error| journal_error(format!("Invalid tool call: {error}")));
+    };
     ToolCall::new(
         call.id.clone(),
-        LOCAL_EXECUTOR,
+        binding.executor,
         call.name.clone(),
         arguments,
     )
+    .and_then(|call| call.with_binding(binding.digest))
     .map_err(|error| journal_error(format!("Invalid tool call: {error}")))
 }
 

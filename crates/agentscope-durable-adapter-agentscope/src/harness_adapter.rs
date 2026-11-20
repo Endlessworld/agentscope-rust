@@ -34,8 +34,8 @@ use agentscope_core::message::{
 use agentscope_core::state::AgentState;
 use agentscope_durable::harness_adapter::{AdapterCapabilities, HarnessAdapter, HarnessContext};
 use agentscope_durable::{
-    DurableError, ExecutionResult, ExecutionState, Lease, Result, ToolExecution, TurnControl,
-    TurnStatus,
+    DurableError, ExecutionResult, ExecutionState, Lease, Result, SessionBackend, ToolCatalog,
+    ToolExecution, TurnControl, TurnStatus,
 };
 use agentscope_harness::HarnessAgent;
 use async_trait::async_trait;
@@ -95,6 +95,10 @@ const UNKNOWN_OUTCOME: &str = "The turn cannot report success because a tool cal
 /// the same `Arc` back every time; a host that wants a fresh agent builds one per tick.
 pub struct AgentScopeHarnessAdapter {
     build: Arc<dyn Fn() -> Arc<HarnessAgent> + Send + Sync>,
+    /// The tools this host exposes; absent keeps every call on the `"local"` executor.
+    tool_catalog: Option<Arc<dyn ToolCatalog>>,
+    /// Prefix of the tool names this adapter answers as delegations (`""` → `delegate`/`fork`).
+    delegation_prefix: String,
     /// The committed projection, advanced with the journal.
     ///
     /// The recovery guard runs at the start of every tick. Replaying the whole journal there
@@ -108,8 +112,24 @@ impl AgentScopeHarnessAdapter {
     pub fn new(build: impl Fn() -> Arc<HarnessAgent> + Send + Sync + 'static) -> Self {
         Self {
             build: Arc::new(build),
+            tool_catalog: None,
+            delegation_prefix: String::new(),
             projection: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Routes tool calls through `catalog`: a hit names the executor and its binding digest, a
+    /// miss keeps the historical `"local"` executor.
+    pub fn with_tool_catalog(mut self, catalog: Arc<dyn ToolCatalog>) -> Self {
+        self.tool_catalog = Some(catalog);
+        self
+    }
+
+    /// Names the tools this adapter answers as delegations: `<prefix>delegate` and `<prefix>fork`.
+    /// The default prefix is empty, so the tools are called `delegate` and `fork`.
+    pub fn with_delegation_tools(mut self, prefix: impl Into<String>) -> Self {
+        self.delegation_prefix = prefix.into();
+        self
     }
 
     /// Settles the calls a failed attempt left without an outcome.
@@ -199,10 +219,14 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
         let lease = &ctx.lease;
         let backend = Arc::clone(&ctx.backend);
         // The journal writes under the lease this tick already holds; it must not claim.
-        let journal = Arc::new(
-            BackendThreadJournal::new(Arc::clone(&backend), lease.thread.clone())
-                .attach_lease(lease.clone()),
-        );
+        let journal = Arc::new({
+            let journal = BackendThreadJournal::new(Arc::clone(&backend), lease.thread.clone())
+                .attach_lease(lease.clone());
+            match &self.tool_catalog {
+                Some(catalog) => journal.with_catalog(Arc::clone(catalog)),
+                None => journal,
+            }
+        });
         // A retry runs over the journal the attempt that just failed left behind, and the
         // recorder refuses to open one that holds a dispatched call without a result. Nothing is
         // dispatched by this invocation yet, so such a call belonged to a run that already
@@ -222,16 +246,35 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
 
         // Opened after the settlement, so the committed state this tick continues already carries
         // the interrupted results instead of the pending calls they replace.
-        let host = Arc::new(
-            AgentScopeExecutionHost::open(
-                Arc::clone(&backend),
-                lease.thread.clone(),
-                lease.clone(),
-                invocation_id(lease),
-            )
-            .await
-            .map_err(convert)?,
-        );
+        let mut host = AgentScopeExecutionHost::open(
+            Arc::clone(&backend),
+            lease.thread.clone(),
+            lease.clone(),
+            invocation_id(lease),
+        )
+        .await
+        .map_err(convert)?;
+        if let Some(catalog) = &self.tool_catalog {
+            host = host.with_catalog(Arc::clone(catalog));
+        }
+        let host = Arc::new(host);
+
+        // A delegate/fork call is answered by the durable backend itself: the child thread and
+        // the parent link are recorded before the agent runs, so core sees a settled result and
+        // never executes the tool locally.
+        let delegated = run_delegations(
+            backend.as_ref(),
+            lease,
+            host.state(),
+            self.tool_catalog.as_deref(),
+            &self.delegation_prefix,
+        )
+        .await?;
+        let frame = if delegated {
+            backend.frame(lease).await?
+        } else {
+            ctx.frame.clone()
+        };
 
         // The committed state *is* the conversation this tick continues. Without seeding it the
         // resumed invocation would ask the model about an empty history and repeat work the
@@ -242,7 +285,7 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
             // A committed tool result whose batch carried no state event leaves the checkpoint
             // showing the call as still unanswered (see the helper); answering it here is what
             // keeps the resumed run from executing the same effect a second time.
-            answer_known_tool_results(&mut state, &ctx.frame.tools);
+            answer_known_tool_results(&mut state, &frame.tools);
             *react
                 .state_handle()
                 .lock()
@@ -533,9 +576,6 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
 ///
 async fn resolve_offloaded_effects(ctx: &HarnessContext) -> Result<agentscope_durable::Frame> {
     let mut frame = ctx.backend.frame(&ctx.lease).await?;
-    if !ctx.executor.capabilities().lookup_by_execution_id {
-        return Ok(frame);
-    }
     let deferred: Vec<agentscope_durable::ExecutionRequest> = frame
         .tools
         .iter()
@@ -549,7 +589,23 @@ async fn resolve_offloaded_effects(ctx: &HarnessContext) -> Result<agentscope_du
     }
     let mut accepted = false;
     for request in deferred {
-        let result = match ctx.executor.query(&request).await {
+        let Some(executor) = ctx.executors.resolve(&request.call.executor) else {
+            // A call bound to an executor this host never registered cannot be answered; the
+            // effect is unknown, never a success the host cannot prove.
+            let result = ExecutionResult::unknown(format!(
+                "No executor is registered under `{}`",
+                request.call.executor
+            ));
+            ctx.backend
+                .accept_result(&ctx.lease.thread, &request.execution_id, result)
+                .await?;
+            accepted = true;
+            continue;
+        };
+        if !executor.capabilities().lookup_by_execution_id {
+            continue;
+        }
+        let result = match executor.query(&request).await {
             Ok(result) => result,
             Err(error) => {
                 // An executor that cannot answer is the same case as one that answers nothing:
@@ -590,7 +646,6 @@ async fn resolve_offloaded_effects(ctx: &HarnessContext) -> Result<agentscope_du
 /// recorded as cancelled: the turn's own record says the host stopped waiting, while the
 /// background runner keeps going and delivers its result as a notification.
 async fn settle_cancelled_effects(ctx: &HarnessContext, frame: &agentscope_durable::Frame) {
-    let lookup = ctx.executor.capabilities().lookup_by_execution_id;
     for tool in frame.tools.iter().filter(|tool| {
         !tool
             .result
@@ -598,12 +653,14 @@ async fn settle_cancelled_effects(ctx: &HarnessContext, frame: &agentscope_durab
             .is_some_and(|result| result.state.concluded())
     }) {
         let mut confirmed = None;
-        if lookup {
-            if let Ok(answered) = ctx.executor.query(&tool.request).await {
-                // Only an answer that really happened is worth keeping; "cannot tell" is what
-                // the cancel itself resolves.
-                if answered.state.terminal() {
-                    confirmed = Some(answered);
+        if let Some(executor) = ctx.executors.resolve(&tool.request.call.executor) {
+            if executor.capabilities().lookup_by_execution_id {
+                if let Ok(answered) = executor.query(&tool.request).await {
+                    // Only an answer that really happened is worth keeping; "cannot tell" is
+                    // what the cancel itself resolves.
+                    if answered.state.terminal() {
+                        confirmed = Some(answered);
+                    }
                 }
             }
         }
@@ -628,6 +685,125 @@ async fn settle_cancelled_effects(ctx: &HarnessContext, frame: &agentscope_durab
                 "cannot record the cancelled effect"
             );
         }
+    }
+}
+
+/// Answers the delegate/fork calls a turn is about to run.
+///
+/// The call is recorded exactly like a local tool (intent, dispatch, result), but the effect is
+/// the durable backend's: it creates the child thread and admits its first turn. The result is
+/// committed here, before the agent starts, so core sees a settled call and never runs it.
+pub(crate) async fn run_delegations(
+    backend: &dyn SessionBackend,
+    lease: &Lease,
+    state: Option<&AgentState>,
+    catalog: Option<&dyn ToolCatalog>,
+    prefix: &str,
+) -> Result<bool> {
+    let Some(state) = state else {
+        return Ok(false);
+    };
+    let calls: Vec<ToolUseBlock> = crate::tool_facts::pending_calls(state)
+        .into_iter()
+        .filter(|call| delegation_kind(&call.name, prefix).is_some())
+        .collect();
+    if calls.is_empty() {
+        return Ok(false);
+    }
+
+    let frame = backend.frame(lease).await?;
+    let mut intents = Vec::with_capacity(calls.len());
+    for call in &calls {
+        intents.push(crate::tool_facts::tool_call(call, catalog).map_err(convert)?);
+    }
+    let mut commit = agentscope_durable::Commit::new(
+        format!("delegation:{}:{}", lease.turn_id, frame.turn.revision),
+        frame.turn.revision,
+        TurnStatus::Running,
+    );
+    commit.tools = intents;
+    backend.commit(lease, commit).await?;
+
+    for call in &calls {
+        let execution_id = crate::tool_facts::execution_id(&lease.turn_id, &call.id);
+        backend.begin_dispatch(lease, &execution_id).await?;
+        let result = match delegate_once(backend, lease, call, &execution_id, prefix).await {
+            Ok(outcome) => ExecutionResult::succeeded(outcome),
+            // A delegation that cannot be recorded must not fall through to the local tool: the
+            // failure is the call's outcome, and the turn keeps a durable record of it.
+            Err(error) => ExecutionResult {
+                state: ExecutionState::Failed,
+                handle: None,
+                result: Value::Null,
+                error: Some(error.to_string()),
+            },
+        };
+        backend
+            .accept_result(&lease.thread, &execution_id, result)
+            .await?;
+    }
+    Ok(true)
+}
+
+fn delegation_kind<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    match name.strip_prefix(prefix)? {
+        "delegate" => Some("delegate"),
+        "fork" => Some("fork"),
+        _ => None,
+    }
+}
+
+async fn delegate_once(
+    backend: &dyn SessionBackend,
+    lease: &Lease,
+    call: &ToolUseBlock,
+    request_id: &str,
+    prefix: &str,
+) -> Result<Value> {
+    let arguments = serde_json::to_value(&call.input).map_err(|error| {
+        DurableError::invalid(format!("Cannot decode delegation arguments: {error}"))
+    })?;
+    let thread_id = arguments
+        .get("threadId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| agentscope_durable::child_thread_id(&lease.thread, request_id));
+    let harness = arguments
+        .get("agent")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DurableError::invalid("A delegation requires `agent`"))?;
+    let definition = arguments
+        .get("definition")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DurableError::invalid("A delegation requires `definition`"))?;
+    let binding = agentscope_durable::ThreadBinding::new(harness, definition, STATE_VERSION)?;
+    let key = agentscope_durable::ThreadKey::new(lease.thread.session.clone(), thread_id)?;
+    let child = agentscope_durable::ThreadSpec { key, binding };
+    let input = arguments.get("input").cloned().unwrap_or(Value::Null);
+    match delegation_kind(&call.name, prefix) {
+        Some("fork") => {
+            let view =
+                agentscope_durable::fork_thread(backend, &lease.thread, request_id, child).await?;
+            Ok(serde_json::json!({ "threadId": view.definition.key.thread_id }))
+        }
+        Some("delegate") => {
+            let executor = agentscope_durable::DelegationExecutor::new(backend, lease);
+            let view = executor
+                .delegate(
+                    request_id,
+                    request_id,
+                    agentscope_durable::DelegationTarget { child, input },
+                )
+                .await?;
+            let link = view
+                .child
+                .ok_or_else(|| DurableError::invalid("The delegation created no child"))?;
+            Ok(serde_json::json!({
+                "threadId": link.thread.thread_id,
+                "turnId": link.turn_id
+            }))
+        }
+        _ => Err(DurableError::invalid("Not a delegation tool")),
     }
 }
 
@@ -793,7 +969,7 @@ mod tests {
     };
     use agentscope_core::state::AgentState;
     use agentscope_durable::backend::TxnBackend;
-    use agentscope_durable::executor::{Executor, ExecutorCapabilities};
+    use agentscope_durable::executor::{Executor, ExecutorCapabilities, ExecutorRegistry};
     use agentscope_durable::harness_adapter::settle_turn;
     use agentscope_durable::types::*;
     use agentscope_durable::{ExecutionState, Result, SessionBackend};
@@ -801,8 +977,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        answer_known_tool_results, resolve_offloaded_effects, settle_cancelled_effects,
-        HarnessContext, STATE_VERSION,
+        answer_known_tool_results, resolve_offloaded_effects, run_delegations,
+        settle_cancelled_effects, HarnessContext, STATE_VERSION,
     };
 
     fn state_with_tool_call(call_id: &str) -> AgentState {
@@ -820,6 +996,107 @@ mod tests {
                 .build(),
         );
         state
+    }
+
+    fn state_with_delegate_call(call_id: &str) -> AgentState {
+        let mut state = AgentState::default();
+        state
+            .context_mut()
+            .push(Msg::text(MsgRole::User, "delegate it"));
+        let input = json!({
+            "threadId": "child-1",
+            "agent": "sub",
+            "definition": "def-2",
+            "input": { "task": "go" }
+        })
+        .as_object()
+        .cloned()
+        .expect("object input");
+        let call = ToolUseBlock::new(call_id, "delegate", input);
+        state.context_mut().push(
+            Msg::builder()
+                .role(MsgRole::Assistant)
+                .content(vec![ContentBlock::ToolUse(call)])
+                .build(),
+        );
+        state
+    }
+
+    /// A turn with no tool facts yet: the delegation path records its own intent.
+    async fn bare_turn() -> (Arc<TxnBackend>, Lease) {
+        let backend = Arc::new(TxnBackend::in_memory());
+        let key = SessionKey::new("ns", "session").expect("session key");
+        backend
+            .create(SessionSpec {
+                key: key.clone(),
+                primary_binding: ThreadBinding::new("harness-a", "def-1", STATE_VERSION)
+                    .expect("binding"),
+                metadata: Value::Null,
+            })
+            .await
+            .expect("create session");
+        let thread = ThreadKey::new(key, "main").expect("thread key");
+        backend
+            .submit(&thread, "req-1", json!({ "text": "go" }))
+            .await
+            .expect("submit");
+        let lease = backend
+            .claim(&thread, "owner-a", Duration::from_secs(30))
+            .await
+            .expect("claim")
+            .expect("a claimable turn");
+        backend.prepare_run(&lease, "req-1").await.expect("run");
+        (backend, lease)
+    }
+
+    #[tokio::test]
+    async fn a_delegate_call_is_settled_before_the_agent_runs() {
+        let (backend, lease) = bare_turn().await;
+        let state = state_with_delegate_call("call-1");
+        assert!(
+            run_delegations(backend.as_ref(), &lease, Some(&state), None, "")
+                .await
+                .expect("delegate")
+        );
+
+        let frame = backend.frame(&lease).await.expect("frame");
+        assert_eq!(frame.tools.len(), 1, "the intent is recorded exactly once");
+        let tool = &frame.tools[0];
+        assert_eq!(
+            tool.result.as_ref().map(|result| result.state),
+            Some(ExecutionState::Succeeded)
+        );
+        let link = tool
+            .delegation
+            .as_ref()
+            .expect("the parent link is recorded");
+        assert_eq!(link.thread.thread_id, "child-1");
+        backend
+            .thread(&link.thread)
+            .await
+            .expect("the child thread exists");
+    }
+
+    #[tokio::test]
+    async fn a_delegate_call_answers_the_same_child_twice() {
+        let (backend, lease) = bare_turn().await;
+        let state = state_with_delegate_call("call-1");
+        run_delegations(backend.as_ref(), &lease, Some(&state), None, "")
+            .await
+            .expect("first delegate");
+        let first = backend.frame(&lease).await.expect("frame").tools[0]
+            .delegation
+            .clone()
+            .expect("link");
+
+        run_delegations(backend.as_ref(), &lease, Some(&state), None, "")
+            .await
+            .expect("replayed delegate");
+        let second = backend.frame(&lease).await.expect("frame").tools[0]
+            .delegation
+            .clone()
+            .expect("link");
+        assert_eq!(second, first, "a replayed call keeps its child");
     }
 
     fn execution(call_id: &str, state: ExecutionState) -> ToolExecution {
@@ -900,6 +1177,13 @@ mod tests {
     /// An offloaded call: the placeholder result is `PENDING`, which blocks every terminal
     /// status until the executor says what became of the effect.
     async fn offloaded_turn(state: ExecutionState) -> (Arc<TxnBackend>, Lease) {
+        offloaded_turn_with(state, "local").await
+    }
+
+    async fn offloaded_turn_with(
+        state: ExecutionState,
+        executor: &str,
+    ) -> (Arc<TxnBackend>, Lease) {
         let backend = Arc::new(TxnBackend::in_memory());
         let key = SessionKey::new("ns", "session").expect("session key");
         backend
@@ -923,7 +1207,7 @@ mod tests {
             .expect("a claimable turn");
         backend.prepare_run(&lease, "req-1").await.expect("run");
         let frame = backend.frame(&lease).await.expect("frame");
-        let call = ToolCall::new("call-1", "local", "shell_execute", json!({ "cmd": "ls" }))
+        let call = ToolCall::new("call-1", executor, "shell_execute", json!({ "cmd": "ls" }))
             .expect("call");
         let mut intent = Commit::new("intent", frame.turn.revision, TurnStatus::Running);
         // A result may only be applied together with the native state that observed it.
@@ -988,10 +1272,57 @@ mod tests {
             definition: frame.definition.clone(),
             frame,
             backend: Arc::clone(backend) as Arc<dyn SessionBackend>,
-            executor,
+            executor: Arc::clone(&executor),
+            executors: Arc::new(ExecutorRegistry::new(executor)),
             lease: lease.clone(),
             events: None,
         }
+    }
+
+    #[tokio::test]
+    async fn an_offloaded_call_routes_by_its_executor_name() {
+        let (backend, lease) = offloaded_turn_with(ExecutionState::Pending, "remote").await;
+        let default = Arc::new(FixedExecutor {
+            answer: ExecutionResult::unknown("this host does not own the call"),
+            lookups: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let remote = Arc::new(FixedExecutor {
+            answer: ExecutionResult::succeeded(json!({ "ok": true })),
+            lookups: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let registry = ExecutorRegistry::new(Arc::clone(&default) as Arc<dyn Executor>);
+        registry.register("remote", Arc::clone(&remote) as Arc<dyn Executor>);
+
+        let mut ctx = context(&backend, &lease, default.clone()).await;
+        ctx.executors = Arc::new(registry);
+        let frame = resolve_offloaded_effects(&ctx).await.expect("resolve");
+        assert_eq!(
+            frame.tools[0].result.as_ref().map(|result| result.state),
+            Some(ExecutionState::Succeeded)
+        );
+        assert_eq!(remote.lookups.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(default.lookups.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_executor_leaves_the_effect_unknown() {
+        let (backend, lease) = offloaded_turn_with(ExecutionState::Pending, "ghost").await;
+        let executor = Arc::new(FixedExecutor {
+            answer: ExecutionResult::succeeded(json!(null)),
+            lookups: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let ctx = context(&backend, &lease, Arc::clone(&executor) as Arc<dyn Executor>).await;
+        let frame = resolve_offloaded_effects(&ctx).await.expect("resolve");
+        assert_eq!(
+            frame.tools[0].result.as_ref().map(|result| result.state),
+            Some(ExecutionState::Unknown),
+            "a host that never registered the executor cannot answer for it"
+        );
+        assert_eq!(
+            executor.lookups.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the default executor is not asked to stand in for a named one"
+        );
     }
 
     #[tokio::test]

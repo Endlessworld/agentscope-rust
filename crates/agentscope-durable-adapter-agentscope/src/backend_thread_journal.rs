@@ -50,6 +50,8 @@ pub struct BackendThreadJournal {
     lease: Mutex<Option<Held>>,
     /// Whether the batch's tool facts are recorded in the same commit (see [`crate::tool_facts`]).
     tool_facts: bool,
+    /// Where a tool call's executor/binding comes from; absent means every call is `"local"`.
+    catalog: Option<Arc<dyn agentscope_durable::ToolCatalog>>,
 }
 
 impl BackendThreadJournal {
@@ -65,7 +67,15 @@ impl BackendThreadJournal {
             thread,
             lease: Mutex::new(None),
             tool_facts: true,
+            catalog: None,
         }
+    }
+
+    /// Routes tool calls through `catalog`: a hit names the executor and its binding digest, and
+    /// a miss keeps the historical `"local"` executor.
+    pub fn with_catalog(mut self, catalog: Arc<dyn agentscope_durable::ToolCatalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     /// Turns tool-fact derivation off, leaving the bridge a pure journal writer for tool calls.
@@ -331,7 +341,7 @@ impl ThreadJournal for BackendThreadJournal {
         let mut commit = Commit::new(batch_id, turn.revision, TurnStatus::Running);
         // The batch's tool facts land in the same transaction as the entries that imply them.
         let facts = if self.tool_facts {
-            tool_facts::from_batch(&turn_id, events)?
+            tool_facts::from_batch(&turn_id, events, self.catalog.as_deref())?
         } else {
             tool_facts::ToolFacts::default()
         };

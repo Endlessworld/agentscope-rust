@@ -63,6 +63,8 @@ pub struct AgentScopeExecutionHost {
     started: bool,
     completed: AtomicBool,
     frame: Mutex<Option<Frame>>,
+    /// Where a tool call's executor/binding comes from; absent means every call is `"local"`.
+    catalog: Option<Arc<dyn agentscope_durable::ToolCatalog>>,
 }
 
 impl AgentScopeExecutionHost {
@@ -197,7 +199,17 @@ impl AgentScopeExecutionHost {
             started,
             completed: AtomicBool::new(completed),
             frame: Mutex::new(frame),
+            catalog: None,
         })
+    }
+
+    /// Routes the dispatch records through `catalog`, matching the journal's tool facts.
+    ///
+    /// Both writers derive the same execution id; they must also derive the same executor, or
+    /// the second commit would describe the same call differently.
+    pub fn with_catalog(mut self, catalog: Arc<dyn agentscope_durable::ToolCatalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     /// The iteration this invocation continues from.
@@ -303,7 +315,7 @@ impl AgentScopeExecutionHost {
         let lease = self.lease()?;
         let mut calls = Vec::with_capacity(pending.len());
         for block in &pending {
-            calls.push(tool_facts::tool_call(block)?);
+            calls.push(tool_facts::tool_call(block, self.catalog.as_deref())?);
         }
         let dispatches = calls
             .iter()
