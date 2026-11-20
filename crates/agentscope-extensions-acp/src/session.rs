@@ -813,12 +813,16 @@ pub(crate) fn turn_status_name(status: TurnStatus) -> &'static str {
 /// `Unavailable` and the session keeps calling its own methods, so the migration changes no
 /// behaviour. What it does pin is the ownership: the session no longer holds a runtime field.
 pub(crate) struct DurableDriver {
+    agent: Arc<HarnessAgent>,
+    session_id: SessionId,
     runtime: tokio::sync::Mutex<Option<Arc<SessionRuntime>>>,
 }
 
 impl DurableDriver {
-    fn new() -> Self {
+    fn new(agent: Arc<HarnessAgent>, session_id: SessionId) -> Self {
         Self {
+            agent,
+            session_id,
             runtime: tokio::sync::Mutex::new(None),
         }
     }
@@ -826,6 +830,103 @@ impl DurableDriver {
     /// The slot [`AcpAgentSession::open_runtime`] fills and every reader locks.
     fn runtime(&self) -> &tokio::sync::Mutex<Option<Arc<SessionRuntime>>> {
         &self.runtime
+    }
+
+    /// The runtime already opened for this session, if any.
+    async fn cached(&self) -> Option<Arc<SessionRuntime>> {
+        self.runtime.lock().await.as_ref().map(Arc::clone)
+    }
+
+    /// Opens (or reuses) the durable runtime of this session.
+    ///
+    /// Opening touches durable storage, which can fail transiently (a competing writer, an
+    /// fsync hiccup). Those failures are not the user's fault and must not end a turn on the
+    /// first attempt.
+    async fn open_runtime(
+        &self,
+        backend: Arc<dyn SessionBackend>,
+        thread: ThreadKey,
+    ) -> std::result::Result<Arc<SessionRuntime>, String> {
+        if let Some(runtime) = self.cached().await {
+            return Ok(runtime);
+        }
+        let mut attempts = 0usize;
+        let opened = loop {
+            attempts += 1;
+            match self
+                .build_runtime(Arc::clone(&backend), thread.clone())
+                .await
+            {
+                Ok(runtime) => break Arc::new(runtime),
+                Err(error) if attempts < 3 => {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        %error,
+                        "opening the durable runtime failed; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        *self.runtime.lock().await = Some(Arc::clone(&opened));
+        Ok(opened)
+    }
+
+    /// Binds the store to this agent: the adapter runs one `HarnessAgent` invocation per tick,
+    /// and the session/thread creation is idempotent so a restart rebuilds the same identity.
+    async fn build_runtime(
+        &self,
+        backend: Arc<dyn SessionBackend>,
+        thread: ThreadKey,
+    ) -> agentscope_durable::Result<SessionRuntime> {
+        let agent = Arc::clone(&self.agent);
+        let adapter = Arc::new(AgentScopeHarnessAdapter::new(move || Arc::clone(&agent)));
+        let binding = ThreadBinding::new(
+            DURABLE_HARNESS,
+            DURABLE_DEFINITION,
+            adapter.capabilities().state_version,
+        )?;
+        let owner = format!("acp-{}-{}", std::process::id(), control_id("run"));
+        let mut runtime =
+            DurableRuntime::new(Arc::clone(&backend), owner).with_adapter(DURABLE_HARNESS, adapter);
+        // An offloaded tool outlives the turn that started it: the turn only holds a placeholder
+        // result, so its record blocks every terminal status until somebody says what became of
+        // the effect. The harness registry is the only authority on that, and the executor is
+        // how the runtime asks (a call whose outcome nothing can confirm stays unknown, which
+        // never lets the turn claim success).
+        if let Some(registry) = self.agent.async_tool_registry() {
+            runtime = runtime.with_executor(Arc::new(OffloadedToolEffects::new(
+                Arc::clone(registry),
+                self.session_id.to_string(),
+            )));
+        }
+        runtime
+            .ensure_session(SessionSpec {
+                key: thread.session.clone(),
+                primary_binding: binding,
+                metadata: serde_json::Value::Null,
+            })
+            .await?;
+        // A control command must not run under the owner the tick uses: `claim` would hand it
+        // the very lease the invocation is writing under, and releasing it would fence the run.
+        let control = Arc::new(DurableRuntime::new(
+            Arc::clone(&backend),
+            control_id("acp-control"),
+        ));
+        let journal: Arc<dyn ThreadJournal> = Arc::new(BackendThreadJournal::new(
+            Arc::clone(&backend),
+            thread.clone(),
+        ));
+        // Before any tick opens a recorder: a session that a dead process left with an unknown
+        // tool outcome is otherwise refused at every open, permanently.
+        reconcile_abandoned_tool_calls(&journal).await;
+        Ok(SessionRuntime {
+            session: Arc::new(DurableSession::new(runtime, thread)),
+            control,
+            journal,
+            projection: tokio::sync::Mutex::new(None),
+        })
     }
 }
 
@@ -1309,10 +1410,12 @@ impl AcpAgentSession {
         // so the catalog is resident -- and the host releases it as soon as every session is bound.
         let descriptor = SelectedDescriptor::resolve(&models, &initial_model);
         let archived = is_archived_on_disk(&cwd, &session_id);
+        let agent = Arc::new(agent);
+        let driver = Arc::new(DurableDriver::new(Arc::clone(&agent), session_id.clone()));
         let mut session = Self {
             session_id,
             cwd,
-            agent: Arc::new(agent),
+            agent,
             config: Arc::new(Mutex::new(SessionConfig::default())),
             models,
             descriptor: Arc::new(Mutex::new(descriptor)),
@@ -1329,7 +1432,7 @@ impl AcpAgentSession {
             elicitation_slot: Arc::new(Mutex::new(None)),
             permission_store,
             mcp_manager: Arc::new(agentscope_harness::agent::McpClientManager::new()),
-            driver: Arc::new(DurableDriver::new()),
+            driver,
             bridged_servers: Arc::new(Mutex::new(Vec::new())),
             pending_acp_servers: Arc::new(Mutex::new(Vec::new())),
             support: ClientSupport::new(),
@@ -1426,89 +1529,12 @@ impl AcpAgentSession {
     /// fsync hiccup). Those failures are not the user's fault and must not end a turn on the
     /// first attempt.
     async fn open_runtime(&self) -> std::result::Result<Arc<SessionRuntime>, String> {
-        let cached = self.driver.runtime().lock().await.as_ref().map(Arc::clone);
-        if let Some(runtime) = cached {
+        if let Some(runtime) = self.driver.cached().await {
             return Ok(runtime);
         }
         let backend = self.durable_backend()?;
         let thread = self.durable_thread()?;
-        let mut attempts = 0usize;
-        let opened = loop {
-            attempts += 1;
-            match self
-                .build_runtime(Arc::clone(&backend), thread.clone())
-                .await
-            {
-                Ok(runtime) => break Arc::new(runtime),
-                Err(error) if attempts < 3 => {
-                    tracing::warn!(
-                        session = %self.session_id,
-                        %error,
-                        "opening the durable runtime failed; retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        };
-        *self.driver.runtime().lock().await = Some(Arc::clone(&opened));
-        Ok(opened)
-    }
-
-    /// Binds the store to this agent: the adapter runs one `HarnessAgent` invocation per tick,
-    /// and the session/thread creation is idempotent so a restart rebuilds the same identity.
-    async fn build_runtime(
-        &self,
-        backend: Arc<dyn SessionBackend>,
-        thread: ThreadKey,
-    ) -> agentscope_durable::Result<SessionRuntime> {
-        let agent = Arc::clone(&self.agent);
-        let adapter = Arc::new(AgentScopeHarnessAdapter::new(move || Arc::clone(&agent)));
-        let binding = ThreadBinding::new(
-            DURABLE_HARNESS,
-            DURABLE_DEFINITION,
-            adapter.capabilities().state_version,
-        )?;
-        let owner = format!("acp-{}-{}", std::process::id(), control_id("run"));
-        let mut runtime =
-            DurableRuntime::new(Arc::clone(&backend), owner).with_adapter(DURABLE_HARNESS, adapter);
-        // An offloaded tool outlives the turn that started it: the turn only holds a placeholder
-        // result, so its record blocks every terminal status until somebody says what became of
-        // the effect. The harness registry is the only authority on that, and the executor is
-        // how the runtime asks (a call whose outcome nothing can confirm stays unknown, which
-        // never lets the turn claim success).
-        if let Some(registry) = self.agent.async_tool_registry() {
-            runtime = runtime.with_executor(Arc::new(OffloadedToolEffects::new(
-                Arc::clone(registry),
-                self.session_id.to_string(),
-            )));
-        }
-        runtime
-            .ensure_session(SessionSpec {
-                key: thread.session.clone(),
-                primary_binding: binding,
-                metadata: serde_json::Value::Null,
-            })
-            .await?;
-        // A control command must not run under the owner the tick uses: `claim` would hand it
-        // the very lease the invocation is writing under, and releasing it would fence the run.
-        let control = Arc::new(DurableRuntime::new(
-            Arc::clone(&backend),
-            control_id("acp-control"),
-        ));
-        let journal: Arc<dyn ThreadJournal> = Arc::new(BackendThreadJournal::new(
-            Arc::clone(&backend),
-            thread.clone(),
-        ));
-        // Before any tick opens a recorder: a session that a dead process left with an unknown
-        // tool outcome is otherwise refused at every open, permanently.
-        reconcile_abandoned_tool_calls(&journal).await;
-        Ok(SessionRuntime {
-            session: Arc::new(DurableSession::new(runtime, thread)),
-            control,
-            journal,
-            projection: tokio::sync::Mutex::new(None),
-        })
+        self.driver.open_runtime(backend, thread).await
     }
 
     /// The working directory.
