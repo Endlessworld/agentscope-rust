@@ -12,36 +12,100 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentscope_durable::store::{RecordStore, Txn, WorkItem};
 use agentscope_durable::{DurableError, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS agentscope_scope (
-    scope_key TEXT PRIMARY KEY,
-    revision INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+mod schema;
+
+/// The engine settings a write transaction needs, matching the other SQLite users in this
+/// workspace (`harness` and the JDBC backend both wait ten seconds). SQLite has one writer, so a
+/// second connection that finds it busy must wait instead of failing with `SQLITE_BUSY` the way
+/// the zero default does — every ACP session opens its own connection on the same file.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `PRAGMA application_id` of a database this store owns (`"ASCP"`). A non-zero id that is
+/// not this one belongs to another application and is refused rather than written into.
+const APPLICATION_ID: i64 = 0x4153_4350;
+
+/// What `PRAGMA user_version` is set to. Version 2 adds the foreign key, the key-length check
+/// and the three-column readiness index; version 1 is migrated in place on open.
+const SCHEMA_VERSION: i64 = 2;
+
+/// The bound the PostgreSQL schema and mapping enforce, so a scope key one store accepts is not
+/// refused by the other.
+const MAX_SCOPE_CHARS: usize = 256;
+
+/// The page bound the PostgreSQL mapping applies; without it a caller asking for a huge page
+/// makes the store allocate it.
+const MAX_PAGE: usize = 1000;
+
+/// Rebuilds the three tables of a version 1 database into the version 2 shapes.
+///
+/// SQLite cannot add a foreign key or a check constraint with `ALTER TABLE`, so the only way to
+/// keep existing rows is the documented table-rebuild procedure: create the new tables, copy,
+/// drop the old ones, rename, recreate the index. The whole sequence runs inside one `IMMEDIATE`
+/// transaction, so a crash leaves the version 1 database untouched, and
+/// `PRAGMA foreign_key_check` runs before the commit rather than trusting the copy.
+const MIGRATE_TO_V2: &str = "
+DROP TABLE IF EXISTS agentscope_scope_v2;
+DROP TABLE IF EXISTS agentscope_part_v2;
+DROP TABLE IF EXISTS agentscope_work_v2;
+CREATE TABLE agentscope_scope_v2 (
+    scope_key  TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+    revision   INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    CONSTRAINT agentscope_scope_key_len CHECK (length(scope_key) BETWEEN 1 AND 256)
 );
-CREATE TABLE IF NOT EXISTS agentscope_part (
-    scope_key TEXT NOT NULL,
-    k TEXT NOT NULL,
-    v TEXT NOT NULL,
+CREATE TABLE agentscope_part_v2 (
+    scope_key TEXT COLLATE BINARY NOT NULL
+        REFERENCES agentscope_scope_v2 (scope_key) ON DELETE CASCADE,
+    k         TEXT COLLATE BINARY NOT NULL,
+    v         TEXT NOT NULL,
     PRIMARY KEY (scope_key, k)
 );
-CREATE TABLE IF NOT EXISTS agentscope_work (
-    queue TEXT NOT NULL,
-    work_id TEXT NOT NULL,
+CREATE TABLE agentscope_work_v2 (
+    queue    TEXT COLLATE BINARY NOT NULL,
+    work_id  TEXT COLLATE BINARY NOT NULL,
     ready_at INTEGER NOT NULL,
-    payload TEXT,
+    payload  TEXT,
     PRIMARY KEY (queue, work_id)
 );
-CREATE INDEX IF NOT EXISTS agentscope_work_due ON agentscope_work (queue, ready_at);
+INSERT INTO agentscope_scope_v2 (scope_key, revision, updated_at)
+    SELECT scope_key, revision, updated_at FROM agentscope_scope;
+INSERT INTO agentscope_part_v2 (scope_key, k, v)
+    SELECT scope_key, k, v FROM agentscope_part;
+INSERT INTO agentscope_work_v2 (queue, work_id, ready_at, payload)
+    SELECT queue, work_id, ready_at, payload FROM agentscope_work;
+DROP TABLE agentscope_part;
+DROP TABLE agentscope_work;
+DROP TABLE agentscope_scope;
+ALTER TABLE agentscope_scope_v2 RENAME TO agentscope_scope;
+ALTER TABLE agentscope_part_v2 RENAME TO agentscope_part;
+ALTER TABLE agentscope_work_v2 RENAME TO agentscope_work;
+CREATE INDEX IF NOT EXISTS agentscope_work_due
+    ON agentscope_work (queue, ready_at, work_id);
 ";
+
+/// The four key-page statements.
+///
+/// A cursor and an upper bound are range constraints here, not filters applied after the index
+/// scan: `(?3 IS NULL OR k > ?3)` cannot be used as a range by the query planner, so paging a
+/// long journal would rescan its prefix for every page. The PostgreSQL mapping splits the same
+/// way for the same reason.
+const KEYS_FROM_PREFIX: &str =
+    "SELECT k FROM agentscope_part WHERE scope_key = ?1 AND k >= ?2 ORDER BY k LIMIT ?3";
+const KEYS_AFTER: &str =
+    "SELECT k FROM agentscope_part WHERE scope_key = ?1 AND k > ?2 ORDER BY k LIMIT ?3";
+const KEYS_FROM_PREFIX_BOUNDED: &str =
+    "SELECT k FROM agentscope_part WHERE scope_key = ?1 AND k >= ?2 AND k < ?3 ORDER BY k LIMIT ?4";
+const KEYS_AFTER_BOUNDED: &str =
+    "SELECT k FROM agentscope_part WHERE scope_key = ?1 AND k > ?2 AND k < ?3 ORDER BY k LIMIT ?4";
 
 // ----------------------------------------------------------------------------
 // Write-traffic counters
@@ -113,10 +177,14 @@ impl SqliteStore {
         // in-memory database ignores the request and stays in its own journal mode.
         let _ = connection.pragma_update(None, "journal_mode", "WAL");
         let _ = connection.pragma_update(None, "synchronous", "NORMAL");
+        connection.busy_timeout(BUSY_TIMEOUT).map_err(unavailable)?;
+        initialize(&connection)?;
+        // `foreign_keys` is a per-connection switch and SQLite defaults it off; a pragma value
+        // cannot be a bound parameter, so it is a literal statement like `auto_vacuum`.
+        let _ = connection.execute_batch("PRAGMA foreign_keys = ON");
         // The commit path issues the same dozen statements over and over; compiling them once is
         // what keeps a row store's per-statement overhead from eating the read win.
         connection.set_prepared_statement_cache_capacity(64);
-        connection.execute_batch(SCHEMA).map_err(unavailable)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -163,11 +231,7 @@ impl SqliteStore {
                 .map_err(unavailable)?
                 .execute(params![scope, revision, now])
                 .map_err(unavailable)?;
-            if updated == 0 {
-                return Err(DurableError::conflict(
-                    "the scope changed while its transaction was open",
-                ));
-            }
+            verify_cas(updated)?;
         }
         transaction.commit().map_err(unavailable)?;
         if written {
@@ -175,6 +239,95 @@ impl SqliteStore {
         }
         Ok(())
     }
+}
+
+/// Applies the schema, refusing a database this build must not write into.
+///
+/// The application id says whose file this is, and `user_version` says how old it is: a newer
+/// version was written by a build that knows a shape this one does not, and rewriting its rows
+/// would corrupt them. Version 1 is migrated in place; an empty database is created at the
+/// current version.
+fn initialize(connection: &Connection) -> Result<()> {
+    let application_id = pragma_i64(connection, "application_id")?;
+    if application_id != 0 && application_id != APPLICATION_ID {
+        return Err(DurableError::invalid(format!(
+            "the database belongs to another application (application_id {application_id:#x})"
+        )));
+    }
+    let version = pragma_i64(connection, "user_version")?;
+    if version > SCHEMA_VERSION {
+        return Err(DurableError::invalid(format!(
+            "the database schema version {version} is newer than this build supports \
+             ({SCHEMA_VERSION})"
+        )));
+    }
+    if application_id == 0 {
+        connection
+            .execute_batch(&format!("PRAGMA application_id = {APPLICATION_ID}"))
+            .map_err(unavailable)?;
+    }
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if no_schema(connection) {
+        for statement in schema::statements() {
+            connection.execute_batch(&statement).map_err(unavailable)?;
+        }
+    } else if !part_is_v2(connection) {
+        migrate_to_v2(connection)?;
+    }
+    connection
+        .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+        .map_err(unavailable)?;
+    Ok(())
+}
+
+/// Rebuilds a version 1 database; the whole copy and rename is one transaction, so a failure
+/// leaves the old tables in place.
+fn migrate_to_v2(connection: &Connection) -> Result<()> {
+    // The switch cannot be flipped inside a transaction, and the rebuild drops the table the
+    // foreign key points from.
+    let _ = connection.execute_batch("PRAGMA foreign_keys = OFF");
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+        .map_err(unavailable)?;
+    transaction
+        .execute_batch(MIGRATE_TO_V2)
+        .map_err(unavailable)?;
+    let violations: i64 = transaction
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .map_err(unavailable)?;
+    if violations > 0 {
+        return Err(DurableError::invalid(format!(
+            "the migrated database has {violations} foreign key violations"
+        )));
+    }
+    transaction.commit().map_err(unavailable)?;
+    Ok(())
+}
+
+/// Whether `agentscope_part` already has the version 2 shape.
+///
+/// A database whose `user_version` was never written but whose tables were rebuilt (a build that
+/// committed the migration and then failed to record the version) must not be rebuilt again:
+/// dropping the tables would drop its rows.
+fn part_is_v2(connection: &Connection) -> bool {
+    connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agentscope_part'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|sql| sql.contains("REFERENCES agentscope_scope"))
+}
+
+fn pragma_i64(connection: &Connection, name: &str) -> Result<i64> {
+    connection
+        .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+        .map_err(unavailable)
 }
 
 impl SqliteStore {
@@ -297,16 +450,18 @@ impl RecordStore for SqliteStore {
     }
 
     fn read_parts(&self, scope: &str, parts: &[&str]) -> Result<Vec<Option<Value>>> {
+        // One indexed statement and no transaction: a control poll runs several times a second
+        // while a model call streams, and WAL already answers it from a consistent snapshot.
+        // The PostgreSQL store reads these the same way.
         if parts.is_empty() {
             return Ok(Vec::new());
         }
-        let keys: Vec<String> = parts.iter().map(|part| (*part).to_string()).collect();
-        let mut values = Vec::new();
-        self.read_transaction(scope, &mut |txn: &mut dyn Txn| {
-            values = txn.get_all(&keys)?;
-            Ok(())
-        })?;
-        Ok(values)
+        let scope = scope_key(scope)?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| DurableError::unavailable("the sqlite connection lock was poisoned"))?;
+        select_parts(&connection, scope, parts)
     }
 
     fn scope_bytes(&self, scope: &str) -> Result<Option<u64>> {
@@ -401,55 +556,36 @@ impl Txn for SqliteTxn<'_> {
     fn keys(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
         // A page is the keys under `prefix`, optionally starting after a cursor. The prefix is a
         // range, not just a lower bound: `turn:` must never page into `thread:`, which is a
-        // different record type with a different shape.
+        // different record type with a different shape. The cursor and the upper bound are
+        // separate statements so they are range constraints, not filters after the scan.
         let cursor = after.filter(|after| *after >= prefix);
         let bound = prefix_bound(prefix);
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut statement = self
-            .connection
-            .prepare_cached(
-                "SELECT k FROM agentscope_part WHERE scope_key = ?1 AND k >= ?2 \
-                 AND (?3 IS NULL OR k > ?3) AND (?4 IS NULL OR k < ?4) \
-                 ORDER BY k LIMIT ?5",
-            )
-            .map_err(unavailable)?;
-        let rows = statement
-            .query_map(
-                params![self.scope, prefix, cursor, bound.as_deref(), limit],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(unavailable)?;
-        rows.map(|row| row.map_err(unavailable)).collect()
+        let limit = page_limit(limit);
+        match (cursor, bound.as_deref()) {
+            (None, None) => query_keys(
+                self.connection,
+                KEYS_FROM_PREFIX,
+                &[&self.scope, &prefix, &limit],
+            ),
+            (Some(cursor), None) => {
+                query_keys(self.connection, KEYS_AFTER, &[&self.scope, &cursor, &limit])
+            }
+            (None, Some(bound)) => query_keys(
+                self.connection,
+                KEYS_FROM_PREFIX_BOUNDED,
+                &[&self.scope, &prefix, &bound, &limit],
+            ),
+            (Some(cursor), Some(bound)) => query_keys(
+                self.connection,
+                KEYS_AFTER_BOUNDED,
+                &[&self.scope, &cursor, &bound, &limit],
+            ),
+        }
     }
 
     fn get_all(&self, parts: &[String]) -> Result<Vec<Option<Value>>> {
-        if parts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let keys = serde_json::to_string(parts).map_err(|error| {
-            DurableError::unavailable(format!("sqlite: a key list was not JSON: {error}"))
-        })?;
-        let mut statement = self
-            .connection
-            .prepare_cached(
-                "SELECT k, v FROM agentscope_part WHERE scope_key = ?1 \
-                 AND k IN (SELECT value FROM json_each(?2))",
-            )
-            .map_err(unavailable)?;
-        let rows = statement
-            .query_map(params![self.scope, keys], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(unavailable)?;
-        let mut found = HashMap::new();
-        for row in rows {
-            let (key, text) = row.map_err(unavailable)?;
-            found.insert(key, decode(&text)?);
-        }
-        Ok(parts
-            .iter()
-            .map(|part| found.remove(part.as_str()))
-            .collect())
+        let keys: Vec<&str> = parts.iter().map(String::as_str).collect();
+        select_parts(self.connection, self.scope, &keys)
     }
 
     fn schedule(
@@ -542,6 +678,11 @@ fn scope_key(scope: &str) -> Result<&str> {
             "a scope key must be non-empty and contain no NUL",
         ));
     }
+    if scope.chars().count() > MAX_SCOPE_CHARS {
+        return Err(DurableError::invalid(format!(
+            "a scope key must be at most {MAX_SCOPE_CHARS} characters"
+        )));
+    }
     Ok(scope)
 }
 
@@ -576,14 +717,112 @@ fn part_key(part: &str) -> Result<&str> {
     Ok(part)
 }
 
+/// The page bound the PostgreSQL mapping applies.
+fn page_limit(limit: usize) -> i64 {
+    limit.min(MAX_PAGE) as i64
+}
+
+/// Interprets the row count of the revision bump.
+///
+/// `BEGIN IMMEDIATE` makes a miss impossible while the write lock is held, so zero rows means the
+/// assumption the lock rests on did not hold (a statement issued outside its transaction, a
+/// connection that committed early); the answer is a conflict rather than a lost update. More
+/// than one row is not reachable through the primary key and would mean the schema is not what
+/// this store thinks it is.
+fn verify_cas(updated: usize) -> Result<()> {
+    match updated {
+        1 => Ok(()),
+        0 => Err(DurableError::conflict(
+            "the scope changed while its transaction was open",
+        )),
+        other => Err(DurableError::invalid(format!(
+            "the scope revision compare-and-set touched {other} rows"
+        ))),
+    }
+}
+
+/// One page of keys, from one of the four statements.
+fn query_keys(connection: &Connection, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<String>> {
+    let mut statement = connection.prepare_cached(sql).map_err(unavailable)?;
+    let rows = statement
+        .query_map(params, |row| row.get::<_, String>(0))
+        .map_err(unavailable)?;
+    rows.map(|row| row.map_err(unavailable)).collect()
+}
+
+/// Several records in one statement, in the order the caller asked for.
+///
+/// The key list crosses as a JSON array because SQLite has no array parameter; `json_each` turns
+/// it back into the rows the `IN` needs, so the whole page is one indexed statement rather than
+/// one per record.
+fn select_parts(
+    connection: &Connection,
+    scope: &str,
+    parts: &[&str],
+) -> Result<Vec<Option<Value>>> {
+    if parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = serde_json::to_string(parts).map_err(|error| {
+        DurableError::invalid(format!("sqlite: a key list was not JSON: {error}"))
+    })?;
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT k, v FROM agentscope_part WHERE scope_key = ?1 \
+             AND k IN (SELECT value FROM json_each(?2))",
+        )
+        .map_err(unavailable)?;
+    let rows = statement
+        .query_map(params![scope, keys], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(unavailable)?;
+    let mut found = HashMap::new();
+    for row in rows {
+        let (key, text) = row.map_err(unavailable)?;
+        found.insert(key, decode(&text)?);
+    }
+    Ok(parts.iter().map(|part| found.remove(*part)).collect())
+}
+
 fn encode(value: &Value) -> Result<String> {
+    check_storable(value)?;
     serde_json::to_string(value)
         .map_err(|error| DurableError::invalid(format!("sqlite: a record is not JSON: {error}")))
 }
 
+/// Refuses a value the PostgreSQL store cannot hold either.
+///
+/// `jsonb` cannot store `U+0000` inside a string, and a record that one store accepts and another
+/// refuses turns a deployment's choice of store into a data loss. The same value is refused here
+/// so a commit succeeds or fails the same way on every store.
+fn check_storable(value: &Value) -> Result<()> {
+    match value {
+        Value::String(text) if text.contains('\0') => Err(unstorable()),
+        Value::Array(items) => items.iter().try_for_each(check_storable),
+        Value::Object(fields) => {
+            for (name, value) in fields {
+                if name.contains('\0') {
+                    return Err(unstorable());
+                }
+                check_storable(value)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn unstorable() -> DurableError {
+    DurableError::invalid(
+        "a value contains U+0000, which the durable record format cannot store; the record was \
+         refused rather than rewritten",
+    )
+}
+
 fn decode(text: &str) -> Result<Value> {
     serde_json::from_str(text).map_err(|error| {
-        DurableError::unavailable(format!("sqlite: a stored record is not JSON: {error}"))
+        DurableError::invalid(format!("sqlite: a stored record is not JSON: {error}"))
     })
 }
 
@@ -767,5 +1006,181 @@ mod tests {
             txn(&store, "s:1", |txn| txn.get("a")).expect("read"),
             Some(json!("hello"))
         );
+    }
+
+    /// A version 1 database keeps its rows: the rebuild copies all three tables into the version 2
+    /// shapes, records the version and leaves the foreign key switch on.
+    #[test]
+    fn a_v1_database_is_migrated_in_place() {
+        let path = temp_path("migrate");
+        {
+            let connection = Connection::open(&path).expect("v1 database");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE agentscope_scope (
+                        scope_key TEXT PRIMARY KEY,
+                        revision INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE agentscope_part (
+                        scope_key TEXT NOT NULL,
+                        k TEXT NOT NULL,
+                        v TEXT NOT NULL,
+                        PRIMARY KEY (scope_key, k)
+                    );
+                    CREATE TABLE agentscope_work (
+                        queue TEXT NOT NULL,
+                        work_id TEXT NOT NULL,
+                        ready_at INTEGER NOT NULL,
+                        payload TEXT,
+                        PRIMARY KEY (queue, work_id)
+                    );
+                    CREATE INDEX agentscope_work_due ON agentscope_work (queue, ready_at);
+                    INSERT INTO agentscope_scope VALUES ('s:1', 7, 1000);
+                    INSERT INTO agentscope_part VALUES ('s:1', 'a', '{"n":1}');
+                    INSERT INTO agentscope_work VALUES ('q', 'w', 5, NULL);
+                    "#,
+                )
+                .expect("version 1 schema");
+        }
+        let store = SqliteStore::open(&path).expect("migrated store");
+        assert_eq!(
+            txn(&store, "s:1", |txn| txn.get("a")).expect("read"),
+            Some(json!({ "n": 1 }))
+        );
+        assert_eq!(store.ready("q", 10, 10).expect("ready").len(), 1);
+        let connection = store.connection.lock().expect("lock");
+        assert_eq!(
+            pragma_i64(&connection, "user_version").expect("version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            pragma_i64(&connection, "application_id").expect("application id"),
+            APPLICATION_ID
+        );
+        assert_eq!(pragma_i64(&connection, "foreign_keys").expect("fk"), 1);
+        let revision: i64 = connection
+            .query_row(
+                "SELECT revision FROM agentscope_scope WHERE scope_key = 's:1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("revision");
+        assert_eq!(revision, 7, "the migration keeps the revision");
+        let indexed: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_index_info('agentscope_work_due')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index columns");
+        assert_eq!(indexed, 3, "the readiness index has its third column");
+        drop(connection);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_newer_schema_version_is_refused() {
+        let path = temp_path("future");
+        {
+            let connection = Connection::open(&path).expect("database");
+            connection
+                .execute_batch("PRAGMA user_version = 99")
+                .expect("version");
+        }
+        let error = match SqliteStore::open(&path) {
+            Ok(_) => panic!("a newer schema is refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Invalid);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_database_of_another_application_is_refused() {
+        let path = temp_path("foreign");
+        {
+            let connection = Connection::open(&path).expect("database");
+            connection
+                .execute_batch("PRAGMA application_id = 12345")
+                .expect("application id");
+        }
+        let error = match SqliteStore::open(&path) {
+            Ok(_) => panic!("a foreign database is refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Invalid);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_scope_key_over_the_bound_is_refused() {
+        let store = SqliteStore::in_memory().expect("store");
+        let key = "x".repeat(MAX_SCOPE_CHARS + 1);
+        let error = txn(&store, &key, |txn| txn.get("k")).expect_err("the key is too long");
+        assert_eq!(error.code(), ErrorCode::Invalid);
+        assert_eq!(
+            txn(&store, &"x".repeat(MAX_SCOPE_CHARS), |txn| txn.get("k"))
+                .expect("the bound itself"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_value_with_a_nul_is_refused() {
+        let store = SqliteStore::in_memory().expect("store");
+        let error = txn(&store, "s:1", |txn| txn.put("k", Some(json!("a\u{0}b"))))
+            .expect_err("U+0000 is not storable");
+        assert_eq!(error.code(), ErrorCode::Invalid);
+        assert_eq!(
+            txn(&store, "s:1", |txn| txn.get("k")).expect("read"),
+            None,
+            "the refused write did not land"
+        );
+    }
+
+    #[test]
+    fn foreign_keys_are_enforced_and_delete_cascades() {
+        let store = SqliteStore::in_memory().expect("store");
+        txn(&store, "s:1", |txn| {
+            txn.put("a", Some(json!(1)))?;
+            txn.put("b", Some(json!(2)))
+        })
+        .expect("write");
+        let connection = store.connection.lock().expect("lock");
+        let error = connection
+            .execute(
+                "INSERT INTO agentscope_part (scope_key, k, v) VALUES ('missing', 'k', '1')",
+                [],
+            )
+            .expect_err("an orphan record is refused");
+        assert!(error.to_string().contains("FOREIGN KEY"), "{error}");
+        connection
+            .execute("DELETE FROM agentscope_scope WHERE scope_key = 's:1'", [])
+            .expect("delete");
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM agentscope_part WHERE scope_key = 's:1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(remaining, 0, "the delete cascaded");
+    }
+
+    #[test]
+    fn a_page_is_capped_at_the_postgres_limit() {
+        let store = SqliteStore::in_memory().expect("store");
+        let count = MAX_PAGE + 1;
+        txn(&store, "s:1", |txn| {
+            for index in 0..count {
+                txn.put(&format!("row:{index:05}"), Some(json!(index)))?;
+            }
+            Ok(())
+        })
+        .expect("write");
+        let keys = txn(&store, "s:1", |txn| txn.keys("row:", None, count * 2)).expect("page");
+        assert_eq!(keys.len(), MAX_PAGE);
     }
 }

@@ -56,11 +56,24 @@ impl Default for MemoryPg {
     }
 }
 
+/// The instant the double dates its transactions by.
+///
+/// A fixed instant is a time bomb: `backend::turn::frame` checks a lease against the host's
+/// clock, so a lease claimed against a 2023 timestamp reads as expired and every ownership check
+/// answers `Fenced`. Starting at the host's clock keeps the double honest; each transaction then
+/// advances it by a millisecond, so ordering inside a test is still deterministic.
+fn host_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 impl MemoryPg {
     pub fn new() -> Self {
         Self {
             db: Mutex::new(Database {
-                clock: 1_700_000_000_000,
+                clock: host_millis(),
                 ..Database::default()
             }),
             statements: Mutex::new(Vec::new()),
