@@ -1,11 +1,14 @@
 //! The backend contract: one session-scoped transaction per commit, fenced by a lease.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::event_filter::EventStreamOptions;
 use crate::types::*;
+use crate::wakeups::Wakeups;
 use crate::{DurableError, Result};
 
 /// What a backend promises about atomicity and replay.
@@ -40,6 +43,14 @@ impl Default for BackendCapabilities {
 #[async_trait]
 pub trait SessionBackend: Send + Sync {
     fn capabilities(&self) -> BackendCapabilities;
+
+    /// The wakeup channel this backend publishes to, if it has one.
+    ///
+    /// A host that subscribes is told a thread may have work as soon as a commit or an
+    /// admission lands; a backend with no channel keeps the host on its interval scan.
+    fn wakeups(&self) -> Option<Arc<dyn Wakeups>> {
+        None
+    }
 
     // ---- identity ----
     async fn create(&self, spec: SessionSpec) -> Result<SessionView>;
@@ -171,6 +182,23 @@ pub trait SessionBackend: Send + Sync {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<EventPage>;
+
+    /// One page of a session's public events, narrowed by the reader's preferences.
+    ///
+    /// The default delegates to [`events`](Self::events): a backend that cannot filter still
+    /// answers, the reader just receives every event. A backend that can filter drops the
+    /// events the caller did not ask for while keeping the page's cursor, so a filtered reader
+    /// can still page forward.
+    async fn events_with(
+        &self,
+        session: &SessionKey,
+        cursor: Option<&str>,
+        limit: usize,
+        options: EventStreamOptions,
+    ) -> Result<EventPage> {
+        let _ = options;
+        self.events(session, cursor, limit).await
+    }
     async fn snapshot(&self, session: &SessionKey) -> Result<Snapshot>;
 
     /// Drops every public event outside the newest `keep_newest` of one session.

@@ -393,6 +393,9 @@ fn apply_tools(
     now: i64,
 ) -> Result<()> {
     for call in &command.tools {
+        // A commit may carry a call decoded from a remote payload; the constructor rules
+        // (executor present, binding a 64-hex digest) must hold on this path too.
+        call.validate()?;
         if turn.cancel {
             return Err(DurableError::conflict("Turn is stopping"));
         }

@@ -11,9 +11,11 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agentscope_durable::backend::TxnBackend;
+use agentscope_durable::session_backend::SessionBackend;
 use agentscope_durable::store::{RecordStore, Txn, WorkItem};
 use agentscope_durable::{DurableError, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -395,6 +397,12 @@ fn no_schema(connection: &Connection) -> bool {
         )
         .map(|count| count == 0)
         .unwrap_or(false)
+}
+
+/// Opens the SQLite-backed [`SessionBackend`] a host can drive without assembling the store.
+pub fn open_backend(path: impl AsRef<Path>) -> Result<Arc<dyn SessionBackend>> {
+    let store: Arc<dyn RecordStore> = Arc::new(SqliteStore::open(path)?);
+    Ok(Arc::new(TxnBackend::with_store(store)))
 }
 
 impl RecordStore for SqliteStore {
@@ -847,9 +855,46 @@ mod tests {
         ))
     }
 
+    #[tokio::test]
+    async fn open_backend_answers_the_baseline_views() {
+        use agentscope_durable::types::{
+            SessionKey, SessionSpec, ThreadBinding, ThreadKey, ThreadSpec,
+        };
+
+        let path = temp_path("backend");
+        let backend = open_backend(&path).expect("backend");
+        let session = SessionKey::new("ns", "s1").expect("key");
+        let binding = ThreadBinding::new("stub", "definition-1", "state-1").expect("binding");
+        backend
+            .create(SessionSpec {
+                key: session.clone(),
+                primary_binding: binding.clone(),
+                metadata: json!({}),
+            })
+            .await
+            .expect("create session");
+        let thread = ThreadKey::new(session, "main").expect("thread");
+        backend
+            .create_thread(ThreadSpec {
+                key: thread.clone(),
+                binding,
+            })
+            .await
+            .expect("create thread");
+        let receipt = backend
+            .submit(&thread, "request-1", json!({"text": "hi"}))
+            .await
+            .expect("submit");
+        assert!(!receipt.turn_id.is_empty());
+        let state = backend.thread_state(&thread).await.expect("state");
+        assert_eq!(state.definition.key, thread);
+
+        drop(backend);
+        std::fs::remove_file(&path).ok();
+    }
+
     /// Enough rows (≈ 5 MB) that dropping them is a slice of the file a rebuild can pay for.
     const ROWS: usize = 1200;
-
     #[test]
     fn reclaim_space_frees_the_pages_a_trim_released() {
         let path = temp_path("reclaim");

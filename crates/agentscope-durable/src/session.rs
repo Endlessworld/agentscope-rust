@@ -13,15 +13,17 @@
 //!   `agentscope-durable-adapter-agentscope`, and publishing events is the adapter's call.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::error::{DurableError, Result};
+use crate::event_filter::EventStreamOptions;
 use crate::harness_adapter::{settle_turn, EventSink};
 use crate::runtime::{DurableRuntime, TickOutcome};
 use crate::session_backend::SessionBackend;
 use crate::types::{
-    CommandReceipt, EventPage, HistoryPage, Lease, ModelCallPage, Signal, ThreadKey,
+    CommandReceipt, EventPage, HistoryPage, Interaction, Lease, ModelCallPage, Signal, ThreadKey,
     ThreadStateView, TurnPage, TurnReceipt, TurnStatus, TurnTask, TurnView,
 };
 
@@ -32,13 +34,25 @@ const RUN_PAGE: usize = 100;
 
 /// The session surface a host drives: admission, one tick, control, ending and views.
 pub struct DurableSession {
-    runtime: DurableRuntime,
+    runtime: Arc<DurableRuntime>,
     thread: ThreadKey,
 }
 
 impl DurableSession {
     pub fn new(runtime: DurableRuntime, thread: ThreadKey) -> Self {
+        Self {
+            runtime: Arc::new(runtime),
+            thread,
+        }
+    }
+
+    /// Shares one runtime with another session; a runtime is cloneable and shares its sinks.
+    pub fn shared(runtime: Arc<DurableRuntime>, thread: ThreadKey) -> Self {
         Self { runtime, thread }
+    }
+
+    pub fn runtime(&self) -> &Arc<DurableRuntime> {
+        &self.runtime
     }
 
     pub fn thread(&self) -> &ThreadKey {
@@ -177,6 +191,33 @@ impl DurableSession {
         }
     }
 
+    /// The interactions the thread's waiting turns are blocked on.
+    ///
+    /// The wait key *is* the interaction id, so this is the `waiting()` projection a host needs
+    /// for a permission prompt: list these, then answer one with [`Self::respond`].
+    pub async fn pending_interactions(&self) -> Result<Vec<Interaction>> {
+        let waiting = self.waiting().await?;
+        Ok(waiting
+            .into_iter()
+            .filter_map(|turn| {
+                let wait = turn.waiting?;
+                Some(Interaction {
+                    thread_id: turn.thread.thread_id.clone(),
+                    run_id: None,
+                    step_id: None,
+                    id: wait.key.clone(),
+                    request_id: wait.key.clone(),
+                    turn_id: turn.turn_id.clone(),
+                    key: wait.key.clone(),
+                    kind: "signal".to_string(),
+                    status: "waiting".to_string(),
+                    automatic: false,
+                    call: Value::Null,
+                })
+            })
+            .collect())
+    }
+
     // ---- ending ----
 
     /// Writes the ending the lease holder observed; the lease is the caller's, not the façade's,
@@ -199,6 +240,15 @@ impl DurableSession {
     }
 
     // ---- views ----
+
+    /// A handle to one turn that survives the call that admitted it.
+    pub fn turn_handle(&self, turn_id: impl Into<String>) -> TurnHandle {
+        TurnHandle {
+            runtime: self.runtime.clone(),
+            thread: self.thread.clone(),
+            turn_id: turn_id.into(),
+        }
+    }
 
     pub async fn turn(&self, turn_id: &str) -> Result<TurnView> {
         self.runtime.turn(&self.thread, turn_id).await
@@ -262,5 +312,77 @@ impl DurableSession {
         self.runtime
             .events(&self.thread.session, cursor, limit)
             .await
+    }
+
+    /// One page of the committed event stream, narrowed to what the reader asked for.
+    pub async fn events_with(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        options: EventStreamOptions,
+    ) -> Result<EventPage> {
+        self.runtime
+            .events_with(&self.thread.session, cursor, limit, options)
+            .await
+    }
+}
+
+/// A handle to one turn: polling, waiting and the committed ending.
+///
+/// The handle holds the runtime, not the session, so a host can keep it across a request or
+/// hand it to a renderer. `wait_until_terminal` polls the committed turn and sleeps with
+/// `std::thread::sleep` — the durable crate keeps no timer dependency; a host that needs a
+/// non-blocking wait polls [`view`](Self::view) from its own scheduler instead.
+#[derive(Clone)]
+pub struct TurnHandle {
+    runtime: Arc<DurableRuntime>,
+    thread: ThreadKey,
+    turn_id: String,
+}
+
+impl TurnHandle {
+    pub fn thread(&self) -> &ThreadKey {
+        &self.thread
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    /// The turn as committed right now.
+    pub async fn view(&self) -> Result<TurnView> {
+        self.runtime.turn(&self.thread, &self.turn_id).await
+    }
+
+    /// Polls until the turn is terminal, or fails once `timeout` is spent.
+    ///
+    /// A terminal turn returns without sleeping, so a caller that arrives after the ending does
+    /// not pay one poll interval.
+    pub async fn wait_until_terminal(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<TurnView> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let view = self.view().await?;
+            if view.status.terminal() {
+                return Ok(view);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(DurableError::unavailable(format!(
+                    "Turn `{}` did not reach a terminal status before the timeout",
+                    self.turn_id
+                )));
+            }
+            std::thread::sleep(poll_interval.min(deadline - now));
+        }
+    }
+
+    /// The ending the turn committed, or `None` while it is still running.
+    pub async fn result(&self) -> Result<Option<Value>> {
+        let view = self.view().await?;
+        Ok(view.status.terminal().then_some(view.output))
     }
 }

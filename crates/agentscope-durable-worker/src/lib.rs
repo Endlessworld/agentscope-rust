@@ -41,12 +41,16 @@ pub mod brain;
 pub mod driver;
 pub mod hands;
 pub mod intent;
+pub mod queued_executor;
+pub mod resident;
 pub mod worker;
 
 pub use brain::{Brain, BrainView, StubBrain, StubReply};
 pub use driver::{DriveReport, Driver, EdgeDriver, LocalDriver};
 pub use hands::{Hands, StubHands};
 pub use intent::{Intent, IntentKind};
+pub use queued_executor::QueuedExecutor;
+pub use resident::{EdgeRunner, ResidentOptions, ResidentRunner};
 pub use worker::{StepReport, Worker, HANDS_SIGNAL_KEY};
 
 /// The durable result type, re-exported so a brain or a hands implementation needs one import.

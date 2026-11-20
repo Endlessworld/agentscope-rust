@@ -15,7 +15,8 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::error::{DurableError, ErrorCode, Result};
-use crate::executor::Executor;
+use crate::event_filter::EventStreamOptions;
+use crate::executor::{Executor, ExecutorRegistry};
 use crate::harness_adapter::{EventSink, HarnessAdapter, HarnessContext};
 use crate::now_millis;
 use crate::session_backend::SessionBackend;
@@ -88,9 +89,24 @@ pub struct DurableRuntime {
     backend: Arc<dyn SessionBackend>,
     owner: String,
     lease_ttl: Duration,
-    executor: Arc<dyn Executor>,
-    adapters: HashMap<String, Arc<dyn HarnessAdapter>>,
-    events: Mutex<Option<EventSink>>,
+    executors: Arc<ExecutorRegistry>,
+    adapters: Arc<HashMap<String, Arc<dyn HarnessAdapter>>>,
+    events: Arc<Mutex<Option<EventSink>>>,
+}
+
+/// A clone shares the sink, the adapters and the executor registry: a host that moves a runtime
+/// into another task (or another session object) keeps observing the same live stream.
+impl Clone for DurableRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+            owner: self.owner.clone(),
+            lease_ttl: self.lease_ttl,
+            executors: Arc::clone(&self.executors),
+            adapters: Arc::clone(&self.adapters),
+            events: Arc::clone(&self.events),
+        }
+    }
 }
 
 impl DurableRuntime {
@@ -99,17 +115,55 @@ impl DurableRuntime {
             backend,
             owner: owner.into(),
             lease_ttl: DEFAULT_LEASE_TTL,
-            executor: Arc::new(UnconfiguredExecutor),
-            adapters: HashMap::new(),
-            events: Mutex::new(None),
+            executors: Arc::new(ExecutorRegistry::new(Arc::new(UnconfiguredExecutor))),
+            adapters: Arc::new(HashMap::new()),
+            events: Arc::new(Mutex::new(None)),
         }
     }
 
     /// The executor every [`HarnessContext`] carries. Without one, tool dispatch fails as
     /// `UNAVAILABLE` instead of silently producing an effect nobody can recover.
-    pub fn with_executor(mut self, executor: Arc<dyn Executor>) -> Self {
-        self.executor = executor;
+    pub fn with_executor(self, executor: Arc<dyn Executor>) -> Self {
+        self.with_executor_named(crate::executor::DEFAULT_EXECUTOR, executor)
+    }
+
+    /// Registers an executor under a routing name; `"local"` (the default) also becomes the
+    /// executor a call without a binding uses.
+    pub fn with_executor_named(self, name: impl Into<String>, executor: Arc<dyn Executor>) -> Self {
+        let name = name.into();
+        if name == crate::executor::DEFAULT_EXECUTOR {
+            self.executors.set_default(Arc::clone(&executor));
+        }
+        self.executors.register(name, executor);
         self
+    }
+
+    /// The named executors this runtime routes to.
+    pub fn executors(&self) -> &Arc<ExecutorRegistry> {
+        &self.executors
+    }
+
+    /// Records a delegation from the leased turn to a child thread.
+    pub async fn delegate(
+        &self,
+        lease: &Lease,
+        execution_id: &str,
+        request_id: &str,
+        target: DelegationTarget,
+    ) -> Result<DelegationView> {
+        self.backend
+            .delegate(lease, execution_id, request_id, target)
+            .await
+    }
+
+    /// Installs the parent's current checkpoint into `spec`'s thread as a settled baseline.
+    pub async fn fork_thread(
+        &self,
+        parent: &ThreadKey,
+        request_id: &str,
+        spec: ThreadSpec,
+    ) -> Result<ThreadView> {
+        crate::delegation::fork_thread(self.backend.as_ref(), parent, request_id, spec).await
     }
 
     /// Registers the adapter for one harness name; a later registration under the same name wins.
@@ -118,7 +172,7 @@ impl DurableRuntime {
         harness: impl Into<String>,
         adapter: Arc<dyn HarnessAdapter>,
     ) -> Self {
-        self.adapters.insert(harness.into(), adapter);
+        Arc::make_mut(&mut self.adapters).insert(harness.into(), adapter);
         self
     }
 
@@ -220,24 +274,54 @@ impl DurableRuntime {
         selectors: &[HarnessSelector],
         limit: usize,
     ) -> Result<Vec<TickOutcome>> {
+        self.scan_with(selectors, limit, 1).await
+    }
+
+    /// Runs one tick per ready thread, up to `parallelism` at a time.
+    ///
+    /// `parallelism == 1` is the serial scan. Above one, ticks are awaited in batches and the
+    /// outcomes are collected in ready order. Parallelism is an explicit choice, not a throughput
+    /// promise: a store with a single writer still serialises the claims, and the gain is on
+    /// stores sharded by thread.
+    pub async fn scan_with(
+        &self,
+        selectors: &[HarnessSelector],
+        limit: usize,
+        parallelism: usize,
+    ) -> Result<Vec<TickOutcome>> {
         let ready = self.backend.ready(selectors, limit).await?;
         let mut outcomes = Vec::with_capacity(ready.len());
-        for spec in ready {
-            match self.tick(&spec.key).await {
-                Ok(outcome) => outcomes.push(outcome),
-                Err(error) => {
-                    if error.code() == ErrorCode::Fenced {
-                        debug!(error = %error, "durable scan lost a lease");
-                    } else {
-                        warn!(error = %error, thread = %spec.key.thread_id, "durable scan step failed");
-                    }
-                    outcomes.push(TickOutcome::Failed {
-                        retryable: retryable(error.code()),
-                    });
-                }
+        if parallelism <= 1 {
+            for spec in ready {
+                let result = self.tick(&spec.key).await;
+                outcomes.push(Self::outcome_of(&spec.key, result));
+            }
+            return Ok(outcomes);
+        }
+        for batch in ready.chunks(parallelism) {
+            let ticks = batch.iter().map(|spec| self.tick(&spec.key));
+            for (spec, result) in batch.iter().zip(futures::future::join_all(ticks).await) {
+                outcomes.push(Self::outcome_of(&spec.key, result));
             }
         }
         Ok(outcomes)
+    }
+
+    /// The outcome a scan reports for one tick.
+    fn outcome_of(thread: &ThreadKey, result: Result<TickOutcome>) -> TickOutcome {
+        match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if error.code() == ErrorCode::Fenced {
+                    debug!(error = %error, "durable scan lost a lease");
+                } else {
+                    warn!(error = %error, thread = %thread.thread_id, "durable scan step failed");
+                }
+                TickOutcome::Failed {
+                    retryable: retryable(error.code()),
+                }
+            }
+        }
     }
 
     /// One adapter call, fenced by `lease`. No status is ever forced here: the adapter commits
@@ -283,7 +367,8 @@ impl DurableRuntime {
             definition: frame.definition.clone(),
             frame,
             backend: Arc::clone(&self.backend),
-            executor: Arc::clone(&self.executor),
+            executor: self.executors.default_executor(),
+            executors: Arc::clone(&self.executors),
             lease: lease.clone(),
             events: self.event_sink(),
         };
@@ -304,11 +389,12 @@ impl DurableRuntime {
     /// flight is recorded as cancelled — which is what lets the terminal commit pass the
     /// "unsettled effects" invariant.
     async fn settle_abandoned_cancel(&self, lease: &Lease, frame: &Frame) -> Result<()> {
-        let lookup = self.executor.capabilities().lookup_by_execution_id;
+        let executor = self.executors.default_executor();
+        let lookup = executor.capabilities().lookup_by_execution_id;
         for tool in frame.tools.iter().filter(|tool| !settled_effect(tool)) {
             let mut confirmed = None;
             if lookup {
-                if let Ok(answered) = self.executor.query(&tool.request).await {
+                if let Ok(answered) = executor.query(&tool.request).await {
                     // Only an answer that really happened is worth keeping; "cannot tell" is
                     // what the cancel itself resolves.
                     if answered.state.terminal() {
@@ -426,10 +512,11 @@ impl DurableRuntime {
             }
         };
         if lease.turn_id == turn_id {
+            let executor = self.executors.default_executor();
             match self.backend.frame(&lease).await {
                 Ok(frame) => {
                     for tool in frame.tools.iter().filter(|tool| !settled_effect(tool)) {
-                        if let Err(error) = self.executor.cancel(&tool.request).await {
+                        if let Err(error) = executor.cancel(&tool.request).await {
                             debug!(error = %error, "executor refused the cancellation");
                         }
                     }
@@ -633,6 +720,18 @@ impl DurableRuntime {
         limit: usize,
     ) -> Result<EventPage> {
         self.backend.events(session, cursor, limit).await
+    }
+
+    pub async fn events_with(
+        &self,
+        session: &SessionKey,
+        cursor: Option<&str>,
+        limit: usize,
+        options: EventStreamOptions,
+    ) -> Result<EventPage> {
+        self.backend
+            .events_with(session, cursor, limit, options)
+            .await
     }
 
     pub async fn snapshot(&self, session: &SessionKey) -> Result<Snapshot> {

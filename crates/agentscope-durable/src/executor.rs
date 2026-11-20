@@ -1,9 +1,15 @@
 //! External effect execution: the only place a side effect may leave the runtime.
 
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
 use async_trait::async_trait;
 
 use crate::types::{ExecutionRequest, ExecutionResult};
 use crate::Result;
+
+/// The name [`ExecutorRegistry::new`] registers the default executor under.
+pub const DEFAULT_EXECUTOR: &str = "local";
 
 /// What an executor can promise during recovery.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -37,5 +43,53 @@ pub trait Executor: Send + Sync {
         Ok(ExecutionResult::unknown(
             "cancel is not supported by this executor",
         ))
+    }
+}
+
+/// The named executors a host can route a tool call to.
+///
+/// The default executor is what a call without a binding uses. A named lookup never falls back
+/// to it: an unregistered name is `None` and the caller reports `UNAVAILABLE`, because guessing
+/// would run the effect somewhere its recovery cannot be found.
+pub struct ExecutorRegistry {
+    default: RwLock<Arc<dyn Executor>>,
+    named: RwLock<HashMap<String, Arc<dyn Executor>>>,
+}
+
+impl ExecutorRegistry {
+    pub fn new(default: Arc<dyn Executor>) -> Self {
+        let registry = Self {
+            default: RwLock::new(Arc::clone(&default)),
+            named: RwLock::new(HashMap::new()),
+        };
+        registry.register(DEFAULT_EXECUTOR, default);
+        registry
+    }
+
+    /// Registers `executor` under `name`; a later registration under the same name wins.
+    pub fn register(&self, name: impl Into<String>, executor: Arc<dyn Executor>) {
+        if let Ok(mut named) = self.named.write() {
+            named.insert(name.into(), executor);
+        }
+    }
+
+    /// The executor registered under `name`, or `None` if the name was never registered.
+    pub fn resolve(&self, name: &str) -> Option<Arc<dyn Executor>> {
+        self.named.read().ok()?.get(name).cloned()
+    }
+
+    /// The executor a call without a binding uses.
+    pub fn default_executor(&self) -> Arc<dyn Executor> {
+        match self.default.read() {
+            Ok(default) => Arc::clone(&default),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Replaces the default executor; the name it was registered under is unchanged.
+    pub fn set_default(&self, executor: Arc<dyn Executor>) {
+        if let Ok(mut default) = self.default.write() {
+            *default = executor;
+        }
     }
 }

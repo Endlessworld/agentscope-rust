@@ -9,7 +9,10 @@
 //! concrete agent implementation lives in `agentscope-durable-adapter-agentscope`.
 
 pub mod backend;
+pub mod delegation;
 pub mod error;
+pub mod event_filter;
+pub mod execution_store;
 pub mod executor;
 pub mod harness_adapter;
 mod json;
@@ -17,15 +20,26 @@ pub mod runtime;
 pub mod session;
 pub mod session_backend;
 pub mod store;
+pub mod tool_binding;
 pub mod traffic;
 pub mod types;
+pub mod wakeups;
 
+pub use backend::local::LocalBackend;
+pub use delegation::{child_thread_id, fork_thread, DelegationExecutor};
 pub use error::{DurableError, ErrorCode, Result};
+pub use event_filter::{is_terminal_event, DeltaFilter, EventStreamOptions};
+pub use execution_store::{
+    DispatchRecord, DispatchState, ExecutionStore, MemoryExecutionStore, RecordStoreExecutionStore,
+};
+pub use executor::{Executor, ExecutorCapabilities, ExecutorRegistry, DEFAULT_EXECUTOR};
 pub use harness_adapter::{AdapterCapabilities, EventSink, HarnessAdapter, HarnessContext};
 pub use runtime::{DurableRuntime, TickOutcome};
 pub use session::DurableSession;
 pub use session_backend::{BackendCapabilities, SessionBackend};
+pub use tool_binding::{MapCatalog, ToolBinding, ToolCatalog};
 pub use types::*;
+pub use wakeups::{LocalWakeups, SubscriptionId, Wakeup, WakeupReason, WakeupSink, Wakeups};
 
 /// The only clock a durable decision may use outside a store transaction.
 pub fn now_millis() -> i64 {

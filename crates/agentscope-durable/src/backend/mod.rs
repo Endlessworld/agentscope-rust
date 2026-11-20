@@ -8,6 +8,7 @@ pub(crate) mod branch;
 pub(crate) mod commit;
 pub(crate) mod compact;
 pub(crate) mod identity;
+pub mod local;
 pub(crate) mod model;
 pub(crate) mod query;
 pub(crate) mod resource;
@@ -23,11 +24,14 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::event_filter::EventStreamOptions;
 use crate::session_backend::{BackendCapabilities, SessionBackend};
 use crate::store::memory::InMemoryStore;
 use crate::store::{RecordStore, Txn};
 use crate::types::*;
+use crate::wakeups::{Wakeup, WakeupReason, Wakeups};
 use crate::{json, DurableError, Result};
+use tracing::warn;
 
 use model::*;
 
@@ -71,6 +75,8 @@ pub struct TxnBackend {
     /// (nothing in this process shortens a lease it granted), so the worst case is one redundant
     /// write, never a lease that lapses unextended.
     granted: Mutex<HashMap<(String, u64), Grant>>,
+    /// Where a commit or an admission is announced; `None` keeps hosts on their interval scan.
+    wakeups: Option<Arc<dyn Wakeups>>,
 }
 
 impl TxnBackend {
@@ -78,6 +84,7 @@ impl TxnBackend {
         Self {
             store: Arc::new(InMemoryStore::new()),
             granted: Mutex::new(HashMap::new()),
+            wakeups: None,
         }
     }
 
@@ -85,7 +92,14 @@ impl TxnBackend {
         Self {
             store,
             granted: Mutex::new(HashMap::new()),
+            wakeups: None,
         }
+    }
+
+    /// Publishes a wakeup after every successful commit and admission.
+    pub fn with_wakeups(mut self, wakeups: Arc<dyn Wakeups>) -> Self {
+        self.wakeups = Some(wakeups);
+        self
     }
 
     fn lease_key(lease: &Lease) -> (String, u64) {
@@ -133,6 +147,22 @@ impl TxnBackend {
 
     pub fn store(&self) -> &Arc<dyn RecordStore> {
         &self.store
+    }
+
+    /// Announces that `thread` may have work. Publication is fail-open: the commit it follows
+    /// already landed, so a broken channel may cost a scan interval but never the work itself.
+    fn notify(&self, thread: &ThreadKey, reason: WakeupReason) {
+        let Some(wakeups) = &self.wakeups else {
+            return;
+        };
+        let wakeup = Wakeup {
+            thread: thread.clone(),
+            at: crate::now_millis(),
+            reason,
+        };
+        if let Err(error) = wakeups.publish(&wakeup) {
+            warn!(error = %error, "durable wakeup publication failed");
+        }
     }
 }
 
@@ -668,6 +698,10 @@ impl SessionBackend for TxnBackend {
         }
     }
 
+    fn wakeups(&self) -> Option<Arc<dyn Wakeups>> {
+        self.wakeups.clone()
+    }
+
     async fn create(&self, spec: SessionSpec) -> Result<SessionView> {
         identity::create(self.store.as_ref(), spec)
     }
@@ -711,7 +745,9 @@ impl SessionBackend for TxnBackend {
         request_id: &str,
         input: Value,
     ) -> Result<TurnReceipt> {
-        turn::submit(self.store.as_ref(), thread, request_id, input)
+        let receipt = turn::submit(self.store.as_ref(), thread, request_id, input)?;
+        self.notify(&receipt.thread, WakeupReason::Submitted);
+        Ok(receipt)
     }
 
     async fn admission(
@@ -789,7 +825,9 @@ impl SessionBackend for TxnBackend {
     }
 
     async fn commit(&self, lease: &Lease, commit: Commit) -> Result<CommitReceipt> {
-        commit::commit(self.store.as_ref(), lease, commit)
+        let receipt = commit::commit(self.store.as_ref(), lease, commit)?;
+        self.notify(&lease.thread, WakeupReason::Committed);
+        Ok(receipt)
     }
 
     async fn receipt(
@@ -889,6 +927,19 @@ impl SessionBackend for TxnBackend {
         limit: usize,
     ) -> Result<EventPage> {
         query::events(self.store.as_ref(), session, cursor, limit)
+    }
+
+    async fn events_with(
+        &self,
+        session: &SessionKey,
+        cursor: Option<&str>,
+        limit: usize,
+        options: EventStreamOptions,
+    ) -> Result<EventPage> {
+        let mut page = query::events(self.store.as_ref(), session, cursor, limit)?;
+        page.events
+            .retain(|event| options.deltas.allows(&event.event_type));
+        Ok(page)
     }
 
     async fn snapshot(&self, session: &SessionKey) -> Result<Snapshot> {

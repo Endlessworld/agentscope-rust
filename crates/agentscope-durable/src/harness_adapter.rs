@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::executor::Executor;
+use crate::executor::{Executor, ExecutorRegistry};
 use crate::session_backend::SessionBackend;
 use crate::types::{
     AppliedResult, Commit, ExecutionState, Frame, Lease, RunStepRef, ThreadSpec, ToolExecution,
@@ -33,6 +33,8 @@ pub struct HarnessContext {
     pub frame: Frame,
     pub backend: Arc<dyn SessionBackend>,
     pub executor: Arc<dyn Executor>,
+    /// The named executors a call's `executor` field routes to.
+    pub executors: Arc<ExecutorRegistry>,
     pub lease: Lease,
     /// Where the adapter publishes a run's events while it is still going.
     pub events: Option<EventSink>,

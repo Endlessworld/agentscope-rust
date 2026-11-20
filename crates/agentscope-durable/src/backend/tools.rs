@@ -250,6 +250,10 @@ pub(super) fn apply_dispatch(
     let Some(tool) = turn.tools.get(execution_id) else {
         return Err(DurableError::not_found("Execution does not exist"));
     };
+    if tool.request.call.executor.trim().is_empty() {
+        return Err(DurableError::invalid("Execution has no executor"));
+    }
+    tool.request.call.validate()?;
     if tool.request.turn_id != turn.turn_id {
         return Err(DurableError::not_found(
             "Execution does not belong to this turn",
