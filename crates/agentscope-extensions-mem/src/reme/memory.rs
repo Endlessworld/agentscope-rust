@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn a_document_only_turn_stays_recordable() {
         let mut msg = Msg::builder().role(MsgRole::User).build();
-        msg.content.push(agentscope_core::ContentBlock::Document(
+        std::sync::Arc::make_mut(&mut msg.content).push(agentscope_core::ContentBlock::Document(
             agentscope_core::DocumentBlock::builder()
                 .source(agentscope_core::Source::Url(
                     agentscope_core::URLSource::new("https://example.com/a.pdf"),

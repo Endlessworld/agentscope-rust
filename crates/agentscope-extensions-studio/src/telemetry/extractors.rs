@@ -624,7 +624,7 @@ mod tests {
     #[test]
     fn format_request_replaces_an_inline_document_with_its_reference() {
         let mut msg = Msg::builder().role(MsgRole::User).build();
-        msg.content.push(ContentBlock::Document(
+        std::sync::Arc::make_mut(&mut msg.content).push(ContentBlock::Document(
             agentscope_core::message::DocumentBlock::builder()
                 .source(agentscope_core::message::Source::Base64(
                     agentscope_core::message::Base64Source::new("application/pdf", "aGVsbG8="),
@@ -644,7 +644,7 @@ mod tests {
     fn format_request_redacts_a_tool_result_document_and_keeps_plain_messages() {
         let plain = Msg::user("hi");
         let mut with_tool = Msg::builder().role(MsgRole::Tool).build();
-        with_tool.content.push(ContentBlock::ToolResult(
+        std::sync::Arc::make_mut(&mut with_tool.content).push(ContentBlock::ToolResult(
             agentscope_core::message::ToolResultBlock {
                 id: Some("call-1".into()),
                 name: Some("export".into()),

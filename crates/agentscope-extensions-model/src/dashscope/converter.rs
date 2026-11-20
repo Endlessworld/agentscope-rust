@@ -1241,8 +1241,8 @@ mod tests {
     #[test]
     fn hint_blocks_are_joined_with_newlines() {
         let mut msg = Msg::user("a");
-        msg.content.push(ContentBlock::Text(TextBlock::new("b")));
-        msg.content
+        std::sync::Arc::make_mut(&mut msg.content).push(ContentBlock::Text(TextBlock::new("b")));
+        std::sync::Arc::make_mut(&mut msg.content)
             .push(ContentBlock::Hint(HintBlock::new("h", "c")));
         let msgs = convert(vec![msg], false);
         assert_eq!(
@@ -1254,7 +1254,7 @@ mod tests {
     #[test]
     fn assistant_tool_use_becomes_tool_calls_with_json_args() {
         let mut msg = Msg::assistant("");
-        msg.content.push(ContentBlock::ToolUse(ToolUseBlock::new(
+        std::sync::Arc::make_mut(&mut msg.content).push(ContentBlock::ToolUse(ToolUseBlock::new(
             "call_1",
             "get_weather",
             serde_json::json!({"city": "Paris"})
@@ -1306,10 +1306,9 @@ mod tests {
     #[test]
     fn base64_image_becomes_data_url_part_in_multimodal_mode() {
         let mut msg = Msg::user("look");
-        msg.content
-            .push(ContentBlock::Image(ImageBlock::new(Source::Base64(
-                agentscope_core::Base64Source::new("image/png", "AAAA"),
-            ))));
+        std::sync::Arc::make_mut(&mut msg.content).push(ContentBlock::Image(ImageBlock::new(
+            Source::Base64(agentscope_core::Base64Source::new("image/png", "AAAA")),
+        )));
         let msgs = convert(vec![msg], false);
         match msgs[0].content.as_ref().unwrap() {
             DashScopeContent::Parts(parts) => {
@@ -1352,7 +1351,7 @@ mod tests {
             ],
         );
         let mut msg = Msg::tool("call_1", "get_image", "");
-        msg.content = vec![ContentBlock::ToolResult(result)];
+        msg.content = vec![ContentBlock::ToolResult(result)].into();
         let msgs = convert(vec![msg], true);
         assert_eq!(msgs[0].role.as_deref(), Some("tool"));
         assert_eq!(msgs[0].tool_call_id.as_deref(), Some("call_1"));
@@ -1371,10 +1370,9 @@ mod tests {
     #[test]
     fn thinking_blocks_are_dropped_from_the_text_content_but_replayed_as_reasoning() {
         let mut msg = Msg::user("x");
-        msg.content
-            .push(ContentBlock::Thinking(agentscope_core::ThinkingBlock::new(
-                "secret",
-            )));
+        std::sync::Arc::make_mut(&mut msg.content).push(ContentBlock::Thinking(
+            agentscope_core::ThinkingBlock::new("secret"),
+        ));
         let msgs = convert(vec![msg], false);
         assert_eq!(
             msgs[0].content.as_ref().and_then(|c| c.as_text()),
@@ -1390,7 +1388,7 @@ mod tests {
         // next request; dropping it (`Thinking(_) => {}`) lost the history.
         for force_multimodal in [false, true] {
             let mut msg = Msg::assistant("answer");
-            msg.content.insert(
+            std::sync::Arc::make_mut(&mut msg.content).insert(
                 0,
                 ContentBlock::Thinking(agentscope_core::ThinkingBlock::new("let me think")),
             );
@@ -1417,13 +1415,9 @@ mod tests {
         // A `tool` message without `name` serialized the field away and the chat
         // template rejected the request ("'dict object' has no attribute 'name'").
         let mut assistant = Msg::assistant("");
-        assistant
-            .content
-            .push(ContentBlock::ToolUse(ToolUseBlock::new(
-                "call_1",
-                "get_weather",
-                agentscope_core::JsonMap::new(),
-            )));
+        std::sync::Arc::make_mut(&mut assistant.content).push(ContentBlock::ToolUse(
+            ToolUseBlock::new("call_1", "get_weather", agentscope_core::JsonMap::new()),
+        ));
         let mut result = agentscope_core::ToolResultBlock::new(
             "call_1",
             "",
@@ -1431,7 +1425,7 @@ mod tests {
         );
         result.name = None;
         let mut tool = Msg::tool("call_1", "", "");
-        tool.content = vec![ContentBlock::ToolResult(result)];
+        tool.content = vec![ContentBlock::ToolResult(result)].into();
 
         let msgs = convert(vec![assistant, tool], false);
         assert_eq!(msgs[1].role.as_deref(), Some("tool"));
@@ -1453,7 +1447,7 @@ mod tests {
         );
         result.name = None;
         let mut tool = Msg::tool("call_9", "", "");
-        tool.content = vec![ContentBlock::ToolResult(result)];
+        tool.content = vec![ContentBlock::ToolResult(result)].into();
         let err = to_dashscope_messages(vec![tool], false)
             .expect_err("a nameless tool message must not be sent");
         let text = format!("{err}");
@@ -1462,7 +1456,7 @@ mod tests {
         // A tool-role message with no tool result at all is refused too.
         let mut empty = Msg::assistant("");
         empty.role = MsgRole::Tool;
-        empty.content = vec![ContentBlock::Text(TextBlock::new("orphan"))];
+        empty.content = vec![ContentBlock::Text(TextBlock::new("orphan"))].into();
         let err = to_dashscope_messages(vec![empty], true).expect_err("no tool_call_id");
         assert!(format!("{err}").contains("tool-role message"), "{err}");
     }
@@ -1473,13 +1467,12 @@ mod tests {
         // type, so the extension check must not reject it (it fell back to a text
         // placeholder before).
         let mut msg = Msg::user("look");
-        msg.content
-            .push(ContentBlock::Image(ImageBlock::new(Source::Url(
-                agentscope_core::URLSource {
-                    url: "https://cdn.example.com/render?id=42".to_string(),
-                    mime_type: Some("image/png".to_string()),
-                },
-            ))));
+        std::sync::Arc::make_mut(&mut msg.content).push(ContentBlock::Image(ImageBlock::new(
+            Source::Url(agentscope_core::URLSource {
+                url: "https://cdn.example.com/render?id=42".to_string(),
+                mime_type: Some("image/png".to_string()),
+            }),
+        )));
         let msgs = convert(vec![msg], false);
         match msgs[0].content.as_ref().unwrap() {
             DashScopeContent::Parts(parts) => assert_eq!(

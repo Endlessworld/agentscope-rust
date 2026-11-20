@@ -1538,7 +1538,7 @@ mod tests {
     fn ctx_with_state(messages: Vec<Msg>) -> RuntimeContext {
         let mut ctx = RuntimeContext::new();
         let mut state = AgentState::default();
-        state.context = messages;
+        state.context = messages.into();
         ctx.state = Some(Arc::new(Mutex::new(state)));
         ctx
     }

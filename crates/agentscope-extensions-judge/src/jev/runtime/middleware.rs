@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn trace_projection_carries_roles_blocks_and_tools() {
         let mut msg = Msg::text(MsgRole::Assistant, "hi");
-        msg.content.push(ContentBlock::ToolResult(
+        std::sync::Arc::make_mut(&mut msg.content).push(ContentBlock::ToolResult(
             agentscope_core::message::ToolResultBlock::new(
                 "c1",
                 "search",
@@ -1366,7 +1366,7 @@ mod tests {
         assert_eq!(middleware.restriction(&text_only), None);
         // A tool result carrying a non-text part is not forwardable (the block-type scan).
         let mut with_result = Msg::text(MsgRole::Tool, "");
-        with_result.content.push(ContentBlock::ToolResult(
+        std::sync::Arc::make_mut(&mut with_result.content).push(ContentBlock::ToolResult(
             agentscope_core::message::ToolResultBlock::new("c1", "search", vec![]),
         ));
         let with_result = ModelCallInput::new(

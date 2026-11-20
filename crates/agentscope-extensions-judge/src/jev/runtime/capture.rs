@@ -273,8 +273,7 @@ mod tests {
     #[test]
     fn task_is_bounded_and_non_text_input_truncates() {
         let mut assistant = Msg::assistant("second");
-        assistant
-            .content
+        std::sync::Arc::make_mut(&mut assistant.content)
             .push(ContentBlock::Thinking(ThinkingBlock::default()));
         let capture = SupervisionCapture::new(scope(), &[user("first"), assistant], 64);
         assert_eq!(capture.task(), "first\nsecond\n");

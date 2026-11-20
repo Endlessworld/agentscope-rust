@@ -509,7 +509,7 @@ mod tests {
         let compacted = projector.compacted();
         assert_eq!(compacted.len(), 1);
         assert_eq!(
-            compacted[0].content,
+            *compacted[0].content,
             vec![ContentBlock::Text(TextBlock::new("Hello"))]
         );
     }

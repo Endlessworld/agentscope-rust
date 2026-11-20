@@ -2114,7 +2114,7 @@ mod tests {
         let compacted = ServerMessageConvert::compact_streaming_chunks(&deltas);
         assert_eq!(compacted.len(), 2);
         assert_eq!(
-            compacted[0].content,
+            *compacted[0].content,
             vec![ContentBlock::Text(TextBlock::new("Hello"))]
         );
         assert_eq!(compacted[1].id, "m2");
@@ -2137,7 +2137,7 @@ mod tests {
         let compacted = ServerMessageConvert::compact_streaming_chunks(&deltas);
         assert_eq!(compacted.len(), 1);
         assert_eq!(
-            compacted[0].content,
+            *compacted[0].content,
             vec![ContentBlock::Thinking(ThinkingBlock::new("ab"))]
         );
     }
@@ -2169,13 +2169,13 @@ mod tests {
         assert_eq!(restored[0].name.as_deref(), Some("alice"));
         assert_eq!(restored[0].role, MsgRole::Assistant);
         assert_eq!(
-            restored[0].content,
+            *restored[0].content,
             vec![ContentBlock::Text(TextBlock::new("one"))]
         );
         assert_eq!(restored[0].metadata["k"], "v");
         assert_eq!(restored[1].id, "m2");
         assert_eq!(
-            restored[1].content,
+            *restored[1].content,
             vec![ContentBlock::Text(TextBlock::new("two"))]
         );
     }
@@ -2187,7 +2187,7 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, MsgRole::User);
         assert_eq!(
-            msgs[0].content,
+            *msgs[0].content,
             vec![ContentBlock::Text(TextBlock::new("plain"))]
         );
     }

@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn convert_messages_keeps_a_document_only_turn() {
         let mut attachment_only = Msg::builder().role(MsgRole::User).build();
-        attachment_only.content.push(ContentBlock::Document(
+        std::sync::Arc::make_mut(&mut attachment_only.content).push(ContentBlock::Document(
             DocumentBlock::builder()
                 .source(agentscope_core::Source::Url(
                     agentscope_core::URLSource::new("https://example.com/a.pdf"),

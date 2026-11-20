@@ -1290,7 +1290,7 @@ mod tests {
         assert_eq!(msg.name.as_deref(), Some("remote-agent"));
         assert_eq!(msg.role, MsgRole::Assistant);
         assert_eq!(
-            msg.content,
+            *msg.content,
             vec![ContentBlock::Text(TextBlock::new("incoming"))]
         );
     }
@@ -1309,7 +1309,7 @@ mod tests {
         assert_eq!(msg.id, "art-2");
         assert_eq!(msg.name.as_deref(), Some("agent-x"));
         assert_eq!(
-            msg.content,
+            *msg.content,
             vec![ContentBlock::Text(TextBlock::new("payload"))]
         );
     }
