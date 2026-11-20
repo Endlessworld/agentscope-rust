@@ -31,16 +31,34 @@ use async_trait::async_trait;
 pub type EventSink =
     Arc<dyn Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync>;
 
+/// The client capabilities a turn needs to render itself.
+///
+/// They are read once per prompt (a client's advertised capabilities do not change within a
+/// session) and carried as plain bits, so the driver never reaches back into the session.
+#[derive(Clone)]
+pub struct PromptCaps {
+    pub supports_notices: bool,
+    pub supports_plan_operations: bool,
+    pub supports_compaction: bool,
+    pub last_input_tokens: Arc<std::sync::atomic::AtomicU64>,
+}
+
 /// One prompt, as the protocol layer sees it.
-#[derive(Clone, Debug)]
+///
+/// The turn's own id is not here: the driver derives it when it admits the turn (a retry of the
+/// same prompt must reuse the entry the first attempt wrote).
+#[derive(Clone)]
 pub struct DriverInput {
-    pub turn_id: String,
-    pub message: Msg,
-    pub accepted_at_ms: i64,
-    pub model: String,
-    pub thought_level: String,
-    /// The generation the turn started under; a cancel that advances it stops only that turn.
-    pub cancel_epoch: u64,
+    pub message: Option<Msg>,
+    pub wakeup: bool,
+    /// The shared generation a cancel advances.
+    pub cancel_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Its value when this turn was admitted; a cancel that advances the generation stops only
+    /// this turn.
+    pub admitted_epoch: u64,
+    pub closed: Arc<std::sync::atomic::AtomicBool>,
+    pub cancellation: Option<agent_client_protocol::RequestCancellation>,
+    pub caps: PromptCaps,
 }
 
 /// What a finished turn reports back to the protocol layer.
