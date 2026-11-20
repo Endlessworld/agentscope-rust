@@ -183,13 +183,45 @@ impl SqliteStore {
             .connection
             .lock()
             .map_err(|_| DurableError::unavailable("the sqlite connection lock was poisoned"))?;
-        // Outside a transaction (the commit has returned). A trim is rare — the size has to
-        // double, or pass the ceiling — so rebuilding the file is the simple answer: it returns
-        // every free page to the filesystem, where `incremental_vacuum` leaves most of the work
-        // to a later checkpoint in WAL mode and freed almost nothing here.
+        // Outside a transaction (the commit has returned). A trim drops rows; whether the pages
+        // they occupied are worth a rebuild is a separate question, because `VACUUM` rewrites
+        // every page of the file — including sessions that have nothing to do with this trim.
+        // The trim that produced this call may have freed next to nothing (a scope whose live
+        // facts exceed the compaction ceiling cannot shrink), and rebuilding the file for it
+        // turns every commit into a whole-file write. The freelist is what a rebuild returns to
+        // the filesystem; below a real share of the file, page reuse already handles it.
+        let (page_size, pages, free) = freelist(&connection)?;
+        let freed = free * page_size;
+        if freed < RECLAIM_MIN_FREED_BYTES || freed * RECLAIM_MIN_FREED_SHARE < pages * page_size {
+            return Ok(());
+        }
         connection.execute_batch("VACUUM").map_err(unavailable)?;
         Ok(())
     }
+}
+
+/// The share of the file a trim has to have released before `VACUUM` pays for its rewrite.
+const RECLAIM_MIN_FREED_SHARE: u64 = 4;
+
+/// The absolute floor a rebuild must return, so a small database is not rewritten for a few pages.
+const RECLAIM_MIN_FREED_BYTES: u64 = 2 << 20;
+
+/// Page size, page count and free pages of the database.
+fn freelist(connection: &Connection) -> Result<(u64, u64, u64)> {
+    let page_size: i64 = connection
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .map_err(unavailable)?;
+    let pages: i64 = connection
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .map_err(unavailable)?;
+    let free: i64 = connection
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .map_err(unavailable)?;
+    Ok((
+        page_size.max(0) as u64,
+        pages.max(0) as u64,
+        free.max(0) as u64,
+    ))
 }
 
 /// Whether the database was created without automatic vacuuming.
@@ -576,6 +608,9 @@ mod tests {
         ))
     }
 
+    /// Enough rows (≈ 5 MB) that dropping them is a slice of the file a rebuild can pay for.
+    const ROWS: usize = 1200;
+
     #[test]
     fn reclaim_space_frees_the_pages_a_trim_released() {
         let path = temp_path("reclaim");
@@ -591,7 +626,7 @@ mod tests {
         let write = |value: Option<Value>| {
             store
                 .transaction("ns/reclaim", &mut |txn: &mut dyn Txn| {
-                    for index in 0..400 {
+                    for index in 0..ROWS {
                         txn.put(&format!("row:{index:04}"), value.clone())?;
                     }
                     Ok(())
@@ -613,6 +648,52 @@ mod tests {
         );
         store.reclaim_space().expect("reclaim");
         assert_eq!(freelist(), 0, "the reclaim empties the freelist");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_trim_that_freed_little_does_not_rebuild_the_file() {
+        let path = temp_path("reclaim-small");
+        let store = SqliteStore::open(&path).expect("store");
+        let payload = "x".repeat(4096);
+        store
+            .transaction("ns/small", &mut |txn: &mut dyn Txn| {
+                for index in 0..ROWS {
+                    txn.put(
+                        &format!("row:{index:04}"),
+                        Some(Value::String(payload.clone())),
+                    )?;
+                }
+                Ok(())
+            })
+            .expect("write");
+        // A trim of a scope that cannot shrink drops a handful of rows, not a share of the file.
+        store
+            .transaction("ns/small", &mut |txn: &mut dyn Txn| {
+                for index in 0..32 {
+                    txn.put(&format!("row:{index:04}"), None)?;
+                }
+                Ok(())
+            })
+            .expect("trim");
+        let before = {
+            let connection = store.connection.lock().expect("lock");
+            connection
+                .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+                .expect("freelist_count")
+        };
+        assert!(before > 0, "the trim did free pages");
+        store.reclaim_space().expect("reclaim");
+        let after = {
+            let connection = store.connection.lock().expect("lock");
+            connection
+                .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+                .expect("freelist_count")
+        };
+        assert_eq!(
+            after, before,
+            "a rebuild that would return a few pages is not worth rewriting the file"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

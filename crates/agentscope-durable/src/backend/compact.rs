@@ -29,8 +29,9 @@
 //! A trim is not free: it walks three key ranges of the document. A scope that cannot shrink — a
 //! transcript longer than the event window, a baseline it must keep — would be walked again on
 //! every commit and give back almost nothing, which is a permanent fee on a session that simply
-//! is big. [`worth_compacting`] therefore asks for the scope to have grown by a tenth since the
-//! previous trim measured its result before it pays for another one.
+//! is big. [`worth_compacting`] therefore asks for the scope to have grown since the previous
+//! trim measured its result before it pays for another one: by half for a scope between the
+//! threshold and the ceiling, and by a fixed slice above the ceiling.
 
 use serde_json::Value;
 
@@ -74,6 +75,18 @@ const MIN_GAIN_DIVISOR: u64 = 2;
 /// enough that one document does not become a second database.
 const COMPACT_CEILING_BYTES: u64 = 12 << 20;
 
+/// How much a scope above [`COMPACT_CEILING_BYTES`] has to grow before it is walked again.
+///
+/// The ceiling used to trim unconditionally, which is only harmless when a trim can shrink the
+/// scope. A long session whose live facts alone (transcript, tool outcomes, the event window)
+/// keep the scope above the ceiling cannot shrink at all: every commit walked three key ranges
+/// and freed nothing, and on SQLite every one of those trims was followed by `VACUUM`, which
+/// rewrites the whole database file — a session resumed into that state wrote hundreds of
+/// megabytes a second while doing no useful work. Growth is what a trim can actually free, so
+/// above the ceiling a real slice of new bytes is what pays for the next walk; the scope stays
+/// bounded because every new byte of dropable data counts towards it.
+const COMPACT_CEILING_GROWTH_BYTES: u64 = 256 * 1024;
+
 /// Whether a scope of `bytes` is worth compacting, given the size the last trim left behind.
 ///
 /// `after` is the scope size recorded by the commit that followed the last trim, or `0` when no
@@ -88,7 +101,7 @@ pub(super) fn worth_compacting(bytes: u64, after: u64) -> bool {
         return false;
     }
     if bytes >= COMPACT_CEILING_BYTES {
-        return true;
+        return bytes.saturating_sub(after) >= COMPACT_CEILING_GROWTH_BYTES;
     }
     after == 0 || bytes.saturating_sub(after) >= bytes / MIN_GAIN_DIVISOR
 }
@@ -293,16 +306,28 @@ mod tests {
     }
 
     #[test]
-    fn a_scope_over_the_ceiling_is_compacted_whatever_it_grew() {
-        // The fractional rule alone would leave a scope that cannot shrink above the threshold
-        // forever; the ceiling is the escape hatch.
-        assert!(worth_compacting(
+    fn a_scope_over_the_ceiling_needs_a_real_slice_of_new_bytes() {
+        // A scope whose live facts alone exceed the ceiling cannot shrink, so trimming it on
+        // every commit is pure cost: every walk frees nothing, and each one is followed by a
+        // store-side reclaim (`VACUUM` on SQLite) that rewrites the whole file.
+        assert!(!worth_compacting(
             COMPACT_CEILING_BYTES,
             COMPACT_CEILING_BYTES
         ));
-        assert!(worth_compacting(
-            COMPACT_CEILING_BYTES + 1,
+        assert!(!worth_compacting(
+            COMPACT_CEILING_BYTES + COMPACT_CEILING_GROWTH_BYTES - 1,
             COMPACT_CEILING_BYTES
+        ));
+        // New dropable bytes are what a walk can free, so they still pay for one.
+        assert!(worth_compacting(
+            COMPACT_CEILING_BYTES + COMPACT_CEILING_GROWTH_BYTES,
+            COMPACT_CEILING_BYTES
+        ));
+        // A scope whose last trim could not shrink is measured at its own size: unchanged is
+        // not a reason to walk it again.
+        assert!(!worth_compacting(
+            COMPACT_CEILING_BYTES * 3,
+            COMPACT_CEILING_BYTES * 3
         ));
     }
 
