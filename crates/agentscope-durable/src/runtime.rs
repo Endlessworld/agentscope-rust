@@ -479,6 +479,10 @@ impl DurableRuntime {
     /// Requests cancellation durably, then asks the executor to stop outstanding effects.
     pub async fn cancel(&self, thread: &ThreadKey, turn_id: &str, request_id: &str) -> Result<()> {
         let turn = self.backend.turn(thread, turn_id).await?;
+        // A turn that never started holds no effect this process could still be running. Looking
+        // for one would claim the *next* unfinished turn (the claim bumps its epoch and marks it
+        // running), so removing or cancelling a queued turn would start the one behind it.
+        let started = turn.status != TurnStatus::Queued;
         self.backend
             .control(
                 thread,
@@ -492,7 +496,9 @@ impl DurableRuntime {
                 },
             )
             .await?;
-        self.cancel_effects(thread, turn_id).await;
+        if started {
+            self.cancel_effects(thread, turn_id).await;
+        }
         Ok(())
     }
 

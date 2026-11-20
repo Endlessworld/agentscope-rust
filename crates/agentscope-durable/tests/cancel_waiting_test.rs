@@ -151,3 +151,32 @@ async fn a_cancelled_turn_settles_the_effects_it_still_holds() {
         "the effect the turn was waiting for belongs to the turn being stopped"
     );
 }
+
+#[tokio::test]
+async fn cancelling_a_queued_turn_leaves_the_next_one_queued() {
+    let (backend, thread, first, adapter) = waiting_turn().await;
+    let runtime = DurableRuntime::new(backend.clone(), "owner-a")
+        .with_adapter("stub", Arc::clone(&adapter) as Arc<dyn HarnessAdapter>);
+
+    // A second turn waits behind the first one.
+    let second = backend
+        .submit(&thread, "req-2", json!({ "text": "two" }))
+        .await
+        .expect("submit");
+
+    // Cancelling a turn that never started must not go looking for in-flight effects: the claim
+    // that search takes lands on the *next* unfinished turn and starts it (epoch bumped, status
+    // running, no owner) — a Stop would then kick the queue instead of clearing it.
+    runtime
+        .cancel(&thread, &first, "cancel-1")
+        .await
+        .expect("cancel");
+
+    let behind = backend.turn(&thread, &second.turn_id).await.expect("turn");
+    assert_eq!(behind.status, TurnStatus::Queued);
+    assert_eq!(
+        adapter.calls.load(Ordering::SeqCst),
+        0,
+        "cancelling a queued turn must not run anything"
+    );
+}
