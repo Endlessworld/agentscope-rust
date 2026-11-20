@@ -22,6 +22,7 @@
 - **权限记忆**：用户选择「总是允许 / 总是拒绝」后写入工作区，跨会话生效
 - **运行时切换**：`model` 与 `thought_level` 作为 ACP config option 暴露，客户端可随时切换
 - **会话持久化**：`session/new|load|resume|list|delete|close`，历史以 journal 为准，重启后恢复；默认走 durable 驱动（跨进程可续跑），也可切到轻量的原生驱动（见「运行模式」）
+- **执行中追加输入**：插话（`steer`，折进当前回合而不打断模型调用）、排队（`queue`，准入成 durable Turn，可单独撤回）、暂停 / 继续（`pause` / `resume`，原地保留位置与工具结果）。只有 durable 驱动提供（见「排队、插话与暂停」）
 - **上下文压缩**：超过阈值自动压缩，并在客户端支持时推送进度通知；也可主动触发——模型调用 `compact_context` 工具（由用户提示词驱动），或直接发送 `/compact`（宿主立即压缩，不占模型回合）
 - **长任务不霸占回合**：`execute` 超过 240 秒自动转后台（执行上限 1800 秒），模型先拿到占位结果继续推理，真实输出在后续 wakeup 回合注入
 - **MCP**：支持客户端以 `stdio` / `http` / `sse` 声明的 MCP server，也支持 MCP over ACP（SDK 5.0 的 request-scoped 语义）
@@ -40,6 +41,7 @@
 - **运行时切换**：`AGENTSCOPE_TURN_DRIVER=native` 选原生驱动；未设置、拼错或空值一律保持 durable——两种历史存放位置不可互换，不能靠“猜”切过去。构建里没有 `durable` feature 时只有一个驱动，该变量被忽略。
 - **SQLite 后端**：编译 `durable-sqlite` 后默认用 `<workspace>/.agentscope/durable/durable.db`；`AGENTSCOPE_DURABLE_STORE=file` 保留 FileStore，无需重新构建。
 - **掉电语义**：FileStore 是“进程崩溃安全、掉电不安全”（不 `fsync`）；重要部署请在文件系统层做快照。
+- **插话 / 排队 / 暂停只在 durable 驱动下可用**：它们依赖 durable 的 Turn 准入与控制通道；`native` 构建（含 `lite` 预编译包）遇到这些扩展会回错误，`queue/list` 永远是空。
 
 ## 安装
 
@@ -162,8 +164,8 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 | --- | --- |
 | `initialize` | 协商协议版本与客户端能力，返回 agent 能力与身份 |
 | `session/new` | 新建会话，返回 `modes` 与 `config_options`；同时桥接客户端声明的 MCP server |
-| `session/prompt` | 跑一轮对话；支持图像输入（按所选模型能力）、客户端 `embedded_context` |
-| `session/cancel` | 取消当前 turn（`StopReason::Cancelled`）；参数是子会话 id 时改为中断该子代理 |
+| `session/prompt` | 跑一轮对话；支持图像输入（按所选模型能力）、客户端 `embedded_context`。它同时是队列的驱动器：先把该会话遗留的排队 Turn 跑完，自己的消息跑完后再排空一次（执行期间排进来的消息跟随同一个请求） |
+| `session/cancel` | 停止：取消当前 turn（`StopReason::Cancelled`）**并清空整个队列**；参数是子会话 id 时改为中断该子代理 |
 | `session/set_mode` | 切换 `plan` / `accept_edits` / `yolo` |
 | `session/set_config_option` | 切换 `model` / `thought_level` |
 | `session/load` · `session/resume` | 从 journal 恢复会话 |
@@ -175,11 +177,42 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 | `providers/list` · `providers/set` · `providers/disable` | 模型供应商管理；`acp_harness_agent` 默认开启，模型表与展示信息走 `_meta`（见下节） |
 | `_acp_extends/providers/remove` · `default` · `catalog` · `probe` | 删供应商 / 改默认 / models.dev 目录 / 探测端点（ACP 扩展） |
 | `_acp_extends/session/respond` | 私有扩展：回答被挂起的结构化提问 |
+| `_acp_extends/session/steer` | 插话：把一条消息折进当前活跃 Turn（不新建 Turn、不排队），回 `{turnId}`；没有活跃 Turn 时 `data` 为 `no_active_turn` |
+| `_acp_extends/session/queue` | 排队：把消息准入成一个 durable Turn，回 `{turnId, position}`（`position` 从 1 起） |
+| `_acp_extends/session/queue/list` | 列出未收尾的 Turn：`{items: [{turnId, position, status}]}`；不回消息正文 |
+| `_acp_extends/session/queue/remove` | 撤回还没开跑的 Turn：`{turnId, removed}`；已开始/已收尾的回 `removed: false` |
+| `_acp_extends/session/pause` | 原地暂停运行中的 Turn：`{turnId, status}`（`pausing` → `paused`），保留位置与工具结果 |
+| `_acp_extends/session/resume` | 继续一个暂停的 Turn：请求直到 Turn 收尾才返回，期间照常推送 `session/update`，回 `{turnId, stopReason}` |
 
 ### 按客户端能力门控
 
 只有在客户端声明了相应能力时才会发送：`session/notice`（会话提示）、压缩进度、plan 操作通知、
 `end_turn` 的 token usage、MCP over ACP。没声明就不会收到，也不会报错。
+
+### 排队、插话与暂停（`_acp_extends/session/*`）
+
+执行中客户端有三种「加话」的方式，语义不同、不能互相替代（都只在 durable 驱动下可用）：
+
+| 手段 | 方法 | 效果 | 打断在途的模型调用 / 工具执行 |
+| --- | --- | --- | --- |
+| 插话 | `_acp_extends/session/steer` | 文本作为一个 Signal 折进**当前** Turn，在下一个推理边界进上下文 | ❌ 照常跑完 |
+| 排队 | `_acp_extends/session/queue` | 新准入一个 Turn（`Queued`），当前 Turn 收尾后按 FIFO 跑 | ❌ 等本轮结束 |
+| 暂停 | `_acp_extends/session/pause` | 运行中的 Turn 在最近的边界停下，保留位置与工具结果，等 `resume` | ✅ 唯一会立即停下的手段 |
+
+「先暂停、再插话、再继续」是唯一能让 agent 提前改变方向的组合：单独的插话不会打断正在跑的调用。
+
+时序与契约：
+
+- **每个 Turn 推的 `session/update` 都带 `_meta.turnId`**：一个 `session/prompt` 请求可能先后跑多个 Turn（排队的跟着它一起跑），客户端按 `turnId` 把流式内容绑到正确的消息气泡。
+- **prompt 是唯一的驱动器**：请求入口先排空遗留的 `Queued` Turn（FIFO；进程崩溃后残留的也先跑），再跑自己的消息，收尾后再排空一次——执行期间排进来的消息跟随同一个请求，不会留下没人驱动的队列。
+- **队列是 durable 的**：`queue` 一返回 Turn 就已写进 store，崩溃/重启后仍是 `Queued`，可被 `queue/list` 看到、被 `queue/remove` 撤回（撤回按 `Queued` 状态判定，已开跑的 Turn 不会被误停）。
+- **Stop = 全停**：`session/cancel` 取消运行中的 Turn 之后还会逐个取消 `Queued` 的（请求 id `stop-<turnId>`，可重放），紧接着的重投不会和在飞的取消打架。被取消的排队消息载荷不可恢复，**正文由客户端保留**，在下一次 prompt 之前用 `queue` 按原顺序重投。
+- **暂停不是取消**：ACP 没有 `paused` 停止原因，`session/prompt` 仍以 `cancelled` 结束，但同时带 `_meta.paused = true`；客户端应以此区分暂停与真正的取消。
+- **暂停不切断已开始的答复**：已经在流式输出的模型消息会写完再停（只有连续 3 秒无产出的卡死流才会被切断），所以继续时不会重复生成一段。
+- **`resume` 等到 Turn 收尾才回**：它占和 prompt 同一把锁，逐条推送 `session/update`，最后回 `{turnId, stopReason}`——fire-and-forget 的继续会让客户端分不清「还在跑」和「已经结束」。
+- **暂停落在答复已生成完之后**（finalization 边界）：`resume` 只补收尾，不再问模型；这期间插的话不会进上下文（已知边界）。
+
+无 durable 的构建（`lite` / `native`）：`steer` / `queue` / `queue/remove` / `pause` / `resume` 一律回错误（提示本构建没有 durable 驱动），`queue/list` 返回空列表，`session/cancel` 没有队列可清。
 
 ### 子代理进度（`subagent_update`，`clientCapabilities.subagents`）
 
@@ -378,6 +411,8 @@ await acp
 - 不稳定特性（plan 操作、`end_turn` usage、MCP over ACP、`providers/*`、`_acp_extends/providers/*`、
   `subagent_update`）全部按**客户端声明的能力**门控：客户端没声明就不会收到，也不会报错。
   session notices 与压缩进度在 schema 1.11 起已转正，不再需要单独的 feature 门控。
+- 执行中追加输入（`_acp_extends/session/steer|queue|pause|resume`）是**本 agent 的私有扩展**（`_` 前缀）：
+  标准客户端不调用它们就没有任何影响，普通 `session/prompt` 流程照旧。
 
 ## 模型供应商管理（`providers/*`）
 
@@ -529,14 +564,16 @@ provider、模型目录、扩展等其余变量见仓库根 [`docs/ENVIRONMENT.m
 ## 已知限制
 
 - 0.x 预发布：协议表面会随 `agent-client-protocol` 的不稳定特性调整
-- 预编译包（`embedded` profile + `lite`）**只带原生驱动**：没有 durable 的跨进程续跑与崩溃原子性；
-  需要这些保证时用 `cargo xtask acp build durable|sqlite` 自建
+- 预编译包（`embedded` profile + `lite`）**只带原生驱动**：没有 durable 的跨进程续跑与崩溃原子性，
+  也没有插话 / 排队 / 暂停；需要这些能力时用 `cargo xtask acp build durable|sqlite` 自建
 - `acp_agent_cli` 默认只按 `acp_harness_agent.exe` 找同级二进制，非 Windows 需设 `ACP_AGENT_EXE`
 - 仅支持 stdio 传输（不提供 TCP / HTTP 上的 ACP）
 - 音频输入未实现（`prompt_capabilities.audio = false`）
 - 全自动模式（`yolo`）不做任何确认，请在可信工作区使用
 - durable 的 FileStore 不做 `fsync`（进程崩溃安全、掉电不安全）；SQLite 后端是单机预览，
   WAL 不能放网络文件系统，多宿主请用 Postgres 记录存储（`agentscope-durable-jdbc`）
+- 暂停落在最终答复已生成完之后（finalization 边界）时，`resume` 只补收尾、不再问模型；
+  这期间插的话不会进上下文
 - 后台化的长工具是**进程内** spawn：ACP 进程退出，后台命令与其结果一起消失
 
 ## 作为库使用
@@ -579,6 +616,7 @@ cargo xtask acp upx sqlite    --profile embedded           # UPX 打包 + 完整
 
 模块划分：`coding_agent`（ACP 请求分发与能力声明）、`session`（协议状态 + durable 驱动）、
 `turn_driver`（驱动接缝）、`native_driver` + `session_history`（无 durable 的驱动与轻量历史）、
+`ext`（`_acp_extends/*` 私有扩展：应答 / 插话 / 队列 / 暂停）、
 `config`（modes / config options）、`elicitation`（结构化提问）、`mcp_over_acp`、`deferred_effects`、
 `event_queue`、`provider` + `providers_admin`（`providers/*` 支持）、`mem`（线程与内存诊断）、
 `retention`、`recording`。
