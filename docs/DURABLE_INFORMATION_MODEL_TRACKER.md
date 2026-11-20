@@ -271,7 +271,7 @@ session/
 2. **P2 阻塞点（已验证）**：前缀帧没有会话可拼接，必须先把 `AgentScopeExecutionHost` 恢复改成走 `JournalProjection`，再开 `CHECKPOINT_PREFIX_FRAMES`。
 3. **P5 marker 增长**：`event-id` 不能随事件删；需要归档/上限策略。
 4. **统一帧（阶段 5）**是否值得取代 FileStore scope/SQLite 行：大工程，先做崩溃/迁移设计。
-5. **第 5–7 项（`turn.output`/`model/chunk`/`finalization_started` 去重）**：收益仅磁盘 −555KB、内存 0，且需读侧 `read_parts`（会引入整份文档读）；建议合并为一次批量并在 B3-phase2 之后做（B3-phase2 的索引/快照会让读侧补读变便宜）。
+5. **第 5–7 项（`turn.output`/`model/chunk`/`finalization_started` 去重）——探针证伪，暂停**：这三类载荷的 `djournal:stored` 1.96MB 由 **recorder 层**写入，不经过 `backend/commit.rs::apply_journal`（探针把 `apply_journal` 的全部 `payload_json` 置空后，20 轮 `sbytes=716,067` 与 `djournal:stored` live-peak `1.97MB` **逐字节不变**）。因此去重只有两条路：改 recorder 写出的 wire payload（R7/B2b：需提升 `PROTOCOL_VERSION`，跨语言同步）或 store 层后置替换 + 读侧还原（与 X19 同源风险），而收益仅磁盘 −555KB、内存 0。结论：优先级降到「暂不做」；若重启需先按 recorder 侧重新归因。
 
 ## 8. 验证命令
 
@@ -310,3 +310,4 @@ cargo fmt --all -- --check
 | 2026-11-20 | **第 1 项归因**：15 次写事务 = 11 次 recorder 提交 + 4 个站点；X20（`model/chunk` 合并实验）被 `a_stalled_stream_is_journaled_within_the_flush_window` 否决并回退；结论：合并空间受恢复语义限制，成本在单次事务（`7be409e`）。 |
 | 2026-11-20 | **文档重构**：合并重复的「五项原则」「四项指标」两套章节为一套（删除概述副本），纳入 L34/L35、X20、`scope_parts` 零收益、第 1/2 项结论与当前 20 轮基线；`store_model_min_probe.rs` 转正为 `store_model_min_test.rs`（断言 DB/unique 与 legacy/new，作为 B3-phase2 的设计依据）；B3-phase2 已获批准。 |
 | 2026-11-20 | **B3-phase2 第 1 步（L36，`3928e12`）**：`FileStore` 持久化键索引 + range read，20 轮 FileStore `djournal:facts` 408.0 → 300.9MB（−26.2%）、`peak_live` 9.47 → 8.22MB。第 2 步增量 tail 解析净变差（`facts` 330.6）已完全回退（X21）；`formatVersion` root 头（`d608f22`）与损坏行恢复测试补齐；收尾 20 轮与第 1 步基线一致（301.0MB、`sbytes` 逐字节相同）。 |
+| 2026-11-20 | **第 5–7 项探针证伪**：`djournal:stored` 的这三类载荷由 recorder 层写入，`apply_journal` 置空探针后 `sbytes`/`djournal:stored` 逐字节不变；去重需改 wire（`PROTOCOL_VERSION`）或 store 层还原（X19 同源），收益仅 −555KB 磁盘/内存 0 → 优先级降到暂不做。 |
