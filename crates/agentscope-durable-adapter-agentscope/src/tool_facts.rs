@@ -132,6 +132,17 @@ pub(crate) fn tool_call(
 /// message. Mirrors core's private `extract_pending_tool_calls`, including the server-tool
 /// filter, so the host logs exactly what core is about to execute.
 pub(crate) fn pending_calls(state: &AgentState) -> Vec<ToolUseBlock> {
+    pending_calls_where(state, |_| true)
+}
+
+/// The pending tool calls that pass `keep`.
+///
+/// The predicate runs before the clone, so a caller that only wants a few calls does not pay
+/// for every argument on the way.
+pub(crate) fn pending_calls_where(
+    state: &AgentState,
+    keep: impl Fn(&ToolUseBlock) -> bool,
+) -> Vec<ToolUseBlock> {
     let context = state.context();
     let Some(owner) = context.iter().rposition(|m| m.role() == MsgRole::Assistant) else {
         return Vec::new();
@@ -146,6 +157,7 @@ pub(crate) fn pending_calls(state: &AgentState) -> Vec<ToolUseBlock> {
         .tool_use_blocks()
         .filter(|call| !call.is_server_tool())
         .filter(|call| !answered.contains(call.id.as_str()))
+        .filter(|call| keep(call))
         .cloned()
         .collect()
 }

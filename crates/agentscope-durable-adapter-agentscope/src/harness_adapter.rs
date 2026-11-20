@@ -113,7 +113,7 @@ impl AgentScopeHarnessAdapter {
         Self {
             build: Arc::new(build),
             tool_catalog: None,
-            delegation_prefix: String::new(),
+            delegation_prefix: "durable_".to_string(),
             projection: tokio::sync::Mutex::new(None),
         }
     }
@@ -126,7 +126,8 @@ impl AgentScopeHarnessAdapter {
     }
 
     /// Names the tools this adapter answers as delegations: `<prefix>delegate` and `<prefix>fork`.
-    /// The default prefix is empty, so the tools are called `delegate` and `fork`.
+    /// The default prefix is `durable_`, so the tools are called `durable_delegate` and
+    /// `durable_fork`; an empty prefix restores the bare names for a host that owns them.
     pub fn with_delegation_tools(mut self, prefix: impl Into<String>) -> Self {
         self.delegation_prefix = prefix.into();
         self
@@ -270,10 +271,12 @@ impl HarnessAdapter for AgentScopeHarnessAdapter {
             &self.delegation_prefix,
         )
         .await?;
-        let frame = if delegated {
-            backend.frame(lease).await?
+        let delegated_frame;
+        let frame: &agentscope_durable::Frame = if delegated {
+            delegated_frame = backend.frame(lease).await?;
+            &delegated_frame
         } else {
-            ctx.frame.clone()
+            &ctx.frame
         };
 
         // The committed state *is* the conversation this tick continues. Without seeding it the
@@ -587,6 +590,15 @@ async fn resolve_offloaded_effects(ctx: &HarnessContext) -> Result<agentscope_du
     if deferred.is_empty() {
         return Ok(frame);
     }
+    // Nothing registered can be re-queried, and every pending call has a registered executor:
+    // there is no answer to collect, so skip the walk over the thread's tool history.
+    if !ctx.executors.supports_lookup_by_execution_id()
+        && deferred
+            .iter()
+            .all(|request| ctx.executors.resolve(&request.call.executor).is_some())
+    {
+        return Ok(frame);
+    }
     let mut accepted = false;
     for request in deferred {
         let Some(executor) = ctx.executors.resolve(&request.call.executor) else {
@@ -703,10 +715,9 @@ pub(crate) async fn run_delegations(
     let Some(state) = state else {
         return Ok(false);
     };
-    let calls: Vec<ToolUseBlock> = crate::tool_facts::pending_calls(state)
-        .into_iter()
-        .filter(|call| delegation_kind(&call.name, prefix).is_some())
-        .collect();
+    let calls = crate::tool_facts::pending_calls_where(state, |call| {
+        delegation_kind(&call.name, prefix).is_some() && delegation_shape(call)
+    });
     if calls.is_empty() {
         return Ok(false);
     }
@@ -751,6 +762,18 @@ fn delegation_kind<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
         "fork" => Some("fork"),
         _ => None,
     }
+}
+
+/// Whether the call carries the arguments a delegation needs. A same-named local tool whose
+/// input does not look like a delegation is left to the local executor instead of being
+/// recorded as a failed delegation.
+fn delegation_shape(call: &ToolUseBlock) -> bool {
+    call.input.get("agent").and_then(Value::as_str).is_some()
+        && call
+            .input
+            .get("definition")
+            .and_then(Value::as_str)
+            .is_some()
 }
 
 async fn delegate_once(
@@ -1020,6 +1043,38 @@ mod tests {
                 .build(),
         );
         state
+    }
+
+    #[tokio::test]
+    async fn a_delegate_call_without_the_shape_is_left_to_the_local_tool() {
+        let (backend, lease) = bare_turn().await;
+        let mut state = AgentState::default();
+        state
+            .context_mut()
+            .push(Msg::text(MsgRole::User, "delegate it"));
+        let input = json!({ "task": "go" })
+            .as_object()
+            .cloned()
+            .expect("object input");
+        let call = ToolUseBlock::new("call-1", "delegate", input);
+        state.context_mut().push(
+            Msg::builder()
+                .role(MsgRole::Assistant)
+                .content(vec![ContentBlock::ToolUse(call)])
+                .build(),
+        );
+        assert!(
+            !run_delegations(backend.as_ref(), &lease, Some(&state), None, "")
+                .await
+                .expect("delegate")
+        );
+        assert!(backend.frame(&lease).await.expect("frame").tools.is_empty());
+    }
+
+    #[test]
+    fn the_default_delegation_prefix_is_namespaced() {
+        let adapter = super::AgentScopeHarnessAdapter::new(|| panic!("never builds"));
+        assert_eq!(adapter.delegation_prefix, "durable_");
     }
 
     /// A turn with no tool facts yet: the delegation path records its own intent.

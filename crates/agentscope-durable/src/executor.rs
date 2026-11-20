@@ -92,4 +92,27 @@ impl ExecutorRegistry {
             *default = executor;
         }
     }
+
+    /// Whether any registered executor can be re-queried by execution id.
+    ///
+    /// When none can, a pending call that is bound to a registered executor has no answer to
+    /// collect, and a host can skip walking a thread's tool history.
+    pub fn supports_lookup_by_execution_id(&self) -> bool {
+        let default = match self.default.read() {
+            Ok(default) => default.capabilities().lookup_by_execution_id,
+            Err(poisoned) => poisoned.into_inner().capabilities().lookup_by_execution_id,
+        };
+        if default {
+            return true;
+        }
+        match self.named.read() {
+            Ok(named) => named
+                .values()
+                .any(|executor| executor.capabilities().lookup_by_execution_id),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .values()
+                .any(|executor| executor.capabilities().lookup_by_execution_id),
+        }
+    }
 }
