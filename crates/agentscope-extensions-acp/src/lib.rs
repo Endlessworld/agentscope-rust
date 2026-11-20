@@ -9,9 +9,11 @@
 
 pub mod coding_agent;
 pub mod config;
+#[cfg(feature = "durable")]
 pub mod deferred_effects;
 pub mod elicitation;
 pub mod event;
+#[cfg(feature = "durable")]
 mod event_queue;
 pub mod ext;
 pub mod mcp_over_acp;

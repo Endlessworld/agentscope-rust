@@ -8,10 +8,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+#[cfg(feature = "durable")]
 use crate::turn_driver::{
-    DriverError, DriverInput, EventSink, Guarantees, PromptCaps, ReplayItem, ResumeOutcome,
-    TurnDriver, TurnOutcome, TurnView,
+    DriverError, Guarantees, ReplayItem, ResumeOutcome, TurnOutcome, TurnView,
 };
+use crate::turn_driver::{DriverInput, EventSink, PromptCaps, TurnDriver};
 use agent_client_protocol::v1::schema::{
     ContentBlock, CreateElicitationRequest, CreateElicitationResponse, MessageId, PermissionOption,
     PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
@@ -21,19 +22,25 @@ use agent_client_protocol::v1::schema::{
 use agent_client_protocol::{v1::ConnectionTo, Client};
 use agentscope_core::agent::CallableAgent;
 use agentscope_core::event::{AgentEvent, AgentEventType, ConfirmResult};
+#[cfg(feature = "durable")]
 use agentscope_core::journal::{ThreadJournal, UncertaintyTracker};
 use agentscope_core::message::{ChatUsage, Msg, ToolUseBlock};
 use agentscope_core::model::catalog::ModelDescriptor;
 use agentscope_core::model::{GenerateOptions, DEFAULT_CONTEXT_WINDOW};
 use agentscope_core::permission::{PermissionBehavior, PermissionRule};
 use agentscope_core::ConfirmHandler;
+#[cfg(feature = "durable")]
 use agentscope_durable::backend::TxnBackend;
+#[cfg(feature = "durable")]
 use agentscope_durable::store::file::FileStore;
+#[cfg(feature = "durable")]
 use agentscope_durable::{
     DurableRuntime, DurableSession, HarnessAdapter, SessionBackend, SessionKey, SessionSpec,
     ThreadBinding, ThreadKey, TurnStatus,
 };
+#[cfg(feature = "durable")]
 use agentscope_durable_adapter_agentscope::{AgentScopeHarnessAdapter, BackendThreadJournal};
+#[cfg(feature = "durable")]
 use sha2::{Digest, Sha256};
 
 use agentscope_harness::agent::bus::MessageBus;
@@ -41,6 +48,7 @@ use agentscope_harness::agent::subagent::task::{BackgroundTask, TaskStatus};
 use agentscope_harness::agent::HarnessAgent;
 
 use super::config::{self, ModeChoice, ModelChoice};
+#[cfg(feature = "durable")]
 use super::deferred_effects::OffloadedToolEffects;
 use super::elicitation::{ElicitationClient, ElicitationSlot};
 use super::event;
@@ -596,41 +604,52 @@ impl SelectedDescriptor {
 }
 
 /// Name this session's turns are registered under in the durable runtime.
+#[cfg(feature = "durable")]
 const DURABLE_HARNESS: &str = "agentscope-acp";
 /// Version of this host's turn definition; a checkpoint is only restorable under the same one.
+#[cfg(feature = "durable")]
 const DURABLE_DEFINITION: &str = "acp/1";
 /// Namespace of an ACP session inside its workspace's durable store.
+#[cfg(feature = "durable")]
 const DURABLE_NAMESPACE: &str = "acp";
 /// How long the tick loop rests between steps.
+#[cfg(feature = "durable")]
 const TICK_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
 /// How long a prompt waits for a tick in flight before it stops waiting for it.
+#[cfg(feature = "durable")]
 const DRIVER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long a `running` turn may make no durable progress before the client is told.
 ///
 /// Not a failure: a long command or a slow provider is legitimate, and the prompt keeps
 /// waiting. The notice exists because a hang with no output is indistinguishable from a lost
 /// request, and the user has to know that cancelling is an option.
+#[cfg(feature = "durable")]
 const RUNNING_STALL_NOTICE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// Default hard cap for a `running` turn with no durable progress.
 ///
 /// Above every per-tool ceiling the ACP agent configures (the shell and generic tool timeout is
 /// 30 minutes), so only a genuinely wedged run reaches it. `AGENTSCOPE_ACP_STALL_CANCEL_SECS`
 /// overrides it; `0`/`off` disables the cap.
+#[cfg(feature = "durable")]
 const RUNNING_STALL_CANCEL: std::time::Duration = std::time::Duration::from_secs(45 * 60);
 /// Message recorded for a tool call whose outcome was lost with the process that dispatched it.
+#[cfg(feature = "durable")]
 const ABANDONED_ON_RESUME_MESSAGE: &str = "This tool call was dispatched, but its outcome was \
      never recorded (the process ended or the run was interrupted). It was not retried; issue the \
      call again if it is still needed.";
 /// Why a resumed session settles the tool calls it found unsettled.
+#[cfg(feature = "durable")]
 const RECONCILE_REASON: &str = "resume: abandoned tool calls whose outcome was never recorded";
 
 /// The hard cap for a silent `running` turn, from `AGENTSCOPE_ACP_STALL_CANCEL_SECS`.
+#[cfg(feature = "durable")]
 fn running_stall_cancel_after() -> Option<std::time::Duration> {
     let value = std::env::var("AGENTSCOPE_ACP_STALL_CANCEL_SECS").ok();
     stall_cancel_after_value(value.as_deref())
 }
 
 /// Parses the stall-cap override; `None` means "wait forever" (the pre-existing behaviour).
+#[cfg(feature = "durable")]
 fn stall_cancel_after_value(value: Option<&str>) -> Option<std::time::Duration> {
     let Some(value) = value else {
         return Some(RUNNING_STALL_CANCEL);
@@ -653,6 +672,7 @@ fn stall_cancel_after_value(value: Option<&str>) -> Option<std::time::Duration> 
 /// running under would take — and release — that tick's lease; and `journal` is the same store
 /// opened as a core [`ThreadJournal`], which is what `session/load` replays and what the turn's
 /// ending is read through.
+#[cfg(feature = "durable")]
 struct SessionRuntime {
     session: Arc<DurableSession>,
     control: Arc<DurableRuntime>,
@@ -671,6 +691,7 @@ struct SessionRuntime {
 /// made a session whose process died mid-tool unopenable forever. Tools run in this process, so
 /// such an outcome can never arrive later: recording it as interrupted (never as success, never
 /// re-executed) is what lets the session continue.
+#[cfg(feature = "durable")]
 async fn reconcile_abandoned_tool_calls(journal: &Arc<dyn ThreadJournal>) {
     agentscope_core::diag::mark("acp:reconcile");
     match agentscope_core::journal::recovery::settle_uncertain_tool_outcomes(
@@ -701,7 +722,7 @@ async fn reconcile_abandoned_tool_calls(journal: &Arc<dyn ThreadJournal>) {
 ///
 /// Production runs [`settle_finished_turn_uncertainties_cached`]; this full-fold variant is kept
 /// as the reference implementation the cached check is tested against.
-#[cfg(test)]
+#[cfg(all(test, feature = "durable"))]
 async fn settle_finished_turn_uncertainties(journal: &Arc<dyn ThreadJournal>) {
     agentscope_core::diag::mark("acp:settle");
     match agentscope_core::journal::TurnViews::read(&**journal).await {
@@ -723,6 +744,7 @@ async fn settle_finished_turn_uncertainties(journal: &Arc<dyn ThreadJournal>) {
 /// only the events committed since the previous prompt. The full fold cost one whole-journal
 /// replay per prompt (≈25MB of allocation at a 1.4MB scope, measured), which dominated every turn
 /// once the durable commit path had been trimmed.
+#[cfg(feature = "durable")]
 async fn settle_finished_turn_uncertainties_cached(runtime: &SessionRuntime) {
     agentscope_core::diag::mark("acp:settle");
     // An unfinished turn owns its uncertainty: resuming it must not find synthetic results.
@@ -744,6 +766,7 @@ async fn settle_finished_turn_uncertainties_cached(runtime: &SessionRuntime) {
 ///
 /// The caller owns the turn gate: it must only be reached when no turn of the thread is open,
 /// because reconciliation turns every uncertain dispatch into an `interrupted` result.
+#[cfg(feature = "durable")]
 async fn settle_uncertain_with_cache(
     journal: &Arc<dyn ThreadJournal>,
     cache: &tokio::sync::Mutex<Option<UncertaintyTracker>>,
@@ -784,11 +807,13 @@ async fn settle_uncertain_with_cache(
 ///
 /// Control is idempotent on its request id, so a *fresh* id per call is what makes a repeated
 /// cancel a new intent instead of a stale receipt; the value only has to be unique per command.
+#[cfg(feature = "durable")]
 fn control_id(kind: &str) -> String {
     format!("{kind}-{}", uuid::Uuid::new_v4())
 }
 
 /// The status name this client compares against, mapped from the durable turn.
+#[cfg(feature = "durable")]
 pub(crate) fn turn_status_name(status: TurnStatus) -> &'static str {
     match status {
         TurnStatus::Succeeded => "completed",
@@ -812,6 +837,25 @@ pub(crate) fn turn_status_name(status: TurnStatus) -> &'static str {
 /// Nothing routes through the trait yet: `run`/`cancel`/`view`/`replay`/`resume` answer
 /// `Unavailable` and the session keeps calling its own methods, so the migration changes no
 /// behaviour. What it does pin is the ownership: the session no longer holds a runtime field.
+/// How many times a run its host interrupted is continued before the driver gives up.
+///
+/// Two covers the transient signal a host sends and leaves room for one more; a run interrupted
+/// a third time is failing for a reason the prompt cannot fix.
+pub(crate) const MAX_INTERRUPTED_RESUMES: usize = 2;
+
+/// The error text a client should see: exactly one `Agent error:` prefix, then the provider's
+/// own detail.
+///
+/// Core errors may already carry the prefix (possibly more than once through wrapping), and a
+/// duplicated prefix hides the part that tells the user what actually went wrong.
+pub(crate) fn error_chunk_text(error: &str) -> String {
+    let mut detail = error;
+    while let Some(rest) = detail.strip_prefix("Agent error: ") {
+        detail = rest;
+    }
+    format!("Agent error: {detail}")
+}
+
 /// The ACP usage update for a session: `used` is the tokens in context, `size` the window.
 pub(crate) fn usage_update(
     session_id: SessionId,
@@ -953,12 +997,14 @@ pub(crate) fn render_event(
     }
 }
 
+#[cfg(feature = "durable")]
 pub(crate) struct DurableDriver {
     agent: Arc<HarnessAgent>,
     session_id: SessionId,
     runtime: tokio::sync::Mutex<Option<Arc<SessionRuntime>>>,
 }
 
+#[cfg(feature = "durable")]
 impl DurableDriver {
     fn new(agent: Arc<HarnessAgent>, session_id: SessionId) -> Self {
         Self {
@@ -1031,7 +1077,10 @@ impl DurableDriver {
         )))
     }
     /// Runs one turn: admits it, ticks it, settles it and renders what the sink publishes.
-    async fn run(
+    ///
+    /// Inherent rather than trait so the rest of this file can call it without a `dyn`
+    /// dispatch; [`TurnDriver::run`] delegates here.
+    async fn run_turn(
         &self,
         input: DriverInput,
         sink: EventSink,
@@ -1228,8 +1277,6 @@ impl DurableDriver {
         // A run stopped by something other than this client's cancel is resumed in place.
         // Bounded so a permanently interrupted environment is reported instead of retried
         // forever; an interruption is not a failure and must not discard the user's prompt.
-        const MAX_INTERRUPTED_RESUMES: usize = 2;
-
         let mut resumes = 0usize;
 
         loop {
@@ -1595,16 +1642,10 @@ impl DurableDriver {
                         .error
                         .clone()
                         .unwrap_or_else(|| "run failed".to_string());
-                    // Core errors may already carry the `Agent error:` prefix (possibly more
-                    // than once through wrapping); keep exactly one.
-                    let mut detail = detail.as_str();
-                    while let Some(rest) = detail.strip_prefix("Agent error: ") {
-                        detail = rest;
-                    }
                     driver.finish().await;
                     sink(super::event::message_chunk(
                         self.session_id.clone(),
-                        format!("Agent error: {detail}"),
+                        error_chunk_text(&detail),
                         message_id_opt.clone(),
                     ));
                     return Ok(TurnOutcome {
@@ -1864,16 +1905,14 @@ impl DurableDriver {
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "durable")]
 impl TurnDriver for DurableDriver {
     async fn run(
         &self,
-        _input: DriverInput,
-        _sink: EventSink,
+        input: DriverInput,
+        sink: EventSink,
     ) -> std::result::Result<TurnOutcome, DriverError> {
-        Err(DriverError::Unavailable(
-            "the turn is still driven by AcpAgentSession; the seam takes over in the next step"
-                .to_string(),
-        ))
+        self.run_turn(input, sink).await
     }
 
     async fn cancel(&self, _turn_id: &str) -> std::result::Result<(), DriverError> {
@@ -1915,6 +1954,7 @@ impl TurnDriver for DurableDriver {
 /// as it takes decisions. The prompt above renders what the sink publishes and watches for
 /// cancellation; this loop only keeps the thread moving. A paused or waiting turn is not ready,
 /// so the loop hands it back instead of spinning on it.
+#[cfg(feature = "durable")]
 async fn drive_turn(session: Arc<DurableSession>, turn_id: String, stop: Arc<AtomicBool>) {
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -1941,11 +1981,13 @@ async fn drive_turn(session: Arc<DurableSession>, turn_id: String, stop: Arc<Ato
 }
 
 /// The tick loop of one prompt attempt.
+#[cfg(feature = "durable")]
 struct TickLoop {
     stop: Arc<AtomicBool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+#[cfg(feature = "durable")]
 impl TickLoop {
     fn spawn(session: Arc<DurableSession>, turn_id: String) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -1971,6 +2013,7 @@ impl TickLoop {
     }
 }
 
+#[cfg(feature = "durable")]
 impl Drop for TickLoop {
     fn drop(&mut self) {
         // Only reached on a path that returned without `finish`: the loop is asked to stop, and
@@ -2018,6 +2061,77 @@ impl Default for TurnState {
             running: Arc::new(AtomicBool::new(false)),
             usage: ChatUsage::default(),
         }
+    }
+}
+
+/// Which driver a session runs its turns through.
+///
+/// Read from `AGENTSCOPE_TURN_DRIVER` when the session is built. Any value other than `native`
+/// keeps the durable runtime: a misspelled or unset variable must not silently change where a
+/// session's history lives. A build without the durable feature has no such choice: there
+/// `native` is the only driver, and the variable is ignored.
+#[cfg(feature = "durable")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnDriverKind {
+    Durable,
+    Native,
+}
+
+#[cfg(feature = "durable")]
+impl TurnDriverKind {
+    fn from_env() -> Self {
+        Self::parse(std::env::var("AGENTSCOPE_TURN_DRIVER").ok().as_deref())
+    }
+
+    /// Parses the selector. Only `native` (any case) moves a session off the durable runtime:
+    /// an unset value, a typo or an empty string must not silently change where a session's
+    /// history lives, because the two stores are not interchangeable after the fact.
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some(value) if value.eq_ignore_ascii_case("native") => Self::Native,
+            _ => Self::Durable,
+        }
+    }
+}
+
+/// The native driver for a session: its history lives beside the session config, under the cwd
+/// the client sent, so `session/load` rebuilds it from that same cwd.
+fn native_driver(
+    agent: &Arc<HarnessAgent>,
+    cwd: &PathBuf,
+    session_id: &SessionId,
+) -> Arc<dyn TurnDriver> {
+    Arc::new(crate::native_driver::NativeDriver::open(
+        &cwd.join(".agentscope"),
+        session_id.clone(),
+        Some(Arc::clone(agent)),
+    ))
+}
+
+#[cfg(all(test, feature = "durable"))]
+mod driver_kind_tests {
+    use super::TurnDriverKind;
+
+    #[test]
+    fn only_native_moves_a_session_off_the_durable_runtime() {
+        assert_eq!(
+            TurnDriverKind::parse(Some("native")),
+            TurnDriverKind::Native
+        );
+        assert_eq!(
+            TurnDriverKind::parse(Some("NATIVE")),
+            TurnDriverKind::Native
+        );
+        assert_eq!(
+            TurnDriverKind::parse(Some("durable")),
+            TurnDriverKind::Durable
+        );
+        assert_eq!(
+            TurnDriverKind::parse(Some("nativ")),
+            TurnDriverKind::Durable
+        );
+        assert_eq!(TurnDriverKind::parse(Some("")), TurnDriverKind::Durable);
+        assert_eq!(TurnDriverKind::parse(None), TurnDriverKind::Durable);
     }
 }
 
@@ -2086,7 +2200,13 @@ pub struct AcpAgentSession {
     /// prompts; opening per prompt would rebuild the store handle and re-read the thread state.
     /// The turns themselves live in the store, so a restart rebuilds this from what a tick
     /// committed.
-    driver: Arc<DurableDriver>,
+    /// The driver this session runs turns through.
+    driver: Arc<dyn TurnDriver>,
+    /// `Some` while the session runs on durable: the protocol paths that need the store
+    /// (`respond`, `close`, `session/load`) read it directly. `None` on the native driver,
+    /// which keeps no runtime and no suspended turn.
+    #[cfg(feature = "durable")]
+    durable: Option<Arc<DurableDriver>>,
     /// Manages MCP client connections for this session (stdio servers declared
     /// by the ACP client via `mcp_servers`). Shared across clones so tools keep
     /// working after `register_session` write-back.
@@ -2308,6 +2428,7 @@ fn write_and_sync(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// *which* prompt a turn belongs to (a random UUID said nothing); the timestamp keeps two
 /// identical questions two distinct turns, so a genuine repeat is never merged away while a
 /// retry inside this process keeps reusing the same key.
+#[cfg(feature = "durable")]
 fn prompt_idempotency_key(message: &Msg, accepted_at_ms: i64) -> String {
     let mut text = String::new();
     for block in message.content.iter() {
@@ -2372,7 +2493,20 @@ impl AcpAgentSession {
         let descriptor = SelectedDescriptor::resolve(&models, &initial_model);
         let archived = is_archived_on_disk(&cwd, &session_id);
         let agent = Arc::new(agent);
-        let driver = Arc::new(DurableDriver::new(Arc::clone(&agent), session_id.clone()));
+        // With the durable feature the choice comes from `AGENTSCOPE_TURN_DRIVER`; without it
+        // there is one driver, and nothing to keep a store for.
+        #[cfg(feature = "durable")]
+        let (driver, durable): (Arc<dyn TurnDriver>, Option<Arc<DurableDriver>>) =
+            match TurnDriverKind::from_env() {
+                TurnDriverKind::Durable => {
+                    let durable =
+                        Arc::new(DurableDriver::new(Arc::clone(&agent), session_id.clone()));
+                    (Arc::clone(&durable) as Arc<dyn TurnDriver>, Some(durable))
+                }
+                TurnDriverKind::Native => (native_driver(&agent, &cwd, &session_id), None),
+            };
+        #[cfg(not(feature = "durable"))]
+        let driver: Arc<dyn TurnDriver> = native_driver(&agent, &cwd, &session_id);
         let mut session = Self {
             session_id,
             cwd,
@@ -2390,6 +2524,8 @@ impl AcpAgentSession {
             permission_store,
             mcp_manager: Arc::new(agentscope_harness::agent::McpClientManager::new()),
             driver,
+            #[cfg(feature = "durable")]
+            durable,
             turn: TurnState::default(),
             bridged_servers: Arc::new(Mutex::new(Vec::new())),
             pending_acp_servers: Arc::new(Mutex::new(Vec::new())),
@@ -2429,34 +2565,19 @@ impl AcpAgentSession {
     }
 
     /// The runtime context that identifies this ACP session in the journal.
+    ///
+    /// Built from the id alone, so both drivers share it: nothing here is durable state.
     fn session_context(&self) -> agentscope_core::agent::RuntimeContext {
-        self.driver.session_context()
+        agentscope_core::agent::RuntimeContext::new().with_session_id(self.session_id.to_string())
     }
 
-    /// The store root of this session's durable state.
-    fn durable_root(&self) -> std::result::Result<PathBuf, String> {
-        self.driver.durable_root()
-    }
-
-    /// The thread this ACP session drives: one session, one thread.
-    fn durable_thread(&self) -> std::result::Result<ThreadKey, String> {
-        self.driver.durable_thread()
-    }
-
-    fn durable_backend(&self) -> std::result::Result<Arc<dyn SessionBackend>, String> {
-        self.driver.durable_backend()
-    }
-
-    /// The durable journal of this session, for a reader that must not open a runtime (the
-    /// `session/load` replay). Reading a thread that was never written is an error, which the
-    /// caller turns into an empty replay.
-    pub(crate) fn durable_journal(&self) -> std::result::Result<Arc<dyn ThreadJournal>, String> {
-        self.driver.durable_journal()
-    }
-
-    /// Opens (or reuses) the durable runtime of this session.
-    async fn open_runtime(&self) -> std::result::Result<Arc<SessionRuntime>, String> {
-        self.driver.open_runtime().await
+    /// The durable driver, or a message that names what the caller asked for and why it is
+    /// absent: the native driver keeps no journal, no runtime and no suspended turn.
+    #[cfg(feature = "durable")]
+    fn durable_store(&self) -> std::result::Result<&Arc<DurableDriver>, String> {
+        self.durable.as_ref().ok_or_else(|| {
+            "this session runs on the native driver, which keeps no durable store".to_string()
+        })
     }
 
     /// The working directory.
@@ -2739,12 +2860,17 @@ impl AcpAgentSession {
     /// A suspended tool (external execution) leaves the turn non-terminal. Without this path
     /// the only way out was `submit`, which necessarily starts a new prompt and discards the
     /// suspended turn. Answers are validated against the committed pending requests.
+    ///
+    /// Only the durable driver can suspend a turn in its store, so only it has something to
+    /// answer: a native turn is either running in this process or already over.
+    #[cfg(feature = "durable")]
     pub async fn respond(
         &self,
         answers: std::collections::BTreeMap<String, String>,
     ) -> std::result::Result<(), String> {
+        let durable = self.durable_store()?.clone();
         let runtime = {
-            let slot = self.driver.runtime().lock().await;
+            let slot = durable.runtime().lock().await;
             match slot.as_ref() {
                 Some(runtime) => Arc::clone(runtime),
                 None => return Err("the session runtime is not open".to_string()),
@@ -2768,6 +2894,18 @@ impl AcpAgentSession {
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    /// Answers an outstanding interaction and continues the turn without a new user prompt.
+    ///
+    /// A build without the durable driver can never have a suspended turn: the native driver
+    /// runs a turn to its end inside this process, so there is nothing on disk to answer.
+    #[cfg(not(feature = "durable"))]
+    pub async fn respond(
+        &self,
+        _answers: std::collections::BTreeMap<String, String>,
+    ) -> std::result::Result<(), String> {
+        Err("this build has no durable driver, so no turn is waiting for an answer".to_string())
     }
 
     /// Current thought level.
@@ -3478,8 +3616,11 @@ impl AcpAgentSession {
         self.cancel_subagents();
         // Release the dispatcher unless a prompt currently holds the handle; dropping the
         // last clone stops it after that prompt unwinds.
-        if let Ok(mut runtime) = self.driver.runtime().try_lock() {
-            runtime.take();
+        #[cfg(feature = "durable")]
+        if let Some(durable) = &self.durable {
+            if let Ok(mut runtime) = durable.runtime().try_lock() {
+                runtime.take();
+            }
         }
     }
 
@@ -3665,52 +3806,104 @@ impl AcpAgentSession {
     where
         F: FnMut(agent_client_protocol::v1::schema::SessionNotification) + Send,
     {
-        use agent_client_protocol::v1::schema::{
-            ContentChunk, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
-        };
-        use agentscope_core::message::{ContentBlock as CoreBlock, MsgRole};
-
         // The transcript comes from the durable journal this session writes. The harness journal
         // store is no longer the writer, so reading it would replay an empty conversation.
-        let cached = self
-            .driver
-            .runtime()
-            .lock()
-            .await
-            .as_ref()
-            .map(|runtime| Arc::clone(&runtime.journal));
-        let journal = match cached {
-            Some(journal) => journal,
-            None => match self.durable_journal() {
-                Ok(journal) => journal,
+        //
+        // A native session has no journal at all: its history is the transcript it wrote
+        // itself, replayed through the same renderer so a client cannot tell the difference.
+        #[cfg(not(feature = "durable"))]
+        self.replay_native_history(&mut emit).await;
+        #[cfg(feature = "durable")]
+        {
+            let Some(durable) = self.durable.clone() else {
+                self.replay_native_history(&mut emit).await;
+                return;
+            };
+            let cached = durable
+                .runtime()
+                .lock()
+                .await
+                .as_ref()
+                .map(|runtime| Arc::clone(&runtime.journal));
+            let journal = match cached {
+                Some(journal) => journal,
+                None => match durable.durable_journal() {
+                    Ok(journal) => journal,
+                    Err(error) => {
+                        tracing::warn!(
+                            session = %self.session_id,
+                            %error,
+                            "cannot open the durable journal; session/load will replay nothing"
+                        );
+                        return;
+                    }
+                },
+            };
+            // The transcript read is also the readability check: it walks the committed prefix and
+            // fails on a damaged journal, so a separate projection pass would fold the same events a
+            // second time and double the memory a resume peaks at.
+            let transcript = match agentscope_core::journal::transcript(&*journal).await {
+                Ok(transcript) => transcript,
                 Err(error) => {
                     tracing::warn!(
                         session = %self.session_id,
                         %error,
-                        "cannot open the durable journal; session/load will replay nothing"
+                        "cannot read the transcript; session/load will replay nothing"
                     );
                     return;
                 }
-            },
-        };
-        // The transcript read is also the readability check: it walks the committed prefix and
-        // fails on a damaged journal, so a separate projection pass would fold the same events a
-        // second time and double the memory a resume peaks at.
-        let transcript = match agentscope_core::journal::transcript(&*journal).await {
-            Ok(transcript) => transcript,
+            };
+            self.replay_messages(transcript.messages, &mut emit);
+            for card in self.replay_subagent_cards().await {
+                emit(card);
+            }
+        }
+    }
+
+    /// Replays what the native driver recorded, through the same renderer the live turn uses.
+    async fn replay_native_history<F>(&self, emit: &mut F)
+    where
+        F: FnMut(agent_client_protocol::v1::schema::SessionNotification) + Send,
+    {
+        let mut messages = Vec::new();
+        match self.driver.replay().await {
+            Ok(items) => messages.extend(items.into_iter().filter_map(|item| match item {
+                crate::turn_driver::ReplayItem::Message(message) => Some(message),
+                crate::turn_driver::ReplayItem::TurnBoundary { .. } => None,
+            })),
             Err(error) => {
                 tracing::warn!(
                     session = %self.session_id,
                     %error,
-                    "cannot read the transcript; session/load will replay nothing"
+                    "cannot read the native history; session/load will replay nothing"
                 );
-                return;
             }
-        };
+        }
+        self.replay_messages(messages, emit);
+        for card in self.replay_subagent_cards().await {
+            emit(card);
+        }
+    }
 
+    /// Renders committed messages as the `session/update`s `session/load` replays.
+    ///
+    /// Shared by both drivers: the durable one hands over its journal
+    /// transcript, the native one the messages its own history stored, and a client must not be
+    /// able to tell which.
+    fn replay_messages<F>(
+        &self,
+        messages: impl IntoIterator<Item = agentscope_core::message::Msg>,
+        emit: &mut F,
+    ) where
+        F: FnMut(agent_client_protocol::v1::schema::SessionNotification) + Send,
+    {
+        use agent_client_protocol::v1::schema::{
+            ContentChunk, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
+        };
+        use agentscope_core::message::{ContentBlock as CoreBlock, MsgRole};
         // Each notification is handed over as it is built: a loaded session has no reason to
         // hold the whole replay twice (once as the transcript, once as a vector of chunks).
-        for message in transcript.messages {
+        for message in messages {
             // One message id per historical message: clients group chunks by it exactly as
             // they do for a live turn, so a replayed turn renders as one bubble.
             let message_id = MessageId::new(format!("history-{}", message.id));
@@ -3751,9 +3944,6 @@ impl AcpAgentSession {
                     emit(SessionNotification::new(self.session_id.clone(), update));
                 }
             }
-        }
-        for card in self.replay_subagent_cards().await {
-            emit(card);
         }
     }
 
@@ -4318,11 +4508,14 @@ fn fold_replay_cards(tasks: Vec<Arc<BackgroundTask>>) -> Vec<ReplayCard> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "durable")]
+    use super::{prompt_idempotency_key, stall_cancel_after_value, RUNNING_STALL_CANCEL};
     use super::{
-        prompt_idempotency_key, save_session_config, stall_cancel_after_value,
-        thought_level_params, turn_usage_to_response, SelectedDescriptor, RUNNING_STALL_CANCEL,
+        save_session_config, thought_level_params, turn_usage_to_response, SelectedDescriptor,
     };
-    use agentscope_core::message::{ChatUsage, Msg};
+    use agentscope_core::message::ChatUsage;
+    #[cfg(feature = "durable")]
+    use agentscope_core::message::Msg;
     use agentscope_harness::agent::subagent::task::{BackgroundTask, TaskStatus};
 
     fn terminal_task(
@@ -4346,6 +4539,7 @@ mod tests {
         task
     }
 
+    #[cfg(feature = "durable")]
     #[test]
     fn the_running_stall_cap_is_configurable_and_can_be_disabled() {
         assert_eq!(stall_cancel_after_value(None), Some(RUNNING_STALL_CANCEL));
@@ -4461,6 +4655,7 @@ mod tests {
         assert!(resolved.descriptor.is_none());
     }
 
+    #[cfg(feature = "durable")]
     #[test]
     fn the_prompt_key_hashes_the_text_and_the_acceptance_time() {
         let message = Msg::user("fix the build");
@@ -4483,6 +4678,7 @@ mod tests {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'));
     }
 
+    #[cfg(feature = "durable")]
     #[test]
     fn a_prompt_without_text_still_gets_a_key() {
         let key = prompt_idempotency_key(&Msg::user(""), 42);
@@ -4519,6 +4715,7 @@ mod tests {
     /// A tool call dispatched by a process that died before recording its outcome used to poison
     /// the session: the recorder refused every open with "Explicit reconciliation required".
     /// Opening a runtime settles it once, as interrupted, so the session opens again.
+    #[cfg(feature = "durable")]
     #[tokio::test]
     async fn an_uncertain_tool_call_is_settled_before_the_session_opens() {
         use agentscope_core::journal::{
@@ -4608,6 +4805,7 @@ mod tests {
     /// builds the runtime, so every later prompt failed with "Explicit reconciliation required".
     /// A finished turn's leftovers are settled before the next prompt; an unfinished turn keeps
     /// its uncertainty because resuming it must not find synthetic results.
+    #[cfg(feature = "durable")]
     #[tokio::test]
     async fn a_finished_turns_stranded_dispatch_is_settled_before_the_next_prompt() {
         use agentscope_core::journal::{

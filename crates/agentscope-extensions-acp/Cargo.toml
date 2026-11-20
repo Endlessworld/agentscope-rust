@@ -14,8 +14,8 @@ categories.workspace = true
 
 [dependencies]
 agentscope-core = { workspace = true }
-agentscope-durable = { workspace = true }
-agentscope-durable-adapter-agentscope = { workspace = true }
+agentscope-durable = { workspace = true, optional = true }
+agentscope-durable-adapter-agentscope = { workspace = true, optional = true }
 # Optional: run the durable runtime on SQLite instead of the file store. Off by default so the
 # bundled SQLite driver is not part of every ACP build; when compiled in, SQLite is the default
 # backend (`AGENTSCOPE_DURABLE_STORE=file` keeps the file store).
@@ -72,6 +72,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
+# The live-memory diagnostic reads the durable traffic counters and the SQLite store it
+# measures, so it only builds when both are compiled in.
+[[test]]
+name = "acp_live_memory_test"
+required-features = ["durable", "durable-sqlite"]
+
 [[bin]]
 name = "acp_agent_cli"
 path = "src/acp_agent_cli.rs"
@@ -83,10 +89,14 @@ path = "src/acp_harness_agent.rs"
 [dev-dependencies]
 
 [features]
-default = ["rusqlite"]
+default = ["rusqlite", "durable"]
+# The durable driver: a session journals its turns so another process can resume them. Without
+# it the session runs on the native driver only, and neither `agentscope-durable` nor its harness
+# adapter is compiled into this crate.
+durable = ["dep:agentscope-durable", "dep:agentscope-durable-adapter-agentscope"]
 # Optional SQLite `RecordStore`. With it compiled in, `AGENTSCOPE_DURABLE_STORE=sqlite` makes a
 # session keep its durable state in one SQLite database instead of the file store.
-durable-sqlite = ["dep:agentscope-durable-sqlite"]
+durable-sqlite = ["durable", "dep:agentscope-durable-sqlite"]
 rusqlite = ["agentscope-harness/rusqlite"]
 # Embedded minimal build: mirrors `agentscope-harness`'s `lite` feature,
 # dropping the bundled SQLite index.

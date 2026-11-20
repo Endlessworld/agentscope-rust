@@ -276,18 +276,18 @@ durable-sqlite = ["durable", "dep:agentscope-durable-sqlite"]
 | P1.5 ✅ | 把 `AcpSession` 拆成 `ProtocolState` + `TurnState`（`cancel_epoch`/`closed`/`prompt_lock`/`running`/`turn_usage` 归后者），再把 `run_prompt_inner` 整体搬到 driver（`da847af`、`2157b23`） | 20 轮基线逐项不变（`djournal:facts`/`djournal:read`/`acp:settle`/`checkpoint:payload`/`peak_live` 均一致） |
 | P2 ✅ | `SessionHistory`（`messages.jsonl` / `turns.json`）+ 单元测试（`2eb8740`） | 写入/回放/resume 单测（4 条） |
 | P3 ✅ | `NativeDriver`：`run`/`view`/`replay`/`resume`（`2eb8740`、`afed959`）；`cancel` 走 prompt 准入时携带的 generation，trait 方法返回 `Unavailable` | `run`/`replay`/`resume`/`view` 单测全绿（3 条）；端到端验收随 P4（native 尚未被选中） |
-| P4 | 运行期切换 + 错误路径 | 两种驱动跑同一组集成测试 |
-| P5 | `feature = "durable"` 可选 + `--no-default-features` 构建 | 裁剪构建通过、体积对比 |
+| P4 ✅ | 运行期切换 + 错误路径：`TurnDriverKind` 选 `durable`/`native`（`a316500`）；native 补齐中断续跑、重启后历史下发、取消子代理任务、错误前缀去重 | 同一组 ACP 集成测试在 `AGENTSCOPE_TURN_DRIVER=durable|native` 下全绿（148 lib + 全部集成目标） |
+| P5 ✅ | `feature = "durable"` 可选：依赖标 `optional`、`default = ["rusqlite", "durable"]`；`session.rs` 的 durable 块、`deferred_effects`、`event_queue`、`TurnDriverKind` 全部 `#[cfg]` | `--no-default-features` 全量绿（132 lib + 全部集成目标，`acp_live_memory_test` 经 `required-features` 跳过）；durable 20 轮基线逐项不变 |
 | P6 | 回归：durable 20 轮基线、全量 workspace 测试、fmt | 与本文 §4 一致 |
 
 **P1.5 不是「把方法搬到 driver」**：`run_prompt_inner` 是 `&mut self`，并深度读写 `cancel_epoch`/`closed`/`prompt_lock`/`running`/`turn_usage`/`client`/`permission_store`。直接搬方法会让 driver 变成第二个 session；正确顺序是先按「协议状态 / turn 状态」拆字段，再搬执行体。P1 的编译错误只出现在 import 与命名层面（`TurnInput` 与既有枚举同名、`async_trait` 需全路径），说明「字段归并 + 委托」是低风险的那一半，真正的成本在 P1.5。
 
-### 7.1 P4 的入口清单（下一步）
+### 7.1 P4 的入口清单（已完成）
 
-1. `AcpAgentSession` 增加 `driver: Arc<dyn TurnDriver>`，构造时按 `AGENTSCOPE_TURN_DRIVER`（`durable`|`native`，默认 `durable`）选择；两个驱动都实现 `TurnDriver`。
+1. `AcpAgentSession` 增加 `driver: Arc<dyn TurnDriver>`，构造时按 `AGENTSCOPE_TURN_DRIVER`（`durable`|`native`，默认 `durable`）选择；两个驱动都实现 `TurnDriver`。**已落地**：没有 durable feature 时只有一个驱动，变量被忽略。
 2. `AcpAgentSession::run_prompt_inner` 现在直接调 `DurableDriver::run`，改为经 `self.driver.run(...)`。
-3. `session/load` 的 `replay`、`session/resume` 的 `resume`、`session/status` 的 `view` 改经 trait（调用点在 `coding_agent.rs`）。
-4. native 模式构造 `NativeDriver::open(cwd.join(".agentscope"), session_id, Some(agent))`；durable 模式沿用现有 `durable_root()`/`durable_thread()`。
+3. `session/load` 的 `replay`、`session/resume` 的 `resume`、`session/status` 的 `view` 改经 trait（调用点在 `coding_agent.rs`）。**纠正**：`view`/`cancel`/`resume` 在协议层没有消费者（`session/status` 返回的是会话级 `Open`/`Saved`），因此只接了 `run` 与 `replay`；其余留为 trait 上的 `Unavailable` 占位。
+4. native 模式构造 `NativeDriver::open(cwd.join(".agentscope"), session_id, Some(agent))`；durable 模式沿用现有 `durable_root()`/`durable_thread()`。**已收敛**：两种模式共用一个 `native_driver()` 构造点。
 5. `Cargo.toml`：`durable = ["dep:agentscope-durable", "dep:agentscope-durable-adapter-agentscope"]`、`default = ["rusqlite", "durable"]`、`durable-sqlite = ["durable", ...]`；用 `#[cfg(feature = "durable")]` 包住 `session.rs` 的 durable 方法与 `impl DurableDriver`。
 6. 端到端：同一组 ACP 集成测试跑两遍（`AGENTSCOPE_TURN_DRIVER=durable|native`）。
 7. native 侧待补：`session/list` 枚举 `acp-sessions/`；`resume` 的 tool 调用合成（`reconciled_tools` 现恒为 0）；`TurnView` 的 `usage`/`stop_reason`（现只填 `status`）。

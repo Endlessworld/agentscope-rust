@@ -36,21 +36,33 @@ pub(crate) struct NativeDriver {
     /// `None` in a build (or a test) that only replays a history.
     agent: Option<Arc<HarnessAgent>>,
     session_id: SessionId,
-    history: SessionHistory,
+    /// Where the history lives. Opened per call rather than up front: a session is built while
+    /// the protocol is still answering `session/new`, and a cwd that cannot be written should
+    /// fail the prompt that needs it, not the announcement of the session.
+    root: std::path::PathBuf,
+    /// How many transcript messages the agent has already been given. A restarted process
+    /// starts at zero, so a fresh agent receives the whole history; a second turn in one
+    /// process only sends what the agent has not seen.
+    delivered: std::sync::Mutex<usize>,
 }
 
 impl NativeDriver {
-    /// Opens the history under `<root>/acp-sessions/<session_id>/`.
+    /// Builds the driver for `<root>/acp-sessions/<session_id>/`.
     pub(crate) fn open(
         root: &Path,
         session_id: SessionId,
         agent: Option<Arc<HarnessAgent>>,
-    ) -> std::result::Result<Self, String> {
-        Ok(Self {
-            history: SessionHistory::open(root, &session_id.to_string())?,
-            session_id,
+    ) -> Self {
+        Self {
             agent,
-        })
+            session_id,
+            root: root.to_path_buf(),
+            delivered: std::sync::Mutex::new(0),
+        }
+    }
+
+    fn history(&self) -> std::result::Result<SessionHistory, DriverError> {
+        SessionHistory::open(&self.root, &self.session_id.to_string()).map_err(DriverError::Failed)
     }
 
     fn status_of(name: &str) -> TurnStatusView {
@@ -144,12 +156,33 @@ impl TurnDriver for NativeDriver {
             updated_at_ms: started_at_ms,
             stop_reason: None,
         };
-        self.history
+        self.history()?
             .record_turn(running)
             .map_err(DriverError::Failed)?;
-        self.history
+        self.history()?
             .append_message(&message)
             .map_err(DriverError::Failed)?;
+
+        // The agent holds no memory of a previous process: the transcript is what a restarted
+        // session has, so the messages this agent has not been given yet go with the prompt.
+        // Within one process the agent already carries them, and resending would duplicate the
+        // conversation (the durable driver restores a checkpoint and does not resend either).
+        let transcript = self.history()?.messages().map_err(DriverError::Failed)?;
+        // Scoped so the guard is dropped before the first await: a `std::sync::MutexGuard` is
+        // not `Send`, and this future has to be.
+        let unseen = {
+            let mut delivered = self
+                .delivered
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let unseen = transcript.len().saturating_sub(*delivered);
+            *delivered = transcript.len();
+            unseen
+        };
+        let mut conversation: Vec<Msg> = transcript[transcript.len() - unseen..].to_vec();
+        if conversation.is_empty() {
+            conversation.push(message.clone());
+        }
 
         // One stable message id per turn: every chunk and tool call shares it, so a client
         // groups them into one assistant message. This is the id the durable driver uses too.
@@ -162,7 +195,8 @@ impl TurnDriver for NativeDriver {
             .map(|agent| agent.model().context_window_size() as u64)
             .unwrap_or(DEFAULT_CONTEXT_WINDOW as u64);
 
-        let mut stream = agent.stream_events(vec![message], StreamOptions::defaults());
+        let mut stream = agent.stream_events(conversation, StreamOptions::defaults());
+        let mut resumes = 0usize;
         let mut turn_usage = ChatUsage::default();
         let mut emitted_text = false;
         let mut reply: Option<Msg> = None;
@@ -173,6 +207,30 @@ impl TurnDriver for NativeDriver {
                 item = stream.next() => match item {
                     Some(Ok(agent_event)) => {
                         if agent_event.event_type() == AgentEventType::AgentResult {
+                            // A run the host interrupted is continued, not ended: the turn is
+                            // still valid and discarding the prompt would lose the user's input.
+                            // The durable driver resumes the stored turn; here the agent's own
+                            // context is the state, so a fresh stream continues it.
+                            if crate::event::result_generate_reason(&agent_event)
+                                == Some(agentscope_core::message::GenerateReason::Interrupted)
+                            {
+                                resumes += 1;
+                                if resumes > crate::session::MAX_INTERRUPTED_RESUMES {
+                                    failure = Some(
+                                        "the run kept being interrupted before it finished"
+                                            .to_string(),
+                                    );
+                                    break;
+                                }
+                                sink(crate::event::message_chunk(
+                                    self.session_id.clone(),
+                                    "\n\n[run interrupted; continuing]\n\n".to_string(),
+                                    Some(message_id.clone()),
+                                ));
+                                stream =
+                                    agent.stream_events(Vec::new(), StreamOptions::defaults());
+                                continue;
+                            }
                             if let Some(parsed) = agent_event
                                 .data()
                                 .fields
@@ -219,10 +277,21 @@ impl TurnDriver for NativeDriver {
             }
         }
 
+        if cancelled {
+            // A cancelled parent must not leave its children running: they keep billing with
+            // nobody left to receive their result, and the next prompt finds them "running".
+            let session_id = self.session_id.to_string();
+            let context =
+                agentscope_core::agent::RuntimeContext::new().with_session_id(session_id.clone());
+            agent
+                .task_repository()
+                .cancel_session_tasks(&context, &session_id)
+                .await;
+        }
         if let Some(error) = &failure {
             sink(crate::event::message_chunk(
                 self.session_id.clone(),
-                format!("Agent error: {error}"),
+                crate::session::error_chunk_text(error),
                 Some(message_id.clone()),
             ));
         }
@@ -239,11 +308,11 @@ impl TurnDriver for NativeDriver {
             _ => StopReason::EndTurn,
         };
         if let Some(reply) = &reply {
-            self.history
+            self.history()?
                 .append_message(reply)
                 .map_err(DriverError::Failed)?;
         }
-        self.history
+        self.history()?
             .record_turn(TurnRecord {
                 turn_id,
                 status: status.as_str().to_string(),
@@ -266,7 +335,7 @@ impl TurnDriver for NativeDriver {
     }
 
     async fn view(&self) -> std::result::Result<TurnView, DriverError> {
-        let turns = self.history.turns().map_err(DriverError::Failed)?;
+        let turns = self.history()?.turns().map_err(DriverError::Failed)?;
         let Some(last) = turns.last() else {
             return Ok(TurnView::default());
         };
@@ -279,13 +348,13 @@ impl TurnDriver for NativeDriver {
     }
 
     async fn replay(&self) -> std::result::Result<Vec<ReplayItem>, DriverError> {
-        let messages = self.history.messages().map_err(DriverError::Failed)?;
+        let messages = self.history()?.messages().map_err(DriverError::Failed)?;
         Ok(messages.into_iter().map(ReplayItem::Message).collect())
     }
 
     async fn resume(&self) -> std::result::Result<ResumeOutcome, DriverError> {
         let mut resumed = 0usize;
-        for turn in self.history.turns().map_err(DriverError::Failed)? {
+        for turn in self.history()?.turns().map_err(DriverError::Failed)? {
             // A turn that already reads as interrupted was put there by an earlier resume; a
             // terminal one is finished. Everything else was cut short by the process ending.
             if turn.terminal() || turn.status == TurnStatusView::Interrupted.as_str() {
@@ -294,7 +363,7 @@ impl TurnDriver for NativeDriver {
             let mut interrupted = turn;
             interrupted.status = TurnStatusView::Interrupted.as_str().to_string();
             interrupted.updated_at_ms = now_ms();
-            self.history
+            self.history()?
                 .record_turn(interrupted)
                 .map_err(DriverError::Failed)?;
             resumed += 1;
@@ -328,7 +397,7 @@ mod tests {
     }
 
     fn driver(root: &Path, id: &str) -> NativeDriver {
-        NativeDriver::open(root, SessionId::new(id.to_string()), None).expect("open")
+        NativeDriver::open(root, SessionId::new(id.to_string()), None)
     }
 
     #[tokio::test]
@@ -336,11 +405,13 @@ mod tests {
         let root = scratch("replay");
         let driver = driver(&root, "s1");
         driver
-            .history
+            .history()
+            .expect("open")
             .append_message(&Msg::user("hello"))
             .expect("append");
         driver
-            .history
+            .history()
+            .expect("open")
             .append_message(&Msg::assistant("hi"))
             .expect("append");
         let items = driver.replay().await.expect("replay");
@@ -353,7 +424,8 @@ mod tests {
         let root = scratch("resume");
         let driver = driver(&root, "s1");
         driver
-            .history
+            .history()
+            .expect("open")
             .record_turn(TurnRecord {
                 turn_id: "t1".to_string(),
                 status: "running".to_string(),
