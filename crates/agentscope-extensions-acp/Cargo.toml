@@ -19,7 +19,7 @@ agentscope-durable-adapter-agentscope = { workspace = true, optional = true }
 # Optional: run the durable runtime on SQLite instead of the file store. Off by default so the
 # bundled SQLite driver is not part of every ACP build; when compiled in, SQLite is the default
 # backend (`AGENTSCOPE_DURABLE_STORE=file` keeps the file store).
-agentscope-durable-sqlite = { path = "../agentscope-durable-sqlite", optional = true }
+agentscope-durable-sqlite = { workspace = true, optional = true }
 agentscope-extensions-model = { workspace = true }
 agentscope-harness = { version = "0.2.0", path = "../agentscope-harness", default-features = false }
 agent-client-protocol = { version = "5.0.0", features = [

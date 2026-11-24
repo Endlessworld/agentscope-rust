@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-agentscope-durable = { version = "0.2.0", path = "../agentscope-durable" }
+agentscope-durable = { workspace = true }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,4 +20,6 @@ serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+# Path-only on purpose: cargo drops version-less dev-dependencies when packaging, while a version
+# here would require `agentscope-durable-worker` on the index before this crate can be packaged.
 agentscope-durable-worker = { path = "../agentscope-durable-worker" }

@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-agentscope-durable = { version = "0.2.0", path = "../agentscope-durable" }
+agentscope-durable = { workspace = true }
 # `raw_value` keeps request params byte-for-byte as the typed struct encoded them, so the
 # field order of `InitializeParams`/`ToolsCallParams` survives instead of being re-sorted
 # through a `serde_json::Value` map.

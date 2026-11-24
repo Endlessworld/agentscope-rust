@@ -5,7 +5,8 @@ name: release-acp
 #   acp_agent_cli     —— 内置 REPL 客户端（会自动拉起上面的 agent）
 #
 # 触发：
-#   - push tag（v*）：构建后创建 GitHub Release，附各平台压缩包 + SHA256SUMS.txt
+#   - push tag（v*）：先校验 tag 与 [workspace.package] version 一致，再构建，最后创建
+#     GitHub Release，附各平台压缩包 + SHA256SUMS.txt + 现成的 ACP Registry `agent.json`
 #   - workflow_dispatch：只构建并上传 artifact，不动 Release
 #
 # 产物名不带版本号（`agentscope-acp-<platform>.zip|tar.gz`）：ACP Registry 的自动更新
@@ -35,6 +36,38 @@ env:
   PROFILE_DIR: embedded
 
 jobs:
+  version-check:
+    name: tag matches workspace version
+    # tag 与 [workspace.package] version 不一致时，产物名、SHA256SUMS 与 ACP Registry 元数据会
+    # 互相矛盾，所以先挡住。只挡 release、不挡 build：workflow_dispatch 没有 tag，矩阵要照跑。
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: compare tag with [workspace.package] version
+        run: |
+          set -euo pipefail
+          version="$(awk '
+            /^\[workspace.package\]/ { inside = 1; next }
+            /^\[/ { inside = 0 }
+            inside && /^version[[:space:]]*=/ {
+              sub(/^version[[:space:]]*=[[:space:]]*/, "");
+              gsub(/"/, "");
+              print; exit
+            }
+          ' Cargo.toml)"
+          if [ -z "${version}" ]; then
+            echo "::error::cannot read version from [workspace.package] in Cargo.toml"
+            exit 1
+          fi
+          tag="${GITHUB_REF_NAME#v}"
+          echo "tag=${GITHUB_REF_NAME} workspace=${version}"
+          if [ "${tag}" != "${version}" ]; then
+            echo "::error::${GITHUB_REF_NAME} does not match workspace version ${version}; bump Cargo.toml (and Cargo.lock) or re-tag"
+            exit 1
+          fi
+
   build:
     name: build (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
@@ -334,11 +367,14 @@ jobs:
 
   release:
     name: publish release
-    needs: [build, build-windows-arm64, build-android]
-    # arm64 那条允许失败，所以只要主矩阵成功就发版
-    if: always() && startsWith(github.ref, 'refs/tags/') && needs.build.result == 'success'
+    needs: [version-check, build, build-windows-arm64, build-android]
+    # arm64 那条允许失败，所以只要主矩阵成功就发版；tag 不一致时 version-check 挡在前面
+    if: always() && startsWith(github.ref, 'refs/tags/') && needs.build.result == 'success' && needs['version-check'].result == 'success'
     runs-on: ubuntu-latest
     steps:
+      # 下面要用 `cargo run -p xtask -- acp registry` 生成 agent.json，所以要有工作区
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -361,6 +397,19 @@ jobs:
             echo '填 ACP Registry 的 `agent.json` 时直接用上面的值。'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: ACP registry metadata
+        # 把 SHA256SUMS.txt 变成可提交给 ACP Registry 的 agent.json：version 取
+        # [workspace.package]，URL 固定为 .../download/v<version>/<asset>（资产名不带版本号，
+        # 见文件头注释），sha256 直接取刚算出的值。产物随 Release 一起分发。
+        run: |
+          cargo run --quiet --package xtask -- acp registry artifacts --out artifacts/acp-registry-agent.json
+          {
+            echo '### ACP Registry `agent.json`'
+            echo '```json'
+            cat artifacts/acp-registry-agent.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -378,6 +427,7 @@ jobs:
             | `README.md` | 安装、会话模式、权限、排障、各语言 SDK 接入 |
             | `libacp_harness_agent.so`（`android-*` 压缩包内） | Android 用的 agent，解压后放进 APK 的 `jniLibs/<abi>/`，由宿主进程 exec |
             | `SHA256SUMS.txt`（仅 Release 顶层） | 各平台压缩包的 sha256 |
+            | `acp-registry-agent.json`（仅 Release 顶层） | 已填好 version / URL / sha256 的 ACP Registry `agent.json`，提交 Registry 时直接用它 |
 
             首次运行会尝试用环境变量里的 provider 密钥（如 `DEEPSEEK_API_KEY`）直接开工；
             什么都没配也能跑，但要先过一遍向导：

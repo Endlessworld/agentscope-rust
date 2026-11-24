@@ -7,7 +7,8 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+# 每个 crate 自带 README（crates.io 页面用自己的，比整仓 README 更贴近本 crate）。
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 
@@ -26,6 +27,9 @@ tokio.workspace = true
 # The store-model probe writes a throwaway database; production code does not use it.
 rusqlite.workspace = true
 # The contract test can run every invariant against SQLite by setting DURABLE_CONTRACT_STORE=sqlite.
+# Path-only on purpose: that is a dev-only link, so cargo drops it when packaging instead of
+# requiring `agentscope-durable-sqlite` on the index (a version here would be a publish cycle,
+# since the SQLite store itself depends on this crate).
 agentscope-durable-sqlite = { path = "../agentscope-durable-sqlite" }
 
 # Liveness of the process that owns a scope lock file.

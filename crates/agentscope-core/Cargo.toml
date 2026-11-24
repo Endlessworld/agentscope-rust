@@ -7,7 +7,8 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+# 每个 crate 自带 README（crates.io 页面用自己的，比整仓 README 更贴近本 crate）。
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 

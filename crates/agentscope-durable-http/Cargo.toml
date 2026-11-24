@@ -17,7 +17,7 @@ client = []
 server = ["client", "dep:axum", "dep:futures", "dep:tokio"]
 
 [dependencies]
-agentscope-durable = { version = "0.2.0", path = "../agentscope-durable" }
+agentscope-durable = { workspace = true }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
