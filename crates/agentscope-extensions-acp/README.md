@@ -10,10 +10,11 @@
 
 | 二进制 | 角色 | 说明 |
 | --- | --- | --- |
-| `acp_harness_agent` | ACP **agent**（server 侧） | stdio 传输；无参数、不监听端口；由客户端拉起，在 `initialize` 中自报 `agentscope-coding-agent` |
+| `acp_harness_agent` | ACP **agent**（server 侧） | 默认 stdio 传输（无参数、不监听端口，由客户端拉起）；`--ws` / `--http [--port 8888]` 时用 SDK 的 HTTP/WS 传输监听 `0.0.0.0`；在 `initialize` 中自报 `agentscope-coding-agent` |
 | `acp_agent_cli` | ACP **client**（REPL） | 自动拉起上方的 agent 子进程，用于本地调试 |
 
-两者都只会说 stdio 上的 JSON-RPC，因此可以被任意客户端用「一个命令」接入。
+两者默认都说 stdio 上的 JSON-RPC，因此可以被任意客户端用「一个命令」接入；
+`acp_harness_agent --ws` / `--http` 则换成监听 `ws://0.0.0.0:8888/acp`（HTTP+SSE 共用同一端点，详见下文）。
 
 ## 提供什么
 
@@ -143,6 +144,49 @@ REPL 会在当前目录拉起 agent 并开始对话。斜杠命令：
 | `/quit` · `/exit` · `Ctrl-D` | 退出 |
 
 启动时可用 `ACP_SESSION_ID=<id>` 打开已有会话，再用 `ACP_SESSION_REPLAY=1` 重放其历史。
+
+### 4. 或者自己监听一个端口（WebSocket / HTTP+SSE）
+
+默认是 stdio，由客户端把你当子进程拉起。想让它当一个常驻服务时加 `--ws` 或 `--http`：
+
+```bash
+acp_harness_agent --ws                  # ws://0.0.0.0:8888/acp
+acp_harness_agent --http                # http://0.0.0.0:8888/acp（同一条监听）
+acp_harness_agent --ws --port 9000      # 指定端口（1-65535）
+```
+
+两个开关是**同一条监听**：传输用的是 SDK 自带的 `agent-client-protocol-http`
+（`AcpHttpServer`），它在同一个 `/acp` 端点上既接 WebSocket 升级，也接 HTTP + SSE。
+握手、分帧、会话流路由都由 SDK 负责，本 crate 只提供「一条连接一份 agent」的工厂。
+
+- **绑 `0.0.0.0`**，局域网 / 其它机器上任意能访问该端口的客户端都能连；服务不退出，
+  连接断开只排空并释放那条连接自己的会话；
+- WebSocket：**一条文本帧 = 一条 JSON-RPC 消息**；
+- HTTP + SSE（客户端按顺序走四步）：
+
+  | 请求 | 作用 |
+  | --- | --- |
+  | `POST /acp`（`Content-Type: application/json`，body 为 `initialize`） | 建连接，返回 `200` + JSON-RPC 响应体 + `Acp-Connection-Id` 响应头 |
+  | `GET /acp`（`Accept: text/event-stream`，带 `Acp-Connection-Id`） | 该连接上 agent→client 的消息流；每条连接只能有一条 |
+  | `POST /acp`（带 `Acp-Connection-Id`） | 发消息，返回 `202 Accepted`；响应从 SSE 流回来 |
+  | `DELETE /acp`（带 `Acp-Connection-Id`） | 关闭连接（`202`） |
+
+  会话级另有一条 `Acp-Session-Id` 头可用的 SSE 流（`session/new` 之后按会话订阅）。
+- `GET /health` 返回 `ok`；浏览器来源不设限（**协议本身没有认证**，暴露面由绑定的网卡决定）；
+- `--port` 也可以单独给（隐含监听），`--port=9000` 与 `--port 9000` 等价；
+- 监听地址会打到 stderr：`[serve] ws://0.0.0.0:8888/acp · http://0.0.0.0:8888/acp`。
+
+最小 HTTP 客户端（curl，可直接跑通 `initialize` + `session/new`）：
+
+```bash
+curl -s -D - -X POST http://127.0.0.1:8888/acp -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}'
+# → 200，响应头里有 acp-connection-id: <id>
+curl -N http://127.0.0.1:8888/acp -H 'Accept: text/event-stream' -H 'Acp-Connection-Id: <id>' &
+curl -s -X POST http://127.0.0.1:8888/acp -H 'Content-Type: application/json' \
+  -H 'Acp-Connection-Id: <id>' -d '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}'
+# → 202 Accepted；session/new 的结果从上面那条 SSE 流里回来
+```
 
 ## 会话模式与权限
 
@@ -567,7 +611,7 @@ provider、模型目录、扩展等其余变量见仓库根 [`docs/ENVIRONMENT.m
 - 预编译包（`embedded` profile + `lite`）**只带原生驱动**：没有 durable 的跨进程续跑与崩溃原子性，
   也没有插话 / 排队 / 暂停；需要这些能力时用 `cargo xtask acp build durable|sqlite` 自建
 - `acp_agent_cli` 默认只按 `acp_harness_agent.exe` 找同级二进制，非 Windows 需设 `ACP_AGENT_EXE`
-- 仅支持 stdio 传输（不提供 TCP / HTTP 上的 ACP）
+- 传输有 stdio 与监听（WebSocket / HTTP+SSE，`--ws` 或 `--http`，同一端点 `/acp`）两种；后者没有认证
 - 音频输入未实现（`prompt_capabilities.audio = false`）
 - 全自动模式（`yolo`）不做任何确认，请在可信工作区使用
 - durable 的 FileStore 不做 `fsync`（进程崩溃安全、掉电不安全）；SQLite 后端是单机预览，

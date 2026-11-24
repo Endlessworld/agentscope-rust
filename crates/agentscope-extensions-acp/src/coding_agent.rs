@@ -29,7 +29,7 @@ use agent_client_protocol::v1::schema::{
     StopReason, SystemPrompt, SystemPromptMode, TextContent, UnarchiveSessionRequest,
     UnarchiveSessionResponse,
 };
-use agent_client_protocol::{Agent, Stdio};
+use agent_client_protocol::{Agent, Client, ConnectTo, DynConnectTo, Stdio};
 
 use agentscope_core::model::Model;
 use agentscope_extensions_model::OpenAiChatModel;
@@ -242,6 +242,10 @@ pub struct SessionBuild {
     /// `None` for probing agents. Shared with [`AcpAgentSession::apply_mode`] so a child always
     /// runs under the mode in force at spawn time.
     pub subagent_mode: Option<Arc<Mutex<String>>>,
+    /// Directories beyond `cwd` the built agent may open itself (ACP `additionalDirectories`
+    /// with a `server` origin). Client-side roots never reach this list: only the client tools
+    /// they were declared with can reach them.
+    pub additional_directories: Vec<PathBuf>,
     /// How many levels below this session a subagent may spawn further subagents.
     ///
     /// `0` keeps every child a leaf; `1` allows one intermediate level (the default).
@@ -566,6 +570,8 @@ impl AcpCodingAgent {
         session_id: SessionId,
         cwd: PathBuf,
         system_prompt: Option<String>,
+        additional_directories: Vec<PathBuf>,
+        client_roots: Vec<super::roots::ClientRoot>,
     ) -> AcpAgentSession {
         // The slot is created *before* the agent so a capability-gated `ask_user`
         // tool can be baked into the toolkit at build time — that is what makes
@@ -593,6 +599,9 @@ impl AcpCodingAgent {
         // first prompt, and again on every mode switch), read by the permission bridge at spawn.
         let subagent_mode: Arc<Mutex<String>> =
             Arc::new(Mutex::new(super::config::default_mode().to_string()));
+        // The client may hold directories on its own device: those cannot be opened here, so
+        // the model is told which tool reaches them instead of being handed a dead path.
+        let system_prompt = super::roots::with_boundary_note(system_prompt, &cwd, &client_roots);
         let agent = match &self.session_factory {
             Some(factory) => factory(SessionBuild {
                 cwd: cwd.clone(),
@@ -600,6 +609,7 @@ impl AcpCodingAgent {
                 client_support: self.client_support.clone(),
                 elicitation_slot: Arc::clone(&elicitation_slot),
                 system_prompt,
+                additional_directories: additional_directories.clone(),
                 subagent_events: Some(subagent_events),
                 client_slot: Some(Arc::clone(&client_slot)),
                 permission_store: Some(Arc::clone(&permission_store)),
@@ -811,6 +821,7 @@ impl AcpCodingAgent {
                 client_support: self.client_support.clone(),
                 elicitation_slot: Arc::new(Mutex::new(None)),
                 system_prompt: None,
+                additional_directories: Vec::new(),
                 subagent_events: None,
                 client_slot: None,
                 permission_store: None,
@@ -1074,6 +1085,7 @@ impl AcpCodingAgent {
                 client_support: self.client_support.clone(),
                 elicitation_slot: Arc::new(Mutex::new(None)),
                 system_prompt: None,
+                additional_directories: Vec::new(),
                 subagent_events: None,
                 client_slot: None,
                 permission_store: None,
@@ -1115,6 +1127,16 @@ impl AcpCodingAgent {
         self,
         transport: impl agent_client_protocol::ConnectTo<Agent> + 'static,
     ) -> agent_client_protocol::Result<()> {
+        self.into_service().connect_to(transport).await
+    }
+
+    /// Builds the handler chain of [`run_with_transport`](Self::run_with_transport) without
+    /// a transport.
+    ///
+    /// A host that owns the transport lifecycle connects the returned value itself. That is
+    /// what the `--ws` server needs: it builds one service per connection and hands it to
+    /// the SDK's HTTP/WebSocket transport.
+    pub fn into_service(self) -> AcpCodingAgentService {
         let agent = Arc::new(self);
         // Start the idle-wakeup loop before serving requests: a session only exists after
         // `session/new`, and the loop picks it up from the registry on its next tick.
@@ -1147,7 +1169,8 @@ impl AcpCodingAgent {
         let a_providers_set = agent.clone();
         let a_providers_disable = agent.clone();
         let a_providers_ext = agent.clone();
-        let result = Agent
+        let handlers = DynConnectTo::new(
+            Agent
             .v1()
             .on_receive_request(
                 async move |initialize: InitializeRequest, responder, _cx| {
@@ -1191,6 +1214,11 @@ impl AcpCodingAgent {
             )
             .on_receive_request(
                 async move |req: NewSessionRequest, responder, cx| {
+                    // Read the declaration before the fields are moved out of `req`.
+                    let declaration =
+                        super::roots::RootsDeclaration::from_meta(req.meta.as_ref());
+                    let (additional_directories, client_roots) =
+                        declaration.split(&req.additional_directories);
                     let cwd = req.cwd;
                     let system_prompt = match a_new.client_system_prompt(req.system_prompt) {
                         Ok(prompt) => prompt,
@@ -1202,8 +1230,14 @@ impl AcpCodingAgent {
                     // expired or fenced"). Java allocates a UUID here; do the same and keep the
                     // readable prefix for logs.
                     let session_id = SessionId::new(format!("session-{}", uuid::Uuid::new_v4()));
-                    let mut session = a_new.create_session(session_id.clone(), cwd, system_prompt);
-                    session.set_additional_directories(req.additional_directories.clone());
+                    let mut session = a_new.create_session(
+                        session_id.clone(),
+                        cwd,
+                        system_prompt,
+                        additional_directories.clone(),
+                        client_roots,
+                    );
+                    session.set_additional_directories(additional_directories);
                     // 建会话时就绑上连接：会话空闲（没跑 prompt）时也要能收到
                     // `config_option_update`（供应商增删改后刷新模型下拉）。
                     session.set_client(AcpClientHandle::new(cx.clone()));
@@ -1455,6 +1489,12 @@ impl AcpCodingAgent {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
+                async move |req: crate::ext::ExtFsListRequest, responder, _cx| {
+                    handle_ext_fs_list(req, responder).await
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
                 async move |req: SetSessionModeRequest, responder, cx| {
                     let sid = req.session_id;
                     let mut session = match a_mode.get_session(&sid) {
@@ -1544,6 +1584,12 @@ impl AcpCodingAgent {
             .on_receive_request(
                 async move |req: LoadSessionRequest, responder, cx| {
                     let sid = req.session_id;
+                    // `session/load` carries no `_meta`, so a path that does not exist on
+                    // this host can only belong to the client.
+                    let (additional_directories, client_roots) =
+                        super::roots::RootsDeclaration::split_by_existence(
+                            &req.additional_directories,
+                        );
                     let system_prompt = match a_load.client_system_prompt(req.system_prompt) {
                         Ok(prompt) => prompt,
                         Err(error) => return responder.respond_with_error(error),
@@ -1573,13 +1619,15 @@ impl AcpCodingAgent {
                                 sid.clone(),
                                 req.cwd.clone(),
                                 system_prompt.clone(),
+                                additional_directories.clone(),
+                                client_roots.clone(),
                             );
                             a_load.register_session(session);
                             a_load.get_session(&sid).unwrap()
                         }
                     };
                     let mut session = session;
-                    session.set_additional_directories(req.additional_directories.clone());
+                    session.set_additional_directories(additional_directories);
                     // 空闲会话也要能收到 `config_option_update`（同 `session/new`）。
                     session.set_client(AcpClientHandle::new(cx.clone()));
                     // Bridge MCP servers declared on load (idempotent per server). Spawned for
@@ -1618,6 +1666,11 @@ impl AcpCodingAgent {
             .on_receive_request(
                 async move |req: ResumeSessionRequest, responder, cx| {
                     let sid = req.session_id;
+                    // Same as `session/load`: no `_meta` on the request, so probe the disk.
+                    let (additional_directories, client_roots) =
+                        super::roots::RootsDeclaration::split_by_existence(
+                            &req.additional_directories,
+                        );
                     let system_prompt = match a_resume.client_system_prompt(req.system_prompt) {
                         Ok(prompt) => prompt,
                         Err(error) => return responder.respond_with_error(error),
@@ -1647,13 +1700,15 @@ impl AcpCodingAgent {
                                 sid.clone(),
                                 req.cwd.clone(),
                                 system_prompt,
+                                additional_directories.clone(),
+                                client_roots.clone(),
                             );
                             a_resume.register_session(session);
                             a_resume.get_session(&sid).unwrap()
                         }
                     };
                     let mut session = session;
-                    session.set_additional_directories(req.additional_directories.clone());
+                    session.set_additional_directories(additional_directories);
                     // 空闲会话也要能收到 `config_option_update`（同 `session/new`）。
                     session.set_client(AcpClientHandle::new(cx.clone()));
                     // Bridge MCP servers declared on resume (idempotent per server). Spawned
@@ -1913,15 +1968,40 @@ impl AcpCodingAgent {
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
-            )
-            .connect_to(transport)
-            .await;
+            ),
+        );
+        AcpCodingAgentService {
+            agent,
+            handlers,
+            wakeup,
+            wakeup_stop,
+        }
+    }
+}
+
+/// An ACP agent that has not been connected to a transport yet.
+///
+/// Holds the full handler chain plus the idle-wakeup loop that seeds results background work
+/// produced into idle sessions. [`AcpCodingAgent::run_with_transport`] connects one and
+/// returns; a host that owns the transport (the `--ws` server builds one service per
+/// connection) keeps it and connects it when its transport is ready.
+pub struct AcpCodingAgentService {
+    agent: Arc<AcpCodingAgent>,
+    handlers: DynConnectTo<Client>,
+    wakeup: tokio::task::JoinHandle<()>,
+    wakeup_stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ConnectTo<Client> for AcpCodingAgentService {
+    async fn connect_to(self, client: impl ConnectTo<Agent>) -> agent_client_protocol::Result<()> {
+        let result = self.handlers.connect_to(client).await;
         // The connection is gone: stop waking sessions nobody is listening to, and release
         // the sessions so a turn that was still running is cancelled instead of finishing
         // into a closed transport (ACP-42).
-        wakeup_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        wakeup.abort();
-        agent.shutdown_sessions().await;
+        self.wakeup_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.wakeup.abort();
+        self.agent.shutdown_sessions().await;
         result
     }
 }
@@ -2410,6 +2490,30 @@ impl AcpCodingAgentBuilder {
         Ok(agent)
     }
 }
+/// Handles `_acp_extends/fs/list`: lists directories on the agent host so a remote client
+/// can pick a session `cwd` without being able to browse the whole disk.
+async fn handle_ext_fs_list(
+    req: crate::ext::ExtFsListRequest,
+    responder: agent_client_protocol::v1::Responder<crate::ext::ExtFsListResult>,
+) -> Result<(), agent_client_protocol::Error> {
+    let roots = crate::ext::fs_list_roots();
+    let requested = req
+        .params
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let result = match requested {
+        Some(raw) => crate::ext::list_directories(std::path::Path::new(raw), &roots, req.params.limit),
+        None => Ok(crate::ext::roots_listing(&roots)),
+    };
+    match result {
+        Ok(listing) => responder.respond(listing),
+        Err(message) => responder
+            .respond_with_error(agent_client_protocol::Error::invalid_params().data(message)),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -2718,7 +2822,13 @@ mod tests {
             .expect("build AcpCodingAgent");
 
         let session_id = SessionId::new("session-shutdown");
-        let session = agent.create_session(session_id.clone(), root.clone(), None);
+        let session = agent.create_session(
+            session_id.clone(),
+            root.clone(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
         let handle = session.clone();
         agent.register_session(session);
         assert!(agent.get_session(&session_id).is_some());

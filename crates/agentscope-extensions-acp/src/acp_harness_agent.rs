@@ -7,6 +7,15 @@
 //!   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}' \
 //!     | cargo run -p agentscope-extensions-acp --bin acp_harness_agent
 //!
+//! 默认是 stdio 传输（客户端把本进程当子进程拉起）。也可以自己监听一个端口：
+//!   acp_harness_agent --ws            # WebSocket: ws://0.0.0.0:8888/acp
+//!   acp_harness_agent --http          # HTTP+SSE:  http://0.0.0.0:8888/acp
+//!   acp_harness_agent --ws --port 9000
+//! `--ws` 与 `--http` 是同一条监听（SDK 的 `AcpHttpServer` 在 `/acp` 上同时接 WS 升级与
+//! `POST`/`GET`）：一条 WS 文本帧 = 一条 JSON-RPC 消息，HTTP 侧 `POST` 发消息、
+//! `GET` + `Accept: text/event-stream` 收消息。服务绑定 `0.0.0.0`，局域网内任意设备都能连
+//! （注意：协议本身没有认证）。
+//!
 //! 配置模型（二选一，都只要一个 API key）：
 //!   - 导出 provider 的密钥（如 `DEEPSEEK_API_KEY`），启动时自动启用对应 provider；
 //!   - 跑 `acp_harness_agent --setup`，从 models.dev 目录里选 provider + 填 key。
@@ -129,6 +138,7 @@ use agentscope_harness::agent::{
 };
 
 use agent_client_protocol::v1::schema::AuthState;
+use agent_client_protocol_http::{AcpHttpServer, CorsOptions, ServerOptions};
 
 // ---------------------------------------------------------------------------
 // Agent 构建
@@ -306,6 +316,7 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         subagent_agents,
         subagent_mode,
         subagent_nesting,
+        additional_directories,
     } = ctx;
     let session_id = session_id.as_str();
     let model_config = ModelConfig::load_or_create_with_env();
@@ -438,6 +449,9 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
     // 工具执行策略：超过 240s 的调用转后台（给模型占位结果，跑完再回送结果并唤醒），
     // 单次执行上限 1800s。没有这一步时 core 的 300s 默认会直接取消长命令。
     builder = agentscope_extensions_acp::coding_agent::with_tool_execution_policy(builder);
+    // Client-declared `additionalDirectories` (server-origin only) widen the built agent's
+    // filesystem roots, so the model can open them with the built-in tools.
+    builder = builder.additional_project_roots(additional_directories);
 
     // Subagent progress: the harness streams each spawned subagent's events out of band (a
     // child keeps running after the parent's prompt returns), and the session forwards them to
@@ -634,21 +648,130 @@ impl SetupIo for TerminalIo {
     }
 }
 
+/// 命令行开关：默认 stdio 传输，`--ws` / `--http` 换成自己监听一个端口。
+struct CliArgs {
+    setup: bool,
+    /// `Some(port)` 表示监听模式：同一个端点同时服务 WebSocket 与 HTTP+SSE。
+    serve: Option<u16>,
+}
+
+/// `--ws` / `--http` 不给 `--port` 时监听的端口。
+const DEFAULT_SERVE_PORT: u16 = 8888;
+
+impl CliArgs {
+    /// 未知参数照旧忽略（历史行为），但参数值写错要报出来。
+    fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Self, String> {
+        let mut cli = Self {
+            setup: false,
+            serve: None,
+        };
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--setup" => cli.setup = true,
+                // 两个名字同一条监听：SDK 的 `AcpHttpServer` 在 `/acp` 上既接 WS 升级，
+                // 也接 `POST` + `Accept: text/event-stream`。显式写出来只是为了让命令行可读。
+                "--ws" | "--http" => {
+                    cli.serve.get_or_insert(DEFAULT_SERVE_PORT);
+                }
+                // 只给 `--port` 不给 `--ws` 也按监听处理：端口只对监听有意义。
+                "--port" => {
+                    let value = args.next().ok_or("--port 缺少端口号")?;
+                    cli.serve = Some(parse_port(&value)?);
+                }
+                _ => {
+                    if let Some(value) = arg.strip_prefix("--port=") {
+                        cli.serve = Some(parse_port(value)?);
+                    }
+                }
+            }
+        }
+        Ok(cli)
+    }
+}
+
+fn parse_port(value: &str) -> Result<u16, String> {
+    match value.parse::<u16>() {
+        Ok(port) if port > 0 => Ok(port),
+        _ => Err(format!("--port 需要 1-65535 的端口号，收到 {value:?}")),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = match CliArgs::parse(std::env::args().skip(1)) {
+        Ok(cli) => cli,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
     // `--setup` 是纯控制台向导：不能启动 ACP 传输，否则屏幕上会混进 stdout 协议帧。
-    if std::env::args().skip(1).any(|arg| arg == "--setup") {
+    if cli.setup {
         return run_setup();
     }
     // Worker count is a knobs, not `ncpu`: this agent serves one conversation, and every extra
     // thread also costs a mimalloc heap that keeps its own freed pages resident.
-    agentscope_extensions_acp::mem::runtime().block_on(run())
+    let runtime = agentscope_extensions_acp::mem::runtime();
+    match cli.serve {
+        Some(port) => runtime.block_on(serve_http_and_ws(port)),
+        None => runtime.block_on(run()),
+    }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// 进程级启动：两种传输都要。
+fn boot() {
     agentscope_extensions_acp::retention::apply_session_defaults();
     init_logging();
     agentscope_core::model::catalog::ModelCatalog::global().spawn_background_refresh();
+}
 
+/// stdio 模式（默认）：ACP 直接跑在进程的 stdin/stdout 上。
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    boot();
+    let agent = serve_agent();
+    let sessions = agent.session_registry();
+    tracing::info!("ACP CodingAgent starting over stdio...");
+    let result = agent.run_stdio().await;
+    // stdin EOF (the IDE closed the pipe) or a transport error ends the stdio loop just like
+    // a signal does: without draining here the runtime is dropped while a turn is still in
+    // flight, so the recorder's `Drop` release and the tool abort paths never run and the
+    // journal keeps a half-written turn. Always drain, then surface the loop's outcome.
+    drain_sessions(&sessions, "transport closed").await;
+    result?;
+    Ok(())
+}
+
+/// 监听模式（`--ws` / `--http`）：用 SDK 的 HTTP/WebSocket 传输（`AcpHttpServer`）在
+/// `0.0.0.0:<port>` 上监听，任何能访问本机端口的外部设备都能接入。
+///
+/// 同一个 `/acp` 端点同时服务两种承载：WS 升级（一条文本帧 = 一条 JSON-RPC 消息）和
+/// HTTP+SSE（`POST` 发消息、`GET` + `Accept: text/event-stream` 收回消息）。路由、分帧、
+/// 会话流都由 SDK 负责，本端只提供「一条连接一份 agent」的工厂。
+///
+/// 一条连接 = 一次对话（与 stdio 的「一个进程一次对话」同构）：每条连接各自建一份 agent，
+/// 连接断开时那份 agent 排空并释放自己的会话。服务本身不退出，下一个客户端可以直接连。
+async fn serve_http_and_ws(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    boot();
+    // 允许任意浏览器 Origin：连进来的可能是别的机器上的 Web 客户端（协议本身没有认证，
+    // 所以这里限的是入口 —— 绑哪个网卡、放行哪些来源）。
+    let app = AcpHttpServer::new(|| serve_agent().into_service())
+        .with_options(ServerOptions::default().with_cors(CorsOptions::allow_any_origin()))
+        .into_router();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await?;
+    tracing::info!("ACP CodingAgent listening over http/websocket...");
+    eprintln!(
+        "[serve] ws://0.0.0.0:{port}/acp · http://0.0.0.0:{port}/acp（局域网内任意外部设备可连）"
+    );
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Builds one ACP agent and binds the process-level helpers to its sessions.
+///
+/// stdio calls it once; the WebSocket server calls it once per connection, so everything
+/// expensive (config parsing) stays per session as before and nothing is shared between
+/// conversations.
+fn serve_agent() -> AcpCodingAgent {
     // 三种 ACP 模式，分别映射到框架的权限模式（切换即时生效，作用于下一个请求）：
     // - plan (Plan)        -> PermissionMode::Explore  ：只读，写/执行类工具一律拒绝
     // - accept_edits (Accept Edits) -> PermissionMode::AcceptEdits：文件读写自动批准，
@@ -696,7 +819,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 AuthState::Unauthenticated
             }
         })
-        .build()?;
+        .build()
+        // 这个 builder 没有可失败的一步；真失配了就在启动时炸出来，而不是半截服务。
+        .expect("the ACP agent builder has no fallible step");
 
     // The footprint the process serves at, before any session exists: this is the baseline the
     // idle trim works on (measured ~26 MB RSS / 29 MB commit on Windows).
@@ -710,6 +835,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `kill -9`, OOM kills and power loss cannot run any handler at all; those rely
     // on the per-iteration checkpoint (`StateCheckpointMiddleware::on_reasoning`)
     // to cap the loss at the in-flight iteration.
+    //
+    // Under `--ws` every connection registers its own handler, so each drains the sessions
+    // that connection owns.
     spawn_shutdown_handler(agent.session_registry());
     spawn_catalog_forwarder(
         agent.session_registry(),
@@ -717,16 +845,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         agent.image_support(),
     );
 
-    tracing::info!("ACP CodingAgent starting over stdio...");
-    let sessions = agent.session_registry();
-    let result = agent.run_stdio().await;
-    // stdin EOF (the IDE closed the pipe) or a transport error ends the stdio loop just like
-    // a signal does: without draining here the runtime is dropped while a turn is still in
-    // flight, so the recorder's `Drop` release and the tool abort paths never run and the
-    // journal keeps a half-written turn. Always drain, then surface the loop's outcome.
-    drain_sessions(&sessions, "transport closed").await;
-    result?;
-    Ok(())
+    agent
 }
 
 /// Forwards catalog content changes to live sessions as
@@ -865,6 +984,29 @@ async fn drain_sessions(sessions: &Arc<Mutex<HashMap<String, AcpAgentSession>>>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--ws` / `--http` / `--port` 的解析：默认 stdio，两个别名同一条监听，端口缺省 8888。
+    #[test]
+    fn serve_flags_pick_the_transport_and_the_port() {
+        let parse = |args: &[&str]| CliArgs::parse(args.iter().map(|arg| (*arg).to_string()));
+        assert!(parse(&[]).unwrap().serve.is_none());
+        assert_eq!(parse(&["--ws"]).unwrap().serve, Some(8888));
+        assert_eq!(parse(&["--http"]).unwrap().serve, Some(8888));
+        assert_eq!(
+            parse(&["--ws", "--port", "9000"]).unwrap().serve,
+            Some(9000)
+        );
+        assert_eq!(
+            parse(&["--http", "--port", "9000"]).unwrap().serve,
+            Some(9000)
+        );
+        assert_eq!(parse(&["--port=9000", "--ws"]).unwrap().serve, Some(9000));
+        assert_eq!(parse(&["--port", "7000"]).unwrap().serve, Some(7000));
+        assert!(parse(&["--setup"]).unwrap().setup);
+        assert!(parse(&["--port"]).is_err());
+        assert!(parse(&["--port", "0"]).is_err());
+        assert!(parse(&["--port", "abc"]).is_err());
+    }
 
     /// ACP-38: the client prompt is appended, never substituted -- our coding rules and
     /// tool guidance stay in front of it.

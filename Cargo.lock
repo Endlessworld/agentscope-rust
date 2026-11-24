@@ -78,6 +78,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-client-protocol-http"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e34a1cc3178fb946b90fe8efd0ad7209c5d8a6ddf1c0b8b24d8ee8ab9d38afd9"
+dependencies = [
+ "agent-client-protocol",
+ "async-stream",
+ "axum 0.8.9",
+ "futures",
+ "serde_json",
+ "tokio",
+ "tower-http 0.7.1",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "agent-client-protocol-schema"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -153,7 +170,7 @@ version = "0.2.0"
 dependencies = [
  "agentscope-durable",
  "async-trait",
- "axum",
+ "axum 0.7.9",
  "futures",
  "serde",
  "serde_json",
@@ -254,7 +271,7 @@ dependencies = [
  "agentscope-core",
  "agentscope-extensions-a2a-client",
  "async-trait",
- "axum",
+ "axum 0.7.9",
  "futures",
  "serde",
  "serde_json",
@@ -268,6 +285,7 @@ name = "agentscope-extensions-acp"
 version = "0.2.0"
 dependencies = [
  "agent-client-protocol",
+ "agent-client-protocol-http",
  "agentscope-core",
  "agentscope-durable",
  "agentscope-durable-adapter-agentscope",
@@ -275,6 +293,7 @@ dependencies = [
  "agentscope-extensions-model",
  "agentscope-harness",
  "async-trait",
+ "axum 0.8.9",
  "chrono",
  "futures",
  "libmimalloc-sys",
@@ -297,7 +316,7 @@ dependencies = [
  "agentscope-core",
  "agentscope-harness",
  "async-trait",
- "axum",
+ "axum 0.7.9",
  "chrono",
  "futures",
  "http 1.5.0",
@@ -314,7 +333,7 @@ version = "0.2.0"
 dependencies = [
  "agentscope-core",
  "agentscope-harness",
- "axum",
+ "axum 0.7.9",
  "chrono",
  "futures",
  "serde",
@@ -332,7 +351,7 @@ dependencies = [
  "agentscope-core",
  "agentscope-harness",
  "async-trait",
- "axum",
+ "axum 0.7.9",
  "base64 0.22.1",
  "bytes",
  "cbc",
@@ -1217,7 +1236,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
- "axum-core",
+ "axum-core 0.4.5",
  "bytes",
  "futures-util",
  "http 1.5.0",
@@ -1226,7 +1245,7 @@ dependencies = [
  "hyper 1.11.0",
  "hyper-util",
  "itoa",
- "matchit",
+ "matchit 0.7.3",
  "memchr",
  "mime",
  "percent-encoding",
@@ -1241,6 +1260,38 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+]
+
+[[package]]
+name = "axum"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
+dependencies = [
+ "axum-core 0.5.6",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
+ "hyper 1.11.0",
+ "hyper-util",
+ "itoa",
+ "matchit 0.8.4",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
+ "sha1 0.10.7",
+ "sync_wrapper",
+ "tokio",
+ "tokio-tungstenite",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -1261,6 +1312,25 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "sync_wrapper",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -3507,6 +3577,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
 name = "maybe-async"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4635,7 +4711,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -4677,7 +4753,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -5895,6 +5971,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tower-http"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08a05a66a4fdd61cbbe0a1d755ffe0ca6aba159dd4820936a0ff8a8278245b9c"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytes",
+ "http 1.5.0",
+ "percent-encoding",
+ "pin-project-lite",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
 name = "tower-layer"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5912,6 +6003,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",

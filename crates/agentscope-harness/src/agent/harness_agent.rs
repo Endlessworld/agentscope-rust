@@ -992,6 +992,17 @@ fn recording_policy_for(record_model_requests: bool) -> agentscope_core::journal
     }
 }
 
+/// Roots the default local filesystems accept: workspace + cwd + the client's roots.
+fn default_tool_roots(
+    workspace: &PathBuf,
+    cwd: &PathBuf,
+    extra: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut roots = vec![workspace.clone(), cwd.clone()];
+    roots.extend(extra.iter().cloned());
+    roots
+}
+
 pub struct HarnessAgentBuilder {
     name: Option<String>,
     model: Option<Arc<dyn Model>>,
@@ -1022,6 +1033,9 @@ pub struct HarnessAgentBuilder {
     sandbox_filesystem_spec: Option<SandboxFilesystemSpec>,
     /// Extra path-prefix routes layered over the resolved filesystem (Java `filesystemRoute`).
     filesystem_routes: Vec<(String, Arc<dyn Filesystem>)>,
+    /// Absolute roots the default local filesystems accept beyond `cwd` and the workspace
+    /// (ACP `additionalDirectories`). Relative tool paths still anchor at `cwd`.
+    additional_project_roots: Vec<PathBuf>,
     cwd: Option<PathBuf>,
     distributed_store: Option<DistributedStore>,
     /// Optional persistent state store wired into a checkpoint middleware.
@@ -1186,6 +1200,7 @@ impl Default for HarnessAgentBuilder {
             remote_filesystem_spec: None,
             sandbox_filesystem_spec: None,
             filesystem_routes: Vec::new(),
+            additional_project_roots: Vec::new(),
             cwd: None,
             distributed_store: None,
             state_store: None,
@@ -1363,6 +1378,17 @@ impl HarnessAgentBuilder {
 
     pub fn filesystem(mut self, fs: Arc<dyn Filesystem>) -> Self {
         self.filesystem = Some(fs);
+        self
+    }
+
+    /// Widens the default local filesystems with absolute roots beyond `cwd` and the
+    /// workspace (ACP `additionalDirectories`). Only existing directories are added, and an
+    /// explicit [`Self::filesystem`] keeps full control of its own roots.
+    pub fn additional_project_roots(
+        mut self,
+        roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Self {
+        self.additional_project_roots = roots.into_iter().collect();
         self
     }
 
@@ -2261,6 +2287,13 @@ impl HarnessAgentBuilder {
                     .map(|spec| spec.build(&resolved_workspace, &agent_id))
             });
         let uses_default_filesystem = configured_filesystem.is_none();
+        // Client-declared roots are absolute and pre-filtered to existing directories.
+        let extra_roots: Vec<PathBuf> = self
+            .additional_project_roots
+            .iter()
+            .filter(|root| root.is_dir())
+            .cloned()
+            .collect();
         let filesystem: Arc<dyn Filesystem> = configured_filesystem.unwrap_or_else(|| {
             Arc::new(
                 LocalFilesystem::with_mode(
@@ -2268,7 +2301,11 @@ impl HarnessAgentBuilder {
                     LocalFsMode::Rooted,
                     DEFAULT_MAX_FILE_SIZE_MB,
                 )
-                .with_additional_roots(vec![resolved_workspace.clone(), cwd.clone()]),
+                .with_additional_roots(default_tool_roots(
+                    &resolved_workspace,
+                    &cwd,
+                    &extra_roots,
+                )),
             )
         });
         let project_filesystem: Arc<dyn Filesystem> = if uses_default_filesystem {
@@ -2278,7 +2315,11 @@ impl HarnessAgentBuilder {
                     LocalFsMode::Rooted,
                     DEFAULT_MAX_FILE_SIZE_MB,
                 )
-                .with_additional_roots(vec![cwd.clone(), resolved_workspace.clone()]),
+                .with_additional_roots(default_tool_roots(
+                    &resolved_workspace,
+                    &cwd,
+                    &extra_roots,
+                )),
             )
         } else {
             Arc::clone(&filesystem)

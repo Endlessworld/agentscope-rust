@@ -67,7 +67,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["signal", "net"] }
+# `--ws` 模式：ACP 架在 SDK 自带的 HTTP + WebSocket 传输上（`AcpHttpServer` 的 WS upgrade），
+# 一条 WS 文本帧 = 一条 JSON-RPC 消息。`server` 特性会带入 axum 0.8（工作区其它 crate 仍是
+# 0.7，两者大版本不同、类型不互通，各自编译各自的）。
+agent-client-protocol-http = { version = "5.0.0", features = ["server"] }
+# 只用于 `axum::serve`：把 SDK 组好的 Router 挂到 TCP 监听上。
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

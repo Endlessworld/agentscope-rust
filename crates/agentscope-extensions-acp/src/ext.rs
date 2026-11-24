@@ -9,6 +9,7 @@
 //! as a narrow, explicitly-namespaced request instead of widening the standard surface.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_client_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, UntypedMessage};
@@ -538,6 +539,245 @@ impl_ext_request!(
 );
 
 wire_response!(ExtPauseResult, ExtResumeResult);
+/// Lists directories on the agent host so a remote client can pick a session cwd.
+///
+/// Params: `{ "path": "/srv/repo", "limit": 500 }`. Omitting `path` answers the browsable
+/// roots, which is what a picker asks for before the user descends anywhere. Only
+/// directories are returned: the endpoint exists to choose a `cwd`, and a project checkout
+/// can hold thousands of files.
+///
+/// Browsing is limited to explicitly allowed directories (`ANIMUS_FS_LIST_ROOTS`,
+/// `;`-separated; the platform roots when unset), so exposing the endpoint does not turn
+/// into unrestricted disk browsing of the agent host.
+pub const FS_LIST_METHOD: &str = "_acp_extends/fs/list";
+
+/// Default number of entries one listing returns.
+const FS_LIST_LIMIT_DEFAULT: usize = 500;
+
+/// Ceiling a client cannot raise: one listing is a UI page, not a disk walk.
+const FS_LIST_LIMIT_MAX: usize = 2000;
+
+/// Parameters of [`FS_LIST_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtFsListParams {
+    /// Absolute directory to list; omitted answers the browsable roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Entry cap, clamped to [`FS_LIST_LIMIT_MAX`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// One directory entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtFsEntry {
+    /// Final path component, for display.
+    pub name: String,
+    /// Absolute path the client sends back as the session cwd.
+    pub path: String,
+}
+
+/// Response of [`FS_LIST_METHOD`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtFsListResult {
+    /// The listed directory (canonicalized); empty when the answer only carries the roots.
+    pub path: String,
+    /// Parent directory, absent at a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Browsable roots; sent on every answer so a picker can render drives.
+    pub roots: Vec<String>,
+    /// `$HOME`, when it is inside a browsable root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+    /// Sub-directories, name-sorted.
+    pub entries: Vec<ExtFsEntry>,
+    /// `true` when more entries exist than the applied limit.
+    pub truncated: bool,
+}
+
+/// An incoming `_acp_extends/fs/list` request.
+#[derive(Debug, Clone)]
+pub struct ExtFsListRequest {
+    method: Arc<str>,
+    pub params: ExtFsListParams,
+}
+
+impl_ext_request!(
+    ExtFsListRequest,
+    ExtFsListParams,
+    FS_LIST_METHOD,
+    ExtFsListResult
+);
+
+wire_response!(ExtFsListResult);
+
+/// Browsable roots: `ANIMUS_FS_LIST_ROOTS` (`;`-separated), or the platform roots.
+pub fn fs_list_roots() -> Vec<PathBuf> {
+    let configured = std::env::var("ANIMUS_FS_LIST_ROOTS").unwrap_or_default();
+    let mut roots: Vec<PathBuf> = configured
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| PathBuf::from(part).canonicalize().ok())
+        .filter(|path| path.is_dir())
+        .collect();
+    if roots.is_empty() {
+        roots = platform_roots();
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// The whole disk on unix, the fixed drives on Windows.
+fn platform_roots() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut roots = Vec::new();
+        for letter in b'C'..=b'Z' {
+            let candidate = PathBuf::from(format!("{}:\\", letter as char));
+            if let Ok(path) = candidate.canonicalize() {
+                if path.is_dir() {
+                    roots.push(path);
+                }
+            }
+        }
+        roots
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/").canonicalize().into_iter().collect()
+    }
+}
+
+/// Canonicalizes `raw` and asserts it stays inside `roots`.
+pub fn resolve_list_path(raw: &str, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("a directory path is required".to_string());
+    }
+    let candidate = PathBuf::from(trimmed);
+    if !candidate.is_absolute() {
+        return Err(format!("path must be absolute: {trimmed}"));
+    }
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!("path must not contain '..': {trimmed}"));
+    }
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|error| format!("directory not found: {trimmed} ({error})"))?;
+    if !resolved.is_dir() {
+        return Err(format!("not a directory: {trimmed}"));
+    }
+    if !roots.iter().any(|root| resolved.starts_with(root)) {
+        return Err(format!("path outside allowed roots: {trimmed}"));
+    }
+    Ok(resolved)
+}
+
+/// Lists the sub-directories of `dir`, without following a symlink out of the roots.
+pub fn list_directories(
+    dir: &Path,
+    roots: &[PathBuf],
+    limit: Option<usize>,
+) -> Result<ExtFsListResult, String> {
+    let dir = resolve_list_path(&dir.to_string_lossy(), roots)?;
+    let limit = limit
+        .unwrap_or(FS_LIST_LIMIT_DEFAULT)
+        .clamp(1, FS_LIST_LIMIT_MAX);
+    let listing = std::fs::read_dir(&dir)
+        .map_err(|error| format!("cannot list {}: {error}", display_path(&dir)))?;
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for entry in listing.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let is_directory = if kind.is_symlink() {
+            // A link is listed only when its target is a directory inside the roots:
+            // otherwise a symlink would widen the browsable surface.
+            match path.canonicalize() {
+                Ok(target) => target.is_dir() && roots.iter().any(|root| target.starts_with(root)),
+                Err(_) => false,
+            }
+        } else {
+            kind.is_dir()
+        };
+        if !is_directory {
+            continue;
+        }
+        entries.push((
+            entry.file_name().to_string_lossy().into_owned(),
+            display_path(&path),
+        ));
+    }
+    entries.sort_by_key(|(name, _)| name.to_lowercase());
+    let truncated = entries.len() > limit;
+    entries.truncate(limit);
+    let parent = dir
+        .parent()
+        .filter(|parent| parent != &dir && roots.iter().any(|root| parent.starts_with(root)))
+        .map(|parent| display_path(&parent));
+    Ok(ExtFsListResult {
+        path: display_path(&dir),
+        parent,
+        roots: roots.iter().map(|root| display_path(root)).collect(),
+        home: home_directory(roots),
+        entries: entries
+            .into_iter()
+            .map(|(name, path)| ExtFsEntry { name, path })
+            .collect(),
+        truncated,
+    })
+}
+
+/// The answer to a request without `path`: the browsable roots, as entries.
+pub fn roots_listing(roots: &[PathBuf]) -> ExtFsListResult {
+    ExtFsListResult {
+        path: String::new(),
+        parent: None,
+        roots: roots.iter().map(|root| display_path(root)).collect(),
+        home: home_directory(roots),
+        entries: roots
+            .iter()
+            .map(|root| ExtFsEntry {
+                name: display_path(root),
+                path: display_path(root),
+            })
+            .collect(),
+        truncated: false,
+    }
+}
+
+/// `$HOME` (or `%USERPROFILE%`), when it is inside a browsable root.
+fn home_directory(roots: &[PathBuf]) -> Option<String> {
+    let raw = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let path = PathBuf::from(raw).canonicalize().ok()?;
+    roots
+        .iter()
+        .any(|root| path.starts_with(root))
+        .then(|| display_path(&path))
+}
+
+/// Renders a path for the wire: Windows canonical paths carry a `\\?\` prefix that a
+/// picker would otherwise show verbatim.
+fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    text
+}
 
 #[cfg(test)]
 mod tests {
@@ -766,5 +1006,79 @@ mod tests {
         .into_json(QUEUE_REMOVE_METHOD)
         .unwrap();
         assert_eq!(value, json!({ "turnId": "turn_1", "removed": false }));
+    }
+
+    fn temp_list_dir(tag: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "agentscope-ext-fs-list-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path.canonicalize().expect("canonical temp dir")
+    }
+
+    #[test]
+    fn the_fs_list_method_uses_our_extension_namespace() {
+        assert!(FS_LIST_METHOD.starts_with("_acp_extends/"));
+        assert!(ExtFsListRequest::matches_method(FS_LIST_METHOD));
+        assert!(!ExtFsListRequest::matches_method("fs/read_text_file"));
+    }
+
+    #[test]
+    fn fs_list_params_round_trip_through_the_wire_format() {
+        let request = ExtFsListRequest::parse_message(
+            FS_LIST_METHOD,
+            &json!({ "path": "/srv/repo", "limit": 10 }),
+        )
+        .unwrap();
+        assert_eq!(request.params.path.as_deref(), Some("/srv/repo"));
+        assert_eq!(request.params.limit, Some(10));
+
+        let bare = ExtFsListRequest::parse_message(FS_LIST_METHOD, &json!({})).unwrap();
+        assert!(bare.params.path.is_none());
+    }
+
+    #[test]
+    fn a_listing_returns_directories_only_and_truncates() {
+        let root = temp_list_dir("dirs");
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+        std::fs::create_dir_all(root.join("Alpha")).unwrap();
+        std::fs::write(root.join("note.txt"), "x").unwrap();
+        let roots = vec![root.clone()];
+
+        let all = list_directories(&root, &roots, None).unwrap();
+        assert_eq!(all.entries.len(), 2);
+        assert_eq!(all.entries[0].name, "Alpha");
+        assert!(!all.truncated);
+        assert_eq!(all.roots.len(), 1);
+
+        let capped = list_directories(&root, &roots, Some(1)).unwrap();
+        assert_eq!(capped.entries.len(), 1);
+        assert!(capped.truncated);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_relative_or_escaping_path_is_rejected() {
+        let root = temp_list_dir("guard");
+        let roots = vec![root.clone()];
+        assert!(resolve_list_path("relative/dir", &roots).is_err());
+        let escape = root.join("..").join("escape");
+        assert!(resolve_list_path(&escape.to_string_lossy(), &roots).is_err());
+        assert!(resolve_list_path(&root.to_string_lossy(), &roots).is_ok());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_path_outside_the_roots_is_rejected() {
+        let root = temp_list_dir("inside");
+        let other = temp_list_dir("outside");
+        let roots = vec![root.clone()];
+        assert!(resolve_list_path(&other.to_string_lossy(), &roots).is_err());
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&other).ok();
     }
 }

@@ -25,6 +25,7 @@ pub mod provider;
 pub mod providers_admin;
 pub mod recording;
 pub mod retention;
+pub mod roots;
 pub mod session;
 mod session_history;
 pub mod setup;
@@ -33,7 +34,8 @@ pub mod turn_driver;
 
 pub use coding_agent::{
     compaction_trigger_for, compaction_window_tokens, release_catalog_if_unused, AcpCodingAgent,
-    AcpCodingAgentBuilder, ImageSupport, SessionBuild, ACP_CONTEXT_WINDOW_TOKENS,
+    AcpCodingAgentBuilder, AcpCodingAgentService, ImageSupport, SessionBuild,
+    ACP_CONTEXT_WINDOW_TOKENS,
 };
 pub use elicitation::{AskUserTool, ElicitationClient, ElicitationSlot};
 pub use mcp_over_acp::{McpAcpConnection, McpAcpTool};
