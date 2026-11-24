@@ -20,5 +20,5 @@ cargo xtask acp registry <artifacts-dir> --out target/agent.json
 推 tag 后，Release 流水线会把生成好的 `acp-registry-agent.json` 一起传上去，发布完把它拷回本目录
 （改名为 `agent.json`）再提 Registry PR，不用手抄 sha256。
 
-> 当前本目录的 `agent.json` 仍是 **v0.1.1** 的产物：v0.2.0 的六平台压缩包要由 CI 构建，
-> 本机拿不到它们的 sha256，所以不能提前回填。发完 v0.2.0 后按上面的做法覆盖一次即可。
+> 当前本目录的 `agent.json` 是 **v0.2.0** 的 Release 产物（直接取自
+> `v0.2.0` Release 里的 `acp-registry-agent.json` 资产）。下次发版同样等 CI 跑完再覆盖。
