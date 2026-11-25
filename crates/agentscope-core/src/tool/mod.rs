@@ -13,6 +13,7 @@ pub mod interceptor;
 pub mod macros;
 pub mod mcp;
 pub mod meta;
+pub mod process_registry;
 pub mod registration;
 pub mod requirement;
 pub mod result;
@@ -38,6 +39,9 @@ pub use group::{ToolGroup, ToolGroupBuilder, ToolGroupManager, ToolGroupScope};
 pub use interceptor::{InterceptorFuture, InterceptorNext, ToolCallInterceptor, ToolInvocation};
 pub use mcp::{McpAsyncHandler, McpTool};
 pub use meta::ToolCallParamBuilder;
+pub use process_registry::{
+    ProcessEvents, ProcessGuard, ProcessRegistry, PROCESS_REGISTRY_CONTEXT_KEY,
+};
 pub use meta::{ExtendedModel, MetaToolFactory, SimpleExtendedModel, ToolCallParam};
 pub use registration::ToolRegistration;
 pub use requirement::RequirementProposeTool;
@@ -52,6 +56,7 @@ pub use suspend::ToolSuspendException;
 pub use todo::TodoWriteTool;
 pub use tool::{
     FunctionTool, Tool, ToolExecutionContext, CONVERSATION_HISTORY_KEY, MAX_CONVERSATION_HISTORY,
+    TOOL_CALL_ID_CONTEXT_KEY,
 };
 pub use tool_request_config::{ToolMergeMode, ToolRequestConfig, TOOL_REQUEST_CONFIG_CONTEXT_KEY};
 pub use toolkit::Toolkit;

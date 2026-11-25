@@ -1031,6 +1031,9 @@ pub struct HarnessAgentBuilder {
     remote_filesystem_spec: Option<RemoteFilesystemSpec>,
     /// Sandbox configuration assembled by `build()` unless `sandbox_context` is set.
     sandbox_filesystem_spec: Option<SandboxFilesystemSpec>,
+    /// Session process registry handed to the sandbox so shell commands can be cancelled
+    /// and streamed (ACP v2).
+    processes: Option<Arc<agentscope_core::tool::ProcessRegistry>>,
     /// Extra path-prefix routes layered over the resolved filesystem (Java `filesystemRoute`).
     filesystem_routes: Vec<(String, Arc<dyn Filesystem>)>,
     /// Absolute roots the default local filesystems accept beyond `cwd` and the workspace
@@ -1199,6 +1202,7 @@ impl Default for HarnessAgentBuilder {
             local_filesystem_spec: None,
             remote_filesystem_spec: None,
             sandbox_filesystem_spec: None,
+            processes: None,
             filesystem_routes: Vec::new(),
             additional_project_roots: Vec::new(),
             cwd: None,
@@ -1303,6 +1307,16 @@ impl Default for HarnessAgentBuilder {
 }
 
 impl HarnessAgentBuilder {
+    /// Wires the session process registry: shell commands register their child process so
+    /// a client cancel can kill it and its output can be streamed.
+    pub fn processes(
+        mut self,
+        processes: Arc<agentscope_core::tool::ProcessRegistry>,
+    ) -> Self {
+        self.processes = Some(processes);
+        self
+    }
+
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -2887,7 +2901,9 @@ impl HarnessAgentBuilder {
             FilesystemTool::register(&toolkit, Arc::clone(&project_filesystem));
         }
         if self.with_shell_tool && !self.disable_shell_tool {
-            if let Some(sandbox) = sandbox_filesystem(&project_filesystem, &cwd) {
+            if let Some(sandbox) =
+                sandbox_filesystem(&project_filesystem, &cwd, self.processes.clone())
+            {
                 toolkit.register_tool(Arc::new(ShellExecuteTool::with_output_compaction(
                     sandbox,
                     self.shell_output_compaction.clone(),
@@ -3503,9 +3519,13 @@ fn eviction_path_in_workspace(workspace: &std::path::Path, eviction_path: &str) 
 fn sandbox_filesystem(
     filesystem: &Arc<dyn Filesystem>,
     cwd: &PathBuf,
+    processes: Option<Arc<agentscope_core::tool::ProcessRegistry>>,
 ) -> Option<Arc<dyn crate::filesystem::SandboxFilesystem>> {
     use crate::filesystem::{SandboxBackedFilesystem, SandboxFilesystem};
-    let sandbox = SandboxBackedFilesystem::new(Arc::clone(filesystem), cwd.clone());
+    let mut sandbox = SandboxBackedFilesystem::new(Arc::clone(filesystem), cwd.clone());
+    if let Some(processes) = processes {
+        sandbox = sandbox.with_processes(processes);
+    }
     Some(Arc::new(sandbox) as Arc<dyn SandboxFilesystem>)
 }
 

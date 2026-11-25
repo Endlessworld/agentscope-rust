@@ -105,6 +105,8 @@ pub struct ExecuteResponse {
     /// (`timeout 30 build`, a script's `exit 124`) is a normal result and must not be reported to
     /// the model as a confirmed timeout (Java `ExecuteResponse.timedOut`).
     pub timed_out: bool,
+    /// Whether a client cancel killed the command before it exited on its own.
+    pub cancelled: bool,
 }
 
 impl ExecuteResponse {
@@ -118,6 +120,11 @@ impl ExecuteResponse {
     /// Whether execution was cut short at its deadline.
     pub fn timed_out(&self) -> bool {
         self.timed_out
+    }
+
+    /// Whether a client cancel killed the command.
+    pub fn cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 

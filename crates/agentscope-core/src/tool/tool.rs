@@ -13,6 +13,12 @@ use super::emitter::ToolEmitter;
 /// read from the agent state.
 pub const CONVERSATION_HISTORY_KEY: &str = "conversationHistory";
 
+/// Runtime key carrying the id of the tool call being executed.
+///
+/// Execute-class tools forward it to the sandbox so the running child process can be
+/// registered (cancel + streamed output) under a key the protocol layer knows.
+pub const TOOL_CALL_ID_CONTEXT_KEY: &str = "tool_call_id";
+
 /// Maximum number of most-recent messages exposed to a single tool call.
 ///
 /// Java hands the whole history to every tool call; the runtime channel caps it here to bound
@@ -35,6 +41,10 @@ pub struct ToolExecutionContext {
     /// [`RuntimeContext`]: crate::agent::RuntimeContext
     /// [`Toolkit`]: super::toolkit::Toolkit
     pub tool_request_config: Option<Arc<super::tool_request_config::ToolRequestConfig>>,
+    /// Session-scoped registry of running command processes, when the host exposes one
+    /// (ACP v2 does; v1 leaves it `None`). Execute-class tools register their child
+    /// process here so a client cancel can kill it and the stream can be forwarded.
+    pub processes: Option<Arc<super::process_registry::ProcessRegistry>>,
 }
 
 impl ToolExecutionContext {

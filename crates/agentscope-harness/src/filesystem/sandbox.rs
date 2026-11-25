@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use agentscope_core::agent::RuntimeContext;
 use agentscope_core::error::{Error, Result};
+use agentscope_core::tool::{ProcessGuard, ProcessRegistry, TOOL_CALL_ID_CONTEXT_KEY};
 use async_trait::async_trait;
 use base64::Engine;
 use tokio::io::AsyncReadExt;
@@ -44,6 +45,9 @@ pub struct SandboxBackedFilesystem {
     /// sub-directory the filesystem layer namespaces file access by, so two users sharing
     /// one sandbox do not execute in one another's directory.
     isolation_scope: Option<super::super::agent::IsolationScope>,
+    /// Session process registry (ACP v2): lets a client cancel kill the running command and
+    /// lets its output stream while it runs. `None` keeps the historical fire-and-wait.
+    processes: Option<Arc<ProcessRegistry>>,
 }
 
 impl SandboxBackedFilesystem {
@@ -52,12 +56,20 @@ impl SandboxBackedFilesystem {
             inner,
             cwd: cwd.into(),
             isolation_scope: None,
+            processes: None,
         }
     }
 
     /// Scopes shell execution by the given isolation scope.
     pub fn with_isolation_scope(mut self, scope: super::super::agent::IsolationScope) -> Self {
         self.isolation_scope = Some(scope);
+        self
+    }
+
+    /// Registers the session process registry so shell commands are cancellable and
+    /// stream their output.
+    pub fn with_processes(mut self, processes: Arc<ProcessRegistry>) -> Self {
+        self.processes = Some(processes);
         self
     }
 
@@ -152,8 +164,14 @@ impl Filesystem for SandboxBackedFilesystem {
 ///  3. 不落盘，无临时文件残留，降低安全软件告警频率。
 #[cfg(windows)]
 fn build_windows_command(command: &str) -> Vec<String> {
+    // pwsh 写管道时默认沿用控制台输出编码（中文系统为 GBK），客户端按 UTF-8 解码会得到成片
+    // U+FFFD——终端流式输出和工具结果都受影响。开跑前把 stdout/stderr 与管道编码切到 UTF-8。
+    let script = format!(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; {}",
+        command
+    );
     // pwsh -EncodedCommand 要求 UTF-16LE 编码后再 Base64
-    let utf16 = command.encode_utf16().collect::<Vec<u16>>();
+    let utf16 = script.encode_utf16().collect::<Vec<u16>>();
     let byte_vec: Vec<u8> = utf16.iter().flat_map(|w| w.to_le_bytes()).collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(&byte_vec);
     vec![
@@ -242,7 +260,9 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         // By spawning first, the Child handle stays in scope and we can:
         // 1. Take stdout/stderr BEFORE waiting (prevents pipe-full deadlock).
         // 2. On timeout, kill the ENTIRE process tree via `taskkill /T`.
-        let mut child = cmd.spawn().map_err(|e| {
+        // An interrupted turn drops this future: without `kill_on_drop` the child would
+        // keep running (and keep holding the pipes) after `session/cancel`.
+        let mut child = cmd.kill_on_drop(true).spawn().map_err(|e| {
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Failed to spawn command: {}", e),
@@ -250,6 +270,27 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         })?;
 
         let pid = child.id().unwrap_or(0);
+
+        // Register the child so a client cancel (tool_call/cancel / terminal/cancel) can kill
+        // the whole tree, and stream its output while it runs. Both are no-ops without a
+        // registry (v1 hosts) or a tool-call id.
+        let process_key = ctx
+            .extension::<String>(TOOL_CALL_ID_CONTEXT_KEY)
+            .map(|id| id.as_str().to_string());
+        let _guard: Option<ProcessGuard> = match (self.processes.as_ref(), process_key.as_ref()) {
+            (Some(registry), Some(key)) => {
+                let registry = Arc::clone(registry);
+                Some(registry.register(key.clone(), move || kill_process_tree(pid)))
+            }
+            _ => None,
+        };
+        let stream_target = match (self.processes.as_ref(), process_key.as_ref()) {
+            (Some(registry), Some(key)) => Some((Arc::clone(registry), key.clone())),
+            _ => None,
+        };
+        if let (Some(registry), Some(key)) = (self.processes.as_ref(), process_key.as_ref()) {
+            registry.emit_started(key, command, &scoped_cwd.to_string_lossy());
+        }
 
         // Take the piped streams BEFORE awaiting — if we don't, and the child
         // writes enough to fill the OS pipe buffer (~64KB on Windows), it blocks
@@ -260,15 +301,17 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         // Spawn background tasks to drain stdout/stderr concurrently, keeping at most
         // `MAX_OUTPUT_BYTES` each while still reading to EOF so the child never blocks on a
         // full pipe.
+        let stdout_sink = stream_target.clone();
         let stdout_fut = async move {
             match stdout_stream {
-                Some(stream) => read_capped(stream, MAX_OUTPUT_BYTES).await,
+                Some(stream) => read_capped(stream, MAX_OUTPUT_BYTES, stdout_sink).await,
                 None => (Vec::new(), false),
             }
         };
+        let stderr_sink = stream_target;
         let stderr_fut = async move {
             match stderr_stream {
-                Some(stream) => read_capped(stream, MAX_OUTPUT_BYTES).await,
+                Some(stream) => read_capped(stream, MAX_OUTPUT_BYTES, stderr_sink).await,
                 None => (Vec::new(), false),
             }
         };
@@ -281,6 +324,10 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
             Ok(result) => result.map_err(Error::Io)?,
             Err(_elapsed) => {
                 // Timeout: kill the entire process tree to avoid orphans.
+                if let (Some(registry), Some(key)) = (self.processes.as_ref(), process_key.as_ref())
+                {
+                    registry.emit_exited(key, ExecuteResponse::TIMEOUT_EXIT_CODE);
+                }
                 kill_process_tree(pid);
                 // Also kill the direct child as a fallback.
                 let _ = child.kill().await;
@@ -301,7 +348,9 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
                     exit_code: ExecuteResponse::TIMEOUT_EXIT_CODE,
                     truncated: true,
                     timed_out: true,
+                    cancelled: false,
                 });
+
             }
         };
 
@@ -324,28 +373,59 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         }
         let truncated = cap_output(&mut output, stdout_truncated || stderr_truncated);
 
+        let cancelled = _guard
+            .as_ref()
+            .map(|guard| guard.is_cancelled())
+            .unwrap_or(false);
+        if let (Some(registry), Some(key)) = (self.processes.as_ref(), process_key.as_ref()) {
+            registry.emit_exited(key, exit_status.code().unwrap_or(-1));
+        }
         Ok(ExecuteResponse {
             output,
             exit_code: exit_status.code().unwrap_or(-1),
             truncated,
             timed_out: false,
+            cancelled,
         })
     }
 }
 
 /// Reads a stream to EOF, keeping at most `cap` bytes but draining the rest so the child
 /// process never blocks on a full pipe.
-async fn read_capped<R>(mut stream: R, cap: usize) -> (Vec<u8>, bool)
+async fn read_capped<R>(
+    mut stream: R,
+    cap: usize,
+    sink: Option<(Arc<ProcessRegistry>, String)>,
+) -> (Vec<u8>, bool)
 where
     R: AsyncReadExt + Unpin,
 {
     let mut collected = Vec::new();
     let mut truncated = false;
     let mut buf = [0u8; 8192];
+    // 尾部不完整的多字节 UTF-8 序列先攒着，和下一个读块拼起来再发：
+    // 否则客户端逐 chunk 解码会把一个汉字拆成两个 U+FFFD。
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         match stream.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(read) => {
+                // Forward the raw chunk before capping: a cancelled or truncated command
+                // still shows the client everything it produced.
+                if let Some((registry, key)) = &sink {
+                    pending.extend_from_slice(&buf[..read]);
+                    let complete = utf8_prefix_len(&pending);
+                    if complete > 0 {
+                        registry.emit_output(key, &pending[..complete]);
+                        pending.drain(..complete);
+                    }
+                    // 非法字节（GBK / 二进制输出）不会让前缀前进；攒满一个不完整序列的
+                    // 最大长度就原样发出去，让客户端按 lossy 处理，避免无限积压。
+                    if pending.len() > 4 {
+                        registry.emit_output(key, &pending);
+                        pending.clear();
+                    }
+                }
                 let room = cap.saturating_sub(collected.len());
                 if room == 0 {
                     // Anything read now is dropped: the output really is longer than the cap.
@@ -357,7 +437,20 @@ where
             }
         }
     }
+    if let Some((registry, key)) = &sink {
+        if !pending.is_empty() {
+            registry.emit_output(key, &pending);
+        }
+    }
     (collected, truncated)
+}
+
+/// bytes 中完整 UTF-8 前缀的长度；尾部不完整序列与非法字节不计入。
+fn utf8_prefix_len(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(err) => err.valid_up_to(),
+    }
 }
 
 /// Caps the combined output the way `LocalFilesystemWithShell` does: cut on a char boundary
@@ -723,6 +816,7 @@ mod tests {
             exit_code: ExecuteResponse::TIMEOUT_EXIT_CODE,
             truncated: false,
             timed_out: false,
+            cancelled: false,
         };
         assert!(!response.timed_out());
         assert!(!response.is_success());

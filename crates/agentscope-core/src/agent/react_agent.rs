@@ -1384,7 +1384,8 @@ impl ReActAgent {
                 if tc.name == STRUCTURED_OUTPUT_TOOL_NAME {
                     // No delta channel here: the structured-output retry path is not
                     // streamed, so the emitter (still carrying the call id) discards.
-                    let tctx = tool_execution_context(tc, Default::default(), &None, None, "");
+                    let tctx =
+                        tool_execution_context(tc, Default::default(), &None, None, "", None);
                     if let Ok(rb) = toolkit.call_tool(tc, tctx).await {
                         // Bind the call id/name like the acting path does: the cleanup that
                         // follows the structured reply identifies these results by name.
@@ -3133,6 +3134,14 @@ fn emit_tool_result_end(
             serde_json::to_value(metadata).unwrap_or(serde_json::Value::Null),
         );
     }
+    // Flat copy of the cancel flag: transports that only forward the flat fields still see it.
+    if metadata
+        .get("cancelled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        fields.insert("cancelled".to_string(), serde_json::Value::Bool(true));
+    }
     emit_delta(
         delta_tx,
         AgentEvent::with_fields(AgentEventType::ToolResultEnd, fields),
@@ -3820,6 +3829,7 @@ fn tool_execution_context(
     delta_tx: &Option<futures::channel::mpsc::UnboundedSender<crate::error::Result<AgentEvent>>>,
     request_config: Option<Arc<crate::tool::ToolRequestConfig>>,
     reply_id: &str,
+    processes: Option<Arc<crate::tool::ProcessRegistry>>,
 ) -> ToolExecutionContext {
     ToolExecutionContext {
         tool_call: Some(call.clone()),
@@ -3829,7 +3839,15 @@ fn tool_execution_context(
             tool_chunk_callback(delta_tx, call, reply_id),
         )),
         tool_request_config: request_config,
+        processes,
     }
+}
+
+/// The session process registry carried by the runtime context, if any.
+fn run_processes(
+    ctx: &crate::agent::RuntimeContext,
+) -> Option<Arc<crate::tool::ProcessRegistry>> {
+    ctx.extension::<crate::tool::ProcessRegistry>(crate::tool::PROCESS_REGISTRY_CONTEXT_KEY)
 }
 
 /// The per-call tool view carried by the runtime context, if any.
@@ -4376,6 +4394,7 @@ async fn run_acting_calls(
                     &run.ctx.delta_tx,
                     tool_request_config(run.ctx),
                     run.reply_id,
+                    run_processes(run.ctx),
                 );
                 // Record the action lifecycle around the real tool call. An acknowledgement
                 // failure is a run-level error: it must never become a retryable tool result.
@@ -4536,6 +4555,7 @@ async fn run_acting_calls(
                             &run.ctx.delta_tx,
                             tool_request_config(run.ctx),
                             run.reply_id,
+                            run_processes(run.ctx),
                         );
                         // Same observation boundary as the allow path: a failed
                         // acknowledgement is a run-level error, never a tool result.
@@ -4675,6 +4695,7 @@ async fn run_parallel_batch(
             &run.ctx.delta_tx,
             tool_request_config(run.ctx),
             run.reply_id,
+            run_processes(run.ctx),
         );
         // Same observation boundary as the serial path: a failed start acknowledgement is a
         // retryable tool error (the tool never ran); only a failed end acknowledgement is a
@@ -6392,7 +6413,7 @@ mod tests {
             tool_chunk_callback(&None, &call, "reply-so").is_none(),
             "no channel means no callback"
         );
-        let tctx = tool_execution_context(&call, JsonMap::new(), &None, None, "reply-so");
+        let tctx = tool_execution_context(&call, JsonMap::new(), &None, None, "reply-so", None);
         let emitter = tctx.emitter.expect("an emitter is always installed");
         // Must not panic, and must not reach any consumer.
         crate::tool::emit_to(&Some(emitter), ToolResultBlock::text("ignored progress"));

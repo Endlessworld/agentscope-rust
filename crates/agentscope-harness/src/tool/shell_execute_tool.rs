@@ -6,7 +6,9 @@ use agentscope_core::error::Result;
 use agentscope_core::message::{
     JsonMap, ToolExecutionDetails, ToolExecutionOutcome, ToolResultBlock,
 };
-use agentscope_core::tool::{is_dangerous_command, Tool, ToolExecutionContext, Toolkit};
+use agentscope_core::tool::{
+    is_dangerous_command, Tool, ToolExecutionContext, Toolkit, TOOL_CALL_ID_CONTEXT_KEY,
+};
 use async_trait::async_trait;
 
 use super::output_compact::{compact_grep_like, CompactConfig};
@@ -73,9 +75,16 @@ pub(crate) fn format_execute_output(
     output: &str,
     truncated: bool,
     timed_out: bool,
+    cancelled: bool,
     compact: &CompactConfig,
 ) -> ToolResultBlock {
-    let mut text = format!("Exit code: {exit_code}\n");
+    // A client-cancelled command is not a process result: saying "cancelled" keeps the model
+    // (and the UI) from reading the kill signal as a failure it should retry.
+    let mut text = if cancelled {
+        "Command cancelled by the client.\n".to_string()
+    } else {
+        format!("Exit code: {exit_code}\n")
+    };
     if timed_out {
         text.push_str("Timed out: true\n");
     }
@@ -200,7 +209,12 @@ impl Tool for ShellExecuteTool {
     }
 
     async fn call(&self, args: JsonMap, _ctx: ToolExecutionContext) -> Result<ToolResultBlock> {
-        let rt = runtime_context(&_ctx.runtime);
+        let mut rt = runtime_context(&_ctx.runtime);
+        // The sandbox registers the child process under this id so a client cancel can
+        // kill it and its output can be streamed back.
+        if let Some(call) = _ctx.tool_call.as_ref() {
+            rt.set_extension(TOOL_CALL_ID_CONTEXT_KEY, call.id.clone());
+        }
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
@@ -248,13 +262,22 @@ impl Tool for ShellExecuteTool {
             "shell execute done"
         );
         let result = result?;
-        Ok(format_execute_output(
+        let mut block = format_execute_output(
             result.exit_code,
             &result.output,
             result.truncated,
             result.timed_out(),
+            result.cancelled(),
             &self.compact,
-        ))
+        );
+        if result.cancelled() {
+            // v1 has no cancelled status: the protocol layer reads this flag to report
+            // `cancelled` instead of `failed`.
+            block
+                .metadata
+                .insert("cancelled".to_string(), serde_json::Value::Bool(true));
+        }
+        Ok(block)
     }
 }
 
@@ -304,6 +327,7 @@ mod tests {
             &grep_like_output(),
             false,
             false,
+            false,
             &CompactConfig::default(),
         );
         let text = block
@@ -329,7 +353,7 @@ mod tests {
     #[test]
     fn execute_output_compaction_can_be_switched_off() {
         let raw = grep_like_output();
-        let block = format_execute_output(0, &raw, false, false, &CompactConfig::disabled());
+        let block = format_execute_output(0, &raw, false, false, false, &CompactConfig::disabled());
         let text = block
             .output
             .iter()
@@ -358,7 +382,7 @@ mod tests {
             format!("  {path}:111:        \"count\" => {{"),
         ]
         .join("\n");
-        let block = format_execute_output(0, &raw, false, false, &CompactConfig::default());
+        let block = format_execute_output(0, &raw, false, false, false, &CompactConfig::default());
         let text = block
             .output
             .iter()
@@ -382,7 +406,7 @@ mod tests {
     #[test]
     fn plain_command_output_is_untouched() {
         let block =
-            format_execute_output(0, "hello\nworld", false, false, &CompactConfig::default());
+            format_execute_output(0, "hello\nworld", false, false, false, &CompactConfig::default());
         let text = block
             .output
             .iter()
@@ -403,7 +427,7 @@ mod tests {
     fn a_successful_run_carries_shell_execution_details() {
         use agentscope_core::message::{ToolExecutionDetails, ToolExecutionOutcome};
 
-        let block = format_execute_output(0, "hello", false, false, &CompactConfig::disabled());
+        let block = format_execute_output(0, "hello", false, false, false, &CompactConfig::disabled());
         let details = block.execution_details().expect("shell execution details");
         assert_eq!(details.kind, "shell");
         assert_eq!(details.outcome, ToolExecutionOutcome::Succeeded);
@@ -423,7 +447,7 @@ mod tests {
     fn a_nonzero_exit_code_is_a_failed_execution() {
         use agentscope_core::message::ToolExecutionOutcome;
 
-        let block = format_execute_output(2, "boom", true, false, &CompactConfig::disabled());
+        let block = format_execute_output(2, "boom", true, false, false, &CompactConfig::disabled());
         let details = block.execution_details().expect("shell execution details");
         assert_eq!(details.kind, "shell");
         assert_eq!(details.outcome, ToolExecutionOutcome::Failed);
@@ -437,6 +461,7 @@ mod tests {
             1,
             &grep_like_output(),
             true,
+            false,
             false,
             &CompactConfig::default(),
         );
@@ -461,6 +486,7 @@ mod tests {
             "Command timed out after 1 seconds.",
             true,
             true,
+            false,
             &CompactConfig::disabled(),
         );
         let text = block
