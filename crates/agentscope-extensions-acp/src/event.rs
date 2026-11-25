@@ -661,11 +661,30 @@ impl ToolEventMapper {
                     (acc.name.clone(), acc.input.clone(), acc.output.clone());
                 let raw_input = json_value_from(input.clone());
                 self.calls.remove(&id);
-                let mut notifications = vec![tool_call_update(
+                let mut update = tool_call_update(
                     sid.clone(),
                     id,
                     result_fields(&name, status, &input, &output, metadata),
-                )];
+                );
+                // v1 has no cancelled status: the flag rides in `_meta` and the v2 converter
+                // turns it into `status: cancelled` (a kill is not a failure).
+                let cancelled = data
+                    .fields
+                    .get("cancelled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                    || metadata
+                        .and_then(|metadata| metadata.get("cancelled"))
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                if cancelled {
+                    if let SessionUpdate::ToolCallUpdate(inner) = &mut update.update {
+                        let mut meta = agent_client_protocol::v1::schema::Meta::new();
+                        meta.insert("cancelled".to_string(), serde_json::Value::Bool(true));
+                        inner.meta = Some(meta);
+                    }
+                }
+                let mut notifications = vec![update];
                 // `todo_write` also drives the client's structured todo list: emit
                 // a `Plan` update built from the tool's own arguments so clients
                 // render a real todo widget rather than only the text summary.
@@ -705,13 +724,27 @@ pub fn map_result_event(
     message_id: Option<MessageId>,
 ) -> Option<SessionNotification> {
     let sid = session_id.into();
-    let reply = ev.data().fields.get("reply")?;
-    let msg: agentscope_core::message::Msg = serde_json::from_value(reply.clone()).ok()?;
-    let text = msg.text_content();
+    let text = result_text(ev)?;
     if text.trim().is_empty() {
         return None;
     }
     Some(message_chunk(sid, text, message_id))
+}
+
+/// The reply text an `AgentResult` event carries, when the reply is decodable.
+pub fn result_text(ev: &AgentEvent) -> Option<String> {
+    let reply = ev.data().fields.get("reply")?;
+    let msg: agentscope_core::message::Msg = serde_json::from_value(reply.clone()).ok()?;
+    Some(msg.text_content())
+}
+
+/// The incremental text a text/thinking delta event carries.
+pub fn delta_text(ev: &AgentEvent) -> &str {
+    ev.data()
+        .fields
+        .get("delta")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
 }
 
 /// Maps a core text/thinking delta event into an ACP message/thought chunk.
@@ -721,12 +754,7 @@ pub fn map_delta_event(
     message_id: Option<MessageId>,
 ) -> Option<SessionNotification> {
     let sid = session_id.into();
-    let delta = ev
-        .data()
-        .fields
-        .get("delta")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let delta = delta_text(ev);
     if delta.is_empty() {
         return None;
     }

@@ -5,7 +5,6 @@
 //! The config path is redirected with `AGENTSCOPE_MODELS_JSON`, so the developer's real
 //! `~/.agentscope/models.json` is never read or written. Everything runs in-process over
 //! `Channel::duplex` with a scripted model.
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -193,10 +192,11 @@ async fn a_provider_edit_reaches_an_idle_session_and_lands_on_disk() {
                             LlmProtocol::OpenAi,
                             "https://extra.example/v1",
                         )
-                        .headers(HashMap::from([(
-                            "Authorization".to_string(),
-                            "Bearer extra-key".to_string(),
-                        )]))
+                        .headers(
+                            [("Authorization".to_string(), "Bearer extra-key".to_string())]
+                                .into_iter()
+                                .collect(),
+                        )
                         .meta(meta),
                     )
                     .block_task()

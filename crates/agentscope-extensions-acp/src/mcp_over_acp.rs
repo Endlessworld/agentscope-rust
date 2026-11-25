@@ -18,8 +18,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use agent_client_protocol::v1::schema::{
-    McpRequestId, McpServerAcpId, MessageMcpRequest, MessageMcpResponse,
+    McpServerAcpId, MessageMcpRequest, MessageMcpResponse,
 };
+#[cfg(feature = "acp-v2")]
+use agent_client_protocol::v2::{schema as v2_schema, ConnectionTo as V2ConnectionTo};
 use agent_client_protocol::{v1::ConnectionTo, Client};
 use agentscope_core::message::{ContentBlock, TextBlock, ToolResultBlock};
 use agentscope_core::tool::{McpTool, Toolkit};
@@ -93,33 +95,62 @@ pub fn render_tool_result(result: &serde_json::Value) -> String {
 ///
 /// The id addresses a single request (it is what a proxy preserves across hops), so it must be
 /// fresh per call — reusing one would make a proxy mistake a later call for an earlier one.
-fn next_request_id() -> McpRequestId {
-    McpRequestId::new(uuid::Uuid::new_v4().to_string())
+/// The bare string is version-neutral: each protocol wraps it in its own `McpRequestId`.
+fn next_request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
-/// Unwraps the ACP carrier into the inner MCP result, or into a tool-level failure.
+/// The inner MCP error of a carrier response, surfaced as a tool-level (ACP internal) failure.
 ///
 /// An inner MCP error arrives as a *successful* ACP response, so it must be surfaced as a tool
 /// failure instead of pretending the ACP call itself failed.
+fn inner_mcp_error(
+    server: &str,
+    code: impl std::fmt::Display,
+    message: &str,
+) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::new(
+        agent_client_protocol::ErrorCode::INTERNAL_ERROR,
+        format!("MCP server `{server}` returned error {code}: {message}"),
+    )
+}
+
+/// A carrier response shape this agent cannot interpret.
+fn unknown_response(server: &str) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::new(
+        agent_client_protocol::ErrorCode::INTERNAL_ERROR,
+        format!("MCP server `{server}` sent an unknown response"),
+    )
+}
+
+/// Unwraps the v1 ACP carrier into the inner MCP result, or into a tool-level failure.
 fn response_payload(
     server: &str,
     response: MessageMcpResponse,
 ) -> Result<serde_json::Value, agent_client_protocol::Error> {
     match response {
         MessageMcpResponse::Result { result, .. } => Ok(result),
-        MessageMcpResponse::Error { error, .. } => Err(agent_client_protocol::Error::new(
-            agent_client_protocol::ErrorCode::INTERNAL_ERROR,
-            format!(
-                "MCP server `{server}` returned error {}: {}",
-                error.code, error.message
-            ),
-        )),
+        MessageMcpResponse::Error { error, .. } => {
+            Err(inner_mcp_error(server, error.code, &error.message))
+        }
         // `MessageMcpResponse` is `#[non_exhaustive]`: a future carrier may add shapes we
         // cannot interpret, so treat them as a tool-level failure too.
-        _ => Err(agent_client_protocol::Error::new(
-            agent_client_protocol::ErrorCode::INTERNAL_ERROR,
-            format!("MCP server `{server}` sent an unknown response"),
-        )),
+        _ => Err(unknown_response(server)),
+    }
+}
+
+/// The v2 counterpart of [`response_payload`]: the two schemas share the wire shape, not the type.
+#[cfg(feature = "acp-v2")]
+fn response_payload_v2(
+    server: &str,
+    response: v2_schema::MessageMcpResponse,
+) -> Result<serde_json::Value, agent_client_protocol::Error> {
+    match response {
+        v2_schema::MessageMcpResponse::Result { result, .. } => Ok(result),
+        v2_schema::MessageMcpResponse::Error { error, .. } => {
+            Err(inner_mcp_error(server, error.code, &error.message))
+        }
+        _ => Err(unknown_response(server)),
     }
 }
 
@@ -130,10 +161,24 @@ fn response_payload(
 /// is no connection lifecycle to manage.
 #[derive(Clone)]
 pub struct McpAcpConnection {
-    connection: ConnectionTo<Client>,
+    /// The ACP connection that created the session, or `None` when the session has no client
+    /// connection at all; the connection then fails every request instead of being impossible to
+    /// construct.
+    connection: Option<AcpTransport>,
     server_id: McpServerAcpId,
     /// Human-readable server name (used when bridging tools into a toolkit).
     name: String,
+}
+
+/// The ACP connection a bridged server answers over.
+///
+/// The stateless `mcp/message` carrier exists in both protocol versions with the same wire shape;
+/// only the connection type differs, so the bridge keeps whichever one created the session.
+#[derive(Clone)]
+enum AcpTransport {
+    V1(ConnectionTo<Client>),
+    #[cfg(feature = "acp-v2")]
+    V2(V2ConnectionTo<Client>),
 }
 
 impl McpAcpConnection {
@@ -148,7 +193,21 @@ impl McpAcpConnection {
         server_id: impl Into<McpServerAcpId>,
     ) -> Self {
         Self {
-            connection,
+            connection: Some(AcpTransport::V1(connection)),
+            server_id: server_id.into(),
+            name: name.into(),
+        }
+    }
+
+    /// The v2 counterpart of [`Self::new`]: same bridge, v2 wire.
+    #[cfg(feature = "acp-v2")]
+    pub fn new_v2(
+        connection: V2ConnectionTo<Client>,
+        name: impl Into<String>,
+        server_id: impl Into<McpServerAcpId>,
+    ) -> Self {
+        Self {
+            connection: Some(AcpTransport::V2(connection)),
             server_id: server_id.into(),
             name: name.into(),
         }
@@ -169,10 +228,30 @@ impl McpAcpConnection {
         method: &str,
         params: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<serde_json::Value, agent_client_protocol::Error> {
-        let request = MessageMcpRequest::new(self.server_id.clone(), next_request_id(), method)
-            .params(params);
-        let response = self.connection.send_request(request).block_task().await?;
-        response_payload(&self.name, response)
+        let Some(connection) = &self.connection else {
+            return Err(agent_client_protocol::Error::invalid_request()
+                .data("MCP-over-ACP is not available: the session has no client connection"));
+        };
+        match connection {
+            AcpTransport::V1(connection) => {
+                let request =
+                    MessageMcpRequest::new(self.server_id.clone(), next_request_id(), method)
+                        .params(params);
+                let response = connection.send_request(request).block_task().await?;
+                response_payload(&self.name, response)
+            }
+            #[cfg(feature = "acp-v2")]
+            AcpTransport::V2(connection) => {
+                let request = v2_schema::MessageMcpRequest::new(
+                    v2_schema::McpServerAcpId::new(self.server_id.0.clone()),
+                    next_request_id(),
+                    method,
+                )
+                .params(params);
+                let response = connection.send_request(request).block_task().await?;
+                response_payload_v2(&self.name, response)
+            }
+        }
     }
 
     /// Lists the tools the server offers.
@@ -336,6 +415,6 @@ mod tests {
     fn every_request_gets_its_own_id() {
         let first = next_request_id();
         let second = next_request_id();
-        assert_ne!(first.0.as_ref(), second.0.as_ref());
+        assert_ne!(first, second);
     }
 }

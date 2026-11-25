@@ -199,6 +199,7 @@ impl TurnDriver for NativeDriver {
         let mut resumes = 0usize;
         let mut turn_usage = ChatUsage::default();
         let mut emitted_text = false;
+        let mut replayed_result: Option<(String, usize)> = None;
         let mut reply: Option<Msg> = None;
         let mut failure: Option<String> = None;
         let mut cancelled = false;
@@ -246,6 +247,7 @@ impl TurnDriver for NativeDriver {
                             caps: &caps,
                             context_window,
                             emitted_text,
+                            replayed_result: &mut replayed_result,
                             tool_events: &mut tool_events,
                         };
                         render_event(

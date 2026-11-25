@@ -47,8 +47,8 @@ use super::session::{AcpAgentSession, AcpClientHandle};
 use super::support::ClientSupport;
 
 /// Default agent info advertised during initialization.
-const AGENT_NAME: &str = "agentscope-coding-agent";
-const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const AGENT_NAME: &str = "agentscope-coding-agent";
+pub(crate) const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How many per-`cwd` index agents stay cached. Each one is a full `HarnessAgent`.
 const MAX_CATALOG_AGENTS: usize = 4;
@@ -250,6 +250,11 @@ pub struct SessionBuild {
     ///
     /// `0` keeps every child a leaf; `1` allows one intermediate level (the default).
     pub subagent_nesting: u8,
+    /// Session process registry: shell commands register their child process so a client
+    /// cancel can kill it and its output can be streamed while it runs.
+    ///
+    /// v1 never installs an event sink, so its behaviour is unchanged.
+    pub processes: Arc<agentscope_core::tool::ProcessRegistry>,
 }
 
 /// An ACP CodingAgent with a session registry and a factory for building the
@@ -263,12 +268,12 @@ pub struct AcpCodingAgent {
     session_factory: Option<Arc<dyn Fn(SessionBuild) -> HarnessAgent + Send + Sync>>,
     models: Arc<std::sync::RwLock<Vec<ModelChoice>>>,
     modes: Vec<ModeChoice>,
-    sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>,
+    pub(crate) sessions: Arc<Mutex<HashMap<String, AcpAgentSession>>>,
     /// 宿主接管 `providers/*`：读写 `models.json`（内置 agent 用），而不是那份内存注册表。
     ///
     /// 开着时 `providers/set` 能新建条目、可以带模型表，并在写入后把新的模型列表
     /// 推给每个活会话（`config_option_update`），没开的宿主行为不变。
-    manage_providers: bool,
+    pub(crate) manage_providers: bool,
     /// Builds a live model from a model id + session id (dynamic model
     /// switching). The session id lets callers derive per-session request
     /// headers (e.g. `x-opencode-session` for prompt-cache routing).
@@ -279,10 +284,10 @@ pub struct AcpCodingAgent {
     /// Capabilities advertised by the connected client at `initialize`.
     /// Several optional `session/update` variants are capability-gated; every
     /// session shares this view so the gates reflect the live negotiation.
-    client_support: ClientSupport,
+    pub(crate) client_support: ClientSupport,
     /// Provider descriptors advertised through `providers/list`, keyed by
     /// provider id. Empty when the client did not negotiate `providers`.
-    providers: ProviderRegistry,
+    pub(crate) providers: ProviderRegistry,
     /// Agents built only to read the durable session index per `cwd`, so
     /// `session/list` does not rebuild one on every call.
     catalog_agents: Mutex<HashMap<PathBuf, Arc<HarnessAgent>>>,
@@ -492,6 +497,13 @@ impl AcpCodingAgent {
             .clone()
     }
 
+    /// The session modes this agent advertises.
+    ///
+    /// `session/options` answers a session-less snapshot, so it needs them without a session.
+    pub fn modes_snapshot(&self) -> Vec<ModeChoice> {
+        self.modes.clone()
+    }
+
     /// Replaces the model choices and pushes them to every live session.
     ///
     /// Called after a `providers/*` mutation: new sessions get the new list from
@@ -565,7 +577,7 @@ impl AcpCodingAgent {
     }
 
     /// Creates a new session using the session factory.
-    fn create_session(
+    pub(crate) fn create_session(
         &self,
         session_id: SessionId,
         cwd: PathBuf,
@@ -602,6 +614,9 @@ impl AcpCodingAgent {
         // The client may hold directories on its own device: those cannot be opened here, so
         // the model is told which tool reaches them instead of being handed a dead path.
         let system_prompt = super::roots::with_boundary_note(system_prompt, &cwd, &client_roots);
+        // One registry per session: shell commands register their child process here, and the
+        // v2 handlers turn those events into terminal updates.
+        let processes = agentscope_core::tool::ProcessRegistry::new();
         let agent = match &self.session_factory {
             Some(factory) => factory(SessionBuild {
                 cwd: cwd.clone(),
@@ -616,6 +631,7 @@ impl AcpCodingAgent {
                 subagent_agents: Some(Arc::clone(&subagent_agents)),
                 subagent_mode: Some(Arc::clone(&subagent_mode)),
                 subagent_nesting: self.subagent_nesting,
+                processes: Arc::clone(&processes),
             }),
             None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
         };
@@ -636,6 +652,7 @@ impl AcpCodingAgent {
         // Clones share the same underlying capability store, so a late
         // `initialize` still gates this session's optional updates correctly.
         session.set_client_support(self.client_support.clone());
+        session.set_processes(processes);
         if let Some(builder) = &self.model_builder {
             session.set_model_builder(Arc::clone(builder));
         }
@@ -647,7 +664,7 @@ impl AcpCodingAgent {
     /// Beyond the mode/content rules of [`system_prompt_text`], a `model_factory`-built agent
     /// has no channel for the text: reject the request instead of accepting it and dropping it
     /// (that configuration does not advertise the capability either).
-    fn client_system_prompt(
+    pub(crate) fn client_system_prompt(
         &self,
         prompt: Option<SystemPrompt>,
     ) -> Result<Option<String>, agent_client_protocol::Error> {
@@ -662,7 +679,7 @@ impl AcpCodingAgent {
     /// Registers the session in the registry.
     /// 嵌入式优化：超过 `max_sessions` 上限时淘汰最旧会话，
     /// 避免多会话同时持有完整 `HarnessAgent` 成倍放大内存。
-    fn register_session(&self, session: AcpAgentSession) {
+    pub(crate) fn register_session(&self, session: AcpAgentSession) {
         let id = session.session_id().to_string();
         self.note_workspace(session.cwd());
         // A prompt that finishes after `session/close` must not resurrect the session.
@@ -710,7 +727,7 @@ impl AcpCodingAgent {
     }
 
     /// Removes a session from the registry.
-    fn remove_session(&self, session_id: &SessionId) {
+    pub(crate) fn remove_session(&self, session_id: &SessionId) {
         self.sessions
             .lock()
             .unwrap()
@@ -733,7 +750,7 @@ impl AcpCodingAgent {
     ///
     /// A journal survives the protocol call only when the backend refuses to delete it; that is
     /// logged rather than failing a `session/delete` whose other effects already landed.
-    async fn forget_session(
+    pub(crate) async fn forget_session(
         &self,
         agent: &HarnessAgent,
         cwd: &std::path::Path,
@@ -747,7 +764,7 @@ impl AcpCodingAgent {
     }
 
     /// Returns a clone of the session (for handlers).
-    fn get_session(&self, session_id: &SessionId) -> Option<AcpAgentSession> {
+    pub(crate) fn get_session(&self, session_id: &SessionId) -> Option<AcpAgentSession> {
         self.sessions
             .lock()
             .unwrap()
@@ -756,7 +773,7 @@ impl AcpCodingAgent {
     }
 
     /// The ACP session that owns `child`, for a `session/cancel` addressed to a subagent.
-    fn subagent_parent(&self, child: &SessionId) -> Option<SessionId> {
+    pub(super) fn subagent_parent(&self, child: &SessionId) -> Option<SessionId> {
         self.subagent_children
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -803,7 +820,7 @@ impl AcpCodingAgent {
     /// mistyped or deleted id: the client would see a successful load with no history. The
     /// workspace is the durable authority, so probe it before building anything: the creation
     /// record covers a session that never ran a turn, the journal one that did.
-    async fn session_exists(&self, session_id: &SessionId, cwd: PathBuf) -> bool {
+    pub(crate) async fn session_exists(&self, session_id: &SessionId, cwd: PathBuf) -> bool {
         // A subagent's session journals like a user session, but it is not one: loading it
         // would open a child transcript as a top-level conversation.
         if is_subagent_session(session_id) {
@@ -828,6 +845,8 @@ impl AcpCodingAgent {
                 subagent_agents: None,
                 subagent_mode: None,
                 subagent_nesting: self.subagent_nesting,
+                // Probing agents never run tools: a throwaway registry keeps the field total.
+                processes: agentscope_core::tool::ProcessRegistry::new(),
             }),
             None => (self.model_factory)(cwd.clone(), session_id.to_string().as_str()),
         };
@@ -846,7 +865,7 @@ impl AcpCodingAgent {
     ///
     /// `open` when this process holds the session, `saved` when only its workspace knows it, and
     /// `None` (→ `session_not_found`) otherwise.
-    async fn session_status(&self, session_id: &SessionId) -> Option<SessionStatus> {
+    pub(crate) async fn session_status(&self, session_id: &SessionId) -> Option<SessionStatus> {
         if self.get_session(session_id).is_some() {
             return Some(SessionStatus::Open);
         }
@@ -875,7 +894,7 @@ impl AcpCodingAgent {
     /// `session/new`, `session/load`, `session/resume` or `session/list` touched. A session
     /// persisted somewhere never seen here reads as unknown, which is what a client that never
     /// named that directory should conclude anyway.
-    async fn session_workspace(&self, session_id: &SessionId) -> Option<PathBuf> {
+    pub(crate) async fn session_workspace(&self, session_id: &SessionId) -> Option<PathBuf> {
         // Subagent sessions live in the same journal as their parent but are not user sessions:
         // `session/status` on one must read as unknown, not as a loadable session.
         if is_subagent_session(session_id) {
@@ -931,7 +950,7 @@ impl AcpCodingAgent {
     /// A live session is released exactly like `session/close`: an archived session must not
     /// keep holding an agent while being invisible to the default `session/list`. A session that
     /// only exists on disk is marked in its workspace's marker file.
-    async fn archive_session(
+    pub(crate) async fn archive_session(
         &self,
         session_id: &SessionId,
         archived: bool,
@@ -976,7 +995,7 @@ impl AcpCodingAgent {
     ///
     /// Sessions are ordered by id (stable) so pagination is deterministic. The archive filter
     /// is applied before pagination, as the spec requires (ACP-36).
-    async fn session_infos(
+    pub(crate) async fn session_infos(
         &self,
         cwd: Option<&std::path::Path>,
         cursor: Option<&str>,
@@ -1067,7 +1086,7 @@ impl AcpCodingAgent {
     /// `HarnessAgent::list_session_keys` reaches the session store through a built agent, so a
     /// process that has not created a session yet still needs one to enumerate history. The
     /// synthetic session id never reaches the journal: only the store's index is read.
-    fn catalog_agent(&self, cwd: &std::path::Path) -> Arc<HarnessAgent> {
+    pub(crate) fn catalog_agent(&self, cwd: &std::path::Path) -> Arc<HarnessAgent> {
         const CATALOG_SESSION_ID: &str = "session-catalog";
         self.note_workspace(cwd);
         if let Some(agent) = self
@@ -1092,6 +1111,8 @@ impl AcpCodingAgent {
                 subagent_agents: None,
                 subagent_mode: None,
                 subagent_nesting: self.subagent_nesting,
+                // Probing agents never run tools: a throwaway registry keeps the field total.
+                processes: agentscope_core::tool::ProcessRegistry::new(),
             }),
             None => (self.model_factory)(cwd.to_path_buf(), CATALOG_SESSION_ID),
         });
@@ -1857,7 +1878,7 @@ impl AcpCodingAgent {
                         &req.provider_id.to_string(),
                         req.api_type,
                         req.base_url,
-                        req.headers,
+                        req.headers.into_iter().collect(),
                     );
                     if ok {
                         responder.respond(SetProviderResponse::new())
@@ -1970,6 +1991,14 @@ impl AcpCodingAgent {
                 agent_client_protocol::on_receive_request!(),
             ),
         );
+        // Protocol router: `initialize` picks the graph. v1 stays the default for every client
+        // that does not ask for v2, so the existing wire behaviour is untouched.
+        #[cfg(feature = "acp-v2")]
+        let handlers = DynConnectTo::new(
+            Agent.protocol_router()
+                .with_v1(handlers)
+                .with_v2(super::v2::handlers(Arc::clone(&agent))),
+        );
         AcpCodingAgentService {
             agent,
             handlers,
@@ -2077,10 +2106,10 @@ fn spawn_wakeup_loop(
 
 /// Handles `_acp_extends/session/respond`: converts the wire answers and hands them to the
 /// session runtime, which continues the suspended turn.
-async fn handle_ext_respond(
+pub(crate) async fn handle_ext_respond<P: agent_client_protocol::Protocol>(
     agent: Arc<AcpCodingAgent>,
     req: crate::ext::ExtRespondRequest,
-    responder: agent_client_protocol::v1::Responder<serde_json::Value>,
+    responder: agent_client_protocol::Responder<serde_json::Value, P>,
 ) -> Result<(), agent_client_protocol::Error> {
     let params = req.params;
     let answers = match params.to_answers() {
@@ -2109,10 +2138,10 @@ async fn handle_ext_respond(
 
 /// Handles `_acp_extends/session/steer`: folds one message into the turn the session is
 /// executing and answers which turn it reached.
-async fn handle_ext_steer(
+pub(crate) async fn handle_ext_steer<P: agent_client_protocol::Protocol>(
     agent: Arc<AcpCodingAgent>,
     req: crate::ext::ExtSteerRequest,
-    responder: agent_client_protocol::v1::Responder<crate::ext::ExtSteerResult>,
+    responder: agent_client_protocol::Responder<crate::ext::ExtSteerResult, P>,
 ) -> Result<(), agent_client_protocol::Error> {
     let params = req.params;
     if let Err(error) = params.validate() {
@@ -2138,10 +2167,10 @@ async fn handle_ext_steer(
 
 /// Handles `_acp_extends/session/queue`: admits the message as its own turn and answers before
 /// it runs.
-async fn handle_ext_queue(
+pub(crate) async fn handle_ext_queue<P: agent_client_protocol::Protocol>(
     agent: Arc<AcpCodingAgent>,
     req: crate::ext::ExtQueueRequest,
-    responder: agent_client_protocol::v1::Responder<crate::ext::ExtQueueResult>,
+    responder: agent_client_protocol::Responder<crate::ext::ExtQueueResult, P>,
 ) -> Result<(), agent_client_protocol::Error> {
     let params = req.params;
     if let Err(error) = params.validate() {
@@ -2171,10 +2200,10 @@ async fn handle_ext_queue(
 }
 
 /// Handles `_acp_extends/session/queue/list`: the session's unfinished turns, in run order.
-async fn handle_ext_queue_list(
+pub(crate) async fn handle_ext_queue_list<P: agent_client_protocol::Protocol>(
     agent: Arc<AcpCodingAgent>,
     req: crate::ext::ExtQueueListRequest,
-    responder: agent_client_protocol::v1::Responder<crate::ext::ExtQueueListResult>,
+    responder: agent_client_protocol::Responder<crate::ext::ExtQueueListResult, P>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = SessionId::new(req.params.session_id.clone());
     let session = match agent.get_session(&session_id) {
@@ -2194,10 +2223,10 @@ async fn handle_ext_queue_list(
 }
 
 /// Handles `_acp_extends/session/queue/remove`: withdraws a queued turn before it runs.
-async fn handle_ext_queue_remove(
+pub(crate) async fn handle_ext_queue_remove<P: agent_client_protocol::Protocol>(
     agent: Arc<AcpCodingAgent>,
     req: crate::ext::ExtQueueRemoveRequest,
-    responder: agent_client_protocol::v1::Responder<crate::ext::ExtQueueRemoveResult>,
+    responder: agent_client_protocol::Responder<crate::ext::ExtQueueRemoveResult, P>,
 ) -> Result<(), agent_client_protocol::Error> {
     let params = req.params;
     let session_id = SessionId::new(params.session_id.clone());
@@ -2224,10 +2253,10 @@ async fn handle_ext_queue_remove(
 }
 
 /// Handles `_acp_extends/session/pause`: suspends the running turn where it is.
-async fn handle_ext_pause(
+pub(crate) async fn handle_ext_pause<P: agent_client_protocol::Protocol>(
     agent: Arc<AcpCodingAgent>,
     req: crate::ext::ExtPauseRequest,
-    responder: agent_client_protocol::v1::Responder<crate::ext::ExtPauseResult>,
+    responder: agent_client_protocol::Responder<crate::ext::ExtPauseResult, P>,
 ) -> Result<(), agent_client_protocol::Error> {
     let params = req.params;
     let session_id = SessionId::new(params.session_id.clone());
@@ -2251,46 +2280,80 @@ async fn handle_ext_pause(
 ///
 /// Runs on a spawned task like a prompt: a long-running handler would block the dispatch loop, so
 /// a `session/cancel` (or another request) could never be read while the turn runs.
+/// Continues a paused turn and returns its stop reason.
+///
+/// Protocol-agnostic: the caller says how v1 session notifications reach its own wire, so the
+/// v1 and v2 graphs share one implementation (v2 wraps the sink with a conversion).
+pub(crate) async fn resume_turn_core<F>(
+    agent: &AcpCodingAgent,
+    params: &crate::ext::ExtResumeParams,
+    emit: F,
+) -> Result<crate::ext::ExtResumeResult, agent_client_protocol::Error>
+where
+    F: Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync + 'static,
+{
+    let session_id = SessionId::new(params.session_id.clone());
+    let Some(session) = agent.get_session(&session_id) else {
+        return Err(agent_client_protocol::v1::schema::Error::session_not_found(session_id).into());
+    };
+    let turn_id = params.turn_id.clone();
+    let outcome = session
+        .resume_turn(&turn_id, &params.client_request_id, move |notification| {
+            emit(notification);
+        })
+        .await;
+    match outcome {
+        Ok(stop) => Ok(crate::ext::ExtResumeResult {
+            turn_id,
+            stop_reason: serde_json::to_value(&stop)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default(),
+        }),
+        Err(error) => Err(agent_client_protocol::Error::internal_error().data(error)),
+    }
+}
+
 async fn handle_ext_resume(
     agent: Arc<AcpCodingAgent>,
     req: crate::ext::ExtResumeRequest,
     responder: agent_client_protocol::v1::Responder<crate::ext::ExtResumeResult>,
     cx: agent_client_protocol::v1::ConnectionTo<agent_client_protocol::Client>,
 ) -> Result<(), agent_client_protocol::Error> {
-    let params = req.params;
-    let session_id = SessionId::new(params.session_id.clone());
-    let session = match agent.get_session(&session_id) {
-        Some(session) => session,
-        None => {
-            return responder.respond_with_error(
-                agent_client_protocol::v1::schema::Error::session_not_found(session_id).into(),
-            );
-        }
-    };
     let emit_cx = cx.clone();
     cx.spawn(async move {
-        let turn_id = params.turn_id.clone();
-        let outcome = session
-            .resume_turn(&turn_id, &params.client_request_id, move |notification| {
-                let _ = emit_cx.send_notification(notification);
-            })
-            .await;
-        match outcome {
-            Ok(stop) => {
-                let stop_reason = serde_json::to_value(&stop)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_string))
-                    .unwrap_or_default();
-                responder.respond(crate::ext::ExtResumeResult {
-                    turn_id,
-                    stop_reason,
-                })
-            }
-            Err(error) => responder
-                .respond_with_error(agent_client_protocol::Error::internal_error().data(error)),
+        let emit = move |notification| {
+            let _ = emit_cx.send_notification(notification);
+        };
+        match resume_turn_core(&agent, &req.params, emit).await {
+            Ok(result) => responder.respond(result),
+            Err(error) => responder.respond_with_error(error),
         }
     })?;
     Ok(())
+}
+
+/// Answers one `_acp_extends/providers/*` request.
+///
+/// The extension methods are protocol-agnostic, so both graphs call this one implementation.
+pub(crate) async fn handle_providers_ext<P: agent_client_protocol::Protocol>(
+    agent: Arc<AcpCodingAgent>,
+    req: crate::providers_admin::ProvidersExtRequest,
+    responder: agent_client_protocol::Responder<serde_json::Value, P>,
+) -> Result<(), agent_client_protocol::Error> {
+    if !agent.manage_providers {
+        return responder.respond_with_error(agent_client_protocol::Error::method_not_found());
+    }
+    let method = req.method_name().to_string();
+    match crate::providers_admin::run_extension(&method, req.params).await {
+        Ok((value, models)) => {
+            if let Some(models) = models {
+                agent.replace_models(models);
+            }
+            responder.respond(value)
+        }
+        Err(error) => responder.respond_with_error(error),
+    }
 }
 
 /// Whether `session_id` names a subagent's session (`sub-<uuid>`, as minted by `agent_spawn`)
@@ -2492,9 +2555,9 @@ impl AcpCodingAgentBuilder {
 }
 /// Handles `_acp_extends/fs/list`: lists directories on the agent host so a remote client
 /// can pick a session `cwd` without being able to browse the whole disk.
-async fn handle_ext_fs_list(
+pub(crate) async fn handle_ext_fs_list<P: agent_client_protocol::Protocol>(
     req: crate::ext::ExtFsListRequest,
-    responder: agent_client_protocol::v1::Responder<crate::ext::ExtFsListResult>,
+    responder: agent_client_protocol::Responder<crate::ext::ExtFsListResult, P>,
 ) -> Result<(), agent_client_protocol::Error> {
     let roots = crate::ext::fs_list_roots();
     let requested = req

@@ -14,7 +14,6 @@
 //! （或 `x-api-key`）里取。标准面没有模型表的字段，因此模型表走 `_meta.models`，
 //! 形状与配置文件里的 `models` 完全一致（分组对象或扁平数组）。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_client_protocol::v1::schema::{
@@ -64,6 +63,57 @@ pub struct ExtParams {
 pub struct ProvidersExtRequest {
     method: Arc<str>,
     pub params: ExtParams,
+}
+
+/// Runs one `_acp_extends/providers/*` request.
+///
+/// Shared by the v1 and v2 graphs: the extension methods are protocol-agnostic, so both graphs
+/// answer through this one implementation.
+pub async fn run_extension(
+    method: &str,
+    params: ExtParams,
+) -> Result<(serde_json::Value, Option<Vec<ModelChoice>>), agent_client_protocol::Error> {
+    // Network probing is the only asynchronous step; everything else is synchronous file work
+    // and is pushed onto the blocking pool.
+    if method == PROBE_METHOD {
+        return Ok((probe(params).await, None));
+    }
+    let method = method.to_string();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut changed = false;
+        let value = match method.as_str() {
+            REMOVE_METHOD => {
+                changed = true;
+                params
+                    .provider_id
+                    .as_deref()
+                    .ok_or_else(|| "providerId is required".to_string())
+                    .and_then(remove)
+                    .map(|()| serde_json::json!({}))
+            }
+            DEFAULT_METHOD => {
+                changed = true;
+                params
+                    .provider_id
+                    .as_deref()
+                    .ok_or_else(|| "providerId is required".to_string())
+                    .and_then(|id| set_default(id, params.model.as_deref()))
+                    .map(|()| serde_json::json!({}))
+            }
+            CATALOG_METHOD => Ok(serde_json::json!({
+                "providers": catalog(params.provider_id.as_deref())
+            })),
+            other => Err(format!("unhandled provider extension '{other}'")),
+        }?;
+        let models = changed.then(choices);
+        Ok::<_, String>((value, models))
+    })
+    .await;
+    match outcome {
+        Ok(Ok(pair)) => Ok(pair),
+        Ok(Err(error)) => Err(agent_client_protocol::Error::invalid_params().data(error)),
+        Err(error) => Err(agent_client_protocol::Error::invalid_params().data(error.to_string())),
+    }
 }
 
 impl ProvidersExtRequest {
@@ -236,13 +286,18 @@ pub fn set(request: SetProviderRequest) -> Result<(), String> {
 }
 
 /// 从标准面的 headers 里取密钥（`Bearer` 前缀去掉）。
-fn api_key_from_headers(headers: &HashMap<String, String>) -> Option<String> {
+///
+/// schema 1.22 起 `SetProviderRequest.headers` 是 `IndexMap`（保留客户端顺序），
+/// 旧调用点传 `HashMap`，所以这里只要求可迭代的键值对。
+fn api_key_from_headers<S: AsRef<str>>(
+    headers: impl IntoIterator<Item = (S, S)>,
+) -> Option<String> {
     for (name, value) in headers {
-        let name = name.to_ascii_lowercase();
+        let name = name.as_ref().to_ascii_lowercase();
         if name != "authorization" && name != "x-api-key" {
             continue;
         }
-        let value = value.trim();
+        let value = value.as_ref().trim();
         let key = value
             .strip_prefix("Bearer ")
             .or_else(|| value.strip_prefix("bearer "))
@@ -406,6 +461,7 @@ fn primary_api(provider: &crate::model_config::ModelProviderConfig) -> ApiProtoc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn the_extension_methods_are_namespaced() {
@@ -424,7 +480,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("x-api-key".to_string(), "sk-ant".to_string());
         assert_eq!(api_key_from_headers(&headers).as_deref(), Some("sk-ant"));
-        assert_eq!(api_key_from_headers(&HashMap::new()), None);
+        assert_eq!(api_key_from_headers(HashMap::<String, String>::new()), None);
     }
 
     #[test]

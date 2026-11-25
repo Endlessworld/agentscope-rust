@@ -317,6 +317,7 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         subagent_mode,
         subagent_nesting,
         additional_directories,
+        processes,
     } = ctx;
     let session_id = session_id.as_str();
     let model_config = ModelConfig::load_or_create_with_env();
@@ -396,6 +397,7 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
             ))
         })
         .cwd(cwd.clone())
+        .processes(processes)
         .workspace(workspace)
         // 会话历史以 **journal 为唯一权威**（对齐 Java native session）：`session_id` 既是
         // journal 的会话键，也是恢复键。进程重启后客户端用同一 sessionId 发

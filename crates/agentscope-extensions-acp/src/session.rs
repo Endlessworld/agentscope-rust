@@ -91,7 +91,19 @@ const OPTION_REJECT_ALWAYS: &str = "REJECT_ALWAYS";
 /// spawned task that runs the agent.
 #[derive(Clone)]
 pub struct AcpClientHandle {
-    connection: ConnectionTo<Client>,
+    connection: ClientConnection,
+}
+
+/// The client end of a live session.
+///
+/// A session is bound to whichever protocol version created it, so the handle carries the
+/// matching connection: v1 sessions push v1 notifications, v2 sessions push v2 ones. Keeping
+/// both behind one handle is what lets the shared session machinery stay protocol-agnostic.
+#[derive(Clone)]
+enum ClientConnection {
+    V1(ConnectionTo<Client>),
+    #[cfg(feature = "acp-v2")]
+    V2(agent_client_protocol::v2::ConnectionTo<Client>),
 }
 
 /// How long an interactive request may stay unanswered.
@@ -109,9 +121,30 @@ const INTERACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl AcpClientHandle {
+    /// The v1 connection behind this handle (v2 handles reach the client through [`crate::v2`]).
+    fn v1_connection(&self) -> &ConnectionTo<Client> {
+        match &self.connection {
+            ClientConnection::V1(connection) => connection,
+            #[cfg(feature = "acp-v2")]
+            ClientConnection::V2(_) => {
+                unreachable!("v2 handles are bridged through crate::v2")
+            }
+        }
+    }
+
     /// Wraps an agent-side connection whose counterpart is the ACP client.
     pub(crate) fn new(connection: ConnectionTo<Client>) -> Self {
-        Self { connection }
+        Self {
+            connection: ClientConnection::V1(connection),
+        }
+    }
+
+    /// Binds the handle to a protocol v2 connection.
+    #[cfg(feature = "acp-v2")]
+    pub(crate) fn new_v2(connection: agent_client_protocol::v2::ConnectionTo<Client>) -> Self {
+        Self {
+            connection: ClientConnection::V2(connection),
+        }
     }
 
     /// Pushes a `session/update` notification to the client.
@@ -119,7 +152,11 @@ impl AcpClientHandle {
         &self,
         notification: agent_client_protocol::v1::schema::SessionNotification,
     ) -> Result<(), agent_client_protocol::Error> {
-        self.connection.send_notification(notification)
+        match &self.connection {
+            ClientConnection::V1(connection) => connection.send_notification(notification),
+            #[cfg(feature = "acp-v2")]
+            ClientConnection::V2(connection) => crate::v2::notify(connection, notification),
+        }
     }
 
     /// Asks the client to request the user's permission for `tool_call`,
@@ -133,6 +170,20 @@ impl AcpClientHandle {
         session_id: &SessionId,
         tool_call: ToolCallUpdate,
     ) -> Result<RequestPermissionResponse, agent_client_protocol::Error> {
+        #[cfg(feature = "acp-v2")]
+        if let ClientConnection::V2(connection) = &self.connection {
+            return tokio::time::timeout(
+                INTERACTION_TIMEOUT,
+                crate::v2::request_permission(connection, session_id, tool_call),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!("permission request timed out; rejecting the tool call");
+                Ok(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ))
+            });
+        }
         let request =
             RequestPermissionRequest::new(session_id.clone(), tool_call, permission_options());
         // Bounded: an unresponsive client must not pin the tool call forever. A timeout is a
@@ -140,7 +191,7 @@ impl AcpClientHandle {
         // missing client), which must never turn a dropped answer into a granted tool call.
         match tokio::time::timeout(
             INTERACTION_TIMEOUT,
-            self.connection.send_request(request).block_task(),
+            self.v1_connection().send_request(request).block_task(),
         )
         .await
         {
@@ -163,9 +214,21 @@ impl AcpClientHandle {
         &self,
         request: CreateElicitationRequest,
     ) -> std::result::Result<CreateElicitationResponse, String> {
+        #[cfg(feature = "acp-v2")]
+        if let ClientConnection::V2(connection) = &self.connection {
+            return match tokio::time::timeout(
+                INTERACTION_TIMEOUT,
+                crate::v2::elicit(connection, request),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err("elicitation timed out: the client did not answer".to_string()),
+            };
+        }
         match tokio::time::timeout(
             INTERACTION_TIMEOUT,
-            self.connection.send_request(request).block_task(),
+            self.v1_connection().send_request(request).block_task(),
         )
         .await
         {
@@ -183,7 +246,17 @@ impl AcpClientHandle {
         name: &str,
         server_id: agent_client_protocol::v1::schema::McpServerAcpId,
     ) -> super::mcp_over_acp::McpAcpConnection {
-        super::mcp_over_acp::McpAcpConnection::new(self.connection.clone(), name, server_id)
+        match &self.connection {
+            ClientConnection::V1(connection) => {
+                super::mcp_over_acp::McpAcpConnection::new(connection.clone(), name, server_id)
+            }
+            #[cfg(feature = "acp-v2")]
+            ClientConnection::V2(connection) => {
+                // The carrier is the same stateless `mcp/message`; only the connection type
+                // differs, so v2 sessions keep the bridge instead of losing it.
+                super::mcp_over_acp::McpAcpConnection::new_v2(connection.clone(), name, server_id)
+            }
+        }
     }
 }
 
@@ -199,7 +272,7 @@ impl ElicitationClient for AcpClientHandle {
 }
 
 /// The four choices surfaced to the reviewer, mirroring the Java agent.
-fn permission_options() -> Vec<PermissionOption> {
+pub(crate) fn permission_options() -> Vec<PermissionOption> {
     vec![
         PermissionOption::new(
             OPTION_ALLOW_ONCE,
@@ -965,6 +1038,11 @@ pub(crate) struct RenderCtx<'a> {
     /// The live model's context window, read once per turn.
     pub(crate) context_window: u64,
     pub(crate) emitted_text: bool,
+    /// The reply rendered before its deltas arrived. The turn's events are produced by
+    /// more than one path, so an `AgentResult` can overtake the deltas it summarizes;
+    /// replaying them afterwards would duplicate the text. Holds the rendered reply and
+    /// how many of its bytes the deltas have already replayed.
+    pub(crate) replayed_result: &'a mut Option<(String, usize)>,
     pub(crate) tool_events: &'a mut super::event::ToolEventMapper,
 }
 
@@ -984,6 +1062,34 @@ pub(crate) fn render_event(
 ) {
     match agent_event.event_type() {
         AgentEventType::TextBlockDelta => {
+            // Drop the deltas of a reply that `AgentResult` already rendered in full.
+            let replayed_delta = match ctx.replayed_result.as_mut() {
+                Some((rendered, replayed)) => {
+                    let delta = super::event::delta_text(agent_event);
+                    let matched = !delta.is_empty()
+                        && rendered
+                            .get(*replayed..)
+                            .map(|rest| rest.starts_with(delta))
+                            .unwrap_or(false);
+                    if matched {
+                        *replayed += delta.len();
+                    }
+                    matched
+                }
+                None => false,
+            };
+            if replayed_delta {
+                let done = ctx
+                    .replayed_result
+                    .as_ref()
+                    .map(|(rendered, replayed)| *replayed >= rendered.len())
+                    .unwrap_or(false);
+                if done {
+                    *ctx.replayed_result = None;
+                }
+                ctx.emitted_text = true;
+                return;
+            }
             if let Some(notification) = super::event::map_delta_event(
                 ctx.session_id.clone(),
                 agent_event,
@@ -1016,6 +1122,11 @@ pub(crate) fn render_event(
                     ctx.message_id.clone(),
                 ) {
                     out(notification);
+                    // Its deltas may still be queued behind it: remember the text so
+                    // they are not rendered a second time.
+                    if let Some(text) = super::event::result_text(agent_event) {
+                        *ctx.replayed_result = Some((text, 0));
+                    }
                 }
             }
         }
@@ -1454,6 +1565,7 @@ impl DurableDriver {
             // the restored state), and it must still reach the client. Keeping the flag from
             // the interrupted attempt would silently drop the final reply.
             let mut emitted_text = false;
+            let mut replayed_result: Option<(String, usize)> = None;
             // Set when the event sink is gone. The run may still be going, so the receipt
             // keeps being polled instead of returning with the turn still open.
             let mut events_closed = false;
@@ -1673,6 +1785,7 @@ impl DurableDriver {
                                     caps: &caps,
                                     context_window,
                                     emitted_text,
+                                    replayed_result: &mut replayed_result,
                                     tool_events: &mut tool_events,
                                 };
                                 render_event(
@@ -2424,6 +2537,9 @@ pub struct AcpAgentSession {
     elicitation_slot: ElicitationSlot,
     /// Persistent "always allow / always reject" rule store for this workspace.
     permission_store: Arc<PermissionRuleStore>,
+    /// Session process registry handed to the sandbox: shell commands register their child
+    /// process so a client cancel can kill it and its output can be streamed.
+    processes: Arc<agentscope_core::tool::ProcessRegistry>,
     /// The durable runtime of this ACP session, opened on the first prompt.
     ///
     /// Reusing one handle keeps the adapter, the store connection and the event sink warm across
@@ -2476,6 +2592,23 @@ pub struct AcpAgentSession {
     subagent_events: Arc<
         Mutex<
             Option<tokio::sync::mpsc::UnboundedReceiver<agentscope_harness::tool::SubagentFrame>>,
+        >,
+    >,
+    /// Protocol-specific exit for subagent frames.
+    ///
+    /// ACP v2 installs this so subagent cards keep flowing to whichever connection is attached
+    /// to the session (frames are published on the process-wide session bus instead of being
+    /// written to the connection that created the session). v1 leaves it unset and keeps using
+    /// `client`, which is what the production-verified path has always done.
+    subagent_sink: Arc<
+        Mutex<
+            Option<
+                Arc<
+                    dyn Fn(agent_client_protocol::v1::schema::SessionNotification)
+                        + Send
+                        + Sync,
+                >,
+            >,
         >,
     >,
     /// Child session id → the ACP session that owns it.
@@ -2767,6 +2900,8 @@ impl AcpAgentSession {
             archived,
             updated_at: Arc::new(Mutex::new(None)),
             subagent_events: Arc::new(Mutex::new(None)),
+            processes: agentscope_core::tool::ProcessRegistry::new(),
+            subagent_sink: Arc::new(Mutex::new(None)),
             subagent_children: Arc::new(Mutex::new(HashMap::new())),
             subagent_agents: Arc::new(Mutex::new(HashMap::new())),
             subagent_mode: Arc::new(Mutex::new(config::default_mode().to_string())),
@@ -3553,6 +3688,21 @@ impl AcpAgentSession {
         self.start_subagent_forwarder();
     }
 
+    /// Routes subagent frames through a protocol-specific sink instead of the bound client.
+    ///
+    /// Used by ACP v2: a reloaded client attaches to the session bus under a new connection, so
+    /// the forwarder already owning the harness channel has to keep feeding it.
+    pub fn set_subagent_sink(
+        &self,
+        sink: Arc<dyn Fn(agent_client_protocol::v1::schema::SessionNotification) + Send + Sync>,
+    ) {
+        *self
+            .subagent_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sink);
+        self.start_subagent_forwarder();
+    }
+
     /// Installs the harness channel carrying subagent frames.
     pub fn set_subagent_events(
         &mut self,
@@ -3601,6 +3751,16 @@ impl AcpAgentSession {
     /// The bridge is installed on the agent before this session exists (it has to be, or the
     /// first spawn would already be running), so both must share one slot instead of each
     /// creating its own.
+    /// The session process registry (see [`SessionBuild::processes`]).
+    pub fn processes(&self) -> Arc<agentscope_core::tool::ProcessRegistry> {
+        Arc::clone(&self.processes)
+    }
+
+    /// Shares the registry the built agent already handed to its sandbox.
+    pub fn set_processes(&mut self, processes: Arc<agentscope_core::tool::ProcessRegistry>) {
+        self.processes = processes;
+    }
+
     pub fn set_client_slot(&mut self, slot: Arc<Mutex<Option<Arc<AcpClientHandle>>>>) {
         self.client = slot;
     }
@@ -3628,14 +3788,22 @@ impl AcpAgentSession {
         else {
             return;
         };
-        let Some(client) = self
+        let client = self
             .client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        else {
+            .clone();
+        // Read through the slot on every frame: ACP v2 installs its sink after `set_client`, and
+        // the forwarder started by that call must already be routing through the session bus.
+        let sink_slot = Arc::clone(&self.subagent_sink);
+        if client.is_none()
+            && sink_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+        {
             return;
-        };
+        }
         let support = self.support.clone();
         let parent = self.session_id.clone();
         let children = Arc::clone(&self.subagent_children);
@@ -3659,10 +3827,20 @@ impl AcpAgentSession {
                     &frame.event,
                     &mut tracker,
                 ) {
-                    if let Err(error) = client.notify(notification) {
-                        // A dropped connection has nobody left to render subagents.
-                        tracing::debug!(%error, "subagent update could not be delivered");
-                        return;
+                    let sink = sink_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(sink) = sink {
+                        sink(notification);
+                        continue;
+                    }
+                    if let Some(client) = &client {
+                        if let Err(error) = client.notify(notification) {
+                            // A dropped connection has nobody left to render subagents.
+                            tracing::debug!(%error, "subagent update could not be delivered");
+                            return;
+                        }
                     }
                 }
                 // Keep the routing table in step with what the client was told: a child is

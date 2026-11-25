@@ -188,11 +188,15 @@ impl Variant {
     }
 
     /// Suffix appended to the profile's base feature. Empty for `native`.
+    ///
+    /// Every variant carries `acp-v2`: the router serves v1 and v2 side by side, so a client
+    /// initializing with `protocolVersion: 2` gets v2 and everything else stays on v1. These
+    /// builds pass `--no-default-features`, so the crate's own default does not apply here.
     fn feature_suffix(self) -> &'static str {
         match self {
-            Self::Native => "",
-            Self::Durable => ",durable",
-            Self::Sqlite => ",durable-sqlite",
+            Self::Native => ",acp-v2",
+            Self::Durable => ",durable,acp-v2",
+            Self::Sqlite => ",durable-sqlite,acp-v2",
         }
     }
 

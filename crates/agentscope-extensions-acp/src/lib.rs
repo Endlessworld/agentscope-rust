@@ -31,6 +31,9 @@ mod session_history;
 pub mod setup;
 pub mod support;
 pub mod turn_driver;
+/// Protocol v2 (draft) handler graph. Compiled only with the `acp-v2` feature.
+#[cfg(feature = "acp-v2")]
+pub mod v2;
 
 pub use coding_agent::{
     compaction_trigger_for, compaction_window_tokens, release_catalog_if_unused, AcpCodingAgent,

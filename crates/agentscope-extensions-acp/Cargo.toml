@@ -13,6 +13,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+base64.workspace = true
 agentscope-core = { workspace = true }
 agentscope-durable = { workspace = true, optional = true }
 agentscope-durable-adapter-agentscope = { workspace = true, optional = true }
@@ -22,7 +23,7 @@ agentscope-durable-adapter-agentscope = { workspace = true, optional = true }
 agentscope-durable-sqlite = { workspace = true, optional = true }
 agentscope-extensions-model = { workspace = true }
 agentscope-harness = { version = "0.2.0", path = "../agentscope-harness", default-features = false }
-agent-client-protocol = { version = "5.0.0", features = [
+agent-client-protocol = { version = "5.6.0", features = [
     # 5.0.0 起原生传输改为 opt-in（2.2.0 时在非 wasm 平台无条件可用）：
     #   - stdio     `Stdio` transport
     #   - process   `AcpAgent` / `AcpAgentConfig`（acp_agent_cli / 集成测试用）
@@ -40,23 +41,23 @@ agent-client-protocol = { version = "5.0.0", features = [
     #   - unstable_session_status         session/status（会话存活探测）
     #   - unstable_auth_status            auth/status（登录态探测）
     #   - unstable_session_archive        session/archive|unarchive + session/list 归档过滤
+    #   - unstable_session_options        session/options（v2 独有：开会话前的选项快照）
     #
     # 注意：`unstable_session_notices` / `unstable_session_compaction` 在 5.0.0
     # 已转正为稳定 API，同名 feature 不再存在（写上会直接报 feature 不存在）。
-    "unstable_plan_operations",
+    # 同理 5.1.0 转正 client `systemPrompt`、5.5.0 转正 plan operations 与
+    # subagent sessions：`unstable_session_system_prompt` / `unstable_plan_operations`
+    # / `unstable_subagents` 在 5.6.0 已删除，不能再列。
     "unstable_llm_providers",
     "unstable_end_turn_token_usage",
     "unstable_mcp_over_acp",
-    # systemPrompt（session/new|load|resume 的 append 模式）；见 ACP-38。
-    "unstable_session_system_prompt",
     # session/set_title、session/status、auth/status、archive/unarchive；
     # 见 ACP-33 / ACP-34 / ACP-35 / ACP-36。
     "unstable_session_set_title",
     "unstable_session_status",
     "unstable_auth_status",
     "unstable_session_archive",
-    # `subagent_update` / `session_message*`（子代理进度上报）；见 ACP 子代理支持。
-    "unstable_subagents",
+    "unstable_session_options",
 ] }
 async-trait = { workspace = true }
 chrono = { workspace = true }
@@ -71,7 +72,7 @@ tokio = { workspace = true, features = ["signal", "net"] }
 # `--ws` 模式：ACP 架在 SDK 自带的 HTTP + WebSocket 传输上（`AcpHttpServer` 的 WS upgrade），
 # 一条 WS 文本帧 = 一条 JSON-RPC 消息。`server` 特性会带入 axum 0.8（工作区其它 crate 仍是
 # 0.7，两者大版本不同、类型不互通，各自编译各自的）。
-agent-client-protocol-http = { version = "5.0.0", features = ["server"] }
+agent-client-protocol-http = { version = "5.6.0", features = ["server"] }
 # 只用于 `axum::serve`：把 SDK 组好的 Router 挂到 TCP 监听上。
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tracing = { workspace = true }
@@ -95,7 +96,7 @@ path = "src/acp_harness_agent.rs"
 [dev-dependencies]
 
 [features]
-default = ["rusqlite", "durable"]
+default = ["rusqlite", "durable", "acp-v2"]
 # The durable driver: a session journals its turns so another process can resume them. Without
 # it the session runs on the native driver only, and neither `agentscope-durable` nor its harness
 # adapter is compiled into this crate.
@@ -110,6 +111,18 @@ lite = []
 # Diagnostic only: install a counting global allocator so `[mem]` lines report live heap bytes
 # (`src/mem.rs`). Not a default -- the atomics are on the allocation hot path.
 alloc-stats = []
+# ACP protocol v2 (draft). Compiles the v2 handler graph (`src/v2/`) and lets `into_service`
+# serve both versions through the SDK's protocol router: a client that initializes with
+# `protocolVersion: 2` gets v2, everything else keeps the v1 implementation unchanged.
+#
+# On by default so every build serves both versions and the router picks per connection. Turn it
+# off (`--no-default-features`, or `default-features = false` in a dependent) to get a v1-only
+# binary: that also drops `unstable_protocol_v2`, which removes `ProtocolVersion::LATEST` from
+# every downstream build of `agent-client-protocol`.
+acp-v2 = [
+    "agent-client-protocol/unstable_protocol_v2",
+    "agent-client-protocol/unstable_session_fork",
+]
 
 # The allocator is platform-specific. Session journaling builds megabyte-sized JSON payloads per
 # turn; on Linux/glibc the default allocator keeps that burst in its arena (RSS never returns), so
