@@ -5,6 +5,8 @@
 //! Frames are injected through the same channel the harness writes to, so the test covers the
 //! whole ACP half (channel plumbing, capability gate, frame mapping, routing) without a model
 //! ever spawning a real subagent.
+mod common;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,8 +22,6 @@ use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v2::schema as v2;
 use agent_client_protocol::{Agent, Channel, Client};
 use agentscope_core::event::{AgentEvent, AgentEventType};
-use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
-use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::{AcpCodingAgent, SessionBuild};
 use agentscope_harness::agent::HarnessAgent;
 use agentscope_harness::tool::{SubagentEventSink, SubagentFrame};
@@ -36,29 +36,6 @@ fn frame(child: &str, event: AgentEvent) -> SubagentFrame {
         parent_session: None,
         child_session: child.to_string(),
         event,
-    }
-}
-
-/// A model that always answers "done", so a turn costs exactly one reasoning call.
-struct StubModel;
-
-#[async_trait::async_trait]
-impl Model for StubModel {
-    fn stream(
-        &self,
-        _messages: Vec<Msg>,
-        _tools: Vec<ToolSchema>,
-        _options: GenerateOptions,
-    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
-        Box::pin(futures::stream::once(async move {
-            Ok(ChatResponse::builder()
-                .content(vec![CoreBlock::Text(TextBlock::new("done"))])
-                .build())
-        }))
-    }
-
-    fn model_name(&self) -> &str {
-        "stub"
     }
 }
 
@@ -87,7 +64,7 @@ fn agent_with_captured_channel(
             }
             HarnessAgent::builder()
                 .name("acp-subagent-test")
-                .model(Arc::new(StubModel))
+                .model(Arc::new(common::StubModel::new("done")))
                 .session_id(build.session_id)
                 .cwd(root.clone())
                 .workspace(root.join(".agentscope").join("workspace"))

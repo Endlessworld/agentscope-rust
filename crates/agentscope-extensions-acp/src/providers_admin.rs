@@ -116,6 +116,98 @@ pub async fn run_extension(
     }
 }
 
+/// `providers/list` 的响应主体，协议无关。
+///
+/// 宿主接管 providers 时读 `models.json`（同步 I/O + 解析模型目录），放到阻塞线程池；
+/// 否则读内存注册表。v1 / v2 的 handler 只负责包上各自的外层类型。
+pub(crate) async fn advertised(agent: &crate::coding_agent::AcpCodingAgent) -> Vec<ProviderInfo> {
+    if agent.manage_providers {
+        // 读 `models.json` + 解析模型目录（catalog 8MB）是同步 I/O：
+        // 放在阻塞线程池，否则这条连接的 JSON-RPC 分发会被卡住，
+        // 后面的 `initialize` / `session/new` 只能排队。
+        tokio::task::spawn_blocking(list).await.unwrap_or_default()
+    } else {
+        agent.providers.list()
+    }
+}
+
+/// `providers/set` 的执行体，协议无关。
+///
+/// v1 / v2 只负责把各自的 wire 转成 [`SetProviderRequest`]（v2 会把 `_meta` 一并带上），
+/// 两个版本都走这里改配置、刷新模型表。
+pub(crate) async fn apply_set(
+    agent: &crate::coding_agent::AcpCodingAgent,
+    request: SetProviderRequest,
+) -> Result<(), ProviderMutationError> {
+    let id = request.provider_id.to_string();
+    if agent.manage_providers {
+        let outcome = tokio::task::spawn_blocking(move || set(request).map(|()| choices())).await;
+        return match outcome {
+            Ok(Ok(models)) => {
+                agent.replace_models(models);
+                Ok(())
+            }
+            Ok(Err(error)) => Err(ProviderMutationError::Backend(format!(
+                "provider '{id}': {error}"
+            ))),
+            Err(error) => Err(ProviderMutationError::Backend(format!(
+                "provider '{id}': {error}"
+            ))),
+        };
+    }
+    let ok = agent.providers.set(
+        &id,
+        request.api_type,
+        request.base_url,
+        request.headers.into_iter().collect(),
+    );
+    if ok {
+        Ok(())
+    } else {
+        Err(ProviderMutationError::Unknown)
+    }
+}
+
+/// `providers/disable` 的执行体，协议无关。
+pub(crate) async fn apply_disable(
+    agent: &crate::coding_agent::AcpCodingAgent,
+    id: &str,
+) -> Result<(), ProviderMutationError> {
+    if agent.manage_providers {
+        let target = id.to_string();
+        let outcome =
+            tokio::task::spawn_blocking(move || disable(&target).map(|()| choices())).await;
+        return match outcome {
+            Ok(Ok(models)) => {
+                agent.replace_models(models);
+                Ok(())
+            }
+            Ok(Err(error)) => Err(ProviderMutationError::Backend(format!(
+                "provider '{id}': {error}"
+            ))),
+            Err(error) => Err(ProviderMutationError::Backend(format!(
+                "provider '{id}': {error}"
+            ))),
+        };
+    }
+    if agent.providers.disable(id) {
+        Ok(())
+    } else {
+        Err(ProviderMutationError::Unknown)
+    }
+}
+
+/// A provider mutation the caller renders itself.
+///
+/// `providers/set|disable` 对「注册表里没有这个 id」的措辞在 v1 / v2 不同（v1 的 disable
+/// 带 `is unknown or required`），所以共享核心只报类别，文案留在各自的 handler 里。
+pub(crate) enum ProviderMutationError {
+    /// 后端（`models.json` / 注册表写入）拒绝，文本已是客户端可读的。
+    Backend(String),
+    /// 内存注册表不认识这个 id。
+    Unknown,
+}
+
 impl ProvidersExtRequest {
     /// The wire method this request arrived on (the four extension methods share one type).
     pub fn method_name(&self) -> &str {
@@ -242,13 +334,10 @@ fn supported_protocols(provider: &crate::model_config::ModelProviderConfig) -> V
 /// 单个模型真正的协议分组仍在 `_meta.models` 里，`current` 只是给不支持 `_meta` 的
 /// 客户端一个可显示的值。
 fn primary_protocol(provider: &crate::model_config::ModelProviderConfig) -> LlmProtocol {
-    if provider.models.completions.is_empty()
-        && provider.models.responses.is_empty()
-        && !provider.models.messages.is_empty()
-    {
-        LlmProtocol::Anthropic
-    } else {
-        LlmProtocol::OpenAi
+    // Same primary-protocol rule as `primary_api`, expressed once.
+    match primary_api(provider) {
+        ApiProtocol::Messages => LlmProtocol::Anthropic,
+        _ => LlmProtocol::OpenAi,
     }
 }
 

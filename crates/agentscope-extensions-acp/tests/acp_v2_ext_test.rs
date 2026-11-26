@@ -7,6 +7,8 @@
 //! "method not found".
 #![cfg(feature = "acp-v2")]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,34 +16,9 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v2::schema as v2;
 use agent_client_protocol::v2::ConnectionTo;
 use agent_client_protocol::{Agent, Channel, Client, ErrorCode, JsonRpcMessage};
-use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
-use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::ext;
 use agentscope_extensions_acp::AcpCodingAgent;
 use agentscope_harness::agent::HarnessAgent;
-
-/// Answers every turn with "done"; this test only drives the extension surface.
-struct StubModel;
-
-#[async_trait::async_trait]
-impl Model for StubModel {
-    fn stream(
-        &self,
-        _messages: Vec<Msg>,
-        _tools: Vec<ToolSchema>,
-        _options: GenerateOptions,
-    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
-        Box::pin(futures::stream::once(async move {
-            Ok(ChatResponse::builder()
-                .content(vec![CoreBlock::Text(TextBlock::new("done"))])
-                .build())
-        }))
-    }
-
-    fn model_name(&self) -> &str {
-        "stub"
-    }
-}
 
 fn session_factory(
     root: PathBuf,
@@ -49,7 +26,7 @@ fn session_factory(
     move |_cwd, session_id| {
         HarnessAgent::builder()
             .name("acp-v2-ext-test")
-            .model(Arc::new(StubModel))
+            .model(Arc::new(common::StubModel::new("done")))
             .session_id(session_id)
             .cwd(root.clone())
             .workspace(root.join(".agentscope").join("workspace"))

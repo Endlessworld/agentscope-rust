@@ -5,6 +5,8 @@
 //! The config path is redirected with `AGENTSCOPE_MODELS_JSON`, so the developer's real
 //! `~/.agentscope/models.json` is never read or written. Everything runs in-process over
 //! `Channel::duplex` with a scripted model.
+mod common;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,34 +18,9 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{Agent, Channel, Client};
-use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
-use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::config::ModelChoice;
 use agentscope_extensions_acp::AcpCodingAgent;
 use agentscope_harness::agent::HarnessAgent;
-
-/// A model that is never actually called: the test only edits the provider table.
-struct StubModel;
-
-#[async_trait::async_trait]
-impl Model for StubModel {
-    fn stream(
-        &self,
-        _messages: Vec<Msg>,
-        _tools: Vec<ToolSchema>,
-        _options: GenerateOptions,
-    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
-        Box::pin(futures::stream::once(async move {
-            Ok(ChatResponse::builder()
-                .content(vec![CoreBlock::Text(TextBlock::new("done"))])
-                .build())
-        }))
-    }
-
-    fn model_name(&self) -> &str {
-        "stub"
-    }
-}
 
 fn fresh_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("agentscope_acp_{name}_{}", std::process::id()));
@@ -138,7 +115,7 @@ async fn a_provider_edit_reaches_an_idle_session_and_lands_on_disk() {
         .model_factory(move |cwd: PathBuf, session_id: &str| {
             HarnessAgent::builder()
                 .name("acp-providers-test")
-                .model(Arc::new(StubModel))
+                .model(Arc::new(common::StubModel::new("done")))
                 .session_id(session_id)
                 .cwd(cwd)
                 .workspace(factory_root.join(".agentscope").join("workspace"))

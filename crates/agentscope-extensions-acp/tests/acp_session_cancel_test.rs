@@ -14,12 +14,15 @@
 //! Both tests use a model that never returns, so they are deterministic: no live provider, no
 //! network and no timer race. The only timing bound asserts that the fix takes effect, while
 //! the unfixed behaviour is either a deterministic 10s or an unbounded wait.
+mod common;
+
+use common::prompt;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_client_protocol::v1::schema::{ContentBlock, SessionId, StopReason, TextContent};
+use agent_client_protocol::v1::schema::{SessionId, StopReason};
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::AcpAgentSession;
@@ -79,23 +82,10 @@ impl Model for HangingFirstModel {
     }
 }
 
-fn scratch_dir(tag: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "acp-session-cancel-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("create the scratch directory");
-    dir
-}
-
 /// Builds a session whose agent is journal-backed (so prompt turns are real) but isolated
 /// from the developer's home directory.
 fn build_session(tag: &str, model: Arc<dyn Model>) -> AcpAgentSession {
-    let dir = scratch_dir(tag);
+    let dir = common::unique_scratch_dir("acp-session-cancel", tag);
     let agent = HarnessAgent::builder()
         .name("acp-session-cancel")
         .model(model)
@@ -112,10 +102,6 @@ fn build_session(tag: &str, model: Arc<dyn Model>) -> AcpAgentSession {
         Vec::new(),
         Vec::new(),
     )
-}
-
-fn prompt(text: &str) -> Vec<ContentBlock> {
-    vec![ContentBlock::Text(TextContent::new(text.to_string()))]
 }
 
 /// Waits until `counter` is non-zero. The prompt's bookkeeping before the first model call is

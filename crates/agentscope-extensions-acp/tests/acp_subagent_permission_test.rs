@@ -5,43 +5,20 @@
 //! trivial context (mode `Default`, no rules). Under `accept_edits` a shell command issued by a
 //! subagent therefore executed without ever raising `session/request_permission` — the user was
 //! asked for the parent's tools and not for the child's.
+mod common;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
 use agent_client_protocol::v1::schema::SessionId;
 use agentscope_core::agent::CallableAgent;
-use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
-use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_core::permission::{PermissionBehavior, PermissionMode, PermissionRule};
 use agentscope_extensions_acp::config::{permission_context_for_mode, MODE_ACCEPT_EDITS};
 use agentscope_extensions_acp::permission_store::PermissionRuleStore;
 use agentscope_extensions_acp::session::SubagentPermissionHook;
 use agentscope_harness::agent::HarnessAgent;
 use agentscope_harness::tool::SubagentRuntimeHook;
-
-/// A model that answers "done" without calling a tool: these tests never run a turn.
-struct StubModel;
-
-#[async_trait::async_trait]
-impl Model for StubModel {
-    fn stream(
-        &self,
-        _messages: Vec<Msg>,
-        _tools: Vec<ToolSchema>,
-        _options: GenerateOptions,
-    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
-        Box::pin(futures::stream::once(async move {
-            Ok(ChatResponse::builder()
-                .content(vec![CoreBlock::Text(TextBlock::new("done"))])
-                .build())
-        }))
-    }
-
-    fn model_name(&self) -> &str {
-        "stub"
-    }
-}
 
 fn fresh_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -56,7 +33,7 @@ fn fresh_root(name: &str) -> PathBuf {
 fn build_child(root: &PathBuf) -> HarnessAgent {
     HarnessAgent::builder()
         .name("acp-subagent-permission-test")
-        .model(Arc::new(StubModel))
+        .model(Arc::new(common::StubModel::new("done")))
         .session_id("sub-x")
         .cwd(root.clone())
         .workspace(root.join(".agentscope").join("workspace"))

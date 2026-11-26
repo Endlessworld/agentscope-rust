@@ -176,39 +176,12 @@ pub struct ExtRespondRequest {
     pub params: ExtRespondParams,
 }
 
-impl JsonRpcMessage for ExtRespondRequest {
-    fn matches_method(method: &str) -> bool {
-        method == RESPOND_METHOD
-    }
-
-    fn method(&self) -> &str {
-        &self.method
-    }
-
-    fn to_untyped_message(&self) -> Result<UntypedMessage, agent_client_protocol::Error> {
-        UntypedMessage::new(self.method(), &self.params)
-    }
-
-    fn parse_message(
-        method: &str,
-        params: &serde_json::Value,
-    ) -> Result<Self, agent_client_protocol::Error> {
-        if method != RESPOND_METHOD {
-            return Err(agent_client_protocol::Error::method_not_found());
-        }
-        let params: ExtRespondParams = serde_json::from_value(params.clone()).map_err(|error| {
-            agent_client_protocol::Error::invalid_params().data(error.to_string())
-        })?;
-        Ok(Self {
-            method: Arc::from(method),
-            params,
-        })
-    }
-}
-
-impl JsonRpcRequest for ExtRespondRequest {
-    type Response = serde_json::Value;
-}
+impl_ext_request!(
+    ExtRespondRequest,
+    ExtRespondParams,
+    RESPOND_METHOD,
+    serde_json::Value
+);
 
 /// Folds one message into the turn a session is executing.
 ///
@@ -262,39 +235,12 @@ pub struct ExtSteerRequest {
     pub params: ExtSteerParams,
 }
 
-impl JsonRpcMessage for ExtSteerRequest {
-    fn matches_method(method: &str) -> bool {
-        method == STEER_METHOD
-    }
-
-    fn method(&self) -> &str {
-        &self.method
-    }
-
-    fn to_untyped_message(&self) -> Result<UntypedMessage, agent_client_protocol::Error> {
-        UntypedMessage::new(self.method(), &self.params)
-    }
-
-    fn parse_message(
-        method: &str,
-        params: &serde_json::Value,
-    ) -> Result<Self, agent_client_protocol::Error> {
-        if method != STEER_METHOD {
-            return Err(agent_client_protocol::Error::method_not_found());
-        }
-        let params: ExtSteerParams = serde_json::from_value(params.clone()).map_err(|error| {
-            agent_client_protocol::Error::invalid_params().data(error.to_string())
-        })?;
-        Ok(Self {
-            method: Arc::from(method),
-            params,
-        })
-    }
-}
-
-impl JsonRpcRequest for ExtSteerRequest {
-    type Response = ExtSteerResult;
-}
+impl_ext_request!(
+    ExtSteerRequest,
+    ExtSteerParams,
+    STEER_METHOD,
+    ExtSteerResult
+);
 
 /// Queues a message as its own turn and answers before it runs.
 ///
@@ -358,39 +304,12 @@ pub struct ExtQueueRequest {
     pub params: ExtQueueParams,
 }
 
-impl JsonRpcMessage for ExtQueueRequest {
-    fn matches_method(method: &str) -> bool {
-        method == QUEUE_METHOD
-    }
-
-    fn method(&self) -> &str {
-        &self.method
-    }
-
-    fn to_untyped_message(&self) -> Result<UntypedMessage, agent_client_protocol::Error> {
-        UntypedMessage::new(self.method(), &self.params)
-    }
-
-    fn parse_message(
-        method: &str,
-        params: &serde_json::Value,
-    ) -> Result<Self, agent_client_protocol::Error> {
-        if method != QUEUE_METHOD {
-            return Err(agent_client_protocol::Error::method_not_found());
-        }
-        let params: ExtQueueParams = serde_json::from_value(params.clone()).map_err(|error| {
-            agent_client_protocol::Error::invalid_params().data(error.to_string())
-        })?;
-        Ok(Self {
-            method: Arc::from(method),
-            params,
-        })
-    }
-}
-
-impl JsonRpcRequest for ExtQueueRequest {
-    type Response = ExtQueueResult;
-}
+impl_ext_request!(
+    ExtQueueRequest,
+    ExtQueueParams,
+    QUEUE_METHOD,
+    ExtQueueResult
+);
 
 /// Parameters of [`QUEUE_LIST_METHOD`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

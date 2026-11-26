@@ -5,6 +5,8 @@
 //!
 //! Everything runs in-process over `Channel::duplex` with a scripted model, so no key or
 //! network is involved.
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,33 +19,8 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{Agent, Channel, Client, ErrorCode};
-use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
-use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
 use agentscope_extensions_acp::{AcpCodingAgent, SessionBuild};
 use agentscope_harness::agent::HarnessAgent;
-
-/// A model that always answers "done", so a turn costs exactly one reasoning call.
-struct StubModel;
-
-#[async_trait::async_trait]
-impl Model for StubModel {
-    fn stream(
-        &self,
-        _messages: Vec<Msg>,
-        _tools: Vec<ToolSchema>,
-        _options: GenerateOptions,
-    ) -> futures::stream::BoxStream<'_, agentscope_core::error::Result<ChatResponse>> {
-        Box::pin(futures::stream::once(async move {
-            Ok(ChatResponse::builder()
-                .content(vec![CoreBlock::Text(TextBlock::new("done"))])
-                .build())
-        }))
-    }
-
-    fn model_name(&self) -> &str {
-        "stub"
-    }
-}
 
 /// Session factory mirroring the binary's persistence wiring: the ACP session id is the
 /// journal key, so a fresh agent can find the session on disk.
@@ -51,7 +28,7 @@ fn factory(root: PathBuf) -> impl Fn(PathBuf, &str) -> HarnessAgent + Send + Syn
     move |_cwd, session_id| {
         HarnessAgent::builder()
             .name("acp-capabilities-test")
-            .model(Arc::new(StubModel))
+            .model(Arc::new(common::StubModel::new("done")))
             .session_id(session_id)
             .cwd(root.clone())
             .workspace(root.join(".agentscope").join("workspace"))
@@ -528,7 +505,7 @@ async fn a_client_system_prompt_reaches_the_session_factory_and_override_is_reje
             let prompt = build.system_prompt.unwrap_or_default();
             HarnessAgent::builder()
                 .name("acp-capabilities-test")
-                .model(Arc::new(StubModel))
+                .model(Arc::new(common::StubModel::new("done")))
                 .session_id(build.session_id)
                 .cwd(root_for_factory.clone())
                 .workspace(root_for_factory.join(".agentscope").join("workspace"))

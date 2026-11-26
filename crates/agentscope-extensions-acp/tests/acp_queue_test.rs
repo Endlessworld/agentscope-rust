@@ -5,10 +5,13 @@
 //! `queued` in the store from the moment the extension answers. Nothing ticks it there — a prompt
 //! is the only thing that ticks this session — so the next prompt has to drain it, in order, before
 //! admitting its own message.
+mod common;
+
+use common::prompt;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::v1::schema::{
-    ContentBlock, SessionId, SessionNotification, StopReason, TextContent,
+    SessionId, SessionNotification, StopReason,
 };
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
@@ -44,15 +47,8 @@ impl Model for RecordingModel {
     }
 }
 
-fn scratch_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("acp-queue-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create the scratch directory");
-    dir
-}
-
 fn build_session(tag: &str, seen: Arc<Mutex<Vec<Vec<String>>>>) -> AcpAgentSession {
-    let dir = scratch_dir(tag);
+    let dir = common::scratch_dir("acp-queue", tag);
     let agent = HarnessAgent::builder()
         .name("acp-queue-test")
         .model(Arc::new(RecordingModel { seen }))
@@ -69,10 +65,6 @@ fn build_session(tag: &str, seen: Arc<Mutex<Vec<Vec<String>>>>) -> AcpAgentSessi
         Vec::new(),
         Vec::new(),
     )
-}
-
-fn prompt(text: &str) -> Vec<ContentBlock> {
-    vec![ContentBlock::Text(TextContent::new(text.to_string()))]
 }
 
 #[tokio::test]

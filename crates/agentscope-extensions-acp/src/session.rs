@@ -3635,6 +3635,43 @@ impl AcpAgentSession {
         self.persist_config();
     }
 
+    /// Applies one `session/set_config_option` value.
+    ///
+    /// Shared by the v1 and v2 graphs: the accepted ids and the rejection text are part of the
+    /// client-visible contract, so both versions go through this one implementation.
+    pub(crate) fn apply_config_option(
+        &mut self,
+        config_id: &str,
+        value: &str,
+    ) -> agent_client_protocol::Result<()> {
+        match config_id {
+            "model" => {
+                if !self.has_model(value) {
+                    return Err(agent_client_protocol::Error::invalid_params()
+                        .data(format!("unknown model '{value}'")));
+                }
+                self.set_model(value);
+                // The live agent keeps the previous model until the next prompt, so refresh the
+                // context-window gauge from the newly selected model's descriptor now.
+                self.push_usage_for_selected_model();
+            }
+            "thought_level" => {
+                if !self.has_thought_level(value) {
+                    return Err(agent_client_protocol::Error::invalid_params().data(format!(
+                        "thought level '{value}' is not supported by the selected model"
+                    )));
+                }
+                self.set_thought_level(value);
+            }
+            "mode" => self.set_mode(value),
+            other => {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data(format!("unknown config option '{other}'")))
+            }
+        }
+        Ok(())
+    }
+
     /// Reconfigures the underlying agent's permission engine to match the
     /// current session mode (`plan` / `accept_edits` / `yolo`), then layers the
     /// persisted "always allow / always reject" user rules on top so they

@@ -490,8 +490,8 @@ pub(crate) fn handlers(agent: Arc<AcpCodingAgent>) -> DynConnectTo<Client> {
                             "config option requires a value id",
                         ));
                     };
-                    if let Err(error) = apply_config_option(&mut session, &req.config_id.to_string(), &value)
-                    {
+                    let config_id = req.config_id.to_string();
+                    if let Err(error) = session.apply_config_option(&config_id, &value) {
                         return responder.respond_with_error(error);
                     }
                     let options = session.config_options();
@@ -737,14 +737,8 @@ pub(crate) fn handlers(agent: Arc<AcpCodingAgent>) -> DynConnectTo<Client> {
                 async move |_req: v2::ListProvidersRequest,
                             responder: Responder<v2::ListProvidersResponse>,
                             _cx: ConnectionTo<Client>| {
-                    let providers = if a_providers.manage_providers {
-                        tokio::task::spawn_blocking(crate::providers_admin::list)
-                            .await
-                            .unwrap_or_default()
-                    } else {
-                        a_providers.providers.list()
-                    };
-                    let providers = providers
+                    let providers = crate::providers_admin::advertised(&a_providers)
+                        .await
                         .into_iter()
                         .filter_map(convert::provider_from_v1)
                         .collect();
@@ -759,47 +753,26 @@ pub(crate) fn handlers(agent: Arc<AcpCodingAgent>) -> DynConnectTo<Client> {
                     let id = req.provider_id.to_string();
                     let headers: std::collections::HashMap<String, String> =
                         req.headers.into_iter().collect();
-                    if a_providers_set.manage_providers {
-                        // `_meta` carries everything the standard v1 shape lacks: the model
-                        // table (`models`), the enabled/disabled flag and the display label.
-                        // Dropping it here made `providers/set` a no-op for those updates.
-                        let request = v1::SetProviderRequest::new(
-                            req.provider_id.to_string(),
-                            convert::protocol_to_v1(req.api_type),
-                            req.base_url.clone(),
-                        )
-                        .headers(headers.into_iter().collect())
-                        .meta(req.meta);
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            crate::providers_admin::set(request)
-                                .map(|()| crate::providers_admin::choices())
-                        })
-                        .await;
-                        return match outcome {
-                            Ok(Ok(models)) => {
-                                a_providers_set.replace_models(models);
-                                responder.respond(v2::SetProviderResponse::new())
-                            }
-                            Ok(Err(error)) => responder.respond_with_error(
-                                convert::invalid_params(format!("provider '{id}': {error}")),
-                            ),
-                            Err(error) => responder.respond_with_error(convert::invalid_params(
-                                format!("provider '{id}': {error}"),
-                            )),
-                        };
-                    }
-                    let ok = a_providers_set.providers.set(
-                        &id,
+                    // `_meta` carries everything the standard v1 shape lacks: the model table
+                    // (`models`), the enabled/disabled flag and the display label. Dropping it
+                    // here made `providers/set` a no-op for those updates.
+                    let request = v1::SetProviderRequest::new(
+                        req.provider_id.to_string(),
                         convert::protocol_to_v1(req.api_type),
                         req.base_url,
-                        headers,
-                    );
-                    if ok {
-                        responder.respond(v2::SetProviderResponse::new())
-                    } else {
-                        responder.respond_with_error(convert::invalid_params(format!(
-                            "unknown provider '{id}'"
-                        )))
+                    )
+                    .headers(headers.into_iter().collect())
+                    .meta(req.meta);
+                    match crate::providers_admin::apply_set(&a_providers_set, request).await {
+                        Ok(()) => responder.respond(v2::SetProviderResponse::new()),
+                        Err(crate::providers_admin::ProviderMutationError::Backend(error)) => {
+                            responder.respond_with_error(convert::invalid_params(error))
+                        }
+                        Err(crate::providers_admin::ProviderMutationError::Unknown) => {
+                            responder.respond_with_error(convert::invalid_params(format!(
+                                "unknown provider '{id}'"
+                            )))
+                        }
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -809,34 +782,16 @@ pub(crate) fn handlers(agent: Arc<AcpCodingAgent>) -> DynConnectTo<Client> {
                             responder: Responder<v2::DisableProviderResponse>,
                             _cx: ConnectionTo<Client>| {
                     let id = req.provider_id.to_string();
-                    if a_providers_disable.manage_providers {
-                        let outcome = tokio::task::spawn_blocking({
-                            let id = id.clone();
-                            move || {
-                                crate::providers_admin::disable(&id)
-                                    .map(|()| crate::providers_admin::choices())
-                            }
-                        })
-                        .await;
-                        return match outcome {
-                            Ok(Ok(models)) => {
-                                a_providers_disable.replace_models(models);
-                                responder.respond(v2::DisableProviderResponse::new())
-                            }
-                            Ok(Err(error)) => responder.respond_with_error(
-                                convert::invalid_params(format!("provider '{id}': {error}")),
-                            ),
-                            Err(error) => responder.respond_with_error(convert::invalid_params(
-                                format!("provider '{id}': {error}"),
-                            )),
-                        };
-                    }
-                    if a_providers_disable.providers.disable(&id) {
-                        responder.respond(v2::DisableProviderResponse::new())
-                    } else {
-                        responder.respond_with_error(convert::invalid_params(format!(
-                            "unknown provider '{id}'"
-                        )))
+                    match crate::providers_admin::apply_disable(&a_providers_disable, &id).await {
+                        Ok(()) => responder.respond(v2::DisableProviderResponse::new()),
+                        Err(crate::providers_admin::ProviderMutationError::Backend(error)) => {
+                            responder.respond_with_error(convert::invalid_params(error))
+                        }
+                        Err(crate::providers_admin::ProviderMutationError::Unknown) => {
+                            responder.respond_with_error(convert::invalid_params(format!(
+                                "unknown provider '{id}'"
+                            )))
+                        }
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -1132,38 +1087,6 @@ fn send_update(
         session_id.clone(),
         update,
     ))
-}
-
-/// Applies one `session/set_config_option` value the way the v1 handler applies it.
-fn apply_config_option(
-    session: &mut AcpAgentSession,
-    config_id: &str,
-    value: &str,
-) -> agent_client_protocol::Result<()> {
-    match config_id {
-        "model" => {
-            if !session.has_model(value) {
-                return Err(convert::invalid_params(format!("unknown model '{value}'")));
-            }
-            session.set_model(value.to_string());
-            session.push_usage_for_selected_model();
-        }
-        "thought_level" => {
-            if !session.has_thought_level(value) {
-                return Err(convert::invalid_params(format!(
-                    "thought level '{value}' is not supported by the selected model"
-                )));
-            }
-            session.set_thought_level(value.to_string());
-        }
-        "mode" => session.set_mode(value.to_string()),
-        other => {
-            return Err(convert::invalid_params(format!(
-                "unknown config option '{other}'"
-            )))
-        }
-    }
-    Ok(())
 }
 
 /// Reads the value id out of a v2 config value (only id-carrying values are supported: every

@@ -1263,32 +1263,22 @@ impl AcpCodingAgent {
                     // expired or fenced"). Java allocates a UUID here; do the same and keep the
                     // readable prefix for logs.
                     let session_id = SessionId::new(format!("session-{}", uuid::Uuid::new_v4()));
-                    let mut session = a_new.create_session(
+                    let session = a_new.create_session(
                         session_id.clone(),
                         cwd,
                         system_prompt,
                         additional_directories.clone(),
                         client_roots,
                     );
-                    session.set_additional_directories(additional_directories);
-                    // 建会话时就绑上连接：会话空闲（没跑 prompt）时也要能收到
-                    // `config_option_update`（供应商增删改后刷新模型下拉）。
-                    session.set_client(AcpClientHandle::new(cx.clone()));
-                    // Bridge the client's MCP servers on a spawned task: an ACP server's
-                    // `tools/list` is an `mcp/message` request whose reply can only be routed
-                    // by the dispatch loop that is running this handler. Awaiting it here
-                    // deadlocks that loop until `MCP_CONNECT_TIMEOUT` (60s per server), so
-                    // `session/new` stalls and the tools never reach the toolkit.
-                    if !req.mcp_servers.is_empty() {
-                        let bridging = session.clone();
-                        let servers = req.mcp_servers.clone();
-                        cx.spawn(async move {
-                            bridging.apply_mcp_servers(&servers).await;
-                            Ok(())
-                        })?;
-                    }
-                    let config_options = session.config_options();
-                    let modes = session.session_mode_state();
+                    let (session, config_options, modes) = match bind_opened_session(
+                        session,
+                        additional_directories,
+                        &req.mcp_servers,
+                        &cx,
+                    ) {
+                        Ok(opened) => opened,
+                        Err(error) => return responder.respond_with_error(error),
+                    };
                     a_new.register_session(session);
                     let response = NewSessionResponse::new(session_id.clone())
                         .modes(modes)
@@ -1428,39 +1418,9 @@ impl AcpCodingAgent {
                                 .data("config option requires a value id"),
                         );
                     };
-                    match req.config_id.to_string().as_str() {
-                        "model" => {
-                            if !session.has_model(&value) {
-                                return responder.respond_with_error(
-                                    agent_client_protocol::Error::invalid_params()
-                                        .data(format!("unknown model '{value}'")),
-                                );
-                            }
-                            session.set_model(value);
-                            // The live agent keeps the previous model until the
-                            // next prompt, so refresh the context-window gauge
-                            // from the newly selected model's descriptor now.
-                            session.push_usage_for_selected_model();
-                        }
-                        "thought_level" => {
-                            if !session.has_thought_level(&value) {
-                                return responder.respond_with_error(
-                                    agent_client_protocol::Error::invalid_params().data(format!(
-                                        "thought level '{value}' is not supported by the selected model"
-                                    )),
-                                );
-                            }
-                            session.set_thought_level(value);
-                        }
-                        "mode" => {
-                            session.set_mode(value);
-                        }
-                        other => {
-                            return responder.respond_with_error(
-                                agent_client_protocol::Error::invalid_params()
-                                    .data(format!("unknown config option '{other}'")),
-                            );
-                        }
+                    let config_id = req.config_id.to_string();
+                    if let Err(error) = session.apply_config_option(&config_id, &value) {
+                        return responder.respond_with_error(error);
                     }
                     let config_options = session.config_options();
                     let update = agent_client_protocol::v1::schema::SessionNotification::new(
@@ -1659,23 +1619,15 @@ impl AcpCodingAgent {
                             a_load.get_session(&sid).unwrap()
                         }
                     };
-                    let mut session = session;
-                    session.set_additional_directories(additional_directories);
-                    // 空闲会话也要能收到 `config_option_update`（同 `session/new`）。
-                    session.set_client(AcpClientHandle::new(cx.clone()));
-                    // Bridge MCP servers declared on load (idempotent per server). Spawned for
-                    // the same reason as `session/new`: awaiting an `mcp/message` reply in a
-                    // handler blocks the loop that has to route it.
-                    if !req.mcp_servers.is_empty() {
-                        let bridging = session.clone();
-                        let servers = req.mcp_servers.clone();
-                        cx.spawn(async move {
-                            bridging.apply_mcp_servers(&servers).await;
-                            Ok(())
-                        })?;
-                    }
-                    let config_options = session.config_options();
-                    let modes = session.session_mode_state();
+                    let (session, config_options, modes) = match bind_opened_session(
+                        session,
+                        additional_directories,
+                        &req.mcp_servers,
+                        &cx,
+                    ) {
+                        Ok(opened) => opened,
+                        Err(error) => return responder.respond_with_error(error),
+                    };
                     // ACP v1 `loadSession` requires the agent to replay the whole conversation
                     // before answering: the client has no state for this session, so it renders
                     // exactly the `session/update`s that arrive. Without this the IDE showed an
@@ -1740,23 +1692,15 @@ impl AcpCodingAgent {
                             a_resume.get_session(&sid).unwrap()
                         }
                     };
-                    let mut session = session;
-                    session.set_additional_directories(additional_directories);
-                    // 空闲会话也要能收到 `config_option_update`（同 `session/new`）。
-                    session.set_client(AcpClientHandle::new(cx.clone()));
-                    // Bridge MCP servers declared on resume (idempotent per server). Spawned
-                    // for the same reason as `session/new` (a handler must not await the
-                    // client's `mcp/message` reply).
-                    if !req.mcp_servers.is_empty() {
-                        let bridging = session.clone();
-                        let servers = req.mcp_servers.clone();
-                        cx.spawn(async move {
-                            bridging.apply_mcp_servers(&servers).await;
-                            Ok(())
-                        })?;
-                    }
-                    let config_options = session.config_options();
-                    let modes = session.session_mode_state();
+                    let (_, config_options, modes) = match bind_opened_session(
+                        session,
+                        additional_directories,
+                        &req.mcp_servers,
+                        &cx,
+                    ) {
+                        Ok(opened) => opened,
+                        Err(error) => return responder.respond_with_error(error),
+                    };
                     let response = ResumeSessionResponse::new()
                         .modes(modes)
                         .config_options(config_options);
@@ -1848,57 +1792,27 @@ impl AcpCodingAgent {
             )
             .on_receive_request(
                 async move |_req: ListProvidersRequest, responder, _cx| {
-                    let providers = if a_providers.manage_providers {
-                        // 读 `models.json` + 解析模型目录（catalog 8MB）是同步 I/O：
-                        // 放在阻塞线程池，否则这条连接的 JSON-RPC 分发会被卡住，
-                        // 后面的 `initialize` / `session/new` 只能排队。
-                        tokio::task::spawn_blocking(crate::providers_admin::list)
-                            .await
-                            .unwrap_or_default()
-                    } else {
-                        a_providers.providers.list()
-                    };
+                    let providers = crate::providers_admin::advertised(&a_providers).await;
                     responder.respond(ListProvidersResponse::new(providers))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
                 async move |req: SetProviderRequest, responder, _cx| {
-                    if a_providers_set.manage_providers {
-                        let id = req.provider_id.to_string();
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            crate::providers_admin::set(req)
-                                .map(|()| crate::providers_admin::choices())
-                        })
-                        .await;
-                        return match outcome {
-                            Ok(Ok(models)) => {
-                                a_providers_set.replace_models(models);
-                                responder.respond(SetProviderResponse::new())
-                            }
-                            Ok(Err(error)) => responder.respond_with_error(
+                    let id = req.provider_id.to_string();
+                    match crate::providers_admin::apply_set(&a_providers_set, req).await {
+                        Ok(()) => responder.respond(SetProviderResponse::new()),
+                        Err(crate::providers_admin::ProviderMutationError::Backend(error)) => {
+                            responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params().data(error),
+                            )
+                        }
+                        Err(crate::providers_admin::ProviderMutationError::Unknown) => {
+                            responder.respond_with_error(
                                 agent_client_protocol::Error::invalid_params()
-                                    .data(format!("provider '{id}': {error}")),
-                            ),
-                            Err(error) => responder.respond_with_error(
-                                agent_client_protocol::Error::invalid_params()
-                                    .data(format!("provider '{id}': {error}")),
-                            ),
-                        };
-                    }
-                    let ok = a_providers_set.providers.set(
-                        &req.provider_id.to_string(),
-                        req.api_type,
-                        req.base_url,
-                        req.headers.into_iter().collect(),
-                    );
-                    if ok {
-                        responder.respond(SetProviderResponse::new())
-                    } else {
-                        responder.respond_with_error(
-                            agent_client_protocol::Error::invalid_params()
-                                .data(format!("unknown provider '{}'", req.provider_id)),
-                        )
+                                    .data(format!("unknown provider '{id}'")),
+                            )
+                        }
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -1906,99 +1820,27 @@ impl AcpCodingAgent {
             .on_receive_request(
                 async move |req: DisableProviderRequest, responder, _cx| {
                     let id = req.provider_id.to_string();
-                    if a_providers_disable.manage_providers {
-                        let target = id.clone();
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            crate::providers_admin::disable(&target)
-                                .map(|()| crate::providers_admin::choices())
-                        })
-                        .await;
-                        return match outcome {
-                            Ok(Ok(models)) => {
-                                a_providers_disable.replace_models(models);
-                                responder.respond(DisableProviderResponse::new())
-                            }
-                            Ok(Err(error)) => responder.respond_with_error(
-                                agent_client_protocol::Error::invalid_params()
-                                    .data(format!("provider '{id}': {error}")),
-                            ),
-                            Err(error) => responder.respond_with_error(
-                                agent_client_protocol::Error::invalid_params()
-                                    .data(format!("provider '{id}': {error}")),
-                            ),
-                        };
-                    }
-                    let ok = a_providers_disable.providers.disable(&id);
-                    if ok {
-                        responder.respond(DisableProviderResponse::new())
-                    } else {
-                        responder.respond_with_error(
-                            agent_client_protocol::Error::invalid_params()
-                                .data(format!("provider '{id}' is unknown or required")),
-                        )
+                    match crate::providers_admin::apply_disable(&a_providers_disable, &id).await {
+                        Ok(()) => responder.respond(DisableProviderResponse::new()),
+                        Err(crate::providers_admin::ProviderMutationError::Backend(error)) => {
+                            responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params().data(error),
+                            )
+                        }
+                        Err(crate::providers_admin::ProviderMutationError::Unknown) => {
+                            responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params().data(format!(
+                                    "unknown provider '{id}' is unknown or required"
+                                )),
+                            )
+                        }
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
                 async move |req: crate::providers_admin::ProvidersExtRequest, responder, _cx| {
-                    if !a_providers_ext.manage_providers {
-                        return responder
-                            .respond_with_error(agent_client_protocol::Error::method_not_found());
-                    }
-                    let mut changed = false;
-                    let method = req.method_name().to_string();
-                    // 除网络探测外都是读盘/解析：同样丢给阻塞线程池。
-                    if method == crate::providers_admin::PROBE_METHOD {
-                        return responder.respond(crate::providers_admin::probe(req.params.clone()).await);
-                    }
-                    let params = req.params.clone();
-                    let outcome = tokio::task::spawn_blocking(move || {
-                        let value = match method.as_str() {
-                            crate::providers_admin::REMOVE_METHOD => {
-                                changed = true;
-                                params
-                                    .provider_id
-                                    .as_deref()
-                                    .ok_or_else(|| "providerId is required".to_string())
-                                    .and_then(crate::providers_admin::remove)
-                                    .map(|()| serde_json::json!({}))
-                            }
-                            crate::providers_admin::DEFAULT_METHOD => {
-                                changed = true;
-                                params
-                                    .provider_id
-                                    .as_deref()
-                                    .ok_or_else(|| "providerId is required".to_string())
-                                    .and_then(|id| {
-                                        crate::providers_admin::set_default(id, params.model.as_deref())
-                                    })
-                                    .map(|()| serde_json::json!({}))
-                            }
-                            crate::providers_admin::CATALOG_METHOD => Ok(serde_json::json!({
-                                "providers": crate::providers_admin::catalog(params.provider_id.as_deref())
-                            })),
-                            other => Err(format!("unhandled provider extension '{other}'")),
-                        }?;
-                        let models = changed.then(crate::providers_admin::choices);
-                        Ok::<_, String>((value, models))
-                    })
-                    .await;
-                    match outcome {
-                        Ok(Ok((value, models))) => {
-                            if let Some(models) = models {
-                                a_providers_ext.replace_models(models);
-                            }
-                            responder.respond(value)
-                        }
-                        Ok(Err(error)) => responder.respond_with_error(
-                            agent_client_protocol::Error::invalid_params().data(error),
-                        ),
-                        Err(error) => responder.respond_with_error(
-                            agent_client_protocol::Error::invalid_params()
-                                .data(error.to_string()),
-                        ),
-                    }
+                    handle_providers_ext(a_providers_ext.clone(), req, responder).await
                 },
                 agent_client_protocol::on_receive_request!(),
             ),
@@ -2343,6 +2185,43 @@ async fn handle_ext_resume(
         }
     })?;
     Ok(())
+}
+
+/// Shared tail of `session/new`, `session/load` and `session/resume`.
+///
+/// All three finish the same way once their session value exists: adopt the extra workspace
+/// directories, bind the live client, bridge the declared MCP servers off the handler task,
+/// and snapshot the config options / modes the response carries. Only session creation and
+/// (for `load`) the transcript replay differ.
+fn bind_opened_session(
+    mut session: AcpAgentSession,
+    additional_directories: Vec<std::path::PathBuf>,
+    mcp_servers: &[agent_client_protocol::v1::schema::McpServer],
+    cx: &agent_client_protocol::v1::ConnectionTo<agent_client_protocol::Client>,
+) -> agent_client_protocol::Result<(
+    AcpAgentSession,
+    Vec<agent_client_protocol::v1::schema::SessionConfigOption>,
+    agent_client_protocol::v1::schema::SessionModeState,
+)> {
+    session.set_additional_directories(additional_directories);
+    // 建会话时就绑上连接：会话空闲（没跑 prompt）时也要能收到
+    // `config_option_update`（供应商增删改后刷新模型下拉）。
+    session.set_client(AcpClientHandle::new(cx.clone()));
+    // Bridge the client's MCP servers on a spawned task: an ACP server's `tools/list` is an
+    // `mcp/message` request whose reply can only be routed by the dispatch loop that is running
+    // this handler. Awaiting it here deadlocks that loop until `MCP_CONNECT_TIMEOUT` (60s per
+    // server), so the request stalls and the tools never reach the toolkit.
+    if !mcp_servers.is_empty() {
+        let bridging = session.clone();
+        let servers = mcp_servers.to_vec();
+        cx.spawn(async move {
+            bridging.apply_mcp_servers(&servers).await;
+            Ok(())
+        })?;
+    }
+    let config_options = session.config_options();
+    let modes = session.session_mode_state();
+    Ok((session, config_options, modes))
 }
 
 /// Answers one `_acp_extends/providers/*` request.

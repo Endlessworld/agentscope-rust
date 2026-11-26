@@ -4,12 +4,15 @@
 //! The tests assert the two properties that make the shortcut worth having: it compacts
 //! immediately (no turn admission, no client-visible turn), and the only model call it pays
 //! is the summarization itself.
+mod common;
+
+use common::prompt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::v1::schema::{
     ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities, CompactionStatus,
-    ContentBlock, SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
+    ContentBlock, SessionId, SessionNotification, SessionUpdate, StopReason,
 };
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
@@ -42,17 +45,6 @@ impl Model for CountingModel {
     }
 }
 
-fn scratch_dir(tag: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir =
-        std::env::temp_dir().join(format!("acp-compact-{tag}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create the scratch directory");
-    dir
-}
-
 /// Builds a session over an agent whose history already has `turns` messages.
 fn build_session(
     tag: &str,
@@ -60,7 +52,7 @@ fn build_session(
     turns: usize,
     compaction: bool,
 ) -> AcpAgentSession {
-    let dir = scratch_dir(tag);
+    let dir = common::unique_scratch_dir("acp-compact", tag);
     let mut builder = HarnessAgent::builder()
         .name("acp-compact")
         .model(model)
@@ -92,10 +84,6 @@ fn build_session(
         Vec::new(),
         Vec::new(),
     )
-}
-
-fn prompt(text: &str) -> Vec<ContentBlock> {
-    vec![ContentBlock::Text(TextContent::new(text.to_string()))]
 }
 
 /// Advertises `session.compaction`, the capability that gates the compaction updates.

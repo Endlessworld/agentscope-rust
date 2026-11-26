@@ -16,6 +16,8 @@
 //!
 //! Set `ACP_AGENT_EXE` to point at a specific `acp_harness_agent` build.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -82,16 +84,6 @@ fn agent_exe() -> PathBuf {
 }
 
 /// Creates a unique scratch directory under the system temp dir.
-fn scratch_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("{tag}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
-}
-
 /// A scripted OpenAI-compatible endpoint: every `POST /chat/completions` is
 /// answered with the same short SSE stream (one reasoning delta, one content
 /// delta, one terminal chunk).
@@ -211,8 +203,8 @@ async fn stdio_agent_streams_thinking_to_client() {
     let llm = ScriptedLlm::start();
     // Isolates the child from the developer's `~/.agentscope/models.json`,
     // `~/.agents/skills`, and keeps journal/log files out of the repo.
-    let home = scratch_dir("acp-stdio-thought-home");
-    let work = scratch_dir("acp-stdio-thought-work");
+    let home = common::unique_scratch_dir("", "acp-stdio-thought-home");
+    let work = common::unique_scratch_dir("", "acp-stdio-thought-work");
 
     let config = AcpAgentConfig::new(agent_exe())
         // A provider that is *not* in models.json exercises the env fallback,

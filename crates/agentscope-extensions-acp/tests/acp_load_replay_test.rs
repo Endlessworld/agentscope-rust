@@ -9,6 +9,8 @@
 //! The test drives the real `AcpCodingAgent` over an in-process channel with a scripted model
 //! (no provider, no network): it runs one prompt, then loads the same session and asserts the
 //! replayed chunks are the user message followed by the agent's answer.
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,19 +53,6 @@ impl Model for AnsweringModel {
     }
 }
 
-fn scratch_dir(tag: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "acp-load-replay-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("create the scratch directory");
-    dir
-}
-
 /// Flattens a chunk's content into text (the replay only carries text blocks).
 fn text_of(content: &ContentBlock) -> Option<String> {
     match content {
@@ -74,7 +63,7 @@ fn text_of(content: &ContentBlock) -> Option<String> {
 
 #[tokio::test]
 async fn session_load_replays_the_conversation_as_chunks() {
-    let work = scratch_dir("work");
+    let work = common::unique_scratch_dir("acp-load-replay", "work");
     let (agent_channel, client_channel) = Channel::duplex();
 
     let agent = AcpCodingAgent::builder()

@@ -2,10 +2,13 @@
 //!
 //! The pause is durable state (`Paused`), not a client-side flag: the turn never becomes
 //! terminal, so resuming continues it in place instead of replaying the prompt.
+mod common;
+
+use common::prompt;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::v1::schema::{
-    ContentBlock, SessionId, SessionNotification, StopReason, TextContent,
+    SessionId, SessionNotification, StopReason,
 };
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
 use agentscope_core::model::{ChatResponse, GenerateOptions, Model, ToolSchema};
@@ -42,9 +45,7 @@ impl Model for RecordingModel {
 }
 
 fn build_session(tag: &str, seen: Arc<Mutex<Vec<Vec<String>>>>) -> AcpAgentSession {
-    let dir = std::env::temp_dir().join(format!("acp-pause-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create the scratch directory");
+    let dir = common::scratch_dir("acp-pause", tag);
     let agent = HarnessAgent::builder()
         .name("acp-pause-test")
         .model(Arc::new(RecordingModel { seen }))
@@ -61,10 +62,6 @@ fn build_session(tag: &str, seen: Arc<Mutex<Vec<Vec<String>>>>) -> AcpAgentSessi
         Vec::new(),
         Vec::new(),
     )
-}
-
-fn prompt(text: &str) -> Vec<ContentBlock> {
-    vec![ContentBlock::Text(TextContent::new(text.to_string()))]
 }
 
 /// Answers after a pause, so the test has a running turn to pause.
@@ -92,9 +89,7 @@ impl Model for SlowModel {
 }
 
 fn build_slow_session(tag: &str) -> AcpAgentSession {
-    let dir = std::env::temp_dir().join(format!("acp-pause-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create the scratch directory");
+    let dir = common::scratch_dir("acp-pause", tag);
     let agent = HarnessAgent::builder()
         .name("acp-pause-test")
         .model(Arc::new(SlowModel))
