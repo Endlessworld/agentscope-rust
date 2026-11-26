@@ -757,12 +757,16 @@ pub(crate) fn handlers(agent: Arc<AcpCodingAgent>) -> DynConnectTo<Client> {
                     let headers: std::collections::HashMap<String, String> =
                         req.headers.into_iter().collect();
                     if a_providers_set.manage_providers {
+                        // `_meta` carries everything the standard v1 shape lacks: the model
+                        // table (`models`), the enabled/disabled flag and the display label.
+                        // Dropping it here made `providers/set` a no-op for those updates.
                         let request = v1::SetProviderRequest::new(
                             req.provider_id.to_string(),
                             convert::protocol_to_v1(req.api_type),
                             req.base_url.clone(),
                         )
-                        .headers(headers.into_iter().collect());
+                        .headers(headers.into_iter().collect())
+                        .meta(req.meta);
                         let outcome = tokio::task::spawn_blocking(move || {
                             crate::providers_admin::set(request)
                                 .map(|()| crate::providers_admin::choices())
