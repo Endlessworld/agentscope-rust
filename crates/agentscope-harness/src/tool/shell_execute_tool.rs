@@ -1,4 +1,5 @@
 //! Shell execution tool backed by a `SandboxFilesystem`, mirroring `ShellExecuteTool`.
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use agentscope_core::agent::RuntimeContext;
@@ -78,6 +79,11 @@ pub(crate) fn format_execute_output(
     cancelled: bool,
     compact: &CompactConfig,
 ) -> ToolResultBlock {
+    // A command can print a binary file (`cat logo.png`, `head -c 200 /dev/zero`), and
+    // `String::from_utf8_lossy` keeps the NUL bytes because they are valid UTF-8. The durable
+    // record format refuses `U+0000` (PostgreSQL `jsonb` cannot store it), so a single such byte
+    // refuses the whole session commit and fails the run. The tool result is where it stops.
+    let output = without_nul(output);
     // A client-cancelled command is not a process result: saying "cancelled" keeps the model
     // (and the UI) from reading the kill signal as a failure it should retry.
     let mut text = if cancelled {
@@ -91,7 +97,7 @@ pub(crate) fn format_execute_output(
     let mut metadata = JsonMap::new();
     if !output.trim().is_empty() {
         text.push('\n');
-        let report = compact_grep_like(output, compact);
+        let report = compact_grep_like(&output, compact);
         if report.compacted {
             tracing::debug!(
                 saved_chars = report.saved_chars,
@@ -123,6 +129,19 @@ pub(crate) fn format_execute_output(
     // attribute map.
     block.metadata.extend(metadata);
     block
+}
+
+/// Replaces NUL bytes with `U+FFFD`.
+///
+/// Only the model-facing text is rewritten; the store's refusal of `U+0000` stays as it is (a
+/// durable record must never be silently rewritten). Borrowed when the output has no NUL, so
+/// the common case costs nothing.
+fn without_nul(text: &str) -> Cow<'_, str> {
+    if text.contains('\0') {
+        Cow::Owned(text.replace('\0', "\u{FFFD}"))
+    } else {
+        Cow::Borrowed(text)
+    }
 }
 
 /// Default command timeout in seconds, mirroring Java `ShellExecuteTool`.
@@ -318,6 +337,31 @@ mod tests {
             ));
         }
         out.trim_end().to_string()
+    }
+
+    #[test]
+    fn nul_bytes_in_output_are_replaced() {
+        // `cat` on a binary file yields NUL inside otherwise valid UTF-8, which
+        // `String::from_utf8_lossy` keeps; the durable session record cannot store `U+0000`, so
+        // the tool result must not carry it.
+        let block = format_execute_output(
+            0,
+            "before\u{0}after\n",
+            false,
+            false,
+            false,
+            &CompactConfig::default(),
+        );
+        let text = block
+            .output
+            .iter()
+            .filter_map(|b| match b {
+                agentscope_core::message::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(!text.contains('\u{0}'), "{text:?}");
+        assert!(text.contains("before\u{FFFD}after"), "{text:?}");
     }
 
     #[test]
