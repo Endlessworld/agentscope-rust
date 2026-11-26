@@ -157,10 +157,18 @@ impl Middleware for InboxMiddleware {
                     Vec::new()
                 }
             };
-            let mut hints: Vec<HintBlock> = Vec::new();
+            // `persist: false` marks a one-shot notification whose durable counterpart is
+            // delivered through another channel (the subagent task result): injecting it into
+            // `state.context` would replay the same completion note on every later request.
+            let mut hints: Vec<(HintBlock, bool)> = Vec::new();
             for entry in entries {
                 if let Some(h) = deserialize_hint_block(&entry.payload) {
-                    hints.push(h);
+                    let persist = entry
+                        .payload
+                        .get("persist")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    hints.push((h, persist));
                 }
             }
 
@@ -178,7 +186,7 @@ impl Middleware for InboxMiddleware {
                                     "failed to mark a stale async tool record as timed out"
                                 );
                             }
-                            hints.push(
+                            hints.push((
                                 HintBlock::builder()
                                     // Stable per record: the context deduplicates by hint id, so
                                     // a random id re-announced the same record on every step
@@ -195,7 +203,8 @@ impl Middleware for InboxMiddleware {
                                     ))
                                     .source("system")
                                     .build(),
-                            );
+                                true,
+                            ));
                         }
                     }
                     Err(e) => tracing::warn!(
@@ -241,7 +250,7 @@ impl Middleware for InboxMiddleware {
                         })
                         .collect()
                 };
-                hints.retain(|hint| {
+                hints.retain(|(hint, _)| {
                     hint.id
                         .as_ref()
                         .map(|id| !delivered.contains(id))
@@ -256,7 +265,7 @@ impl Middleware for InboxMiddleware {
             // Emit a HintBlock event for each hint.
             let mut events: Vec<agentscope_core::error::Result<AgentEvent>> =
                 Vec::with_capacity(hints.len());
-            for h in &hints {
+            for (h, _) in &hints {
                 let mut fields = JsonMap::new();
                 if let Some(id) = &h.id {
                     fields.insert("id".to_string(), Value::String(id.clone()));
@@ -277,9 +286,9 @@ impl Middleware for InboxMiddleware {
             // sentence and structured metadata, mirroring Java `injectHintsToContext`.
             // Batching them into one assistant message (the previous behaviour) made the
             // model read background events as its own prior output.
-            let notifications: Vec<Msg> = hints
+            let notifications: Vec<(Msg, bool)> = hints
                 .iter()
-                .map(|h| {
+                .map(|(h, persist)| {
                     let source = h
                         .source
                         .as_deref()
@@ -306,26 +315,35 @@ impl Middleware for InboxMiddleware {
                     if let Some(id) = &h.id {
                         metadata.insert(METADATA_HINT_ID.to_string(), Value::String(id.clone()));
                     }
-                    Msg::builder()
+                    let message = Msg::builder()
                         .role(MsgRole::User)
                         .name(agent_name.clone())
                         .content(blocks)
                         .metadata(metadata)
-                        .build()
+                        .build();
+                    (message, *persist)
                 })
                 .collect();
 
-            // The hints must also reach the accumulated context so they survive into
-            // later turns; Java writes them to `AgentState.context`.
+            // Persistent hints also reach the accumulated context so they survive into later
+            // turns; Java writes them to `AgentState.context`. One-shot notifications stay in
+            // this request only: their result arrives through the delivery channel.
+            let persistent: Vec<Msg> = notifications
+                .iter()
+                .filter(|(_, persist)| *persist)
+                .map(|(message, _)| message.clone())
+                .collect();
             if let Some(state) = state {
                 // Scoped so the std::sync::Mutex guard is never held across an await.
                 let mut guard = match state.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                guard.context_mut().extend(notifications.iter().cloned());
+                guard.context_mut().extend(persistent);
             }
-            input.messages.extend(notifications);
+            input
+                .messages
+                .extend(notifications.into_iter().map(|(message, _)| message));
 
             let chain = futures::stream::iter(events).chain(next(input));
             Box::pin(chain)
@@ -517,6 +535,77 @@ mod tests {
         // The successful status flip keeps the record from being reported again.
         let records = registry.list_session("sess-1").await.expect("records");
         assert_eq!(records[0].status, AsyncToolRecord::TIMEOUT);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn one_shot_hints_are_injected_once_without_entering_the_context() {
+        // Subagent completion hints are pointers: the actual result is delivered by
+        // `SubagentsMiddleware`. Persisting the pointer made every completion leave a
+        // "delivered next step" note in the context that was replayed forever.
+        let dir = temp_dir("transient_hint").await;
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+        let bus: Arc<dyn MessageBus> = Arc::new(WorkspaceMessageBus::new(fs, "/bus"));
+        bus.inbox_push(
+            "sess-1",
+            serde_json::json!({
+                "type": "hint",
+                "id": "one-shot-1",
+                "hint": "task completed",
+                "source": "subagent_task",
+                "persist": false,
+            }),
+        )
+        .await
+        .expect("push");
+        let state = Arc::new(std::sync::Mutex::new(AgentState::builder().build()));
+        let mut ctx = RuntimeContext::default().with_session_id("sess-1");
+        ctx.state = Some(Arc::clone(&state));
+
+        let (events, msgs, invoked) = run(&InboxMiddleware::new(bus), &ctx).await;
+        assert!(invoked);
+        assert_eq!(hint_events(&events), 1);
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].text_content().contains("task completed"));
+        assert!(
+            state.lock().unwrap().context().is_empty(),
+            "a one-shot hint must not be replayed on later steps"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn default_hints_still_enter_the_context() {
+        let dir = temp_dir("persistent_hint").await;
+        let fs: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::sandboxed(&dir));
+        let bus: Arc<dyn MessageBus> = Arc::new(WorkspaceMessageBus::new(fs, "/bus"));
+        bus.inbox_push(
+            "sess-1",
+            serde_json::json!({
+                "type": "hint",
+                "id": "persistent-1",
+                "hint": "background tool result",
+                "source": "tool_output",
+            }),
+        )
+        .await
+        .expect("push");
+        let state = Arc::new(std::sync::Mutex::new(AgentState::builder().build()));
+        let mut ctx = RuntimeContext::default().with_session_id("sess-1");
+        ctx.state = Some(Arc::clone(&state));
+
+        let (events, msgs, invoked) = run(&InboxMiddleware::new(bus), &ctx).await;
+        assert!(invoked);
+        assert_eq!(hint_events(&events), 1);
+        assert_eq!(msgs.len(), 1);
+        let seen = state.lock().unwrap();
+        assert_eq!(seen.context().len(), 1);
+        assert_eq!(
+            seen.context()[0].text_content(),
+            msgs[0].text_content(),
+            "a persistent hint must be replayed verbatim"
+        );
+        drop(seen);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 

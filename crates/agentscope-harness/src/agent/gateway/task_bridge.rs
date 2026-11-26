@@ -132,6 +132,12 @@ impl TaskCompletionBridge {
                         "id": new_hex(),
                         "hint": hint,
                         "source": "subagent_task",
+                        // The full result is delivered by `SubagentsMiddleware` on the next
+                        // reasoning step and the undelivered task record is what survives a
+                        // restart. Persisting this pointer in the conversation made every
+                        // completed task leave a forever-replayed "delivered next step" note
+                        // in the context, so it is a one-shot notification.
+                        "persist": false,
                     });
                     if let Err(e) = bus.inbox_push(&session_id, payload).await {
                         tracing::warn!(task = %task_id, %e, "task completion hint was not pushed");
@@ -340,6 +346,11 @@ mod tests {
         assert!(
             !completed.contains("result text"),
             "the hint must not duplicate the result body: {completed}"
+        );
+        assert_eq!(
+            entries[0].payload["persist"],
+            serde_json::json!(false),
+            "the completion pointer must not be replayed from the context"
         );
 
         let failed = entries[1].payload["hint"].as_str().unwrap();
