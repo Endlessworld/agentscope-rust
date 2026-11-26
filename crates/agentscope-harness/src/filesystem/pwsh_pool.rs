@@ -275,13 +275,22 @@ async fn spawn_warm() -> Result<WarmPwsh, String> {
 ///
 /// The status assignment is appended to the *user command* (before `Invoke-Expression` runs
 /// it): `$?` read after `Invoke-Expression` itself would describe that call, not the failed
-/// native command inside it. The explicit `exit 0/1` reproduces the cold path's exit code,
-/// including the `cmd /c exit 7` → 1 normalization; an explicit `exit N`/`throw` inside the
-/// user command exits before the wrapper's exit. Completion is signalled by process exit/EOF.
+/// native command inside it. The explicit `[Environment]::Exit(0/1)` reproduces the cold path's
+/// exit code, including the `cmd /c exit 7` → 1 normalization; an explicit `exit N`/`throw`
+/// inside the user command exits before the wrapper's exit. Output is flushed first, then
+/// `Environment.Exit` skips PowerShell's comparatively slow shutdown. Completion is signalled
+/// by process exit/EOF.
 fn build_warm_bootstrap() -> Vec<String> {
     let script = format!(
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n\
          $OutputEncoding = [System.Text.Encoding]::UTF8\n\
+         # The first cmdlet and the first Invoke-Expression in a fresh pwsh each pay a one-time\n\
+         # engine/JIT cost (~80ms + ~12ms measured on Windows). Left until the real command,\n\
+         # that made a fully warmed `echo` still take ~140ms. Prime both before announcing\n\
+         # readiness so the per-command cost is just the command itself.\n\
+         Set-Location -LiteralPath '.'\n\
+         Invoke-Expression '$null = 1'\n\
+         Write-Output $null\n\
          [Console]::Out.WriteLine('{READY_MARKER}')\n\
          [Console]::Out.Flush()\n\
          $__as_cwd = [Console]::In.ReadLine()\n\
@@ -293,7 +302,9 @@ fn build_warm_bootstrap() -> Vec<String> {
            $__as_ok = $true\n\
            $__as_wrapped = $__as_cmd + [Environment]::NewLine + '$__as_ok = $?'\n\
            Invoke-Expression $__as_wrapped\n\
-           if ($__as_ok) {{ exit 0 }} else {{ exit 1 }}\n\
+           [Console]::Out.Flush()\n\
+           [Console]::Error.Flush()\n\
+           if ($__as_ok) {{ [Environment]::Exit(0) }} else {{ [Environment]::Exit(1) }}\n\
          }}\n"
     );
     let utf16: Vec<u16> = script.encode_utf16().collect();
@@ -330,5 +341,16 @@ mod tests {
         assert!(script.contains(READY_MARKER));
         assert!(script.contains("Invoke-Expression $__as_wrapped"));
         assert!(script.contains("$__as_ok = $?"));
+        // The one-time pipeline/JIT priming must finish before the process is advertised as
+        // ready; otherwise the first real command still pays ~90ms.
+        let ready = script.find(READY_MARKER).expect("ready marker");
+        let set_location = script
+            .find("Set-Location -LiteralPath '.'")
+            .expect("priming Set-Location");
+        let invoke = script
+            .find("Invoke-Expression '$null = 1'")
+            .expect("priming Invoke-Expression");
+        assert!(set_location < ready);
+        assert!(invoke < ready);
     }
 }

@@ -169,6 +169,142 @@ async fn exit_codes_are_propagated_and_an_abnormal_exit_does_not_poison_the_next
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Wall-clock latency probe, not a contract assertion.
+///
+/// Run explicitly:
+/// `cargo test -p agentscope-harness --test shell_execute_contract_test latency_probe -- --ignored --nocapture --test-threads=1`
+///
+/// The sandbox rows isolate `execute` itself. The toolkit row adds the real
+/// `ShellExecuteTool` call path (arg parsing, output compaction, metadata). Every sample waits
+/// for a warm replacement first, so only the warm-command cost is measured, matching a session
+/// where commands are spaced far enough apart for the pool to refill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "latency probe; run explicitly with --ignored --nocapture"]
+async fn latency_probe() {
+    let root = temp_root("latency_probe");
+    let registry = ProcessRegistry::new();
+    registry.set_events(Some(Arc::new(EventRecorder::default())));
+    let pool = Arc::new(PwshProcessPool::new(5));
+    let inner = LocalFilesystem::sandboxed(&root);
+    let sandbox = Arc::new(
+        SandboxBackedFilesystem::new(Arc::new(inner), &root)
+            .with_processes(Arc::clone(&registry))
+            .with_pwsh_pool(Arc::clone(&pool)),
+    );
+    wait_until_warm(&pool, 5).await;
+    println!(
+        "pool after warmup: ready={} warming={}",
+        pool.ready_count(),
+        pool.warming_count()
+    );
+
+    let base_ctx = ctx();
+    let mut sandbox_samples = Vec::new();
+    for _ in 0..20 {
+        wait_until_warm(&pool, 1).await;
+        let started = Instant::now();
+        let result = sandbox
+            .execute(&base_ctx, "echo 3", 30)
+            .await
+            .expect("warm command runs");
+        sandbox_samples.push(started.elapsed());
+        assert!(result.is_success(), "{result:?}");
+    }
+    report("sandbox warm (no tool id)", &sandbox_samples);
+
+    let mut ctx_with_id = ctx();
+    ctx_with_id.set_extension(TOOL_CALL_ID_CONTEXT_KEY, "latency-direct".to_string());
+    let mut sandbox_with_events = Vec::new();
+    for _ in 0..20 {
+        wait_until_warm(&pool, 1).await;
+        let started = Instant::now();
+        let result = sandbox
+            .execute(&ctx_with_id, "echo 3", 30)
+            .await
+            .expect("warm command runs");
+        sandbox_with_events.push(started.elapsed());
+        assert!(result.is_success(), "{result:?}");
+    }
+    report("sandbox warm (registry events)", &sandbox_with_events);
+
+    let toolkit = agentscope_core::tool::Toolkit::new();
+    toolkit.register_tool(Arc::new(ShellExecuteTool::new(
+        Arc::clone(&sandbox) as Arc<dyn SandboxFilesystem>
+    )));
+    let call = ToolUseBlock::new(
+        "latency-tool",
+        "execute",
+        tool_args(serde_json::json!({"command": "echo 3"})),
+    );
+    let mut tool_samples = Vec::new();
+    for _ in 0..20 {
+        wait_until_warm(&pool, 1).await;
+        let started = Instant::now();
+        let result = toolkit
+            .call_tool(
+                &call,
+                ToolExecutionContext {
+                    tool_call: Some(call.clone()),
+                    runtime: serde_json::Map::new(),
+                    emitter: None,
+                    tool_request_config: None,
+                    processes: None,
+                },
+            )
+            .await
+            .expect("tool call runs");
+        tool_samples.push(started.elapsed());
+        assert!(result.text_content().contains("Exit code: 0"), "{result:?}");
+    }
+    report("toolkit call warm", &tool_samples);
+
+    // Back-to-back calls: a 5-deep pool covers the first five, then every call must wait for a
+    // replacement or fall back to a cold spawn. This is the "rapid echo" case.
+    let mut burst = Vec::new();
+    for _ in 0..8 {
+        let started = Instant::now();
+        let result = sandbox
+            .execute(&ctx_with_id, "echo 3", 30)
+            .await
+            .expect("burst command runs");
+        burst.push(started.elapsed());
+        assert!(result.is_success(), "{result:?}");
+    }
+    report("sandbox back-to-back burst", &burst);
+
+    let cold_sandbox = sandbox_at(&root);
+    let mut cold = Vec::new();
+    for _ in 0..3 {
+        let started = Instant::now();
+        let result = cold_sandbox
+            .execute(&base_ctx, "echo 3", 30)
+            .await
+            .expect("cold command runs");
+        cold.push(started.elapsed());
+        assert!(result.is_success(), "{result:?}");
+    }
+    report("sandbox cold", &cold);
+
+    pool.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn report(label: &str, samples: &[Duration]) {
+    let mut ms: Vec<f64> = samples.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+    ms.sort_by(f64::total_cmp);
+    let p = |q: f64| ms[((ms.len() as f64 - 1.0) * q).round() as usize];
+    let avg = ms.iter().sum::<f64>() / ms.len() as f64;
+    println!(
+        "{label}: n={} min={:.1}ms p50={:.1}ms p95={:.1}ms max={:.1}ms avg={:.1}ms",
+        ms.len(),
+        ms[0],
+        p(0.5),
+        p(0.95),
+        ms[ms.len() - 1],
+        avg
+    );
+}
+
 #[tokio::test]
 async fn native_failures_keep_the_same_exit_code_on_the_cold_and_warm_paths() {
     let root = temp_root("exit_parity");
