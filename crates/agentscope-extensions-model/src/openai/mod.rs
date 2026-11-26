@@ -1572,6 +1572,47 @@ struct ToolCallFragment {
     thought_signature: Option<String>,
 }
 
+impl ToolCallFragment {
+    /// Keeps the first non-empty call id. A provider that repeats the id on
+    /// every fragment must not have it overwritten by a later blank one, and a
+    /// stray different id is not a reason to lose the call's identity.
+    fn merge_id(&mut self, id: &str) {
+        if self.id.is_empty() && !id.trim().is_empty() {
+            self.id = id.to_string();
+        }
+    }
+
+    /// Merges one streamed name fragment.
+    ///
+    /// Providers send the name once, but some gateways repeat a cumulative
+    /// snapshot on every fragment and others split the name itself (`get_`,
+    /// `weather`). A blank fragment after the name — seen on gateways that emit
+    /// `"name": ""` on argument continuations — must not erase it (#1237).
+    fn merge_name(&mut self, name: &str) {
+        if name.trim().is_empty() {
+            return;
+        }
+        if self.name.is_empty() {
+            self.name = name.to_string();
+        } else if self.name == name {
+            // Repeated full name.
+        } else if name.starts_with(&self.name) {
+            // Cumulative snapshot: the new fragment carries the prefix plus more.
+            self.name = name.to_string();
+        } else if self.name.starts_with(name) {
+            // A shorter/older snapshot of a name we already have in full.
+        } else if self.arguments.is_empty() {
+            // The provider streams the name itself in pieces.
+            self.name.push_str(name);
+        }
+    }
+}
+
+/// Borrows a non-blank field, treating whitespace-only values as absent.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 /// A single SSE chunk from an OpenAI-compatible streaming response, decoded with
 /// an extra `reasoning_content` field so thinking deltas (e.g. DeepSeek/O1) can
 /// be surfaced incrementally. Serde ignores any other unknown fields.
@@ -1764,28 +1805,66 @@ struct StreamIncrementer {
 impl StreamIncrementer {
     /// Resolves the accumulation slot of one streamed fragment.
     ///
-    /// With an explicit `index` the slot is the provider's. Without one, a
-    /// fragment that *opens* a call (it carries a name or an id) gets a fresh
-    /// slot, while a continuation (arguments only) extends the call already being
-    /// streamed — the same "merge into the owning call" contract the DashScope and
+    /// With an explicit `index` the slot is the provider's. Without one, the
+    /// fragment is merged into the call currently being streamed when it can
+    /// still complete it — an id-only fragment after a name, a name-only
+    /// fragment after an id, arguments, or a repeated/cumulative name. Only a
+    /// fragment that cannot belong to the current call (a different id, or a
+    /// different name on a call that already has both) opens a new slot. This is
+    /// the same "merge into the owning call" contract the DashScope and
     /// Anthropic accumulators implement.
     fn tool_call_slot(&mut self, chunk: &OpenAiToolCallChunk) -> u32 {
         if let Some(index) = chunk.index {
             self.last_tool_index = Some(index);
             return index;
         }
-        let opens_a_call = chunk
-            .id
-            .as_deref()
-            .map(|id| !id.trim().is_empty())
-            .unwrap_or(false)
-            || chunk
+        let id = non_empty(chunk.id.as_deref());
+        let name = non_empty(
+            chunk
                 .function
                 .as_ref()
-                .and_then(|function| function.name.as_deref())
-                .map(|name| !name.trim().is_empty())
-                .unwrap_or(false);
-        if opens_a_call {
+                .and_then(|function| function.name.as_deref()),
+        );
+        // A repeated id identifies its call even when fragments arrive out of
+        // order and the provider never sends an index.
+        if let Some(id) = id {
+            if let Some(slot) = self
+                .tool_calls
+                .iter()
+                .find_map(|(slot, fragment)| (fragment.id == id).then_some(*slot))
+            {
+                self.last_tool_index = Some(slot);
+                return slot;
+            }
+        }
+        // Merge into the call being streamed when this fragment can complete it.
+        // The checks are deliberately asymmetric: a name-less continuation must
+        // not take a *different* id (that is a new call), while a late name may
+        // still land on a call that already streamed its id and arguments.
+        if let Some(last) = self.last_tool_index {
+            if let Some(fragment) = self.tool_calls.get(&last) {
+                let merge = match (id, name) {
+                    // The matching-id case returned above, so an id here is new.
+                    (Some(_), Some(name)) => {
+                        fragment.id.is_empty()
+                            && (fragment.name.is_empty() || fragment.name == name)
+                    }
+                    (Some(_), None) => fragment.id.is_empty(),
+                    (None, Some(name)) => {
+                        // A fragment that still has no arguments cannot be the
+                        // continuation of a different, already-started call.
+                        fragment.name.is_empty()
+                            || fragment.name == name
+                            || fragment.arguments.is_empty()
+                    }
+                    (None, None) => true,
+                };
+                if merge {
+                    return last;
+                }
+            }
+        }
+        if id.is_some() || name.is_some() {
             let next = self
                 .tool_calls
                 .keys()
@@ -1830,11 +1909,11 @@ impl StreamIncrementer {
                     let slot = self.tool_call_slot(tc);
                     let frag = self.tool_calls.entry(slot).or_default();
                     if let Some(id) = &tc.id {
-                        frag.id = id.clone();
+                        frag.merge_id(id);
                     }
                     if let Some(function) = &tc.function {
                         if let Some(name) = &function.name {
-                            frag.name = name.clone();
+                            frag.merge_name(name);
                         }
                         if let Some(args) = &function.arguments {
                             frag.arguments.push_str(args);
@@ -2804,6 +2883,150 @@ mod tests {
         };
         assert_eq!(second.name, "second");
         assert_eq!(second.input.get("b").and_then(|v| v.as_i64()), Some(2));
+    }
+
+    #[test]
+    fn a_later_blank_name_fragment_does_not_erase_the_streamed_name() {
+        // Some gateways send `"name": ""` on every argument continuation
+        // instead of omitting the field. Replacing the accumulated name with
+        // that blank fragment turned a valid call into the #1237 failure.
+        let chunk = |value: serde_json::Value| -> OpenAiStreamChunk {
+            serde_json::from_value(value).expect("valid chunk")
+        };
+        let mut inc = StreamIncrementer::default();
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "r-empty-name",
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "function": {"name": "task_output", "arguments": ""}
+            }]}}]
+        })));
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "r-empty-name",
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "function": {"name": "", "arguments": "{\"a\":1}"}
+            }]}}]
+        })));
+
+        let final_resp = inc
+            .into_final()
+            .expect("tool call flushed")
+            .expect("the blank name must not fail the call");
+        let tool = match &final_resp.content[0] {
+            ContentBlock::ToolUse(tool) => tool,
+            other => panic!("expected ToolUse, got {other:?}"),
+        };
+        assert_eq!(tool.id, "call_1");
+        assert_eq!(tool.name, "task_output");
+        assert_eq!(tool.input.get("a").and_then(|v| v.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn a_late_name_fragment_joins_its_index_less_call() {
+        // Native DeepSeek streams id → arguments → name? at least some gateways
+        // split the opening fragment in ways that put the name after the id and
+        // arguments. Without an index, the old "name opens a new slot" rule
+        // stranded the id + arguments in a nameless call.
+        let chunk = |value: serde_json::Value| -> OpenAiStreamChunk {
+            serde_json::from_value(value).expect("valid chunk")
+        };
+        let mut inc = StreamIncrementer::default();
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "r-late-name",
+            "choices": [{"delta": {"tool_calls": [{
+                "id": "call_1",
+                "function": {"arguments": "{\"task_id\":"}
+            }]}}]
+        })));
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "r-late-name",
+            "choices": [{"delta": {"tool_calls": [{
+                "function": {"name": "task_output", "arguments": "\"spawn-56\"}"}
+            }]}}]
+        })));
+
+        let final_resp = inc
+            .into_final()
+            .expect("tool call flushed")
+            .expect("ok response");
+        assert_eq!(final_resp.content.len(), 1);
+        let tool = match &final_resp.content[0] {
+            ContentBlock::ToolUse(tool) => tool,
+            other => panic!("expected ToolUse, got {other:?}"),
+        };
+        assert_eq!(tool.id, "call_1");
+        assert_eq!(tool.name, "task_output");
+        assert_eq!(
+            tool.input.get("task_id").and_then(|v| v.as_str()),
+            Some("spawn-56")
+        );
+    }
+
+    #[test]
+    fn a_late_id_fragment_joins_its_index_less_call() {
+        let chunk = |value: serde_json::Value| -> OpenAiStreamChunk {
+            serde_json::from_value(value).expect("valid chunk")
+        };
+        let mut inc = StreamIncrementer::default();
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "r-late-id",
+            "choices": [{"delta": {"tool_calls": [{
+                "function": {"name": "task_output", "arguments": ""}
+            }]}}]
+        })));
+        inc.accumulate(&chunk(serde_json::json!({
+            "id": "r-late-id",
+            "choices": [{"delta": {"tool_calls": [{
+                "id": "call_1",
+                "function": {"arguments": "{\"task_id\":\"spawn-56\"}"}
+            }]}}]
+        })));
+
+        let final_resp = inc
+            .into_final()
+            .expect("tool call flushed")
+            .expect("ok response");
+        assert_eq!(final_resp.content.len(), 1);
+        let tool = match &final_resp.content[0] {
+            ContentBlock::ToolUse(tool) => tool,
+            other => panic!("expected ToolUse, got {other:?}"),
+        };
+        assert_eq!(tool.id, "call_1");
+        assert_eq!(tool.name, "task_output");
+        assert_eq!(
+            tool.input.get("task_id").and_then(|v| v.as_str()),
+            Some("spawn-56")
+        );
+    }
+
+    #[test]
+    fn split_and_repeated_name_fragments_are_merged() {
+        let chunk = |value: serde_json::Value| -> OpenAiStreamChunk {
+            serde_json::from_value(value).expect("valid chunk")
+        };
+        let mut inc = StreamIncrementer::default();
+        for (name, arguments) in [("task_", ""), ("output", ""), ("task_output", "{}")] {
+            inc.accumulate(&chunk(serde_json::json!({
+                "id": "r-split-name",
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": name, "arguments": arguments}
+                }]}}]
+            })));
+        }
+
+        let final_resp = inc
+            .into_final()
+            .expect("tool call flushed")
+            .expect("ok response");
+        let tool = match &final_resp.content[0] {
+            ContentBlock::ToolUse(tool) => tool,
+            other => panic!("expected ToolUse, got {other:?}"),
+        };
+        assert_eq!(tool.name, "task_output");
     }
 
     #[test]
