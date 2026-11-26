@@ -22,6 +22,14 @@ use super::{ExecuteResponse, FileData, FileInfo, Filesystem, FilesystemKind, Gre
 /// batch never commits.
 const MAX_OUTPUT_BYTES: usize = 100_000;
 
+/// 推送合批阈值：攒够 32KB 或 50ms 就先发一块。
+///
+/// 按行输出的命令每次 `read()` 只回来几十字节；逐块推送时 5MB 输出会变成 20 万+ 帧，
+/// 每帧大约 280B 的 JSON 开销，客户端还要为每一帧整串重解析/重布局（O(n²)）。
+const STREAM_BATCH_BYTES: usize = 32 * 1024;
+/// 见 [`STREAM_BATCH_BYTES`]：不足一批的数据最多压这么久就发出去。
+const STREAM_BATCH_DELAY: Duration = Duration::from_millis(50);
+
 /// A `Filesystem` that additionally supports shell command execution.
 #[async_trait]
 pub trait SandboxFilesystem: Filesystem {
@@ -403,46 +411,77 @@ where
     let mut collected = Vec::new();
     let mut truncated = false;
     let mut buf = [0u8; 8192];
-    // 尾部不完整的多字节 UTF-8 序列先攒着，和下一个读块拼起来再发：
-    // 否则客户端逐 chunk 解码会把一个汉字拆成两个 U+FFFD。
+    // 待发送的推送缓冲：既用于合批，也用于扣住尾部不完整的多字节 UTF-8 序列
+    // （否则客户端逐 chunk 解码会把一个汉字拆成两个 U+FFFD）。
     let mut pending: Vec<u8> = Vec::new();
+    let mut flush_at: Option<tokio::time::Instant> = None;
     loop {
-        match stream.read(&mut buf).await {
+        let read = match flush_at {
+            // 没攒够阈值时最多再等 STREAM_BATCH_DELAY：打印一行后长时间无声的命令
+            // 也要及时显示，不能等下一次写入。
+            Some(at) => tokio::select! {
+                read = stream.read(&mut buf) => read,
+                _ = tokio::time::sleep_until(at) => {
+                    flush_stream(sink.as_ref(), &mut pending, false);
+                    flush_at = None;
+                    continue;
+                }
+            },
+            None => stream.read(&mut buf).await,
+        };
+        let read = match read {
             Ok(0) | Err(_) => break,
-            Ok(read) => {
-                // Forward the raw chunk before capping: a cancelled or truncated command
-                // still shows the client everything it produced.
-                if let Some((registry, key)) = &sink {
-                    pending.extend_from_slice(&buf[..read]);
-                    let complete = utf8_prefix_len(&pending);
-                    if complete > 0 {
-                        registry.emit_output(key, &pending[..complete]);
-                        pending.drain(..complete);
-                    }
-                    // 非法字节（GBK / 二进制输出）不会让前缀前进；攒满一个不完整序列的
-                    // 最大长度就原样发出去，让客户端按 lossy 处理，避免无限积压。
-                    if pending.len() > 4 {
-                        registry.emit_output(key, &pending);
-                        pending.clear();
-                    }
-                }
-                let room = cap.saturating_sub(collected.len());
-                if room == 0 {
-                    // Anything read now is dropped: the output really is longer than the cap.
-                    truncated = true;
-                } else {
-                    collected.extend_from_slice(&buf[..read.min(room)]);
-                    truncated |= read > room;
-                }
+            Ok(read) => read,
+        };
+        // Forward the output before capping: a cancelled or truncated command still shows the
+        // client everything it produced.
+        if sink.is_some() {
+            pending.extend_from_slice(&buf[..read]);
+            if pending.len() >= STREAM_BATCH_BYTES {
+                flush_stream(sink.as_ref(), &mut pending, false);
+                flush_at = None;
+            } else if flush_at.is_none() {
+                flush_at = Some(tokio::time::Instant::now() + STREAM_BATCH_DELAY);
             }
         }
-    }
-    if let Some((registry, key)) = &sink {
-        if !pending.is_empty() {
-            registry.emit_output(key, &pending);
+        let room = cap.saturating_sub(collected.len());
+        if room == 0 {
+            // Anything read now is dropped: the output really is longer than the cap.
+            truncated = true;
+        } else {
+            collected.extend_from_slice(&buf[..read.min(room)]);
+            truncated |= read > room;
         }
     }
+    flush_stream(sink.as_ref(), &mut pending, true);
     (collected, truncated)
+}
+
+/// 发掉缓冲里完整的 UTF-8 前缀。
+///
+/// `at_eof` 为真时连尾部残留（半截字符 / 非法字节）也原样发出，避免命令结束时丢内容；
+/// 否则只把超过一个不完整序列最大长度的非法字节原样发掉（GBK、二进制输出），
+/// 让客户端按 lossy 处理，又不会无限积压。
+fn flush_stream(
+    sink: Option<&(Arc<ProcessRegistry>, String)>,
+    pending: &mut Vec<u8>,
+    at_eof: bool,
+) {
+    let Some((registry, key)) = sink else {
+        return;
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let complete = utf8_prefix_len(pending);
+    if complete > 0 {
+        registry.emit_output(key, &pending[..complete]);
+        pending.drain(..complete);
+    }
+    if !pending.is_empty() && (at_eof || pending.len() > 4) {
+        registry.emit_output(key, pending);
+        pending.clear();
+    }
 }
 
 /// bytes 中完整 UTF-8 前缀的长度；尾部不完整序列与非法字节不计入。
@@ -966,5 +1005,80 @@ mod tests {
         assert!(output.ends_with(&format!(
             "\n\n... Output truncated at {MAX_OUTPUT_BYTES} bytes."
         )));
+    }
+    /// 逐行输出必须合批：两百次小写入不能变成两百多帧（每帧都要客户端整串重渲染）。
+    #[tokio::test]
+    async fn streaming_coalesces_small_writes() {
+        use std::sync::Mutex as StdMutex;
+        use tokio::io::AsyncWriteExt;
+
+        struct Recorder(Arc<StdMutex<Vec<Vec<u8>>>>);
+        impl agentscope_core::tool::ProcessEvents for Recorder {
+            fn output(&self, _key: &str, bytes: &[u8]) {
+                self.0.lock().unwrap().push(bytes.to_vec());
+            }
+        }
+
+        let (mut tx, rx) = tokio::io::duplex(1 << 20);
+        let chunks = Arc::new(StdMutex::new(Vec::new()));
+        let registry = agentscope_core::tool::ProcessRegistry::new();
+        registry.set_events(Some(Arc::new(Recorder(Arc::clone(&chunks)))));
+        let reader = tokio::spawn(read_capped(
+            rx,
+            MAX_OUTPUT_BYTES,
+            Some((Arc::clone(&registry), "call-1".to_string())),
+        ));
+
+        let mut expected = Vec::new();
+        for i in 0..200 {
+            let line = format!("line-{i:04}-abcdefghijklmnopqrstuvwxyz\n");
+            expected.extend_from_slice(line.as_bytes());
+            tx.write_all(line.as_bytes()).await.unwrap();
+            // 让出执行机会，逼出 200 次独立的 read（否则 duplex 会合并成一次大读）
+            tokio::task::yield_now().await;
+        }
+        drop(tx);
+        let (collected, truncated) = reader.await.unwrap();
+
+        assert!(!truncated);
+        assert_eq!(collected, expected);
+        let sent = chunks.lock().unwrap();
+        assert_eq!(sent.concat(), expected, "no byte may be lost or reordered");
+        assert!(!sent.is_empty(), "no output was forwarded");
+        assert!(sent.len() <= 8, "expected batched chunks, got {} sizes {:?}", sent.len(), sent.iter().map(|c| c.len()).collect::<Vec<_>>());
+    }
+
+    /// 不足一批的输出最多压 50ms：交互式命令打印提示后不会一直不显示。
+    #[tokio::test]
+    async fn streaming_flushes_after_the_batch_delay() {
+        use std::sync::Mutex as StdMutex;
+        use tokio::io::AsyncWriteExt;
+
+        struct Recorder(Arc<StdMutex<Vec<Vec<u8>>>>);
+        impl agentscope_core::tool::ProcessEvents for Recorder {
+            fn output(&self, _key: &str, bytes: &[u8]) {
+                self.0.lock().unwrap().push(bytes.to_vec());
+            }
+        }
+
+        let (mut tx, rx) = tokio::io::duplex(1 << 20);
+        let chunks = Arc::new(StdMutex::new(Vec::new()));
+        let registry = agentscope_core::tool::ProcessRegistry::new();
+        registry.set_events(Some(Arc::new(Recorder(Arc::clone(&chunks)))));
+        let reader = tokio::spawn(read_capped(
+            rx,
+            MAX_OUTPUT_BYTES,
+            Some((Arc::clone(&registry), "call-1".to_string())),
+        ));
+
+        tx.write_all(b"press any key").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !chunks.lock().unwrap().is_empty(),
+            "a small write must flush on the 50ms timer"
+        );
+
+        drop(tx);
+        let _ = reader.await.unwrap();
     }
 }
