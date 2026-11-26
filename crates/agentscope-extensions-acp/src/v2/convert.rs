@@ -216,7 +216,7 @@ pub(super) fn capabilities_from_v1(caps: &v1::AgentCapabilities) -> v2::AgentCap
         )
         // v2-only: the graph implements `session/options`, so the capability is advertised.
         .options(Some(v2::SessionOptionsCapabilities::default()));
-    v2::AgentCapabilities::new()
+    let mut out = v2::AgentCapabilities::new()
         .session(session)
         .auth(Some(
             v2::AgentAuthCapabilities::new().status(v2::AuthStatusCapabilities::new()),
@@ -225,7 +225,18 @@ pub(super) fn capabilities_from_v1(caps: &v1::AgentCapabilities) -> v2::AgentCap
             caps.providers
                 .as_ref()
                 .map(|_| v2::ProvidersCapabilities::new()),
-        )
+        );
+    // 私有特性表原样带到 v2：客户端在 v2 连线上也用同一套特性做能力门控。
+    if let Some(features) = caps
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("io.animus/features"))
+    {
+        let mut meta = out.meta.clone().unwrap_or_default();
+        meta.insert("io.animus/features".to_string(), features.clone());
+        out.meta = Some(meta);
+    }
+    out
 }
 
 /// v2 renamed `id` to `configId` and the group key to `groupId`; the option payloads are the

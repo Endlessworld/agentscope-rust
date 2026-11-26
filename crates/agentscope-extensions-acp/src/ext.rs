@@ -46,6 +46,18 @@ macro_rules! wire_response {
     };
 }
 
+/// 私有扩展的特性名（客户端 `agentCapabilities._meta["io.animus/features"]` 用）。
+/// 与各 handler 注册的方法一一对应；新增扩展时同步更新。
+pub const FEATURES: &[&str] = &[
+    "session/steer",
+    "session/queue",
+    "session/pause",
+    "session/resume",
+    "session/respond",
+    "fs/list",
+    "providers/admin",
+];
+
 /// Answers one or more pending interactions of a session and continues its turn.
 ///
 /// Params: `{ "sessionId": "...", "answers": { "<requestId>": { ... } } }` where each answer

@@ -562,7 +562,7 @@ impl AcpCodingAgent {
             session_capabilities =
                 session_capabilities.system_prompt(SessionSystemPromptCapabilities::new());
         }
-        AgentCapabilities::new()
+        let mut caps = AgentCapabilities::new()
             .load_session(true)
             .prompt_capabilities(
                 PromptCapabilities::new()
@@ -573,7 +573,19 @@ impl AcpCodingAgent {
             .mcp_capabilities(McpCapabilities::new().http(true).sse(true).acp(true))
             .session_capabilities(session_capabilities)
             // We never require a sign-in, so `auth/status` answers `not_required` (ACP-35).
-            .auth(AgentAuthCapabilities::new().status(AuthStatusCapabilities::new()))
+            .auth(AgentAuthCapabilities::new().status(AuthStatusCapabilities::new()));
+        // 私有扩展：客户端用 `_meta["io.animus/features"]` 做能力门控；
+        // 标准 ACP 客户端忽略 `_meta`，不影响兼容性。
+        caps.meta = Some(serde_json::Map::from_iter([(
+            "io.animus/features".to_string(),
+            serde_json::Value::from(
+                crate::ext::FEATURES
+                    .iter()
+                    .map(|name| serde_json::Value::from(*name))
+                    .collect::<Vec<_>>(),
+            ),
+        )]));
+        caps
     }
 
     /// Creates a new session using the session factory.

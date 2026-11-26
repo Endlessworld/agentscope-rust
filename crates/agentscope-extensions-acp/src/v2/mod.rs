@@ -105,10 +105,13 @@ pub(crate) fn handlers(agent: Arc<AcpCodingAgent>) -> DynConnectTo<Client> {
                     .map(|(name, _)| name)
                     .collect::<Vec<_>>();
                     if !top.is_empty() {
-                        caps.meta = Some(serde_json::Map::from_iter([(
+                        // 合并而不是覆盖：`capabilities_from_v1` 已经把 `io.animus/features` 带过来了
+                        let mut meta = caps.meta.clone().unwrap_or_default();
+                        meta.insert(
                             "io.animus/caps".to_string(),
                             serde_json::Value::from(top),
-                        )]));
+                        );
+                        caps.meta = Some(meta);
                     }
                     if let Some(session) = caps.session.as_mut() {
                         let flags = [
