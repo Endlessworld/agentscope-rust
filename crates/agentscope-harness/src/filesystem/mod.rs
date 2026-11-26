@@ -6,6 +6,8 @@ pub mod baked;
 pub mod composite;
 pub mod local;
 pub mod overlay;
+#[cfg(windows)]
+pub mod pwsh_pool;
 pub mod remote;
 pub mod result;
 pub mod sandbox;
@@ -22,6 +24,8 @@ pub use baked::BakedContextFilesystem;
 pub use composite::CompositeFilesystem;
 pub use local::{LocalFilesystem, LocalFsMode};
 pub use overlay::OverlayFilesystem;
+#[cfg(windows)]
+pub use pwsh_pool::PwshProcessPool;
 pub use remote::store::{
     BaseStore, DefaultNamespace, InMemoryStore, NamespaceFactory, StaticNamespace, StoreItem,
     StoreValue,

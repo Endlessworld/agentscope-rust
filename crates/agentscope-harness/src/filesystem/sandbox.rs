@@ -9,7 +9,10 @@ use agentscope_core::error::{Error, Result};
 use agentscope_core::tool::{ProcessGuard, ProcessRegistry, TOOL_CALL_ID_CONTEXT_KEY};
 use async_trait::async_trait;
 use base64::Engine;
-use tokio::io::AsyncReadExt;
+#[cfg(windows)]
+use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, ChildStdin};
 
 use super::CompositeFilesystem;
 use super::{ExecuteResponse, FileData, FileInfo, Filesystem, FilesystemKind, GrepMatch};
@@ -56,6 +59,9 @@ pub struct SandboxBackedFilesystem {
     /// Session process registry (ACP v2): lets a client cancel kill the running command and
     /// lets its output stream while it runs. `None` keeps the historical fire-and-wait.
     processes: Option<Arc<ProcessRegistry>>,
+    /// Windows-only pool of pre-warmed one-shot PowerShell processes.
+    #[cfg(windows)]
+    pwsh_pool: Option<Arc<super::PwshProcessPool>>,
 }
 
 impl SandboxBackedFilesystem {
@@ -65,7 +71,16 @@ impl SandboxBackedFilesystem {
             cwd: cwd.into(),
             isolation_scope: None,
             processes: None,
+            #[cfg(windows)]
+            pwsh_pool: None,
         }
+    }
+
+    /// Attaches a pool of pre-warmed Windows PowerShell processes.
+    #[cfg(windows)]
+    pub fn with_pwsh_pool(mut self, pool: Arc<super::PwshProcessPool>) -> Self {
+        self.pwsh_pool = Some(pool);
+        self
     }
 
     /// Scopes shell execution by the given isolation scope.
@@ -232,6 +247,25 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
         // The per-scope directory is created on demand: the shell is the first caller for a
         // fresh user/session, and `Command::current_dir` fails on a missing directory.
         let _ = std::fs::create_dir_all(&scoped_cwd);
+
+        // Take a pre-warmed one-shot PowerShell when this is an ACP session that opted into
+        // pooling. A miss falls through to the historical cold-spawn path, so pool warmup or
+        // exhaustion never changes command semantics.
+        #[cfg(windows)]
+        if let Some(pool) = self.pwsh_pool.as_ref() {
+            if let Some(warm) = pool.checkout().await {
+                let shell = RunningShell {
+                    child: warm.child,
+                    stdin: Some(warm.stdin),
+                    stdout: Some(Box::new(warm.stdout)),
+                    stderr: Some(Box::new(warm.stderr)),
+                };
+                return self
+                    .run_shell(shell, ctx, command, &scoped_cwd, timeout_seconds)
+                    .await;
+            }
+        }
+
         // `build_windows_command` 只在 Windows 下存在，所以这里必须用 `#[cfg]` 分支，
         // 不能用 `if cfg!(windows)`：后者两个分支都会被编译，Windows 专属函数在
         // 非 Windows 目标上会直接 `cannot find function` 编译失败。
@@ -276,8 +310,70 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
                 format!("Failed to spawn command: {}", e),
             ))
         })?;
+        let stdout = child
+            .stdout
+            .take()
+            .map(|stream| Box::new(stream) as Box<dyn AsyncRead + Unpin + Send>);
+        let stderr = child
+            .stderr
+            .take()
+            .map(|stream| Box::new(stream) as Box<dyn AsyncRead + Unpin + Send>);
+        let shell = RunningShell {
+            child,
+            stdin: None,
+            stdout,
+            stderr,
+        };
+        self.run_shell(shell, ctx, command, &scoped_cwd, timeout_seconds)
+            .await
+    }
+}
 
+/// A spawned shell plus its pipes.
+///
+/// Cold spawns put the command in `pwsh -EncodedCommand`; warm processes leave `stdin` open and
+/// receive the command through it. Everything after registration is shared so the two paths
+/// cannot drift.
+struct RunningShell {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: Option<Box<dyn AsyncRead + Unpin + Send>>,
+    stderr: Option<Box<dyn AsyncRead + Unpin + Send>>,
+}
+
+impl SandboxBackedFilesystem {
+    async fn run_shell(
+        &self,
+        shell: RunningShell,
+        ctx: &RuntimeContext,
+        command: &str,
+        cwd: &std::path::Path,
+        timeout_seconds: u32,
+    ) -> Result<ExecuteResponse> {
+        let RunningShell {
+            mut child,
+            mut stdin,
+            stdout,
+            stderr,
+        } = shell;
+        #[cfg(not(windows))]
+        let _ = stdin.take();
         let pid = child.id().unwrap_or(0);
+
+        // A warm process receives the command through stdin. Send it *before* registering the
+        // process: otherwise a client cancel can observe the registration and kill the shell
+        // while this write is in flight, turning a valid cancellation into BrokenPipe.
+        #[cfg(windows)]
+        if let Some(stdin) = stdin.as_mut() {
+            if let Err(error) = send_warm_command(stdin, cwd, command).await {
+                kill_process_tree(pid);
+                let _ = child.kill().await;
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("failed to hand the command to the warm shell: {error}"),
+                )));
+            }
+        }
 
         // Register the child so a client cancel (tool_call/cancel / terminal/cancel) can kill
         // the whole tree, and stream its output while it runs. Both are no-ops without a
@@ -297,28 +393,22 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
             _ => None,
         };
         if let (Some(registry), Some(key)) = (self.processes.as_ref(), process_key.as_ref()) {
-            registry.emit_started(key, command, &scoped_cwd.to_string_lossy());
+            registry.emit_started(key, command, &cwd.to_string_lossy());
         }
-
-        // Take the piped streams BEFORE awaiting — if we don't, and the child
-        // writes enough to fill the OS pipe buffer (~64KB on Windows), it blocks
-        // and our `wait()` never returns.
-        let mut stdout_stream = child.stdout.take();
-        let mut stderr_stream = child.stderr.take();
 
         // Spawn background tasks to drain stdout/stderr concurrently, keeping at most
         // `MAX_OUTPUT_BYTES` each while still reading to EOF so the child never blocks on a
         // full pipe.
         let stdout_sink = stream_target.clone();
         let stdout_fut = async move {
-            match stdout_stream {
+            match stdout {
                 Some(stream) => read_capped(stream, MAX_OUTPUT_BYTES, stdout_sink).await,
                 None => (Vec::new(), false),
             }
         };
         let stderr_sink = stream_target;
         let stderr_fut = async move {
-            match stderr_stream {
+            match stderr {
                 Some(stream) => read_capped(stream, MAX_OUTPUT_BYTES, stderr_sink).await,
                 None => (Vec::new(), false),
             }
@@ -396,6 +486,23 @@ impl SandboxFilesystem for SandboxBackedFilesystem {
             cancelled,
         })
     }
+}
+
+/// Hands a warmed shell its cwd and one command, then closes its stdin.
+#[cfg(windows)]
+async fn send_warm_command(
+    stdin: &mut ChildStdin,
+    cwd: &std::path::Path,
+    command: &str,
+) -> std::io::Result<()> {
+    let cwd = base64::engine::general_purpose::STANDARD.encode(cwd.to_string_lossy().as_bytes());
+    let command = base64::engine::general_purpose::STANDARD.encode(command.as_bytes());
+    stdin.write_all(cwd.as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.write_all(command.as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    stdin.shutdown().await
 }
 
 /// Reads a stream to EOF, keeping at most `cap` bytes but draining the rest so the child

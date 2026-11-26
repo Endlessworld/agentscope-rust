@@ -377,6 +377,12 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
     }
 
     let workspace = cwd.join(".agentscope").join("workspace");
+    // Five covers the usual parallel tool-call burst; memory-conscious hosts can lower it
+    // (zero disables the pool) without rebuilding.
+    let pwsh_pool_size = std::env::var("AGENTSCOPE_PWSH_POOL_SIZE")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(5);
     let mut builder = HarnessAgent::builder()
         .name("agentscope-coding-agent")
         .model(model)
@@ -398,6 +404,10 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
         })
         .cwd(cwd.clone())
         .processes(processes)
+        // Per-session warm, one-shot pwsh pool: a few processes hide the ~300ms PowerShell
+        // startup for short `execute` calls while every command still runs in a clean process.
+        // Other platforms ignore the setting.
+        .pwsh_pool_size(pwsh_pool_size)
         .workspace(workspace)
         // 会话历史以 **journal 为唯一权威**（对齐 Java native session）：`session_id` 既是
         // journal 的会话键，也是恢复键。进程重启后客户端用同一 sessionId 发

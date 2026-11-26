@@ -1034,6 +1034,8 @@ pub struct HarnessAgentBuilder {
     /// Session process registry handed to the sandbox so shell commands can be cancelled
     /// and streamed (ACP v2).
     processes: Option<Arc<agentscope_core::tool::ProcessRegistry>>,
+    /// Windows-only size of the pre-warmed one-shot `pwsh` pool. Zero keeps the cold path.
+    pwsh_pool_size: usize,
     /// Extra path-prefix routes layered over the resolved filesystem (Java `filesystemRoute`).
     filesystem_routes: Vec<(String, Arc<dyn Filesystem>)>,
     /// Absolute roots the default local filesystems accept beyond `cwd` and the workspace
@@ -1203,6 +1205,7 @@ impl Default for HarnessAgentBuilder {
             remote_filesystem_spec: None,
             sandbox_filesystem_spec: None,
             processes: None,
+            pwsh_pool_size: 0,
             filesystem_routes: Vec::new(),
             additional_project_roots: Vec::new(),
             cwd: None,
@@ -1314,6 +1317,15 @@ impl HarnessAgentBuilder {
         processes: Arc<agentscope_core::tool::ProcessRegistry>,
     ) -> Self {
         self.processes = Some(processes);
+        self
+    }
+
+    /// Keeps up to `size` pre-warmed one-shot `pwsh` processes for this agent/session.
+    ///
+    /// Windows only: other platforms execute through `/bin/sh` and ignore the setting. Zero
+    /// (the default) keeps the historical spawn-per-call path.
+    pub fn pwsh_pool_size(mut self, size: usize) -> Self {
+        self.pwsh_pool_size = size;
         self
     }
 
@@ -2901,9 +2913,12 @@ impl HarnessAgentBuilder {
             FilesystemTool::register(&toolkit, Arc::clone(&project_filesystem));
         }
         if self.with_shell_tool && !self.disable_shell_tool {
-            if let Some(sandbox) =
-                sandbox_filesystem(&project_filesystem, &cwd, self.processes.clone())
-            {
+            if let Some(sandbox) = sandbox_filesystem(
+                &project_filesystem,
+                &cwd,
+                self.processes.clone(),
+                self.pwsh_pool_size,
+            ) {
                 toolkit.register_tool(Arc::new(ShellExecuteTool::with_output_compaction(
                     sandbox,
                     self.shell_output_compaction.clone(),
@@ -3520,12 +3535,21 @@ fn sandbox_filesystem(
     filesystem: &Arc<dyn Filesystem>,
     cwd: &PathBuf,
     processes: Option<Arc<agentscope_core::tool::ProcessRegistry>>,
+    pwsh_pool_size: usize,
 ) -> Option<Arc<dyn crate::filesystem::SandboxFilesystem>> {
     use crate::filesystem::{SandboxBackedFilesystem, SandboxFilesystem};
     let mut sandbox = SandboxBackedFilesystem::new(Arc::clone(filesystem), cwd.clone());
     if let Some(processes) = processes {
         sandbox = sandbox.with_processes(processes);
     }
+    #[cfg(windows)]
+    if pwsh_pool_size > 0 {
+        sandbox = sandbox.with_pwsh_pool(Arc::new(crate::filesystem::PwshProcessPool::new(
+            pwsh_pool_size,
+        )));
+    }
+    #[cfg(not(windows))]
+    let _ = pwsh_pool_size;
     Some(Arc::new(sandbox) as Arc<dyn SandboxFilesystem>)
 }
 
