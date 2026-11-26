@@ -20,6 +20,7 @@ fn tool_ctx() -> ToolExecutionContext {
         runtime: serde_json::Map::new(),
         emitter: None,
         tool_request_config: None,
+        processes: None,
     }
 }
 

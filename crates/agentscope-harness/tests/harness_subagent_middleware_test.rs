@@ -47,6 +47,7 @@ fn tctx(session: &str) -> ToolExecutionContext {
         runtime,
         emitter: None,
         tool_request_config: None,
+        processes: None,
     }
 }
 
