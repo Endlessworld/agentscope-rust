@@ -1,7 +1,7 @@
 //! Workspace task runner.
 //!
 //! ```text
-//! cargo xtask acp build <variant> [--profile release|embedded]
+//! cargo xtask acp build <variant> [--profile release|embedded] [--features <list>] [--no-script]
 //! cargo xtask acp upx   <variant> [--profile release|embedded]
 //! cargo xtask acp registry <artifacts-dir> [--out <file>]
 //! cargo xtask publish   [--dry-run] [--sleep <secs>]
@@ -33,7 +33,7 @@ const USAGE: &str = "\
 xtask -- workspace task runner
 
 usage:
-  cargo xtask acp build <variant> [--profile release|embedded]
+  cargo xtask acp build <variant> [--profile release|embedded] [--features <list>] [--no-script]
   cargo xtask acp upx   <variant> [--profile release|embedded]
   cargo xtask acp registry <artifacts-dir> [--out <file>]
   cargo xtask publish   [--dry-run] [--sleep <secs>]
@@ -53,6 +53,11 @@ variants:
 profiles:
   release   default profile, stable toolchain
   embedded  size-optimised profile, requires nightly + rust-src (build-std)
+
+features:
+  Every build adds `script` (the embedded JS/QuickJS engine) by default.
+  --no-script     drop it (smaller binary, no QuickJS)
+  --features a,b  append extra cargo features on top
 
 artifacts:
   target/acp/<profile>/<variant>/acp_harness_agent[.exe]
@@ -88,6 +93,8 @@ fn run() -> Result<(), String> {
     let mut out: Option<PathBuf> = None;
     let mut sleep = Duration::from_secs(30);
     let mut words: Vec<String> = Vec::new();
+    let mut extra_features: Vec<String> = Vec::new();
+    let mut no_script = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -108,6 +115,16 @@ fn run() -> Result<(), String> {
                     .map_err(|_| format!("`{value}` is not a number of seconds"))?;
                 sleep = Duration::from_secs(secs);
             }
+            "--features" => {
+                let value = args.next().ok_or("--features needs a value")?;
+                for feature in value.split(',') {
+                    let feature = feature.trim();
+                    if !feature.is_empty() && !extra_features.iter().any(|f| f == feature) {
+                        extra_features.push(feature.to_string());
+                    }
+                }
+            }
+            "--no-script" => no_script = true,
             "--help" | "-h" => {
                 print!("{USAGE}");
                 return Ok(());
@@ -127,7 +144,7 @@ fn run() -> Result<(), String> {
         }
         ["acp", "build", variant] => variants(variant)?
             .into_iter()
-            .try_for_each(|variant| build(profile, variant)),
+            .try_for_each(|variant| build(profile, variant, &extra_features, no_script)),
         ["acp", "upx", variant] => variants(variant)?
             .into_iter()
             .try_for_each(|variant| upx(profile, variant)),
@@ -220,9 +237,24 @@ fn variants(name: &str) -> Result<Vec<Variant>, String> {
     }
 }
 
-fn build(profile: Profile, variant: Variant) -> Result<(), String> {
+fn build(
+    profile: Profile,
+    variant: Variant,
+    extra_features: &[String],
+    no_script: bool,
+) -> Result<(), String> {
     let root = workspace_root();
-    let features = format!("{}{}", profile.base_features(), variant.feature_suffix());
+    let mut features = format!("{}{}", profile.base_features(), variant.feature_suffix());
+    // `script` (embedded QuickJS engine) is on by default; `--no-script` opts out.
+    if !no_script {
+        features.push_str(",script");
+    }
+    for feature in extra_features {
+        if !features.split(',').any(|existing| existing == feature) {
+            features.push(',');
+            features.push_str(feature);
+        }
+    }
     let out_dir = artifact_dir(&root, profile, variant);
 
     let mut command = Command::new("cargo");

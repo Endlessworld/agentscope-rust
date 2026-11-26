@@ -22,6 +22,8 @@ agentscope-durable-adapter-agentscope = { workspace = true, optional = true }
 # backend (`AGENTSCOPE_DURABLE_STORE=file` keeps the file store).
 agentscope-durable-sqlite = { workspace = true, optional = true }
 agentscope-extensions-model = { workspace = true }
+# Optional embedded JS script engine over the ACP tool surface (behind the `script` feature).
+agentscope-extensions-script = { workspace = true, optional = true }
 agentscope-harness = { version = "0.2.0", path = "../agentscope-harness", default-features = false }
 agent-client-protocol = { version = "5.6.0", features = [
     # 5.0.0 起原生传输改为 opt-in（2.2.0 时在非 wasm 平台无条件可用）：
@@ -97,6 +99,9 @@ path = "src/acp_harness_agent.rs"
 
 [features]
 default = ["rusqlite", "durable", "acp-v2"]
+# Script engine over the ACP tool surface (fs tools + `run_script`). Off by default because it
+# pulls QuickJS (a C dependency) into the binary.
+script = ["dep:agentscope-extensions-script"]
 # The durable driver: a session journals its turns so another process can resume them. Without
 # it the session runs on the native driver only, and neither `agentscope-durable` nor its harness
 # adapter is compiled into this crate.

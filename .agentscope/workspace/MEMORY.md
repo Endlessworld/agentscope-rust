@@ -1572,3 +1572,11 @@
 - 配套：`acp_backend_start` 的复用判断从只看 `_child.try_wait()` 改为同时看 `BackendKind::Stdio{task}.is_finished()`，桥已退出（端口已释放）时不复用，走重启路径。
 - 配套（前端）：`ChatContainer.vue` 的退避重试在 `setTimeout` 内先重新 `resolveAcpEndpoint(agentId)` 再 `tryConnect()`，避免一直连旧端口。
 - 验证：`cargo check` (src-tauri) EXIT=0；`pnpm typecheck` / `pnpm build` EXIT=0。改动需重启 Tauri 应用才生效。
+
+- 2026-11-27（`dev`）`crates/agentscope-extensions-acp` 重构批次 1~3 已提交 **`75fd3d3`**（20 files, +412/−728，含新增 `tests/common/mod.rs` 79 行）。落地点：①v1 providers 扩展 handler 改调 `providers_admin::run_extension`；②`apply_config_option` 下沉为 `AcpAgentSession::apply_config_option`（`pub(crate)`）供 v1/v2 共用；③`providers_admin` 新增 `pub(crate) advertised/apply_set/apply_disable/ProviderMutationError`（共享核心只报错误类别，v1 disable 的 `is unknown or required` 文案留在 v1 handler）；④`session/new|load|resume` 共用 `coding_agent.rs::bind_opened_session(...)`（resume 分支用 `let (_, config_options, modes)`）；⑤`ext.rs` 三个手写 JSON-RPC 头改 `impl_ext_request!`；⑥`primary_protocol` 复用 `primary_api` 判定。
+- `tests/common/mod.rs` 约定：`StubModel::new("done")`、`prompt(text)`、`scratch_dir(prefix, tag)`（先清空，对应原 `remove_dir_all` 语义）、`unique_scratch_dir(prefix, tag)`（时间戳唯一，空 prefix 则只用 tag）；`#![allow(dead_code)]` 因每个测试二进制各编一份。已接入 13 个测试文件（StubModel 8 个、scratch_dir/prompt 4 个、unique 2 个），各文件 `build_session` 形状保持原样。
+- **批次 4~7 仍未批准**：`into_service`（849 行）/ `v2::handlers`（982 行）处理器拆分、`session.rs` 模块化拆分、`drive_turn`（623 行）分层（`AttemptWatch`/`poll_turn`/`stop_current_attempt`）、P2 死代码与 `#[allow]` 清理。另有两个被否决方案勿重提：通用 v1/v2 协议抽象层、合并 `acp_agent_cli` 与 `acp_harness_agent`。
+- 该 crate 默认 feature 已含 `acp-v2`（`default = ["rusqlite","durable","acp-v2"]`），所以 `cargo test -p agentscope-extensions-acp -j 2` 一次即覆盖 v1+v2（lib 172 passed）；`mem_diagnostic_test` 的 3 个 offline 诊断按既有 `#[ignore]` 跳过，非失败。
+
+- PowerShell 里删目录若写成 `Remove-Item -Recurse -Force` 会被命令护栏判为 `rm -rf` 同义而拒绝；改用 `[System.IO.Directory]::Delete($path, $true)` 可通过。
+

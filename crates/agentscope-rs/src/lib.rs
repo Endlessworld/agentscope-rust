@@ -31,6 +31,7 @@
 //! | `nacos` | [`nacos`] | `agentscope-extensions-nacos` |
 //! | `higress` | [`higress`] | `agentscope-extensions-higress` |
 //! | `judge` | [`judge`] | `agentscope-extensions-judge` |
+//! | `script` / `script-js` | [`script`] | `agentscope-extensions-script` (fs/http; `script-js` adds QuickJS) |
 //! | `durable` | [`durable`] | `agentscope-durable` |
 //! | `durable-sqlite` | [`durable_sqlite`] | `agentscope-durable-sqlite` |
 //! | `durable-adapter-agentscope` | [`durable_adapter_agentscope`] | `agentscope-durable-adapter-agentscope` |
@@ -95,6 +96,8 @@ pub use agentscope_extensions_channel as channel;
 pub use agentscope_extensions_higress as higress;
 #[cfg(feature = "judge")]
 pub use agentscope_extensions_judge as judge;
+#[cfg(feature = "script")]
+pub use agentscope_extensions_script as script;
 
 #[cfg(feature = "durable")]
 pub use agentscope_durable as durable;

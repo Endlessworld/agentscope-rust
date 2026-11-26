@@ -45,6 +45,7 @@ members = [
     "crates/agentscope-extensions-nacos",
     "crates/agentscope-extensions-higress",
     "crates/agentscope-extensions-judge",
+    "crates/agentscope-extensions-script",
     "xtask",
 ]
 
@@ -95,6 +96,9 @@ agentscope-extensions-training = { version = "0.2.0", path = "crates/agentscope-
 agentscope-extensions-nacos = { version = "0.2.0", path = "crates/agentscope-extensions-nacos" }
 agentscope-extensions-higress = { version = "0.2.0", path = "crates/agentscope-extensions-higress" }
 agentscope-extensions-judge = { version = "0.2.0", path = "crates/agentscope-extensions-judge" }
+agentscope-extensions-script = { version = "0.2.0", path = "crates/agentscope-extensions-script" }
+# Embedded JavaScript engine (QuickJS bindings); see docs/SCRIPT_ENGINE_RQUICKJS.md.
+rquickjs = "0.14"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
 thiserror = "2"

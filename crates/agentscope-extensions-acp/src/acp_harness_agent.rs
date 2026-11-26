@@ -520,14 +520,42 @@ fn build_agent(ctx: SessionBuild) -> HarnessAgent {
     // without the tool. It is capability-gated: when the client did not
     // advertise `elicitation.form` the tool is not exposed at all (the protocol
     // forbids requesting an un-advertised mode).
+    // Base toolkit: `ask_user` (only when the client advertises elicitation) plus, behind the
+    // `script` feature, the JS engine over the fs tools. `builder.toolkit` clones the map, and the
+    // harness registers its own tools onto that same clone, so a script can also call every
+    // harness tool (the engine holds a clone of this toolkit).
+    let toolkit = agentscope_core::tool::Toolkit::new();
     if client_support.supports_elicitation_form() {
-        let toolkit = agentscope_core::tool::Toolkit::new();
         toolkit.register_tool(Arc::new(AskUserTool::new(
             elicitation_slot,
             agent_client_protocol::v1::schema::SessionId::new(session_id.to_string()),
         )));
-        builder = builder.toolkit(toolkit);
     }
+    #[cfg(feature = "script")]
+    {
+        let sandbox = agentscope_extensions_script::FsSandbox::new(cwd.clone());
+        sandbox.register(&toolkit);
+        // Scripts see the fs tools plus whatever the harness registers later (the engine holds a
+        // clone of this toolkit), minus the tools that would let a script recurse into itself or
+        // rearrange the session. `write_file` / `edit_file` / `execute` stay available: they are
+        // the point of scripting multi-step tool work, and they still go through the toolkit's
+        // permission checks.
+        let engine = Arc::new(
+            agentscope_extensions_script::ScriptEngine::new(
+                toolkit.clone(),
+                agentscope_extensions_script::ScriptLimits::default(),
+            )
+            .with_denied_tools([
+                "run_script",
+                "propose_skill",
+                "skill_manage",
+            ]),
+        );
+        toolkit.register_tool(Arc::new(agentscope_extensions_script::RunScriptTool::new(
+            engine,
+        )));
+    }
+    builder = builder.toolkit(toolkit);
 
     let agent = builder.build();
     // One line per session build: the footprint the agent settles at before any turn runs. This is

@@ -1,0 +1,30 @@
+[package]
+name = "agentscope-extensions-script"
+description = "AgentScope Rust - embedded JavaScript (rquickjs) script engine exposing Toolkit tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+agentscope-core = { workspace = true }
+# rquickjs is opt-in: the `js` feature pulls QuickJS (a C dependency) into the binary. The
+# `fs` / `http` tools do not need it.
+rquickjs = { workspace = true, optional = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+# `net` is needed for the SSRF pre-resolution in the HTTP tool.
+tokio = { workspace = true, features = ["net"] }
+reqwest = { workspace = true }
+# Streaming reads for the HTTP response-size cap.
+futures = { workspace = true }
+
+[features]
+default = ["js"]
+# Embedded JavaScript engine (`ScriptEngine` / `RunScriptTool`). Disable to drop QuickJS.
+js = ["dep:rquickjs"]

@@ -42,6 +42,9 @@ agentscope-extensions-training = { workspace = true, optional = true }
 agentscope-extensions-nacos = { workspace = true, optional = true }
 agentscope-extensions-higress = { workspace = true, optional = true }
 agentscope-extensions-judge = { workspace = true, optional = true }
+# Explicit (not `workspace = true`) so `default-features = false` is honoured: the base
+# `script` feature ships the fs/http tools only; `script-js` opts into the QuickJS engine.
+agentscope-extensions-script = { version = "0.2.0", path = "../agentscope-extensions-script", optional = true, default-features = false }
 agentscope-durable = { workspace = true, optional = true }
 agentscope-durable-sqlite = { workspace = true, optional = true }
 agentscope-durable-adapter-agentscope = { workspace = true, optional = true }
@@ -79,6 +82,9 @@ training = ["harness", "dep:agentscope-extensions-training"]
 nacos = ["harness", "dep:agentscope-extensions-nacos"]
 higress = ["harness", "dep:agentscope-extensions-higress"]
 judge = ["harness", "dep:agentscope-extensions-judge"]
+# Script engine: `script` = fs/http tools, `script-js` adds the embedded QuickJS runtime.
+script = ["core", "dep:agentscope-extensions-script"]
+script-js = ["script", "agentscope-extensions-script/js"]
 
 # Durable execution. `durable` is the semantic core; the other three are the store, the
 # AgentScope harness adapter and the resident worker that drive it.
@@ -117,6 +123,7 @@ full = [
     "nacos",
     "higress",
     "judge",
+    "script-js",
     "durable",
     "durable-sqlite",
     "durable-adapter-agentscope",
