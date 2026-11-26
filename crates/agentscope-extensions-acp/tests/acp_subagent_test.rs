@@ -16,6 +16,8 @@ use agent_client_protocol::v1::schema::{
     TextContent,
 };
 use agent_client_protocol::v1::ConnectionTo;
+#[cfg(feature = "acp-v2")]
+use agent_client_protocol::v2::schema as v2;
 use agent_client_protocol::{Agent, Channel, Client};
 use agentscope_core::event::{AgentEvent, AgentEventType};
 use agentscope_core::message::{ContentBlock as CoreBlock, Msg, TextBlock};
@@ -503,6 +505,109 @@ async fn a_live_child_is_reported_as_an_open_session() {
                     .block_task()
                     .await?;
                 assert_eq!(status.status, SessionStatus::Open);
+                Ok(())
+            },
+        )
+        .await
+        .expect("client run");
+    let _ = agent_task.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// v2 forwards subagent frames through the session bus instead of the connection. The bus key is
+/// the parent session, but the frame must keep naming the child: a client files a child's content
+/// under that id, and a frame carrying the parent's id renders in the main transcript instead.
+#[cfg(feature = "acp-v2")]
+#[tokio::test]
+async fn v2_child_content_keeps_the_child_session_id() {
+    let root = fresh_root("subagent_v2_frames");
+    let (agent, sink) = agent_with_captured_channel(&root);
+    let (agent_channel, client_channel) = Channel::duplex();
+    let agent_task = tokio::spawn(async move { agent.run_with_transport(agent_channel).await });
+
+    let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_notifications = Arc::clone(&seen);
+    let root_for_client = root.clone();
+
+    Client
+        .v2()
+        .on_receive_notification(
+            async move |notification: v2::UpdateSessionNotification, _cx| {
+                if let Ok(value) = serde_json::to_value(&notification) {
+                    seen_notifications.lock().unwrap().push(value);
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            client_channel,
+            |connection: agent_client_protocol::v2::ConnectionTo<Agent>| async move {
+                connection
+                    .send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("subagent-v2-test", "0.0.0"),
+                    ))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(v2::NewSessionRequest::new(root_for_client.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                connection
+                    .send_request(v2::PromptRequest::new(
+                        session_id.clone(),
+                        vec![v2::ContentBlock::Text(v2::TextContent::new("hi"))],
+                    ))
+                    .block_task()
+                    .await?;
+
+                let events = sink
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .expect("the session factory received the subagent channel");
+                events
+                    .send(frame(CHILD, exposure(CHILD, "探索仓库结构")))
+                    .expect("frames are accepted");
+                events
+                    .send(frame(CHILD, text_delta("发现 3 个模块")))
+                    .expect("frames are accepted");
+                events
+                    .send(frame(CHILD, finished()))
+                    .expect("frames are accepted");
+
+                let frames = wait_for(&seen, |frames| {
+                    frames.iter().any(|frame| {
+                        frame["sessionId"] == CHILD
+                            && frame["update"]["sessionUpdate"] == "agent_message_chunk"
+                    })
+                })
+                .await;
+                let frames = subagent_frames(&frames);
+                let parent = session_id.to_string();
+
+                let announcement = frames
+                    .iter()
+                    .find(|frame| frame["update"]["sessionUpdate"] == "subagent_update")
+                    .expect("the child is announced");
+                assert_eq!(
+                    announcement["sessionId"],
+                    parent.as_str(),
+                    "the card belongs to the parent transcript"
+                );
+                assert_eq!(announcement["update"]["sessionId"], CHILD);
+
+                let content = frames
+                    .iter()
+                    .find(|frame| frame["sessionId"] == CHILD)
+                    .expect("the child's content keeps the child session id");
+                assert_eq!(
+                    content["update"]["sessionUpdate"], "agent_message_chunk",
+                    "the child's own text must not be rendered in the parent transcript"
+                );
+                assert_eq!(content["update"]["messageId"], "sub-sub-1");
                 Ok(())
             },
         )

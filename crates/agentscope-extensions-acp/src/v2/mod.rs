@@ -1100,9 +1100,15 @@ fn subagent_sink(route: v1::SessionId) -> Arc<dyn Fn(v1::SessionNotification) + 
     let route = v2::SessionId::new(route.to_string());
     let ids = Arc::new(replay_ids());
     Arc::new(move |notification: v1::SessionNotification| {
+        // The bus key is the session the client is attached to (the root), but
+        // the frame itself must name the session the update belongs to: a
+        // `subagent_update` belongs to the parent while the child's own content
+        // belongs to the child. Reusing `route` for both made every child
+        // message render in the parent transcript.
+        let frame_session = v2::SessionId::new(notification.session_id.to_string());
         let meta = notification.meta;
         if let Some(update) = convert::update_from_v1(notification.update, &ids) {
-            bus::publish_routed(&route.0, (route.clone(), meta, update));
+            bus::publish_routed(&route.0, (frame_session, meta, update));
         }
     })
 }
